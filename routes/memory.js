@@ -1,0 +1,148 @@
+/**
+ * Memory API Routes
+ * Manage user memories for AI agents
+ */
+
+const express = require('express');
+const memoryStore = require('../stores/memoryStore');
+const { getEffectiveUserId } = require('./agents');
+
+const router = express.Router();
+
+// Memory type definitions
+const MEMORY_TYPES = [
+    { id: 'instruction', label: 'Instructions', icon: '📌', description: 'Standing instructions (always/never do X)' },
+    { id: 'person', label: 'People', icon: '👤', description: 'People you know and work with' },
+    { id: 'project', label: 'Projects', icon: '📁', description: 'Project details, tech stacks, URLs' },
+    { id: 'preference', label: 'Preferences', icon: '⚙️', description: 'Your preferences and settings' },
+    { id: 'workflow', label: 'Workflows', icon: '🔄', description: 'How you like to work' },
+    { id: 'fact', label: 'Facts', icon: '📋', description: 'Facts about you or your work' },
+    { id: 'context', label: 'Context', icon: '🏢', description: 'General background context' },
+];
+
+// Get memory type definitions
+router.get('/types', (req, res) => {
+    res.json({ types: MEMORY_TYPES });
+});
+
+// Get all memories for current user
+router.get('/', async (req, res) => {
+    const userId = getEffectiveUserId(req);
+    const agentId = req.query.agentId || null;
+    const projectId = req.query.projectId || null;
+    const typeFilter = req.query.type || null;
+
+    try {
+        let memories = [];
+        if (projectId) {
+            memories = await memoryStore.getMemoriesForProject(userId, projectId);
+        } else if (agentId) {
+            memories = await memoryStore.getMemoriesForAgent(userId, agentId);
+        } else {
+            memories = await memoryStore.getMemories(userId);
+        }
+
+        // Filter by type if requested
+        if (typeFilter) {
+            memories = memories.filter(m => m.type === typeFilter);
+        }
+
+        res.json({ memories });
+    } catch (error) {
+        console.error('Failed to get memories:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get a single memory
+router.get('/:id', async (req, res) => {
+    const userId = getEffectiveUserId(req);
+
+    try {
+        const memory = await memoryStore.getMemoryById(req.params.id);
+        if (!memory) return res.status(404).json({ error: 'Memory not found' });
+        if (memory.user_id !== userId && !memory.project_id) return res.status(403).json({ error: 'Access denied' });
+        res.json({ memory });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Create a memory manually
+router.post('/', async (req, res) => {
+    const userId = getEffectiveUserId(req);
+    const { content, type, agentId, importance, projectId } = req.body;
+
+    if (!content) return res.status(400).json({ error: 'Content is required' });
+
+    try {
+        const id = await memoryStore.createMemory(
+            userId, agentId || null, type || 'fact',
+            content, null, importance || 0.5, null, null, null, null, projectId || null
+        );
+        res.json({ success: true, id });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Update a memory
+router.put('/:id', async (req, res) => {
+    const userId = getEffectiveUserId(req);
+    const { content, summary, importance } = req.body;
+
+    try {
+        const memory = await memoryStore.getMemoryById(req.params.id);
+        if (!memory) return res.status(404).json({ error: 'Memory not found' });
+        if (memory.user_id !== userId && !memory.project_id) return res.status(403).json({ error: 'Access denied' });
+
+        await memoryStore.updateMemory(req.params.id, content || memory.content, summary, importance);
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Delete a memory
+router.delete('/:id', async (req, res) => {
+    const userId = getEffectiveUserId(req);
+
+    try {
+        const memory = await memoryStore.getMemoryById(req.params.id);
+        if (!memory) return res.status(404).json({ error: 'Memory not found' });
+        if (memory.user_id !== userId && !memory.project_id) return res.status(403).json({ error: 'Access denied' });
+
+        await memoryStore.deleteMemory(req.params.id);
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Clear all memories for user
+router.post('/clear', async (req, res) => {
+    const userId = getEffectiveUserId(req);
+
+    try {
+        await memoryStore.clearAllMemories(userId);
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Export memories as JSON
+router.get('/export/all', async (req, res) => {
+    const userId = getEffectiveUserId(req);
+
+    try {
+        const memories = await memoryStore.getMemories(userId, 1000);
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Content-Disposition', 'attachment; filename=memories.json');
+        res.json({ exportDate: new Date().toISOString(), userId, memories });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+module.exports = router;

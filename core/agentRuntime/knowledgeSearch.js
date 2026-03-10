@@ -1,0 +1,147 @@
+async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnowledge, onEvent }) {
+    let systemPromptExtension = '';
+    const kbIds = agent.config?.knowledge_base_ids || [];
+    let allKnowledgeResults = [];
+
+    if (kbIds.length > 0) {
+        try {
+            const searchUrl = process.env.SEARCH_SERVICE_URL || 'http://search-service:8000';
+            
+            // Query preprocessing: extract search intent
+            let searchQuery = userMessage;
+            searchQuery = searchQuery
+                .replace(/^(hey|hi|hello|hoi|hallo|beste)\s*[,!.]?\s*/i, '')
+                .replace(/^(can you|could you|would you|please|kun je|kunt u|wil je|zou je)\s*/i, '')
+                .replace(/^(tell me about|explain|describe|what is|what are|how do|how does|wat is|wat zijn|hoe werkt|hoe kan)\s*/i, '')
+                .replace(/^(i want to know about|i need info on|ik wil weten over|ik zoek informatie over)\s*/i, '')
+                .replace(/\?+$/g, '')
+                .replace(/^(voor ons event|voor mij|voor ons|for us|for me|for our)\s*/i, '')
+                .trim();
+            if (searchQuery.length < 5) searchQuery = userMessage;
+
+            const searchRes = await fetch(`${searchUrl}/tools/kb-search`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    tenant_id: userId,
+                    kb_ids: kbIds,
+                    query: searchQuery,
+                    top_k: 12,
+                    rerank: true
+                }),
+                signal: AbortSignal.timeout(15000)
+            });
+
+            if (searchRes.ok) {
+                const searchData = await searchRes.json();
+                const chunks = searchData.chunks || searchData.results || [];
+                allKnowledgeResults.push(...chunks.map(c => ({
+                    content: c.content,
+                    metadata: { source: c.source_uri || c.title || 'KB', type: 'kb_chunk' },
+                    score: c.score || c.rerank_score || 0
+                })));
+            }
+        } catch (searchErr) {
+            console.warn('[KnowledgeSearch] Search-service unavailable:', searchErr.message);
+        }
+    }
+
+    if (allKnowledgeResults.length > 0) {
+        allKnowledgeResults.sort((a, b) => (b.score || 0) - (a.score || 0));
+        
+        const MIN_SCORE = 0.25;
+        allKnowledgeResults = allKnowledgeResults.filter(r => (r.score || 0) >= MIN_SCORE);
+
+        const sourceMap = new Map();
+        for (const result of allKnowledgeResults) {
+            const source = result.metadata?.source || 'Unknown Source';
+            if (sourceMap.has(source)) {
+                const existing = sourceMap.get(source);
+                existing.content += '\n\n' + result.content;
+                existing.score = Math.max(existing.score || 0, result.score || 0);
+            } else {
+                sourceMap.set(source, { ...result });
+            }
+        }
+        
+        const mergedResults = Array.from(sourceMap.values());
+        mergedResults.sort((a, b) => (b.score || 0) - (a.score || 0));
+        const topResults = mergedResults.slice(0, 8);
+
+        const MAX_CONTENT_CHARS = 1200;
+        for (const result of topResults) {
+            if (result.content && result.content.length > MAX_CONTENT_CHARS) {
+                result.content = result.content.slice(0, MAX_CONTENT_CHARS) + '…';
+            }
+        }
+
+        if (topResults.length > 0) {
+            const includeRefs = agent.config?.includeSourceReferences === true;
+            const knowledgeText = topResults.map((k, i) => {
+                const meta = k.metadata || {};
+                let source = meta.source || meta.source_uri || 'Unknown Source';
+                if (meta.type === 'url_import' && meta.source) source = meta.source;
+                return `### Source ${i + 1}: ${source}\n${k.content}\n`;
+            }).join('\n');
+
+            const citationInstruction = includeRefs
+                ? 'When relevant, include the source URL at the end of your response so the user can verify the information.'
+                : 'Do NOT include citations (e.g. [Source 1]) or source URLs in your final response.';
+
+            if (isStrictKnowledge) {
+                systemPromptExtension += `\n\n## KNOWLEDGE BASE RESULTS
+The following information was retrieved from your knowledge base. Answer ONLY from this data.
+If the user's question cannot be answered from the information below, you MUST say you don't have that information.
+${citationInstruction}
+
+${knowledgeText}
+`;
+            } else {
+                systemPromptExtension += `\n\n## RELEVANT KNOWLEDGE BASE
+The following information from your knowledge base was retrieved based on the user's request. 
+Use this information to answer the question.
+${citationInstruction}
+
+${knowledgeText}
+`;
+            }
+
+            if (includeRefs && onEvent) {
+                onEvent('kb_sources', {
+                    sources: topResults.map(k => ({
+                        title: k.metadata?.source || k.metadata?.source_uri || 'Unknown Source',
+                        content: k.content,
+                        score: k.score || 0,
+                        type: k.metadata?.type || 'unknown'
+                    }))
+                });
+            }
+        } else {
+            if (isStrictKnowledge) {
+                systemPromptExtension += `\n\n## KNOWLEDGE BASE RESULTS
+No relevant information was found in your knowledge base for this query.
+You MUST tell the user you don't have information about this topic. Do NOT answer from general knowledge.
+Suggest the user rephrase their question or ask about topics covered in your knowledge base.
+`;
+            }
+        }
+    } else if (isStrictKnowledge) {
+        if (kbIds.length === 0) {
+            systemPromptExtension += `\n\n## KNOWLEDGE BASE RESULTS
+Your knowledge base is empty. No information has been added yet.
+You MUST tell the user that your knowledge base has not been set up yet and you cannot answer questions until knowledge is added.
+Do NOT answer any questions from general knowledge.
+`;
+        } else {
+            systemPromptExtension += `\n\n## KNOWLEDGE BASE RESULTS
+No relevant information was found in your knowledge base for this query.
+You MUST tell the user you don't have information about this topic. Do NOT answer from general knowledge.
+Suggest the user rephrase their question or ask about topics covered in your knowledge base.
+`;
+        }
+    }
+
+    return systemPromptExtension;
+}
+
+module.exports = { performKnowledgeSearch };

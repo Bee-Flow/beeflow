@@ -1,0 +1,29 @@
+{
+  "admin": {
+    "id": "admin",
+    "name": "Administrator",
+    "description": "Full system access",
+    "permissions": [
+      "all"
+    ]
+  },
+  "user": {
+    "id": "user",
+    "name": "User",
+    "description": "Standard user access",
+    "permissions": [
+      "read",
+      "chat"
+    ]
+  },
+  "admin-light": {
+    "id": "admin-light",
+    "name": "Admin Light",
+    "description": "",
+    "permissions": [
+      "manage_users",
+      "chat",
+      "manage_agents"
+    ]
+  }
+}

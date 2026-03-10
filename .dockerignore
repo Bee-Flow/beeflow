@@ -1,0 +1,31 @@
+# Dependencies - these are installed during build
+node_modules
+npm-debug.log*
+
+# Development files
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+
+# IDE and editor files
+.vscode
+.idea
+*.swp
+*.swo
+
+# Test files
+coverage
+*.test.js
+*.spec.js
+
+# Documentation
+README.md
+CHANGELOG.md
+docs
+
+# Misc
+.DS_Store
+Thumbs.db
+*.log

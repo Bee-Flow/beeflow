@@ -1,0 +1,123 @@
+/**
+ * Subscription Limit Enforcement
+ * 
+ * Shared module for checking subscription-based usage limits.
+ * Used by agent chat, direct chat, group chat, and resource creation.
+ */
+
+const userStore = require('../stores/userStore');
+const usageStore = require('../stores/usageStore');
+
+/**
+ * Check if an organisation has exceeded any subscription limits.
+ * Returns an error message string if blocked, or null if OK.
+ * 
+ * @param {string|null} orgId - Organisation ID
+ * @param {string} agentType - 'chat' | 'browser' | 'terminal' | 'security' | 'swarm'
+ * @returns {string|null} Error message if limit exceeded, null otherwise
+ */
+function checkSubscriptionLimits(orgId, agentType) {
+    if (!orgId) return null; // No org = no limits
+    const limits = userStore.getEffectiveLimits(orgId);
+    if (!limits) return null; // No subscription = no limits
+
+    // Suspended or cancelled orgs are fully blocked
+    if (limits.status === 'suspended') return 'Your organization\'s subscription is suspended. Please contact your administrator.';
+    if (limits.status === 'cancelled') return 'Your organization\'s subscription has been cancelled. Please contact your administrator.';
+
+    // Get current month usage
+    const now = new Date();
+    const startDate = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+    const endDate = now.toISOString();
+    const summary = usageStore.getUsageSummary({ startDate, endDate, organizationId: orgId });
+
+    // Check total messages limit
+    if (limits.max_messages_per_month !== null && limits.max_messages_per_month !== undefined) {
+        if ((summary.total_calls || 0) >= limits.max_messages_per_month) {
+            return `Your organization has reached its monthly message limit (${limits.max_messages_per_month.toLocaleString()} messages). Please contact your administrator.`;
+        }
+    }
+
+    // Check total tokens limit
+    if (limits.max_tokens_per_month !== null && limits.max_tokens_per_month !== undefined) {
+        if ((summary.total_tokens || 0) >= limits.max_tokens_per_month) {
+            return `Your organization has reached its monthly token limit (${limits.max_tokens_per_month.toLocaleString()} tokens). Please contact your administrator.`;
+        }
+    }
+
+    // Check cost limit
+    if (limits.max_cost_per_month !== null && limits.max_cost_per_month !== undefined) {
+        if ((summary.total_estimated_cost || 0) >= limits.max_cost_per_month) {
+            return `Your organization has reached its monthly cost limit (\u20ac${limits.max_cost_per_month.toFixed(2)}). Please contact your administrator.`;
+        }
+    }
+
+    // Check per-agent-type message limit
+    if (limits.max_messages_by_type && agentType && limits.max_messages_by_type[agentType] !== undefined) {
+        const typeLimit = limits.max_messages_by_type[agentType];
+        if (typeLimit !== null) {
+            const byType = usageStore.getUsageByAgentType({ startDate, endDate, organizationId: orgId });
+            const typeUsage = byType.find(t => t.agent_type === agentType);
+            if (typeUsage && typeUsage.calls >= typeLimit) {
+                const typeLabels = { chat: 'Chat', browser: 'Browser Agent', terminal: 'Terminal Agent', security: 'Security Agent', swarm: 'Swarm' };
+                return `Your organization has reached its monthly ${typeLabels[agentType] || agentType} message limit (${typeLimit.toLocaleString()} messages). Please contact your administrator.`;
+            }
+        }
+    }
+
+    return null; // All good
+}
+
+/**
+ * Check if creating a new resource would exceed org limits.
+ * Returns an error message string if blocked, or null if OK.
+ * 
+ * @param {string|null} orgId - Organisation ID
+ * @param {'users'|'agents'|'knowledge_sources'} resourceType - Type of resource
+ * @param {number} currentCount - Current count of resources
+ * @returns {string|null} Error message if limit exceeded, null otherwise
+ */
+function checkResourceLimits(orgId, resourceType, currentCount) {
+    if (!orgId) return null;
+    const limits = userStore.getEffectiveLimits(orgId);
+    if (!limits) return null;
+
+    const fieldMap = {
+        users: 'max_users',
+        agents: 'max_agents',
+        knowledge_sources: 'max_knowledge_sources',
+    };
+
+    const field = fieldMap[resourceType];
+    if (!field) return null;
+
+    const max = limits[field];
+    if (max !== null && max !== undefined && currentCount >= max) {
+        const labels = { users: 'users', agents: 'agents', knowledge_sources: 'knowledge sources' };
+        return `Your organization has reached its limit of ${max} ${labels[resourceType]}. Please upgrade your plan or contact your administrator.`;
+    }
+
+    return null;
+}
+
+/**
+ * Resolve the user's primary org ID from request session.
+ * Returns orgId string or null.
+ */
+function resolveOrgId(req) {
+    const userId = req.session?.user?.id;
+    if (!userId) return null;
+    // Super admin has no org restriction
+    if (req.session?.isAdmin || req.session?.user?.role === 'admin') return null;
+    try {
+        const user = userStore.getUser(userId);
+        if (user?.organizationId) return user.organizationId;
+    } catch (_) { }
+    return null;
+}
+
+module.exports = {
+    checkSubscriptionLimits,
+    checkResourceLimits,
+    resolveOrgId,
+};

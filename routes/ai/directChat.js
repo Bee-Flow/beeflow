@@ -1,0 +1,1367 @@
+/**
+ * Direct Chat Routes
+ * 
+ * Handles: streaming direct chat, conversation CRUD.
+ * Uses LLMClient for all LLM interactions — no provider-specific code here.
+ */
+
+const express = require('express');
+const fs = require('fs');
+const path = require('path');
+const router = express.Router();
+const {
+    getAIConfig,
+    getProviderForModel,
+} = require('../../core/aiAgent');
+const configStore = require('../../stores/configStore');
+const componentManager = require('../../core/componentManager');
+const { classifyPromptComplexity } = require('../../core/promptClassifier');
+const { getAdapter } = require('../../core/providers');
+const agentStore = require('../../stores/agentStore');
+const { executeTool: dispatchTool } = require('../../core/toolDispatcher');
+const { getIntegrationTools, buildToolHint } = require('../../core/integrationTools');
+const { checkRegexPatterns } = require('../../core/guardrails');
+const { checkSubscriptionLimits, resolveOrgId } = require('../../core/limits');
+
+function requireAuth(req, res, next) {
+    if (req.session && req.session.user) return next();
+    res.status(401).json({ error: 'Unauthorized' });
+}
+
+// ─── Streaming Direct Chat ───────────────────────────────────────
+
+router.post('/chat/direct/stream', requireAuth, async (req, res) => {
+    const { message, conversationId, modelTier, history, attachments, imageGenSettings, nanoBananaSettings, disabledMedia, workspaceContent, workspaceSelection, projectId, timezone } = req.body;
+    const userId = req.session.user.id;
+
+    if (!message && (!attachments || attachments.length === 0)) {
+        return res.status(400).json({ error: 'Message or attachments required' });
+    }
+
+    // Resolve model from tier config
+    let tiers = await configStore.getConfig('chat_model_tiers') || {};
+
+    // EU mode override: if user's org has EU mode enabled, use EU-specific tiers from global config
+    const { resolveUserOrgIds: resolveOrgIdsForTiers } = require('../../auth');
+    const orgIdsForTiers = resolveOrgIdsForTiers(req);
+    const userOrgForTiers = orgIdsForTiers && orgIdsForTiers.size > 0 ? Array.from(orgIdsForTiers)[0] : null;
+    if (userOrgForTiers) {
+        const shield = await configStore.getConfig(`org_privacy_shield_${userOrgForTiers}`);
+        if (shield?.enabled && shield?.euModeEnabled) {
+            const euTiers = await configStore.getConfig('chat_model_tiers_eu') || {};
+            const mergedTiers = { ...tiers };
+            for (const [tierName, euTier] of Object.entries(euTiers)) {
+                if (euTier?.modelId) {
+                    mergedTiers[tierName] = { ...mergedTiers[tierName], ...euTier };
+                }
+            }
+            tiers = mergedTiers;
+            console.log(`[DirectChat] EU mode active for org ${userOrgForTiers}`);
+        }
+    }
+    let resolvedTier = modelTier || 'fast';
+
+    // Auto mode: classify which tier to use
+    if (resolvedTier === 'auto') {
+        try {
+            const { classifyWithLLM } = require('../../core/promptClassifier');
+            const result = await classifyWithLLM(message, tiers);
+            resolvedTier = result.tier;
+            console.log(`[DirectChat] Auto: tier="${resolvedTier}" (${result.method}: ${result.reason})`);
+        } catch (err) {
+            console.log(`[DirectChat] Auto classification failed: ${err.message}, using fast`);
+            resolvedTier = 'fast';
+        }
+    }
+
+    const tier = tiers[resolvedTier] || {};
+    let modelId = tier.modelId;
+
+    if (!modelId) {
+        const config = await getAIConfig();
+        modelId = config.model || 'mistral-small-latest';
+    }
+
+    // Resolve provider for this model
+    const config = await getProviderForModel(modelId);
+    const apiKey = config.apiKey;
+    const apiUrl = (config.url || '').replace(/\/+$/, '');
+    const adapter = getAdapter(config.providerType, apiUrl);
+
+    console.log(`[DirectChat] Provider: ${config.providerName || 'default'} (${adapter.name})`);
+    console.log(`[DirectChat] Using model: ${modelId} (tier: ${resolvedTier}${modelTier === 'auto' ? ', auto-selected' : ''})`);
+
+    // ── Subscription limit enforcement ──
+    const limitOrgId = resolveOrgId(req);
+    const limitError = checkSubscriptionLimits(limitOrgId, 'chat');
+    if (limitError) {
+        res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no',
+        });
+        res.write(`event: error\ndata: ${JSON.stringify({ error: limitError })}\n\n`);
+        return res.end();
+    }
+
+    // Set SSE headers
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+    });
+
+    const send = (event, data) => {
+        res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+
+    if (modelTier === 'auto') {
+        send('model_selected', { tier: resolvedTier, modelId });
+    }
+
+    try {
+        // Load tools enabled for this tier
+        const allComponents = componentManager.getComponents();
+        const tierToolsConfig = await configStore.getConfig('direct_chat_tier_tools');
+        const enabledToolIds = tierToolsConfig && tierToolsConfig[resolvedTier];
+        let directChatTools = allComponents
+            .filter(c => {
+                if (enabledToolIds) return enabledToolIds.includes(c.id);
+                return c.definition?.directChatEnabled === true;
+            })
+            .map(c => {
+                const inputDefs = c.definition?.inputs || {};
+                const visibleInputs = Object.entries(inputDefs)
+                    .filter(([, conf]) => {
+                        if (typeof conf !== 'object') return true;
+                        return !conf.secure && conf.default === undefined;
+                    });
+                return {
+                    type: 'function',
+                    function: {
+                        name: c.id,
+                        description: c.definition.description || c.definition.name || c.id,
+                        parameters: {
+                            type: 'object',
+                            properties: visibleInputs.reduce((acc, [key, conf]) => {
+                                acc[key] = {
+                                    type: (typeof conf === 'object' ? conf.type : conf) || 'string',
+                                    description: (typeof conf === 'object' ? conf.description : '') || ''
+                                };
+                                return acc;
+                            }, {}),
+                            required: visibleInputs
+                                .filter(([, conf]) => typeof conf === 'object' && conf.required)
+                                .map(([key]) => key)
+                        }
+                    }
+                };
+            });
+
+        // Load integration tools via shared module
+        const { tools: integrationToolsList, n8nOrgId } = await getIntegrationTools({
+            userId,
+            session: req.session,
+            isAdmin: req.session?.isAdmin,
+        });
+
+        // Merge integration tools with component tools
+        for (const tool of integrationToolsList) {
+            if (!directChatTools.find(t => t.function.name === tool.function.name)) {
+                directChatTools.push(tool);
+            }
+        }
+
+        // ─── Built-in: set_reminder tool ────────────────────────────
+        directChatTools.push({
+            type: 'function',
+            function: {
+                name: 'set_reminder',
+                description: 'Set a reminder for the user. Use this when the user asks to be reminded about something at a specific time. Returns confirmation with the reminder details. IMPORTANT: Use the timezone from the "Now:" line in the system prompt — do NOT use UTC/Z unless the user is in UTC.',
+                parameters: {
+                    type: 'object',
+                    properties: {
+                        title: { type: 'string', description: 'Short title for the reminder' },
+                        message: { type: 'string', description: 'Optional detailed message for the reminder' },
+                        remind_at: { type: 'string', description: 'ISO 8601 datetime string for when to remind. MUST include the user\'s timezone offset from the system prompt (e.g. "2026-03-09T15:00:00+01:00" for CET). Do NOT use "Z" unless the user is in UTC. Use the current date/time context to calculate the correct time.' },
+                        repeat_interval: { type: 'string', enum: ['daily', 'weekly', 'monthly'], description: 'Optional repeat interval. Only set if user asks for recurring reminders.' },
+                    },
+                    required: ['title', 'remind_at'],
+                },
+            },
+        });
+
+        // Filter out user-disabled media tools
+        if (disabledMedia && typeof disabledMedia === 'object') {
+            const disabledToolNames = new Set();
+            if (disabledMedia.image) disabledToolNames.add('generate_image');
+            if (disabledMedia.music) disabledToolNames.add('generate_music');
+            if (disabledMedia.video) disabledToolNames.add('generate_video');
+            if (disabledMedia.elevenlabs) {
+                disabledToolNames.add('elevenlabs_music');
+                disabledToolNames.add('elevenlabs_tts');
+                disabledToolNames.add('elevenlabs_sfx');
+            }
+            if (disabledToolNames.size > 0) {
+                directChatTools = directChatTools.filter(t => !disabledToolNames.has(t.function.name));
+                console.log(`[DirectChat] Disabled media tools: ${[...disabledToolNames].join(', ')}`);
+            }
+        }
+
+        // Build messages array
+        const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+        const customPrompt = await configStore.getConfig('direct_chat_system_prompt');
+        const basePrompt = customPrompt
+            ? `${customPrompt}\n\nToday is ${today}.`
+            : `You are a helpful AI assistant. Today is ${today}. Respond thoughtfully and concisely.`;
+
+        // Build explicit integration hints so the AI knows what tools it has
+        const toolHint = await buildToolHint(directChatTools, userId);
+
+        // ─── Project context injection ───────────────────────────────
+        let projectContext = '';
+        let extractMemoriesEnabled = false;
+        if (projectId) {
+            try {
+                const projectStore = require('../../stores/projectStore');
+                const project = await projectStore.getProject(projectId);
+                if (project) {
+                    extractMemoriesEnabled = project.extractMemories === true;
+                    // Inject custom instructions
+                    if (project.customInstructions && project.customInstructions.trim()) {
+                        projectContext += `\n\n[PROJECT INSTRUCTIONS — "${project.name}"]\n${project.customInstructions}`;
+                    }
+                    // Search project knowledge bases
+                    const kbIds = project.knowledgeBaseIds || [];
+                    if (kbIds.length > 0) {
+                        try {
+                            const searchUrl = process.env.SEARCH_SERVICE_URL || 'http://search-service:8000';
+                            const searchRes = await fetch(`${searchUrl}/tools/kb-search`, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ tenant_id: userId, kb_ids: kbIds, query: message, top_k: 8, rerank: true }),
+                                signal: AbortSignal.timeout(10000),
+                            });
+                            if (searchRes.ok) {
+                                const searchData = await searchRes.json();
+                                const chunks = (searchData.chunks || searchData.results || []).filter(c => (c.score || c.rerank_score || 0) >= 0.25);
+                                if (chunks.length > 0) {
+                                    const kbText = chunks.slice(0, 6).map((c, i) => {
+                                        const src = c.source_uri || c.title || 'KB';
+                                        const content = (c.content || '').slice(0, 1200);
+                                        return `### Source ${i + 1}: ${src}\n${content}`;
+                                    }).join('\n\n');
+                                    projectContext += `\n\n[PROJECT KNOWLEDGE BASE — "${project.name}"]\nRelevant information from this project's knowledge base:\n${kbText}`;
+                                    console.log(`[DirectChat] Injected ${chunks.length} KB chunks from project "${project.name}"`);
+                                }
+                            }
+                        } catch (kbErr) {
+                            console.warn('[DirectChat] Project KB search failed:', kbErr.message);
+                        }
+                    }
+                }
+            } catch (projErr) {
+                console.warn('[DirectChat] Project context failed:', projErr.message);
+            }
+        }
+
+        // ─── Memory injection ────────────────────────────────────────
+        let memoryContext = '';
+        try {
+            const memoryStore = require('../../stores/memoryStore');
+            const relevantMemories = await memoryStore.findRelevantMemories(userId, null, message, 800, extractMemoriesEnabled ? projectId : null);
+            if (relevantMemories.length > 0) {
+                memoryContext = '\n\n' + memoryStore.formatMemoriesForPrompt(relevantMemories);
+            }
+        } catch (e) {
+            console.warn('[DirectChat] Memory retrieval failed:', e.message);
+        }
+
+        // ─── Workspace context injection ─────────────────────────────
+        let workspaceContext = '';
+        if (workspaceContent && workspaceContent.trim()) {
+            workspaceContext = '\n\n[WORKSPACE CONTEXT]\nThe user has an active workspace document (markdown) open alongside the chat. You have 3 workspace tools:\n- workspace_read: Read current content (ALWAYS use this before workspace_replace to get exact text)\n- workspace_write: Replace ALL content (for new documents or full rewrites only)\n- workspace_replace: Replace a SPECIFIC portion (preferred for edits — uses find_text + replace_text)\n\nWORKSPACE RULES:\n1. For partial edits, ALWAYS prefer workspace_replace over workspace_write\n2. Before using workspace_replace, call workspace_read first to see the EXACT current content\n3. Copy the find_text EXACTLY from workspace_read output — character by character, including markdown formatting\n4. The workspace persists across chat messages — content stays until explicitly changed';
+            if (workspaceSelection && workspaceSelection.trim()) {
+                workspaceContext += `\n\n[SELECTED TEXT — RAW MARKDOWN]\nThe user has selected this text in the workspace (raw markdown source):\n\`\`\`\n${workspaceSelection}\n\`\`\`\nUse workspace_replace with find_text set to EXACTLY this text (including any ** # - formatting). Set replace_text to the new version. To remove, set replace_text to empty string.`;
+            }
+        }
+
+        let messages = [
+            {
+                role: 'system', content: basePrompt + toolHint + memoryContext + workspaceContext + projectContext + `\nNow: ${new Date().toLocaleString('sv-SE', { timeZone: timezone || 'UTC', timeZoneName: 'short' })}`
+            }
+        ];
+
+        // Add conversation history
+        if (history && Array.isArray(history)) {
+            for (const msg of history) {
+                if (msg.role === 'user' || msg.role === 'assistant') {
+                    messages.push({ role: msg.role, content: msg.content });
+                }
+            }
+        }
+
+        let convId = conversationId;
+        let lastResponseId = null; // OpenAI Responses API chaining
+        let conversationSummary = null; // Compaction summary
+        let hasDocumentAttachment = false;
+
+        // Load metadata from existing conversation
+        if (convId) {
+            try {
+                const existingConv = await agentStore.getDirectConversation(convId, userId);
+                if (existingConv) {
+                    // Load compaction summary
+                    if (existingConv.conversationSummary) {
+                        conversationSummary = existingConv.conversationSummary;
+                    }
+                    // Load OpenAI response chaining ID (model-specific)
+                    if (config.providerType === 'openai' && existingConv.lastResponseId) {
+                        if (existingConv.lastResponseModel === modelId) {
+                            lastResponseId = existingConv.lastResponseId;
+                            console.log('[DirectChat] Loaded lastResponseId:', lastResponseId);
+                        } else {
+                            console.log('[DirectChat] Model changed, invalidating lastResponseId');
+                        }
+                    }
+                }
+            } catch (e) { /* ignore */ }
+        }
+
+        // Add current message (with attachments if any)
+        if (attachments && attachments.length > 0) {
+            const contentParts = [];
+            if (message) contentParts.push({ type: 'text', text: message });
+
+            for (const att of attachments) {
+                if (att.type && att.type.startsWith('image/') && att.content) {
+                    contentParts.push({ type: 'image_url', image_url: { url: att.content } });
+                } else if (att.source === 'google-drive' && att.content) {
+                    // Google Drive file — already exported as plain text, inject directly
+                    contentParts.push({
+                        type: 'text',
+                        text: `--- Google Drive: ${att.name} ---\n${att.content}\n--- End of ${att.name} ---`
+                    });
+                } else if (att.content && att.type && att.type.includes('pdf')) {
+                    // PDF — use pdf-parse as primary extractor, Mistral OCR as optional fallback for scanned PDFs
+                    try {
+                        const base64Data = att.content.split(',')[1] || att.content;
+                        const pdfBuffer = Buffer.from(base64Data, 'base64');
+                        let pdfText = '';
+
+                        // 1. Try pdfjs-dist first (works for text-based PDFs)
+                        try {
+                            const { extractTextFromPDF } = require('../../core/pdfExtractor');
+                            pdfText = await extractTextFromPDF(pdfBuffer, att.name);
+                        } catch (parseErr) {
+                            console.warn(`[DirectChat] pdfjs extraction failed for ${att.name}:`, parseErr.message);
+                        }
+
+                        // 2. If pdf-parse returned empty (scanned PDF), try Mistral OCR as fallback
+                        if (!pdfText) {
+                            try {
+                                const { mistralOCR } = require('../../core/ocr');
+                                pdfText = await mistralOCR(base64Data, att.type, att.name);
+                                if (pdfText) {
+                                    console.log(`[DirectChat] PDF extracted via Mistral OCR fallback: ${att.name}`);
+                                }
+                            } catch (ocrErr) {
+                                console.warn(`[DirectChat] Mistral OCR fallback failed: ${ocrErr.message}`);
+                            }
+                        }
+
+                        if (pdfText) {
+                            contentParts.push({
+                                type: 'text',
+                                text: `[PDF Document: ${att.name}]\n---\n${pdfText}\n---`
+                            });
+                        } else {
+                            // Both extraction methods failed — fall back to container upload
+                            hasDocumentAttachment = true;
+                            if (!convId) {
+                                const conv = await agentStore.createDirectConversation(userId, modelTier || 'fast');
+                                convId = conv.id;
+                                send('conversation_created', { conversationId: convId });
+                            }
+                            const containerManager = require('../../terminal/containerManager');
+                            const os = require('os');
+                            const crypto = require('crypto');
+                            const fs = require('fs');
+                            const path = require('path');
+
+                            const containerKey = `direct-${convId}`;
+                            await containerManager.getOrCreateContainer(containerKey, `user-${userId}`);
+
+                            const filename = att.name.replace(/[^a-zA-Z0-9.\-_]/g, '_');
+                            const tmpHostPath = path.join(os.tmpdir(), `direct_att_${crypto.randomBytes(8).toString('hex')}_${filename}`);
+                            fs.writeFileSync(tmpHostPath, pdfBuffer);
+                            containerManager.copyToContainer(containerKey, tmpHostPath, `/workspace/${filename}`);
+                            fs.unlinkSync(tmpHostPath);
+
+                            contentParts.push({
+                                type: 'text',
+                                text: `[Uploaded document: ${filename}] This file has been placed in your secure terminal workspace at /workspace/${filename}. Use terminal tools to analyze it.`
+                            });
+                            console.log(`[DirectChat] PDF extraction failed, fell back to container: ${att.name}`);
+                        }
+                    } catch (e) {
+                        console.error(`[DirectChat] PDF processing failed for ${att.name}:`, e.message);
+                        contentParts.push({
+                            type: 'text',
+                            text: `[PDF: ${att.name} — failed to process: ${e.message}]`
+                        });
+                    }
+                } else if (att.content) {
+                    hasDocumentAttachment = true;
+                    if (!convId) {
+                        const conv = await agentStore.createDirectConversation(userId, modelTier || 'fast');
+                        convId = conv.id;
+                        send('conversation_created', { conversationId: convId });
+                    }
+
+                    try {
+                        const containerManager = require('../../terminal/containerManager');
+                        const os = require('os');
+                        const crypto = require('crypto');
+                        const fs = require('fs');
+                        const path = require('path');
+
+                        const containerKey = `direct-${convId}`;
+                        await containerManager.getOrCreateContainer(containerKey, `user-${userId}`);
+
+                        const base64Data = att.content.split(',')[1] || att.content;
+                        const buffer = Buffer.from(base64Data, 'base64');
+                        const filename = att.name.replace(/[^a-zA-Z0-9.\-_]/g, '_');
+                        const tmpHostPath = path.join(os.tmpdir(), `direct_att_${crypto.randomBytes(8).toString('hex')}_${filename}`);
+                        fs.writeFileSync(tmpHostPath, buffer);
+                        containerManager.copyToContainer(containerKey, tmpHostPath, `/workspace/${filename}`);
+                        fs.unlinkSync(tmpHostPath);
+
+                        contentParts.push({
+                            type: 'text',
+                            text: `[Uploaded document: ${filename}] This file has been placed in your secure terminal workspace at /workspace/${filename}. Use terminal tools (like convert_document_to_text, run_command, python_exec) to analyze it.`
+                        });
+                    } catch (e) {
+                        contentParts.push({
+                            type: 'text',
+                            text: `[File: ${att.name}, failed to upload to workspace: ${e.message}]`
+                        });
+                    }
+                }
+            }
+            messages.push({ role: 'user', content: contentParts });
+        } else {
+            messages.push({ role: 'user', content: message });
+        }
+
+        if (hasDocumentAttachment) {
+            const { TERMINAL_TOOLS } = require('../../terminal/tools');
+            for (const tTool of TERMINAL_TOOLS) {
+                if (!directChatTools.find(t => t.function.name === tTool.function.name)) {
+                    directChatTools.push(tTool);
+                }
+            }
+        }
+
+        // ─── AI Content Moderation (org shield) ─────────────────────
+        const { resolveUserOrgIds } = require('../../auth');
+        const userOrgIds = await resolveUserOrgIds(req);
+        const userOrgId = userOrgIds && userOrgIds.size > 0 ? Array.from(userOrgIds)[0] : null;
+
+        // Check if org shield or global config enables moderation for direct chat
+        let moderationViolation = null;
+        const orgShield = userOrgId ? await configStore.getConfig(`org_privacy_shield_${userOrgId}`) : null;
+        const globalModerationEnabled = (await getAIConfig()).llamaGuardConfig?.enabled;
+        const moderationEnabled = (orgShield?.enabled && orgShield?.moderationEnabled) || globalModerationEnabled;
+        const moderationScope = orgShield?.enabled ? (orgShield.scope || { userInput: true, agentOutput: true }) : { userInput: true, agentOutput: true };
+        const webSearchGuardEnabled = !!(orgShield?.enabled && orgShield?.webSearchGuardEnabled);
+        const moderationCategories = orgShield?.moderationCategories || null;
+
+        // Check user input with moderation (only if scope.userInput)
+        if (moderationEnabled && moderationScope.userInput) {
+            try {
+                const { validateWithLlamaGuard } = require('../../core/moderation');
+                await validateWithLlamaGuard(messages, true, moderationCategories);
+                console.log(`[DirectChat] AI moderation passed (user input)`);
+            } catch (guardError) {
+                if (guardError.violationCodes) {
+                    let violationLabels = guardError.violationCodes;
+                    try {
+                        const parsed = JSON.parse(guardError.outcome);
+                        violationLabels = parsed.map(f => f.label || f.category);
+                    } catch (e) { /* use codes as-is */ }
+                    send('guardrail_violation', {
+                        rules: violationLabels,
+                        autoDeleteSeconds: 5,
+                        outcome: guardError.outcome,
+                        categories: violationLabels
+                    });
+                    // Let the AI explain the violation instead of blocking
+                    moderationViolation = violationLabels.join(', ');
+                    console.log(`[DirectChat] Moderation violation detected: ${moderationViolation} — AI will respond`);
+                } else {
+                    // Guard service error (not a violation) — fail-open, log and continue
+                    console.warn(`[DirectChat] Guard service error (fail-open): ${guardError.message}`);
+                }
+            }
+        }
+
+        // Inject moderation violation context into system prompt so AI can explain
+        if (moderationViolation) {
+            messages[0].content += `\n\n[IMPORTANT: The user's message was flagged by content moderation for: "${moderationViolation}". You must briefly explain that their message was flagged for "${moderationViolation}" and politely ask them to rephrase. Keep your response short (1-2 sentences). Do not process or answer the original request.]`;
+        }
+
+        // ─── Regex Guardrails ────────────────────────────────────────
+        const { resolveOrgShield, mergeWithOrgShield } = require('../../core/orgShield');
+
+        // 1. Resolve org-level privacy shield regex rules for this user
+        const orgShieldConfig = await resolveOrgShield(userOrgId);
+        if (orgShieldConfig) {
+            console.log(`[DirectChat] Org Privacy Shield active for org ${userOrgId} (${orgShieldConfig.rulesWithNames.length} rules)`);
+        }
+
+        // 2. Resolve direct-chat-specific regex guardrails
+        const dcRegexConfig = await configStore.getConfig('direct_chat_regex_guardrails');
+        let dcLocalConfig = null;
+
+        if (dcRegexConfig?.enabled) {
+            const globalConfig = await getAIConfig();
+            const globalRegexConfig = globalConfig.regexGuardrails || {};
+            const globalRules = globalRegexConfig.rules || [];
+            const globalCollections = globalRegexConfig.collections || [];
+
+            let rulesWithNames = [];
+            if (dcRegexConfig.collectionIds?.length > 0) {
+                for (const colId of dcRegexConfig.collectionIds) {
+                    const collection = globalCollections.find(c => c.id === colId);
+                    if (collection) {
+                        for (const ruleId of collection.ruleIds || []) {
+                            const rule = globalRules.find(r => r.id === ruleId);
+                            if (rule?.pattern) {
+                                rulesWithNames.push({ name: rule.name, pattern: rule.pattern });
+                            }
+                        }
+                    }
+                }
+            }
+
+            const scope = dcRegexConfig.scope || { userInput: true, agentOutput: true };
+            const action = dcRegexConfig.action || 'delete';
+            if (rulesWithNames.length > 0) {
+                dcLocalConfig = { enabled: true, rulesWithNames, scope, action };
+            }
+        }
+
+        // 3. Merge: org shield + direct chat guardrails
+        let regexConfig = mergeWithOrgShield(orgShieldConfig, dcLocalConfig);
+
+        // Check user input against regex rules
+        if (regexConfig?.enabled && regexConfig?.scope?.userInput) {
+            const matches = checkRegexPatterns(message, regexConfig.rulesWithNames);
+            if (matches.length > 0) {
+                const ruleNames = matches.map(m => m.ruleName).join(', ');
+                console.log(`[DirectChat RegexGuard] User input violated rules: ${ruleNames}, action: ${regexConfig.action}`);
+
+                if (regexConfig.action === 'redact') {
+                    // Redact matched patterns and send event
+                    let redactedMessage = message;
+                    for (const rule of regexConfig.rulesWithNames) {
+                        try {
+                            const regex = new RegExp(rule.pattern, 'gi');
+                            redactedMessage = redactedMessage.replace(regex, `[REDACTED: ${rule.name}]`);
+                        } catch (e) { /* skip invalid patterns */ }
+                    }
+                    send('content_redact', {
+                        originalMessage: message,
+                        redactedMessage,
+                        rules: ruleNames,
+                        autoRedactSeconds: 5
+                    });
+                    // Replace message in the messages array
+                    const lastMsg = messages[messages.length - 1];
+                    if (typeof lastMsg.content === 'string') {
+                        lastMsg.content = redactedMessage;
+                    }
+                } else {
+                    // Delete: send violation and stop
+                    send('guardrail_violation', { rules: ruleNames, autoDeleteSeconds: 5 });
+                    send('done', {});
+                    res.end();
+                    return;
+                }
+            }
+        }
+
+        // ─── Conversation Compaction ─────────────────────────────────
+        // Summarize old messages to reduce token usage on long conversations
+        try {
+            const { compactMessages } = require('../../core/compaction');
+            const compactionResult = await compactMessages(messages, {
+                existingSummary: conversationSummary,
+                summaryModelId: 'tier:fast',
+            });
+            messages = compactionResult.messages;
+            if (compactionResult.newSummary) {
+                conversationSummary = compactionResult.newSummary;
+            }
+        } catch (err) {
+            console.warn('[DirectChat] Compaction failed, using full history:', err.message);
+        }
+
+        // ─── Tool calling loop via unified adapter.chat() ──────────
+        const tierSettings = tiers[resolvedTier] || {};
+        const isThinkingModel = modelId.includes('magistral');
+        const defaultMaxTokens = isThinkingModel ? 40960 : 8192;
+        const chatOptions = {
+            maxTokens: tierSettings.maxTokens || defaultMaxTokens,
+            temperature: tierSettings.temperature !== undefined ? tierSettings.temperature : 0.7,
+            reasoningEffort: tierSettings.reasoningEffort || undefined,
+            reasoningSummary: tierSettings.reasoningSummary || false,
+            budgetTokens: tierSettings.budgetTokens || undefined,
+            // Azure-specific
+            apiVersion: config.apiVersion || undefined,
+            // OpenAI Responses API chaining — skip re-uploading full history
+            previousResponseId: lastResponseId || undefined,
+        };
+
+        // Skip tool pre-check for all SDK-based providers
+        // All providers handle tool calls natively in streaming — no need for a separate non-streaming call
+        const skipToolPrecheck = adapter.shouldUseResponsesApi?.(modelId, chatOptions) || ['google', 'openai', 'claude', 'mistral'].includes(config.providerType);
+        let toolCallRounds = 0;
+        const MAX_TOOL_ROUNDS = 5;
+        const generatedImages = []; // Track images for persistence
+        const generatedAudio = []; // Track audio for persistence
+        const collectedSheetsResults = [];
+        const collectedSheetsDrafts = [];
+        const collectedSheetsReports = [];
+        const collectedEmailDrafts = [];
+        const collectedCalendarDrafts = [];
+        const collectedMapEmbeds = [];
+
+        while (toolCallRounds < MAX_TOOL_ROUNDS) {
+            if (directChatTools.length > 0 && !skipToolPrecheck) {
+                // Non-streaming tool check via adapter.chat()
+                let result;
+                try {
+                    result = await adapter.chat(apiKey, apiUrl, modelId, messages, {
+                        ...chatOptions,
+                        tools: directChatTools,
+                        toolChoice: 'auto',
+                    });
+                } catch (err) {
+                    console.error('[DirectChat] Tool check error:', err.message);
+                    send('error', { error: `API error: ${err.message}` });
+                    res.end();
+                    return;
+                }
+
+                if (result.toolCalls && result.toolCalls.length > 0) {
+                    // Add assistant message with tool calls to history
+                    messages.push({
+                        role: 'assistant',
+                        content: result.content || null,
+                        tool_calls: result.toolCalls,
+                    });
+                    toolCallRounds++;
+
+                    // Execute all tool calls in parallel
+                    const userAuth = { userId, session: req.session };
+                    const toolPromises = result.toolCalls.map(async (toolCall) => {
+                        const toolName = toolCall.function?.name || toolCall.name;
+                        let toolArgs = {};
+                        try { toolArgs = JSON.parse(toolCall.function?.arguments || '{}'); } catch (e) { }
+
+                        console.log(`[DirectChat] Executing tool: ${toolName}`, toolArgs);
+                        send('tool_start', { name: toolName, args: toolArgs });
+
+                        const tierToolParams = await configStore.getConfig('direct_chat_tier_tool_params') || {};
+                        const tierOverrides = tierToolParams[resolvedTier]?.[toolName] || null;
+
+                        let toolResult;
+                        try {
+                            // Web Search Guard — validate agent_search queries
+                            if (webSearchGuardEnabled && toolName === 'agent_search' && toolArgs?.query) {
+                                try {
+                                    const { validateWithLlamaGuard } = require('../../core/moderation');
+                                    await validateWithLlamaGuard([{ role: 'user', content: toolArgs.query }], true, moderationCategories);
+                                    console.log(`[DirectChat WebSearchGuard] Search query passed`);
+                                } catch (guardErr) {
+                                    console.log(`[DirectChat WebSearchGuard] Search query BLOCKED: ${guardErr.message}`);
+                                    send('tool_end', { name: toolName, result: '[Web search blocked — query violates content policy]' });
+                                    return { role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify({ error: 'Web search blocked — query flagged by safety guard. Please rephrase.' }) };
+                                }
+                            }
+                            toolResult = await dispatchTool(toolName, toolArgs, {
+                                userId,
+                                session: req.session,
+                                userAuth,
+                                fixedParams: tierOverrides,
+                                agentId: null,
+                                conversationId: convId,
+                                orgId: n8nOrgId,
+                                send,
+                                imageGenSettings,
+                                nanoBananaSettings,
+                                req,
+                                attachments,
+                                onImageGenerated: (data) => generatedImages.push(data),
+                                terminalCtx: {
+                                    agentId: `user-${userId}`,
+                                    containerKey: `direct-${convId}`,
+                                    timeout: 60000,
+                                    blockedCommands: [],
+                                    onEvent: (type, data) => { send(type, data); },
+                                    signal: undefined
+                                },
+                            });
+                        } catch (err) {
+                            console.error(`[DirectChat] Tool execution failed for ${toolName}:`, err);
+                            toolResult = { error: err.message };
+                        }
+
+                        send('tool_end', { name: toolName, result: toolResult });
+
+                        // Log tool usage
+                        try {
+                            const usageStore = require('../../stores/usageStore');
+                            await usageStore.logUsage({
+                                user_id: userId,
+                                agent_name: 'direct-chat',
+                                agent_type: 'chat',
+                                model: modelId,
+                                tool_name: toolName,
+                                source: 'direct_chat',
+                                organization_id: userOrgId || null,
+                                conversation_id: convId || null,
+                            });
+                        } catch (e) { /* ignore */ }
+
+                        // Emit email_draft SSE event for user approval
+                        if (toolResult?._action === 'email_draft') {
+                            send('email_draft', toolResult.draft);
+                            collectedEmailDrafts.push(toolResult.draft);
+                        }
+                        // Emit calendar_draft SSE event for user approval
+                        if (toolResult?._action === 'calendar_draft') {
+                            send('calendar_draft', toolResult.draft);
+                            collectedCalendarDrafts.push(toolResult.draft);
+                        }
+                        // Emit linkedin_draft SSE event for user approval
+                        if (toolResult?._action === 'linkedin_draft') {
+                            send('linkedin_draft', toolResult.draft);
+                        }
+                        // Emit whatsapp_draft SSE event for user approval
+                        if (toolResult?._action === 'whatsapp_draft') {
+                            send('whatsapp_draft', toolResult.draft);
+                        }
+                        // Emit sheets_result SSE event for visual card (read operations)
+                        if (toolResult?._action === 'sheets_result') {
+                            send('sheets_result', toolResult._sheetsData);
+                            collectedSheetsResults.push(toolResult._sheetsData);
+                        }
+                        // Emit sheets_draft SSE event for user approval (write operations)
+                        if (toolResult?._action === 'sheets_draft') {
+                            send('sheets_draft', toolResult._sheetsDraft);
+                            collectedSheetsDrafts.push({ ...toolResult._sheetsDraft, status: 'pending' });
+                        }
+                        // Emit sheets_report SSE event for report/dashboard view
+                        if (toolResult?._action === 'sheets_report') {
+                            send('sheets_report', toolResult._sheetsReport);
+                            collectedSheetsReports.push(toolResult._sheetsReport);
+                        }
+                        // Emit workspace_update SSE event
+                        if (toolResult?._action === 'workspace_update') {
+                            send('workspace_update', { content: toolResult.content });
+                        }
+                        // Emit kb_sources SSE event
+                        if (toolResult?._action === 'kb_sources' && toolResult._sources?.length > 0) {
+                            send('kb_sources', { sources: toolResult._sources });
+                        }
+                        // Track audio URLs for persistence
+                        if (toolResult?.audioUrl) {
+                            generatedAudio.push({ url: toolResult.audioUrl, source: toolName });
+                        }
+
+                        return {
+                            role: 'tool',
+                            tool_call_id: toolCall.id,
+                            content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult)
+                        };
+                    });
+
+                    const toolResults = await Promise.all(toolPromises);
+                    messages.push(...toolResults);
+                    continue;
+                }
+            }
+            break;
+        }
+
+        // ─── Stream final response via adapter.stream() ──────────
+        let fullContent = '';
+        let thinkingContent = '';
+        let streamToolCalls = []; // Tool calls received during streaming (Google SDK)
+        let streamUsage = null;
+        const streamStartTime = Date.now();
+
+        const streamOptions = {
+            ...chatOptions,
+            tools: (toolCallRounds > 0) ? undefined : (directChatTools.length > 0 ? directChatTools : undefined),
+            toolChoice: (toolCallRounds > 0) ? undefined : (directChatTools.length > 0 ? 'auto' : undefined),
+        };
+
+        const streamCallback = (type, data) => {
+            if (type === 'text') {
+                fullContent += data.text;
+                send('content', { text: data.text });
+            } else if (type === 'thinking') {
+                thinkingContent += data.text;
+                send('thinking', { text: data.text });
+            } else if (type === 'tool_use') {
+                // SDK adapter returns tool calls directly in the stream
+                streamToolCalls.push({
+                    id: data.id || `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                    type: 'function',
+                    function: {
+                        name: data.name,
+                        arguments: JSON.stringify(data.input || {}),
+                    },
+                    _thought_signature: data.thought_signature || undefined,
+                });
+            } else if (type === 'image') {
+                // Image from Google image models
+                generatedImages.push({ data: data.data, mimeType: data.mimeType });
+                send('image', { data: data.data, mimeType: data.mimeType });
+            } else if (type === 'error') {
+                send('error', data);
+            } else if (type === 'done') {
+                // Capture usage data from adapter
+                streamUsage = data;
+                // Capture OpenAI response ID for chaining
+                if (data?.responseId) {
+                    lastResponseId = data.responseId;
+                    console.log('[DirectChat] Captured responseId for chaining:', lastResponseId);
+                }
+            }
+        };
+
+        try {
+            await adapter.stream(apiKey, apiUrl, modelId, messages, streamOptions, streamCallback);
+        } catch (streamErr) {
+            // Retry without previousResponseId if the error is about missing tool output
+            // (stale response ID pointing to unresolved tool-call response)
+            if (streamErr?.error?.message?.includes('No tool output found') && streamOptions.previousResponseId) {
+                console.warn('[DirectChat] Stale previousResponseId detected, retrying without chaining');
+                lastResponseId = null;
+                streamOptions.previousResponseId = undefined;
+                fullContent = '';
+                thinkingContent = '';
+                streamToolCalls = [];
+                await adapter.stream(apiKey, apiUrl, modelId, messages, streamOptions, streamCallback);
+            } else {
+                throw streamErr;
+            }
+        }
+
+        // Log usage to monitoring store
+        try {
+            const usageStore = require('../../stores/usageStore');
+            await usageStore.logUsage({
+                user_id: userId,
+                agent_name: 'direct-chat',
+                agent_type: 'chat',
+                model: modelId,
+                prompt_tokens: streamUsage?.prompt_tokens || 0,
+                completion_tokens: streamUsage?.completion_tokens || 0,
+                total_tokens: streamUsage?.total_tokens || ((streamUsage?.prompt_tokens || 0) + (streamUsage?.completion_tokens || 0)),
+                source: 'direct_chat',
+                duration_ms: Date.now() - streamStartTime,
+                organization_id: userOrgId || null,
+                conversation_id: convId || null,
+            });
+        } catch (e) {
+            console.warn('[DirectChat] Failed to log usage:', e.message);
+        }
+
+        // Handle tool calls received during streaming (Google SDK path)
+        // Loop to support multi-round tool calling (e.g. list → get_summary)
+        const MAX_STREAM_TOOL_ROUNDS = 5;
+        let toolRound = 0;
+
+        while (streamToolCalls.length > 0 && toolRound < MAX_STREAM_TOOL_ROUNDS) {
+            toolRound++;
+            console.log(`[DirectChat] Streamed tool round ${toolRound}: ${streamToolCalls.map(t => t.function?.name).join(', ')}`);
+
+            messages.push({
+                role: 'assistant',
+                content: fullContent || null,
+                tool_calls: streamToolCalls,
+            });
+
+            const userAuth = { userId, session: req.session };
+            const toolPromises = streamToolCalls.map(async (toolCall) => {
+                const toolName = toolCall.function?.name;
+                let toolArgs = {};
+                try { toolArgs = JSON.parse(toolCall.function?.arguments || '{}'); } catch (e) { }
+
+                console.log(`[DirectChat] Executing streamed tool: ${toolName}`, toolArgs);
+                send('tool_start', { name: toolName, args: toolArgs });
+
+                const tierToolParams = await configStore.getConfig('direct_chat_tier_tool_params') || {};
+                const tierOverrides = tierToolParams[resolvedTier]?.[toolName] || null;
+
+                let toolResult;
+                try {
+                    // Web Search Guard — validate agent_search queries
+                    if (webSearchGuardEnabled && toolName === 'agent_search' && toolArgs?.query) {
+                        try {
+                            const { validateWithLlamaGuard } = require('../../core/moderation');
+                            await validateWithLlamaGuard([{ role: 'user', content: toolArgs.query }], true, moderationCategories);
+                            console.log(`[DirectChat WebSearchGuard] Streamed search query passed`);
+                        } catch (guardErr) {
+                            console.log(`[DirectChat WebSearchGuard] Streamed search query BLOCKED: ${guardErr.message}`);
+                            send('tool_end', { name: toolName, result: '[Web search blocked — query violates content policy]' });
+                            return { role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify({ error: 'Web search blocked — query flagged by safety guard. Please rephrase.' }) };
+                        }
+                    }
+                    toolResult = await dispatchTool(toolName, toolArgs, {
+                        userId,
+                        session: req.session,
+                        userAuth,
+                        fixedParams: tierOverrides,
+                        agentId: null,
+                        conversationId: convId,
+                        orgId: n8nOrgId,
+                        send,
+                        imageGenSettings,
+                        nanoBananaSettings,
+                        req,
+                        attachments,
+                        onImageGenerated: (data) => generatedImages.push(data),
+                        terminalCtx: {
+                            agentId: `user-${userId}`,
+                            containerKey: `direct-${convId}`,
+                            timeout: 60000,
+                            blockedCommands: [],
+                            onEvent: (type, data) => { send(type, data); },
+                            signal: undefined
+                        },
+                    });
+                } catch (err) {
+                    console.error(`[DirectChat] Streamed tool execution failed for ${toolName}:`, err);
+                    toolResult = { error: err.message };
+                }
+
+                send('tool_end', { name: toolName, result: toolResult });
+
+                // Emit email_draft SSE event for user approval
+                if (toolResult?._action === 'email_draft') {
+                    send('email_draft', toolResult.draft);
+                    collectedEmailDrafts.push(toolResult.draft);
+                }
+                // Emit calendar_draft SSE event for user approval
+                if (toolResult?._action === 'calendar_draft') {
+                    send('calendar_draft', toolResult.draft);
+                    collectedCalendarDrafts.push(toolResult.draft);
+                }
+                // Emit linkedin_draft SSE event for user approval
+                if (toolResult?._action === 'linkedin_draft') {
+                    send('linkedin_draft', toolResult.draft);
+                }
+                // Emit whatsapp_draft SSE event for user approval
+                if (toolResult?._action === 'whatsapp_draft') {
+                    send('whatsapp_draft', toolResult.draft);
+                }
+                // Emit sheets_result SSE event for visual card (read operations)
+                if (toolResult?._action === 'sheets_result') {
+                    send('sheets_result', toolResult._sheetsData);
+                    collectedSheetsResults.push(toolResult._sheetsData);
+                }
+                // Emit sheets_draft SSE event for user approval (write operations)
+                if (toolResult?._action === 'sheets_draft') {
+                    send('sheets_draft', toolResult._sheetsDraft);
+                    collectedSheetsDrafts.push({ ...toolResult._sheetsDraft, status: 'pending' });
+                }
+                // Emit sheets_report SSE event for report/dashboard view
+                if (toolResult?._action === 'sheets_report') {
+                    send('sheets_report', toolResult._sheetsReport);
+                    collectedSheetsReports.push(toolResult._sheetsReport);
+                }
+                // Emit workspace_update SSE event
+                if (toolResult?._action === 'workspace_update') {
+                    send('workspace_update', { content: toolResult.content });
+                }
+                // Emit kb_sources SSE event
+                if (toolResult?._action === 'kb_sources' && toolResult._sources?.length > 0) {
+                    send('kb_sources', { sources: toolResult._sources });
+                }
+                // Track audio URLs for persistence
+                if (toolResult?.audioUrl) {
+                    generatedAudio.push({ url: toolResult.audioUrl, source: toolName });
+                }
+
+                // Log tool usage
+                try {
+                    const usageStore = require('../../stores/usageStore');
+                    await usageStore.logUsage({
+                        user_id: userId,
+                        agent_name: 'direct-chat',
+                        agent_type: 'chat',
+                        model: modelId,
+                        tool_name: toolName,
+                        source: 'direct_chat',
+                        organization_id: userOrgId || null,
+                        conversation_id: convId || null,
+                    });
+                } catch (e) { /* ignore */ }
+                // Ensure toolResult is an object before stringifying (avoid double-encoding strings)
+                let resultObj = toolResult;
+                if (typeof toolResult === 'string') {
+                    try { resultObj = JSON.parse(toolResult); } catch (e) { resultObj = { result: toolResult }; }
+                }
+                return {
+                    role: 'tool',
+                    tool_call_id: toolCall.id,
+                    content: JSON.stringify(resultObj)
+                };
+            });
+
+            const toolResults = await Promise.all(toolPromises);
+            messages.push(...toolResults);
+
+            // Stream the follow-up response after tool execution (with tools for multi-round)
+            fullContent = '';
+            streamToolCalls = [];
+            await adapter.stream(apiKey, apiUrl, modelId, messages, {
+                ...chatOptions,
+                previousResponseId: undefined, // Don't chain — we need to send tool results in full
+                tools: directChatTools.length > 0 ? directChatTools : undefined,
+            }, (type, data) => {
+                if (type === 'text') {
+                    fullContent += data.text;
+                    send('content', { text: data.text });
+                } else if (type === 'thinking') {
+                    thinkingContent += data.text;
+                    send('thinking', { text: data.text });
+                } else if (type === 'tool_call') {
+                    streamToolCalls.push(data);
+                } else if (type === 'tool_use') {
+                    // Claude SDK returns tool calls as tool_use events
+                    streamToolCalls.push({
+                        id: data.id || `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                        type: 'function',
+                        function: {
+                            name: data.name,
+                            arguments: JSON.stringify(data.input || {}),
+                        },
+                        _thought_signature: data.thought_signature || undefined,
+                    });
+                } else if (type === 'error') {
+                    send('error', data);
+                } else if (type === 'done') {
+                    // Capture the follow-up response ID so chaining uses this
+                    // (not the previous tool-call response)
+                    if (data?.responseId) {
+                        lastResponseId = data.responseId;
+                        console.log('[DirectChat] Updated lastResponseId after tool follow-up:', lastResponseId);
+                    }
+                }
+            });
+        }
+
+        // If LLM returned an empty response after tool calls, send a minimal confirmation
+        if (!fullContent.trim() && toolCallRounds > 0) {
+            fullContent = 'Done ✓';
+            send('content', { text: fullContent });
+        }
+
+        // Check agent output against regex rules
+        if (regexConfig?.enabled && regexConfig?.scope?.agentOutput && fullContent) {
+            const matches = checkRegexPatterns(fullContent, regexConfig.rulesWithNames);
+            if (matches.length > 0) {
+                const ruleNames = matches.map(m => m.ruleName).join(', ');
+                console.log(`[DirectChat RegexGuard] Agent output violated rules: ${ruleNames}`);
+                if (regexConfig.action === 'redact') {
+                    let redacted = fullContent;
+                    for (const rule of regexConfig.rulesWithNames) {
+                        try {
+                            const regex = new RegExp(rule.pattern, 'gi');
+                            redacted = redacted.replace(regex, `[REDACTED: ${rule.name}]`);
+                        } catch (e) { /* skip */ }
+                    }
+                    send('content_replace', { text: redacted });
+                    fullContent = redacted;
+                } else {
+                    send('guardrail_violation', { rules: ruleNames, autoDeleteSeconds: 5, source: 'agent_output' });
+                }
+            }
+        }
+
+        // Check agent output with AI moderation (only if scope.agentOutput)
+        if (moderationEnabled && moderationScope.agentOutput && fullContent && !moderationViolation) {
+            try {
+                const { validateWithLlamaGuard } = require('../../core/moderation');
+                const outputMessages = [{ role: 'assistant', content: fullContent }];
+                await validateWithLlamaGuard(outputMessages, true, moderationCategories);
+                console.log(`[DirectChat] AI moderation passed (agent output)`);
+            } catch (guardError) {
+                if (guardError.violationCodes) {
+                    let violationLabels = guardError.violationCodes;
+                    try {
+                        const parsed = JSON.parse(guardError.outcome);
+                        violationLabels = parsed.map(f => f.label || f.category);
+                    } catch (e) { /* use codes as-is */ }
+                    console.log(`[DirectChat] Agent output moderation violation: ${violationLabels.join(', ')}`);
+                    send('content_replace', { text: `⚠️ This response was blocked by content moderation (${violationLabels.join(', ')}). The AI's response contained content that violates organization safety policies.` });
+                    fullContent = '[Response blocked by content moderation]';
+                }
+            }
+        }
+
+        // ─── Conversation persistence ────────────────────────────
+        if (!convId) {
+            const conv = await agentStore.createDirectConversation(userId, modelTier || 'fast');
+            convId = conv.id;
+            send('conversation_created', { conversationId: convId });
+            // Assign to project if provided
+            if (projectId) {
+                try {
+                    const projectStore = require('../../stores/projectStore');
+                    await projectStore.assignConversation(convId, projectId, 'direct_conversations');
+                } catch (e) {
+                    console.warn('[DirectChat] Failed to assign conversation to project:', e.message);
+                }
+            }
+        }
+
+        const conv = await agentStore.getDirectConversation(convId, userId);
+        if (conv) {
+            const savedMessages = conv.messages || [];
+            savedMessages.push({ role: 'user', content: moderationViolation ? '[Message removed - policy violation]' : message, timestamp: new Date().toISOString() });
+            const assistantSave = { role: 'assistant', content: fullContent, timestamp: new Date().toISOString() };
+            if (thinkingContent) assistantSave.thinking = thinkingContent;
+            if (generatedImages.length > 0) assistantSave.images = generatedImages;
+            if (generatedAudio.length > 0) assistantSave.audioFiles = generatedAudio;
+            if (collectedSheetsResults.length > 0) assistantSave.sheetsResults = collectedSheetsResults;
+            if (collectedSheetsDrafts.length > 0) assistantSave.sheetsDrafts = collectedSheetsDrafts;
+            if (collectedSheetsReports.length > 0) assistantSave.sheetsReports = collectedSheetsReports;
+            if (collectedEmailDrafts.length > 0) assistantSave.emailDrafts = collectedEmailDrafts;
+            if (collectedCalendarDrafts.length > 0) assistantSave.calendarDrafts = collectedCalendarDrafts;
+            if (collectedMapEmbeds.length > 0) assistantSave.mapEmbeds = collectedMapEmbeds;
+            savedMessages.push(assistantSave);
+
+            // Save with metadata for OpenAI response chaining + compaction
+            const updateMeta = {};
+            if (lastResponseId) {
+                updateMeta.lastResponseId = lastResponseId;
+                updateMeta.lastResponseModel = modelId;
+            }
+            if (conversationSummary) {
+                updateMeta.conversationSummary = conversationSummary;
+            }
+            await agentStore.updateDirectConversation(convId, savedMessages, userId, updateMeta);
+
+            // Auto-extract memories from conversation (async, fire-and-forget)
+            if (!moderationViolation && message && fullContent) {
+                try {
+                    const { extractMemories } = require('../../core/memoryExtractor');
+                    extractMemories(userId, message, fullContent, null, extractMemoriesEnabled ? projectId : null).catch(e =>
+                        console.warn('[DirectChat] Memory extraction error:', e.message)
+                    );
+                } catch (e) { /* ignore */ }
+            }
+
+            // Generate title for new conversations (skip if moderation violation — don't send unsafe content to title LLM)
+            if (savedMessages.length <= 2 && !moderationViolation) {
+                try {
+                    const llmClient = require('../../core/llmClient');
+                    const titleAgent = await agentStore.getTitleGeneratorAgent();
+                    let titleModel = titleAgent?.model || modelId;
+                    // Resolve tier: prefix (e.g. 'tier:fast' → actual model ID)
+                    if (titleModel.startsWith('tier:')) {
+                        const tierName = titleModel.substring(5);
+                        let titleTiers = await configStore.getConfig('chat_model_tiers') || {};
+                        // EU mode override for title generation
+                        if (userOrgForTiers) {
+                            const titleShield = await configStore.getConfig(`org_privacy_shield_${userOrgForTiers}`);
+                            if (titleShield?.enabled && titleShield?.euModeEnabled) {
+                                const euTitleTiers = await configStore.getConfig('chat_model_tiers_eu') || {};
+                                const mergedTitleTiers = { ...titleTiers };
+                                for (const [tn, euT] of Object.entries(euTitleTiers)) {
+                                    if (euT?.modelId) mergedTitleTiers[tn] = { ...mergedTitleTiers[tn], ...euT };
+                                }
+                                titleTiers = mergedTitleTiers;
+                            }
+                        }
+                        titleModel = titleTiers[tierName]?.modelId || modelId;
+                    } else {
+                        // Non-tier model — resolve display names and validate
+                        const { resolveModelId } = require('../../core/aiAgent');
+                        titleModel = resolveModelId(titleModel) || titleModel;
+                        // If it still looks like a display label (has uppercase), use the chat model instead
+                        if (!/^[a-z0-9._\/-]+$/.test(titleModel)) {
+                            titleModel = modelId;
+                        }
+                    }
+                    const title = await llmClient.generateTitle(
+                        titleModel,
+                        message,
+                        titleAgent?.system_prompt
+                    );
+                    await agentStore.updateDirectConversationTitle(convId, title, userId);
+                    send('title', { title, conversationId: convId });
+                } catch (e) {
+                    console.error('[DirectChat] Title generation failed:', e.message);
+                }
+            } else if (savedMessages.length <= 2 && moderationViolation) {
+                // Moderation violation — set a safe generic title instead
+                const safeTitle = 'New Chat';
+                await agentStore.updateDirectConversationTitle(convId, safeTitle, userId);
+                send('title', { title: safeTitle, conversationId: convId });
+            }
+        }
+
+        // ─── Memory extraction (background, non-blocking) ──────────
+        try {
+            const memoryExtractor = require('../../agents/memory/extractor');
+            memoryExtractor.extractFromConversation(userId, null, messages, convId)
+                .then(extracted => {
+                    if (extracted.length > 0) {
+                        console.log(`[DirectChat] Extracted ${extracted.length} memories`);
+                    }
+                })
+                .catch(err => console.error('[DirectChat] Memory extraction failed:', err.message));
+        } catch (e) { /* extractor load failed */ }
+
+        send('done', { conversationId: convId });
+    } catch (error) {
+        console.error('[DirectChat] Stream error:', error);
+        send('error', { error: error.message });
+    } finally {
+        res.end();
+    }
+});
+
+// ─── Image Generation (Google Nano Banana 2) ──────────────────────
+
+router.post('/chat/generate-image', requireAuth, async (req, res) => {
+    const { prompt, aspectRatio, conversationId } = req.body;
+    const userId = req.session.user.id;
+
+    if (!prompt) {
+        return res.status(400).json({ error: 'Prompt is required' });
+    }
+
+    try {
+        const googleApiKey = await configStore.getSecret('google_api_key');
+        if (!googleApiKey) {
+            return res.status(400).json({ error: 'Google API key not configured. Add it in Admin → AI Config → API Keys.' });
+        }
+
+        console.log(`[ImageGen] Generating image for user ${userId}: "${prompt.substring(0, 80)}"`);
+
+        const result = await googleAdapter.generateImage(googleApiKey, prompt, {
+            aspectRatio: aspectRatio || '1:1',
+        });
+
+        if (!result.imageBase64) {
+            return res.status(500).json({ error: 'No image was generated. Try a different prompt.' });
+        }
+
+        // Log usage
+        try {
+            const usageStore = require('../../stores/usageStore');
+            await usageStore.logUsage({
+                agent_id: null,
+                agent_name: 'direct-chat',
+                model: 'gemini-3.1-flash-image-preview',
+                prompt_tokens: prompt.length,
+                completion_tokens: 0,
+                total_tokens: prompt.length,
+                source: 'image_generation',
+                conversation_id: conversationId || null,
+            });
+        } catch (e) {
+            console.warn('[ImageGen] Failed to log usage:', e.message);
+        }
+
+        res.json({
+            imageBase64: result.imageBase64,
+            mimeType: result.mimeType,
+            text: result.text,
+            conversationId: conversationId || null,
+        });
+    } catch (error) {
+        console.error('[ImageGen] Error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ─── Conversation CRUD ───────────────────────────────────────────
+
+router.get('/direct/conversations', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const conversations = await agentStore.listDirectConversations(userId);
+        res.json(conversations);
+    } catch (e) {
+        console.error('Failed to list direct conversations:', e);
+        res.status(500).json({ error: 'Failed to list conversations' });
+    }
+});
+
+router.get('/direct/conversations/:id', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const conv = await agentStore.getDirectConversation(req.params.id, userId);
+        if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+        res.json(conv);
+    } catch (e) {
+        console.error('Failed to get direct conversation:', e);
+        res.status(500).json({ error: 'Failed to get conversation' });
+    }
+});
+
+router.delete('/direct/conversations/:id', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const success = await agentStore.deleteDirectConversation(req.params.id, userId);
+        if (!success) return res.status(404).json({ error: 'Conversation not found' });
+        res.json({ success: true });
+    } catch (e) {
+        console.error('Failed to delete direct conversation:', e);
+        res.status(500).json({ error: 'Failed to delete conversation' });
+    }
+});
+
+// Get workspace content for a direct conversation
+router.get('/direct/conversations/:id/workspace', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const conv = await agentStore.getDirectConversation(req.params.id, userId);
+        if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+        res.json({ content: conv.workspace_content || '' });
+    } catch (e) {
+        console.error('Failed to get direct conversation workspace:', e);
+        res.status(500).json({ error: 'Failed to get workspace' });
+    }
+});
+
+// Update workspace content for a direct conversation
+router.put('/direct/conversations/:id/workspace', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const conv = await agentStore.getDirectConversation(req.params.id, userId);
+        if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+        const { content } = req.body;
+        await agentStore.updateDirectConversationWorkspace(req.params.id, content || '');
+        res.json({ success: true });
+    } catch (e) {
+        console.error('Failed to update direct conversation workspace:', e);
+        res.status(500).json({ error: 'Failed to update workspace' });
+    }
+});
+
+module.exports = router;

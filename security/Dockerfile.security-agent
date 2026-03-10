@@ -1,0 +1,26 @@
+FROM alpine:3.20
+
+# Install utilities + pentest tools in one layer
+RUN apk add --no-cache \
+    bash curl wget git jq nmap bind-tools whois \
+    python3 py3-pip unzip ca-certificates openssl \
+    nmap-scripts
+
+# Install Python security tools
+RUN pip3 install --no-cache-dir --break-system-packages \
+    requests
+
+# Install Nuclei from pre-built release (~5s)
+ARG NUCLEI_VERSION=3.3.7
+RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
+    wget -q "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_${ARCH}.zip" \
+    -O /tmp/nuclei.zip && \
+    unzip -q /tmp/nuclei.zip -d /usr/local/bin/ && \
+    chmod +x /usr/local/bin/nuclei && \
+    rm /tmp/nuclei.zip
+
+# Download Nuclei templates
+RUN nuclei -update-templates -silent || true
+
+WORKDIR /workspace
+CMD ["sleep", "infinity"]

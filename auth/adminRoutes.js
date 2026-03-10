@@ -1,0 +1,835 @@
+/**
+ * Admin Routes — User, Organization, Group, Role CRUD + App Passwords
+ * 
+ * All routes require authentication. Most require admin access.
+ */
+
+const express = require('express');
+const bcrypt = require('bcryptjs');
+const fs = require('fs');
+const path = require('path');
+const multer = require('multer');
+const router = express.Router();
+
+const userStore = require('../stores/userStore');
+const { loadConfig, saveConfig, requireAuth, requireAdmin, SYSTEM_PERMISSIONS } = require('./permissions');
+const { rewrapUserDEKCompat, adminResetUser, getOrCreateUserDEKCompat } = require('./encryption');
+const { checkResourceLimits } = require('../core/limits');
+
+/**
+ * Check if the current user is an org admin for a given organization.
+ * Super admins always pass. Org admins must have orgRole='org_admin' and belong to the target org.
+ */
+async function isOrgAdminForOrg(req, orgId) {
+    // Super admin — always allowed
+    if (req.session?.isAdmin || req.session?.user?.role === 'admin') return true;
+
+    const userId = req.session?.user?.id;
+    if (!userId) return false;
+
+    const user = await userStore.getUser(userId);
+    if (!user) return false;
+
+    // Must be org_admin role
+    if (user.orgRole !== 'org_admin') return false;
+
+    // Must belong to the target org
+    if (user.organizationId === orgId) return true;
+
+    // Check group-based membership as fallback
+    let groupIds = [];
+    if (Array.isArray(user.groups)) groupIds = user.groups;
+    else { try { groupIds = JSON.parse(user.groups || '[]'); } catch (_) { } }
+
+    const allGroups = await userStore.getAllGroups();
+    return groupIds.some(gid => {
+        const g = allGroups.find(gr => gr.id === gid);
+        return g?.organizationId === orgId;
+    });
+}
+
+/**
+ * Middleware factory: require org admin access for the org specified by req.params[paramName].
+ * Falls back to requireAuth first, then checks org admin status.
+ */
+function requireOrgAdmin(paramName = 'id') {
+    return async (req, res, next) => {
+        if (!req.session?.user) return res.status(401).json({ error: 'Unauthorized' });
+        const orgId = req.params[paramName];
+        if (!orgId) return res.status(400).json({ error: 'Organization ID required' });
+        if (!await isOrgAdminForOrg(req, orgId)) {
+            return res.status(403).json({ error: 'Organization admin access required' });
+        }
+        next();
+    };
+}
+
+/**
+ * Middleware: require org admin access for the user specified by :id param.
+ * Looks up the target user's org and checks if the requestor is an org admin for it.
+ * For POST (create user), uses req.body.organizationId since no user exists yet.
+ * Also blocks org admins from setting role='admin' (super admin escalation).
+ */
+async function requireOrgAdminForUser(req, res, next) {
+    if (!req.session?.user) return res.status(401).json({ error: 'Unauthorized' });
+
+    // Super admins pass through
+    const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
+    if (isSuperAdmin) return next();
+
+    // Block org admins from setting platform role to 'admin'
+    if (req.body?.role === 'admin') {
+        return res.status(403).json({ error: 'Cannot assign super admin role' });
+    }
+
+    // Determine target org: from existing user (PUT/DELETE) or from body (POST)
+    let targetOrgId = null;
+    const targetUserId = req.params.id;
+    if (targetUserId) {
+        const targetUser = await userStore.getUser(targetUserId);
+        if (!targetUser) return res.status(404).json({ error: 'User not found' });
+        targetOrgId = targetUser.organizationId;
+    } else {
+        // POST /users — use the org from the body
+        targetOrgId = req.body?.organizationId;
+    }
+
+    if (!targetOrgId) {
+        return res.status(403).json({ error: 'Cannot manage users without an organisation' });
+    }
+
+    if (!await isOrgAdminForOrg(req, targetOrgId)) {
+        return res.status(403).json({ error: 'You can only manage users in your organisation' });
+    }
+    next();
+}
+
+// === User Management API (Admin Only) ===
+
+// Get all users
+router.get('/users', requireAuth, async (req, res) => {
+    const users = await userStore.getAllUsers();
+    const config = await loadConfig();
+    const superAdmin = {
+        id: 'admin',
+        username: config.admin.username,
+        displayName: 'Administrator (System)',
+        role: 'admin',
+        isSystem: true
+    };
+
+    let allUsers = [superAdmin, ...users.filter(u => u.id !== 'admin')];
+
+    // Org-scoped filtering
+    const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
+    if (!isSuperAdmin) {
+        const userId = req.session.user?.id;
+        const currentUser = await userStore.getUser(userId);
+        if (currentUser) {
+            const myOrgIds = new Set();
+            // Direct org assignment
+            if (currentUser.organizationId) myOrgIds.add(currentUser.organizationId);
+            // Group-based org detection
+            let myGroups = [];
+            try { myGroups = Array.isArray(currentUser.groups) ? currentUser.groups : JSON.parse(currentUser.groups || '[]'); } catch (_) { }
+
+            const allGroups = await userStore.getAllGroups();
+            for (const gid of myGroups) {
+                const group = allGroups.find(g => g.id === gid);
+                if (group?.organizationId) myOrgIds.add(group.organizationId);
+            }
+
+            const orgGroupIds = new Set();
+            for (const group of allGroups) {
+                if (group.organizationId && myOrgIds.has(group.organizationId)) {
+                    orgGroupIds.add(group.id);
+                }
+            }
+
+            allUsers = allUsers.filter(u => {
+                if (u.isSystem) return false;
+                // Include users directly assigned to the same org
+                if (u.organizationId && myOrgIds.has(u.organizationId)) return true;
+                // Include users in org-scoped groups
+                let uGroups = [];
+                try { uGroups = Array.isArray(u.groups) ? u.groups : JSON.parse(u.groups || '[]'); } catch (_) { }
+                return uGroups.some(gid => orgGroupIds.has(gid));
+            });
+        }
+    }
+
+    res.json(allUsers);
+});
+
+// Create user
+router.post('/users', requireOrgAdminForUser, async (req, res) => {
+    const { username, displayName, firstName, lastName, email, phone, avatar, avatarType, password, role, groups, orgRole, organizationId } = req.body;
+
+    if (!username || !password) {
+        return res.status(400).json({ error: 'Username and password required' });
+    }
+
+    if (username === 'admin') {
+        return res.status(400).json({ error: 'Cannot create user "admin"' });
+    }
+
+    // Check user count limit for target org
+    const targetOrgId = organizationId || null;
+    if (targetOrgId) {
+        const allUsers = await userStore.getAllUsers();
+        const orgUserCount = allUsers.filter(u => u.organizationId === targetOrgId).length;
+        const limitErr = checkResourceLimits(targetOrgId, 'users', orgUserCount);
+        if (limitErr) {
+            return res.status(403).json({ error: limitErr });
+        }
+    }
+
+    // Merge default groups from all organizations
+    let finalGroups = groups || [];
+    try {
+        const orgs = await userStore.getAllOrganizations();
+        for (const org of orgs) {
+            if (org.defaultGroups && Array.isArray(org.defaultGroups)) {
+                for (const gid of org.defaultGroups) {
+                    if (!finalGroups.includes(gid)) {
+                        finalGroups.push(gid);
+                    }
+                }
+            }
+        }
+    } catch (e) {
+        console.warn('[Auth] Failed to merge default groups:', e.message);
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const newUser = {
+        id: username,
+        username,
+        displayName: displayName || username,
+        firstName: firstName || null,
+        lastName: lastName || null,
+        email: email || null,
+        phone: phone || null,
+        avatar: avatar || null,
+        avatarType: avatarType || null,
+        passwordHash,
+        role: role || 'user',
+        groups: finalGroups,
+        orgRole: orgRole || '',
+        organizationId: organizationId || ''
+    };
+
+    if (await userStore.createUser(newUser)) {
+        res.json({ success: true, user: { id: newUser.id, username, displayName, role } });
+    } else {
+        res.status(400).json({ error: 'User already exists' });
+    }
+});
+
+// Update user
+router.put('/users/:id', requireOrgAdminForUser, async (req, res) => {
+    const { id } = req.params;
+    const { role, groups, displayName, firstName, lastName, email, phone, avatar, avatarType, password, oldPassword, orgRole, organizationId, status } = req.body;
+
+    if (id === 'admin') {
+        if (role && role !== 'admin') {
+            return res.status(400).json({ error: 'Cannot downgrade system admin' });
+        }
+    }
+
+    const updates = { role, groups, displayName, firstName, lastName, email, phone, avatar, avatarType, orgRole, organizationId, status };
+    if (password) {
+        updates.passwordHash = await bcrypt.hash(password, 10);
+
+        if (oldPassword) {
+            // User-initiated password change — rewrap DEK
+            try {
+                const result = await rewrapUserDEKCompat(id, oldPassword, password);
+                if (!result.success) {
+                    return res.status(400).json({ error: 'Failed to verify old password' });
+                }
+            } catch (err) {
+                console.error('[Auth] DEK rewrap failed:', err.message);
+                return res.status(400).json({ error: 'Failed to verify old password' });
+            }
+        } else {
+            // Admin-initiated password reset — destructive (zero-knowledge)
+            await adminResetUser(id);
+            console.warn(`[Auth] Admin reset user ${id} — encrypted data requires recovery key`);
+        }
+    }
+
+    if (await userStore.updateUser(id, updates)) {
+        res.json({ success: true });
+    } else {
+        res.status(404).json({ error: 'User not found' });
+    }
+});
+
+// Delete user
+router.delete('/users/:id', requireOrgAdminForUser, async (req, res) => {
+    const { id } = req.params;
+    if (id === 'admin') {
+        return res.status(400).json({ error: 'Cannot delete system admin' });
+    }
+
+    if (await userStore.deleteUser(id)) {
+        res.json({ success: true });
+    } else {
+        res.status(404).json({ error: 'User not found' });
+    }
+});
+
+// Upload user avatar image
+const userAvatarUpload = multer({
+    storage: multer.diskStorage({
+        destination: (req, file, cb) => {
+            const uploadDir = path.join(__dirname, '..', 'data', 'uploads');
+            if (!fs.existsSync(uploadDir)) {
+                fs.mkdirSync(uploadDir, { recursive: true });
+            }
+            cb(null, uploadDir);
+        },
+        filename: (req, file, cb) => {
+            const ext = path.extname(file.originalname);
+            cb(null, `user-avatar-${req.params.id}-${Date.now()}${ext}`);
+        }
+    }),
+    limits: { fileSize: 2 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+        if (/^image\/(png|jpeg|jpg|svg\+xml|webp|gif)$/.test(file.mimetype)) {
+            cb(null, true);
+        } else {
+            cb(new Error('Only PNG, JPG, SVG, WEBP, GIF images are allowed'));
+        }
+    }
+});
+
+router.post('/users/:id/avatar', requireOrgAdminForUser, userAvatarUpload.single('avatar'), async (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const avatarPath = `/uploads/${req.file.filename}`;
+    await userStore.updateUser(req.params.id, { avatar: avatarPath, avatarType: 'image' });
+    res.json({ success: true, avatar: avatarPath, avatarType: 'image' });
+});
+
+router.delete('/users/:id/avatar', requireOrgAdminForUser, async (req, res) => {
+    const user = await userStore.getUser(req.params.id);
+    if (user && user.avatar && user.avatarType === 'image') {
+        const filePath = path.join(__dirname, '..', 'data', user.avatar);
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    }
+    // Use PostgreSQL to set NULL
+    const { run } = require('../db');
+    await run('UPDATE users SET avatar = NULL, "avatarType" = NULL WHERE id = $1', [req.params.id]);
+    res.json({ success: true });
+});
+
+// Change own password (user-facing, requires old password for DEK re-wrap)
+router.post('/change-password', requireAuth, async (req, res) => {
+    const { oldPassword, newPassword } = req.body;
+    const userId = req.session.user?.id;
+
+    if (!userId) {
+        return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    if (!oldPassword || !newPassword) {
+        return res.status(400).json({ error: 'Old and new password required' });
+    }
+
+    if (newPassword.length < 4) {
+        return res.status(400).json({ error: 'Password must be at least 4 characters' });
+    }
+
+    const user = await userStore.getUser(userId);
+    if (!user || !user.passwordHash) {
+        return res.status(404).json({ error: 'User not found' });
+    }
+
+    const isValid = await bcrypt.compare(oldPassword, user.passwordHash);
+    if (!isValid) {
+        return res.status(401).json({ error: 'Current password is incorrect' });
+    }
+
+    try {
+        const result = await rewrapUserDEKCompat(userId, oldPassword, newPassword);
+        if (!result.success) {
+            return res.status(500).json({ error: 'Failed to update encryption keys' });
+        }
+
+        const passwordHash = await bcrypt.hash(newPassword, 10);
+        await userStore.updateUser(userId, { passwordHash });
+
+        // Update session encryption key
+        if (result.encryptionKey) {
+            req.session.encryptionKey = result.encryptionKey;
+        }
+
+        req.session.save((err) => {
+            if (err) {
+                console.error('Session save error:', err);
+            }
+            res.json({ success: true, message: 'Password changed successfully' });
+        });
+    } catch (err) {
+        console.error('[Auth] Password change DEK operation failed:', err.message);
+        return res.status(500).json({ error: 'Failed to update encryption keys' });
+    }
+});
+
+
+// === Organizations Management API (Admin Only) ===
+
+router.get('/organizations', requireAuth, async (req, res) => {
+    let orgs = await userStore.getAllOrganizations();
+
+    const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
+    if (!isSuperAdmin) {
+        const userId = req.session.user?.id;
+        const currentUser = await userStore.getUser(userId);
+        if (currentUser) {
+            const myOrgIds = new Set();
+            // Direct org assignment
+            if (currentUser.organizationId) myOrgIds.add(currentUser.organizationId);
+            // Group-based org detection
+            let myGroups = [];
+            try { myGroups = Array.isArray(currentUser.groups) ? currentUser.groups : JSON.parse(currentUser.groups || '[]'); } catch (_) { }
+            const allGroups = await userStore.getAllGroups();
+            for (const gid of myGroups) {
+                const group = allGroups.find(g => g.id === gid);
+                if (group?.organizationId) myOrgIds.add(group.organizationId);
+            }
+            orgs = orgs.filter(o => myOrgIds.has(o.id));
+        }
+    }
+
+    res.json(orgs);
+});
+
+router.post('/organizations', requireAdmin, async (req, res) => {
+    const { name, description, tagline, address, email, phone, website, kvk, vat, logo, footerText, defaultGroups, allowSignup } = req.body;
+    if (!name) return res.status(400).json({ error: 'Organization name required' });
+
+    const id = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+
+    // Apply default integrations from global config
+    const configStore = require('../stores/configStore');
+    const defaultIntegrations = await configStore.getConfig('default_org_integrations') || null;
+
+    const newOrg = { id, name, description: description || '', tagline, address, email, phone, website, kvk, vat, logo, footerText, defaultGroups: defaultGroups || [], allowSignup: !!allowSignup, enabledIntegrations: defaultIntegrations };
+
+    if (await userStore.createOrganization(newOrg)) {
+        res.json({ success: true, organization: newOrg });
+    } else {
+        res.status(400).json({ error: 'Organization already exists' });
+    }
+});
+
+router.put('/organizations/:id', requireOrgAdmin('id'), async (req, res) => {
+    const { id } = req.params;
+    const { name, description, tagline, address, email, phone, website, kvk, vat, logo, footerText, defaultGroups, allowSignup, authMethod, enabledIntegrations, autoApproveSSO } = req.body;
+
+    // authMethod can only be set once — if already set, ignore any change
+    const existing = await userStore.getOrganization(id);
+    const finalAuthMethod = (existing && existing.authMethod) ? undefined : authMethod;
+
+    // enabledIntegrations: only super admins can change this
+    const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
+    const finalIntegrations = isSuperAdmin && enabledIntegrations !== undefined ? enabledIntegrations : undefined;
+
+    if (await userStore.updateOrganization(id, { name, description, tagline, address, email, phone, website, kvk, vat, logo, footerText, defaultGroups, allowSignup, authMethod: finalAuthMethod, enabledIntegrations: finalIntegrations, autoApproveSSO })) {
+        res.json({ success: true });
+    } else {
+        res.status(404).json({ error: 'Organization not found' });
+    }
+});
+
+router.delete('/organizations/:id', requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    if (await userStore.deleteOrganization(id)) {
+        res.json({ success: true });
+    } else {
+        res.status(404).json({ error: 'Organization not found' });
+    }
+});
+
+// Upload organization logo
+const orgLogoUpload = multer({
+    storage: multer.diskStorage({
+        destination: (req, file, cb) => {
+            const uploadDir = path.join(__dirname, '..', 'data', 'uploads');
+            if (!fs.existsSync(uploadDir)) {
+                fs.mkdirSync(uploadDir, { recursive: true });
+            }
+            cb(null, uploadDir);
+        },
+        filename: (req, file, cb) => {
+            const ext = path.extname(file.originalname);
+            cb(null, `org-logo-${req.params.id}-${Date.now()}${ext}`);
+        }
+    }),
+    limits: { fileSize: 2 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+        if (/^image\/(png|jpeg|jpg|svg\+xml|webp)$/.test(file.mimetype)) {
+            cb(null, true);
+        } else {
+            cb(new Error('Only PNG, JPG, SVG, WEBP images are allowed'));
+        }
+    }
+});
+
+router.post('/organizations/:id/logo', requireOrgAdmin('id'), orgLogoUpload.single('logo'), async (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const logoPath = `/uploads/${req.file.filename}`;
+    await userStore.updateOrganization(req.params.id, { logo: logoPath });
+    res.json({ success: true, logo: logoPath });
+});
+
+router.delete('/organizations/:id/logo', requireOrgAdmin('id'), async (req, res) => {
+    const org = await userStore.getAllOrganizations().find(o => o.id === req.params.id);
+    if (org && org.logo) {
+        const filePath = path.join(__dirname, '..', 'data', org.logo);
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    }
+    await userStore.updateOrganization(req.params.id, { logo: '' });
+    res.json({ success: true });
+});
+
+
+// === Group Management API (Admin Only) ===
+
+router.get('/groups', requireAuth, async (req, res) => {
+    let groups = await userStore.getAllGroups();
+
+    const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
+    if (!isSuperAdmin) {
+        const userId = req.session.user?.id;
+        const currentUser = await userStore.getUser(userId);
+        if (currentUser) {
+            const myOrgIds = new Set();
+            // Direct org assignment
+            if (currentUser.organizationId) myOrgIds.add(currentUser.organizationId);
+            // Group-based detection
+            let myGroups = [];
+            try { myGroups = Array.isArray(currentUser.groups) ? currentUser.groups : JSON.parse(currentUser.groups || '[]'); } catch (_) { }
+            const allGroups = await userStore.getAllGroups();
+            for (const gid of myGroups) {
+                const group = allGroups.find(g => g.id === gid);
+                if (group?.organizationId) myOrgIds.add(group.organizationId);
+            }
+            groups = groups.filter(g => g.organizationId && myOrgIds.has(g.organizationId));
+        }
+    }
+
+    res.json(groups);
+});
+
+router.post('/groups', requireAuth, async (req, res) => {
+    const { name, description, permissions, roles, organizationId, allowedAgentTypes } = req.body;
+
+    if (!name) {
+        return res.status(400).json({ error: 'Group name required' });
+    }
+
+    // For non-super-admins, force the group into their org
+    let orgId = organizationId || null;
+    const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
+    if (!isSuperAdmin) {
+        const userId = req.session.user?.id;
+        const currentUser = await userStore.getUser(userId);
+        if (!currentUser?.organizationId) {
+            return res.status(403).json({ error: 'You must belong to an organisation to create groups' });
+        }
+        orgId = currentUser.organizationId;
+    }
+
+    const id = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+    const newGroup = {
+        id,
+        organizationId: orgId,
+        name,
+        description: description || '',
+        permissions: permissions || [],
+        roles: roles || [],
+        allowedAgentTypes: allowedAgentTypes || []
+    };
+
+    if (await userStore.createGroup(newGroup)) {
+        res.json({ success: true, group: newGroup });
+    } else {
+        res.status(400).json({ error: 'Group already exists' });
+    }
+});
+
+router.put('/groups/:id', requireAuth, async (req, res) => {
+    const { id } = req.params;
+    const { description, permissions, roles, organizationId, allowedAgentTypes } = req.body;
+
+    // Non-super-admins can only edit groups in their org
+    const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
+    if (!isSuperAdmin) {
+        const userId = req.session.user?.id;
+        const currentUser = await userStore.getUser(userId);
+        const allGroups = await userStore.getAllGroups();
+        const group = allGroups.find(g => g.id === id);
+        if (!group || !currentUser?.organizationId || group.organizationId !== currentUser.organizationId) {
+            return res.status(403).json({ error: 'You can only edit groups in your organisation' });
+        }
+    }
+
+    const updates = { description, permissions, roles };
+    if (organizationId !== undefined) {
+        updates.organizationId = organizationId;
+    }
+    if (allowedAgentTypes !== undefined) {
+        updates.allowedAgentTypes = allowedAgentTypes;
+    }
+
+    if (await userStore.updateGroup(id, updates)) {
+        res.json({ success: true });
+    } else {
+        res.status(404).json({ error: 'Group not found' });
+    }
+});
+
+router.delete('/groups/:id', requireAuth, async (req, res) => {
+    const { id } = req.params;
+    if (id === 'admins' || id === 'users') {
+        return res.status(400).json({ error: 'Cannot delete system groups' });
+    }
+
+    // Non-super-admins can only delete groups in their org
+    const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
+    if (!isSuperAdmin) {
+        const userId = req.session.user?.id;
+        const currentUser = await userStore.getUser(userId);
+        const allGroups = await userStore.getAllGroups();
+        const group = allGroups.find(g => g.id === id);
+        if (!group || !currentUser?.organizationId || group.organizationId !== currentUser.organizationId) {
+            return res.status(403).json({ error: 'You can only delete groups in your organisation' });
+        }
+    }
+
+    if (await userStore.deleteGroup(id)) {
+        res.json({ success: true });
+    } else {
+        res.status(404).json({ error: 'Group not found' });
+    }
+});
+
+
+// === Roles Management API (Admin Only) ===
+
+router.get('/roles', requireAuth, async (req, res) => {
+    const roles = await userStore.getAllRoles();
+    res.json(roles);
+});
+
+router.post('/roles', requireAdmin, async (req, res) => {
+    const { name, description, permissions } = req.body;
+
+    if (!name) {
+        return res.status(400).json({ error: 'Role name required' });
+    }
+
+    const id = name.toLowerCase().replace(/\s+/g, '-');
+    const newRole = {
+        id,
+        name,
+        description: description || '',
+        permissions: permissions || []
+    };
+
+    if (await userStore.createRole(newRole)) {
+        res.json({ success: true, role: newRole });
+    } else {
+        res.status(400).json({ error: 'Role already exists' });
+    }
+});
+
+router.put('/roles/:id', requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    const { name, description, permissions } = req.body;
+
+    if (await userStore.updateRole(id, { name, description, permissions })) {
+        res.json({ success: true });
+    } else {
+        res.status(404).json({ error: 'Role not found' });
+    }
+});
+
+router.delete('/roles/:id', requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    if (id === 'admin' || id === 'user') {
+        return res.status(400).json({ error: 'Cannot delete system roles' });
+    }
+
+    if (await userStore.deleteRole(id)) {
+        res.json({ success: true });
+    } else {
+        res.status(404).json({ error: 'Role not found' });
+    }
+});
+
+
+// === Permissions API ===
+
+router.get('/permissions', requireAdmin, async (req, res) => {
+    res.json(SYSTEM_PERMISSIONS);
+});
+
+
+// === App Password Management ===
+
+router.get('/app-password-status', async (req, res) => {
+    if (!req.session.isAuthenticated) {
+        return res.json({ hasAppPassword: false, isNextcloudUser: false });
+    }
+
+    const userId = req.session.user?.id;
+    if (!userId) {
+        return res.json({ hasAppPassword: false, isNextcloudUser: false });
+    }
+
+    res.json({
+        hasAppPassword: await userStore.hasAppPassword(userId),
+        isNextcloudUser: !!req.session.accessToken
+    });
+});
+
+router.post('/create-app-password', async (req, res) => {
+    if (!req.session.isAuthenticated) {
+        return res.status(401).json({ error: 'Must be logged in' });
+    }
+
+    const accessToken = req.session.accessToken;
+    const userId = req.session.user?.id;
+
+    if (!accessToken || !userId) {
+        return res.status(401).json({ error: 'Not authenticated with Nextcloud' });
+    }
+
+    const config = await loadConfig();
+    const nextcloudUrl = config.oauth?.nextcloudUrl;
+
+    if (!nextcloudUrl) {
+        return res.status(400).json({ error: 'Nextcloud URL not configured' });
+    }
+
+    try {
+        const response = await fetch(`${nextcloudUrl}/ocs/v2.php/core/apppassword`, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'OCS-APIRequest': 'true',
+                'Accept': 'application/json'
+            }
+        });
+
+        if (!response.ok) {
+            return res.status(500).json({ error: 'Failed to create app password' });
+        }
+
+        const data = await response.json();
+        const appPassword = data.ocs?.data?.apppassword;
+
+        if (!appPassword) {
+            return res.status(500).json({ error: 'No app password returned' });
+        }
+
+        await userStore.storeAppPassword(userId, userId, appPassword);
+        res.json({ success: true, message: 'App password created' });
+
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.post('/save-app-password', async (req, res) => {
+    if (!req.session.isAuthenticated) {
+        return res.status(401).json({ error: 'Must be logged in' });
+    }
+
+    const { username, password } = req.body;
+    if (!username || !password) {
+        return res.status(400).json({ error: 'Username and password are required' });
+    }
+
+    const userId = req.session.user?.id;
+    await userStore.storeAppPassword(userId, username, password);
+    res.json({ success: true, message: 'App password saved securely' });
+});
+
+router.delete('/app-password', async (req, res) => {
+    if (!req.session.isAuthenticated) {
+        return res.status(401).json({ error: 'Must be logged in' });
+    }
+
+    const userId = req.session.user?.id;
+    await userStore.deleteAppPassword(userId);
+    res.json({ success: true });
+});
+
+
+// === Beta Features Management API (Admin Only) ===
+
+const { BETA_FEATURES, getOrgBetaFeatures, setOrgBetaFeatures } = require('../core/betaFeatures');
+
+// Get the full beta feature registry + per-org assignments
+router.get('/beta-features', requireAdmin, async (req, res) => {
+    const orgs = await userStore.getAllOrganizations();
+    const assignments = {};
+    for (const org of orgs) {
+        assignments[org.id] = await getOrgBetaFeatures(org.id);
+    }
+    res.json({ registry: BETA_FEATURES, assignments });
+});
+
+// Set beta features for an organization
+router.put('/organizations/:orgId/beta-features', requireOrgAdmin('orgId'), async (req, res) => {
+    const { orgId } = req.params;
+    const { features } = req.body;
+
+    if (!Array.isArray(features)) {
+        return res.status(400).json({ error: 'features must be an array of feature IDs' });
+    }
+
+    if (await setOrgBetaFeatures(orgId, features)) {
+        res.json({ success: true, features: getOrgBetaFeatures(orgId) });
+    } else {
+        res.status(500).json({ error: 'Failed to update beta features' });
+    }
+});
+
+// === Default Integrations Config (Super Admin Only) ===
+
+const configStore = require('../stores/configStore');
+
+// All available integration IDs
+const ALL_INTEGRATIONS = [
+    { id: 'gmail', label: 'Gmail' },
+    { id: 'google-calendar', label: 'Calendar' },
+    { id: 'google-drive', label: 'Drive' },
+    { id: 'google-slides', label: 'Slides' },
+    { id: 'google-sheets', label: 'Sheets' },
+    { id: 'google-docs', label: 'Docs' },
+    { id: 'image-gen', label: 'Image Generation' },
+    { id: 'fireflies', label: 'Fireflies' },
+    { id: 'youtrack', label: 'YouTrack' },
+    { id: 'gamma', label: 'Gamma' },
+    { id: 'n8n', label: 'n8n' },
+];
+
+router.get('/default-integrations', requireAdmin, async (req, res) => {
+    const defaults = await configStore.getConfig('default_org_integrations') || null;
+    res.json({ integrations: ALL_INTEGRATIONS, defaults });
+});
+
+router.put('/default-integrations', requireAdmin, async (req, res) => {
+    const { defaults } = req.body;
+    // defaults = null means all enabled, or array of enabled IDs
+    await configStore.setConfig('default_org_integrations', defaults === null ? null : defaults);
+    res.json({ success: true });
+});
+
+module.exports = router;

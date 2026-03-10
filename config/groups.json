@@ -1,0 +1,19 @@
+{
+  "admins": {
+    "id": "admins",
+    "name": "Administrators",
+    "description": "Full system access",
+    "permissions": [
+      "all"
+    ]
+  },
+  "users": {
+    "id": "users",
+    "name": "Users",
+    "description": "Standard user access",
+    "permissions": [
+      "read",
+      "chat"
+    ]
+  }
+}

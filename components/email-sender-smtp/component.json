@@ -1,0 +1,126 @@
+{
+  "name": "Email Sender (SMTP)",
+  "description": "Send emails using SMTP protocol with support for authentication, HTML content, and attachments",
+  "category": "Communication",
+  "inputs": {
+    "smtpHost": {
+      "type": "string",
+      "label": "SMTP Host",
+      "description": "The hostname or IP address of the SMTP server (e.g., smtp.example.com)",
+      "required": true
+    },
+    "smtpPort": {
+      "type": "number",
+      "label": "SMTP Port",
+      "description": "The port number of the SMTP server (e.g., 587 for TLS, 465 for SSL)",
+      "required": true,
+      "default": 587
+    },
+    "smtpUsername": {
+      "type": "string",
+      "label": "SMTP Username",
+      "description": "The username for SMTP authentication (often your email address)",
+      "required": true,
+      "secure": true
+    },
+    "smtpPassword": {
+      "type": "string",
+      "label": "SMTP Password",
+      "description": "The password or app-specific password for SMTP authentication",
+      "required": true,
+      "secure": true
+    },
+    "useTLS": {
+      "type": "boolean",
+      "label": "Use TLS",
+      "description": "Whether to use TLS encryption for the SMTP connection",
+      "required": false,
+      "default": true
+    },
+    "fromEmail": {
+      "type": "string",
+      "label": "From Email",
+      "description": "The sender's email address",
+      "required": true
+    },
+    "toEmails": {
+      "type": "string",
+      "label": "To Emails",
+      "description": "Comma-separated list of recipient email addresses",
+      "required": true
+    },
+    "ccEmails": {
+      "type": "string",
+      "label": "CC Emails",
+      "description": "Comma-separated list of CC recipient email addresses",
+      "required": false,
+      "default": ""
+    },
+    "bccEmails": {
+      "type": "string",
+      "label": "BCC Emails",
+      "description": "Comma-separated list of BCC recipient email addresses",
+      "required": false,
+      "default": ""
+    },
+    "subject": {
+      "type": "string",
+      "label": "Subject",
+      "description": "The subject of the email",
+      "required": true
+    },
+    "body": {
+      "type": "string",
+      "label": "Body",
+      "description": "The body content of the email (supports HTML if isHtml is true)",
+      "required": true
+    },
+    "isHtml": {
+      "type": "boolean",
+      "label": "Is HTML",
+      "description": "Whether the email body is HTML formatted",
+      "required": false,
+      "default": false
+    },
+    "attachments": {
+      "type": "string",
+      "label": "Attachments",
+      "description": "Comma-separated list of file paths to attach to the email",
+      "required": false,
+      "default": ""
+    },
+    "replyTo": {
+      "type": "string",
+      "label": "Reply To",
+      "description": "The email address to use for the Reply-To header",
+      "required": false
+    }
+  },
+  "outputs": {
+    "success": {
+      "type": "boolean",
+      "label": "Success",
+      "description": "Indicates whether the email was sent successfully"
+    },
+    "error": {
+      "type": "string",
+      "label": "Error",
+      "description": "Error message if the email failed to send"
+    },
+    "messageId": {
+      "type": "string",
+      "label": "Message ID",
+      "description": "The message ID assigned by the SMTP server"
+    },
+    "acceptedRecipients": {
+      "type": "array",
+      "label": "Accepted Recipients",
+      "description": "List of recipients that were accepted by the SMTP server"
+    },
+    "rejectedRecipients": {
+      "type": "array",
+      "label": "Rejected Recipients",
+      "description": "List of recipients that were rejected by the SMTP server"
+    }
+  }
+}

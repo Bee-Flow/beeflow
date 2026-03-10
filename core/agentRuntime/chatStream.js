@@ -1,0 +1,1349 @@
+/**
+ * Streaming agent chat — SSE-based tool-calling loop with real-time events
+ * This is the primary chat function used by the frontend
+ */
+const { getAIConfig, getProviderForModel, resolveModelId } = require('../aiAgent');
+const { getAdapter } = require('../providers');
+const componentManager = require('../componentManager');
+const executionEngine = require('../executionEngine');
+const agentStore = require('../../stores/agentStore');
+const { sanitizeToolResult } = require('../../utils/sanitize');
+const fs = require('fs');
+const path = require('path');
+const swarmStore = require('../../stores/swarmStore');
+const swarmOrchestrator = require('../../agents/swarm/orchestrator');
+const HiveMind = require('../../agents/swarm/hiveMind');
+const usageStore = require('../../stores/usageStore');
+const { SEQUENTIAL_THINKING_TOOL, executeSequentialThinking } = require('../sequentialThinkingTool');
+const { runPreThinking } = require('../preThinking');
+const { classifyPromptComplexity } = require('../promptClassifier');
+const configStore = require('../../stores/configStore');
+const { mistralOCR } = require('../ocr');
+const { sanitizeMessages } = require('../../utils/messageUtils');
+const { componentToTool, executeComponentTool, executeSystemTool, SYSTEM_TOOLS } = require('../toolExecution');
+const { resolveAgentModel } = require('./modelResolver');
+const { getAgentTools } = require('./agentTools');
+const { executeWorkerTool } = require('./workerExecution');
+const { enrichMessagesWithFormData } = require('./chatWithAgent');
+const { checkRegexPatterns } = require('../guardrails');
+const { validateWithLlamaGuard } = require('../moderation');
+const { resolveOrgShield, mergeWithOrgShield } = require('../orgShield');
+const { processSystemPrompt } = require('../promptUtils');
+const { buildSystemPrompt } = require('./contextBuilder');
+const { performKnowledgeSearch } = require('./knowledgeSearch');
+const { runInputGuardrails } = require('./guardrailsRunner');
+const { processAttachments } = require('./attachmentProcessor');
+
+async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, onEvent, historyOverride = null, messageMetadata = {}) {
+    // Check swarm first to prioritize virtual agent definition
+    const swarm = await swarmStore.getSwarm(agentId);
+    let agent = null;
+    let isSwarm = false;
+    let brain = null;
+
+    if (swarm) {
+        isSwarm = true;
+        brain = new HiveMind(agentId);
+        // Ensure placeholder exists for FKs
+        await agentStore.ensurePlaceholderAgent(swarm.id, swarm.name, swarm.description);
+
+        // For phase-driven execution, the system prompt will be set per-phase
+        agent = {
+            id: swarm.id,
+            name: swarm.name,
+            model: swarm.model || null,
+            system_prompt: swarmOrchestrator.generatePhasePrompt(swarm, 0, []),
+            config: swarm.config
+        };
+    } else {
+
+        agent = await agentStore.getAgent(agentId);
+    }
+
+    if (!agent) {
+        throw new Error('Agent not found');
+    }
+
+    // Swarm execution history collector
+    const swarmLogs = [];
+    const swarmBrain = [];
+    const SWARM_EVENT_TYPES = new Set(['phase', 'worker_start', 'worker_tool', 'worker_complete', 'worker_error', 'brain_update']);
+
+    // Worker call counter for unique IDs (e.g. "Web Searcher #1", "Web Searcher #2")
+    const workerCallCounts = {};
+
+    // Wrap onEvent to intercept swarm events for persistence
+    const originalOnEvent = onEvent;
+    if (isSwarm) {
+        onEvent = (type, data) => {
+            // Enrich worker events with call number
+            if (type === 'worker_start' || type === 'worker_complete' || type === 'worker_error' || type === 'brain_update') {
+                const workerName = data.worker || 'unknown';
+                if (type === 'worker_start') {
+                    workerCallCounts[workerName] = (workerCallCounts[workerName] || 0) + 1;
+                }
+                data.workerId = `${workerName.toLowerCase().replace(/\s+/g, '_')}_${workerCallCounts[workerName] || 1}`;
+                data.callNumber = workerCallCounts[workerName] || 1;
+            }
+
+            // Collect swarm events for persistence
+            if (SWARM_EVENT_TYPES.has(type)) {
+                const entry = { type, ...data, timestamp: new Date().toISOString() };
+                if (type === 'brain_update') {
+                    swarmBrain.push(entry);
+                } else {
+                    swarmLogs.push(entry);
+                }
+            }
+            // Always forward to the original handler for SSE streaming
+            originalOnEvent(type, data);
+        };
+    }
+
+    // Get global config for guardrails and defaults
+    const globalConfig = await getAIConfig();
+
+    // Get the model to use - supports tier-based selection (tier:auto, tier:fast, etc.)
+    const modelToUse = await resolveAgentModel(agent.model, userMessage, { ...globalConfig, organizationId: agent.organization_id, userOrgId: messageMetadata?.userOrgId });
+
+    // Get the correct provider config for this model
+    const config = await getProviderForModel(modelToUse);
+    console.log(`[AgentRuntime] Streaming with model: ${modelToUse} from provider: ${config.providerName || 'default'}`);
+
+    // For swarms, tools are loaded per-phase; for normal agents, load all tools
+    let tools = isSwarm
+        ? swarmOrchestrator.getSwarmToolsForPhase(swarm, 0)
+        : await getAgentTools(agentId);
+
+    // ── Inject integration tools (Gmail, Calendar, Sheets, etc.) ──────
+    // These require OAuth tokens from the user session
+    let n8nOrgId = null;
+    try {
+        const { getIntegrationTools, buildToolHint } = require('./integrationTools');
+        const session = userAuth?.session;
+        const integrationResult = await getIntegrationTools({
+            userId,
+            session,
+            isAdmin: session?.user?.isAdmin || false,
+            agentConfig: agent.config,
+        });
+        if (integrationResult.tools.length > 0) {
+            // Deduplicate — don't add integration tools that overlap with component tools
+            for (const intTool of integrationResult.tools) {
+                if (!tools.find(t => t.function?.name === intTool.function?.name)) {
+                    tools.push(intTool);
+                }
+            }
+            console.log(`[AgentRuntime] Injected ${integrationResult.tools.length} integration tools for agent ${agentId}`);
+        }
+        n8nOrgId = integrationResult.n8nOrgId;
+    } catch (intErr) {
+        console.warn('[AgentRuntime] Integration tools injection failed:', intErr.message);
+    }
+
+    // ── Built-in: set_reminder tool (always available) ────────────
+    if (!tools.find(t => t.function?.name === 'set_reminder')) {
+        tools.push({
+            type: 'function',
+            function: {
+                name: 'set_reminder',
+                description: 'Set a reminder for the user. Use when the user asks to be reminded about something at a specific time. IMPORTANT: Use the timezone from the "Now:" line in the system prompt — do NOT use UTC/Z unless the user is in UTC.',
+                parameters: {
+                    type: 'object',
+                    properties: {
+                        title: { type: 'string', description: 'Short title for the reminder' },
+                        message: { type: 'string', description: 'Optional detailed message' },
+                        remind_at: { type: 'string', description: 'ISO 8601 datetime for when to remind. MUST include the user\'s timezone offset from the system prompt (e.g. "2026-03-09T15:00:00+01:00" for CET). Do NOT use "Z" unless the user is in UTC.' },
+                        repeat_interval: { type: 'string', enum: ['daily', 'weekly', 'monthly'], description: 'Optional repeat interval' },
+                    },
+                    required: ['title', 'remind_at'],
+                },
+            },
+        });
+    }
+
+    // Load tool configs with fixed params
+    const toolConfigs = await agentStore.getAgentToolsWithParams(agentId);
+    const toolParamsMap = {};
+    for (const tc of toolConfigs) {
+        const toolName = tc.componentId.replace(/-/g, '_');
+        toolParamsMap[toolName] = tc.params;
+    }
+    console.log('[AgentRuntime] Tool params map:', JSON.stringify(toolParamsMap, null, 2));
+
+    // Get or create conversation - use specific conversationId if provided
+    // For ephemeral chats (embed), skip database persistence entirely
+    const isEphemeral = messageMetadata.ephemeral === true;
+    let conversation;
+    if (isEphemeral) {
+        // Use a dummy in-memory conversation — no database writes
+        conversation = { id: `ephemeral-${Date.now()}`, agent_id: agentId, user_id: userId, messages: [] };
+    } else if (messageMetadata.conversationId) {
+        // Use the specific conversation
+        conversation = await agentStore.getConversationById(messageMetadata.conversationId, userAuth.encryptionKey);
+        if (!conversation) {
+            // If conversation doesn't exist, create a new one
+            conversation = await agentStore.getOrCreateConversation(agentId, userId, userAuth.encryptionKey);
+        }
+    } else {
+        // No conversationId provided - create a new conversation
+        conversation = await agentStore.createNewConversation(agentId, userId);
+    }
+
+    // Assign new conversation to project if projectId provided
+    let extractMemoriesEnabled = false;
+    let validProjectId = null;
+    if (messageMetadata.projectId) {
+        validProjectId = messageMetadata.projectId;
+        try {
+            const projectStore = require('../../stores/projectStore');
+            const project = await projectStore.getProject(validProjectId);
+            if (project) {
+                extractMemoriesEnabled = project.extractMemories === true;
+            }
+        } catch (e) {
+            console.warn('[AgentRuntime] Failed to fetch project:', e.message);
+        }
+    }
+
+    if (conversation && messageMetadata.projectId && !messageMetadata.conversationId && !isEphemeral) {
+        try {
+            const projectStore = require('../../stores/projectStore');
+            await projectStore.assignConversation(conversation.id, messageMetadata.projectId, 'agent_conversations');
+        } catch (e) {
+            console.warn('[AgentRuntime] Failed to assign conversation to project:', e.message);
+        }
+    }
+
+    // Use historyOverride if provided (for thread context isolation), otherwise use conversation
+    let messages;
+    if (historyOverride && Array.isArray(historyOverride)) {
+        // Use the overridden history (thread context)
+        messages = [...historyOverride];
+    } else {
+        messages = [...conversation.messages];
+        // Include id and parentId for persistence
+        messages.push({
+            id: messageMetadata.messageId,
+            role: 'user',
+            content: userMessage,
+            parentId: messageMetadata.parentId || null
+        });
+    }
+
+    // ============ MEMORY INTEGRATION ============
+    // Skip memory for embed-enabled agents — private user memories must not leak into public embed chats
+    let memoryContext = '';
+    if (agent.embed_enabled) {
+        console.log(`[AgentRuntime] Skipping memory for embed-enabled agent ${agentId}`);
+    } else {
+        try {
+            const memoryStore = require('../stores/memoryStore');
+            console.log(`[AgentRuntime] Memory lookup - userId: ${userId}, agentId: ${agentId}`);
+            // Limit to ~300 tokens (approx 1200 chars) to prevent context pollution
+            const relevantMemories = memoryStore.findRelevantMemories(userId, agentId, userMessage, 300, extractMemoriesEnabled ? validProjectId : null);
+            if (relevantMemories.length > 0) {
+                memoryContext = memoryStore.formatMemoriesForPrompt(relevantMemories);
+                console.log(`[AgentRuntime] Injected ${relevantMemories.length} memories into prompt`);
+                console.log(`[AgentRuntime] Memory context:\n${memoryContext}`);
+            } else {
+                console.log('[AgentRuntime] No memories found for this user/agent');
+            }
+        } catch (memErr) {
+            console.error('[AgentRuntime] Memory retrieval failed:', memErr.message);
+        }
+    }
+
+    const isStrictKnowledge = agent.config?.strictKnowledge === true;
+    let systemPrompt = await buildSystemPrompt({ agent, tools, userId, messageMetadata, memoryContext, isStrictKnowledge });
+
+    // ============ VECTOR KNOWLEDGE BASE ============
+    try {
+        const kbExtension = await performKnowledgeSearch({ agent, userId, userMessage, isStrictKnowledge, onEvent });
+        if (kbExtension) systemPrompt += kbExtension;
+    } catch (kErr) {
+        console.error('[AgentRuntime] Knowledge retrieval failed:', kErr.message);
+        // Continue without knowledge
+    }
+
+    // ============ WORKSPACE INTEGRATION ============
+    // Workspace streaming/parsing is handled in the stream loop below;
+    // no system prompt injection needed.
+
+    // Verify Guardrails if enabled (AI Content Moderation)
+    const guardrailsResult = await runInputGuardrails({ agent, messages, userMessage, globalConfig, onEvent });
+    let moderationViolation = guardrailsResult.moderationViolation;
+    let guardrailViolation = guardrailsResult.guardrailViolation;
+    let processedUserMessage = guardrailsResult.processedUserMessage;
+    const regexConfig = guardrailsResult.regexConfig;
+    const webSearchGuardEnabled = guardrailsResult.webSearchGuardEnabled;
+    const orgShieldCategories = guardrailsResult.orgShieldCategories;
+
+    // If redaction occurred, update the user message in the messages array
+    if (processedUserMessage !== userMessage) {
+        const lastMsgIndex = messages.length - 1;
+        if (messages[lastMsgIndex]?.role === 'user') {
+            messages[lastMsgIndex].content = processedUserMessage;
+        }
+    }
+
+    // Phase-driven execution state for swarms
+    // Filter out disabled phases before execution
+    if (isSwarm && swarm.phases) {
+        swarm.phases = swarm.phases.filter(p => p.enabled !== false);
+    }
+    let currentPhaseIndex = 0;
+    const phaseResults = [];
+    const totalPhases = isSwarm ? (swarm.phases?.length || 1) : 1;
+    const calledWorkersInPhase = new Set(); // Track called workers for runOnce enforcement
+
+    let iterations = 0;
+    const maxIterations = isSwarm ? (totalPhases * 8) : 10;
+    let toolCalls = [];
+    let fullResponse = '';
+    let _emailDrafts = [];
+    let _linkedInDrafts = [];
+    let _sheetsResults = [];
+    let _sheetsDrafts = [];
+    let _sheetsReports = [];
+    let _mapEmbeds = [];
+    let _audioFiles = [];
+
+    // Abort signal from the route handler (client disconnect)
+    const signal = messageMetadata.signal || null;
+
+    // Emit first phase start event
+    if (isSwarm && swarm.phases?.length > 0) {
+        onEvent('phase', { phase: swarm.phases[0].name, message: `Starting phase: ${swarm.phases[0].name}` });
+    }
+    // ─── Pre-thinking with separate model ───
+    const thinkingModel = agent.config?.sequentialThinkingModel || (agent.config?.sequentialThinkingEnabled ? modelToUse : null);
+    const thinkingEnabled = !!(thinkingModel && agent.config?.sequentialThinkingEnabled);
+    // For swarms, thinking runs per-phase inside the loop; for normal agents, run once here
+    if (thinkingEnabled && !isSwarm) {
+        try {
+            const sessionId = `${agentId}-${conversation.id}-pre`;
+            const { context } = await runPreThinking(thinkingModel, messages, sessionId, onEvent, signal, systemPrompt);
+            if (context) {
+                systemPrompt += context;
+                // Remove sequentialthinking from main model tools to avoid double-thinking
+                tools = tools.filter(t => t.function?.name !== 'sequentialthinking');
+            }
+        } catch (err) {
+            console.error('[PreThinking] Error:', err.message);
+            // Continue without pre-thinking — fall back to normal flow
+        }
+    }
+
+    // Track which swarm phases have had thinking applied
+    const phaseThinkingDone = new Set();
+
+    while (iterations < maxIterations) {
+        // Check if client disconnected
+        if (signal?.aborted) {
+            console.log('[AgentRuntime] Aborting — client disconnected');
+            break;
+        }
+        iterations++;
+
+        try {
+            const headers = { 'Content-Type': 'application/json' };
+            const apiKey = config.apiKey;
+            if (apiKey) {
+                headers['Authorization'] = `Bearer ${apiKey}`;
+            }
+
+            // Build API URL - handle providers with /v1 in URL
+            let apiUrl = config.url.replace(/\/$/, '');
+            if (!apiUrl.endsWith('/v1')) {
+                apiUrl = `${apiUrl}/v1`;
+            }
+
+            // Process Attachments (PDFs, Images)
+            const processedMessages = [...messages];
+            const lastMsg = processedMessages[processedMessages.length - 1]; // This is the user message
+            let attachmentContent = '';
+
+            // Handle attachments if present
+            if (messageMetadata?.attachments && messageMetadata.attachments.length > 0) {
+                console.log(`[Agent] Processing ${messageMetadata.attachments.length} attachments...`);
+                await processAttachments(messageMetadata.attachments, lastMsg);
+            }
+
+            // Inject guardrail violation context if detected
+            let effectiveSystemPrompt = systemPrompt;
+            if (guardrailViolation && iterations === 1) {
+                effectiveSystemPrompt += `\n\n[IMPORTANT: The user's message contains content that violates guardrail rule(s): "${guardrailViolation}". You must politely decline to process this request and explain that the content violates the "${guardrailViolation}" policy. Do not attempt to answer the request.]`;
+            }
+            if (moderationViolation && iterations === 1) {
+                effectiveSystemPrompt += `\n\n[IMPORTANT: The user's message was flagged by content moderation for: "${moderationViolation}". You must briefly explain that their message was flagged for "${moderationViolation}" and politely ask them to rephrase. Keep your response short (1-2 sentences). Do not process or answer the original request.]`;
+            }
+
+            // For swarms: update system prompt and tools for the current phase
+            if (isSwarm) {
+                effectiveSystemPrompt = swarmOrchestrator.generatePhasePrompt(swarm, currentPhaseIndex, phaseResults);
+                tools = swarmOrchestrator.getSwarmToolsForPhase(swarm, currentPhaseIndex);
+                console.log(`[AgentRuntime] 🐝 Phase ${currentPhaseIndex + 1}/${totalPhases}: "${swarm.phases[currentPhaseIndex]?.name}" — ${tools.length} workers available: [${tools.map(t => t.function?.name).join(', ')}]`);
+
+                // Run per-phase pre-thinking for the orchestrator
+                if (thinkingEnabled && !phaseThinkingDone.has(currentPhaseIndex)) {
+                    phaseThinkingDone.add(currentPhaseIndex);
+                    try {
+                        const phaseSessionId = `${agentId}-${conversation.id}-phase${currentPhaseIndex}`;
+                        const { context } = await runPreThinking(thinkingModel, messages, phaseSessionId, onEvent, signal, effectiveSystemPrompt);
+                        if (context) {
+                            effectiveSystemPrompt += context;
+                        }
+                    } catch (err) {
+                        console.error(`[PreThinking] Phase ${currentPhaseIndex} error:`, err.message);
+                    }
+                }
+            }
+
+            // Enrich messages with form data context
+            // We do this inside the loop to ensure it persists across tool calls if needed (though usually it's static)
+            // But strict guardrails might want to check it. Ideally we do it once.
+            // However, doing it here ensures `processedMessages` (which handles attachments) gets enriched.
+            const finalMessages = enrichMessagesWithFormData(processedMessages);
+
+            // Sanitize messages — Mistral rejects extra fields like parentId, id, etc.
+            const sanitize = sanitizeMessages;
+
+            const _streamCallStart = Date.now();
+
+            // ─── Resolve tier settings for thinking/temperature config ─────
+            let tierSettings = {};
+            if (agent.model && agent.model.startsWith('tier:')) {
+                const tierName = agent.model.substring(5);
+                const allTiers = await configStore.getConfig('chat_model_tiers') || {};
+                tierSettings = allTiers[tierName] || {};
+            }
+
+            // ─── Native SDK adapter streaming (Google, OpenAI, Claude, Mistral) ─────
+            const providerAdapter = getAdapter(config.providerType, config.url);
+            const useNativeAdapter = ['google', 'openai', 'claude', 'mistral', 'azure', 'google-vertex'].includes(config.providerType) && typeof providerAdapter?.stream === 'function';
+
+            let currentToolCalls = [];
+            let contentBuffer = '';
+
+            if (useNativeAdapter) {
+                // Build OpenAI-format messages for the adapter's normalizeMessages
+                const adapterMessages = [
+                    { role: 'system', content: effectiveSystemPrompt },
+                    ...sanitizeMessages(finalMessages)
+                ];
+
+                const isThinkingModel = modelToUse.includes('magistral');
+                const defaultMaxTokens = isThinkingModel ? 40960 : 8192;
+                const adapterOptions = {
+                    maxTokens: tierSettings.maxTokens || defaultMaxTokens,
+                    temperature: tierSettings.temperature !== undefined ? tierSettings.temperature : 0.7,
+                    budgetTokens: tierSettings.budgetTokens || undefined,
+                    reasoningEffort: tierSettings.reasoningEffort || undefined,
+                };
+
+                if (tools.length > 0) {
+                    adapterOptions.tools = tools;
+                    adapterOptions.toolChoice = 'auto';
+                }
+
+                console.log(`[AgentRuntime] Using native ${config.providerType} adapter for streaming`, {
+                    model: modelToUse,
+                    budgetTokens: adapterOptions.budgetTokens,
+                    temperature: adapterOptions.temperature,
+                    toolsCount: tools.length,
+                });
+
+                let _adapterStreamUsage = null;
+                await providerAdapter.stream(
+                    config.apiKey, config.url, modelToUse,
+                    adapterMessages, adapterOptions,
+                    (type, data) => {
+                        if (type === 'text') {
+                            const textChunk = data.text || '';
+                            contentBuffer += textChunk;
+
+                            // Real-time Agent Output validation
+                            if (regexConfig?.enabled && regexConfig?.scope?.agentOutput) {
+                                const matches = checkRegexPatterns(contentBuffer, regexConfig.rulesWithNames);
+                                if (matches.length > 0) {
+                                    const ruleNames = matches.map(m => m.ruleName).join(', ');
+                                    console.log(`[RegexGuard] Agent output violated rules during stream: ${ruleNames}`);
+                                    contentBuffer = `I apologize, but I cannot provide that response as it contains content that violates the ${ruleNames} policy.`;
+                                    onEvent('content_replace', { text: contentBuffer });
+                                    guardrailViolation = ruleNames;
+                                    return;
+                                }
+                            }
+
+                            if (!isSwarm) {
+                                onEvent('content', { text: textChunk });
+                            } else {
+                                onEvent('orchestrator_thinking', { text: textChunk });
+                            }
+                        } else if (type === 'thinking') {
+                            if (isSwarm) {
+                                onEvent('orchestrator_thinking', { text: data.text });
+                            } else {
+                                onEvent('thinking', { text: data.text });
+                            }
+                        } else if (type === 'tool_use') {
+                            // Accumulate tool calls for post-stream processing
+                            currentToolCalls.push({
+                                id: data.id || `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                                function: {
+                                    name: data.name,
+                                    arguments: JSON.stringify(data.input || {}),
+                                },
+                                _thought_signature: data.thought_signature || undefined
+                            });
+                        } else if (type === 'done') {
+                            // Capture usage data from adapter
+                            _adapterStreamUsage = data;
+                        } else if (type === 'error') {
+                            onEvent('error', data);
+                        }
+                    }
+                );
+
+                // Log usage for native adapter streams
+                try {
+                    await usageStore.logUsage({
+                        user_id: userId,
+                        agent_id: agentId,
+                        agent_name: agent.name,
+                        agent_type: isSwarm ? 'swarm' : 'chat',
+                        model: modelToUse,
+                        prompt_tokens: _adapterStreamUsage?.prompt_tokens || 0,
+                        completion_tokens: _adapterStreamUsage?.completion_tokens || 0,
+                        total_tokens: _adapterStreamUsage?.total_tokens || 0,
+                        source: isSwarm ? 'swarm_orchestrator' : 'agent_stream',
+                        duration_ms: Date.now() - _streamCallStart,
+                        organization_id: agent.organization_id || null,
+                        conversation_id: conversation?.id || null
+                    });
+                } catch (e) { /* ignore usage errors */ }
+
+            } else {
+                // ─── Raw fetch SSE streaming (OpenAI-compatible) ──────────────
+                // Detect reasoning models that need special handling
+                const isReasoningModel = /^o\d|^gpt-5/i.test(modelToUse);
+                const isRestrictedTemp = /^o\d|nano|^gpt-5/i.test(modelToUse);
+                const requestBody = {
+                    model: modelToUse,
+                    messages: [{ role: 'system', content: effectiveSystemPrompt }, ...sanitizeMessages(finalMessages)],
+                    stream: true,
+                    stream_options: { include_usage: true }
+                };
+                // Only set temperature for models that support it
+                if (!isRestrictedTemp) {
+                    requestBody.temperature = tierSettings.temperature !== undefined ? tierSettings.temperature : 0.7;
+                }
+                // Enable reasoning for capable models
+                if (isReasoningModel) {
+                    requestBody.reasoning_effort = 'medium';
+                }
+
+                if (tools.length > 0) {
+                    requestBody.tools = tools;
+                    requestBody.tool_choice = 'auto';
+
+                    // Enable parallel tool calls when the swarm phase is configured for parallel execution
+                    if (isSwarm && swarm.phases?.[currentPhaseIndex]?.parallel) {
+                        requestBody.parallel_tool_calls = true;
+                        console.log(`[AgentRuntime] ⚡ Parallel tool calls enabled for phase "${swarm.phases[currentPhaseIndex].name}"`);
+                    }
+                }
+
+                // Debug logging: what is being sent to the LLM
+                console.log(`[AgentRuntime] Request to LLM:`, {
+                    agentId,
+                    model: modelToUse,
+                    toolsCount: tools.length,
+                    toolNames: tools.map(t => t.function?.name),
+                    systemPromptPreview: effectiveSystemPrompt.substring(0, 200) + '...'
+                });
+
+                const response = await fetch(`${apiUrl}/chat/completions`, {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify(requestBody),
+                    signal: signal || undefined
+                });
+
+                if (!response.ok) {
+                    const error = await response.text();
+                    throw new Error(`API error ${response.status}: ${error}`);
+                }
+
+                // Parse SSE stream
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || '';
+
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            const data = line.slice(6);
+                            if (data === '[DONE]') continue;
+
+                            try {
+                                const parsed = JSON.parse(data);
+
+                                // Capture usage from final streaming chunk
+                                if (parsed.usage) {
+                                    await usageStore.logUsage({
+                                        user_id: userId,
+                                        agent_id: agentId,
+                                        agent_name: agent.name,
+                                        agent_type: isSwarm ? 'swarm' : 'chat',
+                                        model: modelToUse,
+                                        prompt_tokens: parsed.usage.prompt_tokens || 0,
+                                        completion_tokens: parsed.usage.completion_tokens || 0,
+                                        total_tokens: parsed.usage.total_tokens || 0,
+                                        source: isSwarm ? 'swarm_orchestrator' : 'agent_stream',
+                                        duration_ms: Date.now() - _streamCallStart,
+                                        organization_id: agent.organization_id || null,
+                                        conversation_id: conversation?.id || null
+                                    });
+                                }
+
+                                const delta = parsed.choices?.[0]?.delta;
+
+                                if (delta?.content !== undefined && delta?.content !== null) {
+                                    // Handle reasoning models: delta.content can be a string OR an object
+                                    let textChunk = '';
+                                    if (typeof delta.content === 'string') {
+                                        textChunk = delta.content;
+                                    } else if (Array.isArray(delta.content)) {
+                                        // Reasoning model — array of structured chunks
+                                        // Format: [{type: "thinking", thinking: [{type: "text", text: "..."}]}]
+                                        for (const chunk of delta.content) {
+                                            if (chunk.type === 'thinking' && Array.isArray(chunk.thinking)) {
+                                                const thinkText = chunk.thinking
+                                                    .filter(t => t.type === 'text' && t.text)
+                                                    .map(t => t.text)
+                                                    .join('');
+                                                if (thinkText) {
+                                                    if (isSwarm) {
+                                                        onEvent('orchestrator_thinking', { text: thinkText });
+                                                    } else {
+                                                        onEvent('thinking', { text: thinkText });
+                                                    }
+                                                }
+                                            } else if (chunk.type === 'text' && chunk.text) {
+                                                textChunk += chunk.text;
+                                            }
+                                        }
+                                        if (!textChunk) continue; // Only thinking chunks — skip content processing
+                                    }
+
+                                    if (textChunk) {
+                                        contentBuffer += textChunk;
+
+                                        // Real-time Agent Output validation - check as we stream
+                                        if (regexConfig?.enabled && regexConfig?.scope?.agentOutput) {
+                                            const matches = checkRegexPatterns(contentBuffer, regexConfig.rulesWithNames);
+                                            if (matches.length > 0) {
+                                                const ruleNames = matches.map(m => m.ruleName).join(', ');
+                                                console.log(`[RegexGuard] Agent output violated rules during stream: ${ruleNames}`);
+                                                // Cancel remaining stream and send redacted message
+                                                contentBuffer = `I apologize, but I cannot provide that response as it contains content that violates the ${ruleNames} policy.`;
+                                                onEvent('content_replace', { text: contentBuffer }); // Replace all content
+                                                guardrailViolation = ruleNames; // Mark as violation
+                                                reader.cancel(); // Cancel the stream
+                                                break;
+                                            }
+                                        }
+                                        // Stream content to user (suppress during swarm phases — workers handle output)
+                                        if (!isSwarm) {
+                                            onEvent('content', { text: textChunk });
+                                        } else {
+                                            // In swarm mode, emit orchestrator text as thinking so the UI can show it
+                                            onEvent('orchestrator_thinking', { text: textChunk });
+                                        }
+                                    }
+                                }
+
+                                // Handle tool calls in streaming
+                                if (delta?.tool_calls) {
+                                    for (const tc of delta.tool_calls) {
+                                        const idx = tc.index;
+                                        if (!currentToolCalls[idx]) {
+                                            currentToolCalls[idx] = {
+                                                id: tc.id || '',
+                                                function: { name: '', arguments: '' }
+                                            };
+                                        }
+                                        if (tc.id) currentToolCalls[idx].id = tc.id;
+                                        if (tc.function?.name) currentToolCalls[idx].function.name += tc.function.name;
+                                        if (tc.function?.arguments) currentToolCalls[idx].function.arguments += tc.function.arguments;
+                                    }
+                                }
+                            } catch (e) {
+                                // Skip parse errors
+                            }
+                        }
+                    }
+                }
+            } // end else (raw fetch SSE)
+
+            // Check if we have tool calls to execute
+            if (currentToolCalls.length > 0 && currentToolCalls[0]?.function?.name) {
+                // Clear intermediate planning text from the UI — only the final response
+                // (from the last iteration without tool calls) should be visible to the user
+                if (contentBuffer && !isSwarm) {
+                    onEvent('content_replace', { text: '' });
+                }
+
+                const assistantMessage = {
+                    role: 'assistant',
+                    content: contentBuffer || null,
+                    tool_calls: currentToolCalls.map(tc => ({
+                        id: tc.id,
+                        type: 'function',
+                        function: tc.function,
+                        // Preserve thought_signature for Gemini multi-turn tool calls
+                        _thought_signature: tc._thought_signature || undefined
+                    }))
+                };
+                messages.push(assistantMessage);
+
+                // In the last phase, only execute the FIRST worker_* call to avoid duplicates
+                // (the LLM sometimes issues parallel calls to the same worker)
+                let effectiveToolCalls = currentToolCalls;
+                if (isSwarm && currentPhaseIndex === totalPhases - 1) {
+                    let firstWorkerSeen = false;
+                    effectiveToolCalls = currentToolCalls.filter(tc => {
+                        if (tc.function?.name?.startsWith('worker_')) {
+                            if (firstWorkerSeen) {
+                                console.log(`[AgentRuntime] ⚠️ Last phase: skipping duplicate worker call "${tc.function.name}"`);
+                                return false;
+                            }
+                            firstWorkerSeen = true;
+                        }
+                        return true;
+                    });
+                }
+
+                // Check abort before tool execution
+                if (signal?.aborted) {
+                    console.log('[AgentRuntime] Aborting before tool execution — client disconnected');
+                    break;
+                }
+
+                // Execute all tools in parallel
+                const toolExecutionPromises = effectiveToolCalls.map(async (toolCall) => {
+                    const toolName = toolCall.function.name;
+                    let toolArgs = {};
+                    try {
+                        toolArgs = JSON.parse(toolCall.function.arguments || '{}');
+                    } catch (e) {
+                        toolArgs = {};
+                    }
+
+                    const fixedParams = toolParamsMap[toolName] || null;
+                    console.log(`[AgentRuntime] Tool lookup: ${toolName}, found fixedParams:`, fixedParams);
+                    onEvent('tool_start', { name: toolName, args: toolArgs });
+
+                    // Phase boundary enforcement: reject worker calls not in current phase
+                    if (isSwarm && toolName.startsWith('worker_')) {
+                        const allowedToolNames = tools.map(t => t.function?.name);
+                        if (!allowedToolNames.includes(toolName)) {
+                            const phaseName = swarm.phases[currentPhaseIndex]?.name || `Phase ${currentPhaseIndex + 1}`;
+                            console.log(`[AgentRuntime] ⛔ Blocked worker call "${toolName}" — not available in current phase "${phaseName}". Allowed: [${allowedToolNames.join(', ')}]`);
+                            onEvent('tool_end', { name: toolName, result: `[Blocked: ${toolName} is not available in the current phase "${phaseName}"]` });
+                            return {
+                                toolCall,
+                                toolName,
+                                toolArgs,
+                                finalToolResult: `Error: ${toolName} is not available in the current phase "${phaseName}". Only use the workers provided for this phase.`,
+                                blocked: true
+                            };
+                        }
+
+                        // RunOnce enforcement: block duplicate worker calls in the same phase
+                        const currentPhase = swarm.phases[currentPhaseIndex];
+                        if (currentPhase?.runOnce && calledWorkersInPhase.has(toolName)) {
+                            const phaseName = currentPhase.name || `Phase ${currentPhaseIndex + 1}`;
+                            console.log(`[AgentRuntime] ⛔ Blocked duplicate worker call "${toolName}" — runOnce enabled for phase "${phaseName}"`);
+                            onEvent('tool_end', { name: toolName, result: `[Blocked: ${toolName} already executed in this phase (run-once mode)]` });
+                            return {
+                                toolCall,
+                                toolName,
+                                toolArgs,
+                                finalToolResult: `Error: ${toolName} has already been called in this phase. Each worker can only be called once in "${phaseName}". Move on to the next phase.`,
+                                blocked: true
+                            };
+                        }
+
+                        // Track the worker call
+                        calledWorkersInPhase.add(toolName);
+                    }
+
+                    // Regex Guardrails - Tool Input scope
+                    if (regexConfig?.enabled && regexConfig?.scope?.toolInput) {
+                        const matches = checkRegexPatterns(JSON.stringify(toolArgs), regexConfig.rulesWithNames);
+                        if (matches.length > 0) {
+                            const ruleNames = matches.map(m => m.ruleName).join(', ');
+                            console.log(`[RegexGuard] Tool input violated rules: ${ruleNames}`);
+                            onEvent('tool_end', { name: toolName, result: `[Tool input blocked - violates ${ruleNames} policy]` });
+                            return {
+                                toolCall,
+                                toolName,
+                                toolArgs,
+                                finalToolResult: `[Tool input blocked - violates ${ruleNames} policy]`,
+                                blocked: true
+                            };
+                        }
+                    }
+
+                    // Web Search Guard — validate agent_search queries through Llama Guard
+                    if (webSearchGuardEnabled && toolName === 'agent_search' && toolArgs?.query) {
+                        try {
+                            const searchMessages = [{ role: 'user', content: toolArgs.query }];
+                            await validateWithLlamaGuard(searchMessages, true, orgShieldCategories);
+                            console.log(`[WebSearchGuard] Search query passed: "${toolArgs.query.substring(0, 80)}"`);
+                        } catch (guardError) {
+                            console.log(`[WebSearchGuard] Search query BLOCKED: "${toolArgs.query.substring(0, 80)}" — ${guardError.message}`);
+                            onEvent('tool_end', { name: toolName, result: `[Web search blocked — query violates content policy]` });
+                            return {
+                                toolCall,
+                                toolName,
+                                toolArgs,
+                                finalToolResult: `[Web search blocked — the search query "${toolArgs.query}" was flagged by the safety guard. Please rephrase or use a different approach.]`,
+                                blocked: true
+                            };
+                        }
+                    }
+
+                    let toolResult;
+                    if (toolName === 'sequentialthinking') {
+                        toolResult = executeSequentialThinking(toolArgs, `${agentId}-${conversation.id}`);
+                    } else if (isSwarm && toolName.startsWith('worker_')) {
+                        toolResult = await executeWorkerTool(toolName, toolArgs, agentId, userAuth, onEvent, brain, signal);
+                    } else {
+                        // Use unified tool dispatcher — supports integrations + components
+                        const { executeTool: dispatchTool } = require('./toolDispatcher');
+                        toolResult = await dispatchTool(toolName, toolArgs, {
+                            userId,
+                            session: userAuth?.session,
+                            userAuth,
+                            fixedParams: fixedParams,
+                            agentId: agent.id,
+                            conversationId: conversation.id,
+                            send: onEvent,
+                            req: messageMetadata.req || null,
+                            nanoBananaSettings: messageMetadata.nanoBananaSettings || null,
+                            onImageGenerated: (data) => {
+                                onEvent('image', data);
+                            },
+                        });
+                    }
+
+                    // Regex Guardrails - Tool Output scope
+                    let finalToolResult = toolResult;
+                    if (regexConfig?.enabled && regexConfig?.scope?.toolOutput) {
+                        const matches = checkRegexPatterns(JSON.stringify(toolResult), regexConfig.rulesWithNames);
+                        if (matches.length > 0) {
+                            const ruleNames = matches.map(m => m.ruleName).join(', ');
+                            console.log(`[RegexGuard] Tool output violated rules: ${ruleNames}`);
+                            finalToolResult = `[Tool output redacted - contains ${ruleNames} content]`;
+                        }
+                    }
+
+                    return {
+                        toolCall,
+                        toolName,
+                        toolArgs,
+                        finalToolResult,
+                        blocked: false
+                    };
+                });
+
+                // Wait for all tools to complete
+                console.log(`[AgentRuntime] Executing ${currentToolCalls.length} tools in parallel...`);
+                const toolResults = await Promise.all(toolExecutionPromises);
+
+                // Check if any worker directly streamed to the user
+                const directStreamResult = toolResults.find(r =>
+                    r.finalToolResult && typeof r.finalToolResult === 'object' && r.finalToolResult.__direct_streamed__
+                );
+
+                if (directStreamResult) {
+                    // The last worker already streamed directly to the user
+                    // Save the conversation with the streamed content as the assistant response
+                    fullResponse = directStreamResult.finalToolResult.content;
+                    console.log(`[AgentRuntime] Worker streamed directly to user (${fullResponse.length} chars) — skipping orchestrator synthesis`);
+
+                    // Add the assistant message with the streamed content
+                    const directStreamMsg = {
+                        role: 'assistant',
+                        content: fullResponse,
+                        parentId: messageMetadata.parentId || null
+                    };
+                    // Attach swarm execution history if available
+                    if (isSwarm && (swarmLogs.length > 0 || swarmBrain.length > 0)) {
+                        directStreamMsg.swarmActivity = {
+                            type: 'swarm',
+                            logs: swarmLogs,
+                            brain: swarmBrain
+                        };
+                        console.log(`[AgentRuntime] Persisting swarm activity: ${swarmLogs.length} logs, ${swarmBrain.length} brain entries`);
+                    }
+                    messages.push(directStreamMsg);
+                    await agentStore.updateConversation(conversation.id, messages, userAuth.encryptionKey, userAuth.userId);
+
+                    // Note: 'done' event will be sent by the route handler when chatWithAgentStream returns
+                    break; // Exit the orchestrator loop
+                }
+
+                // Process results in order (normal path)
+                for (const result of toolResults) {
+                    const { toolCall, toolName, toolArgs, finalToolResult } = result;
+
+                    toolCalls.push({ name: toolName, args: toolArgs, result: finalToolResult });
+                    // Sanitize tool result before streaming to client to prevent API key exposure
+                    onEvent('tool_end', { name: toolName, result: sanitizeToolResult(finalToolResult) });
+
+                    // Emit email_draft SSE event for user approval
+                    if (finalToolResult?._action === 'email_draft') {
+                        onEvent('email_draft', finalToolResult.draft);
+                        _emailDrafts.push({ ...finalToolResult.draft, status: 'pending' });
+                    }
+                    // Emit linkedin_draft SSE event for user approval
+                    if (finalToolResult?._action === 'linkedin_draft') {
+                        onEvent('linkedin_draft', finalToolResult.draft);
+                        _linkedInDrafts.push({ ...finalToolResult.draft, status: 'pending' });
+                    }
+                    // Emit whatsapp_draft SSE event for user approval
+                    if (finalToolResult?._action === 'whatsapp_draft') {
+                        onEvent('whatsapp_draft', finalToolResult.draft);
+                    }
+                    // Emit sheets_result SSE event for visual card
+                    if (finalToolResult?._action === 'sheets_result') {
+                        onEvent('sheets_result', finalToolResult._sheetsData);
+                        _sheetsResults.push(finalToolResult._sheetsData);
+                    }
+                    // Emit sheets_draft SSE event for user approval
+                    if (finalToolResult?._action === 'sheets_draft') {
+                        onEvent('sheets_draft', finalToolResult._sheetsDraft);
+                        _sheetsDrafts.push({ ...finalToolResult._sheetsDraft, status: 'pending' });
+                    }
+                    // Emit sheets_report SSE event for report/dashboard view
+                    if (finalToolResult?._action === 'sheets_report') {
+                        onEvent('sheets_report', finalToolResult._sheetsReport);
+                        _sheetsReports.push(finalToolResult._sheetsReport);
+                    }
+
+                    // Emit map_embed SSE event so map renders persist on messages
+                    if (finalToolResult?._action === 'map_embed' && finalToolResult._mapEmbed) {
+                        onEvent('map_embed', finalToolResult._mapEmbed);
+                        _mapEmbeds.push(finalToolResult._mapEmbed);
+                    }
+
+                    // Emit workspace_update SSE event so frontend updates panel
+                    if (finalToolResult?._action === 'workspace_update') {
+                        onEvent('workspace_update', { content: finalToolResult.content });
+                    }
+
+                    // Emit kb_sources SSE event so frontend shows knowledge base sources
+                    if (finalToolResult?._action === 'kb_sources' && finalToolResult._sources?.length > 0) {
+                        onEvent('kb_sources', { sources: finalToolResult._sources });
+                    }
+
+                    // Track audio files for persistence (sent via SSE by the tool)
+                    if (finalToolResult?.audioUrl) {
+                        _audioFiles.push({ url: finalToolResult.audioUrl, source: toolName });
+                    }
+
+                    // Log tool usage
+                    try {
+                        await usageStore.logUsage({
+                            user_id: userId,
+                            agent_id: agentId,
+                            agent_name: agent.name,
+                            agent_type: isSwarm ? 'swarm' : 'chat',
+                            model: modelToUse,
+                            tool_name: toolName,
+                            source: isSwarm ? 'swarm_orchestrator' : 'agent_chat',
+                            organization_id: agent.organization_id || null,
+                            conversation_id: conversation?.id || null,
+                        });
+                    } catch (e) { /* ignore */ }
+
+                    messages.push({
+                        role: 'tool',
+                        tool_call_id: toolCall.id,
+                        content: typeof finalToolResult === 'string' ? finalToolResult : JSON.stringify(finalToolResult)
+                    });
+                }
+
+                // In the LAST phase: ANY worker call produces the final output
+                // Break immediately — don't let the orchestrator add meta-commentary
+                if (isSwarm && currentPhaseIndex === totalPhases - 1) {
+                    const workerResult = toolResults.find(r => r.toolName?.startsWith('worker_') && !r.blocked);
+                    if (workerResult) {
+                        const lastPhase = swarm.phases[currentPhaseIndex];
+                        const workerName = workerResult.toolName.replace('worker_', '');
+                        console.log(`[AgentRuntime] 🐝 Final phase worker "${workerResult.toolName}" completed — using as final output`);
+                        fullResponse = typeof workerResult.finalToolResult === 'string'
+                            ? workerResult.finalToolResult
+                            : JSON.stringify(workerResult.finalToolResult);
+
+                        // Stream the worker's result to the user
+                        onEvent('content', { text: fullResponse });
+                        onEvent('worker_complete', { worker: workerName, result: fullResponse.slice(0, 100) + '...' });
+
+                        // Save conversation and break
+                        const finalMsg = {
+                            role: 'assistant',
+                            content: fullResponse,
+                            parentId: messageMetadata.parentId || null
+                        };
+                        if (swarmLogs.length > 0 || swarmBrain.length > 0) {
+                            finalMsg.swarmActivity = {
+                                type: 'swarm',
+                                logs: swarmLogs,
+                                brain: swarmBrain
+                            };
+                        }
+                        messages.push(finalMsg);
+                        await agentStore.updateConversation(conversation.id, messages, userAuth.encryptionKey, userAuth.userId);
+                        break; // Exit the orchestrator loop
+                    }
+                }
+
+                // Save conversation after tool execution (so tool calls are persisted)
+                console.log('[AgentStream] Saving conversation with tool calls:', JSON.stringify(messages.slice(-3), null, 2));
+                await agentStore.updateConversation(conversation.id, messages, userAuth.encryptionKey, userAuth.userId);
+                continue;
+            }
+
+            // No tool calls — check if swarm phase is complete
+            if (isSwarm && currentPhaseIndex < totalPhases - 1) {
+                // Phase complete but NOT the last phase — advance to next phase
+                const phaseSummary = contentBuffer;
+                const phaseName = swarm.phases[currentPhaseIndex]?.name || `Phase ${currentPhaseIndex + 1}`;
+                phaseResults.push(phaseSummary);
+                console.log(`[AgentRuntime] ✅ Phase "${phaseName}" complete (${phaseSummary.length} chars). Advancing to phase ${currentPhaseIndex + 2}/${totalPhases}`);
+
+                // Add phase summary to Hive Mind so later workers can access it
+                if (brain && phaseSummary.trim()) {
+                    brain.addEntry(`Orchestrator`, `Phase "${phaseName}" summary: ${phaseSummary}`);
+                    onEvent('brain_update', {
+                        worker: 'Orchestrator',
+                        phase: phaseName,
+                        content: phaseSummary
+                    });
+                }
+
+                // Emit phase completion event
+                onEvent('phase', { phase: phaseName, message: `Phase complete: ${phaseName}`, status: 'complete' });
+
+                currentPhaseIndex++;
+                calledWorkersInPhase.clear(); // Reset worker tracking for the new phase
+                const nextPhaseName = swarm.phases[currentPhaseIndex]?.name || `Phase ${currentPhaseIndex + 1}`;
+
+                // Emit next phase start event
+                onEvent('phase', { phase: nextPhaseName, message: `Starting phase: ${nextPhaseName}` });
+
+                // For the last phase, also emit worker_start so the UI shows which agent will respond
+                if (currentPhaseIndex === totalPhases - 1) {
+                    const lastPhase = swarm.phases[currentPhaseIndex];
+                    const lastAgent = lastPhase?.agents?.[lastPhase.agents.length - 1];
+                    if (lastAgent) {
+                        onEvent('worker_start', {
+                            worker: lastAgent.name,
+                            role: lastAgent.role,
+                            phase: nextPhaseName,
+                            message: `${lastAgent.name} is preparing the final response...`
+                        });
+                    }
+                }
+
+                // Trim conversation to prevent cross-phase context bleed
+                // Keep only the original user message(s) and add a compact transition
+                const originalMessages = messages.filter(m => m.role === 'user' && !m.content?.startsWith('Previous phases'));
+                messages.length = 0;
+                messages.push(...originalMessages);
+
+                // Inject Hive Mind context so the orchestrator can see all findings
+                const hiveMindContext = brain && brain.size > 0 ? `\n\n${brain.toPromptContext()}` : '';
+                messages.push({
+                    role: 'user',
+                    content: `Previous phases complete.${hiveMindContext}\n\nBegin phase "${nextPhaseName}" now. Use only the workers provided.`
+                });
+
+                // Reset content buffer for next phase
+                fullResponse = '';
+                continue;
+            }
+
+            // Final response (last phase or non-swarm)
+            if (isSwarm && currentPhaseIndex === totalPhases - 1) {
+                // Last phase: orchestrator didn't call the worker — force-call it
+                const lastPhase = swarm.phases[currentPhaseIndex];
+                const lastAgent = lastPhase?.agents?.[lastPhase.agents.length - 1];
+                const lastWorkerKey = lastAgent?.role || lastAgent?.name?.toLowerCase().replace(/\s+/g, '_');
+
+                if (lastAgent && lastWorkerKey) {
+                    console.log(`[AgentRuntime] 🐝 Orchestrator didn't call last worker "${lastAgent.name}" — force-invoking it`);
+
+                    // Emit worker attribution
+                    onEvent('worker_start', {
+                        worker: lastAgent.name,
+                        role: lastAgent.role,
+                        phase: lastPhase.name,
+                        message: `${lastAgent.name} is preparing the final response...`
+                    });
+
+                    // Use orchestrator's output as instruction for the last worker
+                    const workerResult = await executeWorkerTool(
+                        `worker_${lastWorkerKey}`,
+                        { instruction: contentBuffer || 'Produce the final comprehensive response based on all Hive Mind findings.' },
+                        agentId,
+                        userAuth,
+                        onEvent,
+                        brain,
+                        signal
+                    );
+
+                    if (workerResult && typeof workerResult === 'object' && workerResult.__direct_streamed__) {
+                        fullResponse = workerResult.content;
+                        onEvent('worker_complete', { worker: lastAgent.name, result: '(streamed directly to user)' });
+                    } else {
+                        fullResponse = typeof workerResult === 'string' ? workerResult : JSON.stringify(workerResult);
+                        // Stream the worker's response to the user
+                        onEvent('content', { text: fullResponse });
+                        onEvent('worker_complete', { worker: lastAgent.name, result: fullResponse.slice(0, 100) + '...' });
+                    }
+                } else {
+                    // Fallback: no last agent found, use orchestrator's response
+                    fullResponse = contentBuffer;
+                }
+            } else {
+                fullResponse = contentBuffer;
+            }
+
+            // Strip raw tool-call XML tags from the response — some models (e.g. Mistral thinking)
+            // output <tool_call>/<tool_response> as plain text instead of structured function calls
+            if (fullResponse) {
+                const originalLen = fullResponse.length;
+                fullResponse = fullResponse
+                    .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '')
+                    .replace(/<tool_response>[\s\S]*?<\/tool_response>/g, '')
+                    .replace(/<tool_calls>[\s\S]*?<\/tool_calls>/g, '')
+                    .replace(/<tool_results>[\s\S]*?<\/tool_results>/g, '')
+                    .trim();
+                if (fullResponse.length !== originalLen) {
+                    console.log(`[AgentRuntime] Stripped tool-call XML tags from response (${originalLen} → ${fullResponse.length} chars)`);
+                    // Replace the content in the UI with the cleaned version
+                    onEvent('content_replace', { text: fullResponse });
+                }
+            }
+
+            // Agent Output — AI Content Moderation (Guard Service)
+            // Regex guards are checked in real-time during streaming above;
+            // the Guard Service check runs post-stream on the full response.
+            if (fullResponse && !moderationViolation && !guardrailViolation) {
+                // Resolve org moderation scope for output check
+                const orgModerationEnabled = agent.organization_id
+                    ? await (async () => {
+                        const shield = await configStore.getConfig(`org_privacy_shield_${agent.organization_id}`);
+                        return shield?.enabled && shield?.moderationEnabled;
+                    })()
+                    : false;
+                const orgModerationScope = agent.organization_id
+                    ? await (async () => {
+                        const shield = await configStore.getConfig(`org_privacy_shield_${agent.organization_id}`);
+                        return shield?.enabled ? (shield.scope || { userInput: true, agentOutput: true }) : { userInput: true, agentOutput: true };
+                    })()
+                    : { userInput: true, agentOutput: true };
+                const outputModerationEnabled = (orgModerationEnabled && orgModerationScope.agentOutput) ||
+                    agent.config?.llamaGuardEnabled || globalConfig?.llamaGuardConfig?.enabled;
+
+                if (outputModerationEnabled) {
+                    try {
+                        const outputMessages = [{ role: 'assistant', content: fullResponse }];
+                        await validateWithLlamaGuard(outputMessages, true, orgShieldCategories);
+                        console.log(`[AgentRuntime] AI moderation passed (agent output)`);
+                    } catch (guardError) {
+                        if (guardError.violationCodes) {
+                            let violationLabels = guardError.violationCodes;
+                            try {
+                                const parsed = JSON.parse(guardError.outcome);
+                                violationLabels = parsed.map(f => f.label || f.category);
+                            } catch (e) { /* use codes as-is */ }
+                            console.log(`[AgentRuntime] Agent output moderation violation: ${violationLabels.join(', ')}`);
+                            fullResponse = `⚠️ This response was blocked by content moderation (${violationLabels.join(', ')}). The AI's response contained content that violates organization safety policies.`;
+                            onEvent('content_replace', { text: fullResponse });
+                            moderationViolation = violationLabels.join(', ');
+                        }
+                    }
+                }
+            }
+
+            // Include parentId for thread persistence
+            const assistantMsg = {
+                role: 'assistant',
+                content: fullResponse,
+                parentId: messageMetadata.parentId || null
+            };
+
+            // Attach persisted metadata
+            if (_emailDrafts.length > 0) assistantMsg.emailDrafts = _emailDrafts;
+            if (_linkedInDrafts.length > 0) assistantMsg.linkedInDrafts = _linkedInDrafts;
+            if (_sheetsResults.length > 0) assistantMsg.sheetsResults = _sheetsResults;
+            if (_sheetsDrafts.length > 0) assistantMsg.sheetsDrafts = _sheetsDrafts;
+            if (_sheetsReports.length > 0) assistantMsg.sheetsReports = _sheetsReports;
+            if (_mapEmbeds.length > 0) assistantMsg.mapEmbeds = _mapEmbeds;
+            if (_audioFiles.length > 0) assistantMsg.audioFiles = _audioFiles;
+
+            // Emit phase completion for the last phase
+            if (isSwarm && swarm.phases?.length > 0) {
+                const lastPhaseName = swarm.phases[currentPhaseIndex]?.name || `Phase ${currentPhaseIndex + 1}`;
+                onEvent('phase', { phase: lastPhaseName, message: `Phase complete: ${lastPhaseName}`, status: 'complete' });
+            }
+
+            // Attach swarm execution history if available
+            if (isSwarm && (swarmLogs.length > 0 || swarmBrain.length > 0)) {
+                assistantMsg.swarmActivity = {
+                    type: 'swarm',
+                    logs: swarmLogs,
+                    brain: swarmBrain
+                };
+                console.log(`[AgentRuntime] Persisting swarm activity: ${swarmLogs.length} logs, ${swarmBrain.length} brain entries`);
+            }
+            messages.push(assistantMsg);
+            if (!isEphemeral) {
+                await agentStore.updateConversation(conversation.id, messages, userAuth.encryptionKey, userAuth.userId);
+            }
+
+            // ============ MEMORY EXTRACTION ============
+            // Skip memory extraction if ephemeral, guardrail violation, or redaction occurred
+            if (!isEphemeral && !agent.embed_enabled) {
+                const shouldSkipMemoryExtraction = guardrailViolation || processedUserMessage !== userMessage;
+
+                const debugData = {
+                    agentId,
+                    conversationId: conversation.id,
+                    guardrailViolation: !!guardrailViolation,
+                    isRedacted: processedUserMessage !== userMessage,
+                    shouldSkip: shouldSkipMemoryExtraction,
+                    messagesCount: messages.length,
+                    userMessageLength: userMessage.length
+                };
+                console.log(`[DEBUG] Memory Extraction Check:`, debugData);
+
+
+                if (!shouldSkipMemoryExtraction) {
+                    try {
+                        const memoryExtractor = require('../agents/memory/extractor');
+                        memoryExtractor.extractFromConversation(userId, agentId, messages, conversation.id, extractMemoriesEnabled ? validProjectId : null)
+                            .then(extracted => {
+
+                                if (extracted.length > 0) {
+                                    console.log(`[AgentRuntime] Extracted ${extracted.length} memories from conversation`);
+                                }
+                            })
+                            .catch(err => {
+                                console.error('[AgentRuntime] Memory extraction failed:', err.message);
+
+                            });
+                    } catch (memErr) {
+                        console.error('[AgentRuntime] Memory extractor load failed:', memErr.message);
+
+                    }
+                } else {
+                    console.log('[AgentRuntime] Skipping memory extraction due to guardrail violation or redaction');
+
+                }
+            }
+
+            // ============ SERVER-SIDE PERSISTENCE FOR REDACTION ============
+            // Schedule server-side persistence for both delete mode (guardrailViolation) and redact mode (processedUserMessage changed)
+            // Skip for ephemeral embed chats
+            if (!isEphemeral) {
+                const needsServerPersistence = guardrailViolation || processedUserMessage !== userMessage;
+                if (needsServerPersistence) {
+                    const redactedContent = processedUserMessage !== userMessage
+                        ? processedUserMessage  // Use redacted version (with [REDACTED: RuleName])
+                        : '[Message removed - policy violation]';  // Full replacement for delete mode
+
+                    setTimeout(async () => {
+                        try {
+                            const conv = await agentStore.getConversationById(conversation.id, userAuth.encryptionKey);
+                            if (conv && conv.messages) {
+                                const updatedMessages = conv.messages.map((m, idx) => {
+                                    if (m.role === 'user' && idx === conv.messages.length - 2) {
+                                        return { ...m, content: redactedContent, isRedacted: true };
+                                    }
+                                    return m;
+                                });
+                                await agentStore.updateConversation(conversation.id, updatedMessages, userAuth.encryptionKey, userAuth.userId);
+                                console.log(`[RegexGuard] Server-side persistence completed for conversation ${conversation.id}`);
+                            }
+                        } catch (redactErr) {
+                            console.error('[RegexGuard] Server-side persistence failed:', redactErr.message);
+                        }
+                    }, 5000);
+                }
+            }
+
+            return {
+                message: fullResponse,
+                toolCalls,
+                conversationLength: messages.length,
+                conversationId: conversation.id,
+                guardrailViolation: guardrailViolation || null,
+                model: modelToUse
+            };
+        } catch (error) {
+            console.error('[Agent Stream] Error:', error);
+            throw error;
+        }
+    }
+
+    // If we broke out of the loop with a valid response (last-phase worker path), return it
+    if (fullResponse) {
+        // Memory extraction for the break path
+        // Extract memories from the conversation (skip for ephemeral/embed chats)
+        if (!isEphemeral && !agent.embed_enabled) {
+            try {
+                const shouldSkipMemoryExtraction = guardrailViolation || processedUserMessage !== userMessage;
+                if (!shouldSkipMemoryExtraction) {
+                    const memoryExtractor = require('../agents/memory/extractor');
+
+                    memoryExtractor.extractFromConversation(userId, agentId, messages, conversation.id, extractMemoriesEnabled ? validProjectId : null)
+                        .catch(err => {
+
+                        });
+                } else {
+
+                }
+            } catch (e) { /* ignore */ }
+        }
+
+        return {
+            message: fullResponse,
+            toolCalls,
+            conversationLength: messages.length,
+            conversationId: conversation.id,
+            guardrailViolation: guardrailViolation || null,
+            model: modelToUse
+        };
+    }
+
+    throw new Error('Agent exceeded maximum tool call iterations');
+}
+
+module.exports = { chatWithAgentStream };
