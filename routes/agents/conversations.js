@@ -20,7 +20,7 @@ const { requirePermission } = require('../../auth');
 const MemoryStore = require('../../stores/memoryStore');
 const { resolveUserOrgIds } = require('../../auth');
 const { getEffectiveUserId, getUserAuth } = require('../../utils/routeHelpers');
-const { chatCompletion } = require('../../core/llmClient');
+
 const userStore = require('../../stores/userStore');
 const usageStore = require('../../stores/usageStore');
 const { checkSubscriptionLimits: checkSubLimits, checkResourceLimits } = require('../../core/limits');
@@ -80,7 +80,7 @@ router.get('/:id/conversations/:convId', async (req, res) => {
     res.json(conversation);
 });
 
-// Update conversation title
+// Update conversation title / pin / labels
 router.patch('/:id/conversations/:convId', async (req, res) => {
     const userId = getEffectiveUserId(req);
     const conversation = await agentStore.getConversationById(req.params.convId, req.session?.encryptionKey);
@@ -89,9 +89,15 @@ router.patch('/:id/conversations/:convId', async (req, res) => {
         return res.status(404).json({ error: 'Conversation not found' });
     }
 
-    const { title } = req.body;
-    if (title) {
+    const { title, pinned, labels } = req.body;
+    if (title !== undefined) {
         await agentStore.updateConversationTitle(req.params.convId, title);
+    }
+    if (pinned !== undefined) {
+        await agentStore.pinConversation(req.params.convId, pinned);
+    }
+    if (labels !== undefined) {
+        await agentStore.setConversationLabels(req.params.convId, labels);
     }
     res.json({ success: true });
 });

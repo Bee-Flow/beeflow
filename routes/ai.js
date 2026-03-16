@@ -15,6 +15,7 @@ const agentChatRoutes = require('./ai/agentChat');
 const directChatRoutes = require('./ai/directChat');
 const designerRoutes = require('./ai/designer');
 const researchRoutes = require('./ai/research');
+const templateChatRoutes = require('./ai/templateChat');
 
 // Mount all sub-routes
 router.use('/', configRoutes);
@@ -23,5 +24,6 @@ router.use('/', agentChatRoutes);
 router.use('/', directChatRoutes);
 router.use('/', designerRoutes);
 router.use('/', researchRoutes);
+router.use('/', templateChatRoutes);
 
 module.exports = router;

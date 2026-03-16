@@ -54,15 +54,17 @@ class LLMClient {
     async generateTitle(modelId, userMessage, systemPrompt, options = {}) {
         const messages = [
             { role: 'system', content: systemPrompt || 'Generate a short 2-4 word title for this conversation. Output only the title.' },
-            { role: 'user', content: userMessage },
+            { role: 'user', content: typeof userMessage === 'string' ? userMessage.slice(0, 500) : JSON.stringify(userMessage).slice(0, 500) },
         ];
         const result = await this.chat(modelId, messages, {
-            maxTokens: 30,
+            maxTokens: 60,
             temperature: 0.3,
+            budgetTokens: 0,           // Disable thinking — title gen is trivial
+            reasoningEffort: 'none',   // Disable reasoning for OpenAI models too
             ...options,
         });
         const raw = result.content || '';
-        return raw.trim().replace(/["']/g, '') || 'New Chat';
+        return raw.trim().replace(/[\"']/g, '') || 'New Chat';
     }
 
     /**

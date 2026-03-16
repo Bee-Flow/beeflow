@@ -30,6 +30,18 @@ router.post('/deep-research', requireAuth, async (req, res) => {
     };
 
     try {
+        // Validate research query with Llama Guard
+        try {
+            const { validateWithLlamaGuard } = require('../../core/moderation');
+            await validateWithLlamaGuard([{ role: 'user', content: query }], true);
+        } catch (guardErr) {
+            if (guardErr.message?.includes('Safety Violation')) {
+                console.warn(`[DeepResearch] Query BLOCKED by moderation: ${guardErr.message}`);
+                return res.status(403).json({ error: 'Research query blocked by content safety. Please rephrase.' });
+            }
+            // Guard service unavailable — fail-open
+        }
+
         const report = await runDeepResearch(query, { model: req.body.model || null }, sendEvent);
 
         if (agentId) {

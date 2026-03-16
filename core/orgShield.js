@@ -50,6 +50,7 @@ async function resolveOrgShield(orgId) {
         scope: shield.scope || { userInput: true, agentOutput: true },
         action: shield.action || 'delete',
         webSearchGuardEnabled: !!shield.webSearchGuardEnabled,
+        disableSearchOnUpload: !!shield.disableSearchOnUpload,
     };
 }
 
@@ -88,7 +89,7 @@ function mergeWithOrgShield(orgConfig, localConfig) {
         toolOutput: !!(orgConfig.scope?.toolOutput || localConfig.scope?.toolOutput),
     };
 
-    return { enabled: true, rulesWithNames: mergedRules, scope, action, webSearchGuardEnabled: !!(orgConfig.webSearchGuardEnabled || localConfig.webSearchGuardEnabled) };
+    return { enabled: true, rulesWithNames: mergedRules, scope, action, webSearchGuardEnabled: !!(orgConfig.webSearchGuardEnabled || localConfig.webSearchGuardEnabled), disableSearchOnUpload: !!(orgConfig.disableSearchOnUpload || localConfig.disableSearchOnUpload) };
 }
 
 module.exports = { resolveOrgShield, mergeWithOrgShield };

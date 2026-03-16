@@ -78,7 +78,7 @@ router.get('/agents/:id/knowledge', async (req, res) => {
 
     if (!userId) return res.status(401).json({ error: 'Not authenticated' });
 
-    const ownership = verifyAgentOwnership(userId, agentId);
+    const ownership = await verifyAgentOwnership(userId, agentId);
     if (!ownership.ok) return res.status(ownership.status).json({ error: ownership.error });
 
     try {

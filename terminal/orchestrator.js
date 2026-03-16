@@ -16,8 +16,7 @@ const { processSystemPrompt } = require('../core/promptUtils');
 const { TERMINAL_TOOLS } = require('./tools');
 const { validateCommand } = require('./sandbox');
 const containerManager = require('./containerManager');
-const { SEQUENTIAL_THINKING_TOOL, executeSequentialThinking } = require('../core/sequentialThinkingTool');
-const { runPreThinking } = require('../core/preThinking');
+
 const { parseDocument, isSupportedDocument } = require('../core/documentParser');
 
 const DEFAULT_SYSTEM_PROMPT = require('fs').readFileSync(path.join(__dirname, 'system-prompt.md'), 'utf-8');
@@ -123,27 +122,8 @@ async function executeTerminalTask(agentId, userMessage, userAuth, onEvent = () 
     let actionsExecuted = 0;
     let finalResult = '';
 
-    // Build tool list — optionally include sequential thinking
-    let agentTools = agentConfig.config?.sequentialThinkingEnabled
-        ? [...TERMINAL_TOOLS, SEQUENTIAL_THINKING_TOOL]
-        : [...TERMINAL_TOOLS];
-
-    // ─── Pre-thinking with separate model ───
-    const thinkingModel = config.sequentialThinkingModel;
-    if (thinkingModel && config.sequentialThinkingEnabled) {
-        try {
-            const sessionId = `terminal-${agentId}-${containerKey}-pre`;
-            const { context } = await runPreThinking(thinkingModel, messages.slice(1), sessionId, onEvent, signal, systemPrompt);
-            if (context) {
-                // Inject reasoning context into system prompt
-                messages[0].content += context;
-                // Remove sequentialthinking from tool list to avoid double-thinking
-                agentTools = agentTools.filter(t => t.function?.name !== 'sequentialthinking');
-            }
-        } catch (err) {
-            console.error('[TerminalAgent PreThinking] Error:', err.message);
-        }
-    }
+    // Build tool list
+    let agentTools = [...TERMINAL_TOOLS];
 
     // ─── Agentic Loop ─────────────────────────────────────────
     for (let iteration = 0; iteration < maxIterations; iteration++) {
@@ -210,14 +190,7 @@ async function executeTerminalTask(agentId, userMessage, userAuth, onEvent = () 
 
             console.log(`[TerminalAgent] Tool call: ${fnName}`, args);
 
-            // ─── Handle sequentialthinking OUTSIDE the terminal ───
-            if (fnName === 'sequentialthinking') {
-                onEvent('tool_start', { name: 'sequentialthinking', args });
-                const thinkResult = executeSequentialThinking(args, `terminal-${containerKey}`);
-                onEvent('tool_end', { name: 'sequentialthinking', result: thinkResult });
-                messages.push({ role: 'tool', tool_call_id: toolCall.id, content: thinkResult });
-                continue; // Skip terminal execution path entirely
-            }
+
 
             onEvent('terminal_command', { tool: fnName, args });
 

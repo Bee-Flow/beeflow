@@ -20,7 +20,7 @@ const { requirePermission } = require('../../auth');
 const MemoryStore = require('../../stores/memoryStore');
 const { resolveUserOrgIds } = require('../../auth');
 const { getEffectiveUserId, getUserAuth } = require('../../utils/routeHelpers');
-const { chatCompletion } = require('../../core/llmClient');
+
 const userStore = require('../../stores/userStore');
 const usageStore = require('../../stores/usageStore');
 const { checkSubscriptionLimits: checkSubLimits, checkResourceLimits } = require('../../core/limits');

@@ -13,6 +13,7 @@ const directConversations = require('./agent/directConversations');
 const systemAgents = require('./agent/systemAgents');
 const swarmPipelineConfig = require('./agent/swarmPipelineConfig');
 const agentStats = require('./agent/agentStats');
+const conversationLabels = require('./agent/conversationLabels');
 
 module.exports = {
     // Agent CRUD
@@ -49,6 +50,8 @@ module.exports = {
     getConversationById: agentConversations.getConversationById,
     createConversation: agentConversations.createConversation,
     updateConversationTitle: agentConversations.updateConversationTitle,
+    pinConversation: agentConversations.pinConversation,
+    setConversationLabels: agentConversations.setConversationLabels,
     updateThreadTitles: agentConversations.updateThreadTitles,
     deleteConversationById: agentConversations.deleteConversationById,
     // System Agents
@@ -85,7 +88,14 @@ module.exports = {
     listDirectConversations: directConversations.listDirectConversations,
     updateDirectConversation: directConversations.updateDirectConversation,
     updateDirectConversationTitle: directConversations.updateDirectConversationTitle,
+    pinDirectConversation: directConversations.pinDirectConversation,
+    setDirectConversationLabels: directConversations.setDirectConversationLabels,
     deleteDirectConversation: directConversations.deleteDirectConversation,
     updateDirectConversationWorkspace: directConversations.updateDirectConversationWorkspace,
     getDirectConversationWorkspace: directConversations.getDirectConversationWorkspace,
+    // Conversation Labels
+    listLabels: conversationLabels.listLabels,
+    createLabel: conversationLabels.createLabel,
+    updateLabel: conversationLabels.updateLabel,
+    deleteLabel: conversationLabels.deleteLabel,
 };

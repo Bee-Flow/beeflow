@@ -17,6 +17,8 @@ const { isSlidesTool, executeSlidesTool } = require('../integrations/slidesTools
 const { isDriveTool, executeDriveTool } = require('../integrations/driveTools');
 const { isSheetsTool, executeSheetsTool } = require('../integrations/sheetsTools');
 const { isDocsTool, executeDocsTool } = require('../integrations/docsTools');
+const { isContactsTool, executeContactsTool } = require('../integrations/contactsTools');
+const { isKeepTool, executeKeepTool } = require('../integrations/keepTools');
 const { isFirefliesTool, executeFirefliesTool } = require('../integrations/firefliesTools');
 const { isYouTrackTool, executeYouTrackTool } = require('../integrations/youtrackTools');
 const { isGammaTool, executeGammaTool } = require('../integrations/gammaTools');
@@ -28,6 +30,12 @@ const { isKbSearchTool, executeKbSearchTool } = require('../integrations/kbSearc
 const { isMapsTool, executeMapsTool } = require('../integrations/mapsTools');
 const { isLinkedInTool, executeLinkedInTool } = require('../integrations/linkedinTools');
 const { isWhatsAppTool, executeWhatsAppTool } = require('../integrations/whatsappTools');
+const { isGitHubTool, executeGitHubTool } = require('../integrations/githubTools');
+const { isOutlookTool, executeOutlookTool } = require('../integrations/outlookTools');
+const { isMsCalendarTool, executeMsCalendarTool } = require('../integrations/msCalendarTools');
+const { isOneDriveTool, executeOneDriveTool } = require('../integrations/oneDriveTools');
+const { isMsContactsTool, executeMsContactsTool } = require('../integrations/msContactsTools');
+const { isTranscriptionTool, executeTranscriptionTool } = require('../integrations/transcriptionTools');
 
 /**
  * Execute a tool by name.
@@ -66,6 +74,24 @@ async function executeTool(toolName, toolArgs, context = {}) {
         terminalCtx,
     } = context;
 
+    // ─── Media Gen Prompt Moderation ────────────────────────────
+    // Validate prompts for all media generation tools before dispatch
+    const MEDIA_GEN_TOOLS = ['generate_image', 'generate_video', 'generate_music', 'generate_song', 'generate_tts', 'generate_sfx'];
+    if (MEDIA_GEN_TOOLS.includes(toolName) && (toolArgs?.prompt || toolArgs?.text)) {
+        try {
+            const { validateWithLlamaGuard } = require('./moderation');
+            const promptText = toolArgs.prompt || toolArgs.text;
+            await validateWithLlamaGuard([{ role: 'user', content: promptText }], true);
+            console.log(`[ToolDispatcher] Media gen prompt passed moderation (${toolName})`);
+        } catch (guardErr) {
+            if (guardErr.message?.includes('Safety Violation')) {
+                console.warn(`[ToolDispatcher] Media gen prompt BLOCKED (${toolName}): ${guardErr.message}`);
+                return { error: `Content blocked — the prompt for ${toolName} was flagged by content safety. Please rephrase.` };
+            }
+            // Guard service unavailable — fail-open (already logged by moderation.js)
+        }
+    }
+
     // ─── Terminal Tools ─────────────────────────────────────────
     try {
         const { TERMINAL_TOOLS } = require('../terminal/tools');
@@ -80,13 +106,20 @@ async function executeTool(toolName, toolArgs, context = {}) {
     if (toolName === 'generate_image') {
         // Lazy import to avoid circular deps
         const { executeImageGenTool } = require('../routes/ai/imageGenTool');
+        let capturedImageData = null;
         const imgSend = (type, data) => {
-            if (type === 'image' && data?.data && onImageGenerated) {
-                onImageGenerated(data);
+            if (type === 'image' && data?.data) {
+                capturedImageData = data;
             }
             if (send) send(type, data);
         };
-        return await executeImageGenTool(toolArgs, imageGenSettings, imgSend, req);
+        const result = await executeImageGenTool(toolArgs, imageGenSettings, imgSend, req);
+        // Enrich captured image data with proxy URL for persistent storage
+        if (capturedImageData && onImageGenerated) {
+            if (result?.imageUrl) capturedImageData.url = result.imageUrl;
+            onImageGenerated(capturedImageData);
+        }
+        return result;
     }
 
     // ─── Video Generation ───────────────────────────────────────
@@ -137,6 +170,12 @@ async function executeTool(toolName, toolArgs, context = {}) {
     }
     if (isDriveTool(toolName)) {
         return await executeDriveTool(toolName, toolArgs, session);
+    }
+    if (isContactsTool(toolName)) {
+        return await executeContactsTool(toolName, toolArgs, session);
+    }
+    if (isKeepTool(toolName)) {
+        return await executeKeepTool(toolName, toolArgs, session);
     }
     if (isN8nTool(toolName)) {
         return await executeN8nTool(toolName, toolArgs, orgId, attachments);
@@ -190,6 +229,24 @@ async function executeTool(toolName, toolArgs, context = {}) {
     }
     if (isWhatsAppTool(toolName)) {
         return await executeWhatsAppTool(toolName, toolArgs, { userId, session });
+    }
+    if (isGitHubTool(toolName)) {
+        return await executeGitHubTool(toolName, toolArgs, userId);
+    }
+    if (isOutlookTool(toolName)) {
+        return await executeOutlookTool(toolName, toolArgs, session);
+    }
+    if (isMsCalendarTool(toolName)) {
+        return await executeMsCalendarTool(toolName, toolArgs, session);
+    }
+    if (isOneDriveTool(toolName)) {
+        return await executeOneDriveTool(toolName, toolArgs, session);
+    }
+    if (isMsContactsTool(toolName)) {
+        return await executeMsContactsTool(toolName, toolArgs, session);
+    }
+    if (isTranscriptionTool(toolName)) {
+        return await executeTranscriptionTool(toolName, toolArgs, { userId, session, attachments, req });
     }
 
     // ─── Fallback: Component Tools ──────────────────────────────

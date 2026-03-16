@@ -85,7 +85,7 @@ async function executeMusicGenTool(args, send, req, nanoBananaSettings) {
             const userId = req?.session?.user?.id || 'anonymous';
             const key = storageStore.buildKey(userId, 'audio', filename);
             await storageStore.uploadFile(key, Buffer.from(result.audioBase64, 'base64'), result.mimeType || 'audio/wav');
-            audioUrl = await storageStore.getPresignedUrl(key);
+            audioUrl = storageStore.buildProxyUrl(key);
             console.log(`[MusicGen Tool] Saved to RustFS: ${key}`);
         } else {
             // Fallback: local disk

@@ -81,7 +81,7 @@ async function executeVideoGenTool(args, send, req, nanoBananaSettings) {
             const userId = req?.session?.user?.id || 'anonymous';
             const key = storageStore.buildKey(userId, 'videos', filename);
             await storageStore.uploadFile(key, Buffer.from(result.videoBase64, 'base64'), result.mimeType || 'video/mp4');
-            videoUrl = await storageStore.getPresignedUrl(key);
+            videoUrl = storageStore.buildProxyUrl(key);
             console.log(`[VideoGen Tool] Saved to RustFS: ${key}`);
         } else {
             // Fallback: local disk

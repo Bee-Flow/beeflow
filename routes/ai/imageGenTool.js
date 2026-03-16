@@ -60,6 +60,7 @@ async function executeImageGenTool(args, imageGenSettings, send, req) {
 
     // Save image to RustFS (or local disk as fallback)
     let imageUrl = null;
+    let storageKey = null;
     try {
         const crypto = require('crypto');
         const storageStore = require('../../stores/storageStore');
@@ -70,7 +71,8 @@ async function executeImageGenTool(args, imageGenSettings, send, req) {
             const userId = req?.session?.user?.id || 'anonymous';
             const key = storageStore.buildKey(userId, 'images', filename);
             await storageStore.uploadFile(key, Buffer.from(result.imageBase64, 'base64'), result.mimeType || 'image/png');
-            imageUrl = await storageStore.getPresignedUrl(key);
+            storageKey = key;
+            imageUrl = storageStore.buildProxyUrl(key);
             console.log(`[ImageGen Tool] Saved to RustFS: ${key}`);
         } else {
             // Fallback: local disk

@@ -20,7 +20,32 @@ const { requirePermission } = require('../../auth');
 const MemoryStore = require('../../stores/memoryStore');
 const { resolveUserOrgIds } = require('../../auth');
 const { getEffectiveUserId, getUserAuth } = require('../../utils/routeHelpers');
-const { chatCompletion } = require('../../core/llmClient');
+const llmClient = require('../../core/llmClient');
+
+/**
+ * Resolve a model string — handles tier: prefixes (e.g. 'tier:fast') and falls back to config default.
+ */
+async function resolveModelTier(rawModel, userOrgId = null) {
+    if (rawModel && rawModel.startsWith('tier:')) {
+        const tierName = rawModel.substring(5);
+        let tiers = await configStore.getConfig('chat_model_tiers') || {};
+        if (userOrgId) {
+            const shield = await configStore.getConfig(`org_privacy_shield_${userOrgId}`);
+            if (shield?.enabled && shield?.euModeEnabled) {
+                const euTiers = await configStore.getConfig('chat_model_tiers_eu') || {};
+                for (const [tn, euTier] of Object.entries(euTiers)) {
+                    if (euTier?.modelId) tiers[tn] = { ...tiers[tn], ...euTier };
+                }
+            }
+        }
+        return tiers[tierName]?.modelId || tiers.fast?.modelId || rawModel;
+    }
+    if (!rawModel) {
+        const globalConfig = await getAIConfig();
+        return globalConfig.model;
+    }
+    return rawModel;
+}
 const userStore = require('../../stores/userStore');
 const usageStore = require('../../stores/usageStore');
 const { checkSubscriptionLimits: checkSubLimits, checkResourceLimits } = require('../../core/limits');
@@ -60,28 +85,19 @@ router.post('/system/prompt-designer/chat', async (req, res) => {
             return res.status(404).json({ error: 'System Prompt Designer agent not found' });
         }
 
-        // Get AI config and make the request
-        const globalConfig = await getAIConfig();
+        // Resolve model (handles tier: prefix)
+        const modelToUse = await resolveModelTier(agent.model);
+        console.log(`[PromptDesigner] Using model: ${modelToUse}`);
 
-        // Use agent's model or default to config
-        const modelToUse = agent.model || globalConfig.model;
-
-        // Get the correct provider for this model
-        const config = await getProviderForModel(modelToUse);
-        console.log(`[PromptDesigner] Using model: ${modelToUse} from provider: ${config.providerName || 'default'}`);
-
-        // Build the request
         const messages = [
             { role: 'system', content: agent.system_prompt },
             { role: 'user', content: message }
         ];
 
-        const { content: assistantMessage } = await chatCompletion({
-            url: config.url, apiKey: config.apiKey,
-            model: modelToUse, messages, maxTokens: 4096
-        });
+        const result = await llmClient.chat(modelToUse, messages, { maxTokens: 4096 });
 
-        res.json({ message: assistantMessage });
+        res.json({ message: result.content });
+
 
     } catch (error) {
         console.error('[PromptDesigner] Error:', error);
@@ -101,14 +117,8 @@ router.post('/system/conversation-starters/generate', async (req, res) => {
             return res.status(404).json({ error: 'Conversation Starter Generator agent not found' });
         }
 
-        const globalConfig = await getAIConfig();
-
-        // Use agent's model or default to config
-        const modelToUse = agent.model || globalConfig.model;
-
-        // Get the correct provider for this model
-        const config = await getProviderForModel(modelToUse);
-        console.log(`[ConversationStarters] Using model: ${modelToUse} from provider: ${config.providerName || 'default'}`);
+        const modelToUse = await resolveModelTier(agent.model);
+        console.log(`[ConversationStarters] Using model: ${modelToUse}`);
 
         const contextMessage = `Generate 4 conversation starters for an agent with:
 - Name: ${agentName || '(not set)'}
@@ -120,10 +130,9 @@ router.post('/system/conversation-starters/generate', async (req, res) => {
             { role: 'user', content: contextMessage }
         ];
 
-        const { content } = await chatCompletion({
-            url: config.url, apiKey: config.apiKey,
-            model: modelToUse, messages, maxTokens: 500
-        });
+        const result = await llmClient.chat(modelToUse, messages, { maxTokens: 500 });
+        const content = result.content;
+
 
         // Parse the JSON array from the response
         try {
@@ -154,16 +163,9 @@ router.post('/system/description-improver/generate', async (req, res) => {
             return res.status(404).json({ error: 'Description Improver agent not found' });
         }
 
-        const globalConfig = await getAIConfig();
+        const modelToUse = await resolveModelTier(agent.model);
+        console.log(`[DescriptionImprover] Using model: ${modelToUse}`);
 
-        // Use agent's model or default to config
-        const modelToUse = agent.model || globalConfig.model;
-
-        // Get the correct provider for this model
-        const config = await getProviderForModel(modelToUse);
-        console.log(`[DescriptionImprover] Using model: ${modelToUse} from provider: ${config.providerName || 'default'}`);
-
-        // System prompt is the PRIMARY source - send more of it
         const promptContext = systemPrompt ? systemPrompt.substring(0, 1000) : '';
 
         const contextMessage = promptContext
@@ -175,10 +177,9 @@ router.post('/system/description-improver/generate', async (req, res) => {
             { role: 'user', content: contextMessage }
         ];
 
-        const { content: description } = await chatCompletion({
-            url: config.url, apiKey: config.apiKey,
-            model: modelToUse, messages, maxTokens: 200
-        });
+        const result = await llmClient.chat(modelToUse, messages, { maxTokens: 200 });
+        const description = result.content;
+
 
         // Clean up the description (remove quotes if present)
         const cleanDescription = description.replace(/^["']|["']$/g, '').trim();
@@ -207,14 +208,8 @@ router.post('/system/identity-improver/generate', async (req, res) => {
             return res.status(404).json({ error: 'Identity Improver agent not found' });
         }
 
-        const globalConfig = await getAIConfig();
-
-        // Use agent's model or default to config
-        const modelToUse = agent.model || globalConfig.model;
-
-        // Get the correct provider for this model
-        const config = await getProviderForModel(modelToUse);
-        console.log(`[IdentityImprover] Using model: ${modelToUse} from provider: ${config.providerName || 'default'}`);
+        const modelToUse = await resolveModelTier(agent.model);
+        console.log(`[IdentityImprover] Using model: ${modelToUse}`);
 
         const contextMessage = `Based on this system prompt, generate a name and description:\n\n---\n${systemPrompt.substring(0, 1500)}\n---\n\nCurrent name: ${currentName || '(none)'}\nCurrent description: ${currentDescription || '(none)'}`;
 
@@ -223,10 +218,9 @@ router.post('/system/identity-improver/generate', async (req, res) => {
             { role: 'user', content: contextMessage }
         ];
 
-        const { content } = await chatCompletion({
-            url: config.url, apiKey: config.apiKey,
-            model: modelToUse, messages, maxTokens: 200
-        });
+        const result = await llmClient.chat(modelToUse, messages, { maxTokens: 200 });
+        const content = result.content;
+
 
         // Parse JSON response
         try {

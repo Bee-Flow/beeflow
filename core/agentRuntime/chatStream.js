@@ -14,8 +14,7 @@ const swarmStore = require('../../stores/swarmStore');
 const swarmOrchestrator = require('../../agents/swarm/orchestrator');
 const HiveMind = require('../../agents/swarm/hiveMind');
 const usageStore = require('../../stores/usageStore');
-const { SEQUENTIAL_THINKING_TOOL, executeSequentialThinking } = require('../sequentialThinkingTool');
-const { runPreThinking } = require('../preThinking');
+
 const { classifyPromptComplexity } = require('../promptClassifier');
 const configStore = require('../../stores/configStore');
 const { mistralOCR } = require('../ocr');
@@ -119,7 +118,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     // These require OAuth tokens from the user session
     let n8nOrgId = null;
     try {
-        const { getIntegrationTools, buildToolHint } = require('./integrationTools');
+        const { getIntegrationTools, buildToolHint } = require('../integrationTools');
         const session = userAuth?.session;
         const integrationResult = await getIntegrationTools({
             userId,
@@ -238,7 +237,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         console.log(`[AgentRuntime] Skipping memory for embed-enabled agent ${agentId}`);
     } else {
         try {
-            const memoryStore = require('../stores/memoryStore');
+            const memoryStore = require('../../stores/memoryStore');
             console.log(`[AgentRuntime] Memory lookup - userId: ${userId}, agentId: ${agentId}`);
             // Limit to ~300 tokens (approx 1200 chars) to prevent context pollution
             const relevantMemories = memoryStore.findRelevantMemories(userId, agentId, userMessage, 300, extractMemoriesEnabled ? validProjectId : null);
@@ -260,10 +259,19 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     // ============ VECTOR KNOWLEDGE BASE ============
     try {
         const kbExtension = await performKnowledgeSearch({ agent, userId, userMessage, isStrictKnowledge, onEvent });
-        if (kbExtension) systemPrompt += kbExtension;
+        if (kbExtension) {
+            systemPrompt += kbExtension;
+            // KB context is already injected into the system prompt — remove the kb_search
+            // tool to prevent the LLM from making a redundant duplicate search call.
+            const beforeCount = tools.length;
+            tools = tools.filter(t => t.function?.name !== 'kb_search');
+            if (tools.length < beforeCount) {
+                console.log('[AgentRuntime] Removed kb_search tool (KB context already in system prompt)');
+            }
+        }
     } catch (kErr) {
         console.error('[AgentRuntime] Knowledge retrieval failed:', kErr.message);
-        // Continue without knowledge
+        // Continue without knowledge — kb_search tool stays available as fallback
     }
 
     // ============ WORKSPACE INTEGRATION ============
@@ -316,27 +324,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     if (isSwarm && swarm.phases?.length > 0) {
         onEvent('phase', { phase: swarm.phases[0].name, message: `Starting phase: ${swarm.phases[0].name}` });
     }
-    // ─── Pre-thinking with separate model ───
-    const thinkingModel = agent.config?.sequentialThinkingModel || (agent.config?.sequentialThinkingEnabled ? modelToUse : null);
-    const thinkingEnabled = !!(thinkingModel && agent.config?.sequentialThinkingEnabled);
-    // For swarms, thinking runs per-phase inside the loop; for normal agents, run once here
-    if (thinkingEnabled && !isSwarm) {
-        try {
-            const sessionId = `${agentId}-${conversation.id}-pre`;
-            const { context } = await runPreThinking(thinkingModel, messages, sessionId, onEvent, signal, systemPrompt);
-            if (context) {
-                systemPrompt += context;
-                // Remove sequentialthinking from main model tools to avoid double-thinking
-                tools = tools.filter(t => t.function?.name !== 'sequentialthinking');
-            }
-        } catch (err) {
-            console.error('[PreThinking] Error:', err.message);
-            // Continue without pre-thinking — fall back to normal flow
-        }
-    }
 
-    // Track which swarm phases have had thinking applied
-    const phaseThinkingDone = new Set();
 
     while (iterations < maxIterations) {
         // Check if client disconnected
@@ -385,19 +373,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 tools = swarmOrchestrator.getSwarmToolsForPhase(swarm, currentPhaseIndex);
                 console.log(`[AgentRuntime] 🐝 Phase ${currentPhaseIndex + 1}/${totalPhases}: "${swarm.phases[currentPhaseIndex]?.name}" — ${tools.length} workers available: [${tools.map(t => t.function?.name).join(', ')}]`);
 
-                // Run per-phase pre-thinking for the orchestrator
-                if (thinkingEnabled && !phaseThinkingDone.has(currentPhaseIndex)) {
-                    phaseThinkingDone.add(currentPhaseIndex);
-                    try {
-                        const phaseSessionId = `${agentId}-${conversation.id}-phase${currentPhaseIndex}`;
-                        const { context } = await runPreThinking(thinkingModel, messages, phaseSessionId, onEvent, signal, effectiveSystemPrompt);
-                        if (context) {
-                            effectiveSystemPrompt += context;
-                        }
-                    } catch (err) {
-                        console.error(`[PreThinking] Phase ${currentPhaseIndex} error:`, err.message);
-                    }
-                }
+
             }
 
             // Enrich messages with form data context
@@ -826,13 +802,11 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     }
 
                     let toolResult;
-                    if (toolName === 'sequentialthinking') {
-                        toolResult = executeSequentialThinking(toolArgs, `${agentId}-${conversation.id}`);
-                    } else if (isSwarm && toolName.startsWith('worker_')) {
+                    if (isSwarm && toolName.startsWith('worker_')) {
                         toolResult = await executeWorkerTool(toolName, toolArgs, agentId, userAuth, onEvent, brain, signal);
                     } else {
                         // Use unified tool dispatcher — supports integrations + components
-                        const { executeTool: dispatchTool } = require('./toolDispatcher');
+                        const { executeTool: dispatchTool } = require('../toolDispatcher');
                         toolResult = await dispatchTool(toolName, toolArgs, {
                             userId,
                             session: userAuth?.session,
@@ -1247,7 +1221,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
 
                 if (!shouldSkipMemoryExtraction) {
                     try {
-                        const memoryExtractor = require('../agents/memory/extractor');
+                        const memoryExtractor = require('../../agents/memory/extractor');
                         memoryExtractor.extractFromConversation(userId, agentId, messages, conversation.id, extractMemoriesEnabled ? validProjectId : null)
                             .then(extracted => {
 
@@ -1321,7 +1295,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             try {
                 const shouldSkipMemoryExtraction = guardrailViolation || processedUserMessage !== userMessage;
                 if (!shouldSkipMemoryExtraction) {
-                    const memoryExtractor = require('../agents/memory/extractor');
+                    const memoryExtractor = require('../../agents/memory/extractor');
 
                     memoryExtractor.extractFromConversation(userId, agentId, messages, conversation.id, extractMemoriesEnabled ? validProjectId : null)
                         .catch(err => {

@@ -201,7 +201,7 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
                             toolResult = await executeWorkerTool(toolName, toolArgs, agentId, userAuth, undefined, brain, signal);
                         } else {
                             // Use unified tool dispatcher — supports integrations + components
-                            const { executeTool: dispatchTool } = require('./toolDispatcher');
+                            const { executeTool: dispatchTool } = require('../toolDispatcher');
                             toolResult = await dispatchTool(toolName, toolArgs, {
                                 userId,
                                 session: userAuth?.session,

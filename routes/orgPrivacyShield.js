@@ -83,7 +83,7 @@ router.put('/:orgId', requireAuth, async (req, res) => {
             return res.status(403).json({ error: 'Only organization admins can manage the privacy shield' });
         }
 
-        const { enabled, collectionIds, scope, action, moderationEnabled, moderationCategories, euModeEnabled } = req.body;
+        const { enabled, collectionIds, scope, action, moderationEnabled, moderationCategories, euModeEnabled, webSearchGuardEnabled, disableSearchOnUpload } = req.body;
         const config = {
             enabled: !!enabled,
             collectionIds: Array.isArray(collectionIds) ? collectionIds : [],
@@ -92,6 +92,8 @@ router.put('/:orgId', requireAuth, async (req, res) => {
             moderationEnabled: !!moderationEnabled,
             moderationCategories: Array.isArray(moderationCategories) ? moderationCategories : [],
             euModeEnabled: !!euModeEnabled,
+            webSearchGuardEnabled: !!webSearchGuardEnabled,
+            disableSearchOnUpload: !!disableSearchOnUpload,
             updatedAt: new Date().toISOString(),
             updatedBy: req.session.user.id,
         };

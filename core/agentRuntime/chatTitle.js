@@ -1,7 +1,7 @@
 /**
  * Chat title generation — uses a fast model to create conversation titles
  */
-const { resolveModelId } = require('../aiAgent');
+const { getAIConfig } = require('../aiAgent');
 const agentStore = require('../../stores/agentStore');
 const configStore = require('../../stores/configStore');
 
@@ -28,17 +28,29 @@ async function generateChatTitle(userMessage, modelOverride = null, userOrgId = 
                 tiers = mergedTiers;
             }
         }
-        model = tiers[tierName]?.modelId || tiers.fast?.modelId || resolveModelId(globalConfig?.model);
+        model = tiers[tierName]?.modelId || tiers.fast?.modelId;
     } else {
         // Not tier-based — resolve via tier:fast for title generation
         const fallbackTiers = await configStore.getConfig('chat_model_tiers') || {};
-        model = fallbackTiers.fast?.modelId || resolveModelId(rawModel) || resolveModelId(globalConfig?.model);
+        model = fallbackTiers.fast?.modelId || rawModel;
     }
+
+    // Final fallback: use global config model
+    if (!model) {
+        const globalConfig = await getAIConfig();
+        model = globalConfig?.model;
+    }
+
+    if (!model) {
+        console.error('[generateChatTitle] No model resolved for title generation');
+        return 'New Chat';
+    }
+
     const systemPrompt = titleAgent?.system_prompt || 'Generate a very short title (max 5 words, max 40 characters) for this chat based on the user message. Only output the title, nothing else. No quotes.';
 
     try {
         console.log('[generateChatTitle] Calling LLM with model:', model);
-        const llmClient = require('./llmClient');
+        const llmClient = require('../llmClient');
         const title = await llmClient.generateTitle(
             model,
             typeof userMessage === 'string' ? userMessage.slice(0, 500) : userMessage,

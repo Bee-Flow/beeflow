@@ -14,6 +14,8 @@ const { SLIDES_TOOLS } = require('../integrations/slidesTools');
 const { DRIVE_TOOLS } = require('../integrations/driveTools');
 const { SHEETS_TOOLS } = require('../integrations/sheetsTools');
 const { DOCS_TOOLS } = require('../integrations/docsTools');
+const { CONTACTS_TOOLS } = require('../integrations/contactsTools');
+const { KEEP_TOOLS } = require('../integrations/keepTools');
 const { FIREFLIES_TOOLS } = require('../integrations/firefliesTools');
 const { YOUTRACK_TOOLS } = require('../integrations/youtrackTools');
 const { GAMMA_TOOLS } = require('../integrations/gammaTools');
@@ -28,9 +30,15 @@ const { KB_SEARCH_TOOLS } = require('../integrations/kbSearchTools');
 const { MAPS_TOOLS } = require('../integrations/mapsTools');
 const { LINKEDIN_TOOLS } = require('../integrations/linkedinTools');
 const { WHATSAPP_TOOLS } = require('../integrations/whatsappTools');
+const { GITHUB_TOOLS } = require('../integrations/githubTools');
+const { OUTLOOK_TOOLS } = require('../integrations/outlookTools');
+const { MS_CALENDAR_TOOLS } = require('../integrations/msCalendarTools');
+const { ONEDRIVE_TOOLS } = require('../integrations/oneDriveTools');
+const { MS_CONTACTS_TOOLS } = require('../integrations/msContactsTools');
+const { TRANSCRIPTION_TOOLS } = require('../integrations/transcriptionTools');
 
 // IDs that are gated by org-level enabledIntegrations
-const ORG_GATED_APPS = ['fireflies', 'youtrack', 'gamma', 'n8n', 'linkedin'];
+const ORG_GATED_APPS = ['fireflies', 'youtrack', 'gamma', 'n8n', 'linkedin', 'github'];
 
 /**
  * Build the list of integration tools available for the current user.
@@ -77,7 +85,7 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
 
     // Auto-enable new integrations for users with existing saved lists
     // (these were added after the user saved their enabledApps, so they wouldn't be included)
-    const AUTO_ENABLED_APPS = ['agent-search', 'workspace', 'image-gen', 'music-gen', 'video-gen', 'elevenlabs', 'google-maps', 'linkedin'];
+    const AUTO_ENABLED_APPS = ['agent-search', 'workspace', 'image-gen', 'music-gen', 'video-gen', 'elevenlabs', 'google-maps', 'linkedin', 'github', 'google-contacts', 'google-keep'];
 
     const isAppOn = (appId) => {
         // Must be enabled at user level
@@ -112,6 +120,16 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
         if (isAppOn('google-drive')) addTools(DRIVE_TOOLS);
         if (isAppOn('google-sheets')) addTools(SHEETS_TOOLS);
         if (isAppOn('google-docs')) addTools(DOCS_TOOLS);
+        if (isAppOn('google-contacts')) addTools(CONTACTS_TOOLS);
+        if (isAppOn('google-keep')) addTools(KEEP_TOOLS);
+    }
+
+    // Microsoft integrations — require Microsoft OAuth
+    if (session?.oauthProvider === 'microsoft' && session?.accessToken) {
+        if (isAppOn('outlook')) addTools(OUTLOOK_TOOLS);
+        if (isAppOn('ms-calendar')) addTools(MS_CALENDAR_TOOLS);
+        if (isAppOn('onedrive')) addTools(ONEDRIVE_TOOLS);
+        if (isAppOn('ms-contacts')) addTools(MS_CONTACTS_TOOLS);
     }
 
     // Image Generation — requires Google API key
@@ -207,6 +225,18 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
         addTools(MAPS_TOOLS);
     }
 
+    // GitHub — requires user PAT
+    const hasGitHub = !!(await configStore.getSecret(`github_token_user_${userId}`));
+    if (hasGitHub && isAppOn('github')) {
+        addTools(GITHUB_TOOLS);
+    }
+
+    // Transcription — requires existing Mistral API key
+    const hasMistralKey = !!(await configStore.getSecret('mistral_api_key'));
+    if (hasMistralKey && isAppOn('transcription')) {
+        addTools(TRANSCRIPTION_TOOLS);
+    }
+
     // WhatsApp — requires active Baileys session
     try {
         const whatsappSession = require('../integrations/whatsappSession');
@@ -242,6 +272,8 @@ async function buildToolHint(tools, userId = null) {
     if (tools.some(t => t.function.name.startsWith('drive_'))) integrations.push('Google Drive (search, list, manage files and folders)');
     if (tools.some(t => t.function.name.startsWith('sheets_'))) integrations.push('Google Sheets (create, read, append, update spreadsheets)');
     if (tools.some(t => t.function.name.startsWith('docs_'))) integrations.push('Google Docs (create, read, append, replace text in documents)');
+    if (tools.some(t => t.function.name.startsWith('contacts_'))) integrations.push('Google Contacts (search, list, create, update contacts — create/update require user approval)');
+    if (tools.some(t => t.function.name.startsWith('keep_'))) integrations.push('Google Keep (list, get, create, delete notes — create/delete require user approval, enterprise Workspace only)');
     if (tools.some(t => t.function.name.startsWith('youtrack_'))) integrations.push('YouTrack (search, create, update issues)');
     if (tools.some(t => t.function.name.startsWith('fireflies_'))) integrations.push('Fireflies (meeting transcripts)');
     if (tools.some(t => t.function.name.startsWith('gamma_'))) integrations.push('Gamma (presentation generation)');
@@ -257,15 +289,21 @@ async function buildToolHint(tools, userId = null) {
     if (tools.some(t => t.function.name === 'kb_search')) integrations.push('Knowledge Base Search (search internal knowledge base with custom queries — use this after reading emails or documents to find relevant internal information)');
     if (tools.some(t => t.function.name.startsWith('maps_'))) integrations.push('Google Maps (get directions between locations with route maps, search for places/businesses — IMPORTANT: after getting results, always output the map as a ```map-embed code block containing JSON with embedUrl, title, and mapsLink fields so it renders as an interactive map in the chat)');
     if (tools.some(t => t.function.name.startsWith('linkedin_'))) integrations.push('LinkedIn (create posts — user approves before publishing)');
+    if (tools.some(t => t.function.name.startsWith('github_'))) integrations.push('GitHub (list repos, view code, create repos, manage branches)');
     if (tools.some(t => t.function.name.startsWith('whatsapp_'))) integrations.push('WhatsApp (list chats, read messages, compose with approval). WORKFLOW: 1) Use whatsapp_list_chats to find chats (supports search query). 2) Use whatsapp_read_messages with a contact name or JID from the list. 3) Use whatsapp_compose to draft a message — it will be shown to the user for approval before sending. Messages are captured from the moment the user connected, so very old history may not be available. Always use JIDs from whatsapp_list_chats for accuracy.');
+    if (tools.some(t => t.function.name.startsWith('outlook_'))) integrations.push('Outlook Mail (search, read, compose, send, and reply to emails — the user approves before anything is sent)');
+    if (tools.some(t => t.function.name.startsWith('ms_calendar_'))) integrations.push('Microsoft Calendar (list, search, create, update, delete events — create/update/delete require user approval)');
+    if (tools.some(t => t.function.name.startsWith('onedrive_'))) integrations.push('OneDrive (search, list, manage files and folders)');
+    if (tools.some(t => t.function.name.startsWith('ms_contacts_'))) integrations.push('Microsoft Contacts (search, list, create, update contacts — create/update require user approval)');
+    if (tools.some(t => t.function.name === 'transcribe_audio')) integrations.push('Meeting Transcription (transcribe uploaded audio files with speaker diarization using Voxtral AI — supports up to 3 hours of audio, Dutch and other languages)');
 
     let hint = ' You have access to tools — use them when they would help answer the user\'s question. You can call multiple tools in parallel when appropriate.';
     if (integrations.length > 0) {
         hint += ` Your available integrations: ${integrations.join(', ')}.`;
     }
 
-    // Inject email writing style profile when gmail tools are active
-    if (userId && tools.some(t => t.function.name.startsWith('gmail_'))) {
+    // Inject email writing style profile when gmail or outlook tools are active
+    if (userId && (tools.some(t => t.function.name.startsWith('gmail_')) || tools.some(t => t.function.name.startsWith('outlook_')))) {
         try {
             const toneProfile = await configStore.getConfig(`email_tone_profile_user_${userId}`);
             if (toneProfile) {

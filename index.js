@@ -290,9 +290,18 @@ app.use('/api/monitoring', require('./routes/monitoring'));
 app.use('/api/integrations/gdrive', require('./routes/integrations/googleDrive'));
 app.use('/api/integrations/gmail', require('./routes/integrations/gmail'));
 app.use('/api/integrations/calendar', require('./routes/integrations/calendar'));
+app.use('/api/integrations/contacts', require('./routes/integrations/contacts'));
+app.use('/api/integrations/keep', require('./routes/integrations/keep'));
+app.use('/api/storage', require('./routes/storageProxy'));
 app.use('/api/integrations/sheets', require('./routes/integrations/sheets'));
 app.use('/api/integrations/linkedin', require('./routes/integrations/linkedin'));
 app.use('/api/integrations/whatsapp', require('./routes/integrations/whatsapp'));
+app.use('/api/integrations/github', require('./routes/integrations/github'));
+app.use('/api/integrations/outlook', require('./routes/integrations/outlook'));
+app.use('/api/integrations/onedrive', require('./routes/integrations/oneDrive'));
+app.use('/api/templates', require('./routes/templates'));
+app.use('/api/transcriptions', require('./routes/transcriptions'));
+app.use('/api/meet-bot', require('./routes/meetBot'));
 app.use('/', require('./routes/knowledge'));
 app.use('/api/kb', require('./routes/knowledgeBases'));
 

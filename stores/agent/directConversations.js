@@ -23,7 +23,19 @@ async function getDirectConversation(id, userId) {
 
 async function listDirectConversations(userId) {
     await initDB();
-    return getAll('SELECT id, title, model_tier, project_id, created_at, updated_at FROM direct_conversations WHERE user_id = $1 ORDER BY updated_at DESC', [userId]);
+    return getAll('SELECT id, title, model_tier, project_id, pinned, labels_json, created_at, updated_at FROM direct_conversations WHERE user_id = $1 ORDER BY updated_at DESC', [userId]);
+}
+
+async function pinDirectConversation(id, pinned, userId) {
+    await initDB();
+    const { rowCount } = await run('UPDATE direct_conversations SET pinned = $1 WHERE id = $2 AND user_id = $3', [!!pinned, id, userId]);
+    return rowCount > 0;
+}
+
+async function setDirectConversationLabels(id, labels, userId) {
+    await initDB();
+    const { rowCount } = await run('UPDATE direct_conversations SET labels_json = $1 WHERE id = $2 AND user_id = $3', [JSON.stringify(labels), id, userId]);
+    return rowCount > 0;
 }
 
 async function updateDirectConversation(id, messages, userId, meta = null) {
@@ -66,6 +78,6 @@ async function getDirectConversationWorkspace(id) {
 
 module.exports = {
     createDirectConversation, getDirectConversation, listDirectConversations,
-    updateDirectConversation, updateDirectConversationTitle, deleteDirectConversation,
+    updateDirectConversation, updateDirectConversationTitle, pinDirectConversation, setDirectConversationLabels, deleteDirectConversation,
     updateDirectConversationWorkspace, getDirectConversationWorkspace,
 };

@@ -61,12 +61,12 @@ async function getConversationWorkspace(conversationId) {
 
 async function listConversations(agentId, userId) {
     await initDB();
-    return getAll('SELECT id, agent_id, user_id, title, project_id, created_at, updated_at FROM agent_conversations WHERE agent_id = $1 AND user_id = $2 ORDER BY updated_at DESC', [agentId, userId]);
+    return getAll('SELECT id, agent_id, user_id, title, project_id, pinned, labels_json, created_at, updated_at FROM agent_conversations WHERE agent_id = $1 AND user_id = $2 ORDER BY updated_at DESC', [agentId, userId]);
 }
 
 async function listAllConversations(userId) {
     await initDB();
-    return getAll(`SELECT c.id, c.agent_id, c.user_id, c.title, c.project_id, c.created_at, c.updated_at,
+    return getAll(`SELECT c.id, c.agent_id, c.user_id, c.title, c.project_id, c.pinned, c.labels_json, c.created_at, c.updated_at,
         a.name as agent_name, a.avatar as agent_avatar
         FROM agent_conversations c
         LEFT JOIN agents a ON c.agent_id = a.id
@@ -129,6 +129,16 @@ async function updateConversationTitle(conversationId, title) {
     await run('UPDATE agent_conversations SET title = $1 WHERE id = $2', [title, conversationId]);
 }
 
+async function pinConversation(conversationId, pinned) {
+    await initDB();
+    await run('UPDATE agent_conversations SET pinned = $1 WHERE id = $2', [!!pinned, conversationId]);
+}
+
+async function setConversationLabels(conversationId, labels) {
+    await initDB();
+    await run('UPDATE agent_conversations SET labels_json = $1 WHERE id = $2', [JSON.stringify(labels), conversationId]);
+}
+
 async function updateThreadTitles(conversationId, threadTitles) {
     await initDB();
     await run('UPDATE agent_conversations SET thread_titles_json = $1 WHERE id = $2', [JSON.stringify(threadTitles), conversationId]);
@@ -144,5 +154,5 @@ module.exports = {
     updateConversation, clearConversation, updateConversationWorkspace, getConversationWorkspace,
     listConversations, listAllConversations, searchConversations,
     getConversationById, createConversation,
-    updateConversationTitle, updateThreadTitles, deleteConversationById,
+    updateConversationTitle, pinConversation, setConversationLabels, updateThreadTitles, deleteConversationById,
 };

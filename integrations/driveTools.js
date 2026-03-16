@@ -174,8 +174,16 @@ async function executeDriveTool(toolName, args, session) {
     switch (toolName) {
         case 'drive_search': {
             const maxResults = Math.min(Math.max(args.maxResults || 20, 1), 50);
+            // Sanitize: if query doesn't contain Drive operators, wrap as name search
+            let query = args.query;
+            const driveOps = /\b(contains|=|!=|<|>|in\b|not\b|and\b|or\b|has\b)/i;
+            if (!driveOps.test(query)) {
+                // Strip surrounding quotes if present
+                query = query.replace(/^["']|["']$/g, '').trim();
+                query = `name contains '${query.replace(/'/g, "\\'")}'`;
+            }
             const res = await drive.files.list({
-                q: args.query,
+                q: query,
                 pageSize: maxResults,
                 fields: 'files(id, name, mimeType, size, modifiedTime, createdTime, webViewLink, parents, shared, owners)',
                 orderBy: 'modifiedTime desc',

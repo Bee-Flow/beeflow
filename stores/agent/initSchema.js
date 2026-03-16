@@ -135,6 +135,24 @@ async function _doInit() {
     try { await exec(`ALTER TABLE agent_conversations ADD COLUMN IF NOT EXISTS project_id TEXT`); } catch (e) { /* already exists */ }
     try { await exec(`CREATE INDEX IF NOT EXISTS idx_direct_conversations_project ON direct_conversations(project_id)`); } catch (e) { /* already exists */ }
     try { await exec(`CREATE INDEX IF NOT EXISTS idx_agent_conversations_project ON agent_conversations(project_id)`); } catch (e) { /* already exists */ }
+
+    // Migration: Add pinned column for pin/unpin feature
+    try { await exec(`ALTER TABLE direct_conversations ADD COLUMN IF NOT EXISTS pinned BOOLEAN DEFAULT FALSE`); } catch (e) { /* already exists */ }
+    try { await exec(`ALTER TABLE agent_conversations ADD COLUMN IF NOT EXISTS pinned BOOLEAN DEFAULT FALSE`); } catch (e) { /* already exists */ }
+
+    // Migration: Add labels_json column for conversation labels
+    try { await exec(`ALTER TABLE direct_conversations ADD COLUMN IF NOT EXISTS labels_json TEXT DEFAULT '[]'`); } catch (e) { /* already exists */ }
+    try { await exec(`ALTER TABLE agent_conversations ADD COLUMN IF NOT EXISTS labels_json TEXT DEFAULT '[]'`); } catch (e) { /* already exists */ }
+
+    // User-defined conversation labels
+    await exec(`CREATE TABLE IF NOT EXISTS conversation_labels (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        color TEXT NOT NULL DEFAULT '#6366f1',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )`);
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_conversation_labels_user ON conversation_labels(user_id)`); } catch (e) { /* already exists */ }
 }
 
 module.exports = { initDB };

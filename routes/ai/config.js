@@ -373,6 +373,19 @@ router.get('/user-settings', requireAuth, async (req, res) => {
         }
     } catch (e) { /* ignore */ }
 
+    // Check org privacy shield for disableSearchOnUpload
+    let disableSearchOnUpload = false;
+    try {
+        const userStore2 = require('../../stores/userStore');
+        const currentUser2 = await userStore2.getUser(userId);
+        if (currentUser2?.organizationId) {
+            const shield = await configStore.getConfig(`org_privacy_shield_${currentUser2.organizationId}`);
+            if (shield?.enabled && shield.disableSearchOnUpload) {
+                disableSearchOnUpload = true;
+            }
+        }
+    } catch (e) { /* ignore */ }
+
     res.json({
         hasFirefliesKey: !!(await configStore.getSecret(`fireflies_api_key_user_${userId}`)),
         hasYouTrackConfig: !!(await configStore.getSecret(`youtrack_url_user_${userId}`)) && !!(await configStore.getSecret(`youtrack_token_user_${userId}`)),
@@ -383,6 +396,7 @@ router.get('/user-settings', requireAuth, async (req, res) => {
         orgEnabledIntegrations,
         hasN8nConfig,
         hasGoogleMapsKey: !!(await configStore.getSecret('google_maps_api_key')),
+        disableSearchOnUpload,
     });
 });
 

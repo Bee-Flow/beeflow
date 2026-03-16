@@ -6,6 +6,7 @@
  */
 
 const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, HeadBucketCommand, CreateBucketCommand } = require('@aws-sdk/client-s3');
+const { Readable } = require('stream');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const BUCKET = 'beeflow-media';
@@ -67,7 +68,7 @@ function isAvailable() {
 /**
  * Build a storage key with user-scoped prefix.
  * @param {string} userId - User ID for isolation
- * @param {string} category - File category: 'images', 'videos', 'audio', 'avatars'
+ * @param {string} category - File category: 'images', 'videos', 'audio', 'uploads', 'avatars'
  * @param {string} filename - The filename
  */
 function buildKey(userId, category, filename) {
@@ -130,12 +131,43 @@ async function deleteFile(key) {
     console.log(`[StorageStore] Deleted: ${key}`);
 }
 
+/**
+ * Stream a file from RustFS.
+ * @param {string} key - S3 object key
+ * @returns {{ stream: Readable, contentType: string, contentLength: number }}
+ */
+async function streamFile(key) {
+    if (!s3) throw new Error('StorageStore not initialized');
+
+    const response = await s3.send(new GetObjectCommand({
+        Bucket: BUCKET,
+        Key: key,
+    }));
+
+    return {
+        stream: response.Body,
+        contentType: response.ContentType || 'application/octet-stream',
+        contentLength: response.ContentLength,
+    };
+}
+
+/**
+ * Build a proxy URL for a stored file.
+ * @param {string} key - S3 object key
+ * @returns {string} Proxy URL path
+ */
+function buildProxyUrl(key) {
+    return `/api/storage/file/${encodeURIComponent(key)}`;
+}
+
 module.exports = {
     init,
     isAvailable,
     buildKey,
     uploadFile,
     getPresignedUrl,
+    streamFile,
+    buildProxyUrl,
     deleteFile,
     BUCKET,
 };

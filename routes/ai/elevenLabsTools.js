@@ -108,7 +108,7 @@ async function _saveAudioToStorage(buffer, ext, prefix, mimeType, userId) {
     if (storageStore.isAvailable()) {
         const key = storageStore.buildKey(userId || 'anonymous', 'audio', filename);
         await storageStore.uploadFile(key, buffer, mimeType);
-        const url = await storageStore.getPresignedUrl(key);
+        const url = storageStore.buildProxyUrl(key);
         console.log(`[ElevenLabs Tool] Saved to RustFS: ${key}`);
         return url;
     } else {

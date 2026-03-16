@@ -6,7 +6,7 @@ const agentStore = require('../../stores/agentStore');
 const swarmStore = require('../../stores/swarmStore');
 const swarmOrchestrator = require('../../agents/swarm/orchestrator');
 const { componentToTool, SYSTEM_TOOLS } = require('../toolExecution');
-const { SEQUENTIAL_THINKING_TOOL } = require('../sequentialThinkingTool');
+
 
 async function getAgentTools(agentId) {
     // Check if it's a swarm first
@@ -101,11 +101,7 @@ async function getAgentTools(agentId) {
         tools.push(...SYSTEM_TOOLS);
     }
 
-    // Inject Sequential Thinking tool if enabled in agent config
-    const agentData = await agentStore.getAgent(agentId);
-    if (agentData?.config?.sequentialThinkingEnabled) {
-        tools.push(SEQUENTIAL_THINKING_TOOL);
-    }
+
 
     return tools;
 }

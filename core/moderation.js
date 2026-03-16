@@ -129,10 +129,9 @@ async function validateWithGuardService(messages, agentModerationEnabled = false
     const cacheKey = guardCacheKey('user_input', inputText);
     const cached = guardCacheGet(cacheKey);
     if (cached) {
-        console.log(`[GuardService] Cache hit (${inputText.length} chars) — ${cached.allowed ? 'safe' : 'blocked'}`);
+        const label = GUARD_CATEGORIES[cached.category] || cached.category;
+        console.log(`[GuardService] Cache hit → ${cached.allowed ? '✅ safe' : '🚫 blocked'} | ${cached.category} (${label}) | confidence: ${(cached.confidence || 0).toFixed(3)}`);
         if (!cached.allowed) {
-            // Replay the cached violation
-            const label = GUARD_CATEGORIES[cached.category] || cached.category;
             const violations = `${label} (${cached.confidence.toFixed(3)})`;
             const err = new Error(`Safety Violation: Request blocked due to ${violations}.`);
             err.outcome = JSON.stringify([{ category: cached.category, label, score: cached.confidence.toFixed(3) }]);
@@ -171,8 +170,9 @@ async function validateWithGuardService(messages, agentModerationEnabled = false
         guardCacheSet(cacheKey, result);
 
         // Allowed → safe
+        const label0 = GUARD_CATEGORIES[result.category] || result.category;
         if (result.allowed) {
-            console.log(`[GuardService] Content is safe (category=${result.category}, confidence=${result.confidence}, latency=${guardMs}ms)`);
+            console.log(`[GuardService] ✅ Input safe | ${result.category} (${label0}) | confidence: ${(result.confidence || 0).toFixed(3)} | ${guardMs}ms`);
             return;
         }
 
@@ -195,7 +195,7 @@ async function validateWithGuardService(messages, agentModerationEnabled = false
         // Violation detected
         const label = GUARD_CATEGORIES[result.category] || result.category;
         const violations = `${label} (${result.confidence.toFixed(3)})`;
-        console.warn(`[GuardService] Blocked content. Violations: ${violations}`);
+        console.warn(`[GuardService] 🚫 Input BLOCKED | ${result.category} (${label}) | confidence: ${result.confidence.toFixed(3)} | threshold: ${threshold} | ${guardMs}ms`);
 
         const err = new Error(`Safety Violation: Request blocked due to ${violations}.`);
         err.outcome = JSON.stringify([{
@@ -229,9 +229,9 @@ async function validateOutputWithGuardService(content, allowedCategories = null)
     const cacheKey = guardCacheKey('assistant_output', content);
     const cached = guardCacheGet(cacheKey);
     if (cached) {
-        if (cached.allowed) return;
-        // Replay violation
         const label = GUARD_CATEGORIES[cached.category] || cached.category;
+        console.log(`[GuardService] Cache hit (output) → ${cached.allowed ? '✅ safe' : '🚫 blocked'} | ${cached.category} (${label}) | confidence: ${(cached.confidence || 0).toFixed(3)}`);
+        if (cached.allowed) return;
         const violations = `${label} (${cached.confidence.toFixed(3)})`;
         const err = new Error(`Safety Violation: Response blocked due to ${violations}.`);
         err.outcome = JSON.stringify([{ category: cached.category, label, score: cached.confidence.toFixed(3) }]);
@@ -262,8 +262,9 @@ async function validateOutputWithGuardService(content, allowedCategories = null)
         // Cache the result
         guardCacheSet(cacheKey, result);
 
+        const label0 = GUARD_CATEGORIES[result.category] || result.category;
         if (result.allowed) {
-            console.log(`[GuardService] Output is safe (${guardMs}ms)`);
+            console.log(`[GuardService] ✅ Output safe | ${result.category} (${label0}) | confidence: ${(result.confidence || 0).toFixed(3)} | ${guardMs}ms`);
             return;
         }
 
@@ -276,7 +277,7 @@ async function validateOutputWithGuardService(content, allowedCategories = null)
 
         const label = GUARD_CATEGORIES[result.category] || result.category;
         const violations = `${label} (${result.confidence.toFixed(3)})`;
-        console.warn(`[GuardService] Output blocked: ${violations}`);
+        console.warn(`[GuardService] 🚫 Output BLOCKED | ${result.category} (${label}) | confidence: ${result.confidence.toFixed(3)} | threshold: ${threshold} | ${guardMs}ms`);
 
         const err = new Error(`Safety Violation: Response blocked due to ${violations}.`);
         err.outcome = JSON.stringify([{ category: result.category, label, score: result.confidence.toFixed(3) }]);
