@@ -25,7 +25,7 @@ const { getAgentTools } = require('./agentTools');
 const { executeWorkerTool } = require('./workerExecution');
 const { enrichMessagesWithFormData } = require('./chatWithAgent');
 const { checkRegexPatterns } = require('../guardrails');
-const { validateWithLlamaGuard } = require('../moderation');
+const { validateInput } = require('../moderation');
 const { resolveOrgShield, mergeWithOrgShield } = require('../orgShield');
 const { processSystemPrompt } = require('../promptUtils');
 const { buildSystemPrompt } = require('./contextBuilder');
@@ -660,7 +660,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                                             };
                                         }
                                         if (tc.id) currentToolCalls[idx].id = tc.id;
-                                        if (tc.function?.name) currentToolCalls[idx].function.name += tc.function.name;
+                                        if (tc.function?.name) currentToolCalls[idx].function.name = tc.function.name;
                                         if (tc.function?.arguments) currentToolCalls[idx].function.arguments += tc.function.arguments;
                                     }
                                 }
@@ -786,7 +786,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     if (webSearchGuardEnabled && toolName === 'agent_search' && toolArgs?.query) {
                         try {
                             const searchMessages = [{ role: 'user', content: toolArgs.query }];
-                            await validateWithLlamaGuard(searchMessages, true, orgShieldCategories);
+                            await validateInput(searchMessages, true, orgShieldCategories);
                             console.log(`[WebSearchGuard] Search query passed: "${toolArgs.query.substring(0, 80)}"`);
                         } catch (guardError) {
                             console.log(`[WebSearchGuard] Search query BLOCKED: "${toolArgs.query.substring(0, 80)}" — ${guardError.message}`);
@@ -1148,7 +1148,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 if (outputModerationEnabled) {
                     try {
                         const outputMessages = [{ role: 'assistant', content: fullResponse }];
-                        await validateWithLlamaGuard(outputMessages, true, orgShieldCategories);
+                        await validateInput(outputMessages, true, orgShieldCategories);
                         console.log(`[AgentRuntime] AI moderation passed (agent output)`);
                     } catch (guardError) {
                         if (guardError.violationCodes) {

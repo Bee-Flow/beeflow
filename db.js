@@ -104,9 +104,28 @@ async function getAll(sql, params = []) {
 
 /**
  * Execute raw SQL (e.g., schema init).
+ * Uses a PostgreSQL advisory lock for CREATE TABLE/ALTER TABLE statements
+ * to prevent pg_type_typname_nsp_index race conditions on fresh databases.
  * @param {string} sql
  */
+let _schemaQueue = Promise.resolve();
 async function exec(sql) {
+    // CREATE TABLE / ALTER TABLE statements must be serialized to prevent
+    // PostgreSQL implicit row-type creation races on fresh DBs.
+    // We use a JS-level queue + a dedicated client connection so we don't
+    // exhaust the pool with concurrent DDL calls.
+    if (sql.includes('CREATE TABLE') || sql.includes('ALTER TABLE') || sql.includes('CREATE INDEX')) {
+        return new Promise((resolve, reject) => {
+            _schemaQueue = _schemaQueue.then(async () => {
+                const client = await pool.connect();
+                try {
+                    return await client.query(sql);
+                } finally {
+                    client.release();
+                }
+            }).then(resolve, reject);
+        });
+    }
     return pool.query(sql);
 }
 

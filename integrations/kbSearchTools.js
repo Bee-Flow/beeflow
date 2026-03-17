@@ -8,6 +8,7 @@
  */
 
 const configStore = require('../stores/configStore');
+const { getServiceHeaders } = require('../core/serviceAuth');
 
 const KB_SEARCH_TOOLS = [
     {
@@ -81,7 +82,7 @@ async function executeKbSearchTool(toolName, args, context = {}) {
     try {
         const searchRes = await fetch(`${searchUrl}/tools/kb-search`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: getServiceHeaders(),
             body: JSON.stringify({
                 tenant_id: userId,
                 kb_ids: kbIds,

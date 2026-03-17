@@ -85,7 +85,7 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
 
     // Auto-enable new integrations for users with existing saved lists
     // (these were added after the user saved their enabledApps, so they wouldn't be included)
-    const AUTO_ENABLED_APPS = ['agent-search', 'workspace', 'image-gen', 'music-gen', 'video-gen', 'elevenlabs', 'google-maps', 'linkedin', 'github', 'google-contacts', 'google-keep'];
+    const AUTO_ENABLED_APPS = ['agent-search', 'workspace', 'image-gen', 'music-gen', 'video-gen', 'elevenlabs', 'google-maps', 'linkedin', 'github', 'google-contacts', 'google-keep', 'outlook', 'ms-calendar', 'onedrive', 'ms-contacts'];
 
     const isAppOn = (appId) => {
         // Must be enabled at user level
@@ -149,9 +149,12 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
         addTools(ELEVENLABS_TOOLS);
     }
 
-    // Agent Search — self-hosted AI search with reranking
-    const hasAgentSearchUrl = !!(await configStore.getConfig('agent_search_url'));
-    if (hasAgentSearchUrl && isAppOn('agent-search')) {
+    // Agent Search — self-hosted AI search with reranking, or Bing Web Search
+    const hasAgentSearchUrl = !!process.env.SEARCH_SERVICE_URL || !!(await configStore.getConfig('agent_search_url'));
+    const searchProvider = await configStore.getConfig('search_provider') || 'agent-search';
+    const hasBingSearchKey = !!(await configStore.getSecret('bing_search_key'));
+    const searchAvailable = (searchProvider === 'bing' && hasBingSearchKey) || hasAgentSearchUrl;
+    if (searchAvailable && isAppOn('agent-search')) {
         addTools(AGENT_SEARCH_TOOLS);
     }
 

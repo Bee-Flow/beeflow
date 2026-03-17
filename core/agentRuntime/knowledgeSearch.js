@@ -1,3 +1,6 @@
+const configStore = require('../../stores/configStore');
+const { getServiceHeaders } = require('../serviceAuth');
+
 async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnowledge, onEvent }) {
     let systemPromptExtension = '';
     const kbIds = agent.config?.knowledge_base_ids || [];
@@ -19,15 +22,25 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
                 .trim();
             if (searchQuery.length < 5) searchQuery = userMessage;
 
+            // Determine whether to use Azure embeddings for query (must match ingestion model)
+            const useAzure = !!(await configStore.getConfig('use_azure_doc_processing'));
+            const azureFields = useAzure ? {
+                azure_endpoint: await configStore.getConfig('azure_openai_embedding_endpoint') || '',
+                azure_key: await configStore.getSecret('azure_openai_embedding_key') || '',
+                azure_model: await configStore.getConfig('azure_openai_embedding_model') || 'text-embedding-3-small',
+            } : {};
+
             const searchRes = await fetch(`${searchUrl}/tools/kb-search`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: getServiceHeaders(),
                 body: JSON.stringify({
                     tenant_id: userId,
                     kb_ids: kbIds,
                     query: searchQuery,
-                    top_k: 12,
-                    rerank: true
+                    top_k: 15,
+                    rerank: true,
+                    use_azure: useAzure,
+                    ...azureFields,
                 }),
                 signal: AbortSignal.timeout(15000)
             });
@@ -66,9 +79,9 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
         
         const mergedResults = Array.from(sourceMap.values());
         mergedResults.sort((a, b) => (b.score || 0) - (a.score || 0));
-        const topResults = mergedResults.slice(0, 8);
+        const topResults = mergedResults.slice(0, 10);
 
-        const MAX_CONTENT_CHARS = 1200;
+        const MAX_CONTENT_CHARS = 800;
         for (const result of topResults) {
             if (result.content && result.content.length > MAX_CONTENT_CHARS) {
                 result.content = result.content.slice(0, MAX_CONTENT_CHARS) + '…';

@@ -251,23 +251,36 @@ router.get('/login/:provider', async (req, res) => {
 
     } else if (provider === 'microsoft') {
         const providerConfig = config.providers?.microsoft || {};
+        console.log(`[OAuth/Microsoft] === LOGIN START ===`);
+        console.log(`[OAuth/Microsoft] clientId present: ${!!providerConfig.clientId}, clientSecret present: ${!!providerConfig.clientSecret}`);
+        console.log(`[OAuth/Microsoft] tenantId: ${providerConfig.tenantId || 'common (default)'}`);
+        console.log(`[OAuth/Microsoft] REDIRECT_URI: ${REDIRECT_URI}`);
+        console.log(`[OAuth/Microsoft] returnTo: ${returnTo}`);
+        console.log(`[OAuth/Microsoft] SessionID: ${req.sessionID}`);
         if (!providerConfig.clientId) {
+            console.error(`[OAuth/Microsoft] ABORT: No clientId configured`);
             return res.redirect(`${returnTo}?error=microsoft_not_configured`);
         }
 
         const tenantId = providerConfig.tenantId || 'common';
+        const scopes = OAUTH_PROVIDERS.microsoft.scopes.join(' ');
+        console.log(`[OAuth/Microsoft] Scopes: ${scopes}`);
         const authUrl = OAUTH_PROVIDERS.microsoft.authUrl(tenantId) + '?' + new URLSearchParams({
             response_type: 'code',
             client_id: providerConfig.clientId,
             redirect_uri: REDIRECT_URI,
-            scope: OAUTH_PROVIDERS.microsoft.scopes.join(' '),
+            scope: scopes,
             state: state,
             response_mode: 'query'
         }).toString();
 
-        console.log(`[OAuth] Microsoft auth URL: ${authUrl}`);
-        console.log(`[OAuth] Microsoft clientId: ${providerConfig.clientId}, tenantId: ${tenantId}`);
-        req.session.save(() => res.redirect(authUrl));
+        console.log(`[OAuth/Microsoft] Auth URL: ${authUrl}`);
+        console.log(`[OAuth/Microsoft] State saved: ${state}`);
+        req.session.save((err) => {
+            if (err) console.error(`[OAuth/Microsoft] Session save error on login redirect:`, err);
+            else console.log(`[OAuth/Microsoft] Session saved, redirecting to Microsoft...`);
+            res.redirect(authUrl);
+        });
 
     } else if (provider === 'nextcloud') {
         const { nextcloudUrl, clientId } = config.oauth || {};
@@ -292,26 +305,34 @@ router.get('/login/:provider', async (req, res) => {
 // Provider-specific callback
 router.get('/callback/:provider', async (req, res) => {
     const { provider } = req.params;
-    const { code, error, state } = req.query;
+    const { code, error, error_description, state } = req.query;
     const config = await loadConfig();
+
+    console.log(`[OAuth/${provider}] === CALLBACK START ===`);
+    console.log(`[OAuth/${provider}] SessionID: ${req.sessionID}`);
+    console.log(`[OAuth/${provider}] Query params — code present: ${!!code}, error: ${error || 'none'}, state present: ${!!state}`);
+    if (error_description) console.log(`[OAuth/${provider}] Error description: ${error_description}`);
+    console.log(`[OAuth/${provider}] Session returnTo: ${req.session.returnTo || '(not set)'}`);
+    console.log(`[OAuth/${provider}] Session oauthState: ${req.session.oauthState || '(not set)'}`);
+    console.log(`[OAuth/${provider}] Session oauthProvider: ${req.session.oauthProvider || '(not set)'}`);
 
     const returnTo = req.session.returnTo || 'http://localhost:5173';
     delete req.session.returnTo;
 
     if (error) {
-        console.error(`OAuth ${provider} error:`, error);
+        console.error(`[OAuth/${provider}] ERROR from provider: ${error} — ${error_description || 'no description'}`);
         return res.redirect(`${returnTo}?error=` + encodeURIComponent(error));
     }
 
     if (!code) {
+        console.error(`[OAuth/${provider}] No authorization code received`);
         return res.redirect(`${returnTo}?error=no_code`);
     }
 
-    console.log(`[OAuth] Callback SessionID: ${req.sessionID}`);
-    console.log(`[OAuth] Stored State: ${req.session.oauthState}, Received State: ${state}`);
+    console.log(`[OAuth/${provider}] Stored State: ${req.session.oauthState}, Received State: ${state}`);
 
     if (state !== req.session.oauthState) {
-        console.error('OAuth state mismatch');
+        console.error(`[OAuth/${provider}] STATE MISMATCH — stored: ${req.session.oauthState}, received: ${state}`);
         return res.redirect(`${returnTo}?error=invalid_state`);
     }
     delete req.session.oauthState;
@@ -376,8 +397,17 @@ router.get('/callback/:provider', async (req, res) => {
         } else if (provider === 'microsoft') {
             const providerConfig = config.providers?.microsoft || {};
             const tenantId = providerConfig.tenantId || 'common';
+            const tokenUrl = OAUTH_PROVIDERS.microsoft.tokenUrl(tenantId);
 
-            const tokenResponse = await fetch(OAUTH_PROVIDERS.microsoft.tokenUrl(tenantId), {
+            console.log(`[OAuth/Microsoft] === TOKEN EXCHANGE ===`);
+            console.log(`[OAuth/Microsoft] Token URL: ${tokenUrl}`);
+            console.log(`[OAuth/Microsoft] REDIRECT_URI: ${REDIRECT_URI}`);
+            console.log(`[OAuth/Microsoft] clientId: ${providerConfig.clientId}`);
+            console.log(`[OAuth/Microsoft] clientSecret present: ${!!providerConfig.clientSecret} (length: ${(providerConfig.clientSecret || '').length})`);
+            console.log(`[OAuth/Microsoft] tenantId: ${tenantId}`);
+            console.log(`[OAuth/Microsoft] code length: ${(code || '').length}`);
+
+            const tokenResponse = await fetch(tokenUrl, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
                 body: new URLSearchParams({
@@ -389,26 +419,40 @@ router.get('/callback/:provider', async (req, res) => {
                 }).toString()
             });
 
+            console.log(`[OAuth/Microsoft] Token response status: ${tokenResponse.status} ${tokenResponse.statusText}`);
+
             if (!tokenResponse.ok) {
                 const errorText = await tokenResponse.text();
-                console.error('Microsoft token exchange failed:', errorText);
+                console.error(`[OAuth/Microsoft] TOKEN EXCHANGE FAILED (${tokenResponse.status}):`, errorText);
                 return res.redirect(`${returnTo}?error=token_exchange_failed`);
             }
 
             tokenData = await tokenResponse.json();
+            console.log(`[OAuth/Microsoft] Token exchange successful — access_token present: ${!!tokenData.access_token}, refresh_token present: ${!!tokenData.refresh_token}`);
+            if (tokenData.scope) console.log(`[OAuth/Microsoft] Granted scopes: ${tokenData.scope}`);
+            if (tokenData.error) console.error(`[OAuth/Microsoft] Token response error: ${tokenData.error} — ${tokenData.error_description || ''}`);
 
+            console.log(`[OAuth/Microsoft] === USER INFO FETCH ===`);
+            console.log(`[OAuth/Microsoft] User info URL: ${OAUTH_PROVIDERS.microsoft.userInfoUrl}`);
             const userResponse = await fetch(OAUTH_PROVIDERS.microsoft.userInfoUrl, {
                 headers: { 'Authorization': `Bearer ${tokenData.access_token}` }
             });
 
+            console.log(`[OAuth/Microsoft] User info response status: ${userResponse.status} ${userResponse.statusText}`);
+
             if (userResponse.ok) {
                 const userData = await userResponse.json();
+                console.log(`[OAuth/Microsoft] User info received — id: ${userData.id}, displayName: ${userData.displayName}, mail: ${userData.mail}, upn: ${userData.userPrincipalName}`);
                 user = {
                     id: userData.id || userData.userPrincipalName,
                     displayName: userData.displayName || userData.userPrincipalName,
                     email: userData.mail || userData.userPrincipalName,
                     provider: 'microsoft'
                 };
+                console.log(`[OAuth/Microsoft] Mapped user — id: ${user.id}, displayName: ${user.displayName}, email: ${user.email}`);
+            } else {
+                const userErrorText = await userResponse.text();
+                console.error(`[OAuth/Microsoft] USER INFO FETCH FAILED (${userResponse.status}):`, userErrorText);
             }
         } else if (provider === 'nextcloud') {
             const { nextcloudUrl, clientId, clientSecret } = config.oauth || {};
@@ -455,8 +499,10 @@ router.get('/callback/:provider', async (req, res) => {
         }
 
         if (!user) {
+            console.error(`[OAuth/${provider}] FAILED: Could not obtain user info from provider`);
             return res.redirect(`${returnTo}?error=failed_to_get_user_info`);
         }
+        console.log(`[OAuth/${provider}] === USER PROVISIONING ===`);
 
         // Create or update user in the store with full profile data
         const existingUser = await userStore.getUser(user.id);
@@ -634,6 +680,8 @@ router.get('/callback/:provider', async (req, res) => {
             pendingApproval = true;
         }
 
+        console.log(`[OAuth/${provider}] === SESSION SETUP ===`);
+        console.log(`[OAuth/${provider}] User: ${user.id} (${user.displayName}), pendingApproval: ${pendingApproval}, userHasOrg: ${userHasOrg}`);
         req.session.accessToken = tokenData.access_token;
         req.session.refreshToken = tokenData.refresh_token;
         req.session.user = user;
@@ -645,10 +693,14 @@ router.get('/callback/:provider', async (req, res) => {
         }
         if (!userHasOrg && !req.session.pendingSignup) {
             req.session.noOrganization = true;
+            console.log(`[OAuth/${provider}] User has no organization`);
         }
         // Handle SSO encryption with backward compatibility
+        console.log(`[OAuth/${provider}] Checking encryption for user ${user.id}...`);
         const encryptionEnabled = await isEncryptionEnabledForUser(user.id);
+        console.log(`[OAuth/${provider}] Encryption enabled: ${encryptionEnabled}`);
         const ssoResult = await getOrCreateSSOUserDEKCompat(user.id, encryptionEnabled);
+        console.log(`[OAuth/${provider}] SSO DEK result — hasKey: ${!!ssoResult.encryptionKey}, needsSetup: ${!!ssoResult.needsEncryptionSetup}, needsPin: ${!!ssoResult.needsEncryptionPin}`);
         if (ssoResult.encryptionKey) {
             req.session.encryptionKey = ssoResult.encryptionKey;
         }
@@ -659,13 +711,16 @@ router.get('/callback/:provider', async (req, res) => {
             req.session.needsEncryptionPin = true;
         }
 
+        console.log(`[OAuth/${provider}] Saving session and redirecting to: ${returnTo}`);
         req.session.save((err) => {
-            if (err) console.error('Session save error:', err);
+            if (err) console.error(`[OAuth/${provider}] SESSION SAVE ERROR:`, err);
+            else console.log(`[OAuth/${provider}] === LOGIN COMPLETE === Redirecting user ${user.id}`);
             res.redirect(returnTo);
         });
 
     } catch (err) {
-        console.error(`OAuth ${provider} callback error:`, err);
+        console.error(`[OAuth/${provider}] CALLBACK EXCEPTION:`, err.message);
+        console.error(`[OAuth/${provider}] Stack:`, err.stack);
         res.redirect(`${returnTo}?error=` + encodeURIComponent(err.message));
     }
 });
@@ -813,7 +868,15 @@ router.put('/providers/:provider', requireAdmin, async (req, res) => {
         config.providers.microsoft = config.providers.microsoft || {};
         if (clientId !== undefined) config.providers.microsoft.clientId = clientId;
         if (clientSecret && clientSecret.trim()) config.providers.microsoft.clientSecret = clientSecret;
-        if (tenantId !== undefined) config.providers.microsoft.tenantId = tenantId || 'common';
+        if (tenantId !== undefined) {
+            const tid = (tenantId || '').trim();
+            const knownAliases = ['common', 'organizations', 'consumers', ''];
+            const isGuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(tid);
+            if (!knownAliases.includes(tid.toLowerCase()) && !isGuid) {
+                return res.status(400).json({ error: `Invalid Tenant ID "${tid}". Must be a GUID (e.g. xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx) or one of: common, organizations, consumers` });
+            }
+            config.providers.microsoft.tenantId = tid || 'common';
+        }
 
     } else {
         return res.status(404).json({ error: 'Unknown provider' });

@@ -246,6 +246,19 @@ async function executeComponentTool(toolName, args, userAuth = {}, fixedParams =
         return executeSystemTool(toolName, args);
     }
 
+    // Check for MCP tools (prefixed with "mcp_")
+    if (toolName.startsWith('mcp_')) {
+        try {
+            const mcpManager = require('./mcpManager');
+            const userId = userAuth?.userId || userAuth?.user_id || null;
+            const result = await mcpManager.callToolByPrefixedName(toolName, args || {}, userId);
+            return { result: typeof result === 'string' ? result : JSON.stringify(result) };
+        } catch (err) {
+            console.error(`[MCP] Tool call failed for ${toolName}:`, err.message);
+            return { error: `MCP tool error: ${err.message}` };
+        }
+    }
+
     const componentId = toolName.replace(/_/g, '-');
 
     // Check if this is a subworkflow (virtual component)

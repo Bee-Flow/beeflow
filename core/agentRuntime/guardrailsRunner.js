@@ -1,5 +1,5 @@
 const configStore = require('../../stores/configStore');
-const { validateWithLlamaGuard } = require('../moderation');
+const { validateInput } = require('../moderation');
 const { resolveOrgShield, mergeWithOrgShield } = require('../orgShield');
 const { checkRegexPatterns } = require('../guardrails');
 
@@ -34,7 +34,7 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
     
     if (shouldCheckInputModeration) {
         try {
-            await validateWithLlamaGuard(messages, agent.config?.llamaGuardEnabled, orgShieldCategories);
+            await validateInput(messages, agent.config?.llamaGuardEnabled, orgShieldCategories);
         } catch (guardError) {
             console.error('[GuardrailsRunner] Guardrails Check Failed:', guardError.message);
             if (guardError.violationCodes) {

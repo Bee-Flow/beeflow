@@ -101,7 +101,16 @@ async function getAgentTools(agentId) {
         tools.push(...SYSTEM_TOOLS);
     }
 
-
+    // Load MCP tools from all connected external servers
+    try {
+        const mcpManager = require('../mcpManager');
+        const mcpTools = await mcpManager.getAllToolsAsOpenAI();
+        if (mcpTools.length > 0) {
+            tools.push(...mcpTools);
+        }
+    } catch (err) {
+        console.warn('[AgentTools] Failed to load MCP tools:', err.message);
+    }
 
     return tools;
 }

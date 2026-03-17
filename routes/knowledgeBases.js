@@ -8,9 +8,26 @@ const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const kbStore = require('../stores/knowledgeBases');
+const configStore = require('../stores/configStore');
 const { requireAuth } = require('../auth');
 
 const SEARCH_SERVICE_URL = process.env.SEARCH_SERVICE_URL || 'http://search-service:8000';
+const { getServiceHeaders } = require('../core/serviceAuth');
+
+/**
+ * Read Azure credentials from configStore and return fields for search-service API calls.
+ * Returns { use_azure, azure_endpoint, azure_key, azure_model } when Azure is enabled.
+ */
+async function getAzureIngestParams() {
+    const useAzure = !!(await configStore.getConfig('use_azure_doc_processing'));
+    if (!useAzure) return { use_azure: false };
+    return {
+        use_azure: true,
+        azure_endpoint: await configStore.getConfig('azure_openai_embedding_endpoint') || '',
+        azure_key: await configStore.getSecret('azure_openai_embedding_key') || '',
+        azure_model: await configStore.getConfig('azure_openai_embedding_model') || 'text-embedding-3-small',
+    };
+}
 
 // Auth helper
 const getUserId = (req) => req.session?.user?.id || null;
@@ -102,7 +119,7 @@ router.delete('/:id', requireAuth, async (req, res) => {
         try {
             await fetch(`${SEARCH_SERVICE_URL}/kb/${kb.id}/chunks`, {
                 method: 'DELETE',
-                headers: { 'Content-Type': 'application/json' },
+                headers: getServiceHeaders(),
                 body: JSON.stringify({ tenant_id: kb.tenant_id }),
                 signal: AbortSignal.timeout(10000)
             });
@@ -155,7 +172,7 @@ router.delete('/:id/documents/:docId', requireAuth, async (req, res) => {
         try {
             await fetch(`${SEARCH_SERVICE_URL}/kb/${kb.id}/documents/${doc.id}/chunks`, {
                 method: 'DELETE',
-                headers: { 'Content-Type': 'application/json' },
+                headers: getServiceHeaders(),
                 body: JSON.stringify({ tenant_id: kb.tenant_id }),
                 signal: AbortSignal.timeout(10000)
             });
@@ -203,9 +220,10 @@ router.post('/:id/ingest/text', requireAuth, async (req, res) => {
         );
 
         // Send to search-service for ingestion (chunking + embedding + storage)
+        const azureParams = await getAzureIngestParams();
         const ingestRes = await fetch(`${SEARCH_SERVICE_URL}/kb/ingest/json`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: getServiceHeaders(),
             body: JSON.stringify({
                 tenant_id: kb.tenant_id,
                 knowledge_base_id: kb.id,
@@ -213,7 +231,8 @@ router.post('/:id/ingest/text', requireAuth, async (req, res) => {
                 content,
                 title: title || 'Text snippet',
                 source_uri: null,
-                lang: kb.default_lang
+                lang: kb.default_lang,
+                ...azureParams,
             }),
             signal: AbortSignal.timeout(60000)
         });
@@ -256,14 +275,32 @@ router.post('/:id/ingest/file', requireAuth, upload.single('file'), async (req, 
         let content = '';
         const mime = req.file.mimetype;
         const filename = req.file.originalname;
+        // Global admin toggle — or per-request override for API callers
+        const useAzure = req.body.useAzureDocIntelligence === 'true'
+            || !!(await configStore.getConfig('use_azure_doc_processing'));
 
-        if (mime === 'text/plain' || mime === 'text/markdown') {
+        console.log(`[KB Pipeline] ─── File: ${filename} (${(req.file.size / 1024).toFixed(1)} KB, ${mime}) ───`);
+        console.log(`[KB Pipeline] Mode: ${useAzure ? '☁️  AZURE' : '🖥️  LOCAL'}`);
+
+        if (useAzure) {
+            // ── Azure Document Intelligence path (all file types) ──
+            const { extractWithAzure, isAzureDocIntelligenceConfigured } = require('../core/azureDocIntelligence');
+            if (!(await isAzureDocIntelligenceConfigured())) {
+                return res.status(400).json({ error: 'Azure Document Intelligence is not configured. Set endpoint and key in admin settings.' });
+            }
+            console.log(`[KB Pipeline] Extraction: Azure Document Intelligence (Layout → Markdown)`);
+            content = await extractWithAzure(req.file.buffer, filename);
+        } else if (mime === 'text/plain' || mime === 'text/markdown') {
+            console.log(`[KB Pipeline] Extraction: Direct text read (${mime})`);
             content = req.file.buffer.toString('utf-8');
         } else if (mime === 'application/pdf') {
             // Primary: use pdfExtractor (pdfjs-dist) for text-based PDFs
             try {
                 const { extractTextFromPDF } = require('../core/pdfExtractor');
                 content = await extractTextFromPDF(req.file.buffer, filename);
+                if (content && content.trim().length >= 20) {
+                    console.log(`[KB Pipeline] Extraction: pdfjs-dist (text-based PDF)`);
+                }
             } catch (e) {
                 console.warn('[KB] pdfExtractor failed:', e.message);
             }
@@ -272,6 +309,7 @@ router.post('/:id/ingest/file', requireAuth, upload.single('file'), async (req, 
                 try {
                     const { getMistralOCRApiKey, mistralOCR } = require('../core/ocr');
                     if (await getMistralOCRApiKey()) {
+                        console.log(`[KB Pipeline] Extraction: Mistral OCR (scanned PDF fallback)`);
                         const base64 = req.file.buffer.toString('base64');
                         content = await mistralOCR(base64, mime, filename);
                     }
@@ -289,6 +327,7 @@ router.post('/:id/ingest/file', requireAuth, upload.single('file'), async (req, 
             filename?.match(/\.(docx|csv|xlsx)$/i)
         ) {
             const { parseDocument } = require('../core/documentParser');
+            console.log(`[KB Pipeline] Extraction: documentParser (${filename.split('.').pop()})`);
             content = await parseDocument(req.file.buffer, mime, filename);
         } else {
             return res.status(400).json({ error: 'Unsupported file type' });
@@ -311,10 +350,14 @@ router.post('/:id/ingest/file', requireAuth, upload.single('file'), async (req, 
             filename, 'upload', filename, hash
         );
 
-        // Ingest via search-service
+        // Ingest via search-service (pass use_azure flag for Azure-native embeddings)
+        const azureParams = await getAzureIngestParams();
+        console.log(`[KB Pipeline] Embedding: ${azureParams.use_azure ? 'Azure OpenAI (text-embedding-3-small)' : 'Local vLLM (bge-m3)'}`);
+        console.log(`[KB Pipeline] Reranking: ${azureParams.use_azure ? 'Azure OpenAI cosine similarity' : 'Local vLLM (bge-reranker-large)'}`);
+        console.log(`[KB Pipeline] Sending ${content.length} chars to search-service (use_azure=${azureParams.use_azure})`);
         const ingestRes = await fetch(`${SEARCH_SERVICE_URL}/kb/ingest/json`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: getServiceHeaders(),
             body: JSON.stringify({
                 tenant_id: kb.tenant_id,
                 knowledge_base_id: kb.id,
@@ -322,7 +365,8 @@ router.post('/:id/ingest/file', requireAuth, upload.single('file'), async (req, 
                 content,
                 title: filename,
                 source_uri: filename,
-                lang: kb.default_lang
+                lang: kb.default_lang,
+                ...azureParams,
             }),
             signal: AbortSignal.timeout(120000)
         });
@@ -418,9 +462,10 @@ router.post('/:id/ingest/url', requireAuth, async (req, res) => {
         );
 
         // Ingest
+        const azureParams = await getAzureIngestParams();
         const ingestRes = await fetch(`${SEARCH_SERVICE_URL}/kb/ingest/json`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: getServiceHeaders(),
             body: JSON.stringify({
                 tenant_id: kb.tenant_id,
                 knowledge_base_id: kb.id,
@@ -428,7 +473,8 @@ router.post('/:id/ingest/url', requireAuth, async (req, res) => {
                 content,
                 title: pageTitle,
                 source_uri: response.url || url,
-                lang: kb.default_lang
+                lang: kb.default_lang,
+                ...azureParams,
             }),
             signal: AbortSignal.timeout(120000)
         });
@@ -636,9 +682,10 @@ router.post('/:id/ingest/sitemap', requireAuth, async (req, res) => {
                 );
 
                 // Ingest via search-service
+                const azureParams = await getAzureIngestParams();
                 const ingestRes = await fetch(`${SEARCH_SERVICE_URL}/kb/ingest/json`, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: getServiceHeaders(),
                     body: JSON.stringify({
                         tenant_id: kb.tenant_id,
                         knowledge_base_id: kb.id,
@@ -646,7 +693,8 @@ router.post('/:id/ingest/sitemap', requireAuth, async (req, res) => {
                         content,
                         title: pageTitle,
                         source_uri: response.url || pageUrl,
-                        lang: kb.default_lang
+                        lang: kb.default_lang,
+                        ...azureParams,
                     }),
                     signal: AbortSignal.timeout(60000)
                 });
@@ -710,7 +758,7 @@ router.post('/search', requireAuth, async (req, res) => {
 
         const searchRes = await fetch(`${SEARCH_SERVICE_URL}/tools/kb-search`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: getServiceHeaders(),
             body: JSON.stringify({
                 tenant_id: userId,
                 kb_ids,
@@ -802,7 +850,7 @@ router.post('/:id/reindex', requireAuth, async (req, res) => {
                     console.log(`[KB] Reindex [${i + 1}/${docs.length}] Using existing content for: ${title}`);
                     const contentRes = await fetch(
                         `${SEARCH_SERVICE_URL}/kb/${kb.id}/documents/${doc.id}/content?tenant_id=${encodeURIComponent(kb.tenant_id)}`,
-                        { signal: AbortSignal.timeout(15000) }
+                        { headers: getServiceHeaders(), signal: AbortSignal.timeout(15000) }
                     );
                     if (!contentRes.ok) {
                         throw new Error(`Failed to get existing content: ${contentRes.status}`);
@@ -818,9 +866,10 @@ router.post('/:id/reindex', requireAuth, async (req, res) => {
                 }
 
                 // ── Re-ingest (delete old chunks → re-chunk → re-embed → insert) ──
+                const azureParams = await getAzureIngestParams();
                 const ingestRes = await fetch(`${SEARCH_SERVICE_URL}/kb/ingest/json`, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: getServiceHeaders(),
                     body: JSON.stringify({
                         tenant_id: kb.tenant_id,
                         knowledge_base_id: kb.id,
@@ -828,7 +877,8 @@ router.post('/:id/reindex', requireAuth, async (req, res) => {
                         content,
                         title,
                         source_uri: doc.source_uri || null,
-                        lang: kb.default_lang
+                        lang: kb.default_lang,
+                        ...azureParams,
                     }),
                     signal: AbortSignal.timeout(120000)
                 });

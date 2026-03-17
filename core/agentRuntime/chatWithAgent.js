@@ -15,7 +15,7 @@ const { resolveAgentModel } = require('./modelResolver');
 const { getAgentTools } = require('./agentTools');
 const { executeWorkerTool } = require('./workerExecution');
 const { processSystemPrompt } = require('../promptUtils');
-const { validateWithLlamaGuard } = require('../moderation');
+const { validateInput } = require('../moderation');
 
 async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
     // Check swarm first to prioritize virtual agent definition
@@ -100,7 +100,7 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
 
 
         // 2. Llama Guard Moderation
-        await validateWithLlamaGuard(validationRequest, agent.config?.llamaGuardEnabled);
+        await validateInput(validationRequest, agent.config?.llamaGuardEnabled);
     }
 
     // Enrich messages with form data context

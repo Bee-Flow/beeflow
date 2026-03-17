@@ -9,6 +9,7 @@
  */
 
 const { getAIConfig } = require('./aiAgent');
+const { getServiceHeaders } = require('./serviceAuth');
 
 // ── Guard Result Cache (LRU, 5-min TTL) ──────────────────────────────
 const GUARD_CACHE_MAX = 200;
@@ -149,7 +150,7 @@ async function validateWithGuardService(messages, agentModerationEnabled = false
 
         const response = await fetch(`${guardUrl}/moderate`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: getServiceHeaders(),
             body: JSON.stringify({
                 channel: 'user_input',
                 lang: 'unknown',
@@ -245,7 +246,7 @@ async function validateOutputWithGuardService(content, allowedCategories = null)
 
         const response = await fetch(`${guardUrl}/moderate`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: getServiceHeaders(),
             body: JSON.stringify({
                 channel: 'assistant_output',
                 lang: 'unknown',
@@ -293,10 +294,82 @@ async function validateOutputWithGuardService(content, allowedCategories = null)
 // Alias for convenience
 const validateWithLlamaGuard = validateWithGuardService;
 
+// ── Provider Routing ──────────────────────────────────────────────────
+// Unified functions that delegate to the active moderation provider
+// (Llama Guard or Azure Content Safety) based on config.
+// PII detection runs as an additional parallel check.
+const { validateWithAzureContentSafety, validateOutputWithAzureContentSafety } = require('./azureContentSafety');
+const { validateInputForPii, validateOutputForPii } = require('./azurePiiDetection');
+
+/**
+ * Validate user input — routes to the active moderation provider.
+ * Also runs PII detection in parallel if enabled.
+ * Drop-in replacement that works with both Llama Guard and Azure Content Safety.
+ */
+async function validateInput(messages, agentModerationEnabled = false, allowedCategories = null) {
+    const aiConfig = await getAIConfig();
+    const provider = aiConfig.moderationProvider || 'llamaguard';
+
+    // Run content moderation + PII detection in parallel
+    const checks = [];
+
+    // Content moderation check
+    if (provider === 'azure') {
+        checks.push(validateWithAzureContentSafety(messages, agentModerationEnabled, allowedCategories));
+    } else {
+        checks.push(validateWithGuardService(messages, agentModerationEnabled, allowedCategories));
+    }
+
+    // PII detection check (runs alongside content moderation)
+    if (aiConfig.piiDetectionEnabled) {
+        checks.push(validateInputForPii(messages, false));
+    }
+
+    // Wait for all checks — if any throws, the first error is propagated
+    const results = await Promise.allSettled(checks);
+    for (const result of results) {
+        if (result.status === 'rejected') {
+            throw result.reason;
+        }
+    }
+}
+
+/**
+ * Validate agent output — routes to the active moderation provider.
+ * Also runs PII detection in parallel if enabled.
+ */
+async function validateOutput(content, allowedCategories = null) {
+    const aiConfig = await getAIConfig();
+    const provider = aiConfig.moderationProvider || 'llamaguard';
+
+    const checks = [];
+
+    if (provider === 'azure') {
+        checks.push(validateOutputWithAzureContentSafety(content, allowedCategories));
+    } else {
+        checks.push(validateOutputWithGuardService(content, allowedCategories));
+    }
+
+    if (aiConfig.piiDetectionEnabled) {
+        checks.push(validateOutputForPii(content));
+    }
+
+    const results = await Promise.allSettled(checks);
+    for (const result of results) {
+        if (result.status === 'rejected') {
+            throw result.reason;
+        }
+    }
+}
+
 module.exports = {
     validateWithGuardService,
     validateWithLlamaGuard,
     validateOutputWithGuardService,
+    validateInput,
+    validateOutput,
+    validateInputForPii,
+    validateOutputForPii,
     GUARD_CATEGORIES,
     DEFAULT_MODERATION_THRESHOLD
 };

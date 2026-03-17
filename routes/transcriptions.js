@@ -210,10 +210,14 @@ async function transcribeWithWhisperX(filePath, fileName, language, contextTerms
 
     console.log(`[Transcriptions] Sending to WhisperX at ${whisperxUrl}/transcribe ...`);
 
+    const apiKey = process.env.SERVICES_API_KEY;
     const resp = await fetch(`${whisperxUrl}/transcribe`, {
         method: 'POST',
         body: form,
-        headers: form.getHeaders(),
+        headers: {
+            ...form.getHeaders(),
+            ...(apiKey ? { 'X-API-Key': apiKey } : {}),
+        },
         timeout: 600000, // 10 minutes for long files
     });
 

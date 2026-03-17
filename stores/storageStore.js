@@ -48,7 +48,8 @@ async function init() {
             await s3.send(new CreateBucketCommand({ Bucket: BUCKET }));
             console.log(`[StorageStore] Bucket "${BUCKET}" created`);
         } else {
-            console.error('[StorageStore] Failed to check bucket:', err.message);
+            console.error(`[StorageStore] Failed to check bucket: ${err.name} — ${err.message}`);
+            console.error(`[StorageStore] HTTP status: ${err.$metadata?.httpStatusCode}, endpoint: ${endpoint}`);
             s3 = null;
             return false;
         }

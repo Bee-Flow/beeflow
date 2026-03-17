@@ -16,6 +16,7 @@ const configStore = require('../../stores/configStore');
 const { getAdapter } = require('../../core/providers');
 const templateStore = require('../../stores/templateStore');
 const transcriptionStore = require('../../stores/transcriptionStore');
+const { getServiceHeaders } = require('../../core/serviceAuth');
 
 function requireAuth(req, res, next) {
     if (req.session && req.session.user) return next();
@@ -189,7 +190,7 @@ ABSOLUTE RULES:
                 const searchUrl = process.env.SEARCH_SERVICE_URL || 'http://search-service:8000';
                 const searchRes = await fetch(`${searchUrl}/tools/kb-search`, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: getServiceHeaders(),
                     body: JSON.stringify({ tenant_id: userId, kb_ids: kbIds, query: message, top_k: 8, rerank: true }),
                     signal: AbortSignal.timeout(10000),
                 });

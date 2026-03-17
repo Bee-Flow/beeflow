@@ -9,6 +9,7 @@
  */
 
 const { executeComponentTool } = require('./toolExecution');
+const configStore = require('../stores/configStore');
 
 // ─── Integration imports ────────────────────────────────────────
 const { isGmailTool, executeGmailTool } = require('../integrations/gmailTools');
@@ -181,6 +182,12 @@ async function executeTool(toolName, toolArgs, context = {}) {
         return await executeN8nTool(toolName, toolArgs, orgId, attachments);
     }
     if (isAgentSearchTool(toolName)) {
+        // Check if admin configured Bing as the search provider
+        const searchProvider = await configStore.getConfig('search_provider');
+        if (searchProvider === 'bing') {
+            const { executeBingSearchTool } = require('../integrations/bingSearchTools');
+            return await executeBingSearchTool(toolName, toolArgs);
+        }
         return await executeAgentSearchTool(toolName, toolArgs);
     }
 

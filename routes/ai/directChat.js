@@ -22,6 +22,7 @@ const { executeTool: dispatchTool } = require('../../core/toolDispatcher');
 const { getIntegrationTools, buildToolHint } = require('../../core/integrationTools');
 const { checkRegexPatterns } = require('../../core/guardrails');
 const { checkSubscriptionLimits, resolveOrgId } = require('../../core/limits');
+const { getServiceHeaders } = require('../../core/serviceAuth');
 
 function requireAuth(req, res, next) {
     if (req.session && req.session.user) return next();
@@ -277,7 +278,7 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                             const searchUrl = process.env.SEARCH_SERVICE_URL || 'http://search-service:8000';
                             const searchRes = await fetch(`${searchUrl}/tools/kb-search`, {
                                 method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
+                                headers: getServiceHeaders(),
                                 body: JSON.stringify({ tenant_id: userId, kb_ids: kbIds, query: message, top_k: 8, rerank: true }),
                                 signal: AbortSignal.timeout(10000),
                             });
@@ -564,8 +565,8 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         // Check user input with moderation (only if scope.userInput)
         if (moderationEnabled && moderationScope.userInput) {
             try {
-                const { validateWithLlamaGuard } = require('../../core/moderation');
-                await validateWithLlamaGuard(messages, true, moderationCategories);
+                const { validateInput } = require('../../core/moderation');
+                await validateInput(messages, true, moderationCategories);
                 console.log(`[DirectChat] AI moderation passed (user input)`);
             } catch (guardError) {
                 if (guardError.violationCodes) {
@@ -778,8 +779,8 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                                 // 2. Llama Guard on search query
                                 if (webSearchGuardEnabled) {
                                     try {
-                                        const { validateWithLlamaGuard } = require('../../core/moderation');
-                                        await validateWithLlamaGuard([{ role: 'user', content: toolArgs.query }], true, moderationCategories);
+                                        const { validateInput } = require('../../core/moderation');
+                                        await validateInput([{ role: 'user', content: toolArgs.query }], true, moderationCategories);
                                         console.log(`[DirectChat WebSearchGuard] Search query passed`);
                                     } catch (guardErr) {
                                         console.log(`[DirectChat WebSearchGuard] Search query BLOCKED: ${guardErr.message}`);
@@ -1052,8 +1053,8 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                         // 2. Llama Guard on search query
                         if (webSearchGuardEnabled) {
                             try {
-                                const { validateWithLlamaGuard } = require('../../core/moderation');
-                                await validateWithLlamaGuard([{ role: 'user', content: toolArgs.query }], true, moderationCategories);
+                                const { validateInput } = require('../../core/moderation');
+                                await validateInput([{ role: 'user', content: toolArgs.query }], true, moderationCategories);
                                 console.log(`[DirectChat WebSearchGuard] Streamed search query passed`);
                             } catch (guardErr) {
                                 console.log(`[DirectChat WebSearchGuard] Streamed search query BLOCKED: ${guardErr.message}`);
@@ -1246,9 +1247,9 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         // Check agent output with AI moderation (only if scope.agentOutput)
         if (moderationEnabled && moderationScope.agentOutput && fullContent && !moderationViolation) {
             try {
-                const { validateWithLlamaGuard } = require('../../core/moderation');
+                const { validateInput } = require('../../core/moderation');
                 const outputMessages = [{ role: 'assistant', content: fullContent }];
-                await validateWithLlamaGuard(outputMessages, true, moderationCategories);
+                await validateInput(outputMessages, true, moderationCategories);
                 console.log(`[DirectChat] AI moderation passed (agent output)`);
             } catch (guardError) {
                 if (guardError.violationCodes) {

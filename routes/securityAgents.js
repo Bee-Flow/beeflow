@@ -40,7 +40,7 @@ const fileUpload = multer({
             cb(null, safe);
         }
     }),
-    limits: { fileSize: 10 * 1024 * 1024 } // 10 MB
+    limits: { fileSize: 20 * 1024 * 1024 } // 20 MB
 });
 
 // GET /security-agents — List all security agents

@@ -87,6 +87,12 @@ const DEFAULT_CONFIG = {
     lakeraApiKey: '',
     regexGuardrails: null,
     llamaGuardConfig: null,
+    moderationProvider: 'llamaguard',
+    azureContentSafetySeverityThreshold: 2,
+    azureContentSafetyCategories: null,
+    piiDetectionEnabled: false,
+    piiDetectionCategories: null,
+    piiDetectionConfidenceThreshold: 0.7,
     providers: [],
     defaultProviderId: null
 };
@@ -113,6 +119,12 @@ async function getAIConfig() {
                     mistralOcrApiKey: ai.mistralOcrApiKey || null,
                     regexGuardrails: ai.regexGuardrails || null,
                     llamaGuardConfig: ai.llamaGuardConfig || null,
+                    moderationProvider: ai.moderationProvider || 'llamaguard',
+                    azureContentSafetySeverityThreshold: ai.azureContentSafetySeverityThreshold ?? 2,
+                    azureContentSafetyCategories: ai.azureContentSafetyCategories || null,
+                    piiDetectionEnabled: ai.piiDetectionEnabled || false,
+                    piiDetectionCategories: ai.piiDetectionCategories || null,
+                    piiDetectionConfidenceThreshold: ai.piiDetectionConfidenceThreshold ?? 0.7,
                     embeddingModel: ai.embeddingModel || null,
                     embeddingProviderId: ai.embeddingProviderId || null
                 };
@@ -128,6 +140,12 @@ async function getAIConfig() {
             mistralOcrApiKey: ai.mistralOcrApiKey || null,
             regexGuardrails: ai.regexGuardrails || null,
             llamaGuardConfig: ai.llamaGuardConfig || null,
+            moderationProvider: ai.moderationProvider || 'llamaguard',
+            azureContentSafetySeverityThreshold: ai.azureContentSafetySeverityThreshold ?? 2,
+            azureContentSafetyCategories: ai.azureContentSafetyCategories || null,
+            piiDetectionEnabled: ai.piiDetectionEnabled || false,
+            piiDetectionCategories: ai.piiDetectionCategories || null,
+            piiDetectionConfidenceThreshold: ai.piiDetectionConfidenceThreshold ?? 0.7,
             embeddingModel: ai.embeddingModel || null,
             embeddingProviderId: ai.embeddingProviderId || null
         };
@@ -199,6 +217,12 @@ async function saveAIConfig(aiConfig) {
             lakeraApiKey: aiConfig.lakeraApiKey || '',
             regexGuardrails: aiConfig.regexGuardrails || null,
             llamaGuardConfig: aiConfig.llamaGuardConfig || null,
+            moderationProvider: aiConfig.moderationProvider || ai.moderationProvider || 'llamaguard',
+            azureContentSafetySeverityThreshold: aiConfig.azureContentSafetySeverityThreshold ?? ai.azureContentSafetySeverityThreshold ?? 2,
+            azureContentSafetyCategories: aiConfig.azureContentSafetyCategories !== undefined ? aiConfig.azureContentSafetyCategories : ai.azureContentSafetyCategories || null,
+            piiDetectionEnabled: aiConfig.piiDetectionEnabled !== undefined ? aiConfig.piiDetectionEnabled : ai.piiDetectionEnabled || false,
+            piiDetectionCategories: aiConfig.piiDetectionCategories !== undefined ? aiConfig.piiDetectionCategories : ai.piiDetectionCategories || null,
+            piiDetectionConfidenceThreshold: aiConfig.piiDetectionConfidenceThreshold ?? ai.piiDetectionConfidenceThreshold ?? 0.7,
             embeddingModel: aiConfig.embeddingModel || null,
             embeddingProviderId: aiConfig.embeddingProviderId || null
         };
@@ -412,7 +436,7 @@ async function ensureAzureProvider() {
 
     if (!ai.providers) ai.providers = [];
 
-    const apiVersion = await configStore.getConfig('azure_api_version') || '2025-04-01-preview';
+    const apiVersion = await configStore.getConfig('azure_api_version') || '2024-04-01-preview';
 
     const existing = ai.providers.find(p => p.id === 'azure-default');
     if (existing) {

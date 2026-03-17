@@ -77,9 +77,13 @@ CITATION RULES:
 // ─── Tool Execution ────────────────────────────────────────────
 
 async function executeAgentSearchTool(toolName, args) {
-    const searchUrl = await configStore.getConfig('agent_search_url');
+    const envUrl = process.env.SEARCH_SERVICE_URL;
+    const configUrl = !envUrl ? await configStore.getConfig('agent_search_url') : null;
+    const searchUrl = envUrl || configUrl;
+    console.log(`[AgentSearch] URL resolved: "${searchUrl}" (source: ${envUrl ? 'env SEARCH_SERVICE_URL' : configUrl ? 'admin config (agent_search_url)' : 'NONE'})`);
     if (!searchUrl) {
-        return { error: 'Agent Search URL not configured. An admin can set it in Admin → AI Config.' };
+        console.error('[AgentSearch] ERROR: No search URL configured — set SEARCH_SERVICE_URL env var or agent_search_url in Admin → AI Config');
+        return { error: 'Agent Search URL not configured. Set SEARCH_SERVICE_URL env var or configure it in Admin → AI Config.' };
     }
 
     if (toolName !== 'agent_search') {
@@ -107,6 +111,7 @@ async function executeAgentSearchTool(toolName, args) {
     const detailLevel = ['basic', 'detailed', 'highly_detailed'].includes(detail_level) ? detail_level : (modeDefaults.detail_level || 'detailed');
 
     console.log(`[AgentSearch] Searching: "${query}" (mode=${searchMode}, max=${maxResults}, fetch=${fetchTopN}, detail=${detailLevel})`);
+    console.log(`[AgentSearch] Config — includeCitations=${includeCitations}, maxTokens=${maxTokens}`);
 
     const apiUrl = searchUrl.replace(/\/$/, '');
     const payload = {
@@ -121,16 +126,27 @@ async function executeAgentSearchTool(toolName, args) {
         const serperKey = await configStore.getSecret('serper_api_key');
         const headers = { 'Content-Type': 'application/json' };
         if (serperKey) headers['X-Serper-Key'] = serperKey;
+        const apiKey = process.env.SERVICES_API_KEY;
+        if (apiKey) headers['X-API-Key'] = apiKey;
 
-        const response = await fetch(`${apiUrl}/tools/search`, {
+        const fetchUrl = `${apiUrl}/tools/search`;
+        console.log(`[AgentSearch] POST ${fetchUrl}`);
+        console.log(`[AgentSearch] Payload:`, JSON.stringify(payload));
+
+        const startTime = Date.now();
+        const response = await fetch(fetchUrl, {
             method: 'POST',
             headers,
             body: JSON.stringify(payload),
             signal: AbortSignal.timeout(30000),
         });
 
+        console.log(`[AgentSearch] Response: status=${response.status} (${Date.now() - startTime}ms)`);
+
         if (!response.ok) {
             const text = await response.text();
+            console.error(`[AgentSearch] ERROR: HTTP ${response.status} from ${fetchUrl}`);
+            console.error(`[AgentSearch] Response body: ${text.substring(0, 500)}`);
             throw new Error(`Agent Search API error (${response.status}): ${text}`);
         }
 
@@ -173,7 +189,8 @@ ${sourcesList}
         return markdown;
 
     } catch (err) {
-        console.error(`[AgentSearch] Error:`, err.message);
+        console.error(`[AgentSearch] ERROR: ${err.message}`);
+        console.error(`[AgentSearch] Stack:`, err.stack);
         return `Search failed: ${err.message}`;
     }
 }

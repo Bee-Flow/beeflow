@@ -175,7 +175,7 @@ class OpenAIProvider extends BaseProvider {
             params.tool_choice = options.toolChoice || 'auto';
         }
         const effort = this.normalizeEffort(model, options.reasoningEffort);
-        if (effort && this.supportsReasoning(model)) {
+        if (effort && effort !== 'none' && this.supportsReasoning(model)) {
             params.reasoning_effort = effort;
         }
 
@@ -255,7 +255,7 @@ class OpenAIProvider extends BaseProvider {
             params.tool_choice = options.toolChoice || 'auto';
         }
         const effort = this.normalizeEffort(model, options.reasoningEffort);
-        if (effort && this.supportsReasoning(model)) {
+        if (effort && effort !== 'none' && this.supportsReasoning(model)) {
             params.reasoning_effort = effort;
         }
 
@@ -291,7 +291,7 @@ class OpenAIProvider extends BaseProvider {
                         };
                     }
                     if (tc.id) toolCallAccumulator[idx].id = tc.id;
-                    if (tc.function?.name) toolCallAccumulator[idx].name += tc.function.name;
+                    if (tc.function?.name) toolCallAccumulator[idx].name = tc.function.name;
                     if (tc.function?.arguments) toolCallAccumulator[idx].arguments += tc.function.arguments;
                 }
             }

@@ -18,8 +18,9 @@ const { getAIConfig, getProviderForModel } = require('../core/aiAgent');
 const { getAdapter } = require('../core/providers');
 
 const SEARCH_SERVICE_URL = process.env.SEARCH_SERVICE_URL || 'http://search-service:8000';
+const { getServiceHeaders } = require('../core/serviceAuth');
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB max
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB max
 
 function requireAuth(req, res, next) {
     if (req.session && req.session.user) return next();
@@ -369,10 +370,8 @@ router.post('/:id/fill-and-store', requireAuth, async (req, res) => {
             const key = storageStore.buildKey(userId, 'templates_filled', storageName);
             await storageStore.uploadFile(key, filledBuffer, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
             const proxyPath = storageStore.buildProxyUrl(key);
-            const serverOrigin = `${process.env.SERVER_PROTOCOL || 'https'}://${process.env.SERVER_PUBLIC_HOST || req.get('host')}`;
-            const downloadUrl = `${serverOrigin}${proxyPath}`;
             console.log(`[Templates] Filled document stored: ${key}`);
-            res.json({ downloadUrl, fileName: filledName });
+            res.json({ downloadUrl: proxyPath, fileName: filledName });
         } else {
             // Fallback: store locally
             const fs = require('fs');
@@ -389,7 +388,28 @@ router.post('/:id/fill-and-store', requireAuth, async (req, res) => {
     }
 });
 
-// ── Background: Auto-generate template context via write tier AI ────
+// ── Download filled document (local fallback) ────────────────────
+// Serves files stored locally when RustFS is not available.
+router.get('/download-filled/:filename', requireAuth, (req, res) => {
+    const fs = require('fs');
+    const path = require('path');
+    const userId = req.session.user.id;
+    const filename = req.params.filename;
+
+    // Sanitize filename to prevent directory traversal
+    const sanitized = path.basename(filename);
+    const filePath = path.join(__dirname, '..', 'data', 'templates_filled', userId, sanitized);
+
+    if (!fs.existsSync(filePath)) {
+        console.error(`[Templates] Download-filled file not found: ${filePath}`);
+        return res.status(404).json({ error: 'File not found' });
+    }
+
+    console.log(`[Templates] Serving filled document: ${filePath}`);
+    res.setHeader('Content-Disposition', `attachment; filename="${sanitized}"`);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+    fs.createReadStream(filePath).pipe(res);
+});
 
 async function generateTemplateContext(templateId, userId, text, parameters) {
     console.log(`[Templates] Generating context + instructions for template ${templateId}...`);
@@ -506,7 +526,7 @@ async function autoCreateTemplateKB(templateId, userId, fileName, text) {
     try {
         const ingestRes = await fetch(`${SEARCH_SERVICE_URL}/kb/ingest/json`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: getServiceHeaders(),
             body: JSON.stringify({
                 tenant_id: userId,
                 knowledge_base_id: kb.id,

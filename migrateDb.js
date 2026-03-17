@@ -23,6 +23,7 @@ setTimeout(() => {
 
 // All store modules that contain database migrations
 const STORE_MODULES = [
+    { name: 'userStore', file: './stores/userStore' },
     { name: 'watcherStateStore', file: './stores/watcherStateStore' },
     { name: 'workflowStore', file: './stores/workflowStore' },
     { name: 'configStore', file: './stores/configStore' },
@@ -36,6 +37,15 @@ const STORE_MODULES = [
     { name: 'browserAgentStore', file: './stores/browserAgentStore' },
     { name: 'terminalAgentStore', file: './stores/terminalAgentStore' },
     { name: 'securityAgentStore', file: './stores/securityAgentStore' },
+    { name: 'taskStore', file: './stores/taskStore' },
+    { name: 'notificationStore', file: './stores/notificationStore' },
+    { name: 'projectStore', file: './stores/projectStore' },
+    { name: 'reminderStore', file: './stores/reminderStore' },
+    { name: 'templateStore', file: './stores/templateStore' },
+    { name: 'monitoringStore', file: './stores/monitoringStore' },
+    { name: 'transcriptionStore', file: './stores/transcriptionStore' },
+    { name: 'mcpStore', file: './stores/mcpStore' },
+    { name: 'importStore', file: './stores/importStore' },
 ];
 
 console.log('');
@@ -47,6 +57,23 @@ console.log('');
 const dbUrl = process.env.CORE_DATABASE_URL || 'not set';
 console.log(`[migrate] Database: ${dbUrl.replace(/:[^:@]+@/, ':***@')}`);
 console.log('');
+
+// Pre-create user_sessions table (connect-pg-simple uses its own pool.query
+// which bypasses our serialized exec(), so we create it first)
+const { pool } = require('./db');
+pool.query(`
+    CREATE TABLE IF NOT EXISTS "user_sessions" (
+        "sid" varchar NOT NULL COLLATE "default",
+        "sess" json NOT NULL,
+        "expire" timestamp(6) NOT NULL,
+        CONSTRAINT "user_sessions_pkey" PRIMARY KEY ("sid")
+    );
+    CREATE INDEX IF NOT EXISTS "IDX_user_sessions_expire" ON "user_sessions" ("expire");
+`).then(() => {
+    console.log('  ✅ user_sessions (pre-created)');
+}).catch(err => {
+    console.error('  ❌ user_sessions:', err.message);
+});
 
 let success = 0;
 let failed = 0;

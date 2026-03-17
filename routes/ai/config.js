@@ -37,24 +37,44 @@ router.get('/config', async (req, res) => {
         hasGoogleVertexServiceAccountKey: !!(await configStore.getSecret('google_vertex_service_account_key')),
         hasAzureEndpoint: !!(await configStore.getConfig('azure_endpoint')),
         hasAzureApiKey: !!(await configStore.getSecret('azure_api_key')),
-        azureApiVersion: await configStore.getConfig('azure_api_version') || '2025-04-01-preview',
+        azureApiVersion: await configStore.getConfig('azure_api_version') || '2024-04-01-preview',
+        azureModels: await configStore.getConfig('azure_models') || '',
         hasFirefliesKey: !!(req.session?.user?.id && (await configStore.getSecret(`fireflies_api_key_user_${req.session.user.id}`))),
-        hasAgentSearchUrl: !!(await configStore.getConfig('agent_search_url')),
-        agentSearchUrl: await configStore.getConfig('agent_search_url') || '',
+        hasAgentSearchUrl: !!process.env.SEARCH_SERVICE_URL || !!(await configStore.getConfig('agent_search_url')),
+        agentSearchUrl: process.env.SEARCH_SERVICE_URL || await configStore.getConfig('agent_search_url') || '',
         hasSerperKey: !!(await configStore.getSecret('serper_api_key')),
+        searchProvider: await configStore.getConfig('search_provider') || 'agent-search',
+        hasBingSearchKey: !!(await configStore.getSecret('bing_search_key')),
+        bingSearchMarket: await configStore.getConfig('bing_search_market') || '',
         hasGoogleMapsKey: !!(await configStore.getSecret('google_maps_api_key')),
         hasLinkedInConfig: !!(await configStore.getSecret('linkedin_client_id')) && !!(await configStore.getSecret('linkedin_client_secret')),
         regexGuardrails: config.regexGuardrails || null,
         llamaGuardConfig: config.llamaGuardConfig || null,
+        moderationProvider: config.moderationProvider || 'llamaguard',
+        hasAzureContentSafetyEndpoint: !!(await configStore.getConfig('azure_content_safety_endpoint')),
+        hasAzureContentSafetyKey: !!(await configStore.getSecret('azure_content_safety_key')),
+        azureContentSafetySeverityThreshold: config.azureContentSafetySeverityThreshold ?? 2,
+        azureContentSafetyCategories: config.azureContentSafetyCategories || null,
+        piiDetectionEnabled: config.piiDetectionEnabled || false,
+        piiDetectionCategories: config.piiDetectionCategories || null,
+        piiDetectionConfidenceThreshold: config.piiDetectionConfidenceThreshold ?? 0.7,
         embeddingModel: config.embeddingModel || null,
         embeddingProviderId: config.embeddingProviderId || null,
         allowedModelsByAgentType: await configStore.getConfig('allowedModelsByAgentType') || {},
-        directChatRegexGuardrails: await configStore.getConfig('direct_chat_regex_guardrails') || null
+        directChatRegexGuardrails: await configStore.getConfig('direct_chat_regex_guardrails') || null,
+        // Azure Document Intelligence
+        hasAzureDocIntelligenceEndpoint: !!(await configStore.getConfig('azure_doc_intelligence_endpoint')),
+        hasAzureDocIntelligenceKey: !!(await configStore.getSecret('azure_doc_intelligence_key')),
+        // Azure OpenAI Embeddings (for Azure-native KB pipeline)
+        hasAzureOpenaiEmbeddingEndpoint: !!(await configStore.getConfig('azure_openai_embedding_endpoint')),
+        hasAzureOpenaiEmbeddingKey: !!(await configStore.getSecret('azure_openai_embedding_key')),
+        azureOpenaiEmbeddingModel: await configStore.getConfig('azure_openai_embedding_model') || 'text-embedding-3-small',
+        useAzureDocProcessing: !!(await configStore.getConfig('use_azure_doc_processing')),
     });
 });
 
 router.post('/config', async (req, res) => {
-    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, agentSearchUrl, lakeraApiKey, regexGuardrails, llamaGuardConfig, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey } = req.body;
+    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, llamaGuardConfig, moderationProvider, azureContentSafetyEndpoint, azureContentSafetyKey, azureContentSafetySeverityThreshold, azureContentSafetyCategories, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing } = req.body;
     const existing = await getAIConfig();
 
     if (allowedModelsByAgentType !== undefined) {
@@ -63,11 +83,29 @@ router.post('/config', async (req, res) => {
     if (directChatRegexGuardrails !== undefined) {
         await configStore.setConfig('direct_chat_regex_guardrails', directChatRegexGuardrails);
     }
+    if (azureModels !== undefined) {
+        await configStore.setConfig('azure_models', azureModels || '');
+    }
+    if (azureContentSafetyEndpoint !== undefined) {
+        await configStore.setConfig('azure_content_safety_endpoint', azureContentSafetyEndpoint || '');
+    }
+    if (azureContentSafetyKey !== undefined) {
+        await configStore.setSecret('azure_content_safety_key', azureContentSafetyKey || '');
+    }
     if (agentSearchUrl !== undefined) {
         await configStore.setConfig('agent_search_url', agentSearchUrl || '');
     }
     if (serperApiKey !== undefined) {
         await configStore.setSecret('serper_api_key', serperApiKey || '');
+    }
+    if (req.body.searchProvider !== undefined) {
+        await configStore.setConfig('search_provider', req.body.searchProvider || 'agent-search');
+    }
+    if (req.body.bingSearchKey !== undefined) {
+        await configStore.setSecret('bing_search_key', req.body.bingSearchKey || '');
+    }
+    if (req.body.bingSearchMarket !== undefined) {
+        await configStore.setConfig('bing_search_market', req.body.bingSearchMarket || '');
     }
     if (googleMapsApiKey !== undefined) {
         await configStore.setSecret('google_maps_api_key', googleMapsApiKey || '');
@@ -77,6 +115,26 @@ router.post('/config', async (req, res) => {
     }
     if (req.body.linkedinClientSecret !== undefined) {
         await configStore.setSecret('linkedin_client_secret', req.body.linkedinClientSecret || '');
+    }
+    // Azure Document Intelligence
+    if (azureDocIntelligenceEndpoint !== undefined) {
+        await configStore.setConfig('azure_doc_intelligence_endpoint', azureDocIntelligenceEndpoint || '');
+    }
+    if (azureDocIntelligenceKey !== undefined) {
+        await configStore.setSecret('azure_doc_intelligence_key', azureDocIntelligenceKey || '');
+    }
+    // Azure OpenAI Embeddings
+    if (azureOpenaiEmbeddingEndpoint !== undefined) {
+        await configStore.setConfig('azure_openai_embedding_endpoint', azureOpenaiEmbeddingEndpoint || '');
+    }
+    if (azureOpenaiEmbeddingKey !== undefined) {
+        await configStore.setSecret('azure_openai_embedding_key', azureOpenaiEmbeddingKey || '');
+    }
+    if (azureOpenaiEmbeddingModel !== undefined) {
+        await configStore.setConfig('azure_openai_embedding_model', azureOpenaiEmbeddingModel || 'text-embedding-3-small');
+    }
+    if (useAzureDocProcessing !== undefined) {
+        await configStore.setConfig('use_azure_doc_processing', useAzureDocProcessing ? 'true' : '');
     }
 
     const success = await saveAIConfig({
@@ -97,6 +155,12 @@ router.post('/config', async (req, res) => {
         lakeraApiKey: lakeraApiKey !== undefined ? lakeraApiKey : undefined,
         regexGuardrails: regexGuardrails !== undefined ? regexGuardrails : existing.regexGuardrails,
         llamaGuardConfig: llamaGuardConfig !== undefined ? llamaGuardConfig : existing.llamaGuardConfig,
+        moderationProvider: moderationProvider !== undefined ? moderationProvider : existing.moderationProvider,
+        azureContentSafetySeverityThreshold: azureContentSafetySeverityThreshold !== undefined ? azureContentSafetySeverityThreshold : existing.azureContentSafetySeverityThreshold,
+        azureContentSafetyCategories: azureContentSafetyCategories !== undefined ? azureContentSafetyCategories : existing.azureContentSafetyCategories,
+        piiDetectionEnabled: piiDetectionEnabled !== undefined ? piiDetectionEnabled : existing.piiDetectionEnabled,
+        piiDetectionCategories: piiDetectionCategories !== undefined ? piiDetectionCategories : existing.piiDetectionCategories,
+        piiDetectionConfidenceThreshold: piiDetectionConfidenceThreshold !== undefined ? piiDetectionConfidenceThreshold : existing.piiDetectionConfidenceThreshold,
         embeddingModel: embeddingModel !== undefined ? embeddingModel : existing.embeddingModel,
         embeddingProviderId: embeddingProviderId !== undefined ? embeddingProviderId : existing.embeddingProviderId,
     });
@@ -336,6 +400,7 @@ router.get('/rendering-config', requireAuth, async (req, res) => {
 router.get('/user-settings', requireAuth, async (req, res) => {
     const userId = req.session.user.id;
     const isGoogleUser = req.session.oauthProvider === 'google';
+    const isMicrosoftUser = req.session.oauthProvider === 'microsoft';
     const enabledApps = await configStore.getConfig(`enabled_apps_user_${userId}`);
 
     // Load org-level enabled integrations
@@ -392,6 +457,7 @@ router.get('/user-settings', requireAuth, async (req, res) => {
         hasGammaKey: !!(await configStore.getSecret(`gamma_api_key_user_${userId}`)),
         hasLinkedInConfig: !!(await configStore.getSecret('linkedin_client_id')) && !!(await configStore.getSecret('linkedin_client_secret')),
         isGoogleUser,
+        isMicrosoftUser,
         enabledApps: enabledApps || null,
         orgEnabledIntegrations,
         hasN8nConfig,
@@ -703,6 +769,122 @@ router.put('/n8n/workflows', requireOrgAdminForN8n, async (req, res) => {
     }
 });
 
-module.exports = router;
+// ─── MCP Server Management ──────────────────────────────────────
 
+const mcpManager = require('../../core/mcpManager');
+const crypto = require('crypto');
+
+// GET /ai/mcp-servers — list all configured MCP servers (admin)
+router.get('/mcp-servers', requireAuth, async (req, res) => {
+    try {
+        const servers = await mcpManager.getServersSummary();
+        res.json({ servers });
+    } catch (err) {
+        console.error('[MCP] List servers error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /ai/mcp-servers — add a new MCP server definition (admin)
+router.post('/mcp-servers', requireAuth, async (req, res) => {
+    try {
+        const { name, command, args = [], required_credentials = [] } = req.body;
+        if (!name || !command) {
+            return res.status(400).json({ error: 'name and command are required' });
+        }
+        const id = name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || crypto.randomUUID().slice(0, 8);
+        const server = await mcpManager.addServer({ id, name, command, args, required_credentials });
+        res.json({ success: true, server });
+    } catch (err) {
+        console.error('[MCP] Add server error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /ai/mcp-servers/test — test an MCP server command
+router.post('/mcp-servers/test', requireAuth, async (req, res) => {
+    try {
+        const { command, args = [] } = req.body;
+        if (!command) return res.status(400).json({ error: 'command is required' });
+        const result = await mcpManager.testCommand(command, args);
+        res.json(result);
+    } catch (err) {
+        console.error('[MCP] Test command error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// PUT /ai/mcp-servers/:id — update an MCP server config (admin)
+router.put('/mcp-servers/:id', requireAuth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { name, command, args, required_credentials, enabled } = req.body;
+        const mcpStore = require('../../stores/mcpStore');
+        const updates = {};
+        if (name !== undefined) updates.name = name;
+        if (command !== undefined) updates.command = command;
+        if (args !== undefined) updates.args = args;
+        if (required_credentials !== undefined) updates.required_credentials = required_credentials;
+        if (enabled !== undefined) updates.enabled = enabled;
+        await mcpStore.updateServer(id, updates);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[MCP] Update server error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// DELETE /ai/mcp-servers/:id — remove an MCP server (admin)
+router.delete('/mcp-servers/:id', requireAuth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        await mcpManager.removeServer(id);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[MCP] Delete server error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /ai/mcp-servers/:id/refresh — re-discover tools from a server
+router.post('/mcp-servers/:id/refresh', requireAuth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const tools = await mcpManager.refreshServerTools(id);
+        res.json({ success: true, tools });
+    } catch (err) {
+        console.error('[MCP] Refresh server error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET /ai/mcp-servers/user-credentials — get MCP servers needing user credentials
+router.get('/mcp-servers/user-credentials', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const servers = await mcpManager.getServersForUser(userId);
+        res.json({ servers });
+    } catch (err) {
+        console.error('[MCP] User credentials error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /ai/mcp-servers/user-credentials — save a user's credential for an MCP server
+router.post('/mcp-servers/user-credentials', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const { serverId, credKey, value } = req.body;
+        if (!serverId || !credKey) {
+            return res.status(400).json({ error: 'serverId and credKey are required' });
+        }
+        await mcpManager.saveUserCredential(userId, serverId, credKey, value);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[MCP] Save credential error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+module.exports = router;
 

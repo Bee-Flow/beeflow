@@ -97,16 +97,28 @@ async function executeTavilyTool(toolName, args) {
     const rawContent = include_raw_content !== undefined ? !!include_raw_content : (defaults.include_raw_content !== undefined ? !!defaults.include_raw_content : false);
 
     console.log(`[Tavily] Searching: "${query}" (depth=${searchDepth}, max=${maxResults}, topic=${topicValue})`);
+    console.log(`[Tavily] POST ${TAVILY_API_URL}`);
+    console.log(`[Tavily] Config — scoreThreshold=${scoreThreshold}, rawContent=${rawContent}`);
 
-    const data = await tavilyRequest(apiKey, {
-        query,
-        search_depth: searchDepth,
-        max_results: maxResults,
-        topic: topicValue,
-        include_answer: true,
-        include_raw_content: rawContent,
-        include_favicon: true,
-    });
+    const startTime = Date.now();
+    let data;
+    try {
+        data = await tavilyRequest(apiKey, {
+            query,
+            search_depth: searchDepth,
+            max_results: maxResults,
+            topic: topicValue,
+            include_answer: true,
+            include_raw_content: rawContent,
+            include_favicon: true,
+        });
+        console.log(`[Tavily] Response received (${Date.now() - startTime}ms)`);
+    } catch (err) {
+        console.error(`[Tavily] ERROR: ${err.message}`);
+        console.error(`[Tavily] URL: ${TAVILY_API_URL}, query: "${query}"`);
+        console.error(`[Tavily] Stack:`, err.stack);
+        return { error: `Tavily search failed: ${err.message}` };
+    }
 
     // Post-filter by relevance score
     const results = Array.isArray(data.results) ? data.results : [];
@@ -121,7 +133,7 @@ async function executeTavilyTool(toolName, args) {
             ...(r.raw_content ? { raw_content: r.raw_content.substring(0, 3000) } : {}),
         }));
 
-    console.log(`[Tavily] Found ${filteredResults.length} results (of ${results.length} total)`);
+    console.log(`[Tavily] Found ${filteredResults.length} results (of ${results.length} total, ${Date.now() - startTime}ms)`);
 
     return {
         query: data.query || query,

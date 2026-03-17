@@ -120,8 +120,9 @@ async function graphFetch(path, session, options = {}) {
         throw new Error(errorMsg);
     }
 
-    // Handle 204 No Content (e.g., DELETE responses)
-    if (response.status === 204) {
+    // Handle 202 Accepted / 204 No Content (empty body responses)
+    // e.g., sendMail returns 202, DELETE returns 204
+    if (response.status === 202 || response.status === 204) {
         return { success: true };
     }
 

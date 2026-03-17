@@ -52,7 +52,7 @@ app.use(cors({
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Session-Token']
 }));
 
-app.use(bodyParser.json({ limit: '10mb' }));
+app.use(bodyParser.json({ limit: '20mb' }));
 
 // ── Sessions ──────────────────────────────────────────────────────────────────────
 const pgSession = require('connect-pg-simple')(session);
@@ -275,7 +275,11 @@ app.use('/api/org-privacy-shield', require('./routes/orgPrivacyShield'));
 app.get('/api/guard/health', async (req, res) => {
     try {
         const guardUrl = process.env.GUARD_SERVICE_URL || 'http://guard-service:8100';
-        const resp = await fetch(`${guardUrl}/health`, { signal: AbortSignal.timeout(3000) });
+        const apiKey = process.env.SERVICES_API_KEY;
+        const resp = await fetch(`${guardUrl}/health`, {
+            headers: apiKey ? { 'X-API-Key': apiKey } : {},
+            signal: AbortSignal.timeout(3000),
+        });
         if (resp.ok) return res.json(await resp.json());
         res.json({ status: 'unavailable' });
     } catch { res.json({ status: 'unavailable' }); }
@@ -331,6 +335,16 @@ app.listen(PORT, '0.0.0.0', () => {
         console.log('[Server] Security container manager initialized');
     } catch (err) {
         console.warn('[Server] Security container manager init failed:', err.message);
+    }
+
+    // Initialize MCP server connections (non-blocking)
+    try {
+        const mcpManager = require('./core/mcpManager');
+        mcpManager.initialize().catch(err =>
+            console.warn('[Server] MCP manager init error:', err.message)
+        );
+    } catch (err) {
+        console.warn('[Server] MCP manager load failed:', err.message);
     }
 });
 
