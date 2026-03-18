@@ -144,6 +144,20 @@ async function _doInit() {
     try { await exec(`ALTER TABLE direct_conversations ADD COLUMN IF NOT EXISTS labels_json TEXT DEFAULT '[]'`); } catch (e) { /* already exists */ }
     try { await exec(`ALTER TABLE agent_conversations ADD COLUMN IF NOT EXISTS labels_json TEXT DEFAULT '[]'`); } catch (e) { /* already exists */ }
 
+    // Agent categories (org-level)
+    await exec(`CREATE TABLE IF NOT EXISTS agent_categories (
+        id TEXT PRIMARY KEY,
+        organization_id TEXT,
+        name TEXT NOT NULL,
+        icon TEXT DEFAULT '📁',
+        color TEXT DEFAULT '#6366f1',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )`);
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_agent_categories_org ON agent_categories(organization_id)`); } catch (e) { /* already exists */ }
+
+    // Migration: Add category_id column to agents
+    try { await exec(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS category_id TEXT`); } catch (e) { /* already exists */ }
+
     // User-defined conversation labels
     await exec(`CREATE TABLE IF NOT EXISTS conversation_labels (
         id TEXT PRIMARY KEY,

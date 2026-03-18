@@ -98,4 +98,8 @@ module.exports = {
     createLabel: conversationLabels.createLabel,
     updateLabel: conversationLabels.updateLabel,
     deleteLabel: conversationLabels.deleteLabel,
+    // Agent Categories
+    getAgentCategories: agentCrud.getAgentCategories,
+    createAgentCategory: agentCrud.createAgentCategory,
+    deleteAgentCategory: agentCrud.deleteAgentCategory,
 };

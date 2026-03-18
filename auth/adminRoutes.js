@@ -832,4 +832,119 @@ router.put('/default-integrations', requireAdmin, async (req, res) => {
     res.json({ success: true });
 });
 
+// ═══════════════════════════════════════════════════════════
+// ── Invitations ───────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════
+const invitationStore = require('../stores/invitationStore');
+const { sendInvitationEmail } = require('../utils/emailService');
+
+// Create invitation + send email
+router.post('/invitations', requireAuth, async (req, res) => {
+    try {
+        const { email, role } = req.body;
+        if (!email) return res.status(400).json({ error: 'Email is required' });
+
+        const userId = req.session?.user?.id;
+        const user = await userStore.getUser(userId);
+        if (!user) return res.status(401).json({ error: 'Not authenticated' });
+
+        // Must be org admin
+        const orgId = user.organizationId;
+        if (!orgId) return res.status(403).json({ error: 'You are not part of an organisation' });
+        if (!(await isOrgAdminForOrg(req, orgId))) {
+            return res.status(403).json({ error: 'Only organisation admins can send invitations' });
+        }
+
+        // Check if user already exists with this email
+        const existingUser = await userStore.getUserByEmail(email);
+        if (existingUser && existingUser.organizationId === orgId) {
+            return res.status(409).json({ error: 'A user with this email is already in your organisation' });
+        }
+
+        // Create invitation token
+        const invitation = await invitationStore.createInvitation({
+            email,
+            organizationId: orgId,
+            invitedBy: userId,
+            role: role || 'user',
+        });
+        if (!invitation) return res.status(500).json({ error: 'Failed to create invitation' });
+
+        // Build invite URL
+        const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}`;
+        const inviteUrl = `${clientHost}/login?invite=${invitation.token}`;
+
+        // Get org name and inviter display name
+        const org = await userStore.getOrganization(orgId);
+        const orgName = org?.name || 'your organisation';
+        const inviterName = user.displayName || user.username || 'A team member';
+
+        // Send email
+        const emailResult = await sendInvitationEmail({
+            email,
+            orgName,
+            inviterName,
+            inviteUrl,
+            role: role || 'user',
+        });
+
+        if (!emailResult.success) {
+            console.error('[Invitations] Email send failed:', emailResult.error);
+            // Still return the invitation — admin can share the link manually
+        }
+
+        res.json({
+            success: true,
+            invitation: {
+                id: invitation.id,
+                email,
+                expiresAt: invitation.expiresAt,
+            },
+            emailSent: emailResult.success,
+            emailError: emailResult.success ? undefined : emailResult.error,
+            inviteUrl, // fallback for manual sharing
+        });
+    } catch (err) {
+        console.error('[Invitations] Error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// List invitations for the current user's organisation
+router.get('/invitations', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session?.user?.id;
+        const user = await userStore.getUser(userId);
+        if (!user?.organizationId) return res.json([]);
+
+        if (!(await isOrgAdminForOrg(req, user.organizationId))) {
+            return res.status(403).json({ error: 'Only organisation admins can view invitations' });
+        }
+
+        const invitations = await invitationStore.getInvitationsForOrg(user.organizationId);
+        res.json(invitations);
+    } catch (err) {
+        console.error('[Invitations] List error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Revoke an invitation
+router.delete('/invitations/:id', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session?.user?.id;
+        const user = await userStore.getUser(userId);
+        if (!user?.organizationId) return res.status(403).json({ error: 'Not in an organisation' });
+        if (!(await isOrgAdminForOrg(req, user.organizationId))) {
+            return res.status(403).json({ error: 'Only organisation admins can revoke invitations' });
+        }
+
+        const revoked = await invitationStore.deleteInvitation(req.params.id);
+        res.json({ success: revoked });
+    } catch (err) {
+        console.error('[Invitations] Revoke error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 module.exports = router;

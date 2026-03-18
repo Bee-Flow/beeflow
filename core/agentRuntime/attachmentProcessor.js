@@ -43,6 +43,8 @@ async function processAttachments(attachments = [], lastMsg) {
                 });
             }
         } else if (att.type.startsWith('image/')) {
+            const sizeKB = Math.round((att.content?.length || 0) / 1024);
+            console.log(`[AttachmentProcessor] Added image ${att.name || 'unnamed'} (${sizeKB} KB base64)`);
             lastMsg.content.push({
                 type: "image_url",
                 image_url: { url: att.content }
@@ -64,6 +66,16 @@ async function processAttachments(attachments = [], lastMsg) {
             } catch (e) {
                 console.error(`[AttachmentProcessor] Failed to parse document ${att.name}`, e);
             }
+        }
+    }
+
+    // Warn on oversized total image payload
+    if (Array.isArray(lastMsg.content)) {
+        const totalImageSize = lastMsg.content
+            .filter(p => p.type === 'image_url')
+            .reduce((sum, p) => sum + (p.image_url?.url?.length || 0), 0);
+        if (totalImageSize > 3_000_000) {
+            console.warn(`[AttachmentProcessor] ⚠️ Large image payload: ${Math.round(totalImageSize / 1024)} KB — may cause provider errors`);
         }
     }
 }

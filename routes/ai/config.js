@@ -70,11 +70,15 @@ router.get('/config', async (req, res) => {
         hasAzureOpenaiEmbeddingKey: !!(await configStore.getSecret('azure_openai_embedding_key')),
         azureOpenaiEmbeddingModel: await configStore.getConfig('azure_openai_embedding_model') || 'text-embedding-3-small',
         useAzureDocProcessing: !!(await configStore.getConfig('use_azure_doc_processing')),
+        // Service Email (Gmail SMTP)
+        hasServiceEmail: !!(await configStore.getConfig('service_email_address')) && !!(await configStore.getSecret('service_email_password')),
+        serviceEmailAddress: await configStore.getConfig('service_email_address') || '',
+        serviceEmailDisplayName: await configStore.getConfig('service_email_display_name') || '',
     });
 });
 
 router.post('/config', async (req, res) => {
-    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, llamaGuardConfig, moderationProvider, azureContentSafetyEndpoint, azureContentSafetyKey, azureContentSafetySeverityThreshold, azureContentSafetyCategories, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing } = req.body;
+    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, llamaGuardConfig, moderationProvider, azureContentSafetyEndpoint, azureContentSafetyKey, azureContentSafetySeverityThreshold, azureContentSafetyCategories, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing, serviceEmailAddress, serviceEmailPassword, serviceEmailDisplayName } = req.body;
     const existing = await getAIConfig();
 
     if (allowedModelsByAgentType !== undefined) {
@@ -136,6 +140,16 @@ router.post('/config', async (req, res) => {
     if (useAzureDocProcessing !== undefined) {
         await configStore.setConfig('use_azure_doc_processing', useAzureDocProcessing ? 'true' : '');
     }
+    // Service Email (Gmail SMTP)
+    if (serviceEmailAddress !== undefined) {
+        await configStore.setConfig('service_email_address', serviceEmailAddress || '');
+    }
+    if (serviceEmailPassword !== undefined) {
+        await configStore.setSecret('service_email_password', serviceEmailPassword || '');
+    }
+    if (serviceEmailDisplayName !== undefined) {
+        await configStore.setConfig('service_email_display_name', serviceEmailDisplayName || '');
+    }
 
     const success = await saveAIConfig({
         url: url !== undefined ? url : existing.url,
@@ -169,6 +183,42 @@ router.post('/config', async (req, res) => {
         res.json({ success: true });
     } else {
         res.status(500).json({ error: 'Failed to save configuration' });
+    }
+});
+
+// ─── Test Service Email ──────────────────────────────────────────
+
+router.post('/config/test-service-email', requireAuth, async (req, res) => {
+    try {
+        const { testRecipient } = req.body;
+        if (!testRecipient || !testRecipient.trim()) {
+            return res.status(400).json({ error: 'Test recipient email is required' });
+        }
+
+        const { sendServiceEmail } = require('../../utils/emailService');
+        const result = await sendServiceEmail({
+            to: testRecipient.trim(),
+            subject: 'BeeFlow — Test Service Email',
+            html: [
+                '<div style="font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">',
+                '  <h2 style="color: #1a1a1a; margin-bottom: 8px;">✅ Service Email Configured</h2>',
+                '  <p style="color: #555; font-size: 14px; line-height: 1.6;">',
+                '    This is a test email from your BeeFlow platform. If you received this, your service email is configured correctly.',
+                '  </p>',
+                '  <hr style="border: none; border-top: 1px solid #e5e5e5; margin: 24px 0;" />',
+                '  <p style="color: #999; font-size: 12px;">Sent by BeeFlow Service Email</p>',
+                '</div>',
+            ].join('\n'),
+        });
+
+        if (result.success) {
+            res.json({ success: true, messageId: result.messageId });
+        } else {
+            res.status(500).json({ error: result.error || 'Failed to send test email' });
+        }
+    } catch (err) {
+        console.error('[Config] Test service email error:', err);
+        res.status(500).json({ error: err.message });
     }
 });
 

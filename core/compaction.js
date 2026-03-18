@@ -76,7 +76,19 @@ async function generateSummary(oldMessages, existingSummary, summaryModelId) {
 
     for (const msg of oldMessages) {
         if (msg.role === 'user') {
-            const text = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+            let text;
+            if (typeof msg.content === 'string') {
+                text = msg.content;
+            } else if (Array.isArray(msg.content)) {
+                // Multimodal content — extract text parts, note images as placeholders
+                text = msg.content.map(part => {
+                    if (part.type === 'text') return part.text || '';
+                    if (part.type === 'image_url') return '[image]';
+                    return '';
+                }).filter(Boolean).join(' ');
+            } else {
+                text = '';
+            }
             contentToSummarize += `User: ${text.substring(0, 300)}\n`;
         } else if (msg.role === 'assistant') {
             const text = typeof msg.content === 'string' ? msg.content : '';

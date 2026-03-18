@@ -204,7 +204,11 @@ router.post('/login/start', ensureReady, async (req, res) => {
     }
 
     try {
-        const user = await userStore.getUser(username);
+        let user = await userStore.getUser(username);
+        // Fallback: if not found by ID and input looks like an email, try email lookup
+        if (!user && username.includes('@')) {
+            user = await userStore.getUserByEmail(username);
+        }
         if (!user || !user.opaqueRecord) {
             // Don't reveal whether user exists — use dummy response
             // OPAQUE supports this via fake credentials

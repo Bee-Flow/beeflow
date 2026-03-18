@@ -21,6 +21,27 @@ function _getServerEncryptionKey() {
     return crypto.createHmac('sha256', master).update('beeflow:config-secrets:v1').digest();
 }
 
+// ── Rate-limited decrypt failure logging ────────────────────────
+// Batches decrypt errors into a single summary per interval
+let _decryptFailCount = 0;
+let _decryptFailTimer = null;
+const DECRYPT_FAIL_LOG_INTERVAL_MS = 60_000; // 1 minute
+
+function _logDecryptFailure() {
+    _decryptFailCount++;
+    if (!_decryptFailTimer) {
+        _decryptFailTimer = setTimeout(() => {
+            if (_decryptFailCount > 0) {
+                console.warn(`[ConfigStore] Failed to decrypt ${_decryptFailCount} value(s) in the last 60s — check MASTER_ENCRYPTION_KEY or re-enter API keys via Admin UI`);
+                _decryptFailCount = 0;
+            }
+            _decryptFailTimer = null;
+        }, DECRYPT_FAIL_LOG_INTERVAL_MS);
+        // Don't hold the process open for this timer
+        if (_decryptFailTimer.unref) _decryptFailTimer.unref();
+    }
+}
+
 /**
  * Encrypt a plaintext string using AES-256-GCM.
  * Returns a JSON-encoded envelope: { _encrypted: "config-v1", iv, authTag, data }
@@ -68,7 +89,7 @@ function decryptValue(stored) {
         decipher.setAuthTag(authTag);
         return decipher.update(data) + decipher.final('utf8');
     } catch (err) {
-        console.error('[ConfigStore] Failed to decrypt value:', err.message);
+        _logDecryptFailure();
         return null;
     }
 }

@@ -180,8 +180,31 @@ class GoogleVertexProvider extends GoogleProvider {
      * List models via Vertex AI SDK.
      * Supplements API results with well-known Gemini models since the
      * Vertex AI models.list() endpoint doesn't return all available models.
+     *
+     * If no credentials are configured (no service account key and no ADC),
+     * returns only the well-known models without making an API call.
      */
     async listModels(apiKey, baseUrl, options = {}) {
+        const knownModels = [
+            { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
+            { id: 'gemini-2.5-pro-preview-06-05', name: 'Gemini 2.5 Pro Preview' },
+            { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' },
+            { id: 'gemini-2.5-flash-preview-05-20', name: 'Gemini 2.5 Flash Preview' },
+            { id: 'gemini-2.5-flash-lite-preview-06-17', name: 'Gemini 2.5 Flash Lite Preview' },
+            { id: 'gemini-2.0-flash-001', name: 'Gemini 2.0 Flash 001' },
+            { id: 'gemini-2.0-flash-lite', name: 'Gemini 2.0 Flash Lite' },
+            { id: 'gemini-2.0-flash-exp', name: 'Gemini 2.0 Flash Experimental' },
+            { id: 'gemini-2.0-flash-thinking-exp', name: 'Gemini 2.0 Flash Thinking' },
+        ];
+
+        // Skip API call if no credentials are available — avoids noisy auth errors
+        const hasServiceAccountKey = !!(options.serviceAccountKey);
+        const hasADC = !!(process.env.GOOGLE_APPLICATION_CREDENTIALS);
+        if (!hasServiceAccountKey && !hasADC) {
+            console.log(`[GoogleVertex] No credentials configured — returning ${knownModels.length} well-known models (skipping API call)`);
+            return knownModels;
+        }
+
         try {
             const ai = this.createClient(apiKey, options);
             const models = [];
@@ -209,18 +232,6 @@ class GoogleVertexProvider extends GoogleProvider {
             } while (pageToken);
 
             // Supplement with well-known Gemini models not returned by the API
-            const knownModels = [
-                { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
-                { id: 'gemini-2.5-pro-preview-06-05', name: 'Gemini 2.5 Pro Preview' },
-                { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' },
-                { id: 'gemini-2.5-flash-preview-05-20', name: 'Gemini 2.5 Flash Preview' },
-                { id: 'gemini-2.5-flash-lite-preview-06-17', name: 'Gemini 2.5 Flash Lite Preview' },
-                { id: 'gemini-2.0-flash-001', name: 'Gemini 2.0 Flash 001' },
-                { id: 'gemini-2.0-flash-lite', name: 'Gemini 2.0 Flash Lite' },
-                { id: 'gemini-2.0-flash-exp', name: 'Gemini 2.0 Flash Experimental' },
-                { id: 'gemini-2.0-flash-thinking-exp', name: 'Gemini 2.0 Flash Thinking' },
-            ];
-
             const existingIds = new Set(models.map(m => m.id));
             let added = 0;
             for (const known of knownModels) {
@@ -234,7 +245,7 @@ class GoogleVertexProvider extends GoogleProvider {
             return models;
         } catch (e) {
             console.error('[GoogleVertex] SDK listModels failed:', e.message);
-            return [];
+            return knownModels;
         }
     }
 

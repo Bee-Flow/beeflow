@@ -16,6 +16,7 @@ const { SHEETS_TOOLS } = require('../integrations/sheetsTools');
 const { DOCS_TOOLS } = require('../integrations/docsTools');
 const { CONTACTS_TOOLS } = require('../integrations/contactsTools');
 const { KEEP_TOOLS } = require('../integrations/keepTools');
+const { GOOGLE_GROUPS_TOOLS } = require('../integrations/googleGroupsTools');
 const { FIREFLIES_TOOLS } = require('../integrations/firefliesTools');
 const { YOUTRACK_TOOLS } = require('../integrations/youtrackTools');
 const { GAMMA_TOOLS } = require('../integrations/gammaTools');
@@ -85,7 +86,7 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
 
     // Auto-enable new integrations for users with existing saved lists
     // (these were added after the user saved their enabledApps, so they wouldn't be included)
-    const AUTO_ENABLED_APPS = ['agent-search', 'workspace', 'image-gen', 'music-gen', 'video-gen', 'elevenlabs', 'google-maps', 'linkedin', 'github', 'google-contacts', 'google-keep', 'outlook', 'ms-calendar', 'onedrive', 'ms-contacts'];
+    const AUTO_ENABLED_APPS = ['agent-search', 'workspace', 'image-gen', 'music-gen', 'video-gen', 'elevenlabs', 'google-maps', 'linkedin', 'github', 'google-contacts', 'google-keep', 'outlook', 'ms-calendar', 'onedrive', 'ms-contacts', 'google-groups'];
 
     const isAppOn = (appId) => {
         // Must be enabled at user level
@@ -122,6 +123,7 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
         if (isAppOn('google-docs')) addTools(DOCS_TOOLS);
         if (isAppOn('google-contacts')) addTools(CONTACTS_TOOLS);
         if (isAppOn('google-keep')) addTools(KEEP_TOOLS);
+        if (isAppOn('google-groups')) addTools(GOOGLE_GROUPS_TOOLS);
     }
 
     // Microsoft integrations — require Microsoft OAuth
@@ -277,6 +279,7 @@ async function buildToolHint(tools, userId = null) {
     if (tools.some(t => t.function.name.startsWith('docs_'))) integrations.push('Google Docs (create, read, append, replace text in documents)');
     if (tools.some(t => t.function.name.startsWith('contacts_'))) integrations.push('Google Contacts (search, list, create, update contacts — create/update require user approval)');
     if (tools.some(t => t.function.name.startsWith('keep_'))) integrations.push('Google Keep (list, get, create, delete notes — create/delete require user approval, enterprise Workspace only)');
+    if (tools.some(t => t.function.name.startsWith('groups_'))) integrations.push('Google Groups (list conversations in a group, read full conversation threads, reply to group conversations — replies require user approval before sending)');
     if (tools.some(t => t.function.name.startsWith('youtrack_'))) integrations.push('YouTrack (search, create, update issues)');
     if (tools.some(t => t.function.name.startsWith('fireflies_'))) integrations.push('Fireflies (meeting transcripts)');
     if (tools.some(t => t.function.name.startsWith('gamma_'))) integrations.push('Gamma (presentation generation)');

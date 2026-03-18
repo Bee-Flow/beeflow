@@ -165,7 +165,11 @@ router.post('/admin-login', async (req, res) => {
 
     // 2. Check UserStore Users (if not already logged in as admin)
     if (!user) {
-        const storedUser = await userStore.getUser(username);
+        let storedUser = await userStore.getUser(username);
+        // Fallback: if not found by ID and input looks like an email, try email lookup
+        if (!storedUser && username.includes('@')) {
+            storedUser = await userStore.getUserByEmail(username);
+        }
         if (storedUser && storedUser.passwordHash) {
             // If user has migrated to OPAQUE, reject legacy login
             if (storedUser.kdfMode === 'opaque_v1') {
@@ -592,7 +596,8 @@ router.post('/logout', async (req, res) => {
 // Get organizations with signup enabled (public, no auth required)
 router.get('/organizations/public', async (req, res) => {
     try {
-        const orgs = await userStore.getAllOrganizations().filter(o => o.allowSignup);
+        const allOrgs = await userStore.getAllOrganizations();
+        const orgs = allOrgs.filter(o => o.allowSignup);
         res.json(orgs.map(o => ({ id: o.id, name: o.name, logo: o.logo || null, description: o.description || '' })));
     } catch (err) {
         res.json([]);
@@ -619,7 +624,7 @@ router.post('/pending-signup', async (req, res) => {
 
 // Public signup — create user + optionally a new organization
 router.post('/signup', async (req, res) => {
-    const { username, password, displayName, firstName, lastName, email, organizationId, newOrgName, orgDetails } = req.body;
+    const { username, password, displayName, firstName, lastName, email, organizationId, newOrgName, orgDetails, inviteToken } = req.body;
 
     if (!username || !password) {
         return res.status(400).json({ error: 'Username and password are required' });
@@ -631,8 +636,18 @@ router.post('/signup', async (req, res) => {
         return res.status(400).json({ error: 'This username is not available' });
     }
 
+    // ── Handle invite token ──────────────────────────────────────
+    let inviteData = null;
+    if (inviteToken) {
+        const invitationStore = require('../stores/invitationStore');
+        inviteData = await invitationStore.getInvitationByToken(inviteToken);
+        if (!inviteData) {
+            return res.status(400).json({ error: 'Invalid or expired invitation. Please request a new one.' });
+        }
+    }
+
     let groups = [];
-    let orgId = organizationId;
+    let orgId = inviteData ? inviteData.organization_id : organizationId;
 
     if (newOrgName) {
         // --- Create a new organization with full details ---
@@ -641,15 +656,19 @@ router.post('/signup', async (req, res) => {
         const orgEmail = od.email || email || '';
 
         // Check if an organization with the same email domain already exists
+        // Skip for common public email providers (gmail, outlook, etc.)
+        const PUBLIC_DOMAINS = ['gmail.com', 'outlook.com', 'hotmail.com', 'yahoo.com', 'live.com', 'icloud.com', 'protonmail.com', 'proton.me'];
         if (orgEmail && orgEmail.includes('@')) {
             const domain = orgEmail.split('@')[1].toLowerCase();
-            const existingOrgs = await userStore.getAllOrganizations();
-            const domainTaken = existingOrgs.find(o => {
-                if (!o.email || !o.email.includes('@')) return false;
-                return o.email.split('@')[1].toLowerCase() === domain;
-            });
-            if (domainTaken) {
-                return res.status(400).json({ error: `An organization with the domain "${domain}" already exists. Please join the existing organization instead.` });
+            if (!PUBLIC_DOMAINS.includes(domain)) {
+                const existingOrgs = await userStore.getAllOrganizations();
+                const domainTaken = existingOrgs.find(o => {
+                    if (!o.email || !o.email.includes('@')) return false;
+                    return o.email.split('@')[1].toLowerCase() === domain;
+                });
+                if (domainTaken) {
+                    return res.status(400).json({ error: `An organization with the domain "${domain}" already exists. Please join the existing organization instead.` });
+                }
             }
         }
 
@@ -713,19 +732,24 @@ router.post('/signup', async (req, res) => {
         }
 
         // User gets org_admin role — no default group is created
-    } else if (organizationId) {
-        // --- Join existing organization ---
+    } else if (orgId) {
+        // --- Join existing organization (direct or via invitation) ---
         const orgs = await userStore.getAllOrganizations();
-        const org = orgs.find(o => o.id === organizationId);
-        if (!org || !org.allowSignup) {
-            return res.status(400).json({ error: 'Signup is not available for this organization' });
+        const org = orgs.find(o => o.id === orgId);
+        if (!org) {
+            return res.status(400).json({ error: 'Organization not found' });
         }
-        groups = org.defaultGroups || [];
+        if (org.allowSignup || inviteData) {
+            groups = org.defaultGroups || [];
+        }
+        // Invited users are auto-approved; self-signup depends on org allowSignup
+        var userStatus = (inviteData || org.allowSignup) ? 'active' : 'pending';
     } else {
         return res.status(400).json({ error: 'Organization is required' });
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
+    const resolvedStatus = typeof userStatus !== 'undefined' ? userStatus : 'active';
     const newUser = {
         id: username, username,
         displayName: displayName || username,
@@ -735,12 +759,41 @@ router.post('/signup', async (req, res) => {
         phone: null, avatar: null, avatarType: null,
         passwordHash, role: 'user', groups,
         organizationId: orgId || null,
-        orgRole: newOrgName ? 'org_admin' : ''
+        orgRole: newOrgName ? 'org_admin' : (inviteData?.role || ''),
+        status: resolvedStatus
     };
 
     const createUserResult = await userStore.createUser(newUser);
     if (!createUserResult) {
         return res.status(400).json({ error: 'Username already taken' });
+    }
+
+    // ── Mark invitation as accepted ──────────────────────────
+    if (inviteData) {
+        try {
+            const invitationStore = require('../stores/invitationStore');
+            await invitationStore.markAccepted(inviteToken);
+            console.log(`[Signup] Invitation accepted for ${email} → org ${orgId}`);
+        } catch (e) {
+            console.error('[Signup] Failed to mark invitation as accepted:', e.message);
+        }
+    }
+
+    // If user is pending approval, notify but don't fully log in
+    if (resolvedStatus === 'pending') {
+        req.session.isAuthenticated = true;
+        req.session.isAdmin = false;
+        req.session.pendingApproval = true;
+        req.session.user = {
+            id: newUser.id, displayName: newUser.displayName,
+            role: 'user', isAdmin: false, avatar: null, avatarType: null,
+            organizationId: orgId || '', orgRole: ''
+        };
+        req.session.save((err) => {
+            if (err) console.error('Session save error:', err);
+            res.json({ success: true, pendingApproval: true, user: req.session.user });
+        });
+        return;
     }
 
     // Auto-login after signup
@@ -770,6 +823,31 @@ router.post('/signup', async (req, res) => {
     } catch (err) {
         console.error('[Auth] Signup DEK creation failed:', err.message);
         return res.status(500).json({ error: 'Encryption initialization failed' });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════
+// ── Invitation Token Validation (public route) ────────────
+// ═══════════════════════════════════════════════════════════
+router.get('/invite/:token', async (req, res) => {
+    try {
+        const invitationStore = require('../stores/invitationStore');
+        const invitation = await invitationStore.getInvitationByToken(req.params.token);
+        if (!invitation) {
+            return res.status(410).json({ valid: false, error: 'Invitation expired or invalid' });
+        }
+        const org = await userStore.getOrganization(invitation.organization_id);
+        res.json({
+            valid: true,
+            email: invitation.email,
+            organizationId: invitation.organization_id,
+            orgName: org?.name || '',
+            orgLogo: org?.logo || null,
+            role: invitation.role,
+        });
+    } catch (err) {
+        console.error('[Invite] Token validation error:', err);
+        res.status(500).json({ valid: false, error: 'Server error' });
     }
 });
 

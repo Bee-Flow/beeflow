@@ -8,29 +8,25 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
     let guardrailViolation = null;
     let processedUserMessage = userMessage;
 
-    const orgModerationEnabled = await (async () => {
-        if (!agent.organization_id) return false;
-        const shield = await configStore.getConfig(`org_privacy_shield_${agent.organization_id}`);
-        return shield?.enabled && shield?.moderationEnabled;
-    })();
-    const orgModerationScope = await (async () => {
-        if (!agent.organization_id) return { userInput: true, agentOutput: true };
-        const shield = await configStore.getConfig(`org_privacy_shield_${agent.organization_id}`);
-        return shield?.enabled ? (shield.scope || { userInput: true, agentOutput: true }) : { userInput: true, agentOutput: true };
+    // Read org shield config once (was previously read 3 times)
+    const orgShield = await (async () => {
+        if (!agent.organization_id) return null;
+        return await configStore.getConfig(`org_privacy_shield_${agent.organization_id}`);
     })();
 
-    const orgShieldData = await (async () => {
-        if (!agent.organization_id) return { webSearchGuard: false, categories: null };
-        const shield = await configStore.getConfig(`org_privacy_shield_${agent.organization_id}`);
-        return {
-            webSearchGuard: !!(shield?.enabled && shield?.webSearchGuardEnabled),
-            categories: shield?.moderationCategories || null,
-        };
-    })();
-    const webSearchGuardEnabled = orgShieldData.webSearchGuard || !!agent.config?.webSearchGuardEnabled;
-    const orgShieldCategories = orgShieldData.categories;
+    const orgModerationEnabled = !!(orgShield?.enabled && orgShield?.moderationEnabled);
+    const orgModerationScope = orgShield?.enabled
+        ? (orgShield.scope || { userInput: true, agentOutput: true })
+        : { userInput: true, agentOutput: true };
+
+    const webSearchGuardEnabled = !!(orgShield?.enabled && orgShield?.webSearchGuardEnabled) || !!agent.config?.webSearchGuardEnabled;
+    const orgShieldCategories = orgShield?.moderationCategories || null;
+
+    // Agent-level llamaGuard only fires when the org hasn't explicitly disabled moderation.
+    // If org has an active Privacy Shield with moderationEnabled=false, agent config is overridden.
+    const orgExplicitlyDisabled = orgShield?.enabled && orgShield.moderationEnabled === false;
     const shouldCheckInputModeration = (orgModerationEnabled && orgModerationScope.userInput) ||
-        agent.config?.llamaGuardEnabled || globalConfig?.llamaGuardConfig?.enabled;
+        (!orgExplicitlyDisabled && (agent.config?.llamaGuardEnabled || globalConfig?.llamaGuardConfig?.enabled));
     
     if (shouldCheckInputModeration) {
         try {

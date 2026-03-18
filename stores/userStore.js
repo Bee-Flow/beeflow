@@ -260,6 +260,19 @@ async function getUser(userId) {
     };
 }
 
+async function getUserByEmail(email) {
+    await initDB();
+    const u = await getOne('SELECT * FROM users WHERE LOWER(email) = LOWER($1)', [email]);
+    if (!u) return null;
+    return {
+        ...u, groups: parseJSON(u.groups, []), appPassword: parseJSON(u.appPassword, u.appPassword),
+        masterWrappedDEK: parseJSON(u.masterWrappedDEK, u.masterWrappedDEK), wrappedDEK: parseJSON(u.wrappedDEK, u.wrappedDEK),
+        recoveryWrappedDEK: parseJSON(u.recoveryWrappedDEK, u.recoveryWrappedDEK),
+        dekUnwrapFailures: u.dekUnwrapFailures || 0, ssoEncryptionSetup: u.ssoEncryptionSetup || 0,
+        passwordResetRequired: u.passwordResetRequired || 0
+    };
+}
+
 async function createUser(userData) {
     await initDB();
     const { id, username, passwordHash, displayName, firstName, lastName, email, phone, avatar, avatarType, role, groups, orgRole, organizationId } = userData;
@@ -702,7 +715,7 @@ async function getEffectiveLimits(orgId) {
 }
 
 module.exports = {
-    getAllUsers, getUser, createUser, updateUser, deleteUser,
+    getAllUsers, getUser, getUserByEmail, createUser, updateUser, deleteUser,
     getAllOrganizations, getOrganization, createOrganization, updateOrganization, deleteOrganization,
     getAllGroups, createGroup, updateGroup, deleteGroup,
     storeAppPassword, getAppPassword, hasAppPassword, deleteAppPassword,

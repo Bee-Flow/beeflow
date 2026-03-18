@@ -20,6 +20,7 @@ const { isSheetsTool, executeSheetsTool } = require('../integrations/sheetsTools
 const { isDocsTool, executeDocsTool } = require('../integrations/docsTools');
 const { isContactsTool, executeContactsTool } = require('../integrations/contactsTools');
 const { isKeepTool, executeKeepTool } = require('../integrations/keepTools');
+const { isGoogleGroupsTool, executeGoogleGroupsTool } = require('../integrations/googleGroupsTools');
 const { isFirefliesTool, executeFirefliesTool } = require('../integrations/firefliesTools');
 const { isYouTrackTool, executeYouTrackTool } = require('../integrations/youtrackTools');
 const { isGammaTool, executeGammaTool } = require('../integrations/gammaTools');
@@ -177,6 +178,9 @@ async function executeTool(toolName, toolArgs, context = {}) {
     }
     if (isKeepTool(toolName)) {
         return await executeKeepTool(toolName, toolArgs, session);
+    }
+    if (isGoogleGroupsTool(toolName)) {
+        return await executeGoogleGroupsTool(toolName, toolArgs, session);
     }
     if (isN8nTool(toolName)) {
         return await executeN8nTool(toolName, toolArgs, orgId, attachments);

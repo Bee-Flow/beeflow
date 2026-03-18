@@ -37,6 +37,48 @@ router.get('/', async (req, res) => {
     res.json(agents);
 });
 
+// ============ Agent Categories ============
+
+// List categories for user's org
+router.get('/categories', async (req, res) => {
+    try {
+        const orgIds = await resolveUserOrgIds(req);
+        const orgId = orgIds !== null && orgIds.size > 0 ? Array.from(orgIds)[0] : null;
+        const categories = await agentStore.getAgentCategories(orgId);
+        res.json(categories);
+    } catch (error) {
+        console.error('Failed to get agent categories:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Create a new category
+router.post('/categories', requirePermission('manage_agents'), async (req, res) => {
+    try {
+        const { name, icon, color } = req.body;
+        if (!name || !name.trim()) return res.status(400).json({ error: 'Name is required' });
+        const orgIds = await resolveUserOrgIds(req);
+        const orgId = orgIds !== null && orgIds.size > 0 ? Array.from(orgIds)[0] : null;
+        const category = await agentStore.createAgentCategory(orgId, name.trim(), icon, color);
+        res.json(category);
+    } catch (error) {
+        console.error('Failed to create agent category:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Delete a category
+router.delete('/categories/:id', requirePermission('manage_agents'), async (req, res) => {
+    try {
+        const deleted = await agentStore.deleteAgentCategory(req.params.id);
+        if (!deleted) return res.status(404).json({ error: 'Category not found' });
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Failed to delete agent category:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // Get single agent (or Swarm or Browser Agent)
 router.get('/:id', async (req, res) => {
     const id = req.params.id;
@@ -164,7 +206,7 @@ router.delete('/:id', requirePermission('delete_agent'), async (req, res) => {
 // Create new agent - requires manage_agents permission
 router.post('/', requirePermission('manage_agents'), async (req, res) => {
     const userId = getEffectiveUserId(req);
-    const { name, description, systemPrompt, tools, model, starterPrompts, threadsEnabled, copyEnabled, workspaceEnabled, config, organizationId, sharedGroups } = req.body;
+    const { name, description, systemPrompt, tools, model, starterPrompts, threadsEnabled, copyEnabled, workspaceEnabled, config, organizationId, sharedGroups, categoryId } = req.body;
 
     if (!name) {
         return res.status(400).json({ error: 'Name is required' });
@@ -201,7 +243,8 @@ router.post('/', requirePermission('manage_agents'), async (req, res) => {
         workspaceEnabled === true,
         config || {},
         assignOrgId || null,
-        sharedGroups || []
+        sharedGroups || [],
+        categoryId || null
     );
 
     // Set tools if provided
@@ -216,7 +259,7 @@ router.post('/', requirePermission('manage_agents'), async (req, res) => {
 // Update agent - requires manage_agents permission
 router.put('/:id', requirePermission('manage_agents'), async (req, res) => {
     const userId = getEffectiveUserId(req);
-    const { name, description, systemPrompt, tools, toolParams, model, starterPrompts, avatar, threadsEnabled, copyEnabled, workspaceEnabled, config, embedEnabled, organizationId, sharedGroups } = req.body;
+    const { name, description, systemPrompt, tools, toolParams, model, starterPrompts, avatar, threadsEnabled, copyEnabled, workspaceEnabled, config, embedEnabled, organizationId, sharedGroups, categoryId } = req.body;
 
     const agent = await agentStore.getAgent(req.params.id);
     if (!agent) {
@@ -257,7 +300,8 @@ router.put('/:id', requirePermission('manage_agents'), async (req, res) => {
         config !== undefined ? config : (agent.config || {}),
         embedEnabled !== undefined ? embedEnabled : (agent.embed_enabled !== 0),
         assignOrgId || null,
-        sharedGroups !== undefined ? sharedGroups : existingSharedGroups
+        sharedGroups !== undefined ? sharedGroups : existingSharedGroups,
+        categoryId !== undefined ? categoryId : (agent.category_id || null)
     );
     console.log('[AgentUpdate] workspaceEnabled received:', workspaceEnabled, 'type:', typeof workspaceEnabled);
 
@@ -326,6 +370,5 @@ router.delete('/:id', async (req, res) => {
 
     res.json({ success: true });
 });
-
 
 module.exports = router;

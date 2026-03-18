@@ -29,13 +29,13 @@ async function buildToolParams(agentId) {
     return tool_params;
 }
 
-async function createAgent(name, description, systemPrompt, ownerId, model = null, starterPrompts = [], threadsEnabled = true, copyEnabled = true, workspaceEnabled = false, config = {}, organizationId = null, sharedGroups = []) {
+async function createAgent(name, description, systemPrompt, ownerId, model = null, starterPrompts = [], threadsEnabled = true, copyEnabled = true, workspaceEnabled = false, config = {}, organizationId = null, sharedGroups = [], categoryId = null) {
     await initDB();
     const id = uuidv4();
-    await run(`INSERT INTO agents (id, name, description, system_prompt, model, starter_prompts, threads_enabled, copy_enabled, workspace_enabled, config, organization_id, shared_groups, owner_id, created_at, updated_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW(),NOW())`,
-        [id, name, description || '', systemPrompt || '', model, JSON.stringify(starterPrompts), !!threadsEnabled, !!copyEnabled, !!workspaceEnabled, JSON.stringify(config || {}), organizationId || null, JSON.stringify(sharedGroups || []), ownerId]);
-    return { id, name, description, system_prompt: systemPrompt, model, starter_prompts: starterPrompts, threads_enabled: threadsEnabled, copy_enabled: copyEnabled, workspace_enabled: workspaceEnabled, config, organization_id: organizationId, shared_groups: sharedGroups, owner_id: ownerId };
+    await run(`INSERT INTO agents (id, name, description, system_prompt, model, starter_prompts, threads_enabled, copy_enabled, workspace_enabled, config, organization_id, shared_groups, category_id, owner_id, created_at, updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW(),NOW())`,
+        [id, name, description || '', systemPrompt || '', model, JSON.stringify(starterPrompts), !!threadsEnabled, !!copyEnabled, !!workspaceEnabled, JSON.stringify(config || {}), organizationId || null, JSON.stringify(sharedGroups || []), categoryId || null, ownerId]);
+    return { id, name, description, system_prompt: systemPrompt, model, starter_prompts: starterPrompts, threads_enabled: threadsEnabled, copy_enabled: copyEnabled, workspace_enabled: workspaceEnabled, config, organization_id: organizationId, shared_groups: sharedGroups, category_id: categoryId, owner_id: ownerId };
 }
 
 async function getAgents(ownerId) {
@@ -58,7 +58,7 @@ async function getAgent(id) {
     return { ...parseConfig(agent), tools, tool_params };
 }
 
-async function updateAgent(id, name, description, systemPrompt, ownerId, model = null, starterPrompts = [], avatar = null, threadsEnabled = true, copyEnabled = true, workspaceEnabled = false, config = {}, embedEnabled = false, organizationId = undefined, sharedGroups = undefined) {
+async function updateAgent(id, name, description, systemPrompt, ownerId, model = null, starterPrompts = [], avatar = null, threadsEnabled = true, copyEnabled = true, workspaceEnabled = false, config = {}, embedEnabled = false, organizationId = undefined, sharedGroups = undefined, categoryId = undefined) {
     await initDB();
     // Snapshot current state for version history
     try {
@@ -71,9 +71,10 @@ async function updateAgent(id, name, description, systemPrompt, ownerId, model =
 
     const orgId = organizationId !== undefined ? (organizationId || null) : null;
     const sharedGroupsJson = sharedGroups !== undefined ? JSON.stringify(sharedGroups || []) : '[]';
-    const { rowCount } = await run(`UPDATE agents SET name=$1, description=$2, system_prompt=$3, model=$4, starter_prompts=$5, avatar=$6, threads_enabled=$7, copy_enabled=$8, workspace_enabled=$9, config=$10, embed_enabled=$11, organization_id=$12, shared_groups=$13, updated_at=NOW()
-        WHERE id=$14 AND owner_id=$15`,
-        [name, description || '', systemPrompt || '', model, JSON.stringify(starterPrompts), avatar, !!threadsEnabled, !!copyEnabled, !!workspaceEnabled, JSON.stringify(config || {}), !!embedEnabled, orgId, sharedGroupsJson, id, ownerId]);
+    const catId = categoryId !== undefined ? (categoryId || null) : null;
+    const { rowCount } = await run(`UPDATE agents SET name=$1, description=$2, system_prompt=$3, model=$4, starter_prompts=$5, avatar=$6, threads_enabled=$7, copy_enabled=$8, workspace_enabled=$9, config=$10, embed_enabled=$11, organization_id=$12, shared_groups=$13, category_id=$14, updated_at=NOW()
+        WHERE id=$15 AND owner_id=$16`,
+        [name, description || '', systemPrompt || '', model, JSON.stringify(starterPrompts), avatar, !!threadsEnabled, !!copyEnabled, !!workspaceEnabled, JSON.stringify(config || {}), !!embedEnabled, orgId, sharedGroupsJson, catId, id, ownerId]);
     return rowCount > 0;
 }
 
@@ -177,8 +178,35 @@ async function ensurePlaceholderAgent(id, name, description) {
     }
 }
 
+// ============ Agent Categories CRUD ============
+
+async function getAgentCategories(orgId) {
+    await initDB();
+    if (orgId) {
+        return getAll('SELECT * FROM agent_categories WHERE organization_id = $1 ORDER BY name ASC', [orgId]);
+    }
+    return getAll('SELECT * FROM agent_categories ORDER BY name ASC');
+}
+
+async function createAgentCategory(orgId, name, icon, color) {
+    await initDB();
+    const id = uuidv4();
+    await run('INSERT INTO agent_categories (id, organization_id, name, icon, color) VALUES ($1,$2,$3,$4,$5)',
+        [id, orgId || null, name, icon || '📁', color || '#6366f1']);
+    return { id, organization_id: orgId, name, icon: icon || '📁', color: color || '#6366f1' };
+}
+
+async function deleteAgentCategory(id) {
+    await initDB();
+    // Unset category_id on agents that use this category
+    await run('UPDATE agents SET category_id = NULL WHERE category_id = $1', [id]);
+    const { rowCount } = await run('DELETE FROM agent_categories WHERE id = $1', [id]);
+    return rowCount > 0;
+}
+
 module.exports = {
     createAgent, getAgents, getAgent, updateAgent, deleteAgent, forceDeleteAgent,
     getPublishedAgents, setAgentPublished, getPublishedAgentsForUser,
     getAllAgents, getSystemAgents, ensurePlaceholderAgent,
+    getAgentCategories, createAgentCategory, deleteAgentCategory,
 };

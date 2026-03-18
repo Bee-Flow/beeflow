@@ -493,7 +493,11 @@ router.post('/:id/chat/stream', async (req, res) => {
             console.log('[agents] Agent execution aborted by client');
         } else {
             console.error('Agent streaming chat error:', error);
-            sendEvent('error', { error: error.message });
+            const classified = error._classified || {};
+            sendEvent('error', {
+                error: error.message,
+                errorType: classified.retryable ? 'transient' : 'permanent'
+            });
         }
         if (!res.writableEnded) {
             markEnded();

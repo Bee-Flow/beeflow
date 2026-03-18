@@ -33,6 +33,67 @@ const { performKnowledgeSearch } = require('./knowledgeSearch');
 const { runInputGuardrails } = require('./guardrailsRunner');
 const { processAttachments } = require('./attachmentProcessor');
 
+// ============ RETRY & ERROR HELPERS ============
+
+/**
+ * Classify an error as transient (retryable) or permanent.
+ * Returns an object with { retryable, errorType, userMessage }.
+ */
+function classifyStreamError(error) {
+    const msg = error.message || '';
+    const isNetworkError = error instanceof TypeError && /network|fetch|ECONNRESET|ETIMEDOUT/i.test(msg);
+    const isTimeout = msg.includes('timed out') || msg.includes('AbortError') || error.name === 'TimeoutError';
+    const statusMatch = msg.match(/API error (\d+)/);
+    const status = statusMatch ? parseInt(statusMatch[1]) : null;
+
+    // Transient errors — worth retrying
+    if (isNetworkError) return { retryable: true, errorType: 'network', userMessage: 'Network error — please try again' };
+    if (isTimeout) return { retryable: true, errorType: 'timeout', userMessage: 'Request timed out — please try again' };
+    if (status === 429) return { retryable: true, errorType: 'rate_limit', userMessage: 'The AI service is temporarily busy — please try again in a moment' };
+    if (status && status >= 500) return { retryable: true, errorType: 'server', userMessage: 'The AI service encountered a temporary error — please try again' };
+
+    // Permanent errors — do not retry
+    if (status === 413) return { retryable: false, errorType: 'payload_too_large', userMessage: 'Message too large — try sending fewer or smaller images' };
+    if (status === 400) return { retryable: false, errorType: 'bad_request', userMessage: msg };
+    if (status === 401 || status === 403) return { retryable: false, errorType: 'auth', userMessage: 'Authentication error with AI service' };
+
+    // Context overflow patterns (various providers)
+    if (/context.*(length|window|overflow|limit|exceeded)/i.test(msg) || /max.*token/i.test(msg)) {
+        return { retryable: false, errorType: 'context_overflow', userMessage: 'Message too large for the AI model — try a shorter conversation or fewer images' };
+    }
+
+    // Unknown — don't retry
+    return { retryable: false, errorType: 'unknown', userMessage: msg || 'An unexpected error occurred' };
+}
+
+/**
+ * Retry an async operation with exponential backoff.
+ * Only retries on transient errors as classified by classifyStreamError.
+ * @param {Function} fn - Async function to execute
+ * @param {number} maxRetries - Maximum retry attempts (default 2)
+ * @returns {Promise} Result of fn()
+ */
+async function retryStreamCall(fn, maxRetries = 2) {
+    let lastError;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+            return await fn();
+        } catch (error) {
+            lastError = error;
+            const classified = classifyStreamError(error);
+            if (!classified.retryable || attempt >= maxRetries) {
+                // Attach classification to the error for downstream handling
+                error._classified = classified;
+                throw error;
+            }
+            const delayMs = 1000 * Math.pow(2, attempt); // 1s, 2s
+            console.log(`[AgentRuntime] Retry attempt ${attempt + 1}/${maxRetries} after ${classified.errorType} error (waiting ${delayMs}ms): ${error.message}`);
+            await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
+    }
+    throw lastError;
+}
+
 async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, onEvent, historyOverride = null, messageMetadata = {}) {
     // Check swarm first to prioritize virtual agent definition
     const swarm = await swarmStore.getSwarm(agentId);
@@ -228,6 +289,30 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             content: userMessage,
             parentId: messageMetadata.parentId || null
         });
+    }
+
+    // ============ STRIP BASE64 IMAGES FROM HISTORY ============
+    // Images from previous turns are persisted as full base64 data URIs in the
+    // conversation. Re-sending them on every turn causes context window overflow.
+    // Only the CURRENT (last) user message keeps full image data — older messages
+    // get image_url entries replaced with a lightweight text placeholder.
+    for (let i = 0; i < messages.length - 1; i++) {
+        const msg = messages[i];
+        if (Array.isArray(msg.content)) {
+            const hasImages = msg.content.some(p => p.type === 'image_url');
+            if (hasImages) {
+                messages[i] = {
+                    ...msg,
+                    content: msg.content.map(part => {
+                        if (part.type === 'image_url' && part.image_url?.url?.startsWith('data:')) {
+                            return { type: 'text', text: '[Previously attached image]' };
+                        }
+                        return part;
+                    })
+                };
+                console.log(`[AgentRuntime] Stripped base64 image from historical message ${i}`);
+            }
+        }
     }
 
     // ============ MEMORY INTEGRATION ============
@@ -431,7 +516,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 });
 
                 let _adapterStreamUsage = null;
-                await providerAdapter.stream(
+                await retryStreamCall(() => providerAdapter.stream(
                     config.apiKey, config.url, modelToUse,
                     adapterMessages, adapterOptions,
                     (type, data) => {
@@ -480,7 +565,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                             onEvent('error', data);
                         }
                     }
-                );
+                ));
 
                 // Log usage for native adapter streams
                 try {
@@ -540,17 +625,28 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     systemPromptPreview: effectiveSystemPrompt.substring(0, 200) + '...'
                 });
 
-                const response = await fetch(`${apiUrl}/chat/completions`, {
-                    method: 'POST',
-                    headers,
-                    body: JSON.stringify(requestBody),
-                    signal: signal || undefined
+                // Combine client disconnect signal with a 120s timeout to prevent indefinite hangs
+                const timeoutMs = 120000;
+                const timeoutSignal = AbortSignal.timeout(timeoutMs);
+                const combinedSignal = signal
+                    ? AbortSignal.any([signal, timeoutSignal])
+                    : timeoutSignal;
+
+                const response = await retryStreamCall(async () => {
+                    const resp = await fetch(`${apiUrl}/chat/completions`, {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify(requestBody),
+                        signal: combinedSignal
+                    });
+
+                    if (!resp.ok) {
+                        const errorText = await resp.text();
+                        throw new Error(`API error ${resp.status}: ${errorText}`);
+                    }
+                    return resp;
                 });
 
-                if (!response.ok) {
-                    const error = await response.text();
-                    throw new Error(`API error ${response.status}: ${error}`);
-                }
 
                 // Parse SSE stream
                 const reader = response.body.getReader();
@@ -1253,7 +1349,9 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         ? processedUserMessage  // Use redacted version (with [REDACTED: RuleName])
                         : '[Message removed - policy violation]';  // Full replacement for delete mode
 
-                    setTimeout(async () => {
+                    // Persist redaction immediately after current event-loop tick
+                    // (was setTimeout(5000) which raced with conversation save)
+                    setImmediate(async () => {
                         try {
                             const conv = await agentStore.getConversationById(conversation.id, userAuth.encryptionKey);
                             if (conv && conv.messages) {
@@ -1269,7 +1367,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         } catch (redactErr) {
                             console.error('[RegexGuard] Server-side persistence failed:', redactErr.message);
                         }
-                    }, 5000);
+                    });
                 }
             }
 
@@ -1282,7 +1380,12 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 model: modelToUse
             };
         } catch (error) {
-            console.error('[Agent Stream] Error:', error);
+            // Classify the error for better logging and user-facing messages
+            const classified = error._classified || classifyStreamError(error);
+            console.error(`[Agent Stream] Error (${classified.errorType}):`, error.message);
+            // Attach classification so the route handler can send a descriptive error
+            error._classified = classified;
+            error.message = classified.userMessage;
             throw error;
         }
     }

@@ -11,11 +11,18 @@ const { v4: uuidv4 } = require('uuid');
 const { run, getOne, getAll, exec, getClient } = require('../db');
 
 let initialized = false;
+let pgvectorAvailable = true; // tracks whether pgvector extension is usable
+
 async function initDB() {
     if (initialized) return;
 
-    // Enable pgvector extension
-    await exec('CREATE EXTENSION IF NOT EXISTS vector');
+    // Enable pgvector extension (graceful fallback if not installed)
+    try {
+        await exec('CREATE EXTENSION IF NOT EXISTS vector');
+    } catch (e) {
+        pgvectorAvailable = false;
+        console.warn('[KnowledgeStore] pgvector extension not available — vector search disabled, keyword search will still work. Install postgresql-XX-pgvector to enable.');
+    }
 
     // Metadata table (source of truth)
     await exec(`
@@ -47,9 +54,11 @@ const vectorColumnsCreated = new Set();
 /**
  * Ensure a vector column exists for the given embedding dimension.
  * Uses ALTER TABLE to add typed vector(N) columns dynamically.
+ * Skipped entirely if pgvector extension is not available.
  */
 async function ensureVectorColumn(dim) {
     await initDB();
+    if (!pgvectorAvailable) return; // pgvector not installed — skip
     if (vectorColumnsCreated.has(dim)) return;
 
     const colName = `embedding_${dim}`;
@@ -204,19 +213,23 @@ const KnowledgeStore = {
         const vectorStr = `[${queryEmbedding.join(',')}]`;
 
         // A. Vector Search (Semantic) — get 3x candidates for re-ranking
+        //    Skipped when pgvector is not installed
         let vectorCandidates = [];
-        try {
-            vectorCandidates = await getAll(
-                `SELECT id, "${colName}" <=> $1::vector as distance
-                 FROM knowledge_metadata
-                 WHERE agent_id = $2 AND "${colName}" IS NOT NULL
-                 ORDER BY "${colName}" <=> $1::vector
-                 LIMIT $3`,
-                [vectorStr, agentId, limit * 3]
-            );
-        } catch (e) {
-            console.error('[KnowledgeStore] Vector search failed:', e.message);
+        if (pgvectorAvailable) {
+            try {
+                vectorCandidates = await getAll(
+                    `SELECT id, "${colName}" <=> $1::vector as distance
+                     FROM knowledge_metadata
+                     WHERE agent_id = $2 AND "${colName}" IS NOT NULL
+                     ORDER BY "${colName}" <=> $1::vector
+                     LIMIT $3`,
+                    [vectorStr, agentId, limit * 3]
+                );
+            } catch (e) {
+                console.error('[KnowledgeStore] Vector search failed:', e.message);
+            }
         }
+
 
         // B. Keyword Search (Lexical) using tsvector
         let keywordCandidates = [];
