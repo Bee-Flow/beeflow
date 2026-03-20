@@ -267,6 +267,39 @@ async function unassignConversation(conversationId, tableName = 'direct_conversa
     return rowCount > 0;
 }
 
+// ── Access check ─────────────────────────────────────────
+
+/**
+ * Check if a user has access to a project (owner OR shared).
+ * @param {string} userId
+ * @param {string} projectId
+ * @param {string[]} groupIds - optional group IDs the user belongs to
+ * @returns {Promise<boolean>}
+ */
+async function userHasAccess(userId, projectId, groupIds = []) {
+    await initDB();
+    // Check ownership
+    const project = await getOne('SELECT owner_id FROM projects WHERE id = $1', [projectId]);
+    if (!project) return false;
+    if (project.owner_id === userId) return true;
+    // Check direct user share
+    const userShare = await getOne(
+        `SELECT id FROM project_shares WHERE project_id = $1 AND shared_with_type = 'user' AND shared_with_id = $2`,
+        [projectId, userId]
+    );
+    if (userShare) return true;
+    // Check group shares
+    if (groupIds.length > 0) {
+        const placeholders = groupIds.map((_, i) => `$${i + 3}`).join(', ');
+        const groupShare = await getOne(
+            `SELECT id FROM project_shares WHERE project_id = $1 AND shared_with_type = 'group' AND shared_with_id IN (${placeholders})`,
+            [projectId, ...groupIds]
+        );
+        if (groupShare) return true;
+    }
+    return false;
+}
+
 module.exports = {
     createProject,
     getProject,
@@ -278,4 +311,5 @@ module.exports = {
     getProjectShares,
     assignConversation,
     unassignConversation,
+    userHasAccess,
 };

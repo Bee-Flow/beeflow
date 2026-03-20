@@ -104,9 +104,42 @@ async function getAgentTools(agentId) {
     // Load MCP tools from all connected external servers
     try {
         const mcpManager = require('../mcpManager');
-        const mcpTools = await mcpManager.getAllToolsAsOpenAI();
+        const beforeCount = tools.length;
+        let mcpTools = await mcpManager.getAllToolsAsOpenAI();
+        console.log(`[MCP-DEBUG] agentTools: got ${mcpTools.length} MCP tools from mcpManager (agent: ${agentId}, existing tools: ${beforeCount})`);
+        // Gate MCP tools by org-level enabledIntegrations
         if (mcpTools.length > 0) {
-            tools.push(...mcpTools);
+            try {
+                const agent = await agentStore.getAgent(agentId);
+                if (agent?.userId) {
+                    const userStore = require('../../stores/userStore');
+                    const configStoreForMcp = require('../../stores/configStore');
+                    const agentOwner = await userStore.getUser(agent.userId);
+                    if (agentOwner?.organizationId) {
+                        const org = await userStore.getOrganization(agentOwner.organizationId);
+                        let orgEnabled = null;
+                        if (org?.enabledIntegrations) {
+                            orgEnabled = typeof org.enabledIntegrations === 'string'
+                                ? JSON.parse(org.enabledIntegrations) : org.enabledIntegrations;
+                        } else {
+                            const globalDefs = await configStoreForMcp.getConfig('default_org_integrations');
+                            if (globalDefs) {
+                                orgEnabled = typeof globalDefs === 'string' ? JSON.parse(globalDefs) : globalDefs;
+                            }
+                        }
+                        if (orgEnabled) {
+                            mcpTools = mcpTools.filter(t => {
+                                const serverId = t._mcp?.serverId;
+                                return !serverId || orgEnabled.includes(`mcp:${serverId}`);
+                            });
+                        }
+                    }
+                }
+            } catch (_) { /* ignore */ }
+            if (mcpTools.length > 0) {
+                tools.push(...mcpTools);
+                console.log(`[MCP-DEBUG] agentTools: total tools after MCP injection: ${tools.length}`);
+            }
         }
     } catch (err) {
         console.warn('[AgentTools] Failed to load MCP tools:', err.message);

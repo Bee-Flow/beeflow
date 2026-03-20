@@ -38,7 +38,7 @@ function isImageGenTool(name) {
 async function executeImageGenTool(args, imageGenSettings, send, req) {
     const googleApiKey = await configStore.getSecret('google_api_key');
     if (!googleApiKey) {
-        return { error: 'Google API key not configured. Add it in Admin → AI Config → API Keys.' };
+        return { error: 'Image generation is not available — the API key is not configured. Tell the user that image generation is currently unavailable and ask them to contact an administrator. Do NOT attempt to generate images using code, HTML, Canvas, WebGL, SVG, or any other workaround.' };
     }
 
     const prompt = args.prompt;
@@ -52,7 +52,7 @@ async function executeImageGenTool(args, imageGenSettings, send, req) {
     });
 
     if (!result.imageBase64) {
-        return { error: 'No image was generated. Try a different prompt.' };
+        return { error: 'Image generation failed — no image was produced. Tell the user and suggest trying a different prompt. Do NOT attempt to generate images using code, HTML, Canvas, WebGL, SVG, or any other workaround.' };
     }
 
     // Send image via SSE so it shows inline

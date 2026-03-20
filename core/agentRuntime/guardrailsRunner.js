@@ -1,5 +1,6 @@
 const configStore = require('../../stores/configStore');
 const { validateInput } = require('../moderation');
+const { validateInputForPii } = require('../azurePiiDetection');
 const { resolveOrgShield, mergeWithOrgShield } = require('../orgShield');
 const { checkRegexPatterns } = require('../guardrails');
 
@@ -50,6 +51,38 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
                 }
                 moderationViolation = violationLabels.join(', ');
             }
+        }
+    }
+
+    // ── PII Detection ─────────────────────────────────────────────────
+    // Runs independently of Llama Guard / Azure moderation.
+    // Uses Azure Text Analytics when configured, falls back to CPU model via guard service.
+    if (globalConfig?.piiDetectionEnabled) {
+        try {
+            const piiMessages = [
+                ...messages.slice(-3), // last few messages for context
+            ];
+            await validateInputForPii(piiMessages, false);
+        } catch (piiError) {
+            if (piiError.message?.includes('PII Detected')) {
+                console.warn('[GuardrailsRunner] PII detected in user input:', piiError.message);
+                const entityLabels = piiError.piiEntities
+                    ? [...new Set(piiError.piiEntities.map(e => e.label || e.category))]
+                    : ['personal information'];
+                const labelList = entityLabels.join(', ');
+
+                if (onEvent) {
+                    onEvent('guardrail_violation', {
+                        rules: entityLabels,
+                        autoDeleteSeconds: 5,
+                        outcome: JSON.stringify(entityLabels.map(l => ({ label: l }))),
+                        categories: entityLabels,
+                        type: 'pii'
+                    });
+                }
+                moderationViolation = `PII Detected: ${labelList}`;
+            }
+            // Other errors (service unavailable etc.) → fail-open, log and continue
         }
     }
 

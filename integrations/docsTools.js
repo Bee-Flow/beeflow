@@ -34,11 +34,12 @@ const DOCS_TOOLS = [
         type: 'function',
         function: {
             name: 'docs_read',
-            description: 'Read the text content of a Google Doc.',
+            description: 'Read the text content of a Google Doc. Supports documents with multiple tabs — returns all tab content with tab name labels, or a specific tab if tabName is provided.',
             parameters: {
                 type: 'object',
                 properties: {
                     documentId: { type: 'string', description: 'The document ID' },
+                    tabName: { type: 'string', description: 'Optional: read only a specific tab by its name. If omitted, all tabs are returned with labels.' },
                 },
                 required: ['documentId']
             }
@@ -193,17 +194,47 @@ async function executeDocsTool(toolName, args, session) {
         }
 
         case 'docs_read': {
-            const { documentId } = args;
-            console.log(`[Docs] Reading document: ${documentId}`);
+            const { documentId, tabName } = args;
+            console.log(`[Docs] Reading document: ${documentId}${tabName ? ` (tab: ${tabName})` : ''}`);
 
-            const res = await docs.documents.get({ documentId });
-            const text = extractText(res.data.body);
+            const res = await docs.documents.get({ documentId, includeTabsContent: true });
+            const tabs = res.data.tabs || [];
+
+            let text = '';
+            const tabNames = [];
+
+            if (tabs.length > 0) {
+                for (const tab of tabs) {
+                    const tName = tab.tabProperties?.title || 'Untitled';
+                    tabNames.push(tName);
+                    if (tabName && tName !== tabName) continue;
+                    const tabText = extractText(tab.documentTab?.body);
+                    if (tabs.length > 1) {
+                        text += `\n--- Tab: ${tName} ---\n${tabText}`;
+                    } else {
+                        text += tabText;
+                    }
+                }
+            } else {
+                // Fallback for docs without tabs structure
+                text = extractText(res.data.body);
+            }
+
+            if (tabName && !tabNames.includes(tabName)) {
+                return {
+                    documentId,
+                    title: res.data.title,
+                    error: `Tab "${tabName}" not found. Available tabs: ${tabNames.join(', ')}`,
+                    availableTabs: tabNames,
+                };
+            }
 
             return {
                 documentId,
                 title: res.data.title,
                 text: text.length > 10000 ? text.substring(0, 10000) + '\n... [truncated]' : text,
                 characterCount: text.length,
+                tabs: tabNames.length > 1 ? tabNames : undefined,
             };
         }
 

@@ -314,10 +314,10 @@ async function findRelevantMemories(userId, agentId, userMessage, tokenLimit = 8
     `;
     let params = [agentId || null];
     
-    // Either global user memories OR project memories (if in a project)
+    // Strict project isolation: only project memories in project context, only global in non-project
     if (projectId) {
-        query += ` AND (project_id = $2 OR (user_id = $3 AND project_id IS NULL))`;
-        params.push(projectId, userId);
+        query += ` AND project_id = $2`;
+        params.push(projectId);
     } else {
         query += ` AND user_id = $2 AND project_id IS NULL`;
         params.push(userId);
@@ -452,13 +452,13 @@ function formatMemoriesForPrompt(memories) {
 
 async function getMemoryStats(userId) {
     await initDB();
-    const total = await getOne('SELECT COUNT(*) as count FROM user_memories WHERE user_id = $1', [userId]);
-    const byType = await getAll('SELECT type, COUNT(*) as count FROM user_memories WHERE user_id = $1 GROUP BY type', [userId]);
+    const total = await getOne('SELECT COUNT(*) as count FROM user_memories WHERE user_id = $1 AND project_id IS NULL', [userId]);
+    const byType = await getAll('SELECT type, COUNT(*) as count FROM user_memories WHERE user_id = $1 AND project_id IS NULL GROUP BY type', [userId]);
     const byImportance = await getAll(`
         SELECT
             CASE WHEN importance >= 0.8 THEN 'high' WHEN importance >= 0.5 THEN 'medium' ELSE 'low' END as level,
             COUNT(*) as count
-        FROM user_memories WHERE user_id = $1 GROUP BY level
+        FROM user_memories WHERE user_id = $1 AND project_id IS NULL GROUP BY level
     `, [userId]);
 
     const typeDistribution = { labels: byType.map(r => r.type), data: byType.map(r => parseInt(r.count)) };

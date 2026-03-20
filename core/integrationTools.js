@@ -38,8 +38,8 @@ const { ONEDRIVE_TOOLS } = require('../integrations/oneDriveTools');
 const { MS_CONTACTS_TOOLS } = require('../integrations/msContactsTools');
 const { TRANSCRIPTION_TOOLS } = require('../integrations/transcriptionTools');
 
-// IDs that are gated by org-level enabledIntegrations
-const ORG_GATED_APPS = ['fireflies', 'youtrack', 'gamma', 'n8n', 'linkedin', 'github'];
+// IDs that are exempt from org-level gating (admin-only tools, internal utilities)
+const ORG_EXEMPT_APPS = ['workspace', 'regex-gen'];
 
 /**
  * Build the list of integration tools available for the current user.
@@ -100,8 +100,8 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
                 return false;
             }
         }
-        // Org-level gating only applies to third-party integrations
-        if (ORG_GATED_APPS.includes(appId) && orgEnabledIntegrations && !orgEnabledIntegrations.includes(appId)) return false;
+        // Org-level gating applies to all integrations except exempt ones
+        if (!ORG_EXEMPT_APPS.includes(appId) && orgEnabledIntegrations && !orgEnabledIntegrations.includes(appId)) return false;
         return true;
     };
 
@@ -303,10 +303,31 @@ async function buildToolHint(tools, userId = null) {
     if (tools.some(t => t.function.name.startsWith('ms_contacts_'))) integrations.push('Microsoft Contacts (search, list, create, update contacts — create/update require user approval)');
     if (tools.some(t => t.function.name === 'transcribe_audio')) integrations.push('Meeting Transcription (transcribe uploaded audio files with speaker diarization using Voxtral AI — supports up to 3 hours of audio, Dutch and other languages)');
 
+    // MCP (Model Context Protocol) tools — dynamically discovered from connected external servers
+    const mcpTools = tools.filter(t => t.function?.name?.startsWith('mcp_'));
+    console.log(`[MCP-DEBUG] buildToolHint: ${tools.length} total tools received, ${mcpTools.length} are MCP tools`);
+    if (mcpTools.length > 0) {
+        // Group by server: mcp_{serverId}_{toolName}
+        const serverMap = {};
+        for (const t of mcpTools) {
+            const parts = t.function.name.split('_');
+            // mcp_{serverId}_{rest...} — server ID is the second segment
+            const serverId = parts[1] || 'unknown';
+            if (!serverMap[serverId]) serverMap[serverId] = [];
+            serverMap[serverId].push(t.function.description || t.function.name);
+        }
+        console.log(`[MCP-DEBUG] buildToolHint: MCP servers found: ${Object.keys(serverMap).join(', ')}`);
+        for (const [serverId, toolDescs] of Object.entries(serverMap)) {
+            const label = serverId.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+            integrations.push(`${label} via MCP (${toolDescs.length} tools: ${toolDescs.slice(0, 5).join(', ')}${toolDescs.length > 5 ? `, ... and ${toolDescs.length - 5} more` : ''})`);
+        }
+    }
+
     let hint = ' You have access to tools — use them when they would help answer the user\'s question. You can call multiple tools in parallel when appropriate.';
     if (integrations.length > 0) {
         hint += ` Your available integrations: ${integrations.join(', ')}.`;
     }
+    console.log(`[MCP-DEBUG] buildToolHint final integrations: [${integrations.join(', ')}]`);
 
     // Inject email writing style profile when gmail or outlook tools are active
     if (userId && (tools.some(t => t.function.name.startsWith('gmail_')) || tools.some(t => t.function.name.startsWith('outlook_')))) {

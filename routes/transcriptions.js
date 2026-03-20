@@ -10,7 +10,11 @@
 
 const express = require('express');
 const router = express.Router();
+const { requireBetaFeature } = require('../core/betaFeatures');
 const multer = require('multer');
+
+// Gate all transcription routes behind the meeting_notes beta feature
+router.use(requireBetaFeature('meeting_notes'));
 const path = require('path');
 const fs = require('fs');
 const transcriptionStore = require('../stores/transcriptionStore');

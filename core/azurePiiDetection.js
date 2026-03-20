@@ -1,10 +1,12 @@
 /**
- * Azure PII Detection — detect personally identifiable information in text
+ * PII Detection — detect personally identifiable information in text
  *
- * Uses the @azure/ai-text-analytics SDK to detect PII entities like
- * names, credit cards, phone numbers, emails, bank accounts, etc.
+ * PRIMARY:  Azure AI Text Analytics (when endpoint + key are configured)
+ * FALLBACK: guard-service /pii endpoint (betterdataai/PII_DETECTION_MODEL, CPU)
  *
- * Runs as a separate guardrail alongside Content Safety / Llama Guard.
+ *   createClient() → Azure creds exist?
+ *       YES → Azure Text Analytics (cloud)
+ *       NO  → guard-service /pii (local CPU NER model)
  *
  * SDK: @azure/ai-text-analytics
  * Auth: AzureKeyCredential from @azure/core-auth
@@ -13,6 +15,84 @@
 
 const { getAIConfig } = require('./aiAgent');
 const configStore = require('../stores/configStore');
+
+// ── PII service — standalone service running betterdataai/PII_DETECTION_MODEL
+// Set PII_SERVICE_URL in .env to point at the running pii-service instance.
+// Defaults to localhost:8200 (the pii-service default port).
+// Set PII_SERVICE_API_KEY if the remote service requires API key auth.
+const PII_SERVICE_URL = process.env.PII_SERVICE_URL || 'http://localhost:8200';
+const PII_SERVICE_API_KEY = process.env.PII_SERVICE_API_KEY || '';
+
+// Simple HTTP helper — no extra dependency beyond Node built-ins
+const http = require('http');
+const https = require('https');
+
+function httpPost(url, body) {
+    return new Promise((resolve, reject) => {
+        const parsed = new URL(url);
+        const isHttps = parsed.protocol === 'https:';
+        const lib = isHttps ? https : http;
+        const data = JSON.stringify(body);
+        const headers = {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(data),
+        };
+        if (PII_SERVICE_API_KEY) {
+            headers['X-API-Key'] = PII_SERVICE_API_KEY;
+        }
+        const options = {
+            hostname: parsed.hostname,
+            port: parsed.port || (isHttps ? 443 : 80),
+            path: parsed.pathname,
+            method: 'POST',
+            headers,
+            timeout: 90000,
+        };
+        const req = lib.request(options, (res) => {
+            let chunks = '';
+            res.on('data', (c) => { chunks += c; });
+            res.on('end', () => {
+                if (res.statusCode >= 200 && res.statusCode < 300) {
+                    resolve(JSON.parse(chunks));
+                } else {
+                    reject(new Error(`guard-service /pii returned ${res.statusCode}: ${chunks}`));
+                }
+            });
+        });
+        req.on('error', reject);
+        req.on('timeout', () => { req.destroy(); reject(new Error('guard-service /pii timeout')); });
+        req.write(data);
+        req.end();
+    });
+}
+
+/**
+ * Detect PII using the CPU model via the PII service (betterdataai/PII_DETECTION_MODEL).
+ * Maps response shapes back to the same format as detectPii().
+ */
+async function detectPiiViaCpuModel(text, enabledCategories, confidenceThreshold) {
+    const body = {
+        text,
+        confidence_threshold: confidenceThreshold,
+        enabled_categories: enabledCategories || null,
+    };
+    const result = await httpPost(`${PII_SERVICE_URL}/pii`, body);
+    // result = { hasPii, entities: [{ text, category, label, confidence, offset, length }] }
+    const entities = (result.entities || []).map(e => ({
+        text:        e.text,
+        category:    e.category,
+        subCategory: null,
+        confidence:  e.confidence,
+        offset:      e.offset,
+        length:      e.length,
+        label:       e.label || PII_CATEGORIES[e.category]?.label || e.category,
+    }));
+    return {
+        hasPii:      entities.length > 0,
+        entities,
+        redactedText: text,  // CPU model does not redact
+    };
+}
 
 // ── Cache (LRU, 5-min TTL) ───────────────────────────────────────────
 const CACHE_MAX = 200;
@@ -113,20 +193,75 @@ async function createClient() {
 }
 
 /**
+ * Tokenize PII in text — replace each detected entity with a reversible token.
+ *
+ * Tokens look like: [PII:iban:1], [PII:email:1], [PII:name:1]
+ *
+ * Returns { tokenizedText, tokenMap } where tokenMap maps each token → real value.
+ * Call restoreTokens(text, tokenMap) to reverse.
+ */
+function tokenizeText(text, entities) {
+    if (!entities || entities.length === 0) return { tokenizedText: text, tokenMap: {} };
+
+    // Sort by offset descending so we can splice from end without shifting offsets
+    const sorted = [...entities].sort((a, b) => b.offset - a.offset);
+    const tokenMap = {};
+    const counters = {};
+
+    let tokenized = text;
+    for (const entity of sorted) {
+        const catKey = (entity.category || 'data').toLowerCase().replace(/[^a-z0-9]/g, '_');
+        counters[catKey] = (counters[catKey] || 0) + 1;
+        const token = `[PII:${catKey}:${counters[catKey]}]`;
+        tokenMap[token] = entity.text;
+        // Replace the exact span (using offset if available, else string replace)
+        if (entity.offset !== undefined && entity.offset >= 0) {
+            tokenized = tokenized.slice(0, entity.offset) + token + tokenized.slice(entity.offset + entity.length);
+        } else {
+            tokenized = tokenized.replace(entity.text, token);
+        }
+    }
+
+    return { tokenizedText: tokenized, tokenMap };
+}
+
+/**
+ * Restore PII tokens in text back to real values.
+ * Call on AI response before displaying to user.
+ */
+function restoreTokens(text, tokenMap) {
+    if (!tokenMap || !text) return text;
+    let restored = text;
+    for (const [token, realValue] of Object.entries(tokenMap)) {
+        // Use a global replace in case the AI echoed the token multiple times
+        restored = restored.split(token).join(realValue);
+    }
+    return restored;
+}
+
+/**
  * Detect PII entities in text.
  * Returns { hasPii, entities[] } or null on failure.
  *
- * Azure detects ALL PII types, then we filter client-side by the
- * admin's enabled categories. This avoids "Invalid Request" errors
- * from unsupported categoriesFilter values.
+ * Routing:
+ *   - Azure client available → cloud API (full language support + redaction)
+ *   - No Azure creds        → CPU guard-service /pii endpoint (local NER model)
  */
 async function detectPii(text, enabledCategories = null, confidenceThreshold = DEFAULT_PII_CONFIDENCE_THRESHOLD) {
     const client = await createClient();
+
+    // ── CPU fallback: guard-service /pii (betterdataai/PII_DETECTION_MODEL) ──
     if (!client) {
-        console.warn('[PiiDetection] No endpoint/key configured, skipping');
-        return null;
+        console.log('[PiiDetection] No Azure creds — using CPU model via guard-service');
+        try {
+            return await detectPiiViaCpuModel(text, enabledCategories, confidenceThreshold);
+        } catch (cpuErr) {
+            console.warn('[PiiDetection] CPU model unavailable:', cpuErr.message);
+            return null; // fail-open
+        }
     }
 
+    // ── Azure Text Analytics (primary) ───────────────────────────────────────
     const documents = [text];
 
     // Pass categoriesFilter to only scan for admin-enabled categories
@@ -166,7 +301,14 @@ async function detectPii(text, enabledCategories = null, confidenceThreshold = D
 
 /**
  * Validate user input for PII.
- * Throws an error if PII is detected (blocking the message).
+ *
+ * Behaviour depends on piiDetectionAction config:
+ *   'block'    — throws an error if PII found (existing behaviour)
+ *   'tokenize' — returns { tokenizedText, tokenMap } replacing PII with tokens like [PII:iban:1]
+ *
+ * Returns null if PII detection is disabled or no PII found.
+ * Returns { tokenizedText, tokenMap } when action=tokenize and PII is found.
+ * Throws when action=block and PII is found.
  *
  * @param {Array} messages - Chat messages array
  * @param {boolean} [agentPiiEnabled=false] - Per-agent override
@@ -176,17 +318,19 @@ async function validateInputForPii(messages, agentPiiEnabled = false) {
 
     // Check if PII detection is enabled
     const piiEnabled = aiConfig.piiDetectionEnabled || agentPiiEnabled;
-    if (!piiEnabled) return;
+    if (!piiEnabled) return null;
+
+    const piiAction = aiConfig.piiDetectionAction || 'block';
 
     const lastUserMessage = messages.slice().reverse().find(m => m.role === 'user');
-    if (!lastUserMessage) return;
+    if (!lastUserMessage) return null;
 
     let inputText = lastUserMessage.content;
     if (Array.isArray(inputText)) {
         const textBlock = inputText.find(b => b.type === 'text');
         inputText = textBlock ? textBlock.text : '';
     }
-    if (!inputText || inputText.length < 3) return;
+    if (!inputText || inputText.length < 3) return null;
 
     // Check cache
     const key = cacheKey('user_input', inputText);
@@ -195,12 +339,17 @@ async function validateInputForPii(messages, agentPiiEnabled = false) {
         console.log(`[PiiDetection] Cache hit → ${cached.hasPii ? '🚫 PII found' : '✅ clean'}`);
         if (cached.hasPii) {
             const categoryList = [...new Set(cached.entities.map(e => e.label))].join(', ');
+            if (piiAction === 'tokenize') {
+                const { tokenizedText, tokenMap } = tokenizeText(inputText, cached.entities);
+                console.warn(`[PiiDetection] 🔒 Tokenizing ${cached.entities.length} entities (cached): ${categoryList}`);
+                return { tokenizedText, tokenMap, entities: cached.entities };
+            }
             const err = new Error(`PII Detected: Message contains sensitive personal information (${categoryList}). Please remove PII before sending.`);
             err.piiEntities = cached.entities;
             err.violationCodes = cached.entities.map(e => `PII:${e.category}`);
             throw err;
         }
-        return;
+        return null;
     }
 
     console.log(`[PiiDetection] Scanning input (${inputText.length} chars)...`);
@@ -210,7 +359,7 @@ async function validateInputForPii(messages, agentPiiEnabled = false) {
         const enabledCategories = aiConfig.piiDetectionCategories || ALL_PII_CATEGORY_IDS;
         const confidenceThreshold = aiConfig.piiDetectionConfidenceThreshold ?? DEFAULT_PII_CONFIDENCE_THRESHOLD;
         const result = await detectPii(inputText, enabledCategories, confidenceThreshold);
-        if (!result) return; // No client configured, fail-open
+        if (!result) return null; // No client configured, fail-open
 
         const ms = Date.now() - start;
 
@@ -219,21 +368,31 @@ async function validateInputForPii(messages, agentPiiEnabled = false) {
 
         if (!result.hasPii) {
             console.log(`[PiiDetection] ✅ Input clean | ${ms}ms`);
-            return;
+            return null;
         }
 
         const categoryList = [...new Set(result.entities.map(e => e.label))].join(', ');
-        console.warn(`[PiiDetection] 🚫 PII found | ${categoryList} | ${result.entities.length} entities | ${ms}ms`);
+        const snippets = result.entities.map(e => `"${e.text.slice(0, 20).trim()}" (${e.label}, ${Math.round(e.confidence * 100)}%)`).join(' | ');
+        console.warn(`[PiiDetection] 🚫 PII detected | categories: ${categoryList} | ${result.entities.length} entities | ${ms}ms`);
+        console.warn(`[PiiDetection] 🚫 Entities: ${snippets}`);
 
+        if (piiAction === 'tokenize') {
+            const { tokenizedText, tokenMap } = tokenizeText(inputText, result.entities);
+            console.warn(`[PiiDetection] 🔒 Tokenizing — sending redacted text to AI`);
+            return { tokenizedText, tokenMap, entities: result.entities };
+        }
+
+        // Default: block
         const err = new Error(`PII Detected: Message contains sensitive personal information (${categoryList}). Please remove PII before sending.`);
         err.piiEntities = result.entities;
         err.violationCodes = result.entities.map(e => `PII:${e.category}`);
         throw err;
 
     } catch (e) {
-        if (e.message.includes('PII Detected')) throw e;
+        if (e.message?.includes('PII Detected')) throw e;
         console.error('[PiiDetection] Validation failed:', e.message);
         console.warn('[PiiDetection] Service unavailable, allowing content (fail-open)');
+        return null;
     }
 }
 
@@ -288,6 +447,8 @@ module.exports = {
     validateInputForPii,
     validateOutputForPii,
     detectPii,
+    tokenizeText,
+    restoreTokens,
     PII_CATEGORIES,
     ALL_PII_CATEGORY_IDS,
     DEFAULT_PII_CONFIDENCE_THRESHOLD,

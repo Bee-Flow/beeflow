@@ -182,16 +182,29 @@ router.get('/:id', async (req, res) => {
     return res.status(404).json({ error: 'Agent not found' });
 });
 
-// Delete agent - requires delete_agent permission
-router.delete('/:id', requirePermission('delete_agent'), async (req, res) => {
+// Delete agent - owner can delete own, admin/manage_agents can force-delete any
+router.delete('/:id', async (req, res) => {
     try {
+        const userId = getEffectiveUserId(req);
         const agent = await agentStore.getAgent(req.params.id);
         if (!agent) {
             return res.status(404).json({ error: 'Agent not found' });
         }
 
-        // Admin mode - allow deletion (since Admin Dashboard shows all agents)
-        const deleted = await agentStore.forceDeleteAgent(req.params.id);
+        let deleted;
+        if (agent.owner_id === userId) {
+            // Owner can always delete their own agent
+            deleted = await agentStore.forceDeleteAgent(req.params.id);
+        } else {
+            // Non-owners need manage_agents permission
+            const { hasPermission } = require('../../auth');
+            const hasPerm = await hasPermission(userId, 'manage_agents', req.session);
+            if (!hasPerm) {
+                return res.status(403).json({ error: 'Permission denied' });
+            }
+            deleted = await agentStore.forceDeleteAgent(req.params.id);
+        }
+
         if (deleted) {
             res.json({ success: true });
         } else {
@@ -357,17 +370,6 @@ router.put('/:id/tools/:componentId/params', async (req, res) => {
 
     const { params } = req.body;
     await agentStore.updateAgentToolParams(req.params.id, req.params.componentId, params);
-    res.json({ success: true });
-});
-
-// Delete agent
-router.delete('/:id', async (req, res) => {
-    const userId = getEffectiveUserId(req);
-    const deleted = await agentStore.deleteAgent(req.params.id, userId);
-    if (!deleted) {
-        return res.status(404).json({ error: 'Agent not found or access denied' });
-    }
-
     res.json({ success: true });
 });
 

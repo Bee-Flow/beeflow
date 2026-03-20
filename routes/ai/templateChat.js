@@ -8,6 +8,11 @@
 
 const express = require('express');
 const router = express.Router();
+const { requireBetaFeature } = require('../../core/betaFeatures');
+
+// Gate template chat routes behind the templates beta feature
+router.use(requireBetaFeature('templates'));
+
 const {
     getAIConfig,
     getProviderForModel,

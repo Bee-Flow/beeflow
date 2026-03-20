@@ -17,6 +17,7 @@ const configStore = require('../stores/configStore');
 /** Lazy-loaded SDK modules (ESM dynamic import) */
 let _Client = null;
 let _StdioClientTransport = null;
+let _StreamableHTTPClientTransport = null;
 
 async function loadSDK() {
     if (_Client && _StdioClientTransport) return;
@@ -24,6 +25,12 @@ async function loadSDK() {
     const transportMod = await import('@modelcontextprotocol/sdk/client/stdio.js');
     _Client = clientMod.Client;
     _StdioClientTransport = transportMod.StdioClientTransport;
+    try {
+        const httpMod = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
+        _StreamableHTTPClientTransport = httpMod.StreamableHTTPClientTransport;
+    } catch (_) {
+        console.warn('[MCP] StreamableHTTPClientTransport not available — HTTP transport disabled');
+    }
 }
 
 /**
@@ -81,13 +88,28 @@ async function getConnection(serverId, userId) {
         }
     }
 
-    console.log(`[MCP] Spawning "${server.name}" for user ${userId}: ${server.command} ${(server.args || []).join(' ')}`);
-
-    const transport = new _StdioClientTransport({
-        command: server.command,
-        args: server.args || [],
-        env: { ...process.env, ...userEnv },
-    });
+    let transport;
+    if (server.transport === 'http' && server.url) {
+        // Remote HTTP server
+        if (!_StreamableHTTPClientTransport) {
+            throw new Error('StreamableHTTP transport not available — update @modelcontextprotocol/sdk');
+        }
+        console.log(`[MCP] Connecting to HTTP server "${server.name}" for user ${userId}: ${server.url}`);
+        const httpHeaders = {};
+        // If user has an auth credential, pass it as Authorization header
+        if (userEnv.AUTHORIZATION) httpHeaders['Authorization'] = userEnv.AUTHORIZATION;
+        else if (userEnv.API_KEY) httpHeaders['Authorization'] = `Bearer ${userEnv.API_KEY}`;
+        transport = new _StreamableHTTPClientTransport(new URL(server.url), { requestInit: { headers: httpHeaders } });
+    } else {
+        // Local stdio server
+        if (!server.command) throw new Error(`MCP server ${serverId} has no command configured`);
+        console.log(`[MCP] Spawning "${server.name}" for user ${userId}: ${server.command} ${(server.args || []).join(' ')}`);
+        transport = new _StdioClientTransport({
+            command: server.command,
+            args: server.args || [],
+            env: { ...process.env, ...userEnv },
+        });
+    }
 
     const client = new _Client({
         name: 'beeflow-agent',
@@ -127,8 +149,11 @@ async function getAllToolsAsOpenAI() {
     const tools = [];
     try {
         const servers = await mcpStore.getEnabledServers();
+        console.log(`[MCP-DEBUG] getAllToolsAsOpenAI: ${servers.length} enabled servers found`);
 
         for (const server of servers) {
+            const cacheLen = (server.tools_cache || []).length;
+            console.log(`[MCP-DEBUG]   Server "${server.id}": enabled=${server.enabled}, tools_cache=${cacheLen}, status=${server.status}`);
             for (const tool of (server.tools_cache || [])) {
                 const prefixedName = `mcp_${server.id}_${tool.name}`.replace(/[^a-zA-Z0-9_]/g, '_');
                 tools.push({
@@ -142,6 +167,7 @@ async function getAllToolsAsOpenAI() {
                 });
             }
         }
+        console.log(`[MCP-DEBUG] getAllToolsAsOpenAI: returning ${tools.length} total MCP tools`);
     } catch (err) {
         console.error('[MCP] Error loading tools:', err.message);
     }
@@ -201,16 +227,23 @@ async function callTool(serverId, toolName, args = {}, userId) {
  * Used by admin to validate server config before saving.
  * Returns { success, tools, error }.
  */
-async function testCommand(command, args = [], envVars = {}) {
+async function testCommand(command, args = [], envVars = {}, transportType = 'stdio', url = null) {
     await loadSDK();
     let client;
     let transport;
     try {
-        transport = new _StdioClientTransport({
-            command,
-            args,
-            env: { ...process.env, ...envVars },
-        });
+        if (transportType === 'http' && url) {
+            if (!_StreamableHTTPClientTransport) {
+                return { success: false, tools: [], error: 'StreamableHTTP transport not available' };
+            }
+            transport = new _StreamableHTTPClientTransport(new URL(url));
+        } else {
+            transport = new _StdioClientTransport({
+                command,
+                args,
+                env: { ...process.env, ...envVars },
+            });
+        }
         client = new _Client({ name: 'beeflow-test', version: '1.0.0' });
         await client.connect(transport);
 
@@ -239,7 +272,7 @@ async function refreshServerTools(serverId) {
     const server = await mcpStore.getServer(serverId);
     if (!server) throw new Error('Server not found');
 
-    const result = await testCommand(server.command, server.args || []);
+    const result = await testCommand(server.command, server.args || [], {}, server.transport || 'stdio', server.url);
     if (result.success) {
         await mcpStore.updateServer(serverId, {
             tools_cache: result.tools,
@@ -259,13 +292,13 @@ async function refreshServerTools(serverId) {
 /**
  * Add a new server definition, test it, and cache tools.
  */
-async function addServer({ id, name, command, args = [], required_credentials = [] }) {
+async function addServer({ id, name, command, args = [], required_credentials = [], transport = 'stdio', url, category, description, icon, source = 'manual' }) {
     // Save to store
-    await mcpStore.createServer({ id, name, command, args, required_credentials });
+    await mcpStore.createServer({ id, name, command, args, required_credentials, transport, url, category, description, icon, source });
 
     // Test and cache tools
     try {
-        const result = await testCommand(command, args);
+        const result = await testCommand(command, args, {}, transport, url);
         if (result.success) {
             await mcpStore.updateServer(id, {
                 tools_cache: result.tools,
@@ -316,25 +349,27 @@ async function getServersForUser(userId) {
     const result = [];
 
     for (const server of servers) {
-        if (!server.required_credentials || server.required_credentials.length === 0) continue;
-
         const credentials = [];
-        for (const cred of server.required_credentials) {
-            const hasValue = !!(await configStore.getSecret(`mcp_cred_${server.id}_${cred.key}_user_${userId}`));
-            credentials.push({
-                key: cred.key,
-                label: cred.label || cred.key,
-                description: cred.description || '',
-                configured: hasValue,
-            });
+        if (server.required_credentials && server.required_credentials.length > 0) {
+            for (const cred of server.required_credentials) {
+                const hasValue = !!(await configStore.getSecret(`mcp_cred_${server.id}_${cred.key}_user_${userId}`));
+                credentials.push({
+                    key: cred.key,
+                    label: cred.label || cred.key,
+                    description: cred.description || '',
+                    configured: hasValue,
+                });
+            }
         }
 
         result.push({
             id: server.id,
             name: server.name,
+            description: server.description || '',
+            icon: server.icon || '🔌',
             toolCount: (server.tools_cache || []).length,
             credentials,
-            allConfigured: credentials.every(c => c.configured),
+            allConfigured: credentials.length === 0 || credentials.every(c => c.configured),
         });
     }
 

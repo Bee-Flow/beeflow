@@ -7,7 +7,11 @@
 
 const express = require('express');
 const router = express.Router();
+const { requireBetaFeature } = require('../core/betaFeatures');
 const multer = require('multer');
+
+// Gate all template routes behind the templates beta feature
+router.use(requireBetaFeature('templates'));
 const crypto = require('crypto');
 const mammoth = require('mammoth');
 const templateStore = require('../stores/templateStore');

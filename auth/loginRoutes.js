@@ -365,6 +365,8 @@ router.get('/user', async (req, res) => {
             featureFlags: {
                 tasks: process.env.ENABLE_TASKS !== 'false',
                 monitoring: process.env.ENABLE_MONITORING !== 'false',
+                meeting_notes: process.env.ENABLE_MEETING_NOTES !== 'false',
+                templates: process.env.ENABLE_TEMPLATES !== 'false',
             },
             // Org-level enabled integrations
             enabledIntegrations: await (async () => {

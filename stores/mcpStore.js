@@ -26,17 +26,43 @@ async function initTable() {
         CREATE TABLE IF NOT EXISTS ${TABLE} (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
-            command TEXT NOT NULL,
+            command TEXT,
             args JSONB DEFAULT '[]',
             required_credentials JSONB DEFAULT '[]',
             tools_cache JSONB DEFAULT '[]',
             enabled BOOLEAN DEFAULT true,
             status TEXT DEFAULT 'disconnected',
             error TEXT,
+            transport TEXT DEFAULT 'stdio',
+            url TEXT,
+            category TEXT,
+            description TEXT,
+            icon TEXT,
+            source TEXT DEFAULT 'manual',
             created_at TIMESTAMPTZ DEFAULT NOW(),
             updated_at TIMESTAMPTZ DEFAULT NOW()
         )
     `);
+
+    // Migrate: add new columns if they don't exist yet
+    const newCols = [
+        { name: 'transport', def: "TEXT DEFAULT 'stdio'" },
+        { name: 'url', def: 'TEXT' },
+        { name: 'category', def: 'TEXT' },
+        { name: 'description', def: 'TEXT' },
+        { name: 'icon', def: 'TEXT' },
+        { name: 'source', def: "TEXT DEFAULT 'manual'" },
+    ];
+    for (const col of newCols) {
+        try {
+            await db.exec(`ALTER TABLE ${TABLE} ADD COLUMN ${col.name} ${col.def}`);
+        } catch (_) { /* column already exists */ }
+    }
+    // Make command nullable (HTTP servers don't need a command)
+    try {
+        await db.exec(`ALTER TABLE ${TABLE} ALTER COLUMN command DROP NOT NULL`);
+    } catch (_) { /* already nullable or not supported */ }
+
     console.log('[MCPStore] Initialized (PostgreSQL)');
 }
 
@@ -48,17 +74,23 @@ initTable().catch(err => console.error('[MCPStore] Init error:', err.message));
  * @param {Object} server - { id, name, command, args, required_credentials }
  * required_credentials: [{ key: 'GITHUB_TOKEN', label: 'GitHub Token', description: '...' }]
  */
-async function createServer({ id, name, command, args = [], required_credentials = [] }) {
+async function createServer({ id, name, command, args = [], required_credentials = [], transport = 'stdio', url, category, description, icon, source = 'manual' }) {
     await db.run(
-        `INSERT INTO ${TABLE} (id, name, command, args, required_credentials)
-         VALUES ($1, $2, $3, $4, $5)
+        `INSERT INTO ${TABLE} (id, name, command, args, required_credentials, transport, url, category, description, icon, source)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          ON CONFLICT (id) DO UPDATE SET
             name = EXCLUDED.name,
             command = EXCLUDED.command,
             args = EXCLUDED.args,
             required_credentials = EXCLUDED.required_credentials,
+            transport = EXCLUDED.transport,
+            url = EXCLUDED.url,
+            category = EXCLUDED.category,
+            description = EXCLUDED.description,
+            icon = EXCLUDED.icon,
+            source = EXCLUDED.source,
             updated_at = NOW()`,
-        [id, name, command, JSON.stringify(args), JSON.stringify(required_credentials)]
+        [id, name, command || null, JSON.stringify(args), JSON.stringify(required_credentials), transport, url || null, category || null, description || null, icon || null, source]
     );
 }
 

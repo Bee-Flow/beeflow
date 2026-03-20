@@ -45,17 +45,22 @@ function classifyStreamError(error) {
     const isTimeout = msg.includes('timed out') || msg.includes('AbortError') || error.name === 'TimeoutError';
     const statusMatch = msg.match(/API error (\d+)/);
     const status = statusMatch ? parseInt(statusMatch[1]) : null;
+    // Claude SDK exposes .status directly on the error object
+    const httpStatus = status || error.status || null;
+    // Detect Claude-specific overloaded_error from the error body or status
+    const isOverloaded = /overloaded/i.test(msg) || error.error?.type === 'overloaded_error' || httpStatus === 529;
 
     // Transient errors — worth retrying
     if (isNetworkError) return { retryable: true, errorType: 'network', userMessage: 'Network error — please try again' };
     if (isTimeout) return { retryable: true, errorType: 'timeout', userMessage: 'Request timed out — please try again' };
-    if (status === 429) return { retryable: true, errorType: 'rate_limit', userMessage: 'The AI service is temporarily busy — please try again in a moment' };
-    if (status && status >= 500) return { retryable: true, errorType: 'server', userMessage: 'The AI service encountered a temporary error — please try again' };
+    if (isOverloaded) return { retryable: true, errorType: 'overloaded', userMessage: 'The AI service is temporarily overloaded — retrying automatically' };
+    if (httpStatus === 429) return { retryable: true, errorType: 'rate_limit', userMessage: 'The AI service is temporarily busy — please try again in a moment' };
+    if (httpStatus && httpStatus >= 500) return { retryable: true, errorType: 'server', userMessage: 'The AI service encountered a temporary error — please try again' };
 
     // Permanent errors — do not retry
-    if (status === 413) return { retryable: false, errorType: 'payload_too_large', userMessage: 'Message too large — try sending fewer or smaller images' };
-    if (status === 400) return { retryable: false, errorType: 'bad_request', userMessage: msg };
-    if (status === 401 || status === 403) return { retryable: false, errorType: 'auth', userMessage: 'Authentication error with AI service' };
+    if (httpStatus === 413) return { retryable: false, errorType: 'payload_too_large', userMessage: 'Message too large — try sending fewer or smaller images' };
+    if (httpStatus === 400) return { retryable: false, errorType: 'bad_request', userMessage: msg };
+    if (httpStatus === 401 || httpStatus === 403) return { retryable: false, errorType: 'auth', userMessage: 'Authentication error with AI service' };
 
     // Context overflow patterns (various providers)
     if (/context.*(length|window|overflow|limit|exceeded)/i.test(msg) || /max.*token/i.test(msg)) {
@@ -73,7 +78,7 @@ function classifyStreamError(error) {
  * @param {number} maxRetries - Maximum retry attempts (default 2)
  * @returns {Promise} Result of fn()
  */
-async function retryStreamCall(fn, maxRetries = 2) {
+async function retryStreamCall(fn, maxRetries = 3) {
     let lastError;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
         try {
@@ -86,7 +91,9 @@ async function retryStreamCall(fn, maxRetries = 2) {
                 error._classified = classified;
                 throw error;
             }
-            const delayMs = 1000 * Math.pow(2, attempt); // 1s, 2s
+            const baseDelay = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s
+            const jitter = Math.random() * baseDelay * 0.5; // 0-50% jitter
+            const delayMs = Math.min(Math.round(baseDelay + jitter), 10000); // cap at 10s
             console.log(`[AgentRuntime] Retry attempt ${attempt + 1}/${maxRetries} after ${classified.errorType} error (waiting ${delayMs}ms): ${error.message}`);
             await new Promise(resolve => setTimeout(resolve, delayMs));
         }
@@ -254,12 +261,18 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     let extractMemoriesEnabled = false;
     let validProjectId = null;
     if (messageMetadata.projectId) {
-        validProjectId = messageMetadata.projectId;
         try {
             const projectStore = require('../../stores/projectStore');
-            const project = await projectStore.getProject(validProjectId);
+            const project = await projectStore.getProject(messageMetadata.projectId);
             if (project) {
-                extractMemoriesEnabled = project.extractMemories === true;
+                // Validate user has access to this project
+                const hasAccess = await projectStore.userHasAccess(userId, messageMetadata.projectId);
+                if (hasAccess) {
+                    validProjectId = messageMetadata.projectId;
+                    extractMemoriesEnabled = project.extractMemories === true;
+                } else {
+                    console.warn(`[AgentRuntime] User ${userId} has no access to project ${messageMetadata.projectId}, skipping project context`);
+                }
             }
         } catch (e) {
             console.warn('[AgentRuntime] Failed to fetch project:', e.message);
@@ -325,7 +338,8 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             const memoryStore = require('../../stores/memoryStore');
             console.log(`[AgentRuntime] Memory lookup - userId: ${userId}, agentId: ${agentId}`);
             // Limit to ~300 tokens (approx 1200 chars) to prevent context pollution
-            const relevantMemories = memoryStore.findRelevantMemories(userId, agentId, userMessage, 300, extractMemoriesEnabled ? validProjectId : null);
+            // Always pass projectId for retrieval (project memories should be available regardless of extractMemories flag)
+            const relevantMemories = await memoryStore.findRelevantMemories(userId, agentId, userMessage, 300, validProjectId || null);
             if (relevantMemories.length > 0) {
                 memoryContext = memoryStore.formatMemoriesForPrompt(relevantMemories);
                 console.log(`[AgentRuntime] Injected ${relevantMemories.length} memories into prompt`);
@@ -503,9 +517,18 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     reasoningEffort: tierSettings.reasoningEffort || undefined,
                 };
 
+
                 if (tools.length > 0) {
-                    adapterOptions.tools = tools;
+                    // Strip internal metadata (_mcp, _n8n etc.) before sending to LLM — providers may reject unknown fields
+                    adapterOptions.tools = tools.map(t => {
+                        const { _mcp, _n8n, ...clean } = t;
+                        return clean;
+                    });
                     adapterOptions.toolChoice = 'auto';
+                }
+                const mcpToolCount = tools.filter(t => t._mcp || t.function?.name?.startsWith('mcp_')).length;
+                if (mcpToolCount > 0) {
+                    console.log(`[AgentRuntime] 🔌 ${mcpToolCount} MCP tools loaded for LLM`);
                 }
 
                 console.log(`[AgentRuntime] Using native ${config.providerType} adapter for streaming`, {
@@ -606,7 +629,10 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 }
 
                 if (tools.length > 0) {
-                    requestBody.tools = tools;
+                    requestBody.tools = tools.map(t => {
+                        const { _mcp, _n8n, ...clean } = t;
+                        return clean;
+                    });
                     requestBody.tool_choice = 'auto';
 
                     // Enable parallel tool calls when the swarm phase is configured for parallel execution

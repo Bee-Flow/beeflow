@@ -27,6 +27,8 @@ const BETA_FEATURES = [
     { id: 'custom_themes', name: 'Custom Themes', description: 'Organization-level custom branding and theme support' },
     { id: 'tasks', name: 'Tasks', description: 'AI-proposed task queue with mandatory human approval before execution' },
     { id: 'monitoring', name: 'Monitoring', description: 'Custom monitoring dashboards with SQL queries and data visualizations' },
+    { id: 'meeting_notes', name: 'Meeting Notes', description: 'Meeting recording, transcription, and AI-powered summaries' },
+    { id: 'templates', name: 'Templates', description: 'Word document template management with AI-powered filling' },
 ];
 
 // ──────────────────────────────────────────────

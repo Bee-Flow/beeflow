@@ -58,6 +58,8 @@ router.get('/config', async (req, res) => {
         piiDetectionEnabled: config.piiDetectionEnabled || false,
         piiDetectionCategories: config.piiDetectionCategories || null,
         piiDetectionConfidenceThreshold: config.piiDetectionConfidenceThreshold ?? 0.7,
+        piiDetectionScope: config.piiDetectionScope || { userInput: true, agentOutput: false },
+        piiDetectionAction: config.piiDetectionAction || 'block',
         embeddingModel: config.embeddingModel || null,
         embeddingProviderId: config.embeddingProviderId || null,
         allowedModelsByAgentType: await configStore.getConfig('allowedModelsByAgentType') || {},
@@ -78,7 +80,7 @@ router.get('/config', async (req, res) => {
 });
 
 router.post('/config', async (req, res) => {
-    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, llamaGuardConfig, moderationProvider, azureContentSafetyEndpoint, azureContentSafetyKey, azureContentSafetySeverityThreshold, azureContentSafetyCategories, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing, serviceEmailAddress, serviceEmailPassword, serviceEmailDisplayName } = req.body;
+    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, llamaGuardConfig, moderationProvider, azureContentSafetyEndpoint, azureContentSafetyKey, azureContentSafetySeverityThreshold, azureContentSafetyCategories, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionScope, piiDetectionAction, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing, serviceEmailAddress, serviceEmailPassword, serviceEmailDisplayName } = req.body;
     const existing = await getAIConfig();
 
     if (allowedModelsByAgentType !== undefined) {
@@ -175,6 +177,8 @@ router.post('/config', async (req, res) => {
         piiDetectionEnabled: piiDetectionEnabled !== undefined ? piiDetectionEnabled : existing.piiDetectionEnabled,
         piiDetectionCategories: piiDetectionCategories !== undefined ? piiDetectionCategories : existing.piiDetectionCategories,
         piiDetectionConfidenceThreshold: piiDetectionConfidenceThreshold !== undefined ? piiDetectionConfidenceThreshold : existing.piiDetectionConfidenceThreshold,
+        piiDetectionScope: piiDetectionScope !== undefined ? piiDetectionScope : existing.piiDetectionScope,
+        piiDetectionAction: piiDetectionAction !== undefined ? piiDetectionAction : existing.piiDetectionAction,
         embeddingModel: embeddingModel !== undefined ? embeddingModel : existing.embeddingModel,
         embeddingProviderId: embeddingProviderId !== undefined ? embeddingProviderId : existing.embeddingProviderId,
     });
@@ -838,12 +842,18 @@ router.get('/mcp-servers', requireAuth, async (req, res) => {
 // POST /ai/mcp-servers — add a new MCP server definition (admin)
 router.post('/mcp-servers', requireAuth, async (req, res) => {
     try {
-        const { name, command, args = [], required_credentials = [] } = req.body;
-        if (!name || !command) {
-            return res.status(400).json({ error: 'name and command are required' });
+        const { name, command, args = [], required_credentials = [], transport = 'stdio', url, category, description, icon, source = 'manual' } = req.body;
+        if (!name) {
+            return res.status(400).json({ error: 'name is required' });
+        }
+        if (transport === 'stdio' && !command) {
+            return res.status(400).json({ error: 'command is required for stdio servers' });
+        }
+        if (transport === 'http' && !url) {
+            return res.status(400).json({ error: 'url is required for HTTP servers' });
         }
         const id = name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || crypto.randomUUID().slice(0, 8);
-        const server = await mcpManager.addServer({ id, name, command, args, required_credentials });
+        const server = await mcpManager.addServer({ id, name, command, args, required_credentials, transport, url, category, description, icon, source });
         res.json({ success: true, server });
     } catch (err) {
         console.error('[MCP] Add server error:', err);
@@ -854,9 +864,10 @@ router.post('/mcp-servers', requireAuth, async (req, res) => {
 // POST /ai/mcp-servers/test — test an MCP server command
 router.post('/mcp-servers/test', requireAuth, async (req, res) => {
     try {
-        const { command, args = [] } = req.body;
-        if (!command) return res.status(400).json({ error: 'command is required' });
-        const result = await mcpManager.testCommand(command, args);
+        const { command, args = [], transport = 'stdio', url } = req.body;
+        if (transport === 'stdio' && !command) return res.status(400).json({ error: 'command is required for stdio' });
+        if (transport === 'http' && !url) return res.status(400).json({ error: 'url is required for HTTP' });
+        const result = await mcpManager.testCommand(command, args, {}, transport, url);
         res.json(result);
     } catch (err) {
         console.error('[MCP] Test command error:', err);
@@ -868,7 +879,7 @@ router.post('/mcp-servers/test', requireAuth, async (req, res) => {
 router.put('/mcp-servers/:id', requireAuth, async (req, res) => {
     try {
         const { id } = req.params;
-        const { name, command, args, required_credentials, enabled } = req.body;
+        const { name, command, args, required_credentials, enabled, transport, url, category, description, icon } = req.body;
         const mcpStore = require('../../stores/mcpStore');
         const updates = {};
         if (name !== undefined) updates.name = name;
@@ -876,6 +887,11 @@ router.put('/mcp-servers/:id', requireAuth, async (req, res) => {
         if (args !== undefined) updates.args = args;
         if (required_credentials !== undefined) updates.required_credentials = required_credentials;
         if (enabled !== undefined) updates.enabled = enabled;
+        if (transport !== undefined) updates.transport = transport;
+        if (url !== undefined) updates.url = url;
+        if (category !== undefined) updates.category = category;
+        if (description !== undefined) updates.description = description;
+        if (icon !== undefined) updates.icon = icon;
         await mcpStore.updateServer(id, updates);
         res.json({ success: true });
     } catch (err) {

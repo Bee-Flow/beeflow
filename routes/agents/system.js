@@ -79,7 +79,7 @@ router.post('/system/prompt-designer/chat', async (req, res) => {
         }
 
         const { getSystemPromptDesignerAgent, SYSTEM_PROMPT_DESIGNER_AGENT_ID } = agentStore;
-        const agent = getSystemPromptDesignerAgent();
+        const agent = await getSystemPromptDesignerAgent();
 
         if (!agent) {
             return res.status(404).json({ error: 'System Prompt Designer agent not found' });
@@ -111,7 +111,7 @@ router.post('/system/conversation-starters/generate', async (req, res) => {
         const { agentName, agentDescription, systemPrompt } = req.body;
 
         const { getConversationStarterAgent } = agentStore;
-        const agent = getConversationStarterAgent();
+        const agent = await getConversationStarterAgent();
 
         if (!agent) {
             return res.status(404).json({ error: 'Conversation Starter Generator agent not found' });
@@ -157,7 +157,7 @@ router.post('/system/description-improver/generate', async (req, res) => {
         const { agentName, currentDescription, systemPrompt } = req.body;
 
         const { getDescriptionImproverAgent } = agentStore;
-        const agent = getDescriptionImproverAgent();
+        const agent = await getDescriptionImproverAgent();
 
         if (!agent) {
             return res.status(404).json({ error: 'Description Improver agent not found' });
@@ -202,7 +202,7 @@ router.post('/system/identity-improver/generate', async (req, res) => {
         }
 
         const { getIdentityImproverAgent } = agentStore;
-        const agent = getIdentityImproverAgent();
+        const agent = await getIdentityImproverAgent();
 
         if (!agent) {
             return res.status(404).json({ error: 'Identity Improver agent not found' });

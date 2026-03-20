@@ -12,10 +12,19 @@ async function buildSystemPrompt({ agent, tools, userId, messageMetadata, memory
     systemPrompt = processSystemPrompt(systemPrompt);
 
     // Append integration tool hints so the AI knows what integrations are available
+    const mcpCount = tools.filter(t => t.function?.name?.startsWith('mcp_')).length;
+    console.log(`[MCP-DEBUG] contextBuilder: building system prompt with ${tools.length} tools (${mcpCount} MCP)`);
     try {
         const toolHint = await buildToolHint(tools, userId);
-        if (toolHint) systemPrompt += toolHint;
-    } catch (e) { /* ignore */ }
+        if (toolHint) {
+            systemPrompt += toolHint;
+            console.log(`[MCP-DEBUG] contextBuilder: toolHint added (${toolHint.length} chars) — preview: ${toolHint.substring(0, 200)}`);
+        } else {
+            console.log(`[MCP-DEBUG] contextBuilder: toolHint returned empty/null`);
+        }
+    } catch (e) {
+        console.error(`[MCP-DEBUG] contextBuilder: buildToolHint ERROR: ${e.message}`);
+    }
 
     if (memoryContext) {
         systemPrompt = systemPrompt + '\n\n' + memoryContext;

@@ -301,7 +301,11 @@ class ClaudeProvider extends BaseProvider {
             console.error('[Claude] Stream error:', err.message);
             if (err.status) console.error('[Claude] Error status:', err.status);
             if (err.error) console.error('[Claude] API error body:', JSON.stringify(err.error));
-            onEvent('error', { error: `Claude API error: ${err.message}` });
+            // Enrich the error with status info for upstream retry classification
+            if (err.status && !err.message.includes(`API error ${err.status}`)) {
+                err.message = `API error ${err.status}: ${JSON.stringify(err.error || err.message)}`;
+            }
+            throw err;  // Let retryStreamCall handle retry/classify
         }
 
         console.log(`[Claude] Stream complete — ${eventCount} events, ${textChunks} text chunks, ${thinkingChunks} thinking chunks`);

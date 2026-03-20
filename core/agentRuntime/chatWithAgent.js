@@ -16,6 +16,7 @@ const { getAgentTools } = require('./agentTools');
 const { executeWorkerTool } = require('./workerExecution');
 const { processSystemPrompt } = require('../promptUtils');
 const { validateInput } = require('../moderation');
+const { validateInputForPii } = require('../azurePiiDetection');
 
 async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
     // Check swarm first to prioritize virtual agent definition
@@ -101,6 +102,19 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
 
         // 2. Llama Guard Moderation
         await validateInput(validationRequest, agent.config?.llamaGuardEnabled);
+    }
+
+    // ── PII Detection ─────────────────────────────────────────────────
+    const aiConfigForPii = await getAIConfig();
+    if (aiConfigForPii?.piiDetectionEnabled) {
+        try {
+            await validateInputForPii(messages.slice(-3), false);
+        } catch (piiError) {
+            if (piiError.message?.includes('PII Detected')) {
+                throw piiError; // Propagate to the route handler
+            }
+            // Service unavailable → fail-open
+        }
     }
 
     // Enrich messages with form data context

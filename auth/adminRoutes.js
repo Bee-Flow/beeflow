@@ -822,7 +822,19 @@ const ALL_INTEGRATIONS = [
 
 router.get('/default-integrations', requireAdmin, async (req, res) => {
     const defaults = await configStore.getConfig('default_org_integrations') || null;
-    res.json({ integrations: ALL_INTEGRATIONS, defaults });
+    // Include installed MCP servers
+    let mcpIntegrations = [];
+    try {
+        const mcpStore = require('../stores/mcpStore');
+        const mcpServers = await mcpStore.listServers();
+        mcpIntegrations = mcpServers.map(s => ({
+            id: `mcp:${s.id}`,
+            label: s.name,
+            category: 'MCP',
+            icon: s.icon || '🔌',
+        }));
+    } catch (e) { /* mcpStore not available */ }
+    res.json({ integrations: [...ALL_INTEGRATIONS, ...mcpIntegrations], defaults });
 });
 
 router.put('/default-integrations', requireAdmin, async (req, res) => {
@@ -922,7 +934,14 @@ router.get('/invitations', requireAuth, async (req, res) => {
         }
 
         const invitations = await invitationStore.getInvitationsForOrg(user.organizationId);
-        res.json(invitations);
+
+        // Enrich with inviter display name
+        const enriched = await Promise.all(invitations.map(async (inv) => {
+            const inviter = await userStore.getUser(inv.invited_by);
+            return { ...inv, inviterName: inviter?.displayName || inviter?.username || 'Unknown' };
+        }));
+
+        res.json(enriched);
     } catch (err) {
         console.error('[Invitations] List error:', err);
         res.status(500).json({ error: err.message });

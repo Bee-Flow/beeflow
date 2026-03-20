@@ -10,7 +10,11 @@
 
 const express = require('express');
 const router = express.Router();
+const { requireBetaFeature } = require('../core/betaFeatures');
 const fs = require('fs');
+
+// Gate all meet-bot routes behind the meeting_notes beta feature
+router.use(requireBetaFeature('meeting_notes'));
 const path = require('path');
 const meetBotStore = require('../stores/meetBotStore');
 const meetBot = require('../core/meetBot');

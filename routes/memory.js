@@ -5,6 +5,7 @@
 
 const express = require('express');
 const memoryStore = require('../stores/memoryStore');
+const projectStore = require('../stores/projectStore');
 const { getEffectiveUserId } = require('./agents');
 
 const router = express.Router();
@@ -61,7 +62,12 @@ router.get('/:id', async (req, res) => {
     try {
         const memory = await memoryStore.getMemoryById(req.params.id);
         if (!memory) return res.status(404).json({ error: 'Memory not found' });
-        if (memory.user_id !== userId && !memory.project_id) return res.status(403).json({ error: 'Access denied' });
+        if (memory.project_id) {
+            const hasAccess = await projectStore.userHasAccess(userId, memory.project_id);
+            if (!hasAccess) return res.status(403).json({ error: 'Access denied' });
+        } else if (memory.user_id !== userId) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
         res.json({ memory });
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -74,6 +80,12 @@ router.post('/', async (req, res) => {
     const { content, type, agentId, importance, projectId } = req.body;
 
     if (!content) return res.status(400).json({ error: 'Content is required' });
+
+    // Validate project access before creating project-scoped memory
+    if (projectId) {
+        const hasAccess = await projectStore.userHasAccess(userId, projectId);
+        if (!hasAccess) return res.status(403).json({ error: 'No access to this project' });
+    }
 
     try {
         const id = await memoryStore.createMemory(
@@ -94,10 +106,44 @@ router.put('/:id', async (req, res) => {
     try {
         const memory = await memoryStore.getMemoryById(req.params.id);
         if (!memory) return res.status(404).json({ error: 'Memory not found' });
-        if (memory.user_id !== userId && !memory.project_id) return res.status(403).json({ error: 'Access denied' });
+        if (memory.project_id) {
+            const hasAccess = await projectStore.userHasAccess(userId, memory.project_id);
+            if (!hasAccess) return res.status(403).json({ error: 'Access denied' });
+        } else if (memory.user_id !== userId) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
 
         await memoryStore.updateMemory(req.params.id, content || memory.content, summary, importance);
         res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Bulk delete memories
+router.post('/bulk-delete', async (req, res) => {
+    const userId = getEffectiveUserId(req);
+    const { ids } = req.body;
+
+    if (!Array.isArray(ids) || ids.length === 0) {
+        return res.status(400).json({ error: 'ids array is required' });
+    }
+
+    try {
+        let deleted = 0;
+        for (const id of ids) {
+            const memory = await memoryStore.getMemoryById(id);
+            if (!memory) continue;
+            if (memory.project_id) {
+                const hasAccess = await projectStore.userHasAccess(userId, memory.project_id);
+                if (!hasAccess) continue;
+            } else if (memory.user_id !== userId) {
+                continue;
+            }
+            await memoryStore.deleteMemory(id);
+            deleted++;
+        }
+        res.json({ success: true, deleted });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -110,7 +156,12 @@ router.delete('/:id', async (req, res) => {
     try {
         const memory = await memoryStore.getMemoryById(req.params.id);
         if (!memory) return res.status(404).json({ error: 'Memory not found' });
-        if (memory.user_id !== userId && !memory.project_id) return res.status(403).json({ error: 'Access denied' });
+        if (memory.project_id) {
+            const hasAccess = await projectStore.userHasAccess(userId, memory.project_id);
+            if (!hasAccess) return res.status(403).json({ error: 'Access denied' });
+        } else if (memory.user_id !== userId) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
 
         await memoryStore.deleteMemory(req.params.id);
         res.json({ success: true });

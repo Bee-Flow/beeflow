@@ -200,6 +200,47 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
             }
         }
 
+        // ─── MCP tools injection ─────────────────────────────────────
+        try {
+            const mcpManager = require('../../core/mcpManager');
+            let mcpTools = await mcpManager.getAllToolsAsOpenAI();
+            // Gate MCP tools by org-level enabledIntegrations
+            if (mcpTools.length > 0) {
+                let orgEnabled = null;
+                try {
+                    const userStoreForMcp = require('../../stores/userStore');
+                    const configStoreForMcp = require('../../stores/configStore');
+                    const mcpUser = await userStoreForMcp.getUser(userId);
+                    if (mcpUser?.organizationId) {
+                        const mcpOrg = await userStoreForMcp.getOrganization(mcpUser.organizationId);
+                        if (mcpOrg?.enabledIntegrations) {
+                            orgEnabled = typeof mcpOrg.enabledIntegrations === 'string'
+                                ? JSON.parse(mcpOrg.enabledIntegrations) : mcpOrg.enabledIntegrations;
+                        } else {
+                            const globalDefs = await configStoreForMcp.getConfig('default_org_integrations');
+                            if (globalDefs) {
+                                orgEnabled = typeof globalDefs === 'string' ? JSON.parse(globalDefs) : globalDefs;
+                            }
+                        }
+                    }
+                } catch (_) { /* ignore */ }
+                if (orgEnabled) {
+                    mcpTools = mcpTools.filter(t => {
+                        const serverId = t._mcp?.serverId;
+                        return !serverId || orgEnabled.includes(`mcp:${serverId}`);
+                    });
+                }
+                for (const tool of mcpTools) {
+                    if (!directChatTools.find(t => t.function.name === tool.function.name)) {
+                        directChatTools.push(tool);
+                    }
+                }
+                if (mcpTools.length > 0) console.log(`[DirectChat] 🔌 Loaded ${mcpTools.length} MCP tools`);
+            }
+        } catch (mcpErr) {
+            console.warn('[DirectChat] Failed to load MCP tools:', mcpErr.message);
+        }
+
         // ─── Built-in: set_reminder tool ────────────────────────────
         directChatTools.push({
             type: 'function',
@@ -266,37 +307,43 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                 const projectStore = require('../../stores/projectStore');
                 const project = await projectStore.getProject(projectId);
                 if (project) {
-                    extractMemoriesEnabled = project.extractMemories === true;
-                    // Inject custom instructions
-                    if (project.customInstructions && project.customInstructions.trim()) {
-                        projectContext += `\n\n[PROJECT INSTRUCTIONS — "${project.name}"]\n${project.customInstructions}`;
-                    }
-                    // Search project knowledge bases
-                    const kbIds = project.knowledgeBaseIds || [];
-                    if (kbIds.length > 0) {
-                        try {
-                            const searchUrl = process.env.SEARCH_SERVICE_URL || 'http://search-service:8000';
-                            const searchRes = await fetch(`${searchUrl}/tools/kb-search`, {
-                                method: 'POST',
-                                headers: getServiceHeaders(),
-                                body: JSON.stringify({ tenant_id: userId, kb_ids: kbIds, query: message, top_k: 8, rerank: true }),
-                                signal: AbortSignal.timeout(10000),
-                            });
-                            if (searchRes.ok) {
-                                const searchData = await searchRes.json();
-                                const chunks = (searchData.chunks || searchData.results || []).filter(c => (c.score || c.rerank_score || 0) >= 0.25);
-                                if (chunks.length > 0) {
-                                    const kbText = chunks.slice(0, 6).map((c, i) => {
-                                        const src = c.source_uri || c.title || 'KB';
-                                        const content = (c.content || '').slice(0, 1200);
-                                        return `### Source ${i + 1}: ${src}\n${content}`;
-                                    }).join('\n\n');
-                                    projectContext += `\n\n[PROJECT KNOWLEDGE BASE — "${project.name}"]\nRelevant information from this project's knowledge base:\n${kbText}`;
-                                    console.log(`[DirectChat] Injected ${chunks.length} KB chunks from project "${project.name}"`);
+                    // Validate user has access to this project
+                    const hasAccess = await projectStore.userHasAccess(userId, projectId);
+                    if (!hasAccess) {
+                        console.warn(`[DirectChat] User ${userId} has no access to project ${projectId}, skipping project context`);
+                    } else {
+                        extractMemoriesEnabled = project.extractMemories === true;
+                        // Inject custom instructions
+                        if (project.customInstructions && project.customInstructions.trim()) {
+                            projectContext += `\n\n[PROJECT INSTRUCTIONS — "${project.name}"]\n${project.customInstructions}`;
+                        }
+                        // Search project knowledge bases
+                        const kbIds = project.knowledgeBaseIds || [];
+                        if (kbIds.length > 0) {
+                            try {
+                                const searchUrl = process.env.SEARCH_SERVICE_URL || 'http://search-service:8000';
+                                const searchRes = await fetch(`${searchUrl}/tools/kb-search`, {
+                                    method: 'POST',
+                                    headers: getServiceHeaders(),
+                                    body: JSON.stringify({ tenant_id: userId, kb_ids: kbIds, query: message, top_k: 8, rerank: true }),
+                                    signal: AbortSignal.timeout(10000),
+                                });
+                                if (searchRes.ok) {
+                                    const searchData = await searchRes.json();
+                                    const chunks = (searchData.chunks || searchData.results || []).filter(c => (c.score || c.rerank_score || 0) >= 0.25);
+                                    if (chunks.length > 0) {
+                                        const kbText = chunks.slice(0, 6).map((c, i) => {
+                                            const src = c.source_uri || c.title || 'KB';
+                                            const content = (c.content || '').slice(0, 1200);
+                                            return `### Source ${i + 1}: ${src}\n${content}`;
+                                        }).join('\n\n');
+                                        projectContext += `\n\n[PROJECT KNOWLEDGE BASE — "${project.name}"]\nRelevant information from this project's knowledge base:\n${kbText}`;
+                                        console.log(`[DirectChat] Injected ${chunks.length} KB chunks from project "${project.name}"`);
+                                    }
                                 }
+                            } catch (kbErr) {
+                                console.warn('[DirectChat] Project KB search failed:', kbErr.message);
                             }
-                        } catch (kbErr) {
-                            console.warn('[DirectChat] Project KB search failed:', kbErr.message);
                         }
                     }
                 }
@@ -309,7 +356,8 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         let memoryContext = '';
         try {
             const memoryStore = require('../../stores/memoryStore');
-            const relevantMemories = await memoryStore.findRelevantMemories(userId, null, message, 800, extractMemoriesEnabled ? projectId : null);
+            // Always pass projectId for retrieval (project memories should be available regardless of extractMemories flag)
+            const relevantMemories = await memoryStore.findRelevantMemories(userId, null, message, 800, projectId || null);
             if (relevantMemories.length > 0) {
                 memoryContext = '\n\n' + memoryStore.formatMemoriesForPrompt(relevantMemories);
             }
@@ -539,7 +587,13 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
             messages.push({ role: 'user', content: message });
         }
 
-        if (hasDocumentAttachment) {
+        // Add terminal tools when document attachments are present OR when integrations
+        // that handle attachments (Gmail, etc.) are loaded — so the AI can use
+        // convert_document_to_text and other terminal tools on Gmail attachments.
+        const hasIntegrationWithAttachments = directChatTools.some(t =>
+            ['gmail_tool', 'google_drive_tool'].includes(t.function?.name)
+        );
+        if (hasDocumentAttachment || hasIntegrationWithAttachments) {
             const { TERMINAL_TOOLS } = require('../../terminal/tools');
             for (const tTool of TERMINAL_TOOLS) {
                 if (!directChatTools.find(t => t.function.name === tTool.function.name)) {
@@ -594,6 +648,58 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         // Inject moderation violation context into system prompt so AI can explain
         if (moderationViolation) {
             messages[0].content += `\n\n[IMPORTANT: The user's message was flagged by our content safety policy. You must briefly explain that their message could not be processed because it was flagged by our content policy, and politely ask them to rephrase. Keep your response short (1-2 sentences). Do not reveal the specific violation category. Do not process or answer the original request.]`;
+        }
+
+        // ─── PII Detection (independent of content moderation) ──────
+        // Runs whenever piiDetectionEnabled is true, regardless of moderation settings.
+        // Action 'block' — throw and reject message.
+        // Action 'tokenize' — replace PII spans with tokens, pass clean text to AI,
+        //                     restore tokens in the AI response before showing the user.
+        let piiTokenMap = null;  // non-null only in tokenize mode when PII found
+        try {
+            const { validateInputForPii } = require('../../core/azurePiiDetection');
+            const piiResult = await validateInputForPii(messages.slice(-3), false);
+
+            if (piiResult && piiResult.tokenizedText) {
+                // Tokenize mode: replace last user message with tokenized version
+                const lastMsg = messages[messages.length - 1];
+                if (typeof lastMsg.content === 'string') {
+                    lastMsg.content = piiResult.tokenizedText;
+                } else if (Array.isArray(lastMsg.content)) {
+                    const textPart = lastMsg.content.find(p => p.type === 'text');
+                    if (textPart) textPart.text = piiResult.tokenizedText;
+                }
+                piiTokenMap = piiResult.tokenMap;
+                const tokenList = Object.entries(piiResult.tokenMap).map(([t, v]) => `${t}=“${v.slice(0,15)}”`).join(', ');
+                console.warn(`[DirectChat] 🔒 PII tokenized (${Object.keys(piiResult.tokenMap).length} tokens): ${tokenList}`);
+
+                // Tell the AI about the tokenization so it can reference them properly
+                messages[0].content += `\n\n[PII TOKENIZATION ACTIVE: Some sensitive data in the user's message has been replaced with placeholder tokens like [PII:iban:1]. When referencing this data in your response, use the same token (e.g. [PII:iban:1]) and the system will automatically restore the real value for the user. Never reveal or guess the actual values.`;
+
+                send('pii_tokenized', {
+                    entities: piiResult.entities.map(e => ({ label: e.label, category: e.category })),
+                    tokenCount: Object.keys(piiResult.tokenMap).length,
+                });
+            }
+        } catch (piiError) {
+            if (piiError.piiEntities) {
+                // Block mode: reject the message
+                const categoryList = [...new Set(piiError.piiEntities.map(e => e.label))].join(', ');
+                const snippets = piiError.piiEntities.map(e => `"${e.text.slice(0, 20).trim()}" (${e.label})`).join(' | ');
+                console.warn(`[DirectChat] 🚫 PII blocked | categories: ${categoryList}`);
+                console.warn(`[DirectChat] 🚫 Entities: ${snippets}`);
+                send('guardrail_violation', {
+                    rules: [categoryList],
+                    type: 'pii',
+                    piiEntities: piiError.piiEntities,
+                    autoDeleteSeconds: 5,
+                });
+                send('done', {});
+                res.end();
+                return;
+            }
+            // PII service unavailable — fail-open, log and continue
+            console.warn('[DirectChat] PII check error (fail-open):', piiError.message);
         }
 
         // ─── Regex Guardrails ────────────────────────────────────────
@@ -722,6 +828,12 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         const collectedEmailDrafts = [];
         const collectedCalendarDrafts = [];
         const collectedMapEmbeds = [];
+
+        // Strip internal metadata (_mcp etc.) before sending tools to LLM — providers may reject unknown fields
+        directChatTools = directChatTools.map(t => {
+            const { _mcp, _n8n, ...clean } = t;
+            return clean;
+        });
 
         while (toolCallRounds < MAX_TOOL_ROUNDS) {
             if (directChatTools.length > 0 && !skipToolPrecheck) {
@@ -919,6 +1031,7 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         const streamCallback = (type, data) => {
             if (type === 'text') {
                 fullContent += data.text;
+                // Stream raw text (tokens like [PII:iban:1] will show briefly — restored at end)
                 send('content', { text: data.text });
             } else if (type === 'thinking') {
                 thinkingContent += data.text;
@@ -1220,6 +1333,18 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         if (!fullContent.trim() && toolCallRounds > 0) {
             fullContent = 'Done ✓';
             send('content', { text: fullContent });
+        }
+
+        // ─── PII Token Restoration ──────────────────────────────────
+        // If tokens were injected before sending to AI, restore real values now
+        if (piiTokenMap && Object.keys(piiTokenMap).length > 0 && fullContent) {
+            const { restoreTokens } = require('../../core/azurePiiDetection');
+            const restored = restoreTokens(fullContent, piiTokenMap);
+            if (restored !== fullContent) {
+                console.log('[DirectChat] 🔓 PII tokens restored in AI response');
+                send('content_replace', { text: restored });
+                fullContent = restored;
+            }
         }
 
         // Check agent output against regex rules
