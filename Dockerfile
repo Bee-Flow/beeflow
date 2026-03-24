@@ -19,11 +19,13 @@ RUN install -m 0755 -d /etc/apt/keyrings \
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies
-RUN npm install --only=production
+# Install dependencies with npm cache
+RUN --mount=type=cache,target=/root/.npm \
+    npm install --omit=dev --no-audit --no-fund --prefer-offline
 
 # Install Playwright Chromium for document rendering (PDF generation)
-RUN npx playwright install-deps chromium && npx playwright install chromium
+RUN --mount=type=cache,target=/root/.cache/ms-playwright \
+    npx playwright install-deps chromium && npx playwright install chromium
 
 # Copy server source
 COPY . .

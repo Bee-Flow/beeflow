@@ -46,6 +46,7 @@ const STORE_MODULES = [
     { name: 'transcriptionStore', file: './stores/transcriptionStore' },
     { name: 'mcpStore', file: './stores/mcpStore' },
     { name: 'importStore', file: './stores/importStore' },
+    { name: 'iconStore', file: './stores/iconStore' },
 ];
 
 console.log('');

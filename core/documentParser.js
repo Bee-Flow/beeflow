@@ -14,9 +14,10 @@ const XLSX = require('xlsx');
  * @param {Buffer} buffer - Raw file content
  * @param {string} mimeType - File MIME type
  * @param {string} filename - Original filename (for logging / headers)
+ * @param {Object} [options] - Parsing options (e.g. returnHtml)
  * @returns {Promise<string>} Extracted text content
  */
-async function parseDocument(buffer, mimeType, filename) {
+async function parseDocument(buffer, mimeType, filename, options = {}) {
     const type = (mimeType || '').toLowerCase();
 
     // ── DOCX ──
@@ -24,7 +25,7 @@ async function parseDocument(buffer, mimeType, filename) {
         type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
         filename?.toLowerCase().endsWith('.docx')
     ) {
-        return parseDocx(buffer, filename);
+        return parseDocx(buffer, filename, options);
     }
 
     // ── XLSX / XLS ──
@@ -56,9 +57,11 @@ async function parseDocument(buffer, mimeType, filename) {
 }
 
 // ── DOCX Parser ─────────────────────────────────────────────────
-async function parseDocx(buffer, filename) {
+async function parseDocx(buffer, filename, options = {}) {
     try {
-        const result = await mammoth.extractRawText({ buffer });
+        const result = options.returnHtml 
+            ? await mammoth.convertToHtml({ buffer }) 
+            : await mammoth.extractRawText({ buffer });
         const text = result.value || '';
         if (!text.trim()) {
             console.log(`[DocumentParser] DOCX file "${filename}" is empty or contains only images`);
@@ -132,10 +135,11 @@ function parseSpreadsheet(buffer, filename) {
 // ── PDF Fallback Parser (when Mistral OCR is unavailable) ───────
 async function parsePdf(buffer, filename) {
     try {
-        const pdfParse = require('pdf-parse');
-        const result = await pdfParse(buffer);
-        const text = result.text || '';
-        if (!text.trim()) {
+        const { PDFParse } = require('pdf-parse');
+        const parser = new PDFParse({ verbosity: 0 });
+        await parser.load(buffer);
+        const text = await parser.getText();
+        if (!text || !text.trim()) {
             return `[PDF: ${filename} — no extractable text (may be image-based)]`;
         }
         console.log(`[DocumentParser] Extracted ${text.length} chars from PDF: ${filename}`);

@@ -8,10 +8,6 @@
 
 const express = require('express');
 const router = express.Router();
-const { requireBetaFeature } = require('../../core/betaFeatures');
-
-// Gate template chat routes behind the templates beta feature
-router.use(requireBetaFeature('templates'));
 
 const {
     getAIConfig,
@@ -192,7 +188,7 @@ ABSOLUTE RULES:
         const kbIds = template.knowledgeBaseIds || [];
         if (kbIds.length > 0) {
             try {
-                const searchUrl = process.env.SEARCH_SERVICE_URL || 'http://search-service:8000';
+                const searchUrl = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
                 const searchRes = await fetch(`${searchUrl}/tools/kb-search`, {
                     method: 'POST',
                     headers: getServiceHeaders(),

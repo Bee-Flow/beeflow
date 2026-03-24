@@ -8,7 +8,7 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
 
     if (kbIds.length > 0) {
         try {
-            const searchUrl = process.env.SEARCH_SERVICE_URL || 'http://search-service:8000';
+            const searchUrl = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
             
             // Query preprocessing: extract search intent
             let searchQuery = userMessage;

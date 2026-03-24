@@ -795,7 +795,8 @@ router.put('/organizations/:orgId/beta-features', requireOrgAdmin('orgId'), asyn
     }
 
     if (await setOrgBetaFeatures(orgId, features)) {
-        res.json({ success: true, features: getOrgBetaFeatures(orgId) });
+        const updatedFeatures = await getOrgBetaFeatures(orgId);
+        res.json({ success: true, features: updatedFeatures });
     } else {
         res.status(500).json({ error: 'Failed to update beta features' });
     }

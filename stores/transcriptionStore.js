@@ -43,6 +43,8 @@ async function initDB() {
         await exec(`ALTER TABLE transcriptions ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'completed'`);
         await exec(`ALTER TABLE transcriptions ADD COLUMN IF NOT EXISTS audio_path TEXT DEFAULT ''`);
         await exec(`ALTER TABLE transcriptions ADD COLUMN IF NOT EXISTS provider TEXT DEFAULT 'voxtral'`);
+        await exec(`ALTER TABLE transcriptions ADD COLUMN IF NOT EXISTS action_items JSONB DEFAULT '[]'::jsonb`);
+        await exec(`ALTER TABLE transcriptions ADD COLUMN IF NOT EXISTS tags JSONB DEFAULT '[]'::jsonb`);
         await exec(`CREATE INDEX IF NOT EXISTS idx_transcriptions_shared ON transcriptions USING GIN (shared_with)`);
     } catch (e) {
         // Column might already exist, that's fine
@@ -56,13 +58,13 @@ initDB().catch(err => console.error('[TranscriptionStore] Init error:', err.mess
 
 // ── CRUD ─────────────────────────────────────────────────
 
-async function createTranscription({ userId, title, fileName, language, durationSeconds, speakerCount, segmentCount, fullText, transcript, segments, speakers, summary, status, audioPath, provider }) {
+async function createTranscription({ userId, title, fileName, language, durationSeconds, speakerCount, segmentCount, fullText, transcript, segments, speakers, summary, status, audioPath, provider, actionItems }) {
     await initDB();
     const id = crypto.randomUUID();
     await run(
-        `INSERT INTO transcriptions (id, user_id, title, file_name, language, duration_seconds, speaker_count, segment_count, full_text, transcript, segments, speakers, summary, status, audio_path, provider)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
-        [id, userId, title || fileName || 'Untitled', fileName, language || 'nl', durationSeconds || 0, speakerCount || 0, segmentCount || 0, fullText || '', transcript || '', JSON.stringify(segments || []), JSON.stringify(speakers || []), summary || '', status || 'completed', audioPath || '', provider || 'voxtral']
+        `INSERT INTO transcriptions (id, user_id, title, file_name, language, duration_seconds, speaker_count, segment_count, full_text, transcript, segments, speakers, summary, status, audio_path, provider, action_items)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+        [id, userId, title || fileName || 'Untitled', fileName, language || 'nl', durationSeconds || 0, speakerCount || 0, segmentCount || 0, fullText || '', transcript || '', JSON.stringify(segments || []), JSON.stringify(speakers || []), summary || '', status || 'completed', audioPath || '', provider || 'voxtral', JSON.stringify(actionItems || [])]
     );
     console.log(`[TranscriptionStore] Created transcription "${title}" (${status || 'completed'}) via ${provider || 'voxtral'} for user ${userId}`);
     return { id, userId, title, fileName, language, durationSeconds, speakerCount, segmentCount, status: status || 'completed', provider: provider || 'voxtral', createdAt: new Date().toISOString() };
@@ -98,6 +100,8 @@ async function getTranscription(id, userId) {
         segments: typeof r.segments === 'string' ? JSON.parse(r.segments) : (r.segments || []),
         speakers: typeof r.speakers === 'string' ? JSON.parse(r.speakers) : (r.speakers || []),
         sharedWith: typeof r.shared_with === 'string' ? JSON.parse(r.shared_with) : (r.shared_with || []),
+        actionItems: typeof r.action_items === 'string' ? JSON.parse(r.action_items) : (r.action_items || []),
+        tags: typeof r.tags === 'string' ? JSON.parse(r.tags) : (r.tags || []),
         isOwner: r.user_id === userId,
         ownerId: r.user_id,
     };
@@ -111,6 +115,9 @@ async function updateTranscription(id, userId, updates) {
 
     if (updates.title !== undefined) { setClauses.push(`title = $${idx++}`); params.push(updates.title); }
     if (updates.sharedWith !== undefined) { setClauses.push(`shared_with = $${idx++}`); params.push(JSON.stringify(updates.sharedWith)); }
+    if (updates.actionItems !== undefined) { setClauses.push(`action_items = $${idx++}`); params.push(JSON.stringify(updates.actionItems)); }
+    if (updates.tags !== undefined) { setClauses.push(`tags = $${idx++}`); params.push(JSON.stringify(updates.tags)); }
+    if (updates.summary !== undefined) { setClauses.push(`summary = $${idx++}`); params.push(updates.summary); }
 
     if (setClauses.length === 0) return false;
     setClauses.push(`updated_at = NOW()`);

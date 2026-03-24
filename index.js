@@ -31,6 +31,14 @@ const app = express();
 app.enable('trust proxy');
 const PORT = process.env.SERVER_PORT || process.env.PORT || 3001;
 
+// ── Security headers (helmet) ─────────────────────────────────────────────────
+const helmet = require('helmet');
+app.use(helmet({
+    hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
+    contentSecurityPolicy: false,        // Handled by Nginx
+    crossOriginEmbedderPolicy: false,    // Can break embedded content
+}));
+
 // ── Error handlers ────────────────────────────────────────────────────────────
 process.on('unhandledRejection', (reason, promise) => {
     console.error('Unhandled Rejection at:', promise, 'reason:', reason);
@@ -45,8 +53,25 @@ const WORKFLOWS_DIR = path.resolve(__dirname, '../workflows');
 if (!fs.existsSync(WORKFLOWS_DIR)) fs.mkdirSync(WORKFLOWS_DIR, { recursive: true });
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
+const ALLOWED_ORIGINS = (process.env.CORS_ORIGIN || 'https://dev.beeflow.ai,https://server.dev.beeflow.ai,http://localhost:5173')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+
 app.use(cors({
-    origin: true,
+    origin: (origin, cb) => {
+        // Allow requests with no origin
+        if (!origin) return cb(null, true);
+        const normalizedOrigin = origin.endsWith('/') ? origin.slice(0, -1) : origin;
+        const isAllowed = ALLOWED_ORIGINS.some(o => (o.endsWith('/') ? o.slice(0, -1) : o) === normalizedOrigin);
+        if (isAllowed) {
+            return cb(null, true);
+        }
+        
+        console.warn(`[CORS] Rejected origin: ${origin}. Allowed:`, ALLOWED_ORIGINS);
+        // Return the origin anyway for dev mode flexibility or just 'true' to reflect:
+        cb(null, origin); 
+    },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Session-Token']
@@ -93,7 +118,7 @@ app.use(session({
         secure: process.env.COOKIE_SECURE === 'true',
         httpOnly: true,
         maxAge: 30 * 24 * 60 * 60 * 1000,
-        sameSite: process.env.COOKIE_SECURE === 'true' ? 'none' : 'lax',
+        sameSite: process.env.COOKIE_SAMESITE || 'lax',
         ...(process.env.COOKIE_DOMAIN && { domain: process.env.COOKIE_DOMAIN })
     }
 }));
@@ -163,16 +188,7 @@ app.get('/api/health', (req, res) => {
 });
 
 app.get('/api', (req, res) => {
-    res.json({
-        name: 'Bee Flow API',
-        version: '1.0.0',
-        endpoints: {
-            'GET /api/health': 'Health check endpoint',
-            'GET /components': 'List all available components',
-            'POST /execute': 'Execute a workflow',
-            'GET /agents': 'List all agents'
-        }
-    });
+    res.json({ name: 'Bee Flow API', status: 'ok' });
 });
 
 // ── Static files ──────────────────────────────────────────────────────────────
@@ -304,10 +320,14 @@ app.use('/api/integrations/github', require('./routes/integrations/github'));
 app.use('/api/integrations/outlook', require('./routes/integrations/outlook'));
 app.use('/api/integrations/onedrive', require('./routes/integrations/oneDrive'));
 app.use('/api/templates', require('./routes/templates'));
+app.use('/api/notebooks', require('./routes/notebooks'));
 app.use('/api/transcriptions', require('./routes/transcriptions'));
 app.use('/api/meet-bot', require('./routes/meetBot'));
 app.use('/', require('./routes/knowledge'));
 app.use('/api/kb', require('./routes/knowledgeBases'));
+app.use('/api/e2e', require('./routes/e2eRoutes'));
+app.use('/api/languages', require('./routes/admin/languageRoutes'));
+app.use('/api/icons', require('./routes/icons'));
 
 // ── SPA fallback (production) ─────────────────────────────────────────────────
 if (process.env.NODE_ENV === 'production') {
@@ -320,6 +340,10 @@ if (process.env.NODE_ENV === 'production') {
 // ── Start server ──────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://0.0.0.0:${PORT}`);
+
+    // Run first-boot setup from INIT_* env vars (set by install wizard)
+    const { runBootInit } = require('./boot-init');
+    runBootInit().catch(err => console.error('[boot-init] Fatal:', err));
 
     try {
         containerManager.ensureDockerImage();

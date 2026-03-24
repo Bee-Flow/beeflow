@@ -3,13 +3,13 @@
  * 
  * Pricing sources (in priority order):
  * 1. Custom admin overrides (persisted via configStore)
- * 2. LiteLLM pricing data (2600+ models, fetched from GitHub, 24h cache)
+ * 2. Community pricing database (2600+ models, fetched from GitHub, 24h cache)
  * 
  * Prices are in USD per 1 million tokens.
  */
 
 const configStore = require('../stores/configStore');
-const { getLiteLLMCost, initPricing } = require('./pricingService');
+const { getModelPricing, initPricing } = require('./pricingService');
 
 // Initialize pricing data on startup (non-blocking)
 initPricing();
@@ -41,7 +41,7 @@ function setModelCost(modelId, input, output) {
 }
 
 /**
- * Remove custom cost override for a model (revert to LiteLLM default).
+ * Remove custom cost override for a model (revert to default pricing).
  */
 function resetModelCost(modelId) {
     const overrides = getCustomOverrides();
@@ -53,7 +53,7 @@ function resetModelCost(modelId) {
 
 /**
  * Get cost rates for a model (handles various ID formats).
- * Priority: custom override → LiteLLM data → null
+ * Priority: custom override → community pricing data → null
  * @returns {{ input: number, output: number } | null}  prices per 1M tokens
  */
 function getModelCost(modelName) {
@@ -63,9 +63,9 @@ function getModelCost(modelName) {
     const custom = getCustomOverrides();
     if (custom[modelName]) return custom[modelName];
 
-    // 2. LiteLLM lookup (handles provider prefixes + fuzzy matching)
-    const litellm = getLiteLLMCost(modelName);
-    if (litellm) return litellm;
+    // 2. Community pricing lookup (handles provider prefixes + fuzzy matching)
+    const pricing = getModelPricing(modelName);
+    if (pricing) return pricing;
 
     // 3. Case-insensitive custom override match
     const lower = modelName.toLowerCase();
@@ -88,16 +88,16 @@ function computeCost(model, promptTokens = 0, completionTokens = 0) {
 
 /**
  * Get the full pricing map for the frontend.
- * Custom overrides are merged on top of LiteLLM data.
+ * Custom overrides are merged on top of community pricing data.
  */
 function getAllModelCosts() {
-    const { getAllLiteLLMCosts } = require('./pricingService');
-    const litellmCosts = getAllLiteLLMCosts();
+    const { getAllModelPricing } = require('./pricingService');
+    const pricingData = getAllModelPricing();
     const custom = getCustomOverrides();
 
-    // Start with LiteLLM data (just input/output, drop provider)
+    // Start with community pricing data (just input/output, drop provider)
     const merged = {};
-    for (const [key, val] of Object.entries(litellmCosts)) {
+    for (const [key, val] of Object.entries(pricingData)) {
         merged[key] = { input: val.input, output: val.output };
     }
 
@@ -116,21 +116,21 @@ function getAllModelCosts() {
  * @returns {Array<{ model, input, output, isCustom, defaultInput, defaultOutput, provider }>}
  */
 function getModelCostsForConfig(modelEntries = []) {
-    const { getLiteLLMCost } = require('./pricingService');
+    const { getModelPricing } = require('./pricingService');
     const custom = getCustomOverrides();
     const result = [];
     const seen = new Set();
 
     // 1. Models with custom overrides (always shown)
     for (const [model, rates] of Object.entries(custom)) {
-        const litellm = getLiteLLMCost(model);
+        const defaults = getModelPricing(model);
         result.push({
             model,
             input: rates.input,
             output: rates.output,
             isCustom: true,
-            defaultInput: litellm?.input ?? null,
-            defaultOutput: litellm?.output ?? null,
+            defaultInput: defaults?.input ?? null,
+            defaultOutput: defaults?.output ?? null,
             provider: null,
         });
         seen.add(model);
@@ -149,14 +149,14 @@ function getModelCostsForConfig(modelEntries = []) {
         // Skip custom overrides already added (only skip if no provider differentiation)
         if (!providerName && custom[modelId]) continue;
 
-        const litellm = getLiteLLMCost(modelId, providerType);
+        const defaults = getModelPricing(modelId, providerType);
         result.push({
             model: modelId,
-            input: litellm?.input ?? 0,
-            output: litellm?.output ?? 0,
+            input: defaults?.input ?? 0,
+            output: defaults?.output ?? 0,
             isCustom: false,
-            defaultInput: litellm?.input ?? null,
-            defaultOutput: litellm?.output ?? null,
+            defaultInput: defaults?.input ?? null,
+            defaultOutput: defaults?.output ?? null,
             provider: providerName,
         });
     }

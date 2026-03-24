@@ -1010,10 +1010,14 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     // Sanitize tool result before streaming to client to prevent API key exposure
                     onEvent('tool_end', { name: toolName, result: sanitizeToolResult(finalToolResult) });
 
-                    // Emit email_draft SSE event for user approval
+                    // Emit email_draft SSE event for user approval (with dedup)
                     if (finalToolResult?._action === 'email_draft') {
-                        onEvent('email_draft', finalToolResult.draft);
-                        _emailDrafts.push({ ...finalToolResult.draft, status: 'pending' });
+                        const draftKey = JSON.stringify({ to: finalToolResult.draft?.to, subject: finalToolResult.draft?.subject, body: finalToolResult.draft?.body });
+                        const alreadySent = _emailDrafts.some(d => JSON.stringify({ to: d.to, subject: d.subject, body: d.body }) === draftKey);
+                        if (!alreadySent) {
+                            onEvent('email_draft', finalToolResult.draft);
+                            _emailDrafts.push({ ...finalToolResult.draft, status: 'pending' });
+                        }
                     }
                     // Emit linkedin_draft SSE event for user approval
                     if (finalToolResult?._action === 'linkedin_draft') {

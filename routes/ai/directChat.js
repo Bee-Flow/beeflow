@@ -321,7 +321,7 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                         const kbIds = project.knowledgeBaseIds || [];
                         if (kbIds.length > 0) {
                             try {
-                                const searchUrl = process.env.SEARCH_SERVICE_URL || 'http://search-service:8000';
+                                const searchUrl = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
                                 const searchRes = await fetch(`${searchUrl}/tools/kb-search`, {
                                     method: 'POST',
                                     headers: getServiceHeaders(),
@@ -591,7 +591,7 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         // that handle attachments (Gmail, etc.) are loaded — so the AI can use
         // convert_document_to_text and other terminal tools on Gmail attachments.
         const hasIntegrationWithAttachments = directChatTools.some(t =>
-            ['gmail_tool', 'google_drive_tool'].includes(t.function?.name)
+            t.function?.name?.startsWith('gmail_') || t.function?.name?.startsWith('drive_')
         );
         if (hasDocumentAttachment || hasIntegrationWithAttachments) {
             const { TERMINAL_TOOLS } = require('../../terminal/tools');
@@ -946,15 +946,23 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                             });
                         } catch (e) { /* ignore */ }
 
-                        // Emit email_draft SSE event for user approval
+                        // Emit email_draft SSE event for user approval (with dedup)
                         if (toolResult?._action === 'email_draft') {
-                            send('email_draft', toolResult.draft);
-                            collectedEmailDrafts.push(toolResult.draft);
+                            const draftKey = JSON.stringify({ to: toolResult.draft?.to, subject: toolResult.draft?.subject, body: toolResult.draft?.body });
+                            const alreadySent = collectedEmailDrafts.some(d => JSON.stringify({ to: d.to, subject: d.subject, body: d.body }) === draftKey);
+                            if (!alreadySent) {
+                                send('email_draft', toolResult.draft);
+                                collectedEmailDrafts.push(toolResult.draft);
+                            }
                         }
-                        // Emit calendar_draft SSE event for user approval
+                        // Emit calendar_draft SSE event for user approval (with dedup)
                         if (toolResult?._action === 'calendar_draft') {
-                            send('calendar_draft', toolResult.draft);
-                            collectedCalendarDrafts.push(toolResult.draft);
+                            const draftKey = JSON.stringify({ summary: toolResult.draft?.summary, start: toolResult.draft?.start, end: toolResult.draft?.end });
+                            const alreadySent = collectedCalendarDrafts.some(d => JSON.stringify({ summary: d.summary, start: d.start, end: d.end }) === draftKey);
+                            if (!alreadySent) {
+                                send('calendar_draft', toolResult.draft);
+                                collectedCalendarDrafts.push(toolResult.draft);
+                            }
                         }
                         // Emit linkedin_draft SSE event for user approval
                         if (toolResult?._action === 'linkedin_draft') {
@@ -1206,15 +1214,23 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
 
                 send('tool_end', { name: toolName, result: toolResult });
 
-                // Emit email_draft SSE event for user approval
+                // Emit email_draft SSE event for user approval (with dedup)
                 if (toolResult?._action === 'email_draft') {
-                    send('email_draft', toolResult.draft);
-                    collectedEmailDrafts.push(toolResult.draft);
+                    const draftKey = JSON.stringify({ to: toolResult.draft?.to, subject: toolResult.draft?.subject, body: toolResult.draft?.body });
+                    const alreadySent = collectedEmailDrafts.some(d => JSON.stringify({ to: d.to, subject: d.subject, body: d.body }) === draftKey);
+                    if (!alreadySent) {
+                        send('email_draft', toolResult.draft);
+                        collectedEmailDrafts.push(toolResult.draft);
+                    }
                 }
-                // Emit calendar_draft SSE event for user approval
+                // Emit calendar_draft SSE event for user approval (with dedup)
                 if (toolResult?._action === 'calendar_draft') {
-                    send('calendar_draft', toolResult.draft);
-                    collectedCalendarDrafts.push(toolResult.draft);
+                    const draftKey = JSON.stringify({ summary: toolResult.draft?.summary, start: toolResult.draft?.start, end: toolResult.draft?.end });
+                    const alreadySent = collectedCalendarDrafts.some(d => JSON.stringify({ summary: d.summary, start: d.start, end: d.end }) === draftKey);
+                    if (!alreadySent) {
+                        send('calendar_draft', toolResult.draft);
+                        collectedCalendarDrafts.push(toolResult.draft);
+                    }
                 }
                 // Emit linkedin_draft SSE event for user approval
                 if (toolResult?._action === 'linkedin_draft') {

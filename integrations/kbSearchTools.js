@@ -74,7 +74,7 @@ async function executeKbSearchTool(toolName, args, context = {}) {
         };
     }
 
-    const searchUrl = process.env.SEARCH_SERVICE_URL || 'http://search-service:8000';
+    const searchUrl = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
     const topK = Math.min(Math.max(parseInt(top_k) || 5, 1), 10);
 
     console.log(`[KBSearch] Searching ${kbIds.length} KBs: "${query}" (top_k=${topK}, agent=${agentId})`);

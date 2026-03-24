@@ -8,26 +8,17 @@ const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const kbStore = require('../stores/knowledgeBases');
-const configStore = require('../stores/configStore');
 const { requireAuth } = require('../auth');
 
-const SEARCH_SERVICE_URL = process.env.SEARCH_SERVICE_URL || 'http://search-service:8000';
+const SEARCH_SERVICE_URL = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
 const { getServiceHeaders } = require('../core/serviceAuth');
-
-/**
- * Read Azure credentials from configStore and return fields for search-service API calls.
- * Returns { use_azure, azure_endpoint, azure_key, azure_model } when Azure is enabled.
- */
-async function getAzureIngestParams() {
-    const useAzure = !!(await configStore.getConfig('use_azure_doc_processing'));
-    if (!useAzure) return { use_azure: false };
-    return {
-        use_azure: true,
-        azure_endpoint: await configStore.getConfig('azure_openai_embedding_endpoint') || '',
-        azure_key: await configStore.getSecret('azure_openai_embedding_key') || '',
-        azure_model: await configStore.getConfig('azure_openai_embedding_model') || 'text-embedding-3-small',
-    };
-}
+const {
+    getAzureIngestParams,
+    extractFileContent,
+    fetchUrlContent,
+    ingestDocument,
+    deleteDocumentChunks,
+} = require('../core/kbIngestionHelpers');
 
 // Auth helper
 const getUserId = (req) => req.session?.user?.id || null;
@@ -168,20 +159,7 @@ router.delete('/:id/documents/:docId', requireAuth, async (req, res) => {
             return res.status(404).json({ error: 'Document not found' });
         }
 
-        // Delete chunks from search-service
-        try {
-            await fetch(`${SEARCH_SERVICE_URL}/kb/${kb.id}/documents/${doc.id}/chunks`, {
-                method: 'DELETE',
-                headers: getServiceHeaders(),
-                body: JSON.stringify({ tenant_id: kb.tenant_id }),
-                signal: AbortSignal.timeout(10000)
-            });
-        } catch (e) {
-            console.warn('[KB] Search-service chunk cleanup failed:', e.message);
-        }
-
-        await kbStore.deleteDocument(doc.id);
-        await kbStore.bumpKBVersion(kb.id);
+        await deleteDocumentChunks(kb.id, doc.id, kb.tenant_id);
         res.json({ success: true });
     } catch (e) {
         console.error('[KB] Delete doc error:', e.message);
@@ -205,56 +183,21 @@ router.post('/:id/ingest/text', requireAuth, async (req, res) => {
             return res.status(400).json({ error: 'Content is required (min 3 chars)' });
         }
 
-        // Dedupe check
-        const hash = kbStore.hashContent(content);
-        const existing = await kbStore.hasContentHash(kb.id, hash);
-        if (existing) {
-            return res.status(409).json({ error: 'Duplicate content already exists in this KB', documentId: existing });
-        }
-
-        // Create document record
-        const doc = await kbStore.createDocument(
-            kb.tenant_id, kb.id,
-            title || 'Text snippet',
-            'text', null, hash
+        const result = await ingestDocument(
+            kb.tenant_id, kb.id, content,
+            title || 'Text snippet', 'text', null,
+            { lang: kb.default_lang }
         );
-
-        // Send to search-service for ingestion (chunking + embedding + storage)
-        const azureParams = await getAzureIngestParams();
-        const ingestRes = await fetch(`${SEARCH_SERVICE_URL}/kb/ingest/json`, {
-            method: 'POST',
-            headers: getServiceHeaders(),
-            body: JSON.stringify({
-                tenant_id: kb.tenant_id,
-                knowledge_base_id: kb.id,
-                document_id: doc.id,
-                content,
-                title: title || 'Text snippet',
-                source_uri: null,
-                lang: kb.default_lang,
-                ...azureParams,
-            }),
-            signal: AbortSignal.timeout(60000)
-        });
-
-        if (!ingestRes.ok) {
-            const err = await ingestRes.text();
-            console.error('[KB] Search-service ingest error:', err);
-            // Cleanup document record
-            await kbStore.deleteDocument(doc.id);
-            return res.status(502).json({ error: `Ingestion failed: ${err}` });
-        }
-
-        const result = await ingestRes.json();
-        await kbStore.updateChunkCount(doc.id, result.chunks_created || 0);
-        await kbStore.bumpKBVersion(kb.id);
 
         res.status(201).json({
             success: true,
-            document: doc,
-            chunks: result.chunks_created || 0
+            document: result.document,
+            chunks: result.chunks
         });
     } catch (e) {
+        if (e.code === 'DUPLICATE') {
+            return res.status(409).json({ error: e.message, documentId: e.documentId });
+        }
         console.error('[KB] Ingest text error:', e.message);
         res.status(500).json({ error: e.message });
     }
@@ -271,122 +214,31 @@ router.post('/:id/ingest/file', requireAuth, upload.single('file'), async (req, 
 
         if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
-        // Extract text from file
-        let content = '';
         const mime = req.file.mimetype;
         const filename = req.file.originalname;
-        // Global admin toggle — or per-request override for API callers
-        const useAzure = req.body.useAzureDocIntelligence === 'true'
-            || !!(await configStore.getConfig('use_azure_doc_processing'));
 
-        console.log(`[KB Pipeline] ─── File: ${filename} (${(req.file.size / 1024).toFixed(1)} KB, ${mime}) ───`);
-        console.log(`[KB Pipeline] Mode: ${useAzure ? '☁️  AZURE' : '🖥️  LOCAL'}`);
-
-        if (useAzure) {
-            // ── Azure Document Intelligence path (all file types) ──
-            const { extractWithAzure, isAzureDocIntelligenceConfigured } = require('../core/azureDocIntelligence');
-            if (!(await isAzureDocIntelligenceConfigured())) {
-                return res.status(400).json({ error: 'Azure Document Intelligence is not configured. Set endpoint and key in admin settings.' });
-            }
-            console.log(`[KB Pipeline] Extraction: Azure Document Intelligence (Layout → Markdown)`);
-            content = await extractWithAzure(req.file.buffer, filename);
-        } else if (mime === 'text/plain' || mime === 'text/markdown') {
-            console.log(`[KB Pipeline] Extraction: Direct text read (${mime})`);
-            content = req.file.buffer.toString('utf-8');
-        } else if (mime === 'application/pdf') {
-            // Primary: use pdfExtractor (pdfjs-dist) for text-based PDFs
-            try {
-                const { extractTextFromPDF } = require('../core/pdfExtractor');
-                content = await extractTextFromPDF(req.file.buffer, filename);
-                if (content && content.trim().length >= 20) {
-                    console.log(`[KB Pipeline] Extraction: pdfjs-dist (text-based PDF)`);
-                }
-            } catch (e) {
-                console.warn('[KB] pdfExtractor failed:', e.message);
-            }
-            // Fallback: Mistral OCR for scanned PDFs (if configured)
-            if (!content || content.trim().length < 20) {
-                try {
-                    const { getMistralOCRApiKey, mistralOCR } = require('../core/ocr');
-                    if (await getMistralOCRApiKey()) {
-                        console.log(`[KB Pipeline] Extraction: Mistral OCR (scanned PDF fallback)`);
-                        const base64 = req.file.buffer.toString('base64');
-                        content = await mistralOCR(base64, mime, filename);
-                    }
-                } catch (e) {
-                    console.warn('[KB] Mistral OCR fallback failed:', e.message);
-                }
-            }
-            if (!content || content.trim().length < 10) {
-                return res.status(400).json({ error: 'Could not extract text from PDF. The file may be a scanned document without a text layer.' });
-            }
-        } else if (
-            mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
-            mime === 'text/csv' ||
-            mime === 'application/csv' ||
-            filename?.match(/\.(docx|csv|xlsx)$/i)
-        ) {
-            const { parseDocument } = require('../core/documentParser');
-            console.log(`[KB Pipeline] Extraction: documentParser (${filename.split('.').pop()})`);
-            content = await parseDocument(req.file.buffer, mime, filename);
-        } else {
-            return res.status(400).json({ error: 'Unsupported file type' });
-        }
+        // Extract text from file via shared helpers
+        const content = await extractFileContent(req.file.buffer, mime, filename);
 
         if (!content || content.trim().length < 10) {
             return res.status(400).json({ error: 'Could not extract text from file' });
         }
 
-        // Dedupe
-        const hash = kbStore.hashContent(content);
-        const existing = await kbStore.hasContentHash(kb.id, hash);
-        if (existing) {
-            return res.status(409).json({ error: 'Duplicate content', documentId: existing });
-        }
-
-        // Create document
-        const doc = await kbStore.createDocument(
-            kb.tenant_id, kb.id,
-            filename, 'upload', filename, hash
+        const result = await ingestDocument(
+            kb.tenant_id, kb.id, content,
+            filename, 'upload', filename,
+            { lang: kb.default_lang }
         );
-
-        // Ingest via search-service (pass use_azure flag for Azure-native embeddings)
-        const azureParams = await getAzureIngestParams();
-        console.log(`[KB Pipeline] Embedding: ${azureParams.use_azure ? 'Azure OpenAI (text-embedding-3-small)' : 'Local vLLM (bge-m3)'}`);
-        console.log(`[KB Pipeline] Reranking: ${azureParams.use_azure ? 'Azure OpenAI cosine similarity' : 'Local vLLM (bge-reranker-large)'}`);
-        console.log(`[KB Pipeline] Sending ${content.length} chars to search-service (use_azure=${azureParams.use_azure})`);
-        const ingestRes = await fetch(`${SEARCH_SERVICE_URL}/kb/ingest/json`, {
-            method: 'POST',
-            headers: getServiceHeaders(),
-            body: JSON.stringify({
-                tenant_id: kb.tenant_id,
-                knowledge_base_id: kb.id,
-                document_id: doc.id,
-                content,
-                title: filename,
-                source_uri: filename,
-                lang: kb.default_lang,
-                ...azureParams,
-            }),
-            signal: AbortSignal.timeout(120000)
-        });
-
-        if (!ingestRes.ok) {
-            await kbStore.deleteDocument(doc.id);
-            const err = await ingestRes.text();
-            return res.status(502).json({ error: `Ingestion failed: ${err}` });
-        }
-
-        const result = await ingestRes.json();
-        await kbStore.updateChunkCount(doc.id, result.chunks_created || 0);
-        await kbStore.bumpKBVersion(kb.id);
 
         res.status(201).json({
             success: true,
-            document: doc,
-            chunks: result.chunks_created || 0
+            document: result.document,
+            chunks: result.chunks
         });
     } catch (e) {
+        if (e.code === 'DUPLICATE') {
+            return res.status(409).json({ error: 'Duplicate content', documentId: e.documentId });
+        }
         console.error('[KB] Ingest file error:', e.message);
         res.status(500).json({ error: e.message });
     }
@@ -404,98 +256,31 @@ router.post('/:id/ingest/url', requireAuth, async (req, res) => {
         const { url } = req.body;
         if (!url) return res.status(400).json({ error: 'URL is required' });
 
-        // Validate URL
-        let parsedUrl;
-        try {
-            parsedUrl = new URL(url);
-            if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
-                return res.status(400).json({ error: 'Only HTTP/HTTPS URLs supported' });
-            }
-        } catch {
-            return res.status(400).json({ error: 'Invalid URL' });
-        }
+        // Fetch and convert to markdown via shared helper
+        const { content, title: pageTitle, resolvedUrl } = await fetchUrlContent(url);
 
-        // Fetch and convert to markdown
-        const { htmlToMarkdown } = require('../../components/webpage-to-markdown/index');
-        const response = await fetch(url, {
-            headers: { 'User-Agent': 'Mozilla/5.0 (compatible; BeeFlow/1.0)' },
-            redirect: 'follow',
-            signal: AbortSignal.timeout(30000)
-        });
-
-        if (!response.ok) {
-            return res.status(502).json({ error: `Fetch failed: ${response.status}` });
-        }
-
-        const html = await response.text();
-        const contentType = response.headers.get('content-type') || '';
-        let content = '', pageTitle = '';
-
-        if (contentType.includes('text/html')) {
-            const result = htmlToMarkdown(html, response.url || url, { includeLinks: true, includeImages: false });
-            content = result.markdown;
-            pageTitle = result.title || parsedUrl.hostname;
-            if (pageTitle && !content.startsWith(`# ${pageTitle}`)) {
-                content = `# ${pageTitle}\n\n${content}`;
-            }
-        } else if (contentType.includes('text/plain') || contentType.includes('text/markdown')) {
-            content = html;
-            pageTitle = parsedUrl.hostname;
-        } else {
-            return res.status(400).json({ error: `Unsupported content type: ${contentType}` });
-        }
-
-        if (!content || content.trim().length < 20) {
-            return res.status(400).json({ error: 'No meaningful content extracted' });
-        }
-
-        // Dedupe
-        const hash = kbStore.hashContent(content);
-        const existing = await kbStore.hasContentHash(kb.id, hash);
-        if (existing) {
-            return res.status(409).json({ error: 'This URL content already exists', documentId: existing });
-        }
-
-        const doc = await kbStore.createDocument(
-            kb.tenant_id, kb.id,
-            pageTitle, 'web', response.url || url, hash
+        const result = await ingestDocument(
+            kb.tenant_id, kb.id, content,
+            pageTitle, 'web', resolvedUrl,
+            { lang: kb.default_lang }
         );
-
-        // Ingest
-        const azureParams = await getAzureIngestParams();
-        const ingestRes = await fetch(`${SEARCH_SERVICE_URL}/kb/ingest/json`, {
-            method: 'POST',
-            headers: getServiceHeaders(),
-            body: JSON.stringify({
-                tenant_id: kb.tenant_id,
-                knowledge_base_id: kb.id,
-                document_id: doc.id,
-                content,
-                title: pageTitle,
-                source_uri: response.url || url,
-                lang: kb.default_lang,
-                ...azureParams,
-            }),
-            signal: AbortSignal.timeout(120000)
-        });
-
-        if (!ingestRes.ok) {
-            await kbStore.deleteDocument(doc.id);
-            const err = await ingestRes.text();
-            return res.status(502).json({ error: `Ingestion failed: ${err}` });
-        }
-
-        const result = await ingestRes.json();
-        await kbStore.updateChunkCount(doc.id, result.chunks_created || 0);
-        await kbStore.bumpKBVersion(kb.id);
 
         res.status(201).json({
             success: true,
-            document: doc,
-            chunks: result.chunks_created || 0,
-            source: response.url || url
+            document: result.document,
+            chunks: result.chunks,
+            source: resolvedUrl
         });
     } catch (e) {
+        if (e.code === 'DUPLICATE') {
+            return res.status(409).json({ error: 'This URL content already exists', documentId: e.documentId });
+        }
+        if (e.message.includes('Invalid URL') || e.message.includes('Only HTTP')) {
+            return res.status(400).json({ error: e.message });
+        }
+        if (e.message.includes('Fetch failed')) {
+            return res.status(502).json({ error: e.message });
+        }
         console.error('[KB] Ingest URL error:', e.message);
         res.status(500).json({ error: e.message });
     }

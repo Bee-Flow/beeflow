@@ -10,15 +10,19 @@
 
 const express = require('express');
 const router = express.Router();
-const { requireBetaFeature } = require('../core/betaFeatures');
 const multer = require('multer');
-
-// Gate all transcription routes behind the meeting_notes beta feature
-router.use(requireBetaFeature('meeting_notes'));
 const path = require('path');
 const fs = require('fs');
 const transcriptionStore = require('../stores/transcriptionStore');
 const configStore = require('../stores/configStore');
+
+function formatDuration(seconds) {
+    if (!seconds) return '0:00';
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.floor(seconds % 60);
+    return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}` : `${m}:${String(s).padStart(2, '0')}`;
+}
 
 // Multer for audio file upload
 const uploadsDir = path.resolve(__dirname, '../data/uploads/audio');
@@ -198,11 +202,167 @@ async function generateMeetingTitle(summary, language) {
 }
 
 /**
+ * Extract structured action items from the transcript using Claude.
+ */
+async function extractActionItems(transcript, language) {
+    try {
+        const client = await getClaudeClient();
+        const langName = { nl: 'Dutch', en: 'English', de: 'German', fr: 'French', es: 'Spanish', it: 'Italian', pt: 'Portuguese' }[language] || language;
+
+        const response = await client.messages.create({
+            model: 'claude-opus-4-6',
+            max_tokens: 2048,
+            temperature: 0,
+            system: `You are a meeting analyst. Extract all action items, tasks, and follow-ups from the meeting transcript. For each action item, identify who is responsible (the assignee) and what needs to be done.
+
+Return ONLY a JSON array of objects. Each object must have:
+- "text": the action item description (in ${langName})
+- "assignee": the person responsible (first name or "Unassigned" if unclear)
+- "timestamp": the approximate timestamp in the transcript where this was discussed (format: "MM:SS" or "HH:MM:SS")
+
+If there are no action items, return an empty array [].
+Return ONLY valid JSON, no other text.`,
+            messages: [
+                { role: 'user', content: transcript.substring(0, 100000) }
+            ],
+        });
+
+        const content = (response.content?.[0]?.text || '').trim();
+        const jsonStart = content.indexOf('[');
+        const jsonEnd = content.lastIndexOf(']');
+        if (jsonStart !== -1 && jsonEnd > jsonStart) {
+            const items = JSON.parse(content.substring(jsonStart, jsonEnd + 1));
+            // Normalize: add id and done status
+            return items.map((item, idx) => ({
+                id: `ai-${idx}`,
+                text: item.text || '',
+                assignee: item.assignee || 'Unassigned',
+                timestamp: item.timestamp || '',
+                done: false,
+            }));
+        }
+    } catch (err) {
+        console.error('[Transcriptions] Action item extraction failed:', err.message);
+    }
+    return [];
+}
+
+/** Summary template prompts */
+const SUMMARY_TEMPLATES = {
+    general: `Create a concise, well-structured summary of the meeting transcript.
+
+Format with these sections (use markdown):
+## 📋 Summary
+A brief 2-3 sentence overview of what the meeting was about.
+
+## 🔑 Key Topics
+- Bullet points of main topics discussed
+
+## ✅ Decisions Made
+- Any decisions that were agreed upon (skip if none)
+
+## 📌 Action Items
+- Specific tasks assigned to people (skip if none)
+
+## 💡 Key Insights
+- Notable ideas, suggestions, or observations
+
+Keep it concise and actionable. Skip empty sections.`,
+
+    standup: `Create a standup/daily sync summary of the meeting transcript.
+
+Format with these sections (use markdown):
+## 📋 Daily Sync Summary
+Brief overview of the standup meeting.
+
+## ✅ What Was Done
+- Per person: what they completed since last standup
+
+## 🚧 In Progress
+- Per person: what they're currently working on
+
+## 🚫 Blockers
+- Any blockers or impediments mentioned
+
+## 📌 Next Steps
+- Specific follow-up actions
+
+Keep it concise. Skip empty sections.`,
+
+    sales: `Create a sales call summary of the meeting transcript.
+
+Format with these sections (use markdown):
+## 📋 Call Summary
+Brief overview: who was on the call, company/prospect name if mentioned.
+
+## 🎯 Customer Needs
+- Pain points, requirements, or goals expressed by the prospect
+
+## 💬 Key Discussion Points
+- Main topics covered during the call
+
+## ⚠️ Objections & Concerns
+- Any pushback, hesitations, or concerns raised
+
+## 📌 Next Steps
+- Agreed follow-up actions with owners and timelines
+
+## 📊 Deal Assessment
+- Brief assessment of the opportunity
+
+Keep it concise and actionable. Skip empty sections.`,
+
+    interview: `Create an interview summary of the meeting transcript.
+
+Format with these sections (use markdown):
+## 📋 Interview Summary
+Candidate name (if mentioned), role, and overall impression.
+
+## 💪 Strengths
+- Key strengths and positive signals from the candidate
+
+## ⚠️ Concerns
+- Areas of concern or gaps
+
+## 🔑 Key Responses
+- Notable answers to important questions
+
+## 📊 Fit Assessment
+- Overall assessment and recommendation
+
+## 📌 Follow-up Actions
+- Next steps in the hiring process
+
+Keep it concise and objective. Skip empty sections.`,
+
+    retrospective: `Create a retrospective meeting summary.
+
+Format with these sections (use markdown):
+## 📋 Retrospective Summary
+Brief overview of what was discussed.
+
+## 🌟 What Went Well
+- Positive outcomes and successes
+
+## 🔧 What Could Be Improved
+- Areas for improvement
+
+## 💡 Ideas & Suggestions
+- Proposed changes or experiments
+
+## 📌 Action Items
+- Specific improvement actions with owners
+
+Keep it concise and actionable. Skip empty sections.`,
+};
+
+
+/**
  * Transcribe audio via the self-hosted WhisperX FastAPI service.
  * Returns a response object with the same shape as Voxtral output.
  */
 async function transcribeWithWhisperX(filePath, fileName, language, contextTerms) {
-    const whisperxUrl = process.env.WHISPERX_URL || 'http://localhost:8787';
+    const whisperxUrl = process.env.WHISPERX_URL || 'https://services.beeflow.ai/whisperx';
     const FormData = require('form-data');
     const fetch = require('node-fetch');
 
@@ -301,7 +461,7 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
 
         const fileContent = fs.readFileSync(req.file.path);
         const fileName = req.file.originalname || 'audio.mp3';
-        const provider = req.body.provider || 'voxtral';
+        const provider = req.body.provider || 'whisperx';
 
         console.log(`[Transcriptions] Transcribing "${fileName}" (${(fileContent.length / (1024 * 1024)).toFixed(1)} MB) via ${provider} for user ${userId}`);
 
@@ -420,6 +580,10 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
             if (aiTitle) title = aiTitle;
         }
 
+        // Extract structured action items
+        const actionItems = await extractActionItems(transcript, language);
+
+
         // Save audio permanently for playback
         const audioDir = path.resolve(__dirname, '../data/uploads/saved-recordings');
         if (!fs.existsSync(audioDir)) fs.mkdirSync(audioDir, { recursive: true });
@@ -450,6 +614,7 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
             summary,
             audioPath: fs.existsSync(audioPath) ? audioPath : '',
             provider,
+            actionItems,
         });
 
         res.json({
@@ -466,6 +631,7 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
             transcript,
             segments: merged,
             summary,
+            actionItems,
         });
 
     } catch (err) {
@@ -517,25 +683,37 @@ router.post('/:id/reprocess', requireAuth, async (req, res) => {
             return res.status(400).json({ error: 'Audio file not found. Cannot reprocess.' });
         }
 
-        const apiKey = await configStore.getSecret('mistral_api_key');
-        if (!apiKey) return res.status(400).json({ error: 'Mistral API key not configured' });
+        // Set route timeout to 10 minutes
+        req.setTimeout(600000);
+        res.setTimeout(600000);
 
-        const { Mistral } = require('@mistralai/mistralai');
-        const client = new Mistral({ apiKey });
-
-        const fileContent = fs.readFileSync(transcription.audioPath);
+        const provider = transcription.provider || 'whisperx';
         const fileName = transcription.fileName || 'audio.webm';
         const language = transcription.language || 'nl';
 
-        console.log(`[Transcriptions] Reprocessing "${fileName}" (${(fileContent.length / (1024 * 1024)).toFixed(1)} MB)`);
+        console.log(`[Transcriptions] Reprocessing "${fileName}" via ${provider}`);
 
-        const response = await client.audio.transcriptions.complete({
-            model: 'voxtral-mini-2602',
-            file: { fileName, content: fileContent },
-            diarize: true,
-            language,
-            timestampGranularities: ['segment'],
-        });
+        let response;
+
+        if (provider === 'whisperx') {
+            response = await transcribeWithWhisperX(transcription.audioPath, fileName, language, '');
+        } else {
+            const apiKey = await configStore.getSecret('mistral_api_key');
+            if (!apiKey) return res.status(400).json({ error: 'Mistral API key not configured' });
+
+            const { Mistral } = require('@mistralai/mistralai');
+            const client = new Mistral({ apiKey, timeout: 300000 });
+
+            const fileContent = fs.readFileSync(transcription.audioPath);
+
+            response = await client.audio.transcriptions.complete({
+                model: 'voxtral-mini-2602',
+                file: { fileName, content: fileContent },
+                diarize: true,
+                language,
+                timestampGranularities: ['segment'],
+            });
+        }
 
         // Merge segments
         const segments = response.segments || [];
@@ -546,7 +724,7 @@ router.post('/:id/reprocess', requireAuth, async (req, res) => {
                 last.end = seg.end;
                 last.text += ' ' + (seg.text || '').trim();
             } else {
-                merged.push({ speaker: seg.speakerId || 'Unknown', start: seg.start, end: seg.end, text: (seg.text || '').trim() });
+                merged.push({ speaker: seg.speakerId || seg.speaker || 'Unknown', start: seg.start, end: seg.end, text: (seg.text || '').trim() });
             }
         }
 
@@ -605,9 +783,6 @@ router.post('/:id/reprocess', requireAuth, async (req, res) => {
             ['completed', Math.round(totalDuration), Object.keys(speakerMap).length, merged.length, response.text || '', transcript, JSON.stringify(merged), JSON.stringify(speakers), summary, req.params.id, userId]
         );
 
-        // Delete saved audio file after successful reprocessing
-        try { fs.unlinkSync(transcription.audioPath); } catch (_) {}
-
         res.json({ success: true, id: req.params.id, status: 'completed' });
     } catch (err) {
         console.error('[Transcriptions] Reprocess error:', err.message);
@@ -636,19 +811,97 @@ router.get('/:id/audio', requireAuth, async (req, res) => {
     }
 });
 
-// ── Rename transcription ─────────────────────────────────
+// ── Rename / update transcription ────────────────────────
 
 router.patch('/:id', requireAuth, async (req, res) => {
     try {
         const userId = req.session.user.id;
-        const { title } = req.body;
-        if (!title) return res.status(400).json({ error: 'Title is required' });
-        const updated = await transcriptionStore.updateTranscription(req.params.id, userId, { title });
+        const { title, actionItems, tags } = req.body;
+        if (!title && actionItems === undefined && tags === undefined) {
+            return res.status(400).json({ error: 'Nothing to update' });
+        }
+        const updates = {};
+        if (title) updates.title = title;
+        if (actionItems !== undefined) updates.actionItems = actionItems;
+        if (tags !== undefined) updates.tags = tags;
+        const updated = await transcriptionStore.updateTranscription(req.params.id, userId, updates);
         if (!updated) return res.status(404).json({ error: 'Not found' });
         res.json({ success: true });
     } catch (err) {
         console.error('[Transcriptions] Update error:', err.message);
         res.status(500).json({ error: 'Failed to update' });
+    }
+});
+
+// ── Regenerate summary with template ─────────────────────
+
+router.post('/:id/regenerate-summary', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const { template = 'general' } = req.body;
+        const transcription = await transcriptionStore.getTranscription(req.params.id, userId);
+        if (!transcription) return res.status(404).json({ error: 'Not found' });
+        if (!transcription.transcript) return res.status(400).json({ error: 'No transcript available' });
+
+        const templatePrompt = SUMMARY_TEMPLATES[template] || SUMMARY_TEMPLATES.general;
+        const langName = { nl: 'Dutch', en: 'English', de: 'German', fr: 'French', es: 'Spanish', it: 'Italian', pt: 'Portuguese' }[transcription.language] || transcription.language;
+
+        const client = await getClaudeClient();
+        const response = await client.messages.create({
+            model: 'claude-opus-4-6',
+            max_tokens: 4096,
+            temperature: 0.3,
+            system: `You are a meeting assistant. Write the summary in ${langName}.\n\n${templatePrompt}`,
+            messages: [{ role: 'user', content: transcription.transcript }],
+        });
+
+        const summary = (response.content?.[0]?.text || '').trim();
+        // Also re-extract action items
+        const actionItems = await extractActionItems(transcription.transcript, transcription.language);
+
+        await transcriptionStore.updateTranscription(req.params.id, userId, { summary, actionItems });
+        res.json({ success: true, summary, actionItems });
+    } catch (err) {
+        console.error('[Transcriptions] Regenerate summary error:', err.message);
+        res.status(500).json({ error: `Failed to regenerate: ${err.message}` });
+    }
+});
+
+// ── Export transcription ─────────────────────────────────
+
+router.get('/:id/export', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const format = req.query.format || 'md';
+        const transcription = await transcriptionStore.getTranscription(req.params.id, userId);
+        if (!transcription) return res.status(404).json({ error: 'Not found' });
+
+        const title = transcription.title || 'Meeting Notes';
+        const date = transcription.createdAt ? new Date(transcription.createdAt).toLocaleDateString('en-US', { dateStyle: 'long' }) : '';
+        const duration = formatDuration(transcription.durationSeconds);
+        const speakers = (transcription.speakers || []).map(s => s.id).join(', ');
+
+        // Build action items section
+        const actionItemsText = (transcription.actionItems || []).length > 0
+            ? '## 📌 Action Items\n' + transcription.actionItems.map(ai => `- [${ai.done ? 'x' : ' '}] ${ai.text} (${ai.assignee})${ai.timestamp ? ` — ${ai.timestamp}` : ''}`).join('\n')
+            : '';
+
+        if (format === 'md') {
+            const md = `# ${title}\n\n**Date:** ${date}  \n**Duration:** ${duration}  \n**Speakers:** ${speakers}\n\n---\n\n${transcription.summary || ''}\n\n${actionItemsText}\n\n---\n\n## Transcript\n\n${transcription.transcript || transcription.fullText || ''}`;
+            res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+            res.setHeader('Content-Disposition', `attachment; filename="${title.replace(/[^a-zA-Z0-9 ]/g, '')}.md"`);
+            res.send(md);
+        } else if (format === 'txt') {
+            const txt = `${title}\nDate: ${date}\nDuration: ${duration}\nSpeakers: ${speakers}\n\n${'='.repeat(50)}\n\n${(transcription.summary || '').replace(/[#*]/g, '')}\n\n${'='.repeat(50)}\n\n${(transcription.actionItems || []).length > 0 ? 'ACTION ITEMS:\n' + transcription.actionItems.map(ai => `[${ai.done ? 'X' : ' '}] ${ai.text} (${ai.assignee})`).join('\n') + '\n\n' + '='.repeat(50) + '\n\n' : ''}TRANSCRIPT:\n\n${transcription.transcript || transcription.fullText || ''}`;
+            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+            res.setHeader('Content-Disposition', `attachment; filename="${title.replace(/[^a-zA-Z0-9 ]/g, '')}.txt"`);
+            res.send(txt);
+        } else {
+            res.status(400).json({ error: 'Unsupported format. Use: md, txt' });
+        }
+    } catch (err) {
+        console.error('[Transcriptions] Export error:', err.message);
+        res.status(500).json({ error: 'Failed to export' });
     }
 });
 

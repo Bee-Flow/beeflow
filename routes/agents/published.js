@@ -78,7 +78,7 @@ router.get('/published', async (req, res) => {
                 let swarms = await swarmStore.getAllSwarms();
                 // Org-scope filter for non-admin users
                 if (orgIds !== null) {
-                    swarms = swarms.filter(s => orgIds.has(s.organization_id));
+                    swarms = swarms.filter(s => s.is_builtin || orgIds.has(s.organization_id));
                 }
                 const swarmAgents = swarms
                     .filter(swarm => swarm.enabled)
@@ -98,7 +98,9 @@ router.get('/published', async (req, res) => {
                         config: swarm.config,
                         created_at: swarm.created_at,
                         updated_at: swarm.updated_at,
-                        is_swarm: true
+                        is_swarm: true,
+                        // Deep research v2 has its own pipeline — surface as 'research' not 'swarm'
+                        ...(swarm.type === 'deep_research' ? { _type: 'research' } : {})
                     }));
                 allAgents = [...swarmAgents, ...allAgents];
             } catch (e) {

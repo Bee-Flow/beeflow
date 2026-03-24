@@ -1,10 +1,10 @@
 /**
- * Pricing Service — fetches model pricing from LiteLLM's GitHub repository.
- * Contains 2000+ models from all providers (OpenAI, Anthropic, Google, Mistral, etc.)
+ * Pricing Service — fetches model pricing from a community-maintained
+ * open-source pricing database (2000+ models from all providers).
  * Cached in memory with a 24-hour TTL.
  */
 
-const LITELLM_PRICING_URL =
+const PRICING_URL =
     'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json';
 
 let _cachedPricing = null;
@@ -12,7 +12,7 @@ let _cacheTimestamp = null;
 const CACHE_TTL = 1000 * 60 * 60 * 24; // 24 hours
 
 /**
- * Fetch the full LiteLLM pricing JSON (2000+ models).
+ * Fetch the full pricing JSON (2000+ models).
  * Uses a 24h in-memory cache.
  * @param {boolean} [forceRefresh=false]
  * @returns {Promise<Object>} Map of model keys → pricing objects
@@ -25,8 +25,8 @@ async function fetchAllPricing(forceRefresh = false) {
     }
 
     try {
-        console.log('[PricingService] Fetching pricing data from LiteLLM...');
-        const res = await fetch(LITELLM_PRICING_URL);
+        console.log('[PricingService] Fetching pricing data...');
+        const res = await fetch(PRICING_URL);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
         const data = await res.json();
@@ -48,8 +48,8 @@ async function fetchAllPricing(forceRefresh = false) {
 }
 
 // ─── Provider prefix mapping ────────────────────────────────────────────────
-// LiteLLM uses prefixed keys like "openai/gpt-4o", "mistral/mistral-large-latest", etc.
-// Our system uses bare model IDs. This maps provider types to LiteLLM prefixes.
+// The pricing database uses prefixed keys like "openai/gpt-4o", "mistral/mistral-large-latest", etc.
+// Our system uses bare model IDs. This maps provider types to pricing-DB prefixes.
 
 const PROVIDER_PREFIXES = {
     openai: ['', 'openai/'],
@@ -57,17 +57,18 @@ const PROVIDER_PREFIXES = {
     claude: ['', 'anthropic/', 'claude-'],
     google: ['gemini/', ''],
     'google-vertex': ['vertex_ai/gemini-', 'vertex_ai/', 'gemini/', ''],
+    minimax: ['minimax/', ''],
 };
 
 /**
- * Look up the cost for a model ID, trying various LiteLLM key patterns.
+ * Look up the cost for a model ID, trying various key patterns.
  * Returns { input, output } in USD per 1M tokens, or null if not found.
  *
  * @param {string} modelId - The bare model ID (e.g. "gpt-4o", "mistral-large-latest")
  * @param {string} [providerType] - Optional provider type for prefix hints
  * @returns {{ input: number, output: number } | null}
  */
-function getLiteLLMCost(modelId, providerType) {
+function getModelPricing(modelId, providerType) {
     if (!_cachedPricing || !modelId) return null;
 
     const _extract = (entry) => ({
@@ -112,7 +113,7 @@ function getLiteLLMCost(modelId, providerType) {
  * Used by the config UI to show full pricing list.
  * @returns {Object} Map of modelId → { input, output, provider }
  */
-function getAllLiteLLMCosts() {
+function getAllModelPricing() {
     if (!_cachedPricing) return {};
 
     const result = {};
@@ -145,7 +146,10 @@ function initPricing() {
 
 module.exports = {
     fetchAllPricing,
-    getLiteLLMCost,
-    getAllLiteLLMCosts,
+    getModelPricing,
+    getAllModelPricing,
+    // Legacy aliases (backwards compat)
+    getLiteLLMCost: getModelPricing,
+    getAllLiteLLMCosts: getAllModelPricing,
     initPricing,
 };

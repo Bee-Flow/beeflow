@@ -33,6 +33,7 @@ router.get('/config', async (req, res) => {
         hasGoogleKey: !!(await configStore.getSecret('google_api_key')),
         hasElevenLabsKey: !!(await configStore.getSecret('elevenlabs_api_key')),
         hasGoogleVertexProject: !!(await configStore.getConfig('google_vertex_project')),
+        hasMinimaxKey: !!(await configStore.getSecret('minimax_api_key')),
         googleVertexLocation: await configStore.getConfig('google_vertex_location') || 'europe-west4',
         hasGoogleVertexServiceAccountKey: !!(await configStore.getSecret('google_vertex_service_account_key')),
         hasAzureEndpoint: !!(await configStore.getConfig('azure_endpoint')),
@@ -80,7 +81,7 @@ router.get('/config', async (req, res) => {
 });
 
 router.post('/config', async (req, res) => {
-    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, llamaGuardConfig, moderationProvider, azureContentSafetyEndpoint, azureContentSafetyKey, azureContentSafetySeverityThreshold, azureContentSafetyCategories, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionScope, piiDetectionAction, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing, serviceEmailAddress, serviceEmailPassword, serviceEmailDisplayName } = req.body;
+    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, minimaxApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, llamaGuardConfig, moderationProvider, azureContentSafetyEndpoint, azureContentSafetyKey, azureContentSafetySeverityThreshold, azureContentSafetyCategories, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionScope, piiDetectionAction, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing, serviceEmailAddress, serviceEmailPassword, serviceEmailDisplayName } = req.body;
     const existing = await getAIConfig();
 
     if (allowedModelsByAgentType !== undefined) {
@@ -161,6 +162,7 @@ router.post('/config', async (req, res) => {
         openaiApiKey: openaiApiKey !== undefined ? openaiApiKey : undefined,
         claudeApiKey: claudeApiKey !== undefined ? claudeApiKey : undefined,
         googleApiKey: googleApiKey !== undefined ? googleApiKey : undefined,
+        minimaxApiKey: minimaxApiKey !== undefined ? minimaxApiKey : undefined,
         elevenlabsApiKey: elevenlabsApiKey !== undefined ? elevenlabsApiKey : undefined,
         googleVertexProject: googleVertexProject !== undefined ? googleVertexProject : undefined,
         googleVertexLocation: googleVertexLocation !== undefined ? googleVertexLocation : undefined,

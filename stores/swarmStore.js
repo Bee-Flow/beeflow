@@ -40,8 +40,8 @@ async function seedDefaults() {
 
     const deepResearch = {
         id: 'deep-research',
-        name: 'Deep Research',
-        description: 'Multi-agent web research pipeline. Decomposes a question into sub-queries, searches in parallel, and synthesizes a comprehensive report.',
+        name: 'Deep Research v2',
+        description: 'Advanced multi-agent research engine. Clarifies your query, plans a research DAG, searches in parallel with iterative refinement, and synthesizes a cited report. Supports Fast, Normal, and Detailed depth modes.',
         icon: '🔬',
         type: 'deep_research',
         is_builtin: true,

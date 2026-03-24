@@ -39,7 +39,8 @@ async function initDB() {
             "opaqueRecord" TEXT,
             "kdfMode" TEXT DEFAULT 'legacy_argon2',
             "createdAt" TEXT,
-            status TEXT DEFAULT 'active'
+            status TEXT DEFAULT 'active',
+            "activeIconPackId" TEXT
         );
 
         CREATE TABLE IF NOT EXISTS organizations (
@@ -120,6 +121,7 @@ async function initDB() {
 
     // ── Column migrations (safe for existing DBs) ─────────────────────────────
     try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'`); } catch (e) { /* column already exists */ }
+    try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS "activeIconPackId" TEXT`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "autoApproveSSO" TEXT DEFAULT '0'`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "enabledIntegrations" TEXT DEFAULT NULL`); } catch (e) { /* column already exists */ }
 
@@ -341,7 +343,7 @@ async function updateUser(userId, updates) {
         kekSalt: 'kekSalt', recoverySalt: 'recoverySalt', ssoEncryptionSetup: 'ssoEncryptionSetup',
         passwordResetRequired: 'passwordResetRequired', dekUnwrapFailures: 'dekUnwrapFailures',
         dekLockoutUntil: 'dekLockoutUntil', opaqueRecord: 'opaqueRecord', kdfMode: 'kdfMode',
-        status: 'status',
+        status: 'status', activeIconPackId: 'activeIconPackId',
     };
 
     for (const [jsKey, dbCol] of Object.entries(colMap)) {
