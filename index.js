@@ -37,7 +37,15 @@ app.use(helmet({
     hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
     contentSecurityPolicy: false,        // Handled by Nginx
     crossOriginEmbedderPolicy: false,    // Can break embedded content
+    permissionsPolicy: false,            // Managed manually below (clipboard needs self)
 }));
+// Allow clipboard access so users can paste screenshots in the conversation area.
+// navigator.clipboard.read() requires this header — without it the browser blocks
+// the API before even showing a permission prompt.
+app.use((req, res, next) => {
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(self), geolocation=(), clipboard-read=(self), clipboard-write=(self)');
+    next();
+});
 
 // ── Error handlers ────────────────────────────────────────────────────────────
 process.on('unhandledRejection', (reason, promise) => {
