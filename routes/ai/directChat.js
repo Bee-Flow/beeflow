@@ -100,6 +100,17 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         }
     }
 
+    // Vision override: images require a vision-capable model
+    // Auto classifier only looks at text complexity — override to smart/vision tier
+    if (attachments?.some(a => a.type?.startsWith('image/'))) {
+        const visionTier = tiers['vision'] || tiers['smart'];
+        if (visionTier?.modelId && resolvedTier !== 'vision' && resolvedTier !== 'smart') {
+            const prevTier = resolvedTier;
+            resolvedTier = tiers['vision'] ? 'vision' : 'smart';
+            console.log(`[DirectChat] Image attached — overriding tier: ${prevTier} → ${resolvedTier} (${visionTier.modelId})`);
+        }
+    }
+
     const tier = tiers[resolvedTier] || {};
     let modelId = tier.modelId;
 

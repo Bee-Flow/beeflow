@@ -25,8 +25,33 @@ class ClaudeProvider extends BaseProvider {
 
     normalizeContent(content) {
         if (content == null) return "";
-        if (Array.isArray(content)) return content;
         if (typeof content === "string") return content;
+        if (Array.isArray(content)) {
+            return content.map(block => {
+                // Convert OpenAI image_url → Claude native image block
+                if (block.type === 'image_url') {
+                    const url = typeof block.image_url === 'string'
+                        ? block.image_url
+                        : block.image_url?.url || '';
+                    if (url.startsWith('data:')) {
+                        const match = url.match(/^data:([^;]+);base64,(.+)$/s);
+                        if (match) {
+                            return {
+                                type: 'image',
+                                source: { type: 'base64', media_type: match[1], data: match[2] },
+                            };
+                        }
+                    } else if (url.startsWith('http')) {
+                        return {
+                            type: 'image',
+                            source: { type: 'url', url },
+                        };
+                    }
+                    return null; // Skip if unresolvable
+                }
+                return block;
+            }).filter(Boolean);
+        }
         return JSON.stringify(content);
     }
 
