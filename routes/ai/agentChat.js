@@ -17,7 +17,7 @@ const componentManager = require('../../core/componentManager');
 
 const COMPONENTS_DIR = path.resolve(__dirname, '../../../components');
 
-// Chat withh AI agent (standard JSON response)
+// Chat with AI agent (standard JSON response)
 router.post('/chat', async (req, res) => {
     try {
         const sessionId = req.sessionID || 'default';
