@@ -138,6 +138,11 @@ class ClaudeProvider extends BaseProvider {
         return /^claude-(opus|sonnet|haiku)-4/.test(modelId);
     }
 
+    supportsVision(modelId) {
+        // Claude 3+ and Claude 4+ series all support image input
+        return /claude-3|claude-3-5|claude-3-7|claude-opus-4|claude-sonnet-4|claude-haiku-4/.test(modelId);
+    }
+
     // ─── Tool Normalization ──────────────────────────────────────
 
     normalizeTools(tools = []) {

@@ -58,6 +58,7 @@ class BaseProvider {
 
     isRestrictedModel(modelId) { return false; }
     supportsReasoning(modelId) { return false; }
+    supportsVision(modelId) { return false; }
 
     // ─── High-Level API ──────────────────────────────────────────────
 

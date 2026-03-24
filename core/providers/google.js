@@ -71,6 +71,11 @@ class GoogleProvider extends BaseProvider {
             || THINKING_MODEL_PATTERNS_25.some(p => p.test(modelId));
     }
 
+    supportsVision(modelId) {
+        // All Gemini models support vision/multimodal input
+        return true;
+    }
+
     _isGemini25(modelId) {
         return THINKING_MODEL_PATTERNS_25.some(p => p.test(modelId));
     }

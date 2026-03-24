@@ -37,6 +37,11 @@ class MiniMaxProvider extends BaseProvider {
         return MINIMAX_MODELS;
     }
 
+    supportsVision(modelId) {
+        // MiniMax M2.7 and later support multimodal/vision
+        return /MiniMax-M2\.7/.test(modelId);
+    }
+
     /**
      * Override request body to:
      * 1. Inject `reasoning_split: true` for clean thinking extraction

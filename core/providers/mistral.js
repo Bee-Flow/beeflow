@@ -59,6 +59,11 @@ class MistralProvider extends BaseProvider {
         });
     }
 
+    supportsVision(modelId) {
+        // Only Pixtral models support vision in the Mistral family
+        return /pixtral/.test(modelId);
+    }
+
     // ─── High-Level API (all SDK) ────────────────────────────────
 
     /**

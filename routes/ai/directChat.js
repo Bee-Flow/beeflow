@@ -453,7 +453,15 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                     } catch (e) {
                         console.warn(`[DirectChat] Failed to upload image to RustFS: ${e.message}`);
                     }
-                    contentParts.push({ type: 'image_url', image_url: { url: att.content } });
+                    // Send as image data only if the current model supports vision
+                    if (adapter.supportsVision(modelId)) {
+                        contentParts.push({ type: 'image_url', image_url: { url: att.content } });
+                    } else {
+                        // Non-vision model: add a descriptive text note instead of a broken image reference
+                        contentParts.push({ type: 'text', text: `[Attached image: ${att.name || 'image'} — this model does not support vision. To analyze this image, switch to a vision-capable model such as GPT-4o, Claude 3, Gemini, or Pixtral.]` });
+                        console.log(`[DirectChat] Model ${modelId} doesn't support vision — converted image to text note`);
+                    }
+
                 } else if (att.source === 'google-drive' && att.content) {
                     // Google Drive file — already exported as plain text, inject directly
                     const driveText = `--- Google Drive: ${att.name} ---\n${att.content}\n--- End of ${att.name} ---`;

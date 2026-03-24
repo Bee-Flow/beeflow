@@ -68,6 +68,11 @@ class OpenAIProvider extends BaseProvider {
         return REASONING_MODEL_PATTERNS.some(p => p.test(modelId));
     }
 
+    supportsVision(modelId) {
+        // GPT-4o, GPT-4.1, GPT-4.5, GPT-4-turbo, GPT-4-vision, o4-series
+        return /gpt-4o|gpt-4\.1|gpt-4\.5|gpt-4-turbo|gpt-4-vision|o4/.test(modelId);
+    }
+
     shouldUseResponsesApi(model, options = {}) {
         // Default to Responses API for all reasoning models unless explicitly disabled
         if (!this.supportsReasoning(model)) return false;
