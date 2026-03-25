@@ -415,6 +415,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     let _sheetsReports = [];
     let _mapEmbeds = [];
     let _audioFiles = [];
+    let _toolHistory = []; // Track tool calls for persistence
 
     // Abort signal from the route handler (client disconnect)
     const signal = messageMetadata.signal || null;
@@ -1007,6 +1008,13 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     const { toolCall, toolName, toolArgs, finalToolResult } = result;
 
                     toolCalls.push({ name: toolName, args: toolArgs, result: finalToolResult });
+                    // Track for persistence
+                    _toolHistory.push({
+                        name: toolName,
+                        args: toolArgs,
+                        status: 'done',
+                        resultPreview: (typeof finalToolResult === 'string' ? finalToolResult : JSON.stringify(finalToolResult || '')).slice(0, 200),
+                    });
                     // Sanitize tool result before streaming to client to prevent API key exposure
                     onEvent('tool_end', { name: toolName, result: sanitizeToolResult(finalToolResult) });
 
@@ -1307,6 +1315,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             if (_sheetsReports.length > 0) assistantMsg.sheetsReports = _sheetsReports;
             if (_mapEmbeds.length > 0) assistantMsg.mapEmbeds = _mapEmbeds;
             if (_audioFiles.length > 0) assistantMsg.audioFiles = _audioFiles;
+            if (_toolHistory.length > 0) assistantMsg.toolHistory = _toolHistory;
 
             // Emit phase completion for the last phase
             if (isSwarm && swarm.phases?.length > 0) {

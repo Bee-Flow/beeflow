@@ -128,6 +128,14 @@ async function extractMemories(userId, userMessage, assistantResponse, agentId =
             const validTypes = ['person', 'preference', 'fact', 'project', 'workflow', 'instruction', 'context'];
             if (!validTypes.includes(mem.type)) continue;
 
+            // ── Isolation guard: project-type memories MUST have a project context ──
+            // Prevents project-specific info (frameworks, URLs, deadlines) from
+            // leaking into the user's global memory when chatting outside a project.
+            if (mem.type === 'project' && !projectId) {
+                console.log(`[MemoryExtractor] Skipping project-type memory in user-global scope: "${mem.content.slice(0, 50)}..."`);
+                continue;
+            }
+
             // Check for duplicates
             const existing = await memoryStore.findSimilarMemory(userId, mem.content, projectId);
             if (existing) {

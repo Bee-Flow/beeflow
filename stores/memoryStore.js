@@ -325,7 +325,30 @@ async function findRelevantMemories(userId, agentId, userMessage, tokenLimit = 8
     
     query += ` ORDER BY importance DESC, updated_at DESC`;
     
-    const memories = await getAll(query, params);
+    let memories = await getAll(query, params);
+
+    // ── Suggestion A: Hybrid retrieval ────────────────────────────────────────
+    // When inside a project context, ALSO inject the user's global instructions
+    // and preferences (e.g. "always use TypeScript", "respond concisely").
+    // These are behavioural settings that should apply everywhere.
+    // Project-specific data is still strictly isolated — only instruction/preference
+    // types cross the boundary.
+    if (projectId) {
+        const userGlobalBehaviour = await getAll(`
+            SELECT * FROM user_memories
+            WHERE user_id = $1 AND project_id IS NULL AND status = 'active'
+              AND type IN ('instruction', 'preference')
+            ORDER BY importance DESC, updated_at DESC LIMIT 15
+        `, [userId]);
+        // Merge, deduplicating by id
+        const existingIds = new Set(memories.map(m => m.id));
+        for (const m of userGlobalBehaviour) {
+            if (!existingIds.has(m.id)) {
+                memories.push(m);
+                existingIds.add(m.id);
+            }
+        }
+    }
 
     if (memories.length === 0) return [];
 

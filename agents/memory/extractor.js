@@ -172,6 +172,13 @@ async function extractFromConversation(userId, agentId, messages, conversationId
             }
 
             // Create new memory with evidence
+            // ── Isolation guard ──────────────────────────────────────────────────
+            // Memories with subject='project' belong only inside a project context.
+            // If there is no projectId, skip them to avoid polluting global memory.
+            if (memory.subject === 'project' && !projectId) {
+                console.log(`[MemoryExtractor] Skipping project-subject memory in user-global scope: "${memory.content?.slice(0, 50)}..."`);
+                continue;
+            }
             const id = await memoryStore.createMemory(
                 userId,
                 null,  // agentId null = global memory

@@ -864,6 +864,7 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         const collectedEmailDrafts = [];
         const collectedCalendarDrafts = [];
         const collectedMapEmbeds = [];
+        const collectedToolHistory = []; // Track tool calls for persistence
 
         // Strip internal metadata (_mcp etc.) before sending tools to LLM — providers may reject unknown fields
         directChatTools = directChatTools.map(t => {
@@ -977,6 +978,14 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                         }
 
                         send('tool_end', { name: toolName, result: toolResult });
+
+                        // Track tool call for conversation persistence
+                        collectedToolHistory.push({
+                            name: toolName,
+                            args: toolArgs,
+                            status: 'done',
+                            resultPreview: (typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult || '')).slice(0, 200),
+                        });
 
                         // Log tool usage
                         try {
@@ -1261,6 +1270,14 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
 
                 send('tool_end', { name: toolName, result: toolResult });
 
+                // Track tool call for conversation persistence
+                collectedToolHistory.push({
+                    name: toolName,
+                    args: toolArgs,
+                    status: 'done',
+                    resultPreview: (typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult || '')).slice(0, 200),
+                });
+
                 // Emit email_draft SSE event for user approval (with dedup)
                 if (toolResult?._action === 'email_draft') {
                     const draftKey = JSON.stringify({ to: toolResult.draft?.to, subject: toolResult.draft?.subject, body: toolResult.draft?.body });
@@ -1494,6 +1511,7 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
             if (collectedEmailDrafts.length > 0) assistantSave.emailDrafts = collectedEmailDrafts;
             if (collectedCalendarDrafts.length > 0) assistantSave.calendarDrafts = collectedCalendarDrafts;
             if (collectedMapEmbeds.length > 0) assistantSave.mapEmbeds = collectedMapEmbeds;
+            if (collectedToolHistory.length > 0) assistantSave.toolHistory = collectedToolHistory;
             savedMessages.push(assistantSave);
 
             // Save with metadata for OpenAI response chaining + compaction
@@ -1575,7 +1593,7 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         if (!moderationViolation) {
             try {
                 const memoryExtractor = require('../../agents/memory/extractor');
-                memoryExtractor.extractFromConversation(userId, null, messages, convId)
+                memoryExtractor.extractFromConversation(userId, null, messages, convId, validProjectId || null)
                     .then(extracted => {
                         if (extracted.length > 0) {
                             console.log(`[DirectChat] Extracted ${extracted.length} memories`);
