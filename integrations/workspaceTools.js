@@ -9,7 +9,7 @@ const WORKSPACE_TOOLS = [
         type: 'function',
         function: {
             name: 'workspace_read',
-            description: 'Read the current content of the conversation workspace. The workspace is a persistent document that lives alongside the chat. Use this to check what is currently in the workspace before making updates.',
+            description: 'Read the current content of the conversation workspace. ALWAYS call this before workspace_replace so you have the exact current text to search for. Use it any time the user refers to something already in the workspace, or before making a partial edit.',
             parameters: {
                 type: 'object',
                 properties: {},
@@ -21,7 +21,7 @@ const WORKSPACE_TOOLS = [
         type: 'function',
         function: {
             name: 'workspace_write',
-            description: 'Write or replace the ENTIRE content in the conversation workspace. The workspace is a persistent document that the user can view and edit alongside the chat. Use this to save long-form content like reports, code, plans, drafts, summaries, or any structured output that the user may want to review, copy, or iterate on. The content supports full Markdown formatting. The user will see the workspace panel open with your content. WARNING: This replaces ALL workspace content. For partial edits, use workspace_replace instead.',
+            description: 'Write or replace the ENTIRE content of the conversation workspace. Use this proactively whenever producing long-form output that the user is likely to want to save, copy, or iterate on — such as reports, plans, summaries, code files, structured documents, or meeting notes. The content supports full Markdown. The user will see the workspace panel open automatically. WARNING: This replaces ALL existing workspace content. For editing only a part of an existing document, use workspace_replace instead.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -42,7 +42,7 @@ const WORKSPACE_TOOLS = [
         type: 'function',
         function: {
             name: 'workspace_replace',
-            description: 'Replace a specific portion of the workspace content. Use this when the user has selected text or asks to edit, rewrite, remove, or modify a specific part of the workspace. This is more efficient than workspace_write because it only changes the targeted text while preserving everything else.',
+            description: 'Replace a specific portion of the workspace content. IMPORTANT: always call workspace_read first to get the exact current text, then copy find_text character-for-character (including all Markdown formatting such as ** # - etc.) from that output. Use this when the user asks to edit, rewrite, remove, or update a specific part of the workspace. Prefer this over workspace_write for any partial edit — it preserves everything else in the document.',
             parameters: {
                 type: 'object',
                 properties: {

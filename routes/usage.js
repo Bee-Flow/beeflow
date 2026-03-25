@@ -1,30 +1,33 @@
 const express = require('express');
 const router = express.Router();
 const usageStore = require('../stores/usageStore');
-const { requireAuth } = require('../auth/permissions');
-
-router.use(requireAuth);
-
-// Helper to get the user's primary organisation
-function getOrg(req) {
-    const orgs = req.session.user?.organizations || [];
-    return orgs[0] || req.session.user?.id;
-}
+const { resolveUserOrgIds } = require('../auth');
 
 // Helper to parse days filter
-function getDateFilters(daysAttr = '30') {
-    const days = parseInt(daysAttr, 10) || 30;
+function getDateFilters(daysParam = '30') {
+    const days = parseInt(daysParam, 10) || 30;
     const now = new Date();
     const start = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
     return { startDate: start.toISOString(), endDate: now.toISOString() };
 }
 
+// Resolve org filter for usage queries
+async function getOrgFilter(req) {
+    const orgIds = await resolveUserOrgIds(req);
+    // orgIds is null for super admins (no filter), or a Set of org IDs
+    if (orgIds === null) return null; // super admin — no filter
+    if (orgIds.size === 0) return '__none__'; // user has no org
+    return Array.from(orgIds)[0]; // primary org
+}
+
 // 1. Summary Overview
 router.get('/summary', async (req, res) => {
     try {
+        if (!req.session?.isAuthenticated) return res.status(401).json({ error: 'Not authenticated' });
+        const orgId = await getOrgFilter(req);
         const filters = {
-            organizationId: getOrg(req),
-            ...getDateFilters(req.query.days)
+            ...getDateFilters(req.query.days),
+            ...(orgId ? { organizationId: orgId } : {})
         };
         const summary = await usageStore.getUsageSummary(filters);
         res.json(summary || { total_calls: 0, total_tokens: 0, total_estimated_cost: 0 });
@@ -37,11 +40,12 @@ router.get('/summary', async (req, res) => {
 // 2. Timeline (Sparkline data)
 router.get('/timeline', async (req, res) => {
     try {
+        if (!req.session?.isAuthenticated) return res.status(401).json({ error: 'Not authenticated' });
+        const orgId = await getOrgFilter(req);
         const filters = {
-            organizationId: getOrg(req),
-            ...getDateFilters(req.query.days)
+            ...getDateFilters(req.query.days),
+            ...(orgId ? { organizationId: orgId } : {})
         };
-        // If viewing 7 days or less, show by hour. Otherwise by day.
         const interval = (parseInt(req.query.days, 10) || 30) <= 7 ? 'hour' : 'day';
         const timeline = await usageStore.getUsageTimeline(filters, interval);
         res.json(timeline || []);
@@ -54,26 +58,35 @@ router.get('/timeline', async (req, res) => {
 // 3. Usage by User
 router.get('/users', async (req, res) => {
     try {
-        const orgId = getOrg(req);
+        if (!req.session?.isAuthenticated) return res.status(401).json({ error: 'Not authenticated' });
+        const orgId = await getOrgFilter(req);
         const filters = {
-            organizationId: orgId,
-            ...getDateFilters(req.query.days)
+            ...getDateFilters(req.query.days),
+            ...(orgId ? { organizationId: orgId } : {})
         };
-        
-        // Get raw usage grouped by user_id
         const usersUsage = await usageStore.getUsageByUser(filters);
-        
-        // Enhance with user display names
-        const { getAll } = require('../db');
-        const userRows = await getAll(`SELECT id, username, display_name FROM users WHERE organization_id = $1 OR id = $2`, [orgId, orgId]);
-        const userMap = new Map(userRows.map(u => [u.id, u.display_name || u.username]));
-        
-        const enriched = usersUsage.map(u => ({
-            ...u,
-            display_name: userMap.get(u.user_id) || u.user_id
-        }));
-        
-        res.json(enriched);
+
+        // Try to enrich with display names from userStore
+        try {
+            const userStore = require('../stores/userStore');
+            const allUsers = await userStore.getAllUsers();
+            const userMap = new Map();
+            for (const u of allUsers) {
+                userMap.set(u.id, u.display_name || u.username || u.id);
+            }
+            const enriched = (usersUsage || []).map(u => ({
+                ...u,
+                display_name: userMap.get(u.user_id) || u.user_id || 'Unknown'
+            }));
+            return res.json(enriched);
+        } catch (e) {
+            // Fallback: return without display names
+            const enriched = (usersUsage || []).map(u => ({
+                ...u,
+                display_name: u.user_id || 'Unknown'
+            }));
+            return res.json(enriched);
+        }
     } catch (err) {
         console.error('[Usage API] /users error:', err.message);
         res.status(500).json({ error: 'Failed to fetch user usage' });
@@ -83,9 +96,11 @@ router.get('/users', async (req, res) => {
 // 4. Usage by App Area (Source)
 router.get('/sources', async (req, res) => {
     try {
+        if (!req.session?.isAuthenticated) return res.status(401).json({ error: 'Not authenticated' });
+        const orgId = await getOrgFilter(req);
         const filters = {
-            organizationId: getOrg(req),
-            ...getDateFilters(req.query.days)
+            ...getDateFilters(req.query.days),
+            ...(orgId ? { organizationId: orgId } : {})
         };
         const sources = await usageStore.getUsageBySource(filters);
         res.json(sources || []);
@@ -98,9 +113,11 @@ router.get('/sources', async (req, res) => {
 // 5. Usage by Agent
 router.get('/agents', async (req, res) => {
     try {
+        if (!req.session?.isAuthenticated) return res.status(401).json({ error: 'Not authenticated' });
+        const orgId = await getOrgFilter(req);
         const filters = {
-            organizationId: getOrg(req),
-            ...getDateFilters(req.query.days)
+            ...getDateFilters(req.query.days),
+            ...(orgId ? { organizationId: orgId } : {})
         };
         const agents = await usageStore.getUsageByAgent(filters);
         res.json(agents || []);

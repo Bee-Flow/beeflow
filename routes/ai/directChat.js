@@ -19,6 +19,7 @@ const { classifyPromptComplexity } = require('../../core/promptClassifier');
 const { getAdapter } = require('../../core/providers');
 const agentStore = require('../../stores/agentStore');
 const { executeTool: dispatchTool } = require('../../core/toolDispatcher');
+const { WORKSPACE_TOOLS } = require('../../integrations/workspaceTools');
 const { getIntegrationTools, buildToolHint } = require('../../core/integrationTools');
 const { checkRegexPatterns } = require('../../core/guardrails');
 const { checkSubscriptionLimits, resolveOrgId } = require('../../core/limits');
@@ -277,6 +278,15 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                 },
             },
         });
+
+        // ─── Built-in: workspace tools ────────────────────────────────
+        // Always inject workspace tools — they are context-aware and only
+        // produce visible output when there is actual content to show.
+        for (const wsTool of WORKSPACE_TOOLS) {
+            if (!directChatTools.find(t => t.function.name === wsTool.function.name)) {
+                directChatTools.push(wsTool);
+            }
+        }
 
         // Filter out user-disabled media tools
         if (disabledMedia && typeof disabledMedia === 'object') {
@@ -860,6 +870,17 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
             const { _mcp, _n8n, ...clean } = t;
             return clean;
         });
+
+        // ─── Eagerly create conversation so workspace (and terminal) tools have a valid DB row ──
+        // convId is null for brand-new chats that have no file attachments yet.
+        // Without a row in direct_conversations, workspace_read/write/replace will fail
+        // immediately with "Workspace requires an active conversation".
+        if (!convId) {
+            const newConv = await agentStore.createDirectConversation(userId, resolvedTier);
+            convId = newConv.id;
+            send('conversation_created', { conversationId: convId });
+            console.log(`[DirectChat] Eagerly created conversation ${convId} for workspace/tool access`);
+        }
 
         while (toolCallRounds < MAX_TOOL_ROUNDS) {
             if (directChatTools.length > 0 && !skipToolPrecheck) {
