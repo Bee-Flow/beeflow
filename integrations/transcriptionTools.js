@@ -308,10 +308,20 @@ async function handleVoxtralTranscription(args, context) {
     }
 
     let audioData, audioFileName;
-    try {
-        ({ audioData, audioFileName } = await resolveAudioAttachment(context));
-    } catch (errMsg) {
-        return { error: errMsg };
+    // If called directly from the upload route, args.filePath is the temp file on disk
+    if (args.filePath) {
+        try {
+            audioData = fs.readFileSync(args.filePath);
+            audioFileName = args.fileName || require('path').basename(args.filePath);
+        } catch (e) {
+            return { error: `Could not read audio file: ${e.message}` };
+        }
+    } else {
+        try {
+            ({ audioData, audioFileName } = await resolveAudioAttachment(context));
+        } catch (errMsg) {
+            return { error: errMsg };
+        }
     }
 
     const language = args.language || 'nl';
@@ -589,12 +599,21 @@ async function handleAzureWhisperTranscription(args, context) {
     }
 
     let audioData, audioFileName;
-    try {
-        ({ audioData, audioFileName } = await resolveAudioAttachment(context));
-    } catch (errMsg) {
-        return { error: errMsg };
+    // Accept direct filePath from the upload route, or fall back to message attachment
+    if (args.filePath) {
+        try {
+            audioData = fs.readFileSync(args.filePath);
+            audioFileName = args.fileName || path.basename(args.filePath);
+        } catch (e) {
+            return { error: `Could not read audio file: ${e.message}` };
+        }
+    } else {
+        try {
+            ({ audioData, audioFileName } = await resolveAudioAttachment(context));
+        } catch (errMsg) {
+            return { error: errMsg };
+        }
     }
-
     const language = args.language || 'nl';
     const LOCALE_MAP = {
         nl: 'nl-NL', en: 'en-US', de: 'de-DE', fr: 'fr-FR',
