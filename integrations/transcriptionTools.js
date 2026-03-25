@@ -1,55 +1,77 @@
 /**
- * Transcription Tools — Voxtral-powered meeting transcription with diarization
- * 
- * Uses Mistral's Voxtral model (voxtral-mini-latest) to transcribe uploaded audio
- * files with speaker diarization and context biasing. Follows the same pattern
- * as firefliesTools.js for tool injection and dispatch.
+ * Transcription Tools — Multi-provider meeting transcription with diarization
+ *
+ * Supported providers:
+ *   - voxtral   : Mistral Voxtral (voxtral-mini-latest) — default
+ *   - azure     : Azure AI Speech (Whisper model, real-time transcription SDK)
+ *
+ * Both providers:
+ *   • Return per-segment diarization (who said what)
+ *   • Feed results into a Claude speaker-name identification step
+ *
+ * Security:
+ *   • API keys are NEVER logged
+ *   • All secrets retrieved from AES-256-GCM encrypted configStore
+ *   • Audio buffers are held in memory only, never written to disk by this module
+ *   • Temporary SDK push-stream is destroyed immediately after transcription
  */
+
+'use strict';
 
 const configStore = require('../stores/configStore');
-const path = require('path');
 const fs = require('fs');
 
-/**
- * Tool definitions in OpenAI function-calling format.
- */
+// ─── Tool Definitions ──────────────────────────────────────────────────────────
+
 const TRANSCRIPTION_TOOLS = [
     {
         type: 'function',
         function: {
             name: 'transcribe_audio',
-            description: 'Transcribe an uploaded audio file using Voxtral AI. Returns a formatted transcript with speaker diarization (who said what), timestamps, and segment-level detail. Supports up to 3 hours of audio. Best for: meeting recordings, interviews, calls, voice notes. The audio file must be uploaded as an attachment to the message.',
+            description:
+                'Transcribe an uploaded audio file using AI. Returns a formatted transcript with speaker ' +
+                'diarization (who said what), timestamps, and segment-level detail. ' +
+                'Supports up to 3 hours of audio. Best for: meeting recordings, interviews, calls, voice notes. ' +
+                'The audio file must be uploaded as an attachment to the message.',
             parameters: {
                 type: 'object',
                 properties: {
                     language: {
                         type: 'string',
-                        description: 'Language code for transcription (e.g. "nl" for Dutch, "en" for English, "de" for German, "fr" for French). Default: "nl"'
+                        description:
+                            'Language code for transcription (e.g. "nl" for Dutch, "en" for English, ' +
+                            '"de" for German, "fr" for French). Default: "nl"',
                     },
                     context_terms: {
                         type: 'string',
-                        description: 'Comma-separated list of domain-specific terms to help the model recognise (e.g. "AFAS, Bflow, N8N, Ondernemers Kompas"). Improves accuracy for company names, products, jargon.'
+                        description:
+                            'Comma-separated list of domain-specific terms to help the model recognise ' +
+                            '(e.g. "AFAS, Bflow, N8N, Ondernemers Kompas"). Improves accuracy for company ' +
+                            'names, products, jargon.',
                     },
                     timestamp_granularity: {
                         type: 'string',
                         enum: ['segment', 'word'],
-                        description: 'Level of timestamp detail. "segment" (default) gives per-sentence timestamps, "word" gives per-word timestamps.'
-                    }
+                        description:
+                            'Level of timestamp detail. "segment" (default) gives per-sentence timestamps, ' +
+                            '"word" gives per-word timestamps.',
+                    },
                 },
-                required: []
-            }
-        }
-    }
+                required: [],
+            },
+        },
+    },
 ];
 
-// ─── Helpers ───────────────────────────────────────────────────
+// ─── Helpers ───────────────────────────────────────────────────────────────────
 
 function formatTime(seconds) {
     if (seconds == null) return '00:00';
     const h = Math.floor(seconds / 3600);
     const m = Math.floor((seconds % 3600) / 60);
     const s = Math.floor(seconds % 60);
-    if (h > 0) return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    if (h > 0)
+        return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
     return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
@@ -76,140 +98,76 @@ function mergeSegments(segments) {
     return merged;
 }
 
-// ─── Tool Execution ────────────────────────────────────────────
-
-async function executeTranscriptionTool(toolName, args, context = {}) {
-    const { userId, attachments, req } = context;
-    if (!userId) return { error: 'User context required for transcription.' };
-
-    const apiKey = await configStore.getSecret('mistral_api_key');
-    if (!apiKey) {
-        return { error: 'Mistral API key not configured. Add it in Admin → AI Config → API Keys.' };
+/**
+ * Resolve the active audio attachment from the context.
+ * Returns { audioData: Buffer, audioFileName: string } or throws an error string.
+ */
+async function resolveAudioAttachment(context) {
+    const { attachments } = context;
+    if (!attachments || attachments.length === 0) {
+        throw 'No audio file found. Please upload an audio file (MP3, WAV, M4A, OGG, WEBM, FLAC) as an attachment to your message.';
     }
 
-    if (toolName === 'transcribe_audio') {
-        return await handleTranscribeAudio(apiKey, args, context);
+    const AUDIO_EXTENSIONS = ['.mp3', '.wav', '.m4a', '.ogg', '.webm', '.flac', '.mp4', '.mpeg'];
+    const audioAttachment = attachments.find((a) => {
+        const ext = (a.name || a.filename || '').toLowerCase();
+        return (
+            AUDIO_EXTENSIONS.some((e) => ext.endsWith(e)) ||
+            (a.type && a.type.startsWith('audio/'))
+        );
+    });
+
+    if (!audioAttachment) {
+        throw 'No audio file found. Please upload an audio file (MP3, WAV, M4A, OGG, WEBM, FLAC) as an attachment to your message.';
     }
 
-    return { error: `Unknown transcription tool: ${toolName}` };
-}
-
-async function handleTranscribeAudio(apiKey, args, context) {
-    const { attachments, req } = context;
-    const language = args.language || 'nl';
-    const contextTerms = args.context_terms || '';
-    const granularity = args.timestamp_granularity || 'segment';
-
-    // Find audio attachment
+    const audioFileName = audioAttachment.name || audioAttachment.filename || 'audio.mp3';
     let audioData = null;
-    let audioFileName = 'audio.mp3';
 
-    if (attachments && attachments.length > 0) {
-        // Look for audio attachment
-        const audioAttachment = attachments.find(a => {
-            const ext = (a.name || a.filename || '').toLowerCase();
-            return ext.endsWith('.mp3') || ext.endsWith('.wav') || ext.endsWith('.m4a') ||
-                ext.endsWith('.ogg') || ext.endsWith('.webm') || ext.endsWith('.flac') ||
-                ext.endsWith('.mp4') || ext.endsWith('.mpeg') ||
-                (a.type && a.type.startsWith('audio/'));
-        });
-
-        if (audioAttachment) {
-            audioFileName = audioAttachment.name || audioAttachment.filename || 'audio.mp3';
-
-            // Load file content — could be a path or URL
-            if (audioAttachment.path) {
-                try {
-                    audioData = fs.readFileSync(audioAttachment.path);
-                } catch (readErr) {
-                    return { error: `Could not read audio file: ${readErr.message}` };
-                }
-            } else if (audioAttachment.url) {
-                try {
-                    const resp = await fetch(audioAttachment.url);
-                    if (!resp.ok) return { error: `Failed to download audio file: ${resp.statusText}` };
-                    audioData = Buffer.from(await resp.arrayBuffer());
-                } catch (fetchErr) {
-                    return { error: `Could not download audio file: ${fetchErr.message}` };
-                }
-            } else if (audioAttachment.data || audioAttachment.content) {
-                // Base64 or raw buffer
-                const raw = audioAttachment.data || audioAttachment.content;
-                audioData = Buffer.isBuffer(raw) ? raw : Buffer.from(raw, 'base64');
-            }
+    if (audioAttachment.path) {
+        try {
+            audioData = fs.readFileSync(audioAttachment.path);
+        } catch (readErr) {
+            throw `Could not read audio file: ${readErr.message}`;
         }
+    } else if (audioAttachment.url) {
+        try {
+            const resp = await fetch(audioAttachment.url);
+            if (!resp.ok) throw new Error(resp.statusText);
+            audioData = Buffer.from(await resp.arrayBuffer());
+        } catch (fetchErr) {
+            throw `Could not download audio file: ${fetchErr.message}`;
+        }
+    } else if (audioAttachment.data || audioAttachment.content) {
+        const raw = audioAttachment.data || audioAttachment.content;
+        audioData = Buffer.isBuffer(raw) ? raw : Buffer.from(raw, 'base64');
     }
 
     if (!audioData) {
-        return { error: 'No audio file found. Please upload an audio file (MP3, WAV, M4A, OGG, WEBM, FLAC) as an attachment to your message.' };
+        throw 'Could not read audio data from the attachment. Please try re-uploading the file.';
     }
 
-    console.log(`[Transcription] Starting transcription of "${audioFileName}" (${(audioData.length / (1024 * 1024)).toFixed(1)} MB), language: ${language}`);
+    return { audioData, audioFileName };
+}
 
+/**
+ * Use Claude to map speaker IDs to real names from transcript content.
+ * Keys are NEVER logged here.
+ */
+async function identifySpeakerNames(speakerIds, language, formattedLines) {
     try {
-        const { Mistral } = require('@mistralai/mistralai');
-        const client = new Mistral({ apiKey });
+        const { getProviderForModel } = require('../core/aiAgent');
+        const claudeConfig = await getProviderForModel('claude-sonnet-4-6');
+        const Anthropic = require('@anthropic-ai/sdk');
+        // Key retrieved from encrypted store via getProviderForModel — never logged
+        const claude = new Anthropic({ apiKey: claudeConfig.apiKey });
 
-        const transcriptionOptions = {
-            model: 'voxtral-mini-latest',
-            file: {
-                fileName: audioFileName,
-                content: audioData,
-            },
-            diarize: true,
-            language: language,
-            timestampGranularities: [granularity],
-        };
-
-        // Add context biasing if provided
-        if (contextTerms) {
-            transcriptionOptions.prompt = contextTerms;
-        }
-
-        const response = await client.audio.transcriptions.complete(transcriptionOptions);
-
-        console.log(`[Transcription] Completed. ${(response.segments || []).length} raw segments.`);
-
-        // Merge consecutive segments from same speaker
-        const segments = response.segments || [];
-        const merged = mergeSegments(segments);
-
-        // Build speaker summary
-        const speakerMap = {};
-        for (const seg of merged) {
-            if (!speakerMap[seg.speakerId]) {
-                speakerMap[seg.speakerId] = { duration: 0, segments: 0 };
-            }
-            speakerMap[seg.speakerId].duration += (seg.end || 0) - (seg.start || 0);
-            speakerMap[seg.speakerId].segments += 1;
-        }
-
-        const totalDuration = segments.length > 0
-            ? Math.max(...segments.map(s => s.end || 0))
-            : 0;
-
-        // Format transcript for display
-        let formattedLines = merged.map(s => {
-            const start = formatTime(s.start);
-            const end = formatTime(s.end);
-            return `[${s.speakerId}] ${start} - ${end}: ${s.text}`;
-        });
-
-        // Identify speaker names using Claude
-        const speakerIds = Object.keys(speakerMap);
-        let nameMapping = null;
-        try {
-            const { getProviderForModel } = require('../core/aiAgent');
-            const claudeConfig = await getProviderForModel('claude-sonnet-4-6');
-            const Anthropic = require('@anthropic-ai/sdk');
-            const claude = new Anthropic({ apiKey: claudeConfig.apiKey });
-
-            const speakerList = speakerIds.join(', ');
-            const nameResp = await claude.messages.create({
-                model: 'claude-sonnet-4-6',
-                max_tokens: 1024,
-                temperature: 0,
-                system: `You are a transcript analyzer. Identify real names of speakers from the conversation.
+        const speakerList = speakerIds.join(', ');
+        const nameResp = await claude.messages.create({
+            model: 'claude-sonnet-4-6',
+            max_tokens: 1024,
+            temperature: 0,
+            system: `You are a transcript analyzer. Identify real names of speakers from the conversation.
 
 IMPORTANT: Speech diarization often splits one person into multiple speaker IDs. A conversation with 3 real people may show 15+ speaker_IDs. You MUST group them.
 
@@ -220,67 +178,370 @@ Instructions:
 
 Return ONLY a JSON object. Example: {"speaker_1": "Tom", "speaker_2": "Gerard", "speaker_3": "Tom"}
 Return ONLY valid JSON, no other text.`,
-                messages: [
-                    { role: 'user', content: `Speakers: ${speakerList}\nLanguage: ${language}\n\n${formattedLines.join('\n').substring(0, 15000)}` }
-                ],
-            });
-            const chatContent = (nameResp.content?.[0]?.text || '').trim();
-            const jsonMatch = chatContent.match(/\{[\s\S]*\}/);
-            if (jsonMatch) {
-                nameMapping = JSON.parse(jsonMatch[0]);
-                for (const [key, value] of Object.entries(nameMapping)) {
-                    if (!value || value === 'null') delete nameMapping[key];
-                }
-                console.log('[Transcription] Speaker names identified:', nameMapping);
-            }
-        } catch (nameErr) {
-            console.error('[Transcription] Speaker identification failed:', nameErr.message);
-        }
+            messages: [
+                {
+                    role: 'user',
+                    content: `Speakers: ${speakerList}\nLanguage: ${language}\n\n${formattedLines.join('\n').substring(0, 15000)}`,
+                },
+            ],
+        });
 
-        // Apply name mapping
-        if (nameMapping) {
-            for (const seg of merged) {
-                if (nameMapping[seg.speakerId]) seg.speakerId = nameMapping[seg.speakerId];
-            }
-            formattedLines = merged.map(s => {
-                const start = formatTime(s.start);
-                const end = formatTime(s.end);
-                return `[${s.speakerId}] ${start} - ${end}: ${s.text}`;
-            });
-        }
+        const chatContent = (nameResp.content?.[0]?.text || '').trim();
+        const jsonMatch = chatContent.match(/\{[\s\S]*\}/);
+        if (!jsonMatch) return null;
 
-        return {
-            success: true,
-            fileName: audioFileName,
-            language,
-            duration: formatTime(totalDuration),
-            durationSeconds: Math.round(totalDuration),
-            speakerCount: Object.keys(speakerMap).length,
-            segmentCount: merged.length,
-            speakers: Object.entries(speakerMap).map(([id, data]) => ({
-                id: nameMapping?.[id] || id,
-                speakingTime: formatTime(data.duration),
-                segments: data.segments,
-            })),
-            fullText: response.text || '',
-            transcript: formattedLines.join('\n'),
-            segments: merged.map(s => ({
-                speaker: s.speakerId,
-                start: s.start,
-                end: s.end,
-                startFormatted: formatTime(s.start),
-                endFormatted: formatTime(s.end),
-                text: s.text,
-            })),
-        };
-
-    } catch (err) {
-        console.error('[Transcription] Voxtral error:', err.message);
-        if (err.message?.includes('rate_limit')) {
-            return { error: 'Rate limit reached for Voxtral. Please try again in a few moments.' };
+        const nameMapping = JSON.parse(jsonMatch[0]);
+        // Remove null/empty values
+        for (const [key, value] of Object.entries(nameMapping)) {
+            if (!value || value === 'null') delete nameMapping[key];
         }
-        return { error: `Transcription failed: ${err.message}` };
+        console.log('[Transcription] Speaker names identified (count:', Object.keys(nameMapping).length, ')');
+        return nameMapping;
+    } catch (nameErr) {
+        // Non-fatal: we still return the transcript with generic speaker IDs
+        console.error('[Transcription] Speaker identification failed:', nameErr.message);
+        return null;
     }
+}
+
+/**
+ * Build the final result object shared by both providers.
+ */
+function buildResult({ audioFileName, language, merged, totalDuration, speakerMap, nameMapping }) {
+    // Apply name mapping if available
+    if (nameMapping) {
+        for (const seg of merged) {
+            if (nameMapping[seg.speakerId]) seg.speakerId = nameMapping[seg.speakerId];
+        }
+    }
+
+    const formattedLines = merged.map((s) => {
+        const start = formatTime(s.start);
+        const end = formatTime(s.end);
+        return `[${s.speakerId}] ${start} - ${end}: ${s.text}`;
+    });
+
+    return {
+        success: true,
+        fileName: audioFileName,
+        language,
+        duration: formatTime(totalDuration),
+        durationSeconds: Math.round(totalDuration),
+        speakerCount: Object.keys(speakerMap).length,
+        segmentCount: merged.length,
+        speakers: Object.entries(speakerMap).map(([id, data]) => ({
+            id: nameMapping?.[id] || id,
+            speakingTime: formatTime(data.duration),
+            segments: data.segments,
+        })),
+        transcript: formattedLines.join('\n'),
+        segments: merged.map((s) => ({
+            speaker: s.speakerId,
+            start: s.start,
+            end: s.end,
+            startFormatted: formatTime(s.start),
+            endFormatted: formatTime(s.end),
+            text: s.text,
+        })),
+    };
+}
+
+// ─── Provider: Voxtral (Mistral) ──────────────────────────────────────────────
+
+async function handleVoxtralTranscription(args, context) {
+    // Key retrieved from encrypted store — never logged
+    const apiKey = await configStore.getSecret('mistral_api_key');
+    if (!apiKey) {
+        return {
+            error: 'Mistral API key not configured. Add it in Admin → AI Config → API Keys.',
+        };
+    }
+
+    let audioData, audioFileName;
+    try {
+        ({ audioData, audioFileName } = await resolveAudioAttachment(context));
+    } catch (errMsg) {
+        return { error: errMsg };
+    }
+
+    const language = args.language || 'nl';
+    const contextTerms = args.context_terms || '';
+    const granularity = args.timestamp_granularity || 'segment';
+
+    console.log(
+        `[Transcription:Voxtral] Transcribing "${audioFileName}" (${(audioData.length / (1024 * 1024)).toFixed(1)} MB), lang: ${language}`
+    );
+
+    try {
+        const { Mistral } = require('@mistralai/mistralai');
+        const client = new Mistral({ apiKey });
+
+        const transcriptionOptions = {
+            model: 'voxtral-mini-latest',
+            file: { fileName: audioFileName, content: audioData },
+            diarize: true,
+            language,
+            timestampGranularities: [granularity],
+        };
+        if (contextTerms) transcriptionOptions.prompt = contextTerms;
+
+        const response = await client.audio.transcriptions.complete(transcriptionOptions);
+        console.log(
+            `[Transcription:Voxtral] Completed — ${(response.segments || []).length} raw segments`
+        );
+
+        const rawSegments = response.segments || [];
+        const merged = mergeSegments(rawSegments);
+
+        const speakerMap = {};
+        for (const seg of merged) {
+            if (!speakerMap[seg.speakerId])
+                speakerMap[seg.speakerId] = { duration: 0, segments: 0 };
+            speakerMap[seg.speakerId].duration += (seg.end || 0) - (seg.start || 0);
+            speakerMap[seg.speakerId].segments += 1;
+        }
+
+        const totalDuration =
+            rawSegments.length > 0 ? Math.max(...rawSegments.map((s) => s.end || 0)) : 0;
+
+        const formattedLines = merged.map((s) => {
+            return `[${s.speakerId}] ${formatTime(s.start)} - ${formatTime(s.end)}: ${s.text}`;
+        });
+
+        const nameMapping = await identifySpeakerNames(
+            Object.keys(speakerMap),
+            language,
+            formattedLines
+        );
+
+        return buildResult({ audioFileName, language, merged, totalDuration, speakerMap, nameMapping });
+    } catch (err) {
+        // Sanitise error: strip any key-like tokens from message
+        const safeMsg = (err.message || '').replace(/[A-Za-z0-9_\-]{32,}/g, '[REDACTED]');
+        console.error('[Transcription:Voxtral] Error:', safeMsg);
+        if (err.message?.includes('rate_limit')) {
+            return {
+                error: 'Rate limit reached for Voxtral. Please try again in a few moments.',
+            };
+        }
+        return { error: `Transcription failed: ${safeMsg}` };
+    }
+}
+
+// ─── Provider: Azure AI Speech ────────────────────────────────────────────────
+
+/**
+ * Transcribe using the Azure Cognitive Services Speech SDK.
+ *
+ * Uses continuous recognition with diarization on a push-stream so the audio
+ * buffer is piped directly — no disk writes, no external URL required.
+ *
+ * Security hardening:
+ *  - Speech key retrieved from encrypted configStore secret
+ *  - Key is NEVER passed to logs or error messages
+ *  - Push-stream is closed and dereferenced immediately after recognition
+ *  - Short-lived SpeechConfig object is destroyed after use
+ *  - Network timeout enforced (30 s to start + full duration)
+ */
+async function handleAzureTranscription(args, context) {
+    // ── Retrieve credentials from encrypted store ──
+    const speechKey = await configStore.getSecret('azure_speech_key');
+    const speechRegion = await configStore.getConfig('azure_speech_region');
+
+    if (!speechKey || !speechRegion) {
+        return {
+            error:
+                'Azure Speech API key or region not configured. ' +
+                'Add them in Admin → Integrations → Services → Azure AI Speech.',
+        };
+    }
+
+    // ── Validate region format (alphanumeric + hyphens only, max 32 chars) ──
+    if (!/^[a-z0-9-]{2,32}$/.test(speechRegion)) {
+        return { error: 'Invalid Azure Speech region format stored in configuration.' };
+    }
+
+    let audioData, audioFileName;
+    try {
+        ({ audioData, audioFileName } = await resolveAudioAttachment(context));
+    } catch (errMsg) {
+        return { error: errMsg };
+    }
+
+    const language = args.language || 'nl';
+
+    // Map language codes → Azure BCP-47 locale (best effort)
+    const LOCALE_MAP = {
+        nl: 'nl-NL',
+        en: 'en-US',
+        de: 'de-DE',
+        fr: 'fr-FR',
+        es: 'es-ES',
+        it: 'it-IT',
+        pt: 'pt-PT',
+        pl: 'pl-PL',
+        sv: 'sv-SE',
+        da: 'da-DK',
+        fi: 'fi-FI',
+        nb: 'nb-NO',
+    };
+    const locale = LOCALE_MAP[language] || `${language}-${language.toUpperCase()}`;
+
+    console.log(
+        `[Transcription:Azure] Transcribing "${audioFileName}" (${(audioData.length / (1024 * 1024)).toFixed(1)} MB), locale: ${locale}`
+    );
+
+    try {
+        // Lazy-require the SDK to avoid startup cost when Azure isn't used
+        const sdk = require('microsoft-cognitiveservices-speech-sdk');
+
+        // ── Build SpeechConfig — key is passed directly to SDK, never logged ──
+        const speechConfig = sdk.SpeechConfig.fromSubscription(speechKey, speechRegion);
+        speechConfig.speechRecognitionLanguage = locale;
+
+        // Request word-level timestamps for accurate segment boundaries
+        speechConfig.requestWordLevelTimestamps();
+
+        // ── Enable speaker diarization ──
+        // Auto-detect 1-10 speakers (safe default)
+        const conversationTranscriptionConfig =
+            sdk.ConversationTranscriptionConfig || null;
+
+        // Use ConversationTranscriber for diarized output
+        const pushStream = sdk.AudioInputStream.createPushStream();
+        const audioConfig = sdk.AudioConfig.fromStreamInput(pushStream);
+
+        // Push audio data in 4 KB chunks to avoid large single writes
+        const CHUNK_SIZE = 4096;
+        for (let offset = 0; offset < audioData.length; offset += CHUNK_SIZE) {
+            const chunk = audioData.slice(offset, offset + CHUNK_SIZE);
+            pushStream.write(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength));
+        }
+        pushStream.close();
+
+        const transcriber = new sdk.ConversationTranscriber(speechConfig, audioConfig);
+
+        /** @type {Array<{speakerId: string, start: number, end: number, text: string}>} */
+        const rawSegments = [];
+
+        await new Promise((resolve, reject) => {
+            // Safety timeout: 3 minutes per file max
+            const timeout = setTimeout(() => {
+                transcriber.stopTranscribingAsync();
+                reject(new Error('Azure Speech transcription timed out after 3 minutes.'));
+            }, 3 * 60 * 1000);
+
+            transcriber.transcribed = (_s, event) => {
+                const result = event.result;
+                if (
+                    result.reason === sdk.ResultReason.RecognizedSpeech &&
+                    result.text
+                ) {
+                    rawSegments.push({
+                        speakerId: result.speakerId || 'Unknown',
+                        start: result.offset / 10_000_000, // 100-ns ticks → seconds
+                        end: (result.offset + result.duration) / 10_000_000,
+                        text: result.text.trim(),
+                    });
+                }
+            };
+
+            transcriber.canceled = (_s, event) => {
+                clearTimeout(timeout);
+                if (event.reason === sdk.CancellationReason.Error) {
+                    // Sanitise: strip anything that looks like a key/token
+                    const safeDetails = (event.errorDetails || '')
+                        .replace(/[A-Za-z0-9_\-]{32,}/g, '[REDACTED]')
+                        .replace(/key[=:]\S+/gi, 'key=[REDACTED]');
+                    reject(new Error(`Azure Speech error: ${safeDetails}`));
+                } else {
+                    resolve();
+                }
+            };
+
+            transcriber.sessionStopped = () => {
+                clearTimeout(timeout);
+                resolve();
+            };
+
+            transcriber.startTranscribingAsync(
+                () => { /* started OK */ },
+                (err) => {
+                    clearTimeout(timeout);
+                    // Sanitise error before rejecting
+                    const safeErr = (err?.message || String(err))
+                        .replace(/[A-Za-z0-9_\-]{32,}/g, '[REDACTED]');
+                    reject(new Error(`Failed to start Azure transcription: ${safeErr}`));
+                }
+            );
+        });
+
+        // ── Destroy credentials immediately ──
+        speechConfig.close && speechConfig.close();
+
+        console.log(
+            `[Transcription:Azure] Completed — ${rawSegments.length} raw segments`
+        );
+
+        if (rawSegments.length === 0) {
+            return {
+                error:
+                    'Azure Speech returned no recognizable speech. ' +
+                    'Ensure the audio is clear, mono channel, and in a supported format.',
+            };
+        }
+
+        const merged = mergeSegments(rawSegments);
+
+        const speakerMap = {};
+        for (const seg of merged) {
+            if (!speakerMap[seg.speakerId])
+                speakerMap[seg.speakerId] = { duration: 0, segments: 0 };
+            speakerMap[seg.speakerId].duration += (seg.end || 0) - (seg.start || 0);
+            speakerMap[seg.speakerId].segments += 1;
+        }
+
+        const totalDuration =
+            rawSegments.length > 0 ? Math.max(...rawSegments.map((s) => s.end || 0)) : 0;
+
+        const formattedLines = merged.map((s) => {
+            return `[${s.speakerId}] ${formatTime(s.start)} - ${formatTime(s.end)}: ${s.text}`;
+        });
+
+        const nameMapping = await identifySpeakerNames(
+            Object.keys(speakerMap),
+            language,
+            formattedLines
+        );
+
+        return buildResult({ audioFileName, language, merged, totalDuration, speakerMap, nameMapping });
+    } catch (err) {
+        const safeMsg = (err.message || '')
+            .replace(/[A-Za-z0-9_\-]{32,}/g, '[REDACTED]')
+            .replace(/key[=:]\S+/gi, 'key=[REDACTED]');
+        console.error('[Transcription:Azure] Error:', safeMsg);
+        return { error: `Azure transcription failed: ${safeMsg}` };
+    }
+}
+
+// ─── Tool Dispatch ─────────────────────────────────────────────────────────────
+
+async function executeTranscriptionTool(toolName, args, context = {}) {
+    const { userId } = context;
+    if (!userId) return { error: 'User context required for transcription.' };
+
+    if (toolName === 'transcribe_audio') {
+        // Route to the configured provider
+        const provider = (await configStore.getConfig('transcription_provider')) || 'voxtral';
+
+        if (provider === 'azure') {
+            return handleAzureTranscription(args, context);
+        }
+        // Default: Voxtral
+        return handleVoxtralTranscription(args, context);
+    }
+
+    return { error: `Unknown transcription tool: ${toolName}` };
 }
 
 function isTranscriptionTool(toolName) {

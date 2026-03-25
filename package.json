@@ -46,6 +46,7 @@
     "ioredis": "^5.10.0",
     "jsdom": "^28.1.0",
     "mammoth": "^1.11.0",
+    "microsoft-cognitiveservices-speech-sdk": "^1.48.0",
     "multer": "^1.4.5-lts.1",
     "neo4j-driver": "^5.26.0",
     "node-fetch": "^2.7.0",

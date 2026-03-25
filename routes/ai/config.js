@@ -73,6 +73,10 @@ router.get('/config', async (req, res) => {
         hasAzureOpenaiEmbeddingKey: !!(await configStore.getSecret('azure_openai_embedding_key')),
         azureOpenaiEmbeddingModel: await configStore.getConfig('azure_openai_embedding_model') || 'text-embedding-3-small',
         useAzureDocProcessing: !!(await configStore.getConfig('use_azure_doc_processing')),
+        // Azure AI Speech (Meeting Transcription)
+        hasAzureSpeechKey: !!(await configStore.getSecret('azure_speech_key')),
+        azureSpeechRegion: await configStore.getConfig('azure_speech_region') || '',
+        transcriptionProvider: await configStore.getConfig('transcription_provider') || 'voxtral',
         // Service Email (Gmail SMTP)
         hasServiceEmail: !!(await configStore.getConfig('service_email_address')) && !!(await configStore.getSecret('service_email_password')),
         serviceEmailAddress: await configStore.getConfig('service_email_address') || '',
@@ -81,7 +85,7 @@ router.get('/config', async (req, res) => {
 });
 
 router.post('/config', async (req, res) => {
-    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, minimaxApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, llamaGuardConfig, moderationProvider, azureContentSafetyEndpoint, azureContentSafetyKey, azureContentSafetySeverityThreshold, azureContentSafetyCategories, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionScope, piiDetectionAction, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing, serviceEmailAddress, serviceEmailPassword, serviceEmailDisplayName } = req.body;
+    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, minimaxApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, llamaGuardConfig, moderationProvider, azureContentSafetyEndpoint, azureContentSafetyKey, azureContentSafetySeverityThreshold, azureContentSafetyCategories, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionScope, piiDetectionAction, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing, serviceEmailAddress, serviceEmailPassword, serviceEmailDisplayName, azureSpeechKey, azureSpeechRegion, transcriptionProvider } = req.body;
     const existing = await getAIConfig();
 
     if (allowedModelsByAgentType !== undefined) {
@@ -142,6 +146,25 @@ router.post('/config', async (req, res) => {
     }
     if (useAzureDocProcessing !== undefined) {
         await configStore.setConfig('use_azure_doc_processing', useAzureDocProcessing ? 'true' : '');
+    }
+    // Azure AI Speech (Meeting Transcription)
+    if (azureSpeechKey !== undefined) {
+        await configStore.setSecret('azure_speech_key', azureSpeechKey || '');
+    }
+    if (azureSpeechRegion !== undefined) {
+        // Validate region format before storing
+        const region = (azureSpeechRegion || '').trim().toLowerCase();
+        if (region && !/^[a-z0-9-]{2,32}$/.test(region)) {
+            return res.status(400).json({ error: 'Invalid Azure Speech region format. Use a region like "westeurope" or "eastus".' });
+        }
+        await configStore.setConfig('azure_speech_region', region);
+    }
+    if (transcriptionProvider !== undefined) {
+        const allowed = ['voxtral', 'azure'];
+        if (transcriptionProvider && !allowed.includes(transcriptionProvider)) {
+            return res.status(400).json({ error: `Invalid transcription provider. Allowed: ${allowed.join(', ')}` });
+        }
+        await configStore.setConfig('transcription_provider', transcriptionProvider || 'voxtral');
     }
     // Service Email (Gmail SMTP)
     if (serviceEmailAddress !== undefined) {

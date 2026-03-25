@@ -58,6 +58,7 @@ router.post('/chat/template/stream', requireAuth, async (req, res) => {
     // Resolve provider
     let config;
     let adapter;
+
     try {
         config = await getProviderForModel(modelId);
         adapter = getAdapter(config.providerType, (config.url || '').replace(/\/+$/, ''));
