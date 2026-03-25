@@ -645,23 +645,11 @@ async function handleAzureWhisperTranscription(args, context) {
         // ── Step 3: Create batch transcription job ──
         const speechApiBase = `https://${speechRegion}.api.cognitive.microsoft.com/speechtotext/v3.2`;
 
-        // First, fetch the exact Whisper model URI for this region
-        const modelsResp = await fetch(`${speechApiBase}/models/base`, {
-            headers: { 'Ocp-Apim-Subscription-Key': speechKey }
-        });
-        if (!modelsResp.ok) throw new Error(`Could not fetch Azure models: HTTP ${modelsResp.status}`);
-        const modelsData = await modelsResp.json();
-        const whisperModel = (modelsData.values || []).find(m => /whisper/i.test(m.displayName));
-
-        if (!whisperModel || !whisperModel.self) {
-            throw new Error(`Azure Whisper model not available in region ${speechRegion}`);
-        }
-
         const jobBody = {
             contentUrls: [audioUrl],
             locale,
             displayName: `beeflow-${Date.now()}`,
-            model: { self: whisperModel.self },
+            model: { self: `${speechApiBase}/models/base/whisper` },
             properties: {
                 diarizationEnabled: true,
                 wordLevelTimestampsEnabled: true,
@@ -679,6 +667,9 @@ async function handleAzureWhisperTranscription(args, context) {
         });
         if (!createResp.ok) {
             const errText = await createResp.text().catch(() => '');
+            if (errText.includes('not a valid entity reference')) {
+                throw new Error('Azure rejected the Whisper model. This is usually because your Azure Speech resource is on the Free (F0) tier (Whisper requires Standard S0), or the region does not support it.');
+            }
             throw new Error(`Azure Whisper job creation failed (${createResp.status}): ${errText.replace(/[A-Za-z0-9_\-]{32,}/g, '[REDACTED]').substring(0, 300)}`);
         }
         const job = await createResp.json();
