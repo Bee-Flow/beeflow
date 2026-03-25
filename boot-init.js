@@ -15,6 +15,13 @@
  *   INIT_AZURE_API_VERSION    — Azure OpenAI API version
  *   INIT_AZURE_MODELS         — Azure OpenAI deployment models (comma-separated)
  *   INIT_BING_SEARCH_KEY      — Bing Search API key
+ *   INIT_BING_SEARCH_MARKET   — Bing Search market (e.g. en-US, nl-NL)
+ *   INIT_SEARCH_PROVIDER      — Search provider: 'bing' | 'agent-search' | ''
+ *   INIT_SERPER_API_KEY       — Serper.dev API key (for agent-search web search)
+ *   INIT_AI_PROVIDER          — Generic AI provider: 'openai' | 'google' | 'mistral' | 'claude'
+ *   INIT_GENERIC_API_KEY      — API key for the generic AI provider above
+ *   INIT_CHAT_MODEL_TIERS     — JSON: { fast, thinking, writer, pro } each { modelId }
+ *   INIT_OFFICE_APPS_ENABLED  — 'true' | 'false' — enables Office 365 integration
  */
 
 const bcrypt = require('bcryptjs');
@@ -29,9 +36,18 @@ async function runBootInit() {
     const azureApiVersion = process.env.INIT_AZURE_API_VERSION;
     const azureModels = process.env.INIT_AZURE_MODELS;
     const bingSearchKey = process.env.INIT_BING_SEARCH_KEY;
+    const bingSearchMarket = process.env.INIT_BING_SEARCH_MARKET;
+    const searchProvider = process.env.INIT_SEARCH_PROVIDER;
+    const serperApiKey = process.env.INIT_SERPER_API_KEY;
+    const aiProvider = process.env.INIT_AI_PROVIDER;
+    const genericApiKey = process.env.INIT_GENERIC_API_KEY;
+    const chatModelTiersRaw = process.env.INIT_CHAT_MODEL_TIERS;
+    const officeAppsEnabled = process.env.INIT_OFFICE_APPS_ENABLED;
 
     // Skip if no INIT_ vars are set
-    const hasAny = adminPassword || msClientId || msClientSecret || azureEndpoint || azureApiKey || bingSearchKey;
+    const hasAny = adminPassword || msClientId || msClientSecret || azureEndpoint || azureApiKey
+        || bingSearchKey || serperApiKey || aiProvider || genericApiKey || chatModelTiersRaw
+        || searchProvider;
     if (!hasAny) return;
 
     console.log('[boot-init] Found INIT_* environment variables, running first-boot setup...');
@@ -125,8 +141,78 @@ async function runBootInit() {
         if (bingSearchKey) {
             await retry(async () => {
                 await configStore.setSecret('bing_search_key', bingSearchKey);
-                console.log('[boot-init] ✅ Bing Search key configured');
+                if (bingSearchMarket) await configStore.setConfig('bing_search_market', bingSearchMarket);
+                console.log('[boot-init] ✅ Bing Search configured');
             }, 'Bing Search');
+        }
+
+        // ── 5. Search provider + Serper ─────────────────────────────
+        if (searchProvider) {
+            await retry(async () => {
+                await configStore.setConfig('search_provider', searchProvider);
+                console.log(`[boot-init] ✅ Search provider set to: ${searchProvider}`);
+            }, 'Search Provider');
+        }
+        if (serperApiKey) {
+            await retry(async () => {
+                await configStore.setSecret('serper_api_key', serperApiKey);
+                console.log('[boot-init] ✅ Serper API key saved');
+            }, 'Serper API Key');
+        }
+
+        // ── 6. Generic AI provider key ──────────────────────────────
+        // Maps aiProvider ('openai', 'google', 'mistral', 'claude') to
+        // the configStore secret key used by the server.
+        if (aiProvider && genericApiKey) {
+            const secretKeyMap = {
+                openai:  'openai_api_key',
+                google:  'google_api_key',
+                mistral: 'mistral_api_key',
+                claude:  'claude_api_key',
+            };
+            const secretKey = secretKeyMap[aiProvider];
+            if (secretKey) {
+                await retry(async () => {
+                    await configStore.setSecret(secretKey, genericApiKey);
+                    console.log(`[boot-init] ✅ ${aiProvider} API key saved`);
+                }, `${aiProvider} API Key`);
+            } else {
+                console.warn(`[boot-init] Unknown AI provider: ${aiProvider}`);
+            }
+        }
+
+        // ── 7. Model tier configuration ─────────────────────────────
+        // Tiers are stored in configStore ('chat_model_tiers') as:
+        // { fast: { modelId }, thinking: { modelId }, writer: { modelId }, pro: { modelId } }
+        if (chatModelTiersRaw) {
+            await retry(async () => {
+                const incoming = JSON.parse(chatModelTiersRaw);
+                const existing = await configStore.getConfig('chat_model_tiers') || {};
+                const merged = {
+                    fast:     { modelId: '', label: 'Fast',          ...(existing.fast     || {}), ...(incoming.fast     || {}) },
+                    thinking: { modelId: '', label: 'Thinking',      ...(existing.thinking || {}), ...(incoming.thinking || {}) },
+                    writer:   { modelId: '', label: 'Writer',        ...(existing.writer   || {}), ...(incoming.writer   || {}) },
+                    pro:      { modelId: '', label: 'Deep Thinking',  ...(existing.pro      || {}), ...(incoming.pro      || {}) },
+                };
+                // Remove empty modelIds so auto-selection still works
+                for (const key of Object.keys(merged)) {
+                    if (!merged[key].modelId) delete merged[key].modelId;
+                }
+                await configStore.setConfig('chat_model_tiers', merged);
+                const set = Object.entries(incoming)
+                    .filter(([, v]) => v?.modelId)
+                    .map(([k, v]) => `${k}=${v.modelId}`)
+                    .join(', ');
+                console.log(`[boot-init] ✅ Model tiers configured: ${set || '(none set)'}`);
+            }, 'Model Tiers');
+        }
+
+        // ── 8. Office 365 integration flag ──────────────────────────
+        if (officeAppsEnabled) {
+            await retry(async () => {
+                await configStore.setConfig('office_apps_enabled', officeAppsEnabled === 'true' ? 'true' : '');
+                console.log(`[boot-init] ✅ Office Apps: ${officeAppsEnabled}`);
+            }, 'Office Apps');
         }
 
         console.log('[boot-init] First-boot setup complete');
