@@ -185,58 +185,74 @@ async function resolveAudioAttachment(context) {
 }
 
 /**
- * Use Claude to map speaker IDs to real names from transcript content.
- * Keys are NEVER logged here.
+ * Use the configured fast-tier LLM to map speaker IDs → real names.
+ *
+ * @param {string[]} speakerIds   - All unique speaker IDs from diarisation
+ * @param {string}   language     - Recording language (for context)
+ * @param {string[]} formattedLines - Formatted transcript lines for context
+ * @param {string}  [userName]    - Logged-in user's display name (used as anchor hint)
  */
-async function identifySpeakerNames(speakerIds, language, formattedLines) {
+async function identifySpeakerNames(speakerIds, language, formattedLines, userName) {
     try {
-        const { getProviderForModel } = require('../core/aiAgent');
-        const claudeConfig = await getProviderForModel('claude-sonnet-4-6');
-        const Anthropic = require('@anthropic-ai/sdk');
-        // Key retrieved from encrypted store via getProviderForModel — never logged
-        const claude = new Anthropic({ apiKey: claudeConfig.apiKey });
+        const llmClient = require('../core/llmClient');
+
+        // Resolve fast tier model (same pattern as compaction.js)
+        let modelId = 'tier:fast';
+        try {
+            const tiers = await configStore.getConfig('chat_model_tiers') || {};
+            modelId = tiers['fast']?.modelId || 'gemini-2.0-flash-lite';
+        } catch (_) {
+            modelId = 'gemini-2.0-flash-lite';
+        }
 
         const speakerList = speakerIds.join(', ');
-        const nameResp = await claude.messages.create({
-            model: 'claude-sonnet-4-6',
-            max_tokens: 1024,
-            temperature: 0,
-            system: `You are a transcript analyzer. Identify real names of speakers from the conversation.
+        const userHint = userName
+            ? `\n\nIMPORTANT HINT: The person who made this recording is named "${userName}". Look at the conversation content to identify which speaker is most likely "${userName}" — they are probably the one speaking most or initiating the conversation. Prioritize this name assignment.`
+            : '';
 
-IMPORTANT: Speech diarization often splits one person into multiple speaker IDs. A conversation with 3 real people may show 15+ speaker_IDs. You MUST group them.
+        const systemPrompt = `You are an expert transcript analyst specializing in speaker diarization.
 
-Instructions:
-1. Map EVERY speaker_ID to a real name. Multiple IDs will map to the SAME person.
-2. If a speaker_ID has very few segments, assign them to the most likely existing speaker.
-3. NEVER return null. Every speaker_ID must get a name string.
+Your task: Map EVERY speaker ID to a real person's first name.
 
-Return ONLY a JSON object. Example: {"speaker_1": "Tom", "speaker_2": "Gerard", "speaker_3": "Tom"}
-Return ONLY valid JSON, no other text.`,
-            messages: [
-                {
-                    role: 'user',
-                    content: `Speakers: ${speakerList}\nLanguage: ${language}\n\n${formattedLines.join('\n').substring(0, 15000)}`,
-                },
-            ],
-        });
+Key rules:
+1. Diarization often creates MULTIPLE IDs for ONE person. A meeting with 3 people may have 10+ speaker IDs.
+2. Group speaker IDs who sound similar, speak consecutively, or share speaking patterns.
+3. Assign a FIRST NAME to every speaker ID — never return null or empty.
+4. If you cannot determine a name, use "Speaker A", "Speaker B", etc.
+5. Multiple IDs MUST map to the same name when they belong to the same person.${userHint}
 
-        const chatContent = (nameResp.content?.[0]?.text || '').trim();
+Return ONLY a valid JSON object mapping every speaker ID to a name.
+Example: {"Guest-1": "Tom", "Guest-2": "Tom", "Guest-3": "Gerard", "Guest-4": "Gerard"}
+No explanation, no markdown, ONLY the JSON object.`;
+
+        const userContent = `Speaker IDs: ${speakerList}
+Language: ${language}
+
+Transcript (first 20,000 characters):
+${formattedLines.join('\n').substring(0, 20000)}`;
+
+        const result = await llmClient.chat(modelId, [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userContent },
+        ], { maxTokens: 512, temperature: 0 });
+
+        const chatContent = (result.content || '').trim();
         const jsonMatch = chatContent.match(/\{[\s\S]*\}/);
         if (!jsonMatch) return null;
 
         const nameMapping = JSON.parse(jsonMatch[0]);
-        // Remove null/empty values
+        // Remove null/empty/literal-null values
         for (const [key, value] of Object.entries(nameMapping)) {
-            if (!value || value === 'null') delete nameMapping[key];
+            if (!value || value === 'null' || value === 'unknown') delete nameMapping[key];
         }
-        console.log('[Transcription] Speaker names identified (count:', Object.keys(nameMapping).length, ')');
+        console.log(`[Transcription] Speaker names identified via ${modelId}: ${JSON.stringify(nameMapping)}`);
         return nameMapping;
     } catch (nameErr) {
-        // Non-fatal: we still return the transcript with generic speaker IDs
         console.error('[Transcription] Speaker identification failed:', nameErr.message);
         return null;
     }
 }
+
 
 /**
  * Build the final result object shared by both providers.
@@ -345,7 +361,8 @@ async function handleVoxtralTranscription(args, context) {
         const nameMapping = await identifySpeakerNames(
             Object.keys(speakerMap),
             language,
-            formattedLines
+            formattedLines,
+            args.userName
         );
 
         return buildResult({ audioFileName, language, merged, totalDuration, speakerMap, nameMapping });
@@ -516,7 +533,8 @@ async function handleAzureTranscription(args, context) {
             `[${s.speakerId}] ${formatTime(s.start)} - ${formatTime(s.end)}: ${s.text}`
         );
 
-        const nameMapping = await identifySpeakerNames(Object.keys(speakerMap), language, formattedLines);
+        const nameMapping = await identifySpeakerNames(Object.keys(speakerMap), language, formattedLines, args.userName);
+
 
         return buildResult({ audioFileName, language, merged, totalDuration, speakerMap, nameMapping });
     } catch (err) {
@@ -675,7 +693,8 @@ async function handleWhisperXTranscription(args, context) {
         const formattedLines = merged.map(s =>
             `[${s.speakerId}] ${formatTime(s.start)} - ${formatTime(s.end)}: ${s.text}`
         );
-        const nameMapping = await identifySpeakerNames(Object.keys(speakerMap), language, formattedLines);
+        const nameMapping = await identifySpeakerNames(Object.keys(speakerMap), language, formattedLines, args.userName);
+
         return buildResult({ audioFileName, language, merged, totalDuration, speakerMap, nameMapping });
 
     } catch (err) {

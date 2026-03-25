@@ -15,6 +15,7 @@ const path = require('path');
 const fs = require('fs');
 const transcriptionStore = require('../stores/transcriptionStore');
 const configStore = require('../stores/configStore');
+const { getUser } = require('../stores/userStore');
 
 function formatDuration(seconds) {
     if (!seconds) return '0:00';
@@ -56,74 +57,65 @@ async function getClaudeClient() {
 /**
  * Use Claude to identify speaker names from transcript context.
  */
-async function identifySpeakerNames(transcript, speakerIds, language) {
+async function identifySpeakerNames(transcript, speakerIds, language, userName) {
     try {
-        const client = await getClaudeClient();
+        const llmClient = require('../core/llmClient');
+
+        // Resolve fast tier model (same pattern as compaction.js)
+        let modelId;
+        try {
+            const tiers = await configStore.getConfig('chat_model_tiers') || {};
+            modelId = tiers['fast']?.modelId || 'gemini-2.0-flash-lite';
+        } catch (_) {
+            modelId = 'gemini-2.0-flash-lite';
+        }
 
         const speakerList = speakerIds.join(', ');
-        const response = await client.messages.create({
-            model: 'claude-opus-4-6',
-            max_tokens: 1024,
-            temperature: 0,
-            system: `You are a transcript analyzer. Identify the real names of the people who are ACTUALLY SPEAKING in this meeting.
+        const userHint = userName
+            ? `\n\nSTRONG HINT: The person who recorded this meeting is named "${userName}". They are almost certainly one of the speakers. Identify which speaker ID(s) belong to "${userName}" by looking at who speaks most, who introduces the meeting, or who uses first-person statements. Map those IDs to "${userName}".`
+            : '';
 
-CRITICAL DISTINCTION — Speaking vs. Being Mentioned:
-- A person is a SPEAKER if they introduce themselves ("I am Tom", "Ik ben Tom") or are directly addressed by another speaker ("Tom, what do you think?", "Tom, jij ook?").
-- A person is merely MENTIONED if others talk ABOUT them in the third person ("Wesley zit daar ook", "We should ask Wesley", "Als Wesley er nou bij was"). Being mentioned does NOT make someone a speaker.
-- NEVER assign the name of a person who is only talked about to a speaker_ID. Only use names of people who are actually present and speaking in the meeting.
+        const systemPrompt = `You are a transcript analyst. Identify who is actually SPEAKING in this transcript.
 
-DIARIZATION CONTEXT: Speech diarization often splits one person into multiple speaker IDs. A meeting with 3 real speakers may show 10+ speaker_IDs. You MUST group them correctly.
+CRITICAL — Speaking vs. Being Mentioned:
+- A person is a SPEAKER if they introduce themselves ("I am Tom", "Ik ben Tom") or are directly addressed ("Tom, what do you think?").
+- A person is merely MENTIONED if others talk ABOUT them in third person. Being mentioned does NOT make someone a speaker.
+- NEVER assign the name of a mentioned-but-absent person to a speaker ID.
 
-Instructions:
-1. Read the FULL transcript and identify which named people are actually SPEAKING (present in the room, taking turns) vs. which are just being discussed/referenced.
-2. Map EVERY speaker_ID to a real speaker's first name. Multiple speaker_IDs often map to the SAME person — this is expected.
-3. Use ONLY simple first names (e.g. "Tom", "Gerard"). No descriptions or qualifiers.
-4. If you can only identify some speakers by name, use "Speaker A", "Speaker B" etc. for unidentified ones — do NOT guess with names of mentioned-but-absent people.
-5. NEVER return null. Every speaker_ID must get a name string.
+DIARIZATION: One person often gets multiple speaker IDs. Map them all to the same name.
 
-Return ONLY a JSON object. Example: {"speaker_1": "Tom", "speaker_2": "Gerard", "speaker_3": "Tom", "speaker_4": "Speaker A"}
+Rules:
+1. Map EVERY speaker_ID to a first name (or "Speaker A", "Speaker B" if unknown).
+2. Multiple IDs can map to the same name — this is expected.
+3. Never return null. All IDs must get a value.${userHint}
 
-IMPORTANT: Return ONLY valid JSON, no other text. No null values.`,
-            messages: [
-                { role: 'user', content: `Speakers: ${speakerList}\nLanguage: ${language}\n\n${transcript.substring(0, 100000)}` }
-            ],
-        });
+Return ONLY a JSON object: {"speaker_1": "Tom", "speaker_2": "Gerard", "speaker_3": "Tom"}
+No explanation, no markdown, ONLY valid JSON.`;
 
-        const content = (response.content?.[0]?.text || '').trim();
-        // Extract the first valid JSON object from the response
+        const result = await llmClient.chat(modelId, [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: `Speakers: ${speakerList}\nLanguage: ${language}\n\n${transcript.substring(0, 60000)}` },
+        ], { maxTokens: 512, temperature: 0 });
+
+        const content = (result.content || '').trim();
         const jsonStart = content.indexOf('{');
         const jsonEnd = content.lastIndexOf('}');
         if (jsonStart !== -1 && jsonEnd > jsonStart) {
-            const jsonStr = content.substring(jsonStart, jsonEnd + 1);
-            let mapping;
-            try {
-                mapping = JSON.parse(jsonStr);
-            } catch {
-                // If full range fails, try to find a balanced JSON object
-                let depth = 0, end = -1;
-                for (let i = jsonStart; i < content.length; i++) {
-                    if (content[i] === '{') depth++;
-                    else if (content[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
-                }
-                if (end > jsonStart) {
-                    mapping = JSON.parse(content.substring(jsonStart, end + 1));
+            const mapping = JSON.parse(content.substring(jsonStart, jsonEnd + 1));
+            for (const [key, value] of Object.entries(mapping)) {
+                if (!value || value === 'null' || value === 'unknown' || value === 'Unknown') {
+                    delete mapping[key];
                 }
             }
-            if (mapping) {
-                for (const [key, value] of Object.entries(mapping)) {
-                    if (!value || value === 'null' || value === 'unknown' || value === 'Unknown') {
-                        delete mapping[key];
-                    }
-                }
-                console.log('[Transcriptions] Speaker names identified:', mapping);
-                return mapping;
-            }
+            console.log(`[Transcriptions] Speaker names via ${modelId}:`, mapping);
+            return mapping;
         }
     } catch (err) {
         console.error('[Transcriptions] Speaker identification failed:', err.message);
     }
     return null;
 }
+
 
 /**
  * Generate a structured meeting summary using Claude.
@@ -462,10 +454,17 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
         const fileContent = fs.readFileSync(req.file.path);
         const fileName = req.file.originalname || 'audio.mp3';
 
+        // Fetch the logged-in user's display name for speaker ID anchoring
+        let userName = null;
+        try {
+            const userRecord = await getUser(userId);
+            userName = userRecord?.firstName || userRecord?.displayName || null;
+        } catch (_) {}
+
         // Always read the active provider from admin config — never trust the client
         const provider = await configStore.getConfig('transcription_provider') || 'voxtral';
 
-        console.log(`[Transcriptions] Transcribing "${fileName}" (${(fileContent.length / (1024 * 1024)).toFixed(1)} MB) via ${provider} for user ${userId}`);
+        console.log(`[Transcriptions] Transcribing "${fileName}" (${(fileContent.length / (1024 * 1024)).toFixed(1)} MB) via ${provider} for user ${userId} (${userName || 'unknown'})`);
 
         let response;
 
@@ -627,9 +626,9 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
             segments: data.segments,
         }));
 
-        // Identify speaker names using Claude
+        // Identify speaker names using fast-tier model
         const speakerIds = Object.keys(speakerMap);
-        const nameMapping = await identifySpeakerNames(transcript, speakerIds, language);
+        const nameMapping = await identifySpeakerNames(transcript, speakerIds, language, userName);
 
         if (nameMapping) {
             // Apply name mapping to segments
@@ -850,7 +849,10 @@ router.post('/:id/reprocess', requireAuth, async (req, res) => {
 
         // Speaker identification
         const speakerIds = Object.keys(speakerMap);
-        const nameMapping = await identifySpeakerNames(transcript, speakerIds, language);
+        // Look up user name for reprocess route too
+        let reprocessUserName = null;
+        try { const u = await getUser(req.session.user.id); reprocessUserName = u?.firstName || u?.displayName || null; } catch (_) {}
+        const nameMapping = await identifySpeakerNames(transcript, speakerIds, language, reprocessUserName);
         if (nameMapping) {
             for (const seg of merged) { if (nameMapping[seg.speaker]) seg.speaker = nameMapping[seg.speaker]; }
             transcript = merged.map(s => `[${s.speaker}] ${formatTime(s.start)} - ${formatTime(s.end)}: ${s.text}`).join('\n');
