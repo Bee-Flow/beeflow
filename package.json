@@ -22,6 +22,7 @@
     "@azure/ai-text-analytics": "^5.1.0",
     "@azure/core-auth": "^1.10.1",
     "@azure/identity": "^4.13.0",
+    "@azure/storage-blob": "^12.31.0",
     "@elevenlabs/elevenlabs-js": "^2.38.0",
     "@ffmpeg-installer/ffmpeg": "^1.1.0",
     "@google/genai": "^1.43.0",

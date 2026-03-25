@@ -15,7 +15,6 @@ const path = require('path');
 const fs = require('fs');
 const transcriptionStore = require('../stores/transcriptionStore');
 const configStore = require('../stores/configStore');
-const { getUser } = require('../stores/userStore');
 
 function formatDuration(seconds) {
     if (!seconds) return '0:00';
@@ -461,6 +460,7 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
         // Fetch the logged-in user's display name for speaker ID anchoring
         let userName = null;
         try {
+            const { getUser } = require('../stores/userStore');
             const userRecord = await getUser(userId);
             userName = userRecord?.firstName || userRecord?.displayName || null;
         } catch (_) {}
@@ -477,7 +477,7 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
             response = await transcribeWithWhisperX(req.file.path, fileName, language, contextTerms);
 
         } else if (provider === 'azure') {
-            // ── Azure AI Speech ──────────────────────────────
+            // ── Azure AI Speech (SDK ConversationTranscriber) ────────
             const azureKey = await configStore.getSecret('azure_speech_key');
             const azureRegion = await configStore.getConfig('azure_speech_region');
             if (!azureKey || !azureRegion) {
@@ -596,9 +596,57 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
                 })),
             };
 
+        } else if (provider === 'whisper_azure') {
+            // ── Azure Whisper Batch (REST API v3.2) ─────────────────
+            const { executeTranscriptionTool } = require('../integrations/transcriptionTools');
+            const whisperResult = await executeTranscriptionTool('transcribe_audio', {
+                filePath: req.file.path,
+                fileName,
+                language,
+                contextTerms,
+                userName,
+            }, { userId });
+            if (whisperResult.error) {
+                try { fs.unlinkSync(req.file.path); } catch (_) {}
+                return res.status(422).json({ error: whisperResult.error });
+            }
+            // whisperResult is already fully processed (transcript, segments, speakers, etc.)
+            // Save recording and persist to DB directly
+            const audioDirW = path.resolve(__dirname, '../data/uploads/saved-recordings');
+            if (!fs.existsSync(audioDirW)) fs.mkdirSync(audioDirW, { recursive: true });
+            const extW = path.extname(req.file.originalname || '.webm') || '.webm';
+            const audioNameW = `${Date.now()}-${userId}${extW}`;
+            const audioPathW = path.join(audioDirW, audioNameW);
+            try { fs.copyFileSync(req.file.path, audioPathW); fs.unlinkSync(req.file.path); } catch (_) { try { fs.unlinkSync(req.file.path); } catch (_) {} }
 
+            const summaryW = await generateMeetingSummary(whisperResult.transcript, language);
+            let titleW = title;
+            if (summaryW) { const aiT = await generateMeetingTitle(summaryW, language); if (aiT) titleW = aiT; }
+            const actionItemsW = await extractActionItems(whisperResult.transcript, language);
 
-        } else {
+            const savedW = await transcriptionStore.createTranscription({
+                userId, title: titleW, fileName, language,
+                durationSeconds: whisperResult.durationSeconds || 0,
+                speakerCount: (whisperResult.speakers || []).length,
+                segmentCount: (whisperResult.segments || []).length,
+                fullText: '', transcript: whisperResult.transcript,
+                segments: whisperResult.segments || [],
+                speakers: whisperResult.speakers || [],
+                summary: summaryW, audioPath: fs.existsSync(audioPathW) ? audioPathW : '',
+                provider, actionItems: actionItemsW,
+            });
+
+            return res.json({
+                id: savedW.id, title: titleW, fileName, language,
+                duration: whisperResult.duration || '0:00',
+                durationSeconds: whisperResult.durationSeconds || 0,
+                speakerCount: (whisperResult.speakers || []).length,
+                segmentCount: (whisperResult.segments || []).length,
+                speakers: whisperResult.speakers || [],
+                fullText: '', transcript: whisperResult.transcript,
+                segments: whisperResult.segments || [],
+                summary: summaryW, actionItems: actionItemsW,
+            });
             // ── Voxtral (cloud, default) ─────────────────────
             const apiKey = await configStore.getSecret('mistral_api_key');
             if (!apiKey) {
@@ -825,14 +873,14 @@ router.post('/:id/reprocess', requireAuth, async (req, res) => {
 
         if (provider === 'whisperx') {
             response = await transcribeWithWhisperX(transcription.audioPath, fileName, language, '');
-        } else if (provider === 'azure') {
+        } else if (provider === 'azure' || provider === 'whisper_azure') {
             const { executeTranscriptionTool } = require('../integrations/transcriptionTools');
             response = await executeTranscriptionTool('transcribe_audio', {
                 filePath: transcription.audioPath,
                 fileName,
                 language,
                 contextTerms: '',
-                provider: 'azure',
+                provider,
             });
         } else {
             const apiKey = await configStore.getSecret('mistral_api_key');
@@ -890,7 +938,7 @@ router.post('/:id/reprocess', requireAuth, async (req, res) => {
         const speakerIds = Object.keys(speakerMap);
         // Look up user name for reprocess route too
         let reprocessUserName = null;
-        try { const u = await getUser(req.session.user.id); reprocessUserName = u?.firstName || u?.displayName || null; } catch (_) {}
+        try { const { getUser } = require('../stores/userStore'); const u = await getUser(req.session.user.id); reprocessUserName = u?.firstName || u?.displayName || null; } catch (_) {}
         const nameMapping = await identifySpeakerNames(transcript, speakerIds, language, reprocessUserName);
         if (nameMapping) {
             for (const seg of merged) { if (nameMapping[seg.speaker]) seg.speaker = nameMapping[seg.speaker]; }

@@ -553,6 +553,176 @@ async function handleAzureTranscription(args, context) {
 
 
 
+// ─── Provider: Azure Whisper Batch (Speech REST API v3.2) ─────────────────────
+
+/**
+ * Transcribe using the Azure AI Speech Batch Transcription API with the Whisper model.
+ *
+ * Flow:
+ *  1. Convert audio to 16kHz mono WAV
+ *  2. Upload WAV to RustFS (existing S3-compatible object storage) and generate
+ *     a 15-minute presigned download URL — no extra credentials needed.
+ *     ⚠️  RustFS must be reachable from the public internet for Azure to fetch it.
+ *  3. POST batch transcription job (Whisper model, diarization enabled)
+ *  4. Poll job status every 5 s → up to 10 min
+ *  5. Fetch + parse result JSON
+ *  6. Delete temp WAV from RustFS, delete batch job from Azure
+ *  7. Normalise segments → speaker ID → buildResult
+ */
+async function handleAzureWhisperTranscription(args, context) {
+    const speechKey = await configStore.getSecret('azure_speech_key');
+    const speechRegion = await configStore.getConfig('azure_speech_region');
+
+    if (!speechKey || !speechRegion) {
+        return { error: 'Azure Speech key or region not configured. Add them in Admin → Integrations.' };
+    }
+    if (!/^[a-z0-9-]{2,32}$/.test(speechRegion)) {
+        return { error: 'Invalid Azure Speech region format stored in configuration.' };
+    }
+
+    // Uses existing RustFS storageStore — no separate Azure Blob Storage needed.
+    const storageStore = require('../stores/storageStore');
+    if (!storageStore.isAvailable()) {
+        return {
+            error: 'Azure Whisper requires RustFS object storage to be configured (RUSTFS_ENDPOINT / RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY). Azure\'s servers need to download the audio file via a URL.'
+        };
+    }
+
+    let audioData, audioFileName;
+    try {
+        ({ audioData, audioFileName } = await resolveAudioAttachment(context));
+    } catch (errMsg) {
+        return { error: errMsg };
+    }
+
+    const language = args.language || 'nl';
+    const LOCALE_MAP = {
+        nl: 'nl-NL', en: 'en-US', de: 'de-DE', fr: 'fr-FR',
+        es: 'es-ES', it: 'it-IT', pt: 'pt-PT', pl: 'pl-PL',
+        sv: 'sv-SE', da: 'da-DK', fi: 'fi-FI', nb: 'nb-NO',
+    };
+    const locale = LOCALE_MAP[language] || `${language}-${language.toUpperCase()}`;
+
+    console.log(`[Transcription:AzureWhisper] Transcribing "${audioFileName}" (${(audioData.length / (1024 * 1024)).toFixed(1)} MB), locale: ${locale}`);
+
+    const tempInputPath = path.join(os.tmpdir(), `azwhi-in-${Date.now()}`);
+    fs.writeFileSync(tempInputPath, audioData);
+    let tempWavPath = null;
+    let rustfsKey = null;
+    let transcriptionJobUrl = null;
+
+    try {
+        // ── Step 1: Convert to 16kHz mono WAV ──
+        console.log('[Transcription:AzureWhisper] Converting audio...');
+        tempWavPath = await convertToWav(tempInputPath);
+
+        // ── Step 2: Upload to RustFS, generate 15-min presigned URL ──
+        const wavBuffer = fs.readFileSync(tempWavPath);
+        rustfsKey = `transcription-tmp/${Date.now()}-${audioFileName.replace(/[^a-zA-Z0-9._-]/g, '_')}.wav`;
+        await storageStore.uploadFile(rustfsKey, wavBuffer, 'audio/wav');
+        const audioUrl = await storageStore.getPresignedUrl(rustfsKey, 900); // 15 min
+        console.log(`[Transcription:AzureWhisper] Uploaded to RustFS: ${rustfsKey}`);
+
+        // ── Step 3: Create batch transcription job ──
+        const speechApiBase = `https://${speechRegion}.api.cognitive.microsoft.com/speechtotext/v3.2`;
+        const jobBody = {
+            contentUrls: [audioUrl],
+            locale,
+            displayName: `beeflow-${Date.now()}`,
+            model: { self: `${speechApiBase}/models/base/whisper` },
+            properties: {
+                diarizationEnabled: true,
+                wordLevelTimestampsEnabled: true,
+                punctuationMode: 'DictatedAndAutomatic',
+                profanityFilterMode: 'None',
+                timeToLive: 'PT1H',
+            },
+        };
+
+        console.log('[Transcription:AzureWhisper] Submitting batch job...');
+        const createResp = await fetch(`${speechApiBase}/transcriptions`, {
+            method: 'POST',
+            headers: { 'Ocp-Apim-Subscription-Key': speechKey, 'Content-Type': 'application/json' },
+            body: JSON.stringify(jobBody),
+        });
+        if (!createResp.ok) {
+            const errText = await createResp.text().catch(() => '');
+            throw new Error(`Azure Whisper job creation failed (${createResp.status}): ${errText.replace(/[A-Za-z0-9_\-]{32,}/g, '[REDACTED]').substring(0, 300)}`);
+        }
+        const job = await createResp.json();
+        transcriptionJobUrl = job.self;
+        console.log(`[Transcription:AzureWhisper] Job created: ${transcriptionJobUrl.split('/').pop()}`);
+
+        // ── Step 4: Poll until Succeeded or Failed ──
+        const pollStart = Date.now();
+        let jobStatus = 'Running';
+        while (jobStatus === 'Running' || jobStatus === 'NotStarted') {
+            if (Date.now() - pollStart > 10 * 60 * 1000)
+                throw new Error('Azure Whisper batch job timed out after 10 minutes.');
+            await new Promise(r => setTimeout(r, 5000));
+            const pollResp = await fetch(transcriptionJobUrl, { headers: { 'Ocp-Apim-Subscription-Key': speechKey } });
+            if (!pollResp.ok) throw new Error(`Polling failed: HTTP ${pollResp.status}`);
+            const pollData = await pollResp.json();
+            jobStatus = pollData.status;
+            console.log(`[Transcription:AzureWhisper] Status: ${jobStatus} (${Math.round((Date.now() - pollStart) / 1000)}s)`);
+        }
+        if (jobStatus !== 'Succeeded')
+            throw new Error(`Azure Whisper batch job ${jobStatus}. Check your Azure Speech resource.`);
+
+        // ── Step 5: Fetch result ──
+        const filesResp = await fetch(`${transcriptionJobUrl}/files`, { headers: { 'Ocp-Apim-Subscription-Key': speechKey } });
+        if (!filesResp.ok) throw new Error(`Fetching result files failed: HTTP ${filesResp.status}`);
+        const filesData = await filesResp.json();
+        const resultFile = (filesData.values || []).find(f => f.kind === 'Transcription');
+        if (!resultFile?.links?.contentUrl) throw new Error('No transcription result file in Azure job output.');
+        const resultResp = await fetch(resultFile.links.contentUrl);
+        if (!resultResp.ok) throw new Error(`Downloading result failed: HTTP ${resultResp.status}`);
+        const resultData = await resultResp.json();
+
+        // ── Step 6: Normalise segments ──
+        // recognizedPhrases[].speaker is an integer (1-based), convert to "Guest-N"
+        const rawSegments = (resultData.recognizedPhrases || [])
+            .filter(p => p.nBest?.[0]?.display?.trim())
+            .map(p => ({
+                speakerId: p.speaker != null ? `Guest-${p.speaker}` : 'Unknown',
+                start: (p.offsetInTicks || 0) / 10_000_000,
+                end: ((p.offsetInTicks || 0) + (p.durationInTicks || 0)) / 10_000_000,
+                text: p.nBest[0].display.trim(),
+            }));
+
+        console.log(`[Transcription:AzureWhisper] Completed — ${rawSegments.length} phrases`);
+        if (rawSegments.length === 0)
+            return { error: 'Azure Whisper returned no speech. Ensure audio is clear and language is correct.' };
+
+        const merged = mergeSegments(rawSegments);
+        const speakerMap = {};
+        for (const seg of merged) {
+            if (!speakerMap[seg.speakerId]) speakerMap[seg.speakerId] = { duration: 0, segments: 0 };
+            speakerMap[seg.speakerId].duration += (seg.end || 0) - (seg.start || 0);
+            speakerMap[seg.speakerId].segments += 1;
+        }
+        const totalDuration = rawSegments.length > 0 ? Math.max(...rawSegments.map(s => s.end || 0)) : 0;
+        const formattedLines = merged.map(s => `[${s.speakerId}] ${formatTime(s.start)} - ${formatTime(s.end)}: ${s.text}`);
+        const nameMapping = await identifySpeakerNames(Object.keys(speakerMap), language, formattedLines, args.userName);
+        return buildResult({ audioFileName, language, merged, totalDuration, speakerMap, nameMapping });
+
+    } catch (err) {
+        const safeMsg = (err.message || '').replace(/[A-Za-z0-9_\-]{32,}/g, '[REDACTED]').replace(/key[=:]\S+/gi, 'key=[REDACTED]');
+        console.error('[Transcription:AzureWhisper] Error:', safeMsg);
+        return { error: `Azure Whisper transcription failed: ${safeMsg}` };
+    } finally {
+        try { fs.unlinkSync(tempInputPath); } catch (_) {}
+        try { if (tempWavPath) fs.unlinkSync(tempWavPath); } catch (_) {}
+        try {
+            if (rustfsKey) { const ss = require('../stores/storageStore'); await ss.deleteFile(rustfsKey); console.log('[Transcription:AzureWhisper] Temp WAV deleted from RustFS'); }
+        } catch (_) {}
+        try {
+            if (transcriptionJobUrl && speechKey) await fetch(transcriptionJobUrl, { method: 'DELETE', headers: { 'Ocp-Apim-Subscription-Key': speechKey } });
+        } catch (_) {}
+    }
+}
+
+
 // ─── Provider: WhisperX (self-hosted) ────────────────────────────────────────
 
 /**
@@ -716,6 +886,7 @@ async function executeTranscriptionTool(toolName, args, context = {}) {
     if (toolName === 'transcribe_audio') {
         const provider = (await configStore.getConfig('transcription_provider')) || 'voxtral';
         if (provider === 'azure') return handleAzureTranscription(args, context);
+        if (provider === 'whisper_azure') return handleAzureWhisperTranscription(args, context);
         if (provider === 'whisperx') return handleWhisperXTranscription(args, context);
         return handleVoxtralTranscription(args, context);
     }
