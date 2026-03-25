@@ -642,14 +642,43 @@ async function handleAzureWhisperTranscription(args, context) {
         const audioUrl = await storageStore.getPresignedUrl(rustfsKey, 900); // 15 min
         console.log(`[Transcription:AzureWhisper] Uploaded to RustFS: ${rustfsKey}`);
 
-        // ── Step 3: Create batch transcription job ──
+        // ── Step 3: Discover the Whisper model UUID via paginated API ──
+        // Azure only returns 100 oldest models per page; Whisper is near the end.
         const speechApiBase = `https://${speechRegion}.api.cognitive.microsoft.com/speechtotext/v3.2`;
 
+        console.log('[Transcription:AzureWhisper] Discovering Whisper model in region', speechRegion, '...');
+        let whisperModels = [];
+        let skip = 0;
+        const pageSize = 100;
+        while (true) {
+            const modelsUrl = `${speechApiBase}/models/base?skip=${skip}&top=${pageSize}`;
+            const modelsResp = await fetch(modelsUrl, {
+                headers: { 'Ocp-Apim-Subscription-Key': speechKey },
+            });
+            if (!modelsResp.ok) throw new Error(`Failed to list Azure models: HTTP ${modelsResp.status}`);
+            const modelsData = await modelsResp.json();
+            const vals = modelsData.values || [];
+            const found = vals.filter(m => /whisper/i.test(m.displayName));
+            if (found.length > 0) whisperModels.push(...found);
+            if (vals.length < pageSize) break;
+            skip += pageSize;
+        }
+
+        if (whisperModels.length === 0) {
+            throw new Error(`No Whisper model found in Azure region '${speechRegion}'. Make sure the region supports Whisper batch transcription.`);
+        }
+
+        // Pick the latest Whisper model (highest date in displayName)
+        whisperModels.sort((a, b) => b.displayName.localeCompare(a.displayName));
+        const bestWhisper = whisperModels[0];
+        console.log(`[Transcription:AzureWhisper] Using model: ${bestWhisper.displayName} (${bestWhisper.self})`);
+
+        // ── Step 4: Create batch transcription job ──
         const jobBody = {
             contentUrls: [audioUrl],
             locale,
             displayName: `beeflow-${Date.now()}`,
-            model: { self: `${speechApiBase}/models/base/whisper` },
+            model: { self: bestWhisper.self },
             properties: {
                 diarizationEnabled: true,
                 wordLevelTimestampsEnabled: true,
@@ -667,14 +696,13 @@ async function handleAzureWhisperTranscription(args, context) {
         });
         if (!createResp.ok) {
             const errText = await createResp.text().catch(() => '');
-            if (errText.includes('not a valid entity reference')) {
-                throw new Error('Azure rejected the Whisper model. This is usually because your Azure Speech resource is on the Free (F0) tier (Whisper requires Standard S0), or the region does not support it.');
-            }
             throw new Error(`Azure Whisper job creation failed (${createResp.status}): ${errText.replace(/[A-Za-z0-9_\-]{32,}/g, '[REDACTED]').substring(0, 300)}`);
         }
         const job = await createResp.json();
         transcriptionJobUrl = job.self;
         console.log(`[Transcription:AzureWhisper] Job created: ${transcriptionJobUrl.split('/').pop()}`);
+
+        // ── Step 5: Poll until Succeeded or Failed ──
 
         // ── Step 4: Poll until Succeeded or Failed ──
         const pollStart = Date.now();
