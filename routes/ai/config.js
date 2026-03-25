@@ -77,6 +77,9 @@ router.get('/config', async (req, res) => {
         hasAzureSpeechKey: !!(await configStore.getSecret('azure_speech_key')),
         azureSpeechRegion: await configStore.getConfig('azure_speech_region') || '',
         transcriptionProvider: await configStore.getConfig('transcription_provider') || 'voxtral',
+        // WhisperX self-hosted
+        hasWhisperxUrl: !!(await configStore.getSecret('whisperx_url')),
+        hasWhisperxToken: !!(await configStore.getSecret('whisperx_token')),
         // Service Email (Gmail SMTP)
         hasServiceEmail: !!(await configStore.getConfig('service_email_address')) && !!(await configStore.getSecret('service_email_password')),
         serviceEmailAddress: await configStore.getConfig('service_email_address') || '',
@@ -152,15 +155,30 @@ router.post('/config', async (req, res) => {
         await configStore.setSecret('azure_speech_key', azureSpeechKey || '');
     }
     if (azureSpeechRegion !== undefined) {
-        // Validate region format before storing
         const region = (azureSpeechRegion || '').trim().toLowerCase();
         if (region && !/^[a-z0-9-]{2,32}$/.test(region)) {
             return res.status(400).json({ error: 'Invalid Azure Speech region format. Use a region like "westeurope" or "eastus".' });
         }
         await configStore.setConfig('azure_speech_region', region);
     }
+    // WhisperX self-hosted
+    if (req.body.whisperxUrl !== undefined) {
+        const rawUrl = (req.body.whisperxUrl || '').trim();
+        if (rawUrl) {
+            try {
+                const p = new URL(rawUrl);
+                if (!['http:', 'https:'].includes(p.protocol)) throw new Error('bad protocol');
+            } catch (_) {
+                return res.status(400).json({ error: 'WhisperX URL must be a valid http:// or https:// address.' });
+            }
+        }
+        await configStore.setSecret('whisperx_url', rawUrl);
+    }
+    if (req.body.whisperxToken !== undefined) {
+        await configStore.setSecret('whisperx_token', req.body.whisperxToken || '');
+    }
     if (transcriptionProvider !== undefined) {
-        const allowed = ['voxtral', 'azure'];
+        const allowed = ['voxtral', 'azure', 'whisperx'];
         if (transcriptionProvider && !allowed.includes(transcriptionProvider)) {
             return res.status(400).json({ error: `Invalid transcription provider. Allowed: ${allowed.join(', ')}` });
         }

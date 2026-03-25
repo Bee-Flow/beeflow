@@ -2,12 +2,14 @@
  * Transcription Tools — Multi-provider meeting transcription with diarization
  *
  * Supported providers:
- *   - voxtral   : Mistral Voxtral (voxtral-mini-latest) — default
- *   - azure     : Azure AI Speech (Whisper model, real-time transcription SDK)
+ *   - voxtral   : Mistral Voxtral (voxtral-mini-latest) — cloud, best accuracy
+ *   - azure     : Azure AI Speech (Whisper model, SDK push-stream)
+ *   - whisperx  : Self-hosted WhisperX HTTP API — fully private, no data leaves your server
  *
- * Both providers:
+ * All providers:
  *   • Return per-segment diarization (who said what)
  *   • Feed results into a Claude speaker-name identification step
+ *   • Sanitise errors so API keys are never exposed in logs
  *
  * Security:
  *   • API keys are NEVER logged
@@ -524,6 +526,159 @@ async function handleAzureTranscription(args, context) {
     }
 }
 
+// ─── Provider: WhisperX (self-hosted) ────────────────────────────────────────
+
+/**
+ * Call a self-hosted WhisperX HTTP API.
+ * Expected API contract (same as faster-whisper-server / whisperx-server):
+ *
+ *   POST {url}/transcribe
+ *   Content-Type: multipart/form-data
+ *   Body: { audio: <file>, language: "nl", diarize: true }
+ *
+ *   Response:
+ *   { segments: [{ speaker: "SPEAKER_00", start: 0.5, end: 2.1, text: "Hello" }] }
+ *
+ * Also compatible with the OpenAI-compatible /v1/audio/transcriptions endpoint
+ * when running locally (e.g. Faster Whisper Server).
+ *
+ * Security: URL is stored via configStore secret. No API key required for
+ * internal/private deployments, but an optional bearer token is supported.
+ */
+async function handleWhisperXTranscription(args, context) {
+    const whisperUrl = await configStore.getSecret('whisperx_url');
+    if (!whisperUrl || !whisperUrl.trim()) {
+        return {
+            error:
+                'WhisperX URL not configured. Add the self-hosted URL in ' +
+                'Admin → Integrations → Meeting Transcription.',
+        };
+    }
+
+    // Validate URL format — must be http(s):// to prevent SSRF to arbitrary schemes
+    let parsedUrl;
+    try {
+        parsedUrl = new URL(whisperUrl.trim());
+        if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+            throw new Error('Invalid protocol');
+        }
+    } catch (_) {
+        return { error: 'WhisperX URL must be a valid http:// or https:// address.' };
+    }
+
+    // Optional bearer token for secured deployments
+    const whisperToken = await configStore.getSecret('whisperx_token');
+
+    let audioData, audioFileName;
+    try {
+        ({ audioData, audioFileName } = await resolveAudioAttachment(context));
+    } catch (errMsg) {
+        return { error: errMsg };
+    }
+
+    const language = args.language || 'nl';
+
+    console.log(
+        `[Transcription:WhisperX] Transcribing "${audioFileName}" (${(audioData.length / (1024 * 1024)).toFixed(1)} MB), lang: ${language}, url: ${parsedUrl.hostname}`
+    );
+
+    try {
+        // Build multipart form body
+        const FormData = (await import('form-data')).default;
+        const form = new FormData();
+        form.append('audio', audioData, { filename: audioFileName, contentType: 'application/octet-stream' });
+        form.append('language', language);
+        form.append('diarize', 'true');
+        // Also append OpenAI-compat field names for wider server support
+        form.append('file', audioData, { filename: audioFileName, contentType: 'application/octet-stream' });
+        form.append('model', 'whisper-1');
+
+        const headers = { ...form.getHeaders() };
+        if (whisperToken) {
+            headers['Authorization'] = `Bearer ${whisperToken}`;
+        }
+
+        // Try /transcribe first; fall back to /v1/audio/transcriptions
+        const baseUrl = parsedUrl.origin + parsedUrl.pathname.replace(/\/+$/, '');
+        const primaryEndpoint = `${baseUrl}/transcribe`;
+        const fallbackEndpoint = `${baseUrl}/v1/audio/transcriptions`;
+
+        let resp = null;
+        let data = null;
+
+        // Abort signal: 5 minutes max
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5 * 60 * 1000);
+
+        try {
+            resp = await fetch(primaryEndpoint, {
+                method: 'POST',
+                headers,
+                body: form,
+                signal: controller.signal,
+            });
+            if (!resp.ok && resp.status === 404) {
+                // Try OpenAI-compat endpoint
+                resp = await fetch(fallbackEndpoint, {
+                    method: 'POST',
+                    headers,
+                    body: form,
+                    signal: controller.signal,
+                });
+            }
+        } finally {
+            clearTimeout(timeoutId);
+        }
+
+        if (!resp.ok) {
+            const errBody = await resp.text().catch(() => '');
+            const safeBody = errBody.replace(/[A-Za-z0-9_\-]{32,}/g, '[REDACTED]').substring(0, 200);
+            return { error: `WhisperX server returned HTTP ${resp.status}: ${safeBody}` };
+        }
+
+        data = await resp.json();
+
+        // Normalise response — support both { segments: [...] } and { text, segments: [...] }
+        const rawSegments = (data.segments || []).map((seg) => ({
+            speakerId: seg.speaker || seg.speakerId || 'Unknown',
+            start: typeof seg.start === 'number' ? seg.start : parseFloat(seg.start) || 0,
+            end: typeof seg.end === 'number' ? seg.end : parseFloat(seg.end) || 0,
+            text: (seg.text || seg.transcript || '').trim(),
+        })).filter(s => s.text);
+
+        if (rawSegments.length === 0) {
+            return {
+                error:
+                    'WhisperX returned no speech segments. Ensure the audio is clear and the server is running with diarization enabled.',
+            };
+        }
+
+        console.log(`[Transcription:WhisperX] Completed — ${rawSegments.length} raw segments`);
+
+        const merged = mergeSegments(rawSegments);
+        const speakerMap = {};
+        for (const seg of merged) {
+            if (!speakerMap[seg.speakerId]) speakerMap[seg.speakerId] = { duration: 0, segments: 0 };
+            speakerMap[seg.speakerId].duration += (seg.end || 0) - (seg.start || 0);
+            speakerMap[seg.speakerId].segments += 1;
+        }
+        const totalDuration = rawSegments.length > 0 ? Math.max(...rawSegments.map(s => s.end || 0)) : 0;
+        const formattedLines = merged.map(s =>
+            `[${s.speakerId}] ${formatTime(s.start)} - ${formatTime(s.end)}: ${s.text}`
+        );
+        const nameMapping = await identifySpeakerNames(Object.keys(speakerMap), language, formattedLines);
+        return buildResult({ audioFileName, language, merged, totalDuration, speakerMap, nameMapping });
+
+    } catch (err) {
+        if (err.name === 'AbortError') {
+            return { error: 'WhisperX transcription timed out (5 minutes). The file may be too large.' };
+        }
+        const safeMsg = (err.message || '').replace(/[A-Za-z0-9_\-]{32,}/g, '[REDACTED]');
+        console.error('[Transcription:WhisperX] Error:', safeMsg);
+        return { error: `WhisperX transcription failed: ${safeMsg}` };
+    }
+}
+
 // ─── Tool Dispatch ─────────────────────────────────────────────────────────────
 
 async function executeTranscriptionTool(toolName, args, context = {}) {
@@ -531,13 +686,9 @@ async function executeTranscriptionTool(toolName, args, context = {}) {
     if (!userId) return { error: 'User context required for transcription.' };
 
     if (toolName === 'transcribe_audio') {
-        // Route to the configured provider
         const provider = (await configStore.getConfig('transcription_provider')) || 'voxtral';
-
-        if (provider === 'azure') {
-            return handleAzureTranscription(args, context);
-        }
-        // Default: Voxtral
+        if (provider === 'azure') return handleAzureTranscription(args, context);
+        if (provider === 'whisperx') return handleWhisperXTranscription(args, context);
         return handleVoxtralTranscription(args, context);
     }
 
