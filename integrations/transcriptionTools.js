@@ -644,11 +644,24 @@ async function handleAzureWhisperTranscription(args, context) {
 
         // ── Step 3: Create batch transcription job ──
         const speechApiBase = `https://${speechRegion}.api.cognitive.microsoft.com/speechtotext/v3.2`;
+
+        // First, fetch the exact Whisper model URI for this region
+        const modelsResp = await fetch(`${speechApiBase}/models/base`, {
+            headers: { 'Ocp-Apim-Subscription-Key': speechKey }
+        });
+        if (!modelsResp.ok) throw new Error(`Could not fetch Azure models: HTTP ${modelsResp.status}`);
+        const modelsData = await modelsResp.json();
+        const whisperModel = (modelsData.values || []).find(m => /whisper/i.test(m.displayName));
+
+        if (!whisperModel || !whisperModel.self) {
+            throw new Error(`Azure Whisper model not available in region ${speechRegion}`);
+        }
+
         const jobBody = {
             contentUrls: [audioUrl],
             locale,
             displayName: `beeflow-${Date.now()}`,
-            model: { self: `${speechApiBase}/models/base/whisper` },
+            model: { self: whisperModel.self },
             properties: {
                 diarizationEnabled: true,
                 wordLevelTimestampsEnabled: true,
