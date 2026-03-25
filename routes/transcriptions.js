@@ -461,7 +461,9 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
 
         const fileContent = fs.readFileSync(req.file.path);
         const fileName = req.file.originalname || 'audio.mp3';
-        const provider = req.body.provider || 'whisperx';
+
+        // Always read the active provider from admin config — never trust the client
+        const provider = await configStore.getConfig('transcription_provider') || 'voxtral';
 
         console.log(`[Transcriptions] Transcribing "${fileName}" (${(fileContent.length / (1024 * 1024)).toFixed(1)} MB) via ${provider} for user ${userId}`);
 
@@ -470,12 +472,30 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
         if (provider === 'whisperx') {
             // ── WhisperX (self-hosted) ───────────────────────
             response = await transcribeWithWhisperX(req.file.path, fileName, language, contextTerms);
+
+        } else if (provider === 'azure') {
+            // ── Azure AI Speech ──────────────────────────────
+            const azureKey = await configStore.getSecret('azure_speech_key');
+            const azureRegion = await configStore.getConfig('azure_speech_region');
+            if (!azureKey || !azureRegion) {
+                try { fs.unlinkSync(req.file.path); } catch (_) {}
+                return res.status(400).json({ error: 'Azure Speech credentials not configured. Go to Admin → Integrations → Transcription.' });
+            }
+            const { executeTranscriptionTool } = require('../../integrations/transcriptionTools');
+            response = await executeTranscriptionTool('transcribe_audio', {
+                filePath: req.file.path,
+                fileName,
+                language,
+                contextTerms,
+                provider: 'azure',
+            });
+
         } else {
-            // ── Voxtral (cloud) ──────────────────────────────
+            // ── Voxtral (cloud, default) ─────────────────────
             const apiKey = await configStore.getSecret('mistral_api_key');
             if (!apiKey) {
                 try { fs.unlinkSync(req.file.path); } catch (_) {}
-                return res.status(400).json({ error: 'Mistral API key not configured' });
+                return res.status(400).json({ error: 'Mistral API key not configured. Go to Admin → AI Config → API Keys.' });
             }
 
             const { Mistral } = require('@mistralai/mistralai');
@@ -687,7 +707,8 @@ router.post('/:id/reprocess', requireAuth, async (req, res) => {
         req.setTimeout(600000);
         res.setTimeout(600000);
 
-        const provider = transcription.provider || 'whisperx';
+        // Use the stored provider, falling back to current admin config
+        const provider = transcription.provider || await configStore.getConfig('transcription_provider') || 'voxtral';
         const fileName = transcription.fileName || 'audio.webm';
         const language = transcription.language || 'nl';
 
@@ -697,6 +718,15 @@ router.post('/:id/reprocess', requireAuth, async (req, res) => {
 
         if (provider === 'whisperx') {
             response = await transcribeWithWhisperX(transcription.audioPath, fileName, language, '');
+        } else if (provider === 'azure') {
+            const { executeTranscriptionTool } = require('../../integrations/transcriptionTools');
+            response = await executeTranscriptionTool('transcribe_audio', {
+                filePath: transcription.audioPath,
+                fileName,
+                language,
+                contextTerms: '',
+                provider: 'azure',
+            });
         } else {
             const apiKey = await configStore.getSecret('mistral_api_key');
             if (!apiKey) return res.status(400).json({ error: 'Mistral API key not configured' });
