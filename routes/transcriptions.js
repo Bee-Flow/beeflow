@@ -481,7 +481,7 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
                 try { fs.unlinkSync(req.file.path); } catch (_) {}
                 return res.status(400).json({ error: 'Azure Speech credentials not configured. Go to Admin → Integrations → Transcription.' });
             }
-            const { executeTranscriptionTool } = require('../../integrations/transcriptionTools');
+            const { executeTranscriptionTool } = require('../integrations/transcriptionTools');
             response = await executeTranscriptionTool('transcribe_audio', {
                 filePath: req.file.path,
                 fileName,
@@ -719,7 +719,7 @@ router.post('/:id/reprocess', requireAuth, async (req, res) => {
         if (provider === 'whisperx') {
             response = await transcribeWithWhisperX(transcription.audioPath, fileName, language, '');
         } else if (provider === 'azure') {
-            const { executeTranscriptionTool } = require('../../integrations/transcriptionTools');
+            const { executeTranscriptionTool } = require('../integrations/transcriptionTools');
             response = await executeTranscriptionTool('transcribe_audio', {
                 filePath: transcription.audioPath,
                 fileName,
