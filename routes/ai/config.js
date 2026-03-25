@@ -178,7 +178,7 @@ router.post('/config', async (req, res) => {
         await configStore.setSecret('whisperx_token', req.body.whisperxToken || '');
     }
     if (transcriptionProvider !== undefined) {
-        const allowed = ['voxtral', 'azure', 'whisperx'];
+        const allowed = ['voxtral', 'azure', 'whisperx', 'whisper_azure'];
         if (transcriptionProvider && !allowed.includes(transcriptionProvider)) {
             return res.status(400).json({ error: `Invalid transcription provider. Allowed: ${allowed.join(', ')}` });
         }
