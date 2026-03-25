@@ -66,7 +66,8 @@ router.get('/:orgId', requireAuth, async (req, res) => {
             scope: { userInput: true, agentOutput: true },
             action: 'delete',
             moderationEnabled: false,
-            euModeEnabled: false
+            euModeEnabled: false,
+            azurePiiEnabled: false
         };
         res.json(config);
     } catch (e) {
@@ -83,7 +84,7 @@ router.put('/:orgId', requireAuth, async (req, res) => {
             return res.status(403).json({ error: 'Only organization admins can manage the privacy shield' });
         }
 
-        const { enabled, collectionIds, scope, action, moderationEnabled, moderationCategories, euModeEnabled, webSearchGuardEnabled, disableSearchOnUpload } = req.body;
+        const { enabled, collectionIds, scope, action, moderationEnabled, moderationCategories, euModeEnabled, webSearchGuardEnabled, disableSearchOnUpload, azurePiiEnabled } = req.body;
         const config = {
             enabled: !!enabled,
             collectionIds: Array.isArray(collectionIds) ? collectionIds : [],
@@ -94,6 +95,7 @@ router.put('/:orgId', requireAuth, async (req, res) => {
             euModeEnabled: !!euModeEnabled,
             webSearchGuardEnabled: !!webSearchGuardEnabled,
             disableSearchOnUpload: !!disableSearchOnUpload,
+            azurePiiEnabled: !!azurePiiEnabled,
             updatedAt: new Date().toISOString(),
             updatedBy: req.session.user.id,
         };
