@@ -681,7 +681,6 @@ async function handleAzureWhisperTranscription(args, context) {
             model: { self: bestWhisper.self },
             properties: {
                 diarizationEnabled: true,
-                wordLevelTimestampsEnabled: true,
                 punctuationMode: 'DictatedAndAutomatic',
                 profanityFilterMode: 'None',
                 timeToLive: 'PT1H',
