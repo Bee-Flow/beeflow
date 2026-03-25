@@ -46,12 +46,28 @@ const upload = multer({
 /**
  * Get an Anthropic client using the provider key for Claude.
  */
-async function getClaudeClient() {
-    const { getProviderForModel } = require('../core/aiAgent');
-    const config = await getProviderForModel('claude-opus-4-6');
-    if (!config || !config.apiKey) throw new Error('Claude API key not configured');
-    const Anthropic = require('@anthropic-ai/sdk');
-    return new Anthropic({ apiKey: config.apiKey });
+const llmClient = require('../core/llmClient');
+
+/**
+ * Resolve the smart-tier model ID from admin config.
+ * Falls back to fast tier, then a safe default.
+ */
+async function resolveSmartModel() {
+    try {
+        const tiers = await configStore.getConfig('chat_model_tiers') || {};
+        return tiers['smart']?.modelId || tiers['fast']?.modelId || 'gemini-2.0-flash';
+    } catch (_) {
+        return 'gemini-2.0-flash';
+    }
+}
+
+async function resolveFastModel() {
+    try {
+        const tiers = await configStore.getConfig('chat_model_tiers') || {};
+        return tiers['fast']?.modelId || 'gemini-2.0-flash-lite';
+    } catch (_) {
+        return 'gemini-2.0-flash-lite';
+    }
 }
 
 /**
@@ -118,19 +134,17 @@ No explanation, no markdown, ONLY valid JSON.`;
 
 
 /**
- * Generate a structured meeting summary using Claude.
+ * Generate a structured meeting summary using the smart-tier LLM.
  */
 async function generateMeetingSummary(transcript, language) {
     try {
-        const client = await getClaudeClient();
-
+        const modelId = await resolveSmartModel();
         const langName = { nl: 'Dutch', en: 'English', de: 'German', fr: 'French', es: 'Spanish', it: 'Italian', pt: 'Portuguese' }[language] || language;
 
-        const response = await client.messages.create({
-            model: 'claude-opus-4-6',
-            max_tokens: 4096,
-            temperature: 0.3,
-            system: `You are a meeting assistant. Create a concise, well-structured summary of the meeting transcript. Write the summary in ${langName}.
+        const result = await llmClient.chat(modelId, [
+            {
+                role: 'system',
+                content: `You are a meeting assistant. Create a concise, well-structured summary of the meeting transcript. Write the summary in ${langName}.
 
 Format the summary with these sections (use markdown):
 ## 📋 Summary
@@ -149,13 +163,12 @@ A brief 2-3 sentence overview of what the meeting was about.
 - Notable ideas, suggestions, or observations
 
 Keep it concise and actionable. Skip empty sections.`,
-            messages: [
-                { role: 'user', content: transcript }
-            ],
-        });
+            },
+            { role: 'user', content: transcript },
+        ], { maxTokens: 4096, temperature: 0.3 });
 
-        const summary = (response.content?.[0]?.text || '').trim();
-        console.log(`[Transcriptions] Meeting summary generated (${summary.length} chars)`);
+        const summary = (result.content || '').trim();
+        console.log(`[Transcriptions] Meeting summary generated (${summary.length} chars) via ${modelId}`);
         return summary;
     } catch (err) {
         console.error('[Transcriptions] Summary generation failed:', err.message);
@@ -164,25 +177,19 @@ Keep it concise and actionable. Skip empty sections.`,
 }
 
 /**
- * Generate a short, descriptive meeting title using Claude.
+ * Generate a short, descriptive meeting title using the fast-tier LLM.
  */
 async function generateMeetingTitle(summary, language) {
     try {
-        const client = await getClaudeClient();
-
+        const modelId = await resolveFastModel();
         const langName = { nl: 'Dutch', en: 'English', de: 'German', fr: 'French', es: 'Spanish', it: 'Italian', pt: 'Portuguese' }[language] || language;
 
-        const response = await client.messages.create({
-            model: 'claude-opus-4-6',
-            max_tokens: 50,
-            temperature: 0,
-            system: `Generate a short, descriptive title (max 8 words) for this meeting based on the summary. Write in ${langName}. Return ONLY the title, nothing else. No quotes, no prefixes.`,
-            messages: [
-                { role: 'user', content: summary.substring(0, 1000) }
-            ],
-        });
+        const result = await llmClient.chat(modelId, [
+            { role: 'system', content: `Generate a short, descriptive title (max 8 words) for this meeting based on the summary. Write in ${langName}. Return ONLY the title, nothing else. No quotes, no prefixes.` },
+            { role: 'user', content: summary.substring(0, 1000) },
+        ], { maxTokens: 50, temperature: 0 });
 
-        const title = (response.content?.[0]?.text || '').trim().replace(/^["']|["']$/g, '');
+        const title = (result.content || '').trim().replace(/^["']|["']$/g, '');
         if (title && title.length > 2 && title.length < 100) {
             console.log(`[Transcriptions] AI title: "${title}"`);
             return title;
@@ -194,18 +201,17 @@ async function generateMeetingTitle(summary, language) {
 }
 
 /**
- * Extract structured action items from the transcript using Claude.
+ * Extract structured action items from the transcript using the smart-tier LLM.
  */
 async function extractActionItems(transcript, language) {
     try {
-        const client = await getClaudeClient();
+        const modelId = await resolveSmartModel();
         const langName = { nl: 'Dutch', en: 'English', de: 'German', fr: 'French', es: 'Spanish', it: 'Italian', pt: 'Portuguese' }[language] || language;
 
-        const response = await client.messages.create({
-            model: 'claude-opus-4-6',
-            max_tokens: 2048,
-            temperature: 0,
-            system: `You are a meeting analyst. Extract all action items, tasks, and follow-ups from the meeting transcript. For each action item, identify who is responsible (the assignee) and what needs to be done.
+        const result = await llmClient.chat(modelId, [
+            {
+                role: 'system',
+                content: `You are a meeting analyst. Extract all action items, tasks, and follow-ups from the meeting transcript. For each action item, identify who is responsible (the assignee) and what needs to be done.
 
 Return ONLY a JSON array of objects. Each object must have:
 - "text": the action item description (in ${langName})
@@ -214,17 +220,15 @@ Return ONLY a JSON array of objects. Each object must have:
 
 If there are no action items, return an empty array [].
 Return ONLY valid JSON, no other text.`,
-            messages: [
-                { role: 'user', content: transcript.substring(0, 100000) }
-            ],
-        });
+            },
+            { role: 'user', content: transcript.substring(0, 80000) },
+        ], { maxTokens: 2048, temperature: 0 });
 
-        const content = (response.content?.[0]?.text || '').trim();
+        const content = (result.content || '').trim();
         const jsonStart = content.indexOf('[');
         const jsonEnd = content.lastIndexOf(']');
         if (jsonStart !== -1 && jsonEnd > jsonStart) {
             const items = JSON.parse(content.substring(jsonStart, jsonEnd + 1));
-            // Normalize: add id and done status
             return items.map((item, idx) => ({
                 id: `ai-${idx}`,
                 text: item.text || '',
@@ -486,13 +490,29 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
             const ffmpegLib = require('fluent-ffmpeg');
             ffmpegLib.setFfmpegPath(ffmpegInstaller.path);
 
-            // Azure Speech JS SDK requires 16kHz mono PCM WAV
+            // Azure Speech SDK requires 16kHz mono PCM WAV.
+            // Audio preprocessing notes:
+            //   - highpass=f=80    — cut DC offset / low-frequency rumble below 80Hz
+            //   - loudnorm          — EBU R128 loudness normalization (recommended over dynaudnorm
+            //                         for speech; preserves dynamics without distorting quiet speakers)
+            //   - NO lowpass filter — keeping frequencies up to 8kHz is intentional; Dutch (and most
+            //                         languages) have important fricatives (s, f, sh) at 4-8kHz that
+            //                         a lowpass filter would cut, reducing recognition accuracy.
             const tempWavPath = path.join(os.tmpdir(), `azure-stt-${Date.now()}.wav`);
-            console.log('[Transcriptions] Converting audio to WAV for Azure...');
+            console.log('[Transcriptions] Converting & preprocessing audio for Azure...');
             await new Promise((resolve, reject) => {
                 ffmpegLib(req.file.path)
-                    .audioChannels(1).audioFrequency(16000).audioCodec('pcm_s16le').format('wav')
-                    .on('end', resolve).on('error', reject).save(tempWavPath);
+                    .audioChannels(1)
+                    .audioFrequency(16000)
+                    .audioCodec('pcm_s16le')
+                    .format('wav')
+                    .audioFilters([
+                        'highpass=f=80',   // remove DC offset / very low-freq rumble only
+                        'loudnorm',        // EBU R128 normalization — balanced volume
+                    ])
+                    .on('end', resolve)
+                    .on('error', reject)
+                    .save(tempWavPath);
             });
 
             const LOCALE_MAP = {
@@ -505,10 +525,30 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
             const speechConfig = sdk.SpeechConfig.fromSubscription(azureKey, azureRegion);
             speechConfig.speechRecognitionLanguage = locale;
             speechConfig.requestWordLevelTimestamps();
+            // Detailed output provides higher accuracy & word-level confidence
+            speechConfig.outputFormat = sdk.OutputFormat.Detailed;
+            // Don't censor/filter words — we want raw transcription
+            speechConfig.setProfanity && speechConfig.setProfanity(sdk.ProfanityOption.Raw);
+            // Allow longer pauses within a sentence before it's considered complete.
+            // Default is 500ms — increase to 3000ms so short pauses don't fragment sentences.
+            speechConfig.setProperty('Speech_SegmentationSilenceTimeoutMs', '3000');
+            // Allow up to 10s of initial silence (recordings often start with a pause/intro)
+            speechConfig.setProperty('SpeechServiceConnection_InitialSilenceTimeoutMs', '10000');
 
+            // If context terms were provided, add them as a phrase list for better recognition
             const audioConfig = sdk.AudioConfig.fromWavFileInput(fs.readFileSync(tempWavPath));
             const transcriber = new sdk.ConversationTranscriber(speechConfig, audioConfig);
             const rawSegments = [];
+            if (contextTerms) {
+                try {
+                    const phraseList = sdk.PhraseListGrammar.fromRecognizer(transcriber);
+                    contextTerms.split(/[,;\n]/).map(t => t.trim()).filter(Boolean).forEach(term => {
+                        phraseList.addPhrase(term);
+                    });
+                    console.log('[Transcriptions] Azure phrase hints added from context terms');
+                } catch (_) { /* PhraseListGrammar may not work with ConversationTranscriber */ }
+            }
+
 
             console.log(`[Transcriptions] Azure ConversationTranscriber started (locale: ${locale})...`);
             await new Promise((resolve, reject) => {
@@ -766,9 +806,8 @@ router.post('/:id/reprocess', requireAuth, async (req, res) => {
         const userId = req.session.user.id;
         const transcription = await transcriptionStore.getTranscription(req.params.id, userId);
         if (!transcription) return res.status(404).json({ error: 'Not found' });
-        if (transcription.status !== 'failed') return res.status(400).json({ error: 'Only failed transcriptions can be reprocessed' });
         if (!transcription.audioPath || !fs.existsSync(transcription.audioPath)) {
-            return res.status(400).json({ error: 'Audio file not found. Cannot reprocess.' });
+            return res.status(400).json({ error: 'Saved audio not found. Cannot reprocess — please upload again.' });
         }
 
         // Set route timeout to 10 minutes
@@ -947,16 +986,15 @@ router.post('/:id/regenerate-summary', requireAuth, async (req, res) => {
         const templatePrompt = SUMMARY_TEMPLATES[template] || SUMMARY_TEMPLATES.general;
         const langName = { nl: 'Dutch', en: 'English', de: 'German', fr: 'French', es: 'Spanish', it: 'Italian', pt: 'Portuguese' }[transcription.language] || transcription.language;
 
-        const client = await getClaudeClient();
-        const response = await client.messages.create({
-            model: 'claude-opus-4-6',
-            max_tokens: 4096,
-            temperature: 0.3,
-            system: `You are a meeting assistant. Write the summary in ${langName}.\n\n${templatePrompt}`,
-            messages: [{ role: 'user', content: transcription.transcript }],
-        });
+        const modelId = await resolveSmartModel();
+        const result = await llmClient.chat(modelId, [
+            { role: 'system', content: `You are a meeting assistant. Write the summary in ${langName}.
 
-        const summary = (response.content?.[0]?.text || '').trim();
+${templatePrompt}` },
+            { role: 'user', content: transcription.transcript },
+        ], { maxTokens: 4096, temperature: 0.3 });
+
+        const summary = (result.content || '').trim();
         // Also re-extract action items
         const actionItems = await extractActionItems(transcription.transcript, transcription.language);
 
