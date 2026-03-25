@@ -108,10 +108,17 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
     }
 
     // Resolve provider
-    const config = await getProviderForModel(modelId);
+    let config;
+    let adapter;
+    try {
+        config = await getProviderForModel(modelId);
+        adapter = getAdapter(config.providerType, (config.url || '').replace(/\/+$/, ''));
+    } catch (providerErr) {
+        console.error(`[NotebookChat] Provider resolution failed for model "${modelId}":`, providerErr.message);
+        return res.status(400).json({ error: providerErr.message });
+    }
     const apiKey = config.apiKey;
     const apiUrl = (config.url || '').replace(/\/+$/, '');
-    const adapter = getAdapter(config.providerType, apiUrl);
 
     console.log(`[NotebookChat] Model: ${modelId} (tier: ${resolvedTier}${modelTier === 'auto' ? ', auto-selected' : ''}) for notebook: "${notebook.name}" (${readySources.length} sources)`);
 

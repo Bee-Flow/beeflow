@@ -120,10 +120,17 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
     }
 
     // Resolve provider for this model
-    const config = await getProviderForModel(modelId);
+    let config;
+    let adapter;
+    try {
+        config = await getProviderForModel(modelId);
+        adapter = getAdapter(config.providerType, (config.url || '').replace(/\/+$/, ''));
+    } catch (providerErr) {
+        console.error(`[DirectChat] Provider resolution failed for model "${modelId}":`, providerErr.message);
+        return res.status(400).json({ error: providerErr.message });
+    }
     const apiKey = config.apiKey;
     const apiUrl = (config.url || '').replace(/\/+$/, '');
-    const adapter = getAdapter(config.providerType, apiUrl);
 
     console.log(`[DirectChat] Provider: ${config.providerName || 'default'} (${adapter.name})`);
     console.log(`[DirectChat] Using model: ${modelId} (tier: ${resolvedTier}${modelTier === 'auto' ? ', auto-selected' : ''})`);
