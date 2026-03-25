@@ -22,6 +22,38 @@
 
 const configStore = require('../stores/configStore');
 const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+// ffmpeg helper — installed via @ffmpeg-installer/ffmpeg
+let ffmpeg;
+try {
+    const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
+    ffmpeg = require('fluent-ffmpeg');
+    ffmpeg.setFfmpegPath(ffmpegInstaller.path);
+} catch (_) {
+    ffmpeg = null; // ffmpeg not available, Azure will attempt raw stream (WAV only)
+}
+
+/**
+ * Convert any audio file to 16kHz mono PCM WAV using ffmpeg.
+ * Azure Speech JS SDK only accepts this format for push-stream input.
+ * Returns the path to the temporary WAV file.
+ */
+async function convertToWav(inputPath) {
+    if (!ffmpeg) throw new Error('ffmpeg not available — install @ffmpeg-installer/ffmpeg');
+    const outPath = path.join(os.tmpdir(), `azure-stt-${Date.now()}.wav`);
+    return new Promise((resolve, reject) => {
+        ffmpeg(inputPath)
+            .audioChannels(1)          // mono
+            .audioFrequency(16000)     // 16 kHz — Azure Speech requirement
+            .audioCodec('pcm_s16le')   // 16-bit little-endian PCM
+            .format('wav')
+            .on('end', () => resolve(outPath))
+            .on('error', (err) => reject(new Error(`ffmpeg conversion failed: ${err.message}`)))
+            .save(outPath);
+    });
+}
 
 // ─── Tool Definitions ──────────────────────────────────────────────────────────
 
@@ -370,22 +402,18 @@ async function handleAzureTranscription(args, context) {
         return { error: errMsg };
     }
 
+    // Write audio to a temp file so ffmpeg can read it
+    const tempInputPath = path.join(os.tmpdir(), `azure-in-${Date.now()}`);
+    fs.writeFileSync(tempInputPath, audioData);
+    let tempWavPath = null;
+
     const language = args.language || 'nl';
 
     // Map language codes → Azure BCP-47 locale (best effort)
     const LOCALE_MAP = {
-        nl: 'nl-NL',
-        en: 'en-US',
-        de: 'de-DE',
-        fr: 'fr-FR',
-        es: 'es-ES',
-        it: 'it-IT',
-        pt: 'pt-PT',
-        pl: 'pl-PL',
-        sv: 'sv-SE',
-        da: 'da-DK',
-        fi: 'fi-FI',
-        nb: 'nb-NO',
+        nl: 'nl-NL', en: 'en-US', de: 'de-DE', fr: 'fr-FR',
+        es: 'es-ES', it: 'it-IT', pt: 'pt-PT', pl: 'pl-PL',
+        sv: 'sv-SE', da: 'da-DK', fi: 'fi-FI', nb: 'nb-NO',
     };
     const locale = LOCALE_MAP[language] || `${language}-${language.toUpperCase()}`;
 
@@ -394,32 +422,21 @@ async function handleAzureTranscription(args, context) {
     );
 
     try {
+        // ── Convert to 16kHz mono PCM WAV (Azure SDK requirement) ──
+        console.log('[Transcription:Azure] Converting audio to 16kHz WAV...');
+        tempWavPath = await convertToWav(tempInputPath);
+        console.log('[Transcription:Azure] Conversion done, starting recognition...');
+
         // Lazy-require the SDK to avoid startup cost when Azure isn't used
         const sdk = require('microsoft-cognitiveservices-speech-sdk');
 
         // ── Build SpeechConfig — key is passed directly to SDK, never logged ──
         const speechConfig = sdk.SpeechConfig.fromSubscription(speechKey, speechRegion);
         speechConfig.speechRecognitionLanguage = locale;
-
-        // Request word-level timestamps for accurate segment boundaries
         speechConfig.requestWordLevelTimestamps();
 
-        // ── Enable speaker diarization ──
-        // Auto-detect 1-10 speakers (safe default)
-        const conversationTranscriptionConfig =
-            sdk.ConversationTranscriptionConfig || null;
-
-        // Use ConversationTranscriber for diarized output
-        const pushStream = sdk.AudioInputStream.createPushStream();
-        const audioConfig = sdk.AudioConfig.fromStreamInput(pushStream);
-
-        // Push audio data in 4 KB chunks to avoid large single writes
-        const CHUNK_SIZE = 4096;
-        for (let offset = 0; offset < audioData.length; offset += CHUNK_SIZE) {
-            const chunk = audioData.slice(offset, offset + CHUNK_SIZE);
-            pushStream.write(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength));
-        }
-        pushStream.close();
+        // ── AudioConfig directly from WAV file ──
+        const audioConfig = sdk.AudioConfig.fromWavFileInput(fs.readFileSync(tempWavPath));
 
         const transcriber = new sdk.ConversationTranscriber(speechConfig, audioConfig);
 
@@ -427,21 +444,18 @@ async function handleAzureTranscription(args, context) {
         const rawSegments = [];
 
         await new Promise((resolve, reject) => {
-            // Safety timeout: 3 minutes per file max
+            // Safety timeout: 10 minutes per file max
             const timeout = setTimeout(() => {
                 transcriber.stopTranscribingAsync();
-                reject(new Error('Azure Speech transcription timed out after 3 minutes.'));
-            }, 3 * 60 * 1000);
+                reject(new Error('Azure Speech transcription timed out after 10 minutes.'));
+            }, 10 * 60 * 1000);
 
             transcriber.transcribed = (_s, event) => {
                 const result = event.result;
-                if (
-                    result.reason === sdk.ResultReason.RecognizedSpeech &&
-                    result.text
-                ) {
+                if (result.reason === sdk.ResultReason.RecognizedSpeech && result.text) {
                     rawSegments.push({
                         speakerId: result.speakerId || 'Unknown',
-                        start: result.offset / 10_000_000, // 100-ns ticks → seconds
+                        start: result.offset / 10_000_000,  // 100-ns ticks → seconds
                         end: (result.offset + result.duration) / 10_000_000,
                         text: result.text.trim(),
                     });
@@ -451,7 +465,6 @@ async function handleAzureTranscription(args, context) {
             transcriber.canceled = (_s, event) => {
                 clearTimeout(timeout);
                 if (event.reason === sdk.CancellationReason.Error) {
-                    // Sanitise: strip anything that looks like a key/token
                     const safeDetails = (event.errorDetails || '')
                         .replace(/[A-Za-z0-9_\-]{32,}/g, '[REDACTED]')
                         .replace(/key[=:]\S+/gi, 'key=[REDACTED]');
@@ -470,7 +483,6 @@ async function handleAzureTranscription(args, context) {
                 () => { /* started OK */ },
                 (err) => {
                     clearTimeout(timeout);
-                    // Sanitise error before rejecting
                     const safeErr = (err?.message || String(err))
                         .replace(/[A-Za-z0-9_\-]{32,}/g, '[REDACTED]');
                     reject(new Error(`Failed to start Azure transcription: ${safeErr}`));
@@ -478,18 +490,13 @@ async function handleAzureTranscription(args, context) {
             );
         });
 
-        // ── Destroy credentials immediately ──
         speechConfig.close && speechConfig.close();
 
-        console.log(
-            `[Transcription:Azure] Completed — ${rawSegments.length} raw segments`
-        );
+        console.log(`[Transcription:Azure] Completed — ${rawSegments.length} raw segments`);
 
         if (rawSegments.length === 0) {
             return {
-                error:
-                    'Azure Speech returned no recognizable speech. ' +
-                    'Ensure the audio is clear, mono channel, and in a supported format.',
+                error: 'Azure Speech returned no recognizable speech. Ensure the audio is clear and the language setting matches the recording.',
             };
         }
 
@@ -503,18 +510,13 @@ async function handleAzureTranscription(args, context) {
             speakerMap[seg.speakerId].segments += 1;
         }
 
-        const totalDuration =
-            rawSegments.length > 0 ? Math.max(...rawSegments.map((s) => s.end || 0)) : 0;
+        const totalDuration = rawSegments.length > 0 ? Math.max(...rawSegments.map((s) => s.end || 0)) : 0;
 
-        const formattedLines = merged.map((s) => {
-            return `[${s.speakerId}] ${formatTime(s.start)} - ${formatTime(s.end)}: ${s.text}`;
-        });
-
-        const nameMapping = await identifySpeakerNames(
-            Object.keys(speakerMap),
-            language,
-            formattedLines
+        const formattedLines = merged.map((s) =>
+            `[${s.speakerId}] ${formatTime(s.start)} - ${formatTime(s.end)}: ${s.text}`
         );
+
+        const nameMapping = await identifySpeakerNames(Object.keys(speakerMap), language, formattedLines);
 
         return buildResult({ audioFileName, language, merged, totalDuration, speakerMap, nameMapping });
     } catch (err) {
@@ -523,8 +525,15 @@ async function handleAzureTranscription(args, context) {
             .replace(/key[=:]\S+/gi, 'key=[REDACTED]');
         console.error('[Transcription:Azure] Error:', safeMsg);
         return { error: `Azure transcription failed: ${safeMsg}` };
+    } finally {
+        // Clean up temp files
+        try { fs.unlinkSync(tempInputPath); } catch (_) {}
+        try { if (tempWavPath) fs.unlinkSync(tempWavPath); } catch (_) {}
     }
 }
+
+
+
 
 // ─── Provider: WhisperX (self-hosted) ────────────────────────────────────────
 

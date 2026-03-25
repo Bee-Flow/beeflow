@@ -481,14 +481,83 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
                 try { fs.unlinkSync(req.file.path); } catch (_) {}
                 return res.status(400).json({ error: 'Azure Speech credentials not configured. Go to Admin → Integrations → Transcription.' });
             }
-            const { executeTranscriptionTool } = require('../integrations/transcriptionTools');
-            response = await executeTranscriptionTool('transcribe_audio', {
-                filePath: req.file.path,
-                fileName,
-                language,
-                contextTerms,
-                provider: 'azure',
+
+            const os = require('os');
+            const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
+            const ffmpegLib = require('fluent-ffmpeg');
+            ffmpegLib.setFfmpegPath(ffmpegInstaller.path);
+
+            // Azure Speech JS SDK requires 16kHz mono PCM WAV
+            const tempWavPath = path.join(os.tmpdir(), `azure-stt-${Date.now()}.wav`);
+            console.log('[Transcriptions] Converting audio to WAV for Azure...');
+            await new Promise((resolve, reject) => {
+                ffmpegLib(req.file.path)
+                    .audioChannels(1).audioFrequency(16000).audioCodec('pcm_s16le').format('wav')
+                    .on('end', resolve).on('error', reject).save(tempWavPath);
             });
+
+            const LOCALE_MAP = {
+                nl: 'nl-NL', en: 'en-US', de: 'de-DE', fr: 'fr-FR',
+                es: 'es-ES', it: 'it-IT', pt: 'pt-PT',
+            };
+            const locale = LOCALE_MAP[language] || `${language}-${language.toUpperCase()}`;
+
+            const sdk = require('microsoft-cognitiveservices-speech-sdk');
+            const speechConfig = sdk.SpeechConfig.fromSubscription(azureKey, azureRegion);
+            speechConfig.speechRecognitionLanguage = locale;
+            speechConfig.requestWordLevelTimestamps();
+
+            const audioConfig = sdk.AudioConfig.fromWavFileInput(fs.readFileSync(tempWavPath));
+            const transcriber = new sdk.ConversationTranscriber(speechConfig, audioConfig);
+            const rawSegments = [];
+
+            console.log(`[Transcriptions] Azure ConversationTranscriber started (locale: ${locale})...`);
+            await new Promise((resolve, reject) => {
+                const timeout = setTimeout(() => { transcriber.stopTranscribingAsync(); reject(new Error('Azure timed out')); }, 10 * 60 * 1000);
+                transcriber.transcribed = (_s, e) => {
+                    if (e.result.reason === sdk.ResultReason.RecognizedSpeech && e.result.text) {
+                        rawSegments.push({
+                            speakerId: e.result.speakerId || 'Unknown',
+                            start: e.result.offset / 10_000_000,
+                            end: (e.result.offset + e.result.duration) / 10_000_000,
+                            text: e.result.text.trim(),
+                        });
+                    }
+                };
+                transcriber.canceled = (_s, e) => {
+                    clearTimeout(timeout);
+                    if (e.reason === sdk.CancellationReason.Error) {
+                        const safe = (e.errorDetails || '').replace(/[A-Za-z0-9_\-]{32,}/g, '[REDACTED]');
+                        reject(new Error(`Azure Speech error: ${safe}`));
+                    } else { resolve(); }
+                };
+                transcriber.sessionStopped = () => { clearTimeout(timeout); resolve(); };
+                transcriber.startTranscribingAsync(() => {}, (err) => {
+                    clearTimeout(timeout);
+                    reject(new Error(`Azure start failed: ${(err?.message || String(err)).replace(/[A-Za-z0-9_\-]{32,}/g, '[REDACTED]')}`));
+                });
+            });
+            speechConfig.close && speechConfig.close();
+            try { fs.unlinkSync(tempWavPath); } catch (_) {}
+
+            console.log(`[Transcriptions] Azure returned ${rawSegments.length} segments`);
+            if (rawSegments.length === 0) {
+                try { fs.unlinkSync(req.file.path); } catch (_) {}
+                return res.status(422).json({ error: 'Azure Speech returned no speech. Check language setting and audio quality.' });
+            }
+
+            // Normalize to Voxtral-compatible shape
+            response = {
+                text: rawSegments.map(s => s.text).join(' '),
+                segments: rawSegments.map(s => ({
+                    speakerId: s.speakerId,
+                    start: s.start,
+                    end: s.end,
+                    text: s.text,
+                })),
+            };
+
+
 
         } else {
             // ── Voxtral (cloud, default) ─────────────────────
