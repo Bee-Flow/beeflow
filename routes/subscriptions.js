@@ -22,12 +22,12 @@ function requireAdmin(req, res, next) {
 function requireAuthOrOrgMember(req, res, next) {
     if (!req.session?.isAuthenticated) return res.status(401).json({ error: 'Not authenticated' });
     if (isSuperAdmin(req)) return next();
-    // Check if user belongs to the requested org
+    // Check if user belongs to the requested org (session is already hydrated — no async needed)
     const orgId = req.params.orgId;
-    const userId = req.session.user?.id;
-    if (orgId && userId) {
-        const user = userStore.getUser(userId);
-        if (user?.organizationId === orgId) return next();
+    const sessionUser = req.session.user;
+    if (orgId && sessionUser) {
+        const userOrgId = sessionUser.organizationId || sessionUser.orgId;
+        if (userOrgId === orgId) return next();
     }
     return res.status(403).json({ error: 'Admin access required' });
 }
