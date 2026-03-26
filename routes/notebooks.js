@@ -723,6 +723,57 @@ ${sourceContent.slice(0, 60000)}`;
 });
 
 
+// ── Notebook Image Upload (for TipTap Image extension) ───────────
+//
+//  POST /api/notebooks/:id/images
+//  Accepts: multipart/form-data { image: File }
+//  Returns: { url: "/api/storage/file/..." }
+//
+//  Images are stored in RustFS under users/{userId}/notebook-images/.
+//  If RustFS is not configured the server falls back to a base64 data-URL
+//  so the editor still works in local dev without object storage.
+
+const imageUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
+    fileFilter: (_req, file, cb) => {
+        if (/^image\//.test(file.mimetype)) cb(null, true);
+        else cb(new Error('Only image files are allowed'));
+    },
+});
+
+router.post('/:id/images', requireAuth, imageUpload.single('image'), async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const notebookId = req.params.id;
+
+        const nb = await notebookStore.getNotebook(notebookId, userId);
+        if (!nb) return res.status(404).json({ error: 'Notebook not found' });
+        if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
+
+        const { buffer, mimetype, originalname } = req.file;
+        const ext = originalname.split('.').pop().toLowerCase();
+        const safeFilename = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}.${ext}`;
+
+        if (storageStore.isAvailable()) {
+            // Store in RustFS and return a proxy URL (token-free, routed through Express)
+            const key = storageStore.buildKey(userId, 'notebook-images', safeFilename);
+            await storageStore.uploadFile(key, buffer, mimetype);
+            const url = storageStore.buildProxyUrl(key);
+            return res.json({ url });
+        }
+
+        // Fallback: base64 data-URL (works in local dev without RustFS)
+        const b64 = buffer.toString('base64');
+        const url = `data:${mimetype};base64,${b64}`;
+        return res.json({ url });
+
+    } catch (err) {
+        console.error('[Notebooks] Image upload failed:', err);
+        res.status(500).json({ error: 'Image upload failed: ' + err.message });
+    }
+});
+
 // ── Import File to Editor (PDF, DOCX, TXT...) ────────────────────
 
 router.post('/:id/import-file', requireAuth, upload.single('file'), async (req, res) => {

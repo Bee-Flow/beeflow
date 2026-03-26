@@ -1541,10 +1541,12 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                 try {
                     const llmClient = require('../../core/llmClient');
                     const titleAgent = await agentStore.getTitleGeneratorAgent();
-                    let titleModel = titleAgent?.model || modelId;
-                    // Resolve tier: prefix (e.g. 'tier:fast' → actual model ID)
-                    if (titleModel.startsWith('tier:')) {
-                        const tierName = titleModel.substring(5);
+                    // Always use the fast tier for title generation (cheap, quick)
+                    // If the title agent has an explicit tier: model, honour it; otherwise default to fast tier.
+                    let titleModel;
+                    {
+                        const rawTitleModel = titleAgent?.model || 'tier:fast';
+                        const tierName = rawTitleModel.startsWith('tier:') ? rawTitleModel.substring(5) : 'fast';
                         let titleTiers = await configStore.getConfig('chat_model_tiers') || {};
                         // EU mode override for title generation
                         if (userOrgForTiers) {
@@ -1558,15 +1560,7 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                                 titleTiers = mergedTitleTiers;
                             }
                         }
-                        titleModel = titleTiers[tierName]?.modelId || modelId;
-                    } else {
-                        // Non-tier model — resolve display names and validate
-                        const { resolveModelId } = require('../../core/aiAgent');
-                        titleModel = resolveModelId(titleModel) || titleModel;
-                        // If it still looks like a display label (has uppercase), use the chat model instead
-                        if (!/^[a-z0-9._\/-]+$/.test(titleModel)) {
-                            titleModel = modelId;
-                        }
+                        titleModel = titleTiers[tierName]?.modelId || titleTiers.fast?.modelId || modelId;
                     }
                     console.log(`[DirectChat] Title: generating with model=${titleModel}`);
                     const title = await llmClient.generateTitle(

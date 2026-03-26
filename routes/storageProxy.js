@@ -1,7 +1,7 @@
 /**
  * Storage Proxy — Auth-protected file streaming from RustFS
  * 
- * GET /api/storage/file/:key
+ * GET /api/storage/file/{key...}
  * - Requires authenticated session
  * - Validates user owns the file (key starts with users/{userId}/ or shared/)
  * - Streams file directly from S3 with correct Content-Type
@@ -11,18 +11,17 @@ const express = require('express');
 const router = express.Router();
 const storageStore = require('../stores/storageStore');
 
-// GET /api/storage/file/:key — stream a file from RustFS
-router.get('/file/:key', async (req, res) => {
+// GET /api/storage/file/* — stream a file from RustFS
+router.get('/file/{*path}', async (req, res) => {
     try {
         const userId = req.session?.user?.id;
         if (!userId) {
             return res.status(401).json({ error: 'Authentication required' });
         }
 
-        // The key is everything after /file/ in the original URL (supports slashes)
-        const prefix = '/file/';
-        const idx = req.originalUrl.indexOf(prefix);
-        const key = idx >= 0 ? decodeURIComponent(req.originalUrl.substring(idx + prefix.length)) : req.params.key;
+        // Extract key from the wildcard path (everything after /file/)
+        const rawKey = req.params.path || '';
+        const key = decodeURIComponent(rawKey);
         if (!key) {
             return res.status(400).json({ error: 'File key required' });
         }

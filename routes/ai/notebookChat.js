@@ -243,6 +243,52 @@ Inline marks (wrap text inside <p> or <li>):
   <code>inline code</code>
   <a href="https://example.com" target="_blank" rel="noopener noreferrer">link text</a>
 
+MATH FORMULAS (KaTeX — @tiptap/extension-mathematics):
+  Inline math:  $E = mc^2$    (dollar signs around the LaTeX expression)
+  Block math:   $$\\frac{a}{b} = \\frac{c}{d}$$    (double dollar signs on their own line)
+  Rules:
+  - Use LaTeX syntax inside the $ delimiters (e.g., \\frac, \\sum, \\int, \\sqrt, ^, _)
+  - Inline math goes directly inside a <p> tag: <p>The formula $E = mc^2$ shows mass-energy equivalence.</p>
+  - Block math goes in its own <p> tag on a separate line: <p>$$\\sum_{i=1}^{n} x_i$$</p>
+  - NEVER escape the dollar signs in HTML — write them as literal $ characters
+  - Good example: <p>Einstein's equation $E = mc^2$ states that energy equals mass times the speed of light squared.</p>
+
+EMOJI (via :shortcode: syntax — @tiptap/extension-emoji):
+  The editor supports emoji shortcodes using GitHub emoji names.
+  Examples: :rocket: 🚀  :fire: 🔥  :check: ✅  :warning: ⚠️  :star: ⭐  :brain: 🧠  :book: 📖
+  - Emoji can be placed directly inline in text: <p>Great work! :rocket: This is a breakthrough :fire:</p>
+  - You can also use the literal Unicode emoji character directly in HTML: <p>Great work! 🚀</p>
+  - Prefer Unicode characters in document tool calls for maximum compatibility.
+
+DRAG HANDLE (user feature — no action needed from AI):
+  The editor has a drag handle that appears when the user hovers over a block.
+  This allows blocks to be reordered by drag-and-drop. No special HTML is needed.
+
+TEXT COLOR (@tiptap/extension-color + TextStyle):
+  The editor supports colored text via the toolbar. No special HTML action required from AI.
+  The user applies colors manually via the color picker. Avoid setting inline color styles in document tool calls.
+
+TYPOGRAPHY (auto-corrections — transparent to AI):
+  The editor auto-corrects typographic patterns (smart quotes, em dashes, fractions).
+  Examples: typing -- → —, (tm) → ™, 1/2 → ½. These happen automatically. No action needed from AI.
+
+IMAGES (@tiptap/extension-image):
+  - HTML: <img src="URL" alt="description">
+  - When inserting images, use publicly accessible URLs. User uploads go via the toolbar (not AI).
+  - If the user asks to add an image by URL: <p><img src="https://example.com/photo.jpg" alt="Description"></p>
+  - Do NOT try to upload images or use data: URLs from AI tool calls.
+
+TASK LISTS (@tiptap/extension-task-list + TaskItem):
+  - Use <ul data-type="taskList"> for task/checklist items
+  - Each item: <li data-type="taskItem" data-checked="false"><label><input type="checkbox"></label><div><p>Task text</p></div></li>
+  - Checked item: data-checked="true" (and add checked attribute to input)
+  - Example:
+    <ul data-type="taskList">
+      <li data-type="taskItem" data-checked="false"><label><input type="checkbox"></label><div><p>Review document</p></div></li>
+      <li data-type="taskItem" data-checked="true"><label><input type="checkbox" checked></label><div><p>Write introduction</p></div></li>
+    </ul>
+  - Use task lists when the user asks for action items, to-do lists, checklists, or follow-ups.
+
 IMPORTANT HTML RULES:
 - List items MUST contain <p> tags: <ul><li><p>text</p></li></ul>, NOT <ul><li>text</li></ul>
 - Links MUST use <a href="url" target="_blank" rel="noopener noreferrer">text</a> format
@@ -259,6 +305,10 @@ DOCUMENT RULES — FOLLOW STRICTLY:
 6. After applying changes via tool, briefly confirm what you did in your response (e.g. "I've shortened that paragraph in the document")
 7. For source citations in documents, use clickable links: <a href="url" target="_blank" rel="noopener noreferrer">Source Name</a> — never use [1] style refs
 8. STYLE CONSISTENCY: When using notebook_doc_replace, ALWAYS match the original text's formatting. If you are replacing text that was in a paragraph, the replacement MUST be wrapped in <p> tags. Do NOT use headers (h1, h2, h3) for replacements unless specifically asked for a header. Avoid "Big Bold Letters" unless they were already there.
+9. MATH: When writing scientific, mathematical, or technical content — use KaTeX math syntax ($inline$ or $$block$$) for formulas. This renders beautifully in the editor.
+10. EMOJI: You may use Unicode emoji characters directly in document content where appropriate for visual clarity.
+11. TASK LISTS: When the user asks for action items, to-dos, checklists, or follow-up tasks — use the task list HTML syntax above. This renders as real interactive checkboxes.
+12. IMAGES: Only insert images by URL when explicitly asked. Do NOT invent image URLs.
 
 [WEB SEARCH & SOURCES]
 - You can search the web using agent_search for current information and research

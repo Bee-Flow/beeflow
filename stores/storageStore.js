@@ -158,7 +158,9 @@ async function streamFile(key) {
  * @returns {string} Proxy URL path
  */
 function buildProxyUrl(key) {
-    return `/api/storage/file/${encodeURIComponent(key)}`;
+    // Encode each path segment individually so slashes remain real /
+    // (avoids %2F issues with nginx proxy and browser URL handling)
+    return `/api/storage/file/${key.split('/').map(encodeURIComponent).join('/')}`;
 }
 
 module.exports = {
