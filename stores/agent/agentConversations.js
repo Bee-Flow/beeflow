@@ -46,15 +46,19 @@ async function clearConversation(agentId, userId) {
     await run('DELETE FROM agent_conversations WHERE agent_id = $1 AND user_id = $2', [agentId, userId]);
 }
 
-async function updateConversationWorkspace(conversationId, content) {
+async function updateConversationWorkspace(conversationId, content, notebookId = null) {
     await initDB();
-    await run('UPDATE agent_conversations SET workspace_content = $1, updated_at = NOW() WHERE id = $2', [content, conversationId]);
+    if (notebookId !== null) {
+        await run('UPDATE agent_conversations SET workspace_content = $1, workspace_notebook_id = $2, updated_at = NOW() WHERE id = $3', [content, notebookId, conversationId]);
+    } else {
+        await run('UPDATE agent_conversations SET workspace_content = $1, updated_at = NOW() WHERE id = $2', [content, conversationId]);
+    }
 }
 
 async function getConversationWorkspace(conversationId) {
     await initDB();
-    const row = await getOne('SELECT workspace_content FROM agent_conversations WHERE id = $1', [conversationId]);
-    return row ? { content: row.workspace_content || '' } : null;
+    const row = await getOne('SELECT workspace_content, workspace_notebook_id FROM agent_conversations WHERE id = $1', [conversationId]);
+    return row ? { content: row.workspace_content || '', notebookId: row.workspace_notebook_id || null } : null;
 }
 
 // ============ Multi-Conversation ============

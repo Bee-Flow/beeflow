@@ -62,15 +62,15 @@ router.get('/published', async (req, res) => {
         }
         const hasTypeRestrictions = !isAdmin && allowedAgentTypes.length > 0;
 
+        // Resolve user org IDs ONCE for consistent filtering across all agent types
+        const orgIds = isAdmin ? null : await resolveUserOrgIds(req);
+
         // Only load chat agents if allowed
         let allAgents = [];
         if (!hasTypeRestrictions || allowedAgentTypes.includes('chat')) {
-            const agents = isAdmin ? await agentStore.getPublishedAgents() : await agentStore.getPublishedAgentsForUser(userGroups, userDirectOrgId);
+            const agents = isAdmin ? await agentStore.getPublishedAgents() : await agentStore.getPublishedAgentsForUser(userGroups, userDirectOrgId, orgIds);
             allAgents = [...agents];
         }
-
-        // Resolve user org IDs for filtering other agent types
-        const orgIds = isAdmin ? null : await resolveUserOrgIds(req);
 
         // Also fetch enabled swarms as virtual agents for the marketplace/chat
         if (!hasTypeRestrictions || allowedAgentTypes.includes('swarm')) {

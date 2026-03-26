@@ -66,8 +66,8 @@ async function initTable() {
     console.log('[MCPStore] Initialized (PostgreSQL)');
 }
 
-// Initialize on load
-initTable().catch(err => console.error('[MCPStore] Init error:', err.message));
+// Initialize on load — export promise for callers that need to wait
+const _initPromise = initTable().catch(err => console.error('[MCPStore] Init error:', err.message));
 
 /**
  * Create a new MCP server definition.
@@ -153,6 +153,7 @@ function parseRow(row) {
 }
 
 module.exports = {
+    ready: _initPromise,
     createServer,
     getServer,
     listServers,

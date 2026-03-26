@@ -155,7 +155,7 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
     const hasAgentSearchUrl = !!process.env.SEARCH_SERVICE_URL || !!(await configStore.getConfig('agent_search_url'));
     const searchProvider = await configStore.getConfig('search_provider') || 'agent-search';
     const hasBingSearchKey = !!(await configStore.getSecret('bing_search_key'));
-    const searchAvailable = (searchProvider === 'bing' && hasBingSearchKey) || hasAgentSearchUrl;
+    const searchAvailable = searchProvider !== 'disabled' && ((searchProvider === 'bing' && hasBingSearchKey) || hasAgentSearchUrl);
     if (searchAvailable && isAppOn('agent-search')) {
         addTools(AGENT_SEARCH_TOOLS);
     }

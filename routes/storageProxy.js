@@ -5,14 +5,97 @@
  * - Requires authenticated session
  * - Validates user owns the file (key starts with users/{userId}/ or shared/)
  * - Streams file directly from S3 with correct Content-Type
+ * 
+ * GET /api/storage/tmp/:token
+ * - No auth required — used by external services (e.g. Azure Whisper batch)
+ * - Token is an HMAC-signed, time-limited URL with the key embedded
+ * - Only works for keys under transcription-tmp/ prefix
  */
 
 const express = require('express');
+const crypto = require('crypto');
 const router = express.Router();
 const storageStore = require('../stores/storageStore');
 
+// ── Temporary public download (for Azure Whisper batch) ────────────────────
+
+const HMAC_SECRET = process.env.SESSION_SECRET || 'beeflow-tmp-download';
+
+/**
+ * Generate a time-limited, HMAC-signed public URL for a RustFS key.
+ * Only allowed for keys under `transcription-tmp/`.
+ * @param {string} key - RustFS object key
+ * @param {number} ttlSeconds - URL lifetime (default: 900 = 15 min)
+ * @returns {string} Full public URL
+ */
+function generateTempDownloadUrl(key, ttlSeconds = 900) {
+    if (!key.startsWith('transcription-tmp/')) {
+        throw new Error('Temp download URLs only allowed for transcription-tmp/ keys');
+    }
+    const expires = Math.floor(Date.now() / 1000) + ttlSeconds;
+    const payload = `${key}:${expires}`;
+    const token = crypto.createHmac('sha256', HMAC_SECRET).update(payload).digest('hex');
+    const encodedKey = encodeURIComponent(key);
+
+    // Build full public URL from server config
+    const protocol = process.env.SERVER_PROTOCOL || 'https';
+    const host = process.env.SERVER_PUBLIC_HOST || 'localhost:3002';
+    return `${protocol}://${host}/api/storage/tmp/${token}?key=${encodedKey}&expires=${expires}`;
+}
+
+// GET /api/storage/tmp/:token — unauthenticated, HMAC-verified temp download
+router.get('/tmp/:token', async (req, res) => {
+    try {
+        const { token } = req.params;
+        const key = req.query.key;
+        const expires = parseInt(req.query.expires, 10);
+
+        if (!key || !expires || !token) {
+            return res.status(400).json({ error: 'Missing parameters' });
+        }
+
+        // Only allow transcription-tmp/ keys
+        if (!key.startsWith('transcription-tmp/')) {
+            return res.status(403).json({ error: 'Forbidden' });
+        }
+
+        // Check expiry
+        if (Math.floor(Date.now() / 1000) > expires) {
+            return res.status(410).json({ error: 'URL expired' });
+        }
+
+        // Verify HMAC token
+        const payload = `${key}:${expires}`;
+        const expected = crypto.createHmac('sha256', HMAC_SECRET).update(payload).digest('hex');
+        if (!crypto.timingSafeEqual(Buffer.from(token, 'hex'), Buffer.from(expected, 'hex'))) {
+            return res.status(403).json({ error: 'Invalid token' });
+        }
+
+        if (!storageStore.isAvailable()) {
+            return res.status(503).json({ error: 'Storage not available' });
+        }
+
+        const { stream, contentType, contentLength } = await storageStore.streamFile(key);
+
+        res.setHeader('Content-Type', contentType || 'audio/wav');
+        if (contentLength) res.setHeader('Content-Length', contentLength);
+        res.setHeader('Cache-Control', 'no-store');
+
+        stream.pipe(res);
+    } catch (err) {
+        if (err.name === 'NoSuchKey' || err.$metadata?.httpStatusCode === 404) {
+            return res.status(404).json({ error: 'File not found' });
+        }
+        console.error('[StorageProxy] Temp download error:', err.message);
+        res.status(500).json({ error: 'Failed to retrieve file' });
+    }
+});
+
+// Export the URL generator for use in transcription tools
+router.generateTempDownloadUrl = generateTempDownloadUrl;
+
 // GET /api/storage/file/* — stream a file from RustFS
-router.get('/file/{*path}', async (req, res) => {
+router.get('/file/{*fileKey}', async (req, res) => {
     try {
         const userId = req.session?.user?.id;
         if (!userId) {
@@ -20,8 +103,15 @@ router.get('/file/{*path}', async (req, res) => {
         }
 
         // Extract key from the wildcard path (everything after /file/)
-        const rawKey = req.params.path || '';
-        const key = decodeURIComponent(rawKey);
+        // path-to-regexp v8 returns wildcard params as an array of segments
+        const rawKey = req.params.fileKey;
+        let key = Array.isArray(rawKey) ? rawKey.join('/') : (rawKey || '');
+        key = decodeURIComponent(key);
+        
+        // Express wildcard captures often include the leading slash, which breaks prefix checking!
+        if (key.startsWith('/')) {
+            key = key.substring(1);
+        }
         if (!key) {
             return res.status(400).json({ error: 'File key required' });
         }
@@ -30,6 +120,7 @@ router.get('/file/{*path}', async (req, res) => {
         const isOwnFile = key.startsWith(`users/${userId}/`);
         const isSharedFile = key.startsWith('shared/');
         if (!isOwnFile && !isSharedFile) {
+            console.warn(`[StorageProxy] Access denied: sessionUserId="${userId}" key="${key}"`);
             return res.status(403).json({ error: 'Access denied' });
         }
 

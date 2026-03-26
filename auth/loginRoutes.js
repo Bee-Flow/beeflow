@@ -88,7 +88,7 @@ router.get('/setup-status', async (req, res) => {
     const serverUrl = process.env.SERVER_PUBLIC_HOST
         ? `${process.env.SERVER_PROTOCOL || 'https'}://${process.env.SERVER_PUBLIC_HOST}`
         : '';
-    res.json({ isSetupComplete, isOAuthConfigured, isGoogleConfigured, isMicrosoftConfigured, serverUrl });
+    res.json({ isSetupComplete, isOAuthConfigured, isGoogleConfigured, isMicrosoftConfigured, serverUrl, deploymentMode: process.env.DEPLOYMENT_MODE || 'cloud' });
 });
 
 // Initial admin setup (set password for first time)
@@ -367,6 +367,7 @@ router.get('/user', async (req, res) => {
                 monitoring: process.env.ENABLE_MONITORING !== 'false',
                 meeting_notes: process.env.ENABLE_MEETING_NOTES !== 'false',
                 templates: process.env.ENABLE_TEMPLATES !== 'false',
+                deploymentMode: process.env.DEPLOYMENT_MODE || 'cloud',
             },
             // Org-level enabled integrations
             enabledIntegrations: await (async () => {

@@ -25,6 +25,39 @@ const { checkRegexPatterns } = require('../../core/guardrails');
 const { checkSubscriptionLimits, resolveOrgId } = require('../../core/limits');
 const { getServiceHeaders } = require('../../core/serviceAuth');
 
+// ─── Default system prompt ──────────────────────────────────────────
+// Used when no custom `direct_chat_system_prompt` is configured in admin.
+// Covers identity, formatting, rich output, tool usage, and language.
+const DEFAULT_SYSTEM_PROMPT = `You are BeeFlow — a fast, precise, and proactive AI assistant embedded in a professional productivity platform.
+
+## Core Principles
+- Lead with the answer. Put the conclusion, result, or recommendation first — then explain.
+- Be concise. Avoid filler phrases, preambles ("Sure!", "Of course!"), and restating the question.
+- Be thorough when asked. When the user requests deep analysis, research, or comprehensive output — deliver in full. Length is fine when it adds value.
+- Prefer structured formatting (headings, bullets, tables, numbered steps) for clarity.
+- When uncertain, say so honestly. Offer to search the web or check the user's knowledge base for verification.
+
+## Formatting & Rich Output
+You render full GitHub-Flavored Markdown including tables, task lists, and heading anchors.
+You can also produce these rich blocks when appropriate:
+- **Code**: Use fenced code blocks with language tags for syntax highlighting.
+- **Math**: Use LaTeX ($...$ inline, $$...$$ block) for mathematical expressions.
+- **Diagrams**: Use \`\`\`mermaid code blocks for flowcharts, sequences, ERDs, Gantt charts, etc.
+- **Charts**: Use \`\`\`vega-lite code blocks with a Vega-Lite JSON spec for interactive data visualizations.
+- **Interactive Apps**: Use \`\`\`html-app code blocks to build runnable HTML/CSS/JS mini-applications.
+- **Quotes / Proposals**: Use \`\`\`quote code blocks with JSON to generate professional business quotes.
+- **Research Reports**: Use \`\`\`json-research code blocks for structured, sourced research summaries.
+
+## Tool Usage
+Do NOT describe what you *could* do — just do it. When a user asks to send an email, search something, generate an image, or create a spreadsheet, call the appropriate tool immediately. Only ask for clarification when critical parameters are genuinely ambiguous.
+
+When composing emails, always match the user's personal writing style and language if a style profile is available.
+
+When the user has a notebook open, prefer partial edits (notebook_replace) over full rewrites (notebook_write). Always call notebook_read before notebook_replace to see the exact current content.
+
+## Response Language
+Always respond in the same language the user writes in. If the user writes in Dutch, respond in Dutch. If in English, respond in English. Match their language exactly — do not switch unless explicitly asked.`;
+
 function requireAuth(req, res, next) {
     if (req.session && req.session.user) return next();
     res.status(401).json({ error: 'Unauthorized' });
@@ -320,9 +353,9 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         // Build messages array
         const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
         const customPrompt = await configStore.getConfig('direct_chat_system_prompt');
-        const basePrompt = (requestSystemPrompt ? requestSystemPrompt + '\n\n' : '') + (customPrompt
-            ? `${customPrompt}\n\nToday is ${today}.`
-            : `You are a helpful AI assistant. Today is ${today}. Respond thoughtfully and concisely.`);
+        const basePrompt = (requestSystemPrompt ? requestSystemPrompt + '\n\n' : '')
+            + (customPrompt || DEFAULT_SYSTEM_PROMPT)
+            + `\n\nToday is ${today}.`;
 
         // Build explicit integration hints so the AI knows what tools it has
         const toolHint = await buildToolHint(directChatTools, userId);
@@ -393,12 +426,44 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
             console.warn('[DirectChat] Memory retrieval failed:', e.message);
         }
 
-        // ─── Workspace context injection ─────────────────────────────
+        // ─── Notebook context injection ─────────────────────────────
         let workspaceContext = '';
-        if (workspaceContent && workspaceContent.trim()) {
-            workspaceContext = '\n\n[WORKSPACE CONTEXT]\nThe user has an active workspace document (markdown) open alongside the chat. You have 3 workspace tools:\n- workspace_read: Read current content (ALWAYS use this before workspace_replace to get exact text)\n- workspace_write: Replace ALL content (for new documents or full rewrites only)\n- workspace_replace: Replace a SPECIFIC portion (preferred for edits — uses find_text + replace_text)\n\nWORKSPACE RULES:\n1. For partial edits, ALWAYS prefer workspace_replace over workspace_write\n2. Before using workspace_replace, call workspace_read first to see the EXACT current content\n3. Copy the find_text EXACTLY from workspace_read output — character by character, including markdown formatting\n4. The workspace persists across chat messages — content stays until explicitly changed';
+        if (workspaceContent) {
+            workspaceContext = `\n\n[NOTEBOOK]
+The user has a rich-text Notebook open alongside the chat. You have 4 notebook tools:
+- notebook_read: Read current content as Markdown (ALWAYS call this before notebook_replace)
+- notebook_write: Replace ALL content (use for new documents or full rewrites)
+- notebook_replace: Replace a SPECIFIC portion (preferred for edits — uses find_text + replace_text)
+- notebook_insert: Insert content at start, end, or after a specific heading/text (preferred for adding new sections)
+
+NOTEBOOK RULES:
+1. Write content in Markdown — the notebook renders it as rich text automatically
+2. For partial edits, prefer notebook_replace over notebook_write
+3. To add new sections without touching existing content, use notebook_insert
+4. Before using notebook_replace, call notebook_read first to see the EXACT current content
+5. Copy find_text EXACTLY from notebook_read output — character by character
+6. The notebook persists across messages — content stays until explicitly changed
+
+RICH-TEXT FORMATTING — Use these Markdown features for full styling:
+• Headings: # H1, ## H2, ### H3 (up to 6 levels)
+• Bold: **text**, Italic: *text*, Strikethrough: ~~text~~, Underline: use <u>text</u>
+• Text color: <span style="color: #e74c3c">red text</span> or any hex/named color
+• Highlight: <mark>highlighted text</mark> or <mark style="background-color: #ffeaa7">custom color</mark>
+• Font family: <span style="font-family: Georgia">serif text</span> (supports any web font)
+• Inline code: \`code\`, Code blocks: \`\`\`language\\ncode\\n\`\`\`
+• Bullet lists: - item, Numbered lists: 1. item
+• Task lists: - [ ] unchecked, - [x] checked
+• Tables: | Header | Header |\\n|--------|--------|\\n| Cell | Cell |
+• Blockquotes: > text (nestable: > > nested)
+• Links: [text](url), Images: ![alt](url)
+• Math formulas: $inline$ or $$block$$  (LaTeX/KaTeX)
+• Mermaid diagrams: \`\`\`mermaid\\ngraph TD; A-->B\\n\`\`\`
+• Horizontal rules: ---
+• Emoji shortcodes: :smile: :rocket: :warning:
+• Combine formatting freely: **<span style="color: #2ecc71">bold green</span>**, *<mark>italic highlighted</mark>*
+• Nested lists and complex table structures are fully supported`;
             if (workspaceSelection && workspaceSelection.trim()) {
-                workspaceContext += `\n\n[SELECTED TEXT — RAW MARKDOWN]\nThe user has selected this text in the workspace (raw markdown source):\n\`\`\`\n${workspaceSelection}\n\`\`\`\nUse workspace_replace with find_text set to EXACTLY this text (including any ** # - formatting). Set replace_text to the new version. To remove, set replace_text to empty string.`;
+                workspaceContext += `\n\n[SELECTED TEXT IN NOTEBOOK]\nThe user has selected this text in the notebook:\n\`\`\`\n${workspaceSelection}\n\`\`\`\nUse notebook_replace with find_text set to EXACTLY this text (including any ** # - formatting). Set replace_text to the new version. To remove, set replace_text to empty string.`;
             }
         }
 
@@ -1767,7 +1832,10 @@ router.get('/direct/conversations/:id/workspace', requireAuth, async (req, res) 
         const userId = req.session.user.id;
         const conv = await agentStore.getDirectConversation(req.params.id, userId);
         if (!conv) return res.status(404).json({ error: 'Conversation not found' });
-        res.json({ content: conv.workspace_content || '' });
+        res.json({
+            content: conv.workspace_content || '',
+            notebookId: conv.workspace_notebook_id || null,
+        });
     } catch (e) {
         console.error('Failed to get direct conversation workspace:', e);
         res.status(500).json({ error: 'Failed to get workspace' });
@@ -1780,8 +1848,8 @@ router.put('/direct/conversations/:id/workspace', requireAuth, async (req, res) 
         const userId = req.session.user.id;
         const conv = await agentStore.getDirectConversation(req.params.id, userId);
         if (!conv) return res.status(404).json({ error: 'Conversation not found' });
-        const { content } = req.body;
-        await agentStore.updateDirectConversationWorkspace(req.params.id, content || '');
+        const { content, notebookId } = req.body;
+        await agentStore.updateDirectConversationWorkspace(req.params.id, content || '', notebookId !== undefined ? notebookId : null);
         res.json({ success: true });
     } catch (e) {
         console.error('Failed to update direct conversation workspace:', e);

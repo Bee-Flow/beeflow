@@ -70,38 +70,84 @@ router.get('/system', async (req, res) => {
     }
 });
 
-// System Prompt Designer Chat Endpoint
-router.post('/system/prompt-designer/chat', async (req, res) => {
+// System Prompt Designer SSE Streaming Endpoint (uses thinking tier)
+router.post('/system/prompt-designer/stream', async (req, res) => {
     try {
         const { message } = req.body;
         if (!message) {
             return res.status(400).json({ error: 'Message is required' });
         }
 
-        const { getSystemPromptDesignerAgent, SYSTEM_PROMPT_DESIGNER_AGENT_ID } = agentStore;
+        const { getSystemPromptDesignerAgent } = agentStore;
         const agent = await getSystemPromptDesignerAgent();
 
         if (!agent) {
             return res.status(404).json({ error: 'System Prompt Designer agent not found' });
         }
 
-        // Resolve model (handles tier: prefix)
-        const modelToUse = await resolveModelTier(agent.model);
-        console.log(`[PromptDesigner] Using model: ${modelToUse}`);
+        // Resolve thinking tier model from chat_model_tiers config
+        const tiers = await configStore.getConfig('chat_model_tiers') || {};
+        const thinkingTier = tiers['thinking'] || tiers['smart'] || tiers['fast'] || {};
+        const modelId = thinkingTier.modelId;
+
+        if (!modelId) {
+            return res.status(500).json({ error: 'No thinking/smart/fast tier model configured. Check your model tier configuration.' });
+        }
+
+        console.log(`[PromptDesigner] Using thinking tier model: ${modelId}`);
+
+        // Set up SSE (matches setupSSE pattern — flushHeaders is required for Nginx Proxy Manager)
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.flushHeaders();
+
+        const send = (event, data) => {
+            if (!res.writableEnded) {
+                res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+            }
+        };
 
         const messages = [
             { role: 'system', content: agent.system_prompt },
             { role: 'user', content: message }
         ];
 
-        const result = await llmClient.chat(modelToUse, messages, { maxTokens: 4096 });
+        // Stream via llmClient
+        let fullContent = '';
+        let thinkingContent = '';
 
-        res.json({ message: result.content });
+        await llmClient.stream(modelId, messages, {
+            maxTokens: thinkingTier.maxTokens || 16384,
+            temperature: thinkingTier.temperature !== undefined ? thinkingTier.temperature : 0.7,
+            reasoningEffort: thinkingTier.reasoningEffort || undefined,
+            budgetTokens: thinkingTier.budgetTokens || undefined,
+        }, (type, data) => {
+            if (type === 'text') {
+                fullContent += data.text;
+                send('content', { text: data.text });
+            } else if (type === 'thinking') {
+                thinkingContent += data.text;
+                send('thinking', { text: data.text });
+            } else if (type === 'error') {
+                send('error', data);
+            } else if (type === 'done') {
+                // done handled below
+            }
+        });
 
+        send('done', { fullContent });
+        res.end();
 
     } catch (error) {
         console.error('[PromptDesigner] Error:', error);
-        res.status(500).json({ error: error.message });
+        if (res.headersSent) {
+            res.write(`event: error\ndata: ${JSON.stringify({ error: error.message })}\n\n`);
+            res.end();
+        } else {
+            res.status(500).json({ error: error.message });
+        }
     }
 });
 
@@ -117,7 +163,15 @@ router.post('/system/conversation-starters/generate', async (req, res) => {
             return res.status(404).json({ error: 'Conversation Starter Generator agent not found' });
         }
 
-        const modelToUse = await resolveModelTier(agent.model);
+        // Ignore hardcoded model and use the smart tier (with fallback to default)
+        let modelToUse = await resolveModelTier('tier:smart');
+        try {
+            await getProviderForModel(modelToUse);
+        } catch (_) {
+            const globalConfig = await getAIConfig();
+            modelToUse = globalConfig.model;
+            console.warn(`[ConversationStarters] Smart tier model not found, falling back to: ${modelToUse}`);
+        }
         console.log(`[ConversationStarters] Using model: ${modelToUse}`);
 
         const contextMessage = `Generate 4 conversation starters for an agent with:
@@ -133,13 +187,11 @@ router.post('/system/conversation-starters/generate', async (req, res) => {
         const result = await llmClient.chat(modelToUse, messages, { maxTokens: 500 });
         const content = result.content;
 
-
         // Parse the JSON array from the response
         try {
-            // Extract JSON array from response (in case there's extra text)
             const jsonMatch = content.match(/\[[\s\S]*\]/);
             const starters = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
-            res.json({ starters: starters.slice(0, 4) }); // Ensure max 4
+            res.json({ starters: starters.slice(0, 4) });
         } catch (parseError) {
             console.error('[ConversationStarters] Parse error:', parseError);
             res.json({ starters: [] });
@@ -163,7 +215,15 @@ router.post('/system/description-improver/generate', async (req, res) => {
             return res.status(404).json({ error: 'Description Improver agent not found' });
         }
 
-        const modelToUse = await resolveModelTier(agent.model);
+        // Ignore hardcoded model and use the smart tier (with fallback to default)
+        let modelToUse = await resolveModelTier('tier:smart');
+        try {
+            await getProviderForModel(modelToUse);
+        } catch (_) {
+            const globalConfig = await getAIConfig();
+            modelToUse = globalConfig.model;
+            console.warn(`[DescriptionImprover] Smart tier model not found, falling back to: ${modelToUse}`);
+        }
         console.log(`[DescriptionImprover] Using model: ${modelToUse}`);
 
         const promptContext = systemPrompt ? systemPrompt.substring(0, 1000) : '';
@@ -180,10 +240,7 @@ router.post('/system/description-improver/generate', async (req, res) => {
         const result = await llmClient.chat(modelToUse, messages, { maxTokens: 200 });
         const description = result.content;
 
-
-        // Clean up the description (remove quotes if present)
         const cleanDescription = description.replace(/^["']|["']$/g, '').trim();
-
         res.json({ description: cleanDescription });
 
     } catch (error) {
@@ -208,7 +265,16 @@ router.post('/system/identity-improver/generate', async (req, res) => {
             return res.status(404).json({ error: 'Identity Improver agent not found' });
         }
 
-        const modelToUse = await resolveModelTier(agent.model);
+        // Ignore hardcoded model and use the smart tier (with fallback to default)
+        let modelToUse = await resolveModelTier('tier:smart');
+        try {
+            await getProviderForModel(modelToUse);
+        } catch (_) {
+            // Smart tier model not available — fall back to global default
+            const globalConfig = await getAIConfig();
+            modelToUse = globalConfig.model;
+            console.warn(`[IdentityImprover] Smart tier model not found, falling back to: ${modelToUse}`);
+        }
         console.log(`[IdentityImprover] Using model: ${modelToUse}`);
 
         const contextMessage = `Based on this system prompt, generate a name and description:\n\n---\n${systemPrompt.substring(0, 1500)}\n---\n\nCurrent name: ${currentName || '(none)'}\nCurrent description: ${currentDescription || '(none)'}`;
@@ -221,10 +287,7 @@ router.post('/system/identity-improver/generate', async (req, res) => {
         const result = await llmClient.chat(modelToUse, messages, { maxTokens: 200 });
         const content = result.content;
 
-
-        // Parse JSON response
         try {
-            // Try to extract JSON from the response
             const jsonMatch = content.match(/\{[\s\S]*\}/);
             if (jsonMatch) {
                 const identity = JSON.parse(jsonMatch[0]);
@@ -246,6 +309,5 @@ router.post('/system/identity-improver/generate', async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 });
-
 
 module.exports = router;

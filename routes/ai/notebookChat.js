@@ -264,9 +264,20 @@ DRAG HANDLE (user feature — no action needed from AI):
   The editor has a drag handle that appears when the user hovers over a block.
   This allows blocks to be reordered by drag-and-drop. No special HTML is needed.
 
-TEXT COLOR (@tiptap/extension-color + TextStyle):
-  The editor supports colored text via the toolbar. No special HTML action required from AI.
-  The user applies colors manually via the color picker. Avoid setting inline color styles in document tool calls.
+TEXT COLOR & HIGHLIGHTS (@tiptap/extension-color + TextStyle + Highlight):
+  Apply text colors using inline styles on <span> elements:
+    <span style="color: #e74c3c">red text</span>
+    <span style="color: #2ecc71">green text</span>
+    <span style="color: #3498db">blue text</span>
+  Apply background highlights using <mark>:
+    <mark>default yellow highlight</mark>
+    <mark style="background-color: #ffeaa7">custom highlight color</mark>
+  You can combine color with other formatting:
+    <strong><span style="color: #e74c3c">bold red</span></strong>
+    <em><mark style="background-color: #dfe6e9">italic highlighted</mark></em>
+  Use colors when the user asks for colored, highlighted, or styled text.
+  Common color palette: #e74c3c (red), #e67e22 (orange), #f1c40f (yellow),
+    #2ecc71 (green), #3498db (blue), #9b59b6 (purple), #1abc9c (teal), #34495e (dark)
 
 TYPOGRAPHY (auto-corrections — transparent to AI):
   The editor auto-corrects typographic patterns (smart quotes, em dashes, fractions).
@@ -310,11 +321,11 @@ DOCUMENT RULES — FOLLOW STRICTLY:
 11. TASK LISTS: When the user asks for action items, to-dos, checklists, or follow-up tasks — use the task list HTML syntax above. This renders as real interactive checkboxes.
 12. IMAGES: Only insert images by URL when explicitly asked. Do NOT invent image URLs.
 
-[WEB SEARCH & SOURCES]
+${searchAvailable ? `[WEB SEARCH & SOURCES]
 - You can search the web using agent_search for current information and research
 - You can add search results or any text directly as a notebook source using notebook_add_source
 - When adding web search results as a source, pass the complete results text directly — no need to re-fetch
-${kbContext}${documentContext}
+` : ''}${kbContext}${documentContext}
 Now: ${new Date().toLocaleString('sv-SE', { timeZone: timezone || 'UTC', timeZoneName: 'short' })}`;
 
         let messages = [{ role: 'system', content: systemPrompt }];
@@ -367,7 +378,7 @@ Now: ${new Date().toLocaleString('sv-SE', { timeZone: timezone || 'UTC', timeZon
         const hasAgentSearchUrl = !!process.env.SEARCH_SERVICE_URL || !!(await configStore.getConfig('agent_search_url'));
         const searchProvider = await configStore.getConfig('search_provider') || 'agent-search';
         const hasBingSearchKey = !!(await configStore.getSecret('bing_search_key'));
-        const searchAvailable = (searchProvider === 'bing' && hasBingSearchKey) || hasAgentSearchUrl;
+        const searchAvailable = searchProvider !== 'disabled' && ((searchProvider === 'bing' && hasBingSearchKey) || hasAgentSearchUrl);
         if (searchAvailable) {
             notebookTools.push(...AGENT_SEARCH_TOOLS);
         }

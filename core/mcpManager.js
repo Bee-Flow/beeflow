@@ -47,6 +47,7 @@ const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 async function initialize() {
     try {
         await loadSDK();
+        await mcpStore.ready; // Ensure table exists before querying
         const servers = await mcpStore.getEnabledServers();
         console.log(`[MCP] Initialized — ${servers.length} server definition(s) loaded`);
     } catch (err) {

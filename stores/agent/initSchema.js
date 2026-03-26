@@ -144,6 +144,10 @@ async function _doInit() {
     try { await exec(`ALTER TABLE direct_conversations ADD COLUMN IF NOT EXISTS labels_json TEXT DEFAULT '[]'`); } catch (e) { /* already exists */ }
     try { await exec(`ALTER TABLE agent_conversations ADD COLUMN IF NOT EXISTS labels_json TEXT DEFAULT '[]'`); } catch (e) { /* already exists */ }
 
+    // Migration: Add workspace_notebook_id to link workspace notebook to conversation
+    try { await exec(`ALTER TABLE direct_conversations ADD COLUMN IF NOT EXISTS workspace_notebook_id TEXT`); } catch (e) { /* already exists */ }
+    try { await exec(`ALTER TABLE agent_conversations ADD COLUMN IF NOT EXISTS workspace_notebook_id TEXT`); } catch (e) { /* already exists */ }
+
     // Agent categories (org-level)
     await exec(`CREATE TABLE IF NOT EXISTS agent_categories (
         id TEXT PRIMARY KEY,

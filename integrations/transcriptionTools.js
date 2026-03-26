@@ -626,21 +626,62 @@ async function handleAzureWhisperTranscription(args, context) {
 
     const tempInputPath = path.join(os.tmpdir(), `azwhi-in-${Date.now()}`);
     fs.writeFileSync(tempInputPath, audioData);
-    let tempWavPath = null;
+    let tempConvertedPath = null;
     let rustfsKey = null;
     let transcriptionJobUrl = null;
 
-    try {
-        // ── Step 1: Convert to 16kHz mono WAV ──
-        console.log('[Transcription:AzureWhisper] Converting audio...');
-        tempWavPath = await convertToWav(tempInputPath);
+    // Azure Whisper batch API natively supports these formats — no conversion needed.
+    // Converting to uncompressed WAV only bloats file size (15 MB MP3 → 128 MB WAV).
+    const WHISPER_NATIVE_FORMATS = ['.mp3', '.wav', '.ogg', '.flac', '.m4a', '.mp4', '.opus'];
+    const fileExt = path.extname(audioFileName).toLowerCase();
+    const isNativeFormat = WHISPER_NATIVE_FORMATS.includes(fileExt);
 
-        // ── Step 2: Upload to RustFS, generate 15-min presigned URL ──
-        const wavBuffer = fs.readFileSync(tempWavPath);
-        rustfsKey = `transcription-tmp/${Date.now()}-${audioFileName.replace(/[^a-zA-Z0-9._-]/g, '_')}.wav`;
-        await storageStore.uploadFile(rustfsKey, wavBuffer, 'audio/wav');
-        const audioUrl = await storageStore.getPresignedUrl(rustfsKey, 900); // 15 min
-        console.log(`[Transcription:AzureWhisper] Uploaded to RustFS: ${rustfsKey}`);
+    try {
+        let uploadBuffer;
+        let uploadKey;
+        let uploadMime;
+
+        if (isNativeFormat) {
+            // ── Step 1a: Native format — upload original file directly ──
+            console.log(`[Transcription:AzureWhisper] Format "${fileExt}" is natively supported — skipping conversion`);
+            uploadBuffer = audioData;
+            uploadKey = `transcription-tmp/${Date.now()}-${audioFileName.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+            const MIME_MAP = {
+                '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg',
+                '.flac': 'audio/flac', '.m4a': 'audio/mp4', '.mp4': 'audio/mp4',
+                '.opus': 'audio/ogg',
+            };
+            uploadMime = MIME_MAP[fileExt] || 'audio/mpeg';
+        } else {
+            // ── Step 1b: Non-native format (e.g. .webm) — convert to OGG/Opus ──
+            // OGG/Opus is compact (~1/8th of WAV) and natively supported by Whisper.
+            console.log(`[Transcription:AzureWhisper] Converting "${fileExt}" to OGG/Opus...`);
+            tempConvertedPath = path.join(os.tmpdir(), `azwhi-${Date.now()}.ogg`);
+            await new Promise((resolve, reject) => {
+                ffmpeg(tempInputPath)
+                    .audioCodec('libopus')
+                    .audioChannels(1)
+                    .audioBitrate('64k')
+                    .format('ogg')
+                    .on('end', resolve)
+                    .on('error', (err) => reject(new Error(`ffmpeg conversion failed: ${err.message}`)))
+                    .save(tempConvertedPath);
+            });
+            uploadBuffer = fs.readFileSync(tempConvertedPath);
+            uploadKey = `transcription-tmp/${Date.now()}-${audioFileName.replace(/[^a-zA-Z0-9._-]/g, '_')}.ogg`;
+            uploadMime = 'audio/ogg';
+            console.log(`[Transcription:AzureWhisper] Converted: ${(audioData.length / 1024).toFixed(0)} KB → ${(uploadBuffer.length / 1024).toFixed(0)} KB (OGG/Opus)`);
+        }
+
+        // ── Step 2: Upload to RustFS, generate public temp URL ──
+        // Azure's batch API needs to download the audio from a public URL.
+        // RustFS presigned URLs point to localhost:9000 (unreachable by Azure),
+        // so we use an HMAC-signed temporary public URL through the BeeFlow server proxy.
+        rustfsKey = uploadKey;
+        await storageStore.uploadFile(rustfsKey, uploadBuffer, uploadMime);
+        const { generateTempDownloadUrl } = require('../routes/storageProxy');
+        const audioUrl = generateTempDownloadUrl(rustfsKey, 900); // 15 min
+        console.log(`[Transcription:AzureWhisper] Uploaded to RustFS: ${rustfsKey} (${(uploadBuffer.length / 1024).toFixed(0)} KB)`);
 
         // ── Step 3: Discover the Whisper model UUID via paginated API ──
         // Azure only returns 100 oldest models per page; Whisper is near the end.
@@ -762,9 +803,9 @@ async function handleAzureWhisperTranscription(args, context) {
         return { error: `Azure Whisper transcription failed: ${safeMsg}` };
     } finally {
         try { fs.unlinkSync(tempInputPath); } catch (_) {}
-        try { if (tempWavPath) fs.unlinkSync(tempWavPath); } catch (_) {}
+        try { if (tempConvertedPath) fs.unlinkSync(tempConvertedPath); } catch (_) {}
         try {
-            if (rustfsKey) { const ss = require('../stores/storageStore'); await ss.deleteFile(rustfsKey); console.log('[Transcription:AzureWhisper] Temp WAV deleted from RustFS'); }
+            if (rustfsKey) { const ss = require('../stores/storageStore'); await ss.deleteFile(rustfsKey); console.log('[Transcription:AzureWhisper] Temp audio deleted from RustFS'); }
         } catch (_) {}
         try {
             if (transcriptionJobUrl && speechKey) await fetch(transcriptionJobUrl, { method: 'DELETE', headers: { 'Ocp-Apim-Subscription-Key': speechKey } });

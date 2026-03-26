@@ -37,6 +37,7 @@ app.use(helmet({
     hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
     contentSecurityPolicy: false,        // Handled by Nginx
     crossOriginEmbedderPolicy: false,    // Can break embedded content
+    crossOriginResourcePolicy: { policy: 'same-site' },  // Allow cross-subdomain resource loading (server.dev → dev.beeflow.ai)
     permissionsPolicy: false,            // Managed manually below (clipboard needs self)
 }));
 // Allow clipboard access so users can paste screenshots in the conversation area.
@@ -202,7 +203,21 @@ app.get('/api', (req, res) => {
 // ── Static files ──────────────────────────────────────────────────────────────
 const agentHubDistPath = path.resolve(__dirname, '../agent-hub/dist');
 if (process.env.NODE_ENV === 'production' && fs.existsSync(agentHubDistPath)) {
-    app.use(express.static(agentHubDistPath));
+    // Hashed Vite assets get long-lived immutable cache; everything else (index.html) gets no-cache
+    app.use('/assets', express.static(path.join(agentHubDistPath, 'assets'), {
+        maxAge: '1y',
+        immutable: true,
+    }));
+    app.use(express.static(agentHubDistPath, {
+        maxAge: 0,
+        setHeaders: (res, filePath) => {
+            if (filePath.endsWith('.html')) {
+                res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+                res.setHeader('Pragma', 'no-cache');
+                res.setHeader('Expires', '0');
+            }
+        },
+    }));
     console.log('[Production] Serving static files from agent-hub:', agentHubDistPath);
 }
 app.use('/uploads', express.static(path.join(__dirname, 'data', 'uploads')));
@@ -329,6 +344,7 @@ app.use('/api/integrations/outlook', require('./routes/integrations/outlook'));
 app.use('/api/integrations/onedrive', require('./routes/integrations/oneDrive'));
 app.use('/api/templates', require('./routes/templates'));
 app.use('/api/notebooks', require('./routes/notebooks'));
+app.use('/api/notebooks', require('./routes/notebookExport'));
 app.use('/api/transcriptions', require('./routes/transcriptions'));
 app.use('/api/meet-bot', require('./routes/meetBot'));
 app.use('/', require('./routes/knowledge'));
@@ -341,7 +357,12 @@ app.use('/api/icons', require('./routes/icons'));
 if (process.env.NODE_ENV === 'production') {
     const indexPath = path.join(agentHubDistPath, 'index.html');
     if (fs.existsSync(indexPath)) {
-        app.use((req, res) => res.sendFile(indexPath));
+        app.use((req, res) => {
+            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+            res.setHeader('Pragma', 'no-cache');
+            res.setHeader('Expires', '0');
+            res.sendFile(indexPath);
+        });
     }
 }
 

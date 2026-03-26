@@ -85,6 +85,22 @@ router.put('/:id', requireAuth, async (req, res) => {
     try {
         const userId = req.session.user.id;
         const { name, description, instructions, settings, knowledgeBaseIds, documentContent } = req.body;
+
+        // Auto-version: snapshot current content before overwriting (5-min debounce)
+        if (documentContent !== undefined) {
+            try {
+                const nb = await notebookStore.getNotebook(req.params.id, userId);
+                if (nb && nb.documentContent && nb.documentContent.trim() && nb.documentContent !== documentContent) {
+                    const shouldSnapshot = await notebookStore.shouldAutoVersion(req.params.id);
+                    if (shouldSnapshot) {
+                        await notebookStore.createVersion(req.params.id, nb.documentContent, 'Auto-save');
+                    }
+                }
+            } catch (vErr) {
+                console.warn('[Notebooks] Auto-version failed:', vErr.message);
+            }
+        }
+
         const ok = await notebookStore.updateNotebook(req.params.id, userId, {
             name, description, instructions, settings, knowledgeBaseIds, documentContent
         });
@@ -747,8 +763,11 @@ router.post('/:id/images', requireAuth, imageUpload.single('image'), async (req,
         const userId = req.session.user.id;
         const notebookId = req.params.id;
 
-        const nb = await notebookStore.getNotebook(notebookId, userId);
-        if (!nb) return res.status(404).json({ error: 'Notebook not found' });
+        // Allow 'workspace' as a virtual notebook ID for the workspace notebook pane
+        if (notebookId !== 'workspace') {
+            const nb = await notebookStore.getNotebook(notebookId, userId);
+            if (!nb) return res.status(404).json({ error: 'Notebook not found' });
+        }
         if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
 
         const { buffer, mimetype, originalname } = req.file;
@@ -793,5 +812,76 @@ router.post('/:id/import-file', requireAuth, upload.single('file'), async (req, 
     }
 });
 
-module.exports = router;
+// ── Version Control ─────────────────────────────────────────────────
 
+// List versions (metadata only)
+router.get('/:id/versions', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const nb = await notebookStore.getNotebook(req.params.id, userId);
+        if (!nb) return res.status(404).json({ error: 'Notebook not found' });
+
+        const versions = await notebookStore.getVersions(req.params.id);
+        res.json({ versions });
+    } catch (err) {
+        console.error('[Notebooks] List versions failed:', err);
+        res.status(500).json({ error: 'Failed to list versions' });
+    }
+});
+
+// Get a single version with full content
+router.get('/:id/versions/:vid', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const nb = await notebookStore.getNotebook(req.params.id, userId);
+        if (!nb) return res.status(404).json({ error: 'Notebook not found' });
+
+        const version = await notebookStore.getVersion(req.params.vid);
+        if (!version || version.notebookId !== req.params.id) {
+            return res.status(404).json({ error: 'Version not found' });
+        }
+        res.json({ version });
+    } catch (err) {
+        console.error('[Notebooks] Get version failed:', err);
+        res.status(500).json({ error: 'Failed to get version' });
+    }
+});
+
+// Create a manual snapshot
+router.post('/:id/versions', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const nb = await notebookStore.getNotebook(req.params.id, userId);
+        if (!nb) return res.status(404).json({ error: 'Notebook not found' });
+
+        const summary = req.body.summary || 'Manual snapshot';
+        const content = nb.documentContent || '';
+        if (!content.trim()) {
+            return res.status(400).json({ error: 'Notebook is empty — nothing to snapshot' });
+        }
+
+        const version = await notebookStore.createVersion(req.params.id, content, summary);
+        res.json({ success: true, version });
+    } catch (err) {
+        console.error('[Notebooks] Create version failed:', err);
+        res.status(500).json({ error: 'Failed to create version' });
+    }
+});
+
+// Delete a version
+router.delete('/:id/versions/:vid', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const nb = await notebookStore.getNotebook(req.params.id, userId);
+        if (!nb) return res.status(404).json({ error: 'Notebook not found' });
+
+        const ok = await notebookStore.deleteVersion(req.params.vid);
+        if (!ok) return res.status(404).json({ error: 'Version not found' });
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[Notebooks] Delete version failed:', err);
+        res.status(500).json({ error: 'Failed to delete version' });
+    }
+});
+
+module.exports = router;

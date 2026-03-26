@@ -473,7 +473,7 @@ async function executeSheetsAction(action, session) {
 }
 
 function isSheetsTool(toolName) {
-    return toolName.startsWith('sheets_');
+    return typeof toolName === 'string' && toolName.startsWith('sheets_');
 }
 
 module.exports = {

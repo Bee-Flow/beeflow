@@ -163,7 +163,10 @@ router.get('/:id/conversations/:convId/workspace', async (req, res) => {
         return res.status(404).json({ error: 'Conversation not found' });
     }
 
-    res.json({ content: conversation.workspace_content || '' });
+    res.json({
+        content: conversation.workspace_content || '',
+        notebookId: conversation.workspace_notebook_id || null,
+    });
 });
 
 // Update workspace content for a conversation
@@ -174,8 +177,8 @@ router.put('/:id/conversations/:convId/workspace', async (req, res) => {
         return res.status(404).json({ error: 'Conversation not found' });
     }
 
-    const { content } = req.body;
-    await agentStore.updateConversationWorkspace(req.params.convId, content || '');
+    const { content, notebookId } = req.body;
+    await agentStore.updateConversationWorkspace(req.params.convId, content || '', notebookId !== undefined ? notebookId : null);
     res.json({ success: true });
 });
 

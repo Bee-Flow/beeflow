@@ -55,7 +55,13 @@ router.get('/meta/models', async (req, res) => {
                         headers['Authorization'] = `Bearer ${apiKey}`;
                     }
 
-                    let baseUrl = provider.url.replace(/\/$/, '');
+                    let baseUrl = (provider.url || '').replace(/\/$/, '');
+
+                    // Skip SDK-based providers that don't have HTTP model endpoints
+                    if (!baseUrl || (!baseUrl.startsWith('http://') && !baseUrl.startsWith('https://'))) {
+                        return [];
+                    }
+
                     let models = [];
 
                     // Standard OpenAI-compatible API

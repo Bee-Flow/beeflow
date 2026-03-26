@@ -233,6 +233,68 @@ router.post('/config', async (req, res) => {
     }
 });
 
+// ─── Delete API Key ──────────────────────────────────────────────
+
+// Whitelist of keys that can be deleted via this endpoint
+const DELETABLE_KEYS = [
+    'openai_api_key', 'claude_api_key', 'google_api_key', 'mistral_api_key',
+    'elevenlabs_api_key', 'minimax_api_key', 'serper_api_key', 'google_maps_api_key',
+    'google_vertex_service_account_key', 'azure_api_key', 'azure_content_safety_key',
+    'azure_doc_intelligence_key', 'azure_openai_embedding_key', 'azure_speech_key',
+    'bing_search_key', 'linkedin_client_id', 'linkedin_client_secret',
+    'service_email_password', 'whisperx_url', 'whisperx_token',
+];
+
+router.delete('/config/key/:keyName', requireAuth, async (req, res) => {
+    try {
+        if (!req.session.isAdmin) {
+            return res.status(403).json({ error: 'Admin access required' });
+        }
+
+        const { keyName } = req.params;
+        if (!DELETABLE_KEYS.includes(keyName)) {
+            return res.status(400).json({ error: `Key "${keyName}" cannot be deleted via this endpoint` });
+        }
+
+        await configStore.deleteConfig(keyName);
+        console.log(`[Config] Admin deleted key: ${keyName}`);
+        res.json({ success: true, deleted: keyName });
+    } catch (err) {
+        console.error('[Config] Delete key error:', err);
+        res.status(500).json({ error: 'Failed to delete key' });
+    }
+});
+
+// Also support deleting non-secret config keys (like vertex project/location)
+const DELETABLE_CONFIG_KEYS = [
+    'google_vertex_project', 'google_vertex_location',
+    'azure_endpoint', 'azure_api_version', 'azure_models',
+    'azure_content_safety_endpoint', 'azure_doc_intelligence_endpoint',
+    'azure_openai_embedding_endpoint', 'azure_openai_embedding_model',
+    'azure_speech_region', 'agent_search_url', 'service_email_address',
+    'service_email_display_name',
+];
+
+router.delete('/config/setting/:keyName', requireAuth, async (req, res) => {
+    try {
+        if (!req.session.isAdmin) {
+            return res.status(403).json({ error: 'Admin access required' });
+        }
+
+        const { keyName } = req.params;
+        if (!DELETABLE_CONFIG_KEYS.includes(keyName)) {
+            return res.status(400).json({ error: `Setting "${keyName}" cannot be deleted via this endpoint` });
+        }
+
+        await configStore.deleteConfig(keyName);
+        console.log(`[Config] Admin deleted setting: ${keyName}`);
+        res.json({ success: true, deleted: keyName });
+    } catch (err) {
+        console.error('[Config] Delete setting error:', err);
+        res.status(500).json({ error: 'Failed to delete setting' });
+    }
+});
+
 // ─── Test Service Email ──────────────────────────────────────────
 
 router.post('/config/test-service-email', requireAuth, async (req, res) => {
@@ -553,6 +615,8 @@ router.get('/user-settings', requireAuth, async (req, res) => {
         hasYouTrackConfig: !!(await configStore.getSecret(`youtrack_url_user_${userId}`)) && !!(await configStore.getSecret(`youtrack_token_user_${userId}`)),
         hasGammaKey: !!(await configStore.getSecret(`gamma_api_key_user_${userId}`)),
         hasLinkedInConfig: !!(await configStore.getSecret('linkedin_client_id')) && !!(await configStore.getSecret('linkedin_client_secret')),
+        hasGoogleKey: !!(await configStore.getSecret('google_api_key')),
+        hasElevenLabsKey: !!(await configStore.getSecret('elevenlabs_api_key')),
         isGoogleUser,
         isMicrosoftUser,
         enabledApps: enabledApps || null,
@@ -560,6 +624,7 @@ router.get('/user-settings', requireAuth, async (req, res) => {
         hasN8nConfig,
         hasGoogleMapsKey: !!(await configStore.getSecret('google_maps_api_key')),
         disableSearchOnUpload,
+        searchProvider: await configStore.getConfig('search_provider') || 'agent-search',
     });
 });
 

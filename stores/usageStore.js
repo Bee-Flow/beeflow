@@ -94,6 +94,22 @@ function buildFilters(filters, startIdx = 1) {
         conditions.push(`organization_id = $${idx++}`);
         params.push(filters.organizationId);
     }
+    if (filters?.userId) {
+        conditions.push(`user_id = $${idx++}`);
+        params.push(filters.userId);
+    }
+    if (filters?.agentId) {
+        conditions.push(`agent_id = $${idx++}`);
+        params.push(filters.agentId);
+    }
+    if (filters?.model) {
+        conditions.push(`model = $${idx++}`);
+        params.push(filters.model);
+    }
+    if (filters?.source) {
+        conditions.push(`source = $${idx++}`);
+        params.push(filters.source);
+    }
     const where = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
     return { where, params, nextIdx: idx };
 }
@@ -274,7 +290,10 @@ async function getUsageBySource(filters = {}) {
     const { where, params } = buildFilters(filters);
     return getAll(`
         SELECT source, COUNT(*) as calls,
-            COALESCE(SUM(total_tokens), 0) as total_tokens
+            COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
+            COALESCE(SUM(completion_tokens), 0) as completion_tokens,
+            COALESCE(SUM(total_tokens), 0) as total_tokens,
+            COALESCE(SUM(estimated_cost), 0) as estimated_cost
         FROM ai_usage_log ${where}
         GROUP BY source
         ORDER BY total_tokens DESC
@@ -332,6 +351,43 @@ async function getUsageByAgentType(filters = {}) {
     `, params);
 }
 
+async function getUsageByModelAndAgent(filters = {}) {
+    await initDB();
+    const { where, params } = buildFilters(filters);
+    return getAll(`
+        SELECT
+            model,
+            COALESCE(agent_name, 'Direct Chat') as agent_name,
+            agent_id,
+            COUNT(*) as calls,
+            COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
+            COALESCE(SUM(completion_tokens), 0) as completion_tokens,
+            COALESCE(SUM(total_tokens), 0) as total_tokens,
+            COALESCE(SUM(estimated_cost), 0) as estimated_cost
+        FROM ai_usage_log ${where}
+        GROUP BY model, agent_name, agent_id
+        ORDER BY total_tokens DESC
+    `, params);
+}
+
+async function getUsageByModelAndUser(filters = {}) {
+    await initDB();
+    const { where, params } = buildFilters(filters);
+    return getAll(`
+        SELECT
+            model,
+            user_id,
+            COUNT(*) as calls,
+            COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
+            COALESCE(SUM(completion_tokens), 0) as completion_tokens,
+            COALESCE(SUM(total_tokens), 0) as total_tokens,
+            COALESCE(SUM(estimated_cost), 0) as estimated_cost
+        FROM ai_usage_log ${where}
+        GROUP BY model, user_id
+        ORDER BY total_tokens DESC
+    `, params);
+}
+
 module.exports = {
     logUsage,
     getUsageSummary,
@@ -347,4 +403,6 @@ module.exports = {
     getUsageModels,
     getUsageByConversation,
     getUsageByAgentType,
+    getUsageByModelAndAgent,
+    getUsageByModelAndUser,
 };

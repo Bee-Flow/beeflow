@@ -60,6 +60,13 @@ const PROVIDER_PREFIXES = {
     minimax: ['minimax/', ''],
 };
 
+// ─── Fallback pricing for models not yet in the community database ──────────
+// Prices are per 1M tokens (USD). Sourced from official provider pages.
+const FALLBACK_PRICING = {
+    'MiniMax-M2.7':            { input: 0.30, output: 1.20 },
+    'MiniMax-M2.7-highspeed':  { input: 0.60, output: 2.40 },
+};
+
 /**
  * Look up the cost for a model ID, trying various key patterns.
  * Returns { input, output } in USD per 1M tokens, or null if not found.
@@ -69,7 +76,18 @@ const PROVIDER_PREFIXES = {
  * @returns {{ input: number, output: number } | null}
  */
 function getModelPricing(modelId, providerType) {
-    if (!_cachedPricing || !modelId) return null;
+    if (!modelId) return null;
+
+    // 0. Check fallback pricing first (for models not yet in community DB)
+    const fallback = FALLBACK_PRICING[modelId];
+    if (fallback) return fallback;
+    // Case-insensitive fallback check
+    const lowerModelId = modelId.toLowerCase();
+    for (const [key, val] of Object.entries(FALLBACK_PRICING)) {
+        if (key.toLowerCase() === lowerModelId) return val;
+    }
+
+    if (!_cachedPricing) return null;
 
     const _extract = (entry) => ({
         input: (entry.input_cost_per_token || 0) * 1_000_000,
@@ -80,7 +98,7 @@ function getModelPricing(modelId, providerType) {
     // Build candidate keys to try
     const prefixes = providerType && PROVIDER_PREFIXES[providerType]
         ? PROVIDER_PREFIXES[providerType]
-        : ['', 'openai/', 'mistral/', 'gemini/', 'vertex_ai/', 'anthropic/'];
+        : ['', 'openai/', 'mistral/', 'gemini/', 'vertex_ai/', 'anthropic/', 'minimax/'];
 
     // Build candidate model IDs (original + without -latest)
     const candidates = [modelId];

@@ -60,6 +60,12 @@ const { isTranscriptionTool, executeTranscriptionTool } = require('../integratio
  * @returns {*} Tool result
  */
 async function executeTool(toolName, toolArgs, context = {}) {
+    // Guard: some providers return tool_calls without a valid function name
+    if (!toolName) {
+        console.warn('[ToolDispatcher] Skipping tool with undefined name');
+        return { error: 'Tool call had no function name — skipped.' };
+    }
+
     const {
         userId,
         session,
@@ -215,8 +221,9 @@ async function executeTool(toolName, toolArgs, context = {}) {
         }
     }
 
-    // ─── Workspace Tools ────────────────────────────────────────
-    if (toolName === 'workspace_read' || toolName === 'workspace_write' || toolName === 'workspace_replace') {
+    // ─── Notebook Tools (formerly Workspace) ──────────────────────
+    if (toolName === 'notebook_read' || toolName === 'notebook_write' || toolName === 'notebook_replace' || toolName === 'notebook_insert' ||
+        toolName === 'workspace_read' || toolName === 'workspace_write' || toolName === 'workspace_replace') {
         return await executeWorkspaceTool(toolName, toolArgs, {
             conversationId: context.conversationId,
             agentId: context.agentId,

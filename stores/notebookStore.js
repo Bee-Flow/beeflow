@@ -1,9 +1,10 @@
 /**
  * Notebook Store — PostgreSQL-backed notebook management.
  *
- * Two tables:
- *   • notebooks        — top-level notebook (name, instructions, KB links, settings)
- *   • notebook_sources  — individual sources within a notebook (PDF, DOCX, URL, text, etc.)
+ * Three tables:
+ *   • notebooks          — top-level notebook (name, instructions, KB links, settings)
+ *   • notebook_sources   — individual sources within a notebook (PDF, DOCX, URL, text, etc.)
+ *   • notebook_versions  — immutable content snapshots for version history
  *
  * Backwards-compatible: existing `word_templates` rows are migrated into notebooks on first access.
  */
@@ -56,6 +57,19 @@ async function initDB() {
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         CREATE INDEX IF NOT EXISTS idx_notebook_sources_notebook ON notebook_sources(notebook_id);
+    `);
+
+    // ── Notebook Versions table (immutable content snapshots) ────────
+    await exec(`
+        CREATE TABLE IF NOT EXISTS notebook_versions (
+            id TEXT PRIMARY KEY,
+            notebook_id TEXT NOT NULL REFERENCES notebooks(id) ON DELETE CASCADE,
+            content TEXT NOT NULL DEFAULT '',
+            summary TEXT DEFAULT '',
+            content_length INTEGER DEFAULT 0,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_notebook_versions_notebook ON notebook_versions(notebook_id, created_at DESC);
     `);
 
     initialized = true;
@@ -251,6 +265,103 @@ function mapSourceRow(r) {
     };
 }
 
+// ── Version Control ─────────────────────────────────────────────────
+
+const MAX_VERSIONS_PER_NOTEBOOK = 50;
+const AUTO_VERSION_DEBOUNCE_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Create a version snapshot. Auto-prunes oldest versions beyond MAX.
+ */
+async function createVersion(notebookId, content, summary = 'Auto-save') {
+    await initDB();
+    const id = crypto.randomUUID();
+    const contentLength = (content || '').length;
+    await run(
+        `INSERT INTO notebook_versions (id, notebook_id, content, summary, content_length)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [id, notebookId, content || '', summary, contentLength]
+    );
+
+    // Prune: keep only the newest MAX_VERSIONS_PER_NOTEBOOK versions
+    await run(
+        `DELETE FROM notebook_versions
+         WHERE id IN (
+             SELECT id FROM notebook_versions
+             WHERE notebook_id = $1
+             ORDER BY created_at DESC
+             OFFSET $2
+         )`,
+        [notebookId, MAX_VERSIONS_PER_NOTEBOOK]
+    );
+
+    return { id, notebookId, summary, contentLength, createdAt: new Date().toISOString() };
+}
+
+/**
+ * Get version list (metadata only — no content). Newest first.
+ */
+async function getVersions(notebookId, { limit = 50, offset = 0 } = {}) {
+    await initDB();
+    const rows = await getAll(
+        `SELECT id, notebook_id, summary, content_length, created_at
+         FROM notebook_versions
+         WHERE notebook_id = $1
+         ORDER BY created_at DESC
+         LIMIT $2 OFFSET $3`,
+        [notebookId, limit, offset]
+    );
+    return rows.map(r => ({
+        id: r.id,
+        notebookId: r.notebook_id,
+        summary: r.summary || '',
+        contentLength: parseInt(r.content_length) || 0,
+        createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+    }));
+}
+
+/**
+ * Get a single version with full content.
+ */
+async function getVersion(versionId) {
+    await initDB();
+    const r = await getOne('SELECT * FROM notebook_versions WHERE id = $1', [versionId]);
+    if (!r) return null;
+    return {
+        id: r.id,
+        notebookId: r.notebook_id,
+        content: r.content || '',
+        summary: r.summary || '',
+        contentLength: parseInt(r.content_length) || 0,
+        createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+    };
+}
+
+/**
+ * Delete a specific version.
+ */
+async function deleteVersion(versionId) {
+    await initDB();
+    const { rowCount } = await run('DELETE FROM notebook_versions WHERE id = $1', [versionId]);
+    return rowCount > 0;
+}
+
+/**
+ * Check whether an auto-version should be created.
+ * Returns true if no version exists or the last one is > 5 minutes old.
+ */
+async function shouldAutoVersion(notebookId) {
+    await initDB();
+    const latest = await getOne(
+        `SELECT created_at FROM notebook_versions
+         WHERE notebook_id = $1 ORDER BY created_at DESC LIMIT 1`,
+        [notebookId]
+    );
+    if (!latest) return true;
+    const elapsed = Date.now() - new Date(latest.created_at).getTime();
+    return elapsed >= AUTO_VERSION_DEBOUNCE_MS;
+}
+
 module.exports = {
     // Notebooks
     createNotebook,
@@ -264,4 +375,10 @@ module.exports = {
     getSource,
     updateSource,
     deleteSource,
+    // Versions
+    createVersion,
+    getVersions,
+    getVersion,
+    deleteVersion,
+    shouldAutoVersion,
 };

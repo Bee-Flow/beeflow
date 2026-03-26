@@ -87,6 +87,19 @@ function computeCost(model, promptTokens = 0, completionTokens = 0) {
 }
 
 /**
+ * Compute estimated cost split into input and output.
+ * @returns {{ input_cost: number, output_cost: number }}
+ */
+function computeCostSplit(model, promptTokens = 0, completionTokens = 0) {
+    const rates = getModelCost(model);
+    if (!rates) return { input_cost: 0, output_cost: 0 };
+    return {
+        input_cost: (promptTokens / 1_000_000) * rates.input,
+        output_cost: (completionTokens / 1_000_000) * rates.output,
+    };
+}
+
+/**
  * Get the full pricing map for the frontend.
  * Custom overrides are merged on top of community pricing data.
  */
@@ -167,6 +180,7 @@ function getModelCostsForConfig(modelEntries = []) {
 module.exports = {
     getModelCost,
     computeCost,
+    computeCostSplit,
     getAllModelCosts,
     getModelCostsForConfig,
     setModelCost,

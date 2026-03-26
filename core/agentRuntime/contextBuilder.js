@@ -34,11 +34,43 @@ async function buildSystemPrompt({ agent, tools, userId, messageMetadata, memory
     const tz = messageMetadata?.timezone || 'UTC';
     systemPrompt += `\nNow: ${new Date().toLocaleString('sv-SE', { timeZone: tz, timeZoneName: 'short' })}`;
 
-    // ─── Workspace context injection ─────────────────────────────
-    if (messageMetadata?.workspaceContent && messageMetadata.workspaceContent.trim()) {
-        systemPrompt += '\n\n[WORKSPACE CONTEXT]\nThe user has an active workspace document (markdown) open alongside the chat. You have 3 workspace tools:\n- workspace_read: Read current content (ALWAYS use this before workspace_replace to get exact text)\n- workspace_write: Replace ALL content (for new documents or full rewrites only)\n- workspace_replace: Replace a SPECIFIC portion (preferred for edits — uses find_text + replace_text)\n\nWORKSPACE RULES:\n1. For partial edits, ALWAYS prefer workspace_replace over workspace_write\n2. Before using workspace_replace, call workspace_read first to see the EXACT current content\n3. Copy the find_text EXACTLY from workspace_read output — character by character, including markdown formatting\n4. The workspace persists across chat messages — content stays until explicitly changed';
+    // ─── Notebook context injection ─────────────────────────────
+    if (messageMetadata?.workspaceContent) {
+        systemPrompt += `\n\n[NOTEBOOK]
+The user has a rich-text Notebook open alongside the chat. You have 4 notebook tools:
+- notebook_read: Read current content as Markdown (ALWAYS call this before notebook_replace)
+- notebook_write: Replace ALL content (use for new documents or full rewrites)
+- notebook_replace: Replace a SPECIFIC portion (preferred for edits — uses find_text + replace_text)
+- notebook_insert: Insert content at start, end, or after a specific heading/text (preferred for adding new sections)
+
+NOTEBOOK RULES:
+1. Write content in Markdown — the notebook renders it as rich text automatically
+2. For partial edits, prefer notebook_replace over notebook_write
+3. To add new sections without touching existing content, use notebook_insert
+4. Before using notebook_replace, call notebook_read first to see the EXACT current content
+5. Copy find_text EXACTLY from notebook_read output — character by character
+6. The notebook persists across messages — content stays until explicitly changed
+
+RICH-TEXT FORMATTING — Use these Markdown features for full styling:
+• Headings: # H1, ## H2, ### H3 (up to 6 levels)
+• Bold: **text**, Italic: *text*, Strikethrough: ~~text~~, Underline: use <u>text</u>
+• Text color: <span style="color: #e74c3c">red text</span> or any hex/named color
+• Highlight: <mark>highlighted text</mark> or <mark style="background-color: #ffeaa7">custom color</mark>
+• Font family: <span style="font-family: Georgia">serif text</span> (supports any web font)
+• Inline code: \`code\`, Code blocks: \`\`\`language\\ncode\\n\`\`\`
+• Bullet lists: - item, Numbered lists: 1. item
+• Task lists: - [ ] unchecked, - [x] checked
+• Tables: | Header | Header |\\n|--------|--------|\\n| Cell | Cell |
+• Blockquotes: > text (nestable: > > nested)
+• Links: [text](url), Images: ![alt](url)
+• Math formulas: $inline$ or $$block$$  (LaTeX/KaTeX)
+• Mermaid diagrams: \`\`\`mermaid\\ngraph TD; A-->B\\n\`\`\`
+• Horizontal rules: ---
+• Emoji shortcodes: :smile: :rocket: :warning:
+• Combine formatting freely: **<span style="color: #2ecc71">bold green</span>**, *<mark>italic highlighted</mark>*
+• Nested lists and complex table structures are fully supported`;
         if (messageMetadata.workspaceSelection && messageMetadata.workspaceSelection.trim()) {
-            systemPrompt += `\n\n[SELECTED TEXT — RAW MARKDOWN]\nThe user has selected this text in the workspace (raw markdown source):\n\`\`\`\n${messageMetadata.workspaceSelection}\n\`\`\`\nUse workspace_replace with find_text set to EXACTLY this text (including any ** # - formatting). Set replace_text to the new version. To remove, set replace_text to empty string.`;
+            systemPrompt += `\n\n[SELECTED TEXT IN NOTEBOOK]\nThe user has selected this text in the notebook:\n\`\`\`\n${messageMetadata.workspaceSelection}\n\`\`\`\nUse notebook_replace with find_text set to EXACTLY this text (including any ** # - formatting). Set replace_text to the new version. To remove, set replace_text to empty string.`;
         }
     }
 

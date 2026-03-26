@@ -65,15 +65,19 @@ async function deleteDirectConversation(id, userId) {
     return rowCount > 0;
 }
 
-async function updateDirectConversationWorkspace(id, content) {
+async function updateDirectConversationWorkspace(id, content, notebookId = null) {
     await initDB();
-    await run('UPDATE direct_conversations SET workspace_content = $1, updated_at = NOW() WHERE id = $2', [content, id]);
+    if (notebookId !== null) {
+        await run('UPDATE direct_conversations SET workspace_content = $1, workspace_notebook_id = $2, updated_at = NOW() WHERE id = $3', [content, notebookId, id]);
+    } else {
+        await run('UPDATE direct_conversations SET workspace_content = $1, updated_at = NOW() WHERE id = $2', [content, id]);
+    }
 }
 
 async function getDirectConversationWorkspace(id) {
     await initDB();
-    const row = await getOne('SELECT workspace_content FROM direct_conversations WHERE id = $1', [id]);
-    return row ? { content: row.workspace_content || '' } : null;
+    const row = await getOne('SELECT workspace_content, workspace_notebook_id FROM direct_conversations WHERE id = $1', [id]);
+    return row ? { content: row.workspace_content || '', notebookId: row.workspace_notebook_id || null } : null;
 }
 
 module.exports = {

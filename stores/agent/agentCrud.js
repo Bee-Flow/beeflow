@@ -111,29 +111,38 @@ async function setAgentPublished(id, isPublished, ownerId, sharedGroups = undefi
     return rowCount > 0;
 }
 
-async function getPublishedAgentsForUser(userGroups = [], userOrgId = null) {
+async function getPublishedAgentsForUser(userGroups = [], userOrgId = null, resolvedOrgIds = null) {
     await initDB();
     const allPublished = await getAll("SELECT * FROM agents WHERE is_published = TRUE AND owner_id NOT IN ('system', 'swarm') ORDER BY name ASC");
 
-    // Pre-load group→org mapping
-    const groupsData = await getAll('SELECT id, "organizationId" FROM groups');
-    const groupOrgMap = {};
-    for (const g of groupsData) { groupOrgMap[g.id] = g.organizationId || null; }
+    // Use pre-resolved org IDs if provided (from resolveUserOrgIds), otherwise build from params
+    let userOrgIds;
+    if (resolvedOrgIds instanceof Set) {
+        userOrgIds = resolvedOrgIds;
+    } else {
+        // Pre-load group→org mapping
+        const groupsData = await getAll('SELECT id, "organizationId" FROM groups');
+        const groupOrgMap = {};
+        for (const g of groupsData) { groupOrgMap[g.id] = g.organizationId || null; }
 
-    const userOrgIds = new Set();
-    if (userOrgId) userOrgIds.add(userOrgId);
-    for (const gid of userGroups) { const orgId = groupOrgMap[gid]; if (orgId) userOrgIds.add(orgId); }
+        userOrgIds = new Set();
+        if (userOrgId) userOrgIds.add(userOrgId);
+        for (const gid of userGroups) { const orgId = groupOrgMap[gid]; if (orgId) userOrgIds.add(orgId); }
+    }
     const hasOrgMembership = userOrgIds.size > 0;
 
     const filtered = allPublished.filter(agent => {
         if (hasOrgMembership) {
+            // Strict isolation: org users ONLY see agents belonging to their org(s)
             if (!agent.organization_id) return false;
             if (!userOrgIds.has(agent.organization_id)) return false;
         } else {
+            // Users without any org only see global (non-org) agents
             if (agent.organization_id) return false;
         }
         let sharedGroups = [];
         try { sharedGroups = JSON.parse(agent.shared_groups || '[]'); } catch (_) { }
+        // If agent has group restrictions, user must be in at least one shared group
         if (sharedGroups.length > 0) return sharedGroups.some(sg => userGroups.includes(sg));
         return true;
     });
