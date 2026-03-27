@@ -623,31 +623,50 @@ router.post('/:id/ai-fill', requireAuth, async (req, res) => {
 
         if (kbIds.length > 0) {
             const configStore = require('../stores/configStore');
-            const searchUrl = await configStore.getConfig('search_service_url') || 'https://services.beeflow.ai';
-            const searchKey = await configStore.getSecret('search_service_api_key') || '';
-
-            // Fetch all KB content using source names as queries
-            const sources = await notebookStore.getSources(nb.id);
-            for (const source of sources) {
-                if (source.status !== 'ready') continue;
-                try {
-                    const searchRes = await fetch(`${searchUrl}/api/search`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'X-API-Key': searchKey },
-                        body: JSON.stringify({
-                            query: source.name || 'main content',
-                            kb_ids: kbIds,
-                            top_k: 30,
-                        }),
-                    });
-                    if (searchRes.ok) {
-                        const data = await searchRes.json();
-                        if (data.results?.length > 0) {
+            const useAzure = !!(await configStore.getConfig('use_azure_doc_processing'));
+            
+            if (useAzure) {
+                const { searchLocally } = require('../core/localKBIngest');
+                const sources = await notebookStore.getSources(nb.id);
+                for (const source of sources) {
+                    if (source.status !== 'ready') continue;
+                    try {
+                        const localResults = await searchLocally(userId, kbIds, source.name || 'main content', { topK: 30 });
+                        if (localResults.length > 0) {
                             sourceContent += `\n--- Source: ${source.name} ---\n`;
-                            sourceContent += data.results.map(r => r.content || r.text).join('\n');
+                            sourceContent += localResults.map(r => r.content || r.text).join('\n');
                         }
+                    } catch (err) {
+                        console.warn('[Notebooks] Local search err:', err.message);
                     }
-                } catch {}
+                }
+            } else {
+                const searchUrl = await configStore.getConfig('search_service_url') || 'https://services.beeflow.ai';
+                const searchKey = await configStore.getSecret('search_service_api_key') || '';
+
+                // Fetch all KB content using source names as queries
+                const sources = await notebookStore.getSources(nb.id);
+                for (const source of sources) {
+                    if (source.status !== 'ready') continue;
+                    try {
+                        const searchRes = await fetch(`${searchUrl}/api/search`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', 'X-API-Key': searchKey },
+                            body: JSON.stringify({
+                                query: source.name || 'main content',
+                                kb_ids: kbIds,
+                                top_k: 30,
+                            }),
+                        });
+                        if (searchRes.ok) {
+                            const data = await searchRes.json();
+                            if (data.results?.length > 0) {
+                                sourceContent += `\n--- Source: ${source.name} ---\n`;
+                                sourceContent += data.results.map(r => r.content || r.text).join('\n');
+                            }
+                        }
+                    } catch {}
+                }
             }
         }
 

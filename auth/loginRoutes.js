@@ -88,7 +88,16 @@ router.get('/setup-status', async (req, res) => {
     const serverUrl = process.env.SERVER_PUBLIC_HOST
         ? `${process.env.SERVER_PROTOCOL || 'https'}://${process.env.SERVER_PUBLIC_HOST}`
         : '';
-    res.json({ isSetupComplete, isOAuthConfigured, isGoogleConfigured, isMicrosoftConfigured, serverUrl, deploymentMode: process.env.DEPLOYMENT_MODE || 'cloud' });
+    res.json({
+        isSetupComplete,
+        isOAuthConfigured,
+        isGoogleConfigured,
+        isMicrosoftConfigured,
+        serverUrl,
+        deploymentMode: process.env.DEPLOYMENT_MODE || 'cloud',
+        allowSignups: process.env.ALLOW_SIGNUPS !== 'false',
+        allowPasswordLogin: process.env.ALLOW_PASSWORD_LOGIN !== 'false',
+    });
 });
 
 // Initial admin setup (set password for first time)
@@ -148,6 +157,14 @@ router.post('/setup', async (req, res) => {
 
 // Admin/User login with username/password
 router.post('/admin-login', async (req, res) => {
+    // Block password login if disabled (admin username is always allowed through)
+    if (process.env.ALLOW_PASSWORD_LOGIN === 'false') {
+        const config = await loadConfig();
+        const { username } = req.body;
+        if (username !== config.admin.username) {
+            return res.status(403).json({ error: 'Password login is disabled on this server.' });
+        }
+    }
     const config = await loadConfig();
     const { username, password } = req.body;
 
@@ -361,14 +378,21 @@ router.get('/user', async (req, res) => {
             // Organisation membership for SSO users
             noOrganization: req.session.noOrganization || false,
             pendingApproval: req.session.pendingApproval || false,
-            // Feature flags from env
-            featureFlags: {
-                tasks: process.env.ENABLE_TASKS !== 'false',
-                monitoring: process.env.ENABLE_MONITORING !== 'false',
-                meeting_notes: process.env.ENABLE_MEETING_NOTES !== 'false',
-                templates: process.env.ENABLE_TEMPLATES !== 'false',
-                deploymentMode: process.env.DEPLOYMENT_MODE || 'cloud',
-            },
+            // Feature flags from env + configStore
+            featureFlags: await (async () => {
+                const configStore = require('../stores/configStore');
+                const notebooksEnabled = await configStore.getConfig('feature_notebooks_enabled');
+                const projectsEnabled = await configStore.getConfig('feature_projects_enabled');
+                return {
+                    tasks: process.env.ENABLE_TASKS !== 'false',
+                    monitoring: process.env.ENABLE_MONITORING !== 'false',
+                    meeting_notes: process.env.ENABLE_MEETING_NOTES !== 'false',
+                    templates: process.env.ENABLE_TEMPLATES !== 'false',
+                    notebooks: notebooksEnabled !== false && notebooksEnabled !== 'false',
+                    projects: projectsEnabled !== false && projectsEnabled !== 'false',
+                    deploymentMode: process.env.DEPLOYMENT_MODE || 'cloud',
+                };
+            })(),
             // Org-level enabled integrations
             enabledIntegrations: await (async () => {
                 try {
@@ -610,6 +634,9 @@ router.get('/organizations/public', async (req, res) => {
 
 // Store pending signup data in session (for OAuth flows)
 router.post('/pending-signup', async (req, res) => {
+    if (process.env.ALLOW_SIGNUPS === 'false') {
+        return res.status(403).json({ error: 'Account creation is disabled on this server.' });
+    }
     const { newOrgName, orgDetails } = req.body;
     if (!newOrgName) {
         return res.status(400).json({ error: 'Organization name is required' });
@@ -627,6 +654,9 @@ router.post('/pending-signup', async (req, res) => {
 
 // Public signup — create user + optionally a new organization
 router.post('/signup', async (req, res) => {
+    if (process.env.ALLOW_SIGNUPS === 'false') {
+        return res.status(403).json({ error: 'Account creation is disabled on this server.' });
+    }
     const { username, password, displayName, firstName, lastName, email, organizationId, newOrgName, orgDetails, inviteToken } = req.body;
 
     if (!username || !password) {

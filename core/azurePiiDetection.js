@@ -240,18 +240,100 @@ function restoreTokens(text, tokenMap) {
 }
 
 /**
+ * Detect PII via Azure AI Language REST API.
+ * Uses the /language/:analyze-text endpoint with PiiEntityRecognition kind.
+ * This works with Azure AI Foundry / multi-service endpoints (same as Content Safety).
+ */
+async function detectPiiViaRestApi(text, endpoint, apiKey, enabledCategories, confidenceThreshold) {
+    const url = `${endpoint.replace(/\/$/, '')}/language/:analyze-text?api-version=2023-04-01`;
+
+    const body = {
+        kind: 'PiiEntityRecognition',
+        parameters: {
+            modelVersion: 'latest',
+        },
+        analysisInput: {
+            documents: [
+                { id: '1', text }
+            ]
+        }
+    };
+
+    // NOTE: We do NOT send piiCategories to Azure — the API expects SCREAMING_SNAKE_CASE
+    // enum values (e.g. CREDIT_CARD_NUMBER) but our config stores PascalCase (CreditCardNumber).
+    // Instead, we let Azure scan for everything and post-filter the results server-side
+    // against the enabled categories. This is safer and decouples us from Azure's enum format.
+
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Ocp-Apim-Subscription-Key': apiKey,
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(30000),
+    });
+
+    if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Azure Language API ${response.status}: ${errText}`);
+    }
+
+    const data = await response.json();
+    const doc = data.results?.documents?.[0];
+
+    if (!doc) {
+        const errors = data.results?.errors;
+        if (errors?.length) {
+            throw new Error(`Azure Language API error: ${JSON.stringify(errors[0])}`);
+        }
+        throw new Error('Azure Language API returned no documents');
+    }
+
+    // Filter by confidence threshold
+    let detectedEntities = (doc.entities || [])
+        .filter(entity => entity.confidenceScore >= confidenceThreshold)
+        .map(entity => ({
+            text: entity.text,
+            category: entity.category,
+            subCategory: entity.subcategory || null,
+            confidence: entity.confidenceScore,
+            offset: entity.offset,
+            length: entity.length,
+            label: PII_CATEGORIES[entity.category]?.label || entity.category,
+        }));
+
+    // Post-filter: enforce enabled categories on the results
+    // Azure may ignore piiCategories or return extra categories
+    if (enabledCategories && enabledCategories.length > 0) {
+        const enabledSet = new Set(enabledCategories);
+        const before = detectedEntities.length;
+        detectedEntities = detectedEntities.filter(e => enabledSet.has(e.category));
+        if (before !== detectedEntities.length) {
+            console.log(`[PiiDetection] Post-filter: ${before} → ${detectedEntities.length} entities (filtered by ${enabledCategories.length} enabled categories)`);
+        }
+    }
+
+    return {
+        hasPii: detectedEntities.length > 0,
+        entities: detectedEntities,
+        redactedText: doc.redactedText || text,
+    };
+}
+
+/**
  * Detect PII entities in text.
  * Returns { hasPii, entities[] } or null on failure.
  *
  * Routing:
- *   - Azure client available → cloud API (full language support + redaction)
- *   - No Azure creds        → CPU guard-service /pii endpoint (local NER model)
+ *   - Azure Content Safety endpoint + key configured → REST API /language/:analyze-text
+ *   - No Azure creds → CPU guard-service /pii endpoint (local NER model)
  */
 async function detectPii(text, enabledCategories = null, confidenceThreshold = DEFAULT_PII_CONFIDENCE_THRESHOLD) {
-    const client = await createClient();
+    const endpoint = await configStore.getConfig('azure_content_safety_endpoint');
+    const apiKey = await configStore.getSecret('azure_content_safety_key');
 
-    // ── CPU fallback: guard-service /pii (betterdataai/PII_DETECTION_MODEL) ──
-    if (!client) {
+    if (!endpoint || !apiKey) {
         console.log('[PiiDetection] No Azure creds — using CPU model via guard-service');
         try {
             return await detectPiiViaCpuModel(text, enabledCategories, confidenceThreshold);
@@ -261,42 +343,8 @@ async function detectPii(text, enabledCategories = null, confidenceThreshold = D
         }
     }
 
-    // ── Azure Text Analytics (primary) ───────────────────────────────────────
-    const documents = [text];
-
-    // Pass categoriesFilter to only scan for admin-enabled categories
-    const options = {};
-    if (enabledCategories && enabledCategories.length > 0) {
-        options.categoriesFilter = enabledCategories;
-    }
-
-    // Auto-detect language (supports Dutch, German, French, etc.)
-    const results = await client.recognizePiiEntities(documents, undefined, options);
-    const result = results[0];
-
-    if (result.error) {
-        console.error(`[PiiDetection] API error:`, JSON.stringify(result.error));
-        throw new Error(`PII Detection API error: ${result.error.code} - ${result.error.message}`);
-    }
-
-    // Filter by confidence threshold
-    const detectedEntities = (result.entities || [])
-        .filter(entity => entity.confidenceScore >= confidenceThreshold)
-        .map(entity => ({
-            text: entity.text,
-            category: entity.category,
-            subCategory: entity.subCategory || null,
-            confidence: entity.confidenceScore,
-            offset: entity.offset,
-            length: entity.length,
-            label: PII_CATEGORIES[entity.category]?.label || entity.category,
-        }));
-
-    return {
-        hasPii: detectedEntities.length > 0,
-        entities: detectedEntities,
-        redactedText: result.redactedText || text,
-    };
+    // Use Azure AI Language REST API (works with AI Foundry multi-service endpoints)
+    return await detectPiiViaRestApi(text, endpoint, apiKey, enabledCategories, confidenceThreshold);
 }
 
 /**
@@ -355,9 +403,33 @@ async function validateInputForPii(messages, agentPiiEnabled = false) {
     console.log(`[PiiDetection] Scanning input (${inputText.length} chars)...`);
     const start = Date.now();
 
+    // ── Load enabled categories from Org Privacy Shield (single source of truth)
+    // Fall back to global AI config, then to all categories
+    let enabledCategories = ALL_PII_CATEGORY_IDS;
+    let confidenceThreshold = aiConfig.piiDetectionConfidenceThreshold ?? DEFAULT_PII_CONFIDENCE_THRESHOLD;
     try {
-        const enabledCategories = aiConfig.piiDetectionCategories || ALL_PII_CATEGORY_IDS;
-        const confidenceThreshold = aiConfig.piiDetectionConfidenceThreshold ?? DEFAULT_PII_CONFIDENCE_THRESHOLD;
+        const allConfigs = await configStore.getAllConfig() || {};
+        const shieldKey = Object.keys(allConfigs).find(k => k.startsWith('org_privacy_shield_'));
+        const shieldConfig = shieldKey ? allConfigs[shieldKey] : null;
+        if (shieldConfig) {
+            if (Array.isArray(shieldConfig.piiDetectionCategories) && shieldConfig.piiDetectionCategories.length > 0) {
+                enabledCategories = shieldConfig.piiDetectionCategories.filter(id => ALL_PII_CATEGORY_IDS.includes(id));
+            }
+            if (typeof shieldConfig.piiDetectionConfidenceThreshold === 'number') {
+                confidenceThreshold = shieldConfig.piiDetectionConfidenceThreshold;
+            }
+            console.log(`[PiiDetection] Using org shield: ${enabledCategories.length}/${ALL_PII_CATEGORY_IDS.length} categories (Email=${enabledCategories.includes('Email')}), confidence ≥ ${confidenceThreshold}`);
+        } else if (aiConfig.piiDetectionCategories?.length > 0) {
+            enabledCategories = aiConfig.piiDetectionCategories.filter(id => ALL_PII_CATEGORY_IDS.includes(id));
+            console.log(`[PiiDetection] Using AI config: ${enabledCategories.length}/${ALL_PII_CATEGORY_IDS.length} categories, confidence ≥ ${confidenceThreshold}`);
+        } else {
+            console.log(`[PiiDetection] No org shield found, using all ${ALL_PII_CATEGORY_IDS.length} categories`);
+        }
+    } catch (shieldErr) {
+        console.warn(`[PiiDetection] Could not load org shield:`, shieldErr.message);
+    }
+
+    try {
         const result = await detectPii(inputText, enabledCategories, confidenceThreshold);
         if (!result) return null; // No client configured, fail-open
 

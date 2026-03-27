@@ -8,6 +8,7 @@ const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const kbStore = require('../stores/knowledgeBases');
+const configStore = require('../stores/configStore');
 const { requireAuth } = require('../auth');
 
 const SEARCH_SERVICE_URL = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
@@ -460,43 +461,20 @@ router.post('/:id/ingest/sitemap', requireAuth, async (req, res) => {
                     continue;
                 }
 
-                // Create document
-                const doc = await kbStore.createDocument(
-                    kb.tenant_id, kb.id,
-                    pageTitle, 'web', response.url || pageUrl, hash
+                const result = await ingestDocument(
+                    kb.tenant_id,
+                    kb.id,
+                    content,
+                    pageTitle,
+                    'web',
+                    response.url || pageUrl,
+                    { skipDedup: true, lang: kb.default_lang }
                 );
 
-                // Ingest via search-service
-                const azureParams = await getAzureIngestParams();
-                const ingestRes = await fetch(`${SEARCH_SERVICE_URL}/kb/ingest/json`, {
-                    method: 'POST',
-                    headers: getServiceHeaders(),
-                    body: JSON.stringify({
-                        tenant_id: kb.tenant_id,
-                        knowledge_base_id: kb.id,
-                        document_id: doc.id,
-                        content,
-                        title: pageTitle,
-                        source_uri: response.url || pageUrl,
-                        lang: kb.default_lang,
-                        ...azureParams,
-                    }),
-                    signal: AbortSignal.timeout(60000)
-                });
-
-                if (!ingestRes.ok) {
-                    await kbStore.deleteDocument(doc.id);
-                    results.errors++;
-                    results.details.push({ url: pageUrl, status: 'error', reason: 'Ingest failed' });
-                    continue;
-                }
-
-                const ingestResult = await ingestRes.json();
-                await kbStore.updateChunkCount(doc.id, ingestResult.chunks_created || 0);
                 results.ingested++;
-                results.details.push({ url: pageUrl, status: 'ingested', chunks: ingestResult.chunks_created || 0 });
+                results.details.push({ url: pageUrl, status: 'ingested', chunks: result.chunks || 0 });
 
-                console.log(`[KB] Sitemap page ${i + 1}/${pageUrls.length}: ${pageTitle} (${ingestResult.chunks_created} chunks)`);
+                console.log(`[KB] Sitemap page ${i + 1}/${pageUrls.length}: ${pageTitle} (${result.chunks} chunks)`);
             } catch (e) {
                 results.errors++;
                 results.details.push({ url: pageUrl, status: 'error', reason: e.message });
@@ -541,25 +519,38 @@ router.post('/search', requireAuth, async (req, res) => {
             }
         }
 
-        const searchRes = await fetch(`${SEARCH_SERVICE_URL}/tools/kb-search`, {
-            method: 'POST',
-            headers: getServiceHeaders(),
-            body: JSON.stringify({
-                tenant_id: userId,
-                kb_ids,
-                query,
-                top_k: top_k || 8,
-                rerank: true
-            }),
-            signal: AbortSignal.timeout(30000)
-        });
+        const useAzure = !!(await configStore.getConfig('use_azure_doc_processing'));
 
-        if (!searchRes.ok) {
-            const err = await searchRes.text();
-            return res.status(502).json({ error: `Search failed: ${err}` });
+        let results;
+        if (useAzure) {
+            const { searchLocally } = require('../core/localKBIngest');
+            const localResults = await searchLocally(userId, kb_ids, query, { topK: top_k || 8 });
+            results = {
+                chunks: localResults,
+                results: localResults
+            };
+        } else {
+            const searchRes = await fetch(`${SEARCH_SERVICE_URL}/tools/kb-search`, {
+                method: 'POST',
+                headers: getServiceHeaders(),
+                body: JSON.stringify({
+                    tenant_id: userId,
+                    kb_ids,
+                    query,
+                    top_k: top_k || 8,
+                    rerank: true
+                }),
+                signal: AbortSignal.timeout(30000)
+            });
+
+            if (!searchRes.ok) {
+                const err = await searchRes.text();
+                return res.status(502).json({ error: `Search failed: ${err}` });
+            }
+
+            results = await searchRes.json();
         }
 
-        const results = await searchRes.json();
         res.json(results);
     } catch (e) {
         console.error('[KB] Search error:', e.message);
@@ -584,7 +575,8 @@ router.post('/:id/reindex', requireAuth, async (req, res) => {
             return res.json({ success: true, reindexed: 0, failed: 0, details: [] });
         }
 
-        console.log(`[KB] Re-indexing KB "${kb.name}" (${docs.length} docs)...`);
+        const useAzure = !!(await configStore.getConfig('use_azure_doc_processing'));
+        console.log(`[KB] Re-indexing KB "${kb.name}" (${docs.length} docs, azure: ${useAzure})...`);
         const results = { reindexed: 0, failed: 0, details: [] };
 
         for (let i = 0; i < docs.length; i++) {
@@ -633,15 +625,22 @@ router.post('/:id/reindex', requireAuth, async (req, res) => {
                 // ── Fallback / text / upload: get existing chunk content ──
                 if (!content || content.trim().length < 20) {
                     console.log(`[KB] Reindex [${i + 1}/${docs.length}] Using existing content for: ${title}`);
-                    const contentRes = await fetch(
-                        `${SEARCH_SERVICE_URL}/kb/${kb.id}/documents/${doc.id}/content?tenant_id=${encodeURIComponent(kb.tenant_id)}`,
-                        { headers: getServiceHeaders(), signal: AbortSignal.timeout(15000) }
-                    );
-                    if (!contentRes.ok) {
-                        throw new Error(`Failed to get existing content: ${contentRes.status}`);
+
+                    if (useAzure) {
+                        // Retrieve existing content from local kb_chunks
+                        const { getDocumentContent } = require('../core/localKBIngest');
+                        content = await getDocumentContent(kb.tenant_id, kb.id, doc.id);
+                    } else {
+                        const contentRes = await fetch(
+                            `${SEARCH_SERVICE_URL}/kb/${kb.id}/documents/${doc.id}/content?tenant_id=${encodeURIComponent(kb.tenant_id)}`,
+                            { headers: getServiceHeaders(), signal: AbortSignal.timeout(15000) }
+                        );
+                        if (!contentRes.ok) {
+                            throw new Error(`Failed to get existing content: ${contentRes.status}`);
+                        }
+                        const contentData = await contentRes.json();
+                        content = contentData.content;
                     }
-                    const contentData = await contentRes.json();
-                    content = contentData.content;
                 }
 
                 if (!content || content.trim().length < 10) {
@@ -651,36 +650,56 @@ router.post('/:id/reindex', requireAuth, async (req, res) => {
                 }
 
                 // ── Re-ingest (delete old chunks → re-chunk → re-embed → insert) ──
-                const azureParams = await getAzureIngestParams();
-                const ingestRes = await fetch(`${SEARCH_SERVICE_URL}/kb/ingest/json`, {
-                    method: 'POST',
-                    headers: getServiceHeaders(),
-                    body: JSON.stringify({
-                        tenant_id: kb.tenant_id,
-                        knowledge_base_id: kb.id,
-                        document_id: doc.id,
-                        content,
+                if (useAzure) {
+                    // Local Azure path: delete old chunks then re-ingest locally
+                    const { deleteChunksLocally, ingestLocally } = require('../core/localKBIngest');
+                    await deleteChunksLocally(kb.tenant_id, kb.id, doc.id);
+                    const ingestResult = await ingestLocally(kb.tenant_id, kb.id, doc.id, content, {
                         title,
                         source_uri: doc.source_uri || null,
                         lang: kb.default_lang,
-                        ...azureParams,
-                    }),
-                    signal: AbortSignal.timeout(120000)
-                });
+                    });
+                    await kbStore.updateChunkCount(doc.id, ingestResult.chunks_created || 0);
+                    results.reindexed++;
+                    results.details.push({
+                        doc_id: doc.id, title,
+                        status: doc.source_type === 'web' ? 'refetched' : 'reembedded',
+                        chunks: ingestResult.chunks_created || 0
+                    });
+                    console.log(`[KB] Reindex [${i + 1}/${docs.length}] ✓ ${title}: ${ingestResult.chunks_created} chunks (azure)`);
+                } else {
+                    // Search-service path
+                    const azureParams = await getAzureIngestParams();
+                    const ingestRes = await fetch(`${SEARCH_SERVICE_URL}/kb/ingest/json`, {
+                        method: 'POST',
+                        headers: getServiceHeaders(),
+                        body: JSON.stringify({
+                            tenant_id: kb.tenant_id,
+                            knowledge_base_id: kb.id,
+                            document_id: doc.id,
+                            content,
+                            title,
+                            source_uri: doc.source_uri || null,
+                            lang: kb.default_lang,
+                            ...azureParams,
+                        }),
+                        signal: AbortSignal.timeout(120000)
+                    });
 
-                if (!ingestRes.ok) {
-                    throw new Error(`Ingest failed: ${await ingestRes.text()}`);
+                    if (!ingestRes.ok) {
+                        throw new Error(`Ingest failed: ${await ingestRes.text()}`);
+                    }
+
+                    const ingestResult = await ingestRes.json();
+                    await kbStore.updateChunkCount(doc.id, ingestResult.chunks_created || 0);
+                    results.reindexed++;
+                    results.details.push({
+                        doc_id: doc.id, title,
+                        status: doc.source_type === 'web' ? 'refetched' : 'reembedded',
+                        chunks: ingestResult.chunks_created || 0
+                    });
+                    console.log(`[KB] Reindex [${i + 1}/${docs.length}] ✓ ${title}: ${ingestResult.chunks_created} chunks`);
                 }
-
-                const ingestResult = await ingestRes.json();
-                await kbStore.updateChunkCount(doc.id, ingestResult.chunks_created || 0);
-                results.reindexed++;
-                results.details.push({
-                    doc_id: doc.id, title,
-                    status: doc.source_type === 'web' ? 'refetched' : 'reembedded',
-                    chunks: ingestResult.chunks_created || 0
-                });
-                console.log(`[KB] Reindex [${i + 1}/${docs.length}] ✓ ${title}: ${ingestResult.chunks_created} chunks`);
             } catch (docErr) {
                 console.error(`[KB] Reindex failed for doc "${title}":`, docErr.message);
                 results.failed++;

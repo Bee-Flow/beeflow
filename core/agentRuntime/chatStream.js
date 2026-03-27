@@ -516,6 +516,9 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     temperature: tierSettings.temperature !== undefined ? tierSettings.temperature : 0.7,
                     budgetTokens: tierSettings.budgetTokens || undefined,
                     reasoningEffort: tierSettings.reasoningEffort || undefined,
+                    reasoningSummary: tierSettings.reasoningSummary || false,
+                    // Azure-specific: needed for Responses API version check
+                    apiVersion: config.apiVersion || undefined,
                 };
 
 

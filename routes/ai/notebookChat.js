@@ -201,6 +201,13 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
 
         // Build system prompt
         const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+
+        // Compute search availability before the system prompt uses it
+        const hasAgentSearchUrl = !!process.env.SEARCH_SERVICE_URL || !!(await configStore.getConfig('agent_search_url'));
+        const searchProvider = await configStore.getConfig('search_provider') || 'agent-search';
+        const hasBingSearchKey = !!(await configStore.getSecret('bing_search_key'));
+        const searchAvailable = searchProvider !== 'disabled' && ((searchProvider === 'bing' && hasBingSearchKey) || hasAgentSearchUrl);
+
         const systemPrompt = `You are an intelligent notebook assistant. Today is ${today}.
 
 [NOTEBOOK: "${notebook.name}"]
@@ -374,11 +381,7 @@ Now: ${new Date().toLocaleString('sv-SE', { timeZone: timezone || 'UTC', timeZon
             notebookTools.push(NOTEBOOK_KB_SEARCH_TOOL);
         }
 
-        // Add web search if available
-        const hasAgentSearchUrl = !!process.env.SEARCH_SERVICE_URL || !!(await configStore.getConfig('agent_search_url'));
-        const searchProvider = await configStore.getConfig('search_provider') || 'agent-search';
-        const hasBingSearchKey = !!(await configStore.getSecret('bing_search_key'));
-        const searchAvailable = searchProvider !== 'disabled' && ((searchProvider === 'bing' && hasBingSearchKey) || hasAgentSearchUrl);
+        // Add web search tools if available (searchAvailable computed earlier for system prompt)
         if (searchAvailable) {
             notebookTools.push(...AGENT_SEARCH_TOOLS);
         }

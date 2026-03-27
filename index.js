@@ -311,6 +311,7 @@ app.use('/versions', require('./routes/versions'));
 app.use('/api/usage', require('./routes/usage'));
 app.use('/api/feedback', require('./routes/feedback'));
 app.use('/api/org-privacy-shield', require('./routes/orgPrivacyShield'));
+app.use('/api/org-azure-config', require('./routes/orgAzureConfig'));
 app.get('/api/guard/health', async (req, res) => {
     try {
         const guardUrl = process.env.GUARD_SERVICE_URL || 'http://guard-service:8100';
@@ -327,7 +328,18 @@ app.use('/api/subscriptions', require('./routes/subscriptions'));
 app.use('/api/documents', require('./routes/documents'));
 app.use('/api/tasks', require('./routes/tasks'));
 app.use('/api/notifications', require('./routes/notifications'));
-app.use('/api/projects', require('./routes/projects'));
+// Project feature gate middleware
+const projectFeatureGate = async (req, res, next) => {
+    try {
+        const configStore = require('./stores/configStore');
+        const enabled = await configStore.getConfig('feature_projects_enabled');
+        if (enabled === false) {
+            return res.status(403).json({ error: 'Projects feature is disabled' });
+        }
+    } catch (_) { /* allow on error — fail open */ }
+    next();
+};
+app.use('/api/projects', projectFeatureGate, require('./routes/projects'));
 app.use('/api/reminders', require('./routes/reminders'));
 app.use('/api/monitoring', require('./routes/monitoring'));
 app.use('/api/integrations/gdrive', require('./routes/integrations/googleDrive'));
@@ -343,8 +355,19 @@ app.use('/api/integrations/github', require('./routes/integrations/github'));
 app.use('/api/integrations/outlook', require('./routes/integrations/outlook'));
 app.use('/api/integrations/onedrive', require('./routes/integrations/oneDrive'));
 app.use('/api/templates', require('./routes/templates'));
-app.use('/api/notebooks', require('./routes/notebooks'));
-app.use('/api/notebooks', require('./routes/notebookExport'));
+// Notebook feature gate middleware
+const notebookFeatureGate = async (req, res, next) => {
+    try {
+        const configStore = require('./stores/configStore');
+        const enabled = await configStore.getConfig('feature_notebooks_enabled');
+        if (enabled === false) {
+            return res.status(403).json({ error: 'Notebooks feature is disabled' });
+        }
+    } catch (_) { /* allow on error — fail open */ }
+    next();
+};
+app.use('/api/notebooks', notebookFeatureGate, require('./routes/notebooks'));
+app.use('/api/notebooks', notebookFeatureGate, require('./routes/notebookExport'));
 app.use('/api/transcriptions', require('./routes/transcriptions'));
 app.use('/api/meet-bot', require('./routes/meetBot'));
 app.use('/', require('./routes/knowledge'));

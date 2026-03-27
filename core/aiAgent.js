@@ -126,6 +126,8 @@ async function getAIConfig() {
                     piiDetectionEnabled: ai.piiDetectionEnabled || false,
                     piiDetectionCategories: ai.piiDetectionCategories || null,
                     piiDetectionConfidenceThreshold: ai.piiDetectionConfidenceThreshold ?? 0.7,
+                    piiDetectionAction: ai.piiDetectionAction || 'block',
+                    piiDetectionScope: ai.piiDetectionScope || { userInput: true, agentOutput: false },
                     embeddingModel: ai.embeddingModel || null,
                     embeddingProviderId: ai.embeddingProviderId || null
                 };
@@ -147,6 +149,8 @@ async function getAIConfig() {
             piiDetectionEnabled: ai.piiDetectionEnabled || false,
             piiDetectionCategories: ai.piiDetectionCategories || null,
             piiDetectionConfidenceThreshold: ai.piiDetectionConfidenceThreshold ?? 0.7,
+            piiDetectionAction: ai.piiDetectionAction || 'block',
+            piiDetectionScope: ai.piiDetectionScope || { userInput: true, agentOutput: false },
             embeddingModel: ai.embeddingModel || null,
             embeddingProviderId: ai.embeddingProviderId || null
         };
@@ -229,6 +233,8 @@ async function saveAIConfig(aiConfig) {
             piiDetectionEnabled: aiConfig.piiDetectionEnabled !== undefined ? aiConfig.piiDetectionEnabled : ai.piiDetectionEnabled || false,
             piiDetectionCategories: aiConfig.piiDetectionCategories !== undefined ? aiConfig.piiDetectionCategories : ai.piiDetectionCategories || null,
             piiDetectionConfidenceThreshold: aiConfig.piiDetectionConfidenceThreshold ?? ai.piiDetectionConfidenceThreshold ?? 0.7,
+            piiDetectionAction: aiConfig.piiDetectionAction !== undefined ? aiConfig.piiDetectionAction : ai.piiDetectionAction || 'block',
+            piiDetectionScope: aiConfig.piiDetectionScope !== undefined ? aiConfig.piiDetectionScope : ai.piiDetectionScope || { userInput: true, agentOutput: false },
             embeddingModel: aiConfig.embeddingModel || null,
             embeddingProviderId: aiConfig.embeddingProviderId || null
         };
@@ -472,7 +478,7 @@ async function ensureAzureProvider() {
 
     if (!ai.providers) ai.providers = [];
 
-    const apiVersion = await configStore.getConfig('azure_api_version') || '2024-04-01-preview';
+    const apiVersion = await configStore.getConfig('azure_api_version') || '2025-04-01-preview';
 
     const existing = ai.providers.find(p => p.id === 'azure-default');
     if (existing) {

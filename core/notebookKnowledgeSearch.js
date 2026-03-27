@@ -88,26 +88,35 @@ async function searchNotebookKB({ userId, kbIds, query, options = {} }) {
 
     let chunks = [];
     try {
-        const searchRes = await fetch(`${SEARCH_SERVICE_URL}/tools/kb-search`, {
-            method: 'POST',
-            headers: getServiceHeaders(),
-            body: JSON.stringify({
-                tenant_id: userId,
-                kb_ids: kbIds,
-                query: searchQuery,
-                top_k: topK,
-                rerank,
-                ...azureParams,
-            }),
-            signal: AbortSignal.timeout(timeoutMs),
-        });
-
-        if (searchRes.ok) {
-            const data = await searchRes.json();
-            chunks = (data.chunks || data.results || [])
-                .filter(c => (c.score || c.rerank_score || 0) >= minScore);
+        if (azureParams.use_azure) {
+            // ── Local search path (Azure) ─────────────────────────
+            const { searchLocally } = require('./localKBIngest');
+            const localResults = await searchLocally(userId, kbIds, searchQuery, { topK });
+            chunks = localResults
+                .filter(c => (c.score || 0) >= minScore)
+                .map(c => ({ ...c, rerank_score: c.score }));
         } else {
-            console.warn(`[NotebookKBSearch] Search-service error: ${searchRes.status}`);
+            // ── Search-service path ────────────────────────────────
+            const searchRes = await fetch(`${SEARCH_SERVICE_URL}/tools/kb-search`, {
+                method: 'POST',
+                headers: getServiceHeaders(),
+                body: JSON.stringify({
+                    tenant_id: userId,
+                    kb_ids: kbIds,
+                    query: searchQuery,
+                    top_k: topK,
+                    rerank,
+                }),
+                signal: AbortSignal.timeout(timeoutMs),
+            });
+
+            if (searchRes.ok) {
+                const data = await searchRes.json();
+                chunks = (data.chunks || data.results || [])
+                    .filter(c => (c.score || c.rerank_score || 0) >= minScore);
+            } else {
+                console.warn(`[NotebookKBSearch] Search-service error: ${searchRes.status}`);
+            }
         }
     } catch (err) {
         console.warn('[NotebookKBSearch] Search failed:', err.message);
@@ -207,39 +216,49 @@ async function gatherNotebookContent({ userId, kbIds, sources, documentContent, 
         ? `${sourceNames.join(', ')} — main content overview summary key points`
         : 'main content summary overview';
 
+    // Helper: process search results into allContent
+    function processChunks(chunks) {
+        for (const chunk of chunks) {
+            if (allContent.length >= maxChars) break;
+            const key = (chunk.content || '').slice(0, 100);
+            if (seenChunks.has(key)) continue;
+            seenChunks.add(key);
+
+            const sourceName = sources.find(s =>
+                s.id === chunk.source_uri || s.name === chunk.source_uri ||
+                chunk.title?.includes(s.name) || s.name?.includes(chunk.title)
+            )?.name || chunk.source_uri || 'Source';
+
+            allContent += `\n\n[${sourceName}]\n${chunk.content || ''}`;
+            chunkCount++;
+        }
+    }
+
     try {
-        const searchRes = await fetch(`${SEARCH_SERVICE_URL}/tools/kb-search`, {
-            method: 'POST',
-            headers: getServiceHeaders(),
-            body: JSON.stringify({
-                tenant_id: userId,
-                kb_ids: kbIds,
-                query: comprehensiveQuery,
-                top_k: topK,
-                rerank: true,
-                ...azureParams,
-            }),
-            signal: AbortSignal.timeout(15000),
-        });
+        if (azureParams.use_azure) {
+            // ── Local search path (Azure) ─────────────────────────
+            const { searchLocally } = require('./localKBIngest');
+            const localResults = await searchLocally(userId, kbIds, comprehensiveQuery, { topK });
+            processChunks(localResults.filter(c => (c.score || 0) >= minScore));
+        } else {
+            // ── Search-service path ────────────────────────────────
+            const searchRes = await fetch(`${SEARCH_SERVICE_URL}/tools/kb-search`, {
+                method: 'POST',
+                headers: getServiceHeaders(),
+                body: JSON.stringify({
+                    tenant_id: userId,
+                    kb_ids: kbIds,
+                    query: comprehensiveQuery,
+                    top_k: topK,
+                    rerank: true,
+                }),
+                signal: AbortSignal.timeout(15000),
+            });
 
-        if (searchRes.ok) {
-            const data = await searchRes.json();
-            const chunks = (data.chunks || data.results || [])
-                .filter(c => (c.score || c.rerank_score || 0) >= minScore);
-
-            for (const chunk of chunks) {
-                if (allContent.length >= maxChars) break;
-                const key = (chunk.content || '').slice(0, 100);
-                if (seenChunks.has(key)) continue;
-                seenChunks.add(key);
-
-                const sourceName = sources.find(s =>
-                    s.id === chunk.source_uri || s.name === chunk.source_uri ||
-                    chunk.title?.includes(s.name) || s.name?.includes(chunk.title)
-                )?.name || chunk.source_uri || 'Source';
-
-                allContent += `\n\n[${sourceName}]\n${chunk.content || ''}`;
-                chunkCount++;
+            if (searchRes.ok) {
+                const data = await searchRes.json();
+                processChunks((data.chunks || data.results || [])
+                    .filter(c => (c.score || c.rerank_score || 0) >= minScore));
             }
         }
     } catch (e) {
@@ -249,38 +268,29 @@ async function gatherNotebookContent({ userId, kbIds, sources, documentContent, 
     // 3. If we got very few results, do a second broader query
     if (chunkCount < 5 && allContent.length < maxChars / 2) {
         try {
-            const fallbackRes = await fetch(`${SEARCH_SERVICE_URL}/tools/kb-search`, {
-                method: 'POST',
-                headers: getServiceHeaders(),
-                body: JSON.stringify({
-                    tenant_id: userId,
-                    kb_ids: kbIds,
-                    query: 'key information details analysis findings data',
-                    top_k: topK,
-                    rerank: true,
-                    ...azureParams,
-                }),
-                signal: AbortSignal.timeout(15000),
-            });
+            const fallbackQuery = 'key information details analysis findings data';
+            if (azureParams.use_azure) {
+                const { searchLocally } = require('./localKBIngest');
+                const localResults = await searchLocally(userId, kbIds, fallbackQuery, { topK });
+                processChunks(localResults.filter(c => (c.score || 0) >= minScore));
+            } else {
+                const fallbackRes = await fetch(`${SEARCH_SERVICE_URL}/tools/kb-search`, {
+                    method: 'POST',
+                    headers: getServiceHeaders(),
+                    body: JSON.stringify({
+                        tenant_id: userId,
+                        kb_ids: kbIds,
+                        query: fallbackQuery,
+                        top_k: topK,
+                        rerank: true,
+                    }),
+                    signal: AbortSignal.timeout(15000),
+                });
 
-            if (fallbackRes.ok) {
-                const data = await fallbackRes.json();
-                const chunks = (data.chunks || data.results || [])
-                    .filter(c => (c.score || c.rerank_score || 0) >= minScore);
-
-                for (const chunk of chunks) {
-                    if (allContent.length >= maxChars) break;
-                    const key = (chunk.content || '').slice(0, 100);
-                    if (seenChunks.has(key)) continue;
-                    seenChunks.add(key);
-
-                    const sourceName = sources.find(s =>
-                        s.id === chunk.source_uri || s.name === chunk.source_uri ||
-                        chunk.title?.includes(s.name) || s.name?.includes(chunk.title)
-                    )?.name || chunk.source_uri || 'Source';
-
-                    allContent += `\n\n[${sourceName}]\n${chunk.content || ''}`;
-                    chunkCount++;
+                if (fallbackRes.ok) {
+                    const data = await fallbackRes.json();
+                    processChunks((data.chunks || data.results || [])
+                        .filter(c => (c.score || c.rerank_score || 0) >= minScore));
                 }
             }
         } catch (e) {

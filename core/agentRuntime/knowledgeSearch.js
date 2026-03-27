@@ -8,8 +8,9 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
 
     if (kbIds.length > 0) {
         try {
-            const searchUrl = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
-            
+            // Determine whether to use Azure embeddings for query (must match ingestion model)
+            const useAzure = !!(await configStore.getConfig('use_azure_doc_processing'));
+
             // Query preprocessing: extract search intent
             let searchQuery = userMessage;
             searchQuery = searchQuery
@@ -22,40 +23,46 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
                 .trim();
             if (searchQuery.length < 5) searchQuery = userMessage;
 
-            // Determine whether to use Azure embeddings for query (must match ingestion model)
-            const useAzure = !!(await configStore.getConfig('use_azure_doc_processing'));
-            const azureFields = useAzure ? {
-                azure_endpoint: await configStore.getConfig('azure_openai_embedding_endpoint') || '',
-                azure_key: await configStore.getSecret('azure_openai_embedding_key') || '',
-                azure_model: await configStore.getConfig('azure_openai_embedding_model') || 'text-embedding-3-small',
-            } : {};
-
-            const searchRes = await fetch(`${searchUrl}/tools/kb-search`, {
-                method: 'POST',
-                headers: getServiceHeaders(),
-                body: JSON.stringify({
-                    tenant_id: userId,
-                    kb_ids: kbIds,
-                    query: searchQuery,
-                    top_k: 15,
-                    rerank: true,
-                    use_azure: useAzure,
-                    ...azureFields,
-                }),
-                signal: AbortSignal.timeout(15000)
-            });
-
-            if (searchRes.ok) {
-                const searchData = await searchRes.json();
-                const chunks = searchData.chunks || searchData.results || [];
+            if (useAzure) {
+                // ── Local search path (Azure) ──────────────────────────
+                // Search locally-ingested chunks directly from PostgreSQL
+                const { searchLocally } = require('../localKBIngest');
+                const chunks = await searchLocally(userId, kbIds, searchQuery, { topK: 15 });
                 allKnowledgeResults.push(...chunks.map(c => ({
                     content: c.content,
                     metadata: { source: c.source_uri || c.title || 'KB', type: 'kb_chunk' },
-                    score: c.score || c.rerank_score || 0
+                    score: c.score || 0
                 })));
+            } else {
+                // ── Search-service path ─────────────────────────────────
+                const searchUrl = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
+
+                const searchRes = await fetch(`${searchUrl}/tools/kb-search`, {
+                    method: 'POST',
+                    headers: getServiceHeaders(),
+                    body: JSON.stringify({
+                        tenant_id: userId,
+                        kb_ids: kbIds,
+                        query: searchQuery,
+                        top_k: 15,
+                        rerank: true,
+                        use_azure: false,
+                    }),
+                    signal: AbortSignal.timeout(15000)
+                });
+
+                if (searchRes.ok) {
+                    const searchData = await searchRes.json();
+                    const chunks = searchData.chunks || searchData.results || [];
+                    allKnowledgeResults.push(...chunks.map(c => ({
+                        content: c.content,
+                        metadata: { source: c.source_uri || c.title || 'KB', type: 'kb_chunk' },
+                        score: c.score || c.rerank_score || 0
+                    })));
+                }
             }
         } catch (searchErr) {
-            console.warn('[KnowledgeSearch] Search-service unavailable:', searchErr.message);
+            console.warn('[KnowledgeSearch] KB search failed:', searchErr.message);
         }
     }
 

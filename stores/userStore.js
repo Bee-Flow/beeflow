@@ -125,6 +125,12 @@ async function initDB() {
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "autoApproveSSO" TEXT DEFAULT '0'`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "enabledIntegrations" TEXT DEFAULT NULL`); } catch (e) { /* column already exists */ }
 
+    // ── Azure AD Group Sync columns ──
+    try { await exec(`ALTER TABLE groups ADD COLUMN IF NOT EXISTS "azureGroupId" TEXT`); } catch (e) { /* column already exists */ }
+    try { await exec(`ALTER TABLE groups ADD COLUMN IF NOT EXISTS "source" TEXT DEFAULT 'manual'`); } catch (e) { /* column already exists */ }
+    try { await exec(`ALTER TABLE groups ADD COLUMN IF NOT EXISTS "lastSyncedAt" TEXT`); } catch (e) { /* column already exists */ }
+    try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS "azureUserId" TEXT`); } catch (e) { /* column already exists */ }
+
     initialized = true;
 }
 
@@ -343,7 +349,7 @@ async function updateUser(userId, updates) {
         kekSalt: 'kekSalt', recoverySalt: 'recoverySalt', ssoEncryptionSetup: 'ssoEncryptionSetup',
         passwordResetRequired: 'passwordResetRequired', dekUnwrapFailures: 'dekUnwrapFailures',
         dekLockoutUntil: 'dekLockoutUntil', opaqueRecord: 'opaqueRecord', kdfMode: 'kdfMode',
-        status: 'status', activeIconPackId: 'activeIconPackId',
+        status: 'status', activeIconPackId: 'activeIconPackId', azureUserId: 'azureUserId',
     };
 
     for (const [jsKey, dbCol] of Object.entries(colMap)) {
@@ -463,12 +469,12 @@ async function getAllGroups() {
 
 async function createGroup(groupData) {
     await initDB();
-    const { id, organizationId, name, description, permissions, roles, allowedAgentTypes } = groupData;
+    const { id, organizationId, name, description, permissions, roles, allowedAgentTypes, azureGroupId, source, lastSyncedAt } = groupData;
     const ex = await getOne('SELECT id FROM groups WHERE id = $1', [id]);
     if (ex) return false;
     try {
-        await run('INSERT INTO groups (id, "organizationId", name, description, permissions, roles, "userCount", "allowedAgentTypes") VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
-            [id, organizationId || null, name, description || '', JSON.stringify(permissions || []), JSON.stringify(roles || []), 0, JSON.stringify(allowedAgentTypes || [])]);
+        await run('INSERT INTO groups (id, "organizationId", name, description, permissions, roles, "userCount", "allowedAgentTypes", "azureGroupId", "source", "lastSyncedAt") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)',
+            [id, organizationId || null, name, description || '', JSON.stringify(permissions || []), JSON.stringify(roles || []), 0, JSON.stringify(allowedAgentTypes || []), azureGroupId || null, source || 'manual', lastSyncedAt || null]);
         return true;
     } catch (e) { console.error(e); return false; }
 }
@@ -477,7 +483,7 @@ async function updateGroup(groupId, updates) {
     await initDB();
     const ex = await getOne('SELECT id FROM groups WHERE id = $1', [groupId]);
     if (!ex) return false;
-    const colMap = { name: 'name', description: 'description' };
+    const colMap = { name: 'name', description: 'description', azureGroupId: 'azureGroupId', source: 'source', lastSyncedAt: 'lastSyncedAt' };
     const updateMap = {};
     for (const [k, v] of Object.entries(colMap)) { if (updates[k] !== undefined) updateMap[k] = updates[k]; }
     if (updates.organizationId !== undefined) updateMap.organizationId = updates.organizationId;
@@ -494,8 +500,55 @@ async function updateGroup(groupId, updates) {
 
 async function deleteGroup(groupId) {
     await initDB();
+
+    // Cascade: remove group from all users' groups arrays
+    const users = await getAll('SELECT id, groups FROM users');
+    for (const user of users) {
+        let groups = [];
+        try { groups = JSON.parse(user.groups || '[]'); } catch (_) {}
+        if (groups.includes(groupId)) {
+            groups = groups.filter(g => g !== groupId);
+            await run('UPDATE users SET groups = $1 WHERE id = $2', [JSON.stringify(groups), user.id]);
+        }
+    }
+
+    // Cascade: remove group from all agents' shared_groups arrays
+    const agents = await getAll('SELECT id, shared_groups FROM agents');
+    for (const agent of agents) {
+        let sharedGroups = [];
+        try { sharedGroups = JSON.parse(agent.shared_groups || '[]'); } catch (_) {}
+        if (sharedGroups.includes(groupId)) {
+            sharedGroups = sharedGroups.filter(g => g !== groupId);
+            await run('UPDATE agents SET shared_groups = $1 WHERE id = $2', [JSON.stringify(sharedGroups), agent.id]);
+        }
+    }
+
+    // Cascade: remove group from all organizations' defaultGroups arrays
+    const orgs = await getAll('SELECT id, "defaultGroups" FROM organizations');
+    for (const org of orgs) {
+        let defaultGroups = [];
+        try { defaultGroups = JSON.parse(org.defaultGroups || '[]'); } catch (_) {}
+        if (defaultGroups.includes(groupId)) {
+            defaultGroups = defaultGroups.filter(g => g !== groupId);
+            await run('UPDATE organizations SET "defaultGroups" = $1 WHERE id = $2', [JSON.stringify(defaultGroups), org.id]);
+        }
+    }
+
     const { rowCount } = await run('DELETE FROM groups WHERE id = $1', [groupId]);
     return rowCount > 0;
+}
+
+// ── Azure AD Lookup Helpers ─────────────────────────────
+async function getGroupByAzureId(azureGroupId) {
+    await initDB();
+    return await getOne('SELECT * FROM groups WHERE "azureGroupId" = $1', [azureGroupId]);
+}
+
+async function getUserByAzureId(azureUserId) {
+    await initDB();
+    const row = await getOne('SELECT * FROM users WHERE "azureUserId" = $1', [azureUserId]);
+    if (!row) return null;
+    return { ...row, groups: parseJSON(row.groups, []) };
 }
 
 async function initDefaultGroups() {
@@ -719,7 +772,7 @@ async function getEffectiveLimits(orgId) {
 module.exports = {
     getAllUsers, getUser, getUserByEmail, createUser, updateUser, deleteUser,
     getAllOrganizations, getOrganization, createOrganization, updateOrganization, deleteOrganization,
-    getAllGroups, createGroup, updateGroup, deleteGroup,
+    getAllGroups, createGroup, updateGroup, deleteGroup, getGroupByAzureId, getUserByAzureId,
     storeAppPassword, getAppPassword, hasAppPassword, deleteAppPassword,
     getAllRoles, createRole, updateRole, deleteRole,
     getAllPlans, getPlan, createPlan, updatePlan, deletePlan,

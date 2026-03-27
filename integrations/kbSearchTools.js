@@ -74,32 +74,43 @@ async function executeKbSearchTool(toolName, args, context = {}) {
         };
     }
 
-    const searchUrl = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
     const topK = Math.min(Math.max(parseInt(top_k) || 5, 1), 10);
 
     console.log(`[KBSearch] Searching ${kbIds.length} KBs: "${query}" (top_k=${topK}, agent=${agentId})`);
 
     try {
-        const searchRes = await fetch(`${searchUrl}/tools/kb-search`, {
-            method: 'POST',
-            headers: getServiceHeaders(),
-            body: JSON.stringify({
-                tenant_id: userId,
-                kb_ids: kbIds,
-                query,
-                top_k: topK,
-                rerank: true
-            }),
-            signal: AbortSignal.timeout(15000)
-        });
+        const useAzure = !!(await configStore.getConfig('use_azure_doc_processing'));
+        let chunks = [];
 
-        if (!searchRes.ok) {
-            console.warn(`[KBSearch] Search-service error: ${searchRes.status}`);
-            return { error: `Knowledge base search failed (${searchRes.status})` };
+        if (useAzure) {
+            // ── Local search path (Azure) ─────────────────────────
+            const { searchLocally } = require('../core/localKBIngest');
+            const localResults = await searchLocally(userId, kbIds, query, { topK });
+            chunks = localResults;
+        } else {
+            // ── Search-service path ────────────────────────────────
+            const searchUrl = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
+            const searchRes = await fetch(`${searchUrl}/tools/kb-search`, {
+                method: 'POST',
+                headers: getServiceHeaders(),
+                body: JSON.stringify({
+                    tenant_id: userId,
+                    kb_ids: kbIds,
+                    query,
+                    top_k: topK,
+                    rerank: true
+                }),
+                signal: AbortSignal.timeout(15000)
+            });
+
+            if (!searchRes.ok) {
+                console.warn(`[KBSearch] Search-service error: ${searchRes.status}`);
+                return { error: `Knowledge base search failed (${searchRes.status})` };
+            }
+
+            const searchData = await searchRes.json();
+            chunks = searchData.chunks || searchData.results || [];
         }
-
-        const searchData = await searchRes.json();
-        const chunks = searchData.chunks || searchData.results || [];
 
         // Format results for the agent
         const results = chunks

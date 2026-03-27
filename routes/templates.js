@@ -528,30 +528,44 @@ async function autoCreateTemplateKB(templateId, userId, fileName, text) {
     );
 
     try {
-        const ingestRes = await fetch(`${SEARCH_SERVICE_URL}/kb/ingest/json`, {
-            method: 'POST',
-            headers: getServiceHeaders(),
-            body: JSON.stringify({
-                tenant_id: userId,
-                knowledge_base_id: kb.id,
-                document_id: doc.id,
-                content: text,
+        const useAzure = !!(await configStore.getConfig('use_azure_doc_processing'));
+
+        if (useAzure) {
+            const { ingestLocally } = require('../core/localKBIngest');
+            const result = await ingestLocally(userId, kb.id, doc.id, text, {
                 title: fileName,
                 source_uri: fileName,
                 lang: kb.default_lang || 'en'
-            }),
-            signal: AbortSignal.timeout(120000)
-        });
-
-        if (ingestRes.ok) {
-            const result = await ingestRes.json();
+            });
             await kbStore.updateChunkCount(doc.id, result.chunks_created || 0);
             await kbStore.bumpKBVersion(kb.id);
-            console.log(`[Templates] Auto-KB "${kbName}" created with ${result.chunks_created || 0} chunks`);
+            console.log(`[Templates] Auto-KB "${kbName}" created locally with ${result.chunks_created || 0} chunks`);
         } else {
-            const err = await ingestRes.text();
-            console.warn(`[Templates] Auto-KB ingestion failed: ${err}`);
-            await kbStore.deleteDocument(doc.id);
+            const ingestRes = await fetch(`${SEARCH_SERVICE_URL}/kb/ingest/json`, {
+                method: 'POST',
+                headers: getServiceHeaders(),
+                body: JSON.stringify({
+                    tenant_id: userId,
+                    knowledge_base_id: kb.id,
+                    document_id: doc.id,
+                    content: text,
+                    title: fileName,
+                    source_uri: fileName,
+                    lang: kb.default_lang || 'en'
+                }),
+                signal: AbortSignal.timeout(120000)
+            });
+
+            if (ingestRes.ok) {
+                const result = await ingestRes.json();
+                await kbStore.updateChunkCount(doc.id, result.chunks_created || 0);
+                await kbStore.bumpKBVersion(kb.id);
+                console.log(`[Templates] Auto-KB "${kbName}" created with ${result.chunks_created || 0} chunks`);
+            } else {
+                const err = await ingestRes.text();
+                console.warn(`[Templates] Auto-KB ingestion failed: ${err}`);
+                await kbStore.deleteDocument(doc.id);
+            }
         }
     } catch (e) {
         console.warn(`[Templates] Auto-KB ingestion error: ${e.message}`);

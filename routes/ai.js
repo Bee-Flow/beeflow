@@ -26,6 +26,19 @@ router.use('/', directChatRoutes);
 router.use('/', designerRoutes);
 router.use('/', researchRoutes);
 router.use('/', templateChatRoutes);
+// Notebook chat feature gate
+const notebookChatGate = async (req, res, next) => {
+    if (!req.path.startsWith('/chat/notebook')) return next();
+    try {
+        const configStore = require('../stores/configStore');
+        const enabled = await configStore.getConfig('feature_notebooks_enabled');
+        if (enabled === false) {
+            return res.status(403).json({ error: 'Notebooks feature is disabled' });
+        }
+    } catch (_) { /* fail open */ }
+    next();
+};
+router.use(notebookChatGate);
 router.use('/', notebookChatRoutes);
 
 module.exports = router;

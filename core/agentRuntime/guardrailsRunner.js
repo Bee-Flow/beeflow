@@ -57,12 +57,13 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
     // ── PII Detection ─────────────────────────────────────────────────
     // Runs independently of Llama Guard / Azure moderation.
     // Uses Azure Text Analytics when configured, falls back to CPU model via guard service.
-    if (globalConfig?.piiDetectionEnabled) {
+    const orgPiiEnabled = !!(orgShield?.enabled && orgShield?.azurePiiEnabled);
+    if (globalConfig?.piiDetectionEnabled || orgPiiEnabled) {
         try {
             const piiMessages = [
                 ...messages.slice(-3), // last few messages for context
             ];
-            await validateInputForPii(piiMessages, false);
+            await validateInputForPii(piiMessages, orgPiiEnabled);
         } catch (piiError) {
             if (piiError.message?.includes('PII Detected')) {
                 console.warn('[GuardrailsRunner] PII detected in user input:', piiError.message);

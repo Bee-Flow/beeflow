@@ -52,6 +52,7 @@ class OpenAIProvider extends BaseProvider {
         // Map any non-standard values to valid OpenAI values
         const EFFORT_MAP = {
             'minimal': 'low',   // 'minimal' is not valid for OpenAI, map to 'low'
+            'xhigh': 'high',   // 'xhigh' maps to OpenAI's max effort level
         };
         effort = EFFORT_MAP[effort] || effort;
         for (const [pattern, fixed] of Object.entries(MODEL_EFFORT_OVERRIDES)) {
@@ -69,8 +70,8 @@ class OpenAIProvider extends BaseProvider {
     }
 
     supportsVision(modelId) {
-        // GPT-4o, GPT-4.1, GPT-4.5, GPT-4-turbo, GPT-4-vision, o4-series
-        return /gpt-4o|gpt-4\.1|gpt-4\.5|gpt-4-turbo|gpt-4-vision|o4/.test(modelId);
+        // GPT-4o, GPT-4.1, GPT-4.5, GPT-4-turbo, GPT-4-vision, GPT-5.x, o4-series
+        return /gpt-4o|gpt-4\.1|gpt-4\.5|gpt-4-turbo|gpt-4-vision|gpt-5|o4/.test(modelId);
     }
 
     shouldUseResponsesApi(model, options = {}) {
@@ -218,7 +219,7 @@ class OpenAIProvider extends BaseProvider {
         if (options.maxTokens !== undefined) params.max_output_tokens = options.maxTokens;
         // Note: temperature is not supported in the Responses API for reasoning models
 
-        const reasoning = { summary: 'auto' };
+        const reasoning = { summary: options.reasoningSummary ? 'auto' : 'concise' };
         const effort = this.normalizeEffort(model, options.reasoningEffort);
         reasoning.effort = effort || 'medium';
         params.reasoning = reasoning;
@@ -343,7 +344,7 @@ class OpenAIProvider extends BaseProvider {
         if (options.maxTokens !== undefined) params.max_output_tokens = options.maxTokens;
         // Note: temperature is not supported in the Responses API
 
-        const reasoning = { summary: 'auto' };
+        const reasoning = { summary: options.reasoningSummary ? 'auto' : 'concise' };
         const effort = this.normalizeEffort(model, options.reasoningEffort);
         reasoning.effort = effort || 'medium';
         params.reasoning = reasoning;

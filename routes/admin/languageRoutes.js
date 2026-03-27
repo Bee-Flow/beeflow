@@ -396,20 +396,81 @@ router.post('/:code/import', requireAdmin, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════
-// USER-FACING ROUTES (require only auth)
+// ORG ADMIN ROUTES (require org admin or platform admin)
 // ══════════════════════════════════════════════════════════════════
 
-// GET /admin/languages/user/locales — Get available locales for language picker
-router.get('/user/locales', requireAuth, async (req, res) => {
+function requireOrgAdmin(req, res, next) {
+    if (!req.session?.user) return res.status(401).json({ error: 'Unauthorized' });
+    // Platform admin can always manage
+    if (req.session.isAdmin || req.session.user?.role === 'admin') return next();
+    // Org admin check
+    const perms = req.session.user?.permissions || [];
+    const orgRole = req.session.user?.orgRole;
+    if (perms.includes('all') || perms.includes('org_admin') || perms.some(p => p.startsWith('admin_')) ||
+        orgRole === 'admin' || orgRole === 'org_admin') {
+        return next();
+    }
+    res.status(403).json({ error: 'Organisation admin access required' });
+}
+
+// GET /api/languages/org/default — Get the org default locale for new users
+router.get('/org/default', requireOrgAdmin, async (req, res) => {
     try {
+        const configStore = require('../../stores/configStore');
+        const defaultLocale = await configStore.getConfig('org_default_locale') || 'en';
         const locales = await languageStore.getAvailableLocales();
-        res.json(locales);
+        res.json({ defaultLocale, locales });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-// GET /admin/languages/user/strings/:locale — Get effective GUI strings for a locale
+// PUT /api/languages/org/default — Set the org default locale for new users
+router.put('/org/default', requireOrgAdmin, async (req, res) => {
+    try {
+        const { defaultLocale } = req.body;
+        if (!defaultLocale || typeof defaultLocale !== 'string') {
+            return res.status(400).json({ error: 'defaultLocale is required' });
+        }
+        // Validate that the locale exists
+        const locales = await languageStore.getAvailableLocales();
+        if (!locales.find(l => l.code === defaultLocale)) {
+            return res.status(400).json({ error: `Locale '${defaultLocale}' is not available` });
+        }
+        const configStore = require('../../stores/configStore');
+        await configStore.setConfig('org_default_locale', defaultLocale);
+        console.log(`[Languages] Org default locale set to: ${defaultLocale}`);
+        res.json({ success: true, defaultLocale });
+    } catch (err) {
+        console.error('[Languages] Set org default error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ══════════════════════════════════════════════════════════════════
+// USER-FACING ROUTES (require only auth)
+// ══════════════════════════════════════════════════════════════════
+
+// GET /api/languages/user/locales — Get available locales for language picker
+router.get('/user/locales', requireAuth, async (req, res) => {
+    try {
+        const locales = await languageStore.getAvailableLocales();
+        // Include org default locale info so the frontend can use it for new users
+        const configStore = require('../../stores/configStore');
+        const defaultLocale = await configStore.getConfig('org_default_locale') || null;
+        // Attach default info to the response — the frontend already expects an array,
+        // so we annotate each locale with isOrgDefault
+        const withDefaults = locales.map(l => ({
+            ...l,
+            isOrgDefault: l.code === defaultLocale,
+        }));
+        res.json(withDefaults);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET /api/languages/user/strings/:locale — Get effective GUI strings for a locale
 router.get('/user/strings/:locale', requireAuth, async (req, res) => {
     try {
         const strings = await languageStore.getEffectiveGUIStrings(req.params.locale);

@@ -67,8 +67,27 @@ router.get('/:orgId', requireAuth, async (req, res) => {
             action: 'delete',
             moderationEnabled: false,
             euModeEnabled: false,
-            azurePiiEnabled: false
+            azurePiiEnabled: false,
+            azureSeverityThreshold: 2,
+            azureEnabledCategories: ['Hate', 'Violence', 'Sexual', 'SelfHarm'],
+            piiDetectionCategories: [],
+            piiDetectionConfidenceThreshold: 0.7,
         };
+
+        // Also pull current global AI config values so the UI stays in sync
+        const aiBlob = await configStore.getConfig('ai') || {};
+        if (!config.azureSeverityThreshold && config.azureSeverityThreshold !== 0) {
+            config.azureSeverityThreshold = aiBlob.azureContentSafetySeverityThreshold ?? 2;
+        }
+        if (!config.azureEnabledCategories?.length) {
+            config.azureEnabledCategories = aiBlob.azureContentSafetyCategories || ['Hate', 'Violence', 'Sexual', 'SelfHarm'];
+        }
+        if (!config.piiDetectionCategories?.length) {
+            config.piiDetectionCategories = aiBlob.piiDetectionCategories || [];
+        }
+        if (config.piiDetectionConfidenceThreshold === undefined) {
+            config.piiDetectionConfidenceThreshold = aiBlob.piiDetectionConfidenceThreshold ?? 0.7;
+        }
         res.json(config);
     } catch (e) {
         console.error('[OrgPrivacyShield] GET error:', e);
@@ -84,7 +103,7 @@ router.put('/:orgId', requireAuth, async (req, res) => {
             return res.status(403).json({ error: 'Only organization admins can manage the privacy shield' });
         }
 
-        const { enabled, collectionIds, scope, action, moderationEnabled, moderationCategories, euModeEnabled, webSearchGuardEnabled, disableSearchOnUpload, azurePiiEnabled } = req.body;
+        const { enabled, collectionIds, scope, action, moderationEnabled, moderationCategories, euModeEnabled, webSearchGuardEnabled, disableSearchOnUpload, azurePiiEnabled, azureSeverityThreshold, azureEnabledCategories, piiDetectionCategories, piiDetectionConfidenceThreshold } = req.body;
         const config = {
             enabled: !!enabled,
             collectionIds: Array.isArray(collectionIds) ? collectionIds : [],
@@ -96,11 +115,26 @@ router.put('/:orgId', requireAuth, async (req, res) => {
             webSearchGuardEnabled: !!webSearchGuardEnabled,
             disableSearchOnUpload: !!disableSearchOnUpload,
             azurePiiEnabled: !!azurePiiEnabled,
+            azureSeverityThreshold: typeof azureSeverityThreshold === 'number' ? azureSeverityThreshold : 2,
+            azureEnabledCategories: Array.isArray(azureEnabledCategories) ? azureEnabledCategories : ['Hate', 'Violence', 'Sexual', 'SelfHarm'],
+            piiDetectionCategories: Array.isArray(piiDetectionCategories) ? piiDetectionCategories : [],
+            piiDetectionConfidenceThreshold: typeof piiDetectionConfidenceThreshold === 'number' ? piiDetectionConfidenceThreshold : 0.7,
             updatedAt: new Date().toISOString(),
             updatedBy: req.session.user.id,
         };
 
         await configStore.setConfig(`org_privacy_shield_${orgId}`, config);
+
+        // Sync shield settings → global AI config so the runtime uses these values
+        const aiBlob = await configStore.getConfig('ai') || {};
+        if (azurePiiEnabled !== undefined) aiBlob.piiDetectionEnabled = !!azurePiiEnabled;
+        if (typeof azureSeverityThreshold === 'number') aiBlob.azureContentSafetySeverityThreshold = azureSeverityThreshold;
+        if (Array.isArray(azureEnabledCategories)) aiBlob.azureContentSafetyCategories = azureEnabledCategories;
+        if (Array.isArray(piiDetectionCategories)) aiBlob.piiDetectionCategories = piiDetectionCategories;
+        if (typeof piiDetectionConfidenceThreshold === 'number') aiBlob.piiDetectionConfidenceThreshold = piiDetectionConfidenceThreshold;
+        await configStore.setConfig('ai', aiBlob);
+        console.log(`[OrgPrivacyShield] Synced shield settings to global AI config`);
+
         console.log(`[OrgPrivacyShield] Saved config for org ${orgId} by ${req.session.user.id}`);
         res.json({ ok: true, config });
     } catch (e) {

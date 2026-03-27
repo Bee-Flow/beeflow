@@ -313,11 +313,13 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         });
 
         // ─── Built-in: workspace tools ────────────────────────────────
-        // Always inject workspace tools — they are context-aware and only
-        // produce visible output when there is actual content to show.
-        for (const wsTool of WORKSPACE_TOOLS) {
-            if (!directChatTools.find(t => t.function.name === wsTool.function.name)) {
-                directChatTools.push(wsTool);
+        // Only inject notebook tools if the feature is enabled
+        const notebooksEnabled = (await configStore.getConfig('feature_notebooks_enabled')) !== false;
+        if (notebooksEnabled) {
+            for (const wsTool of WORKSPACE_TOOLS) {
+                if (!directChatTools.find(t => t.function.name === wsTool.function.name)) {
+                    directChatTools.push(wsTool);
+                }
             }
         }
 
@@ -353,8 +355,13 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         // Build messages array
         const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
         const customPrompt = await configStore.getConfig('direct_chat_system_prompt');
+        let systemPromptText = customPrompt || DEFAULT_SYSTEM_PROMPT;
+        // Strip notebook instructions from prompt when feature is disabled
+        if (!notebooksEnabled) {
+            systemPromptText = systemPromptText.replace(/\n*When the user has a notebook open[^\n]*\n*/g, '\n');
+        }
         const basePrompt = (requestSystemPrompt ? requestSystemPrompt + '\n\n' : '')
-            + (customPrompt || DEFAULT_SYSTEM_PROMPT)
+            + systemPromptText
             + `\n\nToday is ${today}.`;
 
         // Build explicit integration hints so the AI knows what tools it has
@@ -382,25 +389,35 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                         const kbIds = project.knowledgeBaseIds || [];
                         if (kbIds.length > 0) {
                             try {
-                                const searchUrl = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
-                                const searchRes = await fetch(`${searchUrl}/tools/kb-search`, {
-                                    method: 'POST',
-                                    headers: getServiceHeaders(),
-                                    body: JSON.stringify({ tenant_id: userId, kb_ids: kbIds, query: message, top_k: 8, rerank: true }),
-                                    signal: AbortSignal.timeout(10000),
-                                });
-                                if (searchRes.ok) {
-                                    const searchData = await searchRes.json();
-                                    const chunks = (searchData.chunks || searchData.results || []).filter(c => (c.score || c.rerank_score || 0) >= 0.25);
-                                    if (chunks.length > 0) {
-                                        const kbText = chunks.slice(0, 6).map((c, i) => {
-                                            const src = c.source_uri || c.title || 'KB';
-                                            const content = (c.content || '').slice(0, 1200);
-                                            return `### Source ${i + 1}: ${src}\n${content}`;
-                                        }).join('\n\n');
-                                        projectContext += `\n\n[PROJECT KNOWLEDGE BASE — "${project.name}"]\nRelevant information from this project's knowledge base:\n${kbText}`;
-                                        console.log(`[DirectChat] Injected ${chunks.length} KB chunks from project "${project.name}"`);
+                                const useAzure = !!(await configStore.getConfig('use_azure_doc_processing'));
+                                let chunks = [];
+
+                                if (useAzure) {
+                                    const { searchLocally } = require('../../core/localKBIngest');
+                                    const localResults = await searchLocally(userId, kbIds, message, { topK: 8 });
+                                    chunks = localResults.filter(c => (c.score || 0) >= 0.25);
+                                } else {
+                                    const searchUrl = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
+                                    const searchRes = await fetch(`${searchUrl}/tools/kb-search`, {
+                                        method: 'POST',
+                                        headers: getServiceHeaders(),
+                                        body: JSON.stringify({ tenant_id: userId, kb_ids: kbIds, query: message, top_k: 8, rerank: true }),
+                                        signal: AbortSignal.timeout(10000),
+                                    });
+                                    if (searchRes.ok) {
+                                        const searchData = await searchRes.json();
+                                        chunks = (searchData.chunks || searchData.results || []).filter(c => (c.score || c.rerank_score || 0) >= 0.25);
                                     }
+                                }
+
+                                if (chunks.length > 0) {
+                                    const kbText = chunks.slice(0, 6).map((c, i) => {
+                                        const src = c.source_uri || c.title || 'KB';
+                                        const content = (c.content || '').slice(0, 1200);
+                                        return `### Source ${i + 1}: ${src}\n${content}`;
+                                    }).join('\n\n');
+                                    projectContext += `\n\n[PROJECT KNOWLEDGE BASE — "${project.name}"]\nRelevant information from this project's knowledge base:\n${kbText}`;
+                                    console.log(`[DirectChat] Injected ${chunks.length} KB chunks from project "${project.name}"`);
                                 }
                             } catch (kbErr) {
                                 console.warn('[DirectChat] Project KB search failed:', kbErr.message);
@@ -428,7 +445,7 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
 
         // ─── Notebook context injection ─────────────────────────────
         let workspaceContext = '';
-        if (workspaceContent) {
+        if (notebooksEnabled && workspaceContent) {
             workspaceContext = `\n\n[NOTEBOOK]
 The user has a rich-text Notebook open alongside the chat. You have 4 notebook tools:
 - notebook_read: Read current content as Markdown (ALWAYS call this before notebook_replace)
@@ -550,13 +567,13 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
                     contentParts.push({ type: 'text', text: driveText });
                     persistedAttachments.push({ name: att.name, type: 'google-drive', extractedText: driveText });
                 } else if (att.content && att.type && att.type.includes('pdf')) {
-                    // PDF — use pdf-parse as primary extractor, Mistral OCR as optional fallback for scanned PDFs
+                    // PDF — pdfjs → Azure Document Intelligence (fallback when enabled)
                     try {
                         const base64Data = att.content.split(',')[1] || att.content;
                         const pdfBuffer = Buffer.from(base64Data, 'base64');
                         let pdfText = '';
 
-                        // 1. Try pdfjs-dist first (works for text-based PDFs)
+                        // 1. Try pdfjs-dist first (fast, free — works for text-based PDFs)
                         try {
                             const { extractTextFromPDF } = require('../../core/pdfExtractor');
                             pdfText = await extractTextFromPDF(pdfBuffer, att.name);
@@ -564,16 +581,21 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
                             console.warn(`[DirectChat] pdfjs extraction failed for ${att.name}:`, parseErr.message);
                         }
 
-                        // 2. If pdf-parse returned empty (scanned PDF), try Mistral OCR as fallback
+                        // 2. If pdfjs returned empty (e.g. scanned PDF), try Azure Document Intelligence
                         if (!pdfText) {
-                            try {
-                                const { mistralOCR } = require('../../core/ocr');
-                                pdfText = await mistralOCR(base64Data, att.type, att.name);
-                                if (pdfText) {
-                                    console.log(`[DirectChat] PDF extracted via Mistral OCR fallback: ${att.name}`);
+                            const useAzureDoc = !!(await configStore.getConfig('use_azure_doc_processing'));
+                            if (useAzureDoc) {
+                                try {
+                                    const { extractWithAzure, isAzureDocIntelligenceConfigured } = require('../../core/azureDocIntelligence');
+                                    if (await isAzureDocIntelligenceConfigured()) {
+                                        pdfText = await extractWithAzure(pdfBuffer, att.name);
+                                        if (pdfText) {
+                                            console.log(`[DirectChat] PDF extracted via Azure Document Intelligence: ${att.name} (${pdfText.length} chars)`);
+                                        }
+                                    }
+                                } catch (azureErr) {
+                                    console.warn(`[DirectChat] Azure Document Intelligence failed for PDF ${att.name}:`, azureErr.message);
                                 }
-                            } catch (ocrErr) {
-                                console.warn(`[DirectChat] Mistral OCR fallback failed: ${ocrErr.message}`);
                             }
                         }
 
@@ -629,6 +651,130 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
                         contentParts.push({
                             type: 'text',
                             text: `[PDF: ${att.name} — failed to process: ${e.message}]`
+                        });
+                    }
+                } else if (att.content && (att.type?.includes('wordprocessingml') || att.name?.toLowerCase().endsWith('.docx'))) {
+                    // DOCX — Azure Document Intelligence (when enabled) → mammoth fallback
+                    try {
+                        const base64Data = att.content.split(',')[1] || att.content;
+                        const docxBuffer = Buffer.from(base64Data, 'base64');
+                        let docxText = '';
+
+                        // 1. Try Azure Document Intelligence first (highest quality — Markdown with tables/headings)
+                        const useAzureDoc = !!(await configStore.getConfig('use_azure_doc_processing'));
+                        if (useAzureDoc) {
+                            try {
+                                const { extractWithAzure, isAzureDocIntelligenceConfigured } = require('../../core/azureDocIntelligence');
+                                if (await isAzureDocIntelligenceConfigured()) {
+                                    docxText = await extractWithAzure(docxBuffer, att.name);
+                                    if (docxText) {
+                                        console.log(`[DirectChat] DOCX extracted via Azure Document Intelligence: ${att.name} (${docxText.length} chars)`);
+                                    }
+                                }
+                            } catch (azureErr) {
+                                console.warn(`[DirectChat] Azure Document Intelligence failed for DOCX ${att.name}:`, azureErr.message);
+                            }
+                        }
+
+                        // 2. Fallback to mammoth (basic plain text extraction)
+                        if (!docxText) {
+                            const { parseDocument } = require('../../core/documentParser');
+                            docxText = await parseDocument(docxBuffer, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', att.name);
+                        }
+
+                        // Upload original to RustFS for persistence
+                        let docxProxyUrl = null;
+                        try {
+                            if (storageStore.isAvailable()) {
+                                const filename = `upload_${Date.now()}_${crypto.randomBytes(4).toString('hex')}_${att.name.replace(/[^a-zA-Z0-9.\-_]/g, '_')}`;
+                                const key = storageStore.buildKey(userId, 'uploads', filename);
+                                await storageStore.uploadFile(key, docxBuffer, att.type || 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+                                docxProxyUrl = storageStore.buildProxyUrl(key);
+                                console.log(`[DirectChat] Uploaded DOCX to RustFS: ${key}`);
+                            }
+                        } catch (e) {
+                            console.warn(`[DirectChat] Failed to upload DOCX to RustFS: ${e.message}`);
+                        }
+
+                        if (docxText && !docxText.startsWith('[Document:')) {
+                            const docText = `[Word Document: ${att.name}]\n---\n${docxText}\n---`;
+                            contentParts.push({ type: 'text', text: docText });
+                            persistedAttachments.push({ name: att.name, type: att.type, url: docxProxyUrl, extractedText: docText });
+                            console.log(`[DirectChat] Extracted ${docxText.length} chars from DOCX: ${att.name}`);
+                        } else {
+                            // mammoth extraction returned empty/error — fall back to container
+                            contentParts.push({ type: 'text', text: `[Word Document: ${att.name} — no extractable text, may contain only images]` });
+                            persistedAttachments.push({ name: att.name, type: att.type, url: docxProxyUrl });
+                        }
+                    } catch (e) {
+                        console.error(`[DirectChat] DOCX processing failed for ${att.name}:`, e.message);
+                        contentParts.push({
+                            type: 'text',
+                            text: `[DOCX: ${att.name} — failed to process: ${e.message}]`
+                        });
+                    }
+                } else if (att.content && (
+                    att.type?.includes('spreadsheetml') || att.type?.includes('ms-excel') ||
+                    att.type === 'text/csv' || att.type === 'application/csv' ||
+                    att.name?.toLowerCase().endsWith('.xlsx') || att.name?.toLowerCase().endsWith('.xls') ||
+                    att.name?.toLowerCase().endsWith('.csv')
+                )) {
+                    // Spreadsheet — Azure Document Intelligence (when enabled) → XLSX library fallback
+                    try {
+                        const base64Data = att.content.split(',')[1] || att.content;
+                        const spreadsheetBuffer = Buffer.from(base64Data, 'base64');
+                        let sheetText = '';
+
+                        // 1. Try Azure Document Intelligence first (when enabled)
+                        const useAzureDoc = !!(await configStore.getConfig('use_azure_doc_processing'));
+                        if (useAzureDoc) {
+                            try {
+                                const { extractWithAzure, isAzureDocIntelligenceConfigured } = require('../../core/azureDocIntelligence');
+                                if (await isAzureDocIntelligenceConfigured()) {
+                                    sheetText = await extractWithAzure(spreadsheetBuffer, att.name);
+                                    if (sheetText) {
+                                        console.log(`[DirectChat] Spreadsheet extracted via Azure Document Intelligence: ${att.name} (${sheetText.length} chars)`);
+                                    }
+                                }
+                            } catch (azureErr) {
+                                console.warn(`[DirectChat] Azure Document Intelligence failed for spreadsheet ${att.name}:`, azureErr.message);
+                            }
+                        }
+
+                        // 2. Fallback to local XLSX parser
+                        if (!sheetText) {
+                            const { parseDocument } = require('../../core/documentParser');
+                            sheetText = await parseDocument(spreadsheetBuffer, att.type || 'application/octet-stream', att.name);
+                        }
+
+                        // Upload original to RustFS for persistence
+                        let sheetProxyUrl = null;
+                        try {
+                            if (storageStore.isAvailable()) {
+                                const filename = `upload_${Date.now()}_${crypto.randomBytes(4).toString('hex')}_${att.name.replace(/[^a-zA-Z0-9.\-_]/g, '_')}`;
+                                const key = storageStore.buildKey(userId, 'uploads', filename);
+                                await storageStore.uploadFile(key, spreadsheetBuffer, att.type || 'application/octet-stream');
+                                sheetProxyUrl = storageStore.buildProxyUrl(key);
+                                console.log(`[DirectChat] Uploaded spreadsheet to RustFS: ${key}`);
+                            }
+                        } catch (e) {
+                            console.warn(`[DirectChat] Failed to upload spreadsheet to RustFS: ${e.message}`);
+                        }
+
+                        if (sheetText && !sheetText.startsWith('[Spreadsheet:')) {
+                            const docText = `[Spreadsheet: ${att.name}]\n---\n${sheetText}\n---`;
+                            contentParts.push({ type: 'text', text: docText });
+                            persistedAttachments.push({ name: att.name, type: att.type, url: sheetProxyUrl, extractedText: docText });
+                            console.log(`[DirectChat] Extracted ${sheetText.length} chars from spreadsheet: ${att.name}`);
+                        } else {
+                            contentParts.push({ type: 'text', text: sheetText || `[Spreadsheet: ${att.name} — no data found]` });
+                            persistedAttachments.push({ name: att.name, type: att.type, url: sheetProxyUrl });
+                        }
+                    } catch (e) {
+                        console.error(`[DirectChat] Spreadsheet processing failed for ${att.name}:`, e.message);
+                        contentParts.push({
+                            type: 'text',
+                            text: `[Spreadsheet: ${att.name} — failed to process: ${e.message}]`
                         });
                     }
                 } else if (att.content) {
@@ -759,7 +905,8 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
         let piiTokenMap = null;  // non-null only in tokenize mode when PII found
         try {
             const { validateInputForPii } = require('../../core/azurePiiDetection');
-            const piiResult = await validateInputForPii(messages.slice(-3), false);
+            const orgPiiEnabled = !!(orgShield?.enabled && orgShield?.azurePiiEnabled);
+            const piiResult = await validateInputForPii(messages.slice(-3), orgPiiEnabled);
 
             if (piiResult && piiResult.tokenizedText) {
                 // Tokenize mode: replace last user message with tokenized version

@@ -12,7 +12,7 @@ const multer = require('multer');
 const router = express.Router();
 
 const userStore = require('../stores/userStore');
-const { loadConfig, saveConfig, requireAuth, requireAdmin, SYSTEM_PERMISSIONS } = require('./permissions');
+const { loadConfig, saveConfig, requireAuth, requireAdmin, getUserPermissions, SYSTEM_PERMISSIONS } = require('./permissions');
 const { rewrapUserDEKCompat, adminResetUser, getOrCreateUserDEKCompat } = require('./encryption');
 const { checkResourceLimits } = require('../core/limits');
 
@@ -220,6 +220,7 @@ router.post('/users', requireOrgAdminForUser, async (req, res) => {
     };
 
     if (await userStore.createUser(newUser)) {
+        console.log(`[Audit] ${req.session.user?.id || 'system'} created user '${username}' in org '${organizationId || 'none'}' with orgRole '${orgRole || 'none'}'`);
         res.json({ success: true, user: { id: newUser.id, username, displayName, role } });
     } else {
         res.status(400).json({ error: 'User already exists' });
@@ -260,6 +261,8 @@ router.put('/users/:id', requireOrgAdminForUser, async (req, res) => {
     }
 
     if (await userStore.updateUser(id, updates)) {
+        const changedFields = Object.keys(updates).filter(k => updates[k] !== undefined);
+        console.log(`[Audit] ${req.session.user?.id || 'system'} updated user '${id}' — fields: ${changedFields.join(', ')}`);
         res.json({ success: true });
     } else {
         res.status(404).json({ error: 'User not found' });
@@ -274,6 +277,7 @@ router.delete('/users/:id', requireOrgAdminForUser, async (req, res) => {
     }
 
     if (await userStore.deleteUser(id)) {
+        console.log(`[Audit] ${req.session.user?.id || 'system'} deleted user '${id}'`);
         res.json({ success: true });
     } else {
         res.status(404).json({ error: 'User not found' });
@@ -419,6 +423,7 @@ router.post('/organizations', requireAdmin, async (req, res) => {
     const newOrg = { id, name, description: description || '', tagline, address, email, phone, website, kvk, vat, logo, footerText, defaultGroups: defaultGroups || [], allowSignup: !!allowSignup, enabledIntegrations: defaultIntegrations };
 
     if (await userStore.createOrganization(newOrg)) {
+        console.log(`[Audit] ${req.session.user?.id || 'system'} created organization '${name}' (${id})`);
         res.json({ success: true, organization: newOrg });
     } else {
         res.status(400).json({ error: 'Organization already exists' });
@@ -447,6 +452,7 @@ router.put('/organizations/:id', requireOrgAdmin('id'), async (req, res) => {
 router.delete('/organizations/:id', requireAdmin, async (req, res) => {
     const { id } = req.params;
     if (await userStore.deleteOrganization(id)) {
+        console.log(`[Audit] ${req.session.user?.id || 'system'} deleted organization '${id}'`);
         res.json({ success: true });
     } else {
         res.status(404).json({ error: 'Organization not found' });
@@ -531,16 +537,35 @@ router.post('/groups', requireAuth, async (req, res) => {
         return res.status(400).json({ error: 'Group name required' });
     }
 
+    // Require org_admin or manage_users permission to create groups
+    const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
+    const userId = req.session.user?.id;
+    if (!isSuperAdmin) {
+        const perms = await getUserPermissions(userId, req.session);
+        if (!perms.includes('all') && !perms.includes('org_admin') && !perms.includes('manage_users')) {
+            return res.status(403).json({ error: 'Organisation admin access required to manage groups' });
+        }
+    }
+
     // For non-super-admins, force the group into their org
     let orgId = organizationId || null;
-    const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
     if (!isSuperAdmin) {
-        const userId = req.session.user?.id;
         const currentUser = await userStore.getUser(userId);
         if (!currentUser?.organizationId) {
             return res.status(403).json({ error: 'You must belong to an organisation to create groups' });
         }
         orgId = currentUser.organizationId;
+
+        // Validate permissions — users can only grant permissions they possess
+        if (permissions && permissions.length > 0) {
+            const userPerms = await getUserPermissions(userId, req.session);
+            if (!userPerms.includes('all')) {
+                const unauthorized = permissions.filter(p => !userPerms.includes(p));
+                if (unauthorized.length > 0) {
+                    return res.status(403).json({ error: `Cannot assign permissions you don't have: ${unauthorized.join(', ')}` });
+                }
+            }
+        }
     }
 
     const id = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
@@ -555,6 +580,7 @@ router.post('/groups', requireAuth, async (req, res) => {
     };
 
     if (await userStore.createGroup(newGroup)) {
+        console.log(`[Audit] ${userId || 'system'} created group '${name}' (${id}) in org '${orgId || 'global'}'`);
         res.json({ success: true, group: newGroup });
     } else {
         res.status(400).json({ error: 'Group already exists' });
@@ -565,20 +591,37 @@ router.put('/groups/:id', requireAuth, async (req, res) => {
     const { id } = req.params;
     const { description, permissions, roles, organizationId, allowedAgentTypes } = req.body;
 
-    // Non-super-admins can only edit groups in their org
+    // Require org_admin or manage_users permission to edit groups
     const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
+    const userId = req.session.user?.id;
     if (!isSuperAdmin) {
-        const userId = req.session.user?.id;
+        const perms = await getUserPermissions(userId, req.session);
+        if (!perms.includes('all') && !perms.includes('org_admin') && !perms.includes('manage_users')) {
+            return res.status(403).json({ error: 'Organisation admin access required to manage groups' });
+        }
+
         const currentUser = await userStore.getUser(userId);
         const allGroups = await userStore.getAllGroups();
         const group = allGroups.find(g => g.id === id);
         if (!group || !currentUser?.organizationId || group.organizationId !== currentUser.organizationId) {
             return res.status(403).json({ error: 'You can only edit groups in your organisation' });
         }
+
+        // Validate permissions — users can only grant permissions they possess
+        if (permissions && permissions.length > 0) {
+            const userPerms = await getUserPermissions(userId, req.session);
+            if (!userPerms.includes('all')) {
+                const unauthorized = permissions.filter(p => !userPerms.includes(p));
+                if (unauthorized.length > 0) {
+                    return res.status(403).json({ error: `Cannot assign permissions you don't have: ${unauthorized.join(', ')}` });
+                }
+            }
+        }
     }
 
     const updates = { description, permissions, roles };
-    if (organizationId !== undefined) {
+    // Only super admins can reassign a group to a different org
+    if (organizationId !== undefined && isSuperAdmin) {
         updates.organizationId = organizationId;
     }
     if (allowedAgentTypes !== undefined) {
@@ -586,6 +629,7 @@ router.put('/groups/:id', requireAuth, async (req, res) => {
     }
 
     if (await userStore.updateGroup(id, updates)) {
+        console.log(`[Audit] ${userId || 'system'} updated group '${id}' — fields: ${Object.keys(updates).filter(k => updates[k] !== undefined).join(', ')}`);
         res.json({ success: true });
     } else {
         res.status(404).json({ error: 'Group not found' });
@@ -598,10 +642,15 @@ router.delete('/groups/:id', requireAuth, async (req, res) => {
         return res.status(400).json({ error: 'Cannot delete system groups' });
     }
 
-    // Non-super-admins can only delete groups in their org
+    // Require org_admin or manage_users permission to delete groups
     const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
+    const userId = req.session.user?.id;
     if (!isSuperAdmin) {
-        const userId = req.session.user?.id;
+        const perms = await getUserPermissions(userId, req.session);
+        if (!perms.includes('all') && !perms.includes('org_admin') && !perms.includes('manage_users')) {
+            return res.status(403).json({ error: 'Organisation admin access required to manage groups' });
+        }
+
         const currentUser = await userStore.getUser(userId);
         const allGroups = await userStore.getAllGroups();
         const group = allGroups.find(g => g.id === id);
@@ -611,6 +660,7 @@ router.delete('/groups/:id', requireAuth, async (req, res) => {
     }
 
     if (await userStore.deleteGroup(id)) {
+        console.log(`[Audit] ${userId || 'system'} deleted group '${id}'`);
         res.json({ success: true });
     } else {
         res.status(404).json({ error: 'Group not found' });
@@ -641,6 +691,7 @@ router.post('/roles', requireAdmin, async (req, res) => {
     };
 
     if (await userStore.createRole(newRole)) {
+        console.log(`[Audit] ${req.session.user?.id || 'system'} created role '${name}' (${id})`);
         res.json({ success: true, role: newRole });
     } else {
         res.status(400).json({ error: 'Role already exists' });
@@ -665,6 +716,7 @@ router.delete('/roles/:id', requireAdmin, async (req, res) => {
     }
 
     if (await userStore.deleteRole(id)) {
+        console.log(`[Audit] ${req.session.user?.id || 'system'} deleted role '${id}'`);
         res.json({ success: true });
     } else {
         res.status(404).json({ error: 'Role not found' });

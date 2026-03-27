@@ -207,8 +207,9 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
         addTools(REGEX_GENERATOR_TOOLS);
     }
 
-    // Workspace — always available (no external credentials needed)
-    if (isAppOn('workspace')) {
+    // Workspace/Notebook — check feature flag (disabled from admin panel = no tools)
+    const notebooksFeatureEnabled = (await configStore.getConfig('feature_notebooks_enabled')) !== false;
+    if (notebooksFeatureEnabled && isAppOn('workspace')) {
         addTools(WORKSPACE_TOOLS);
     }
 
@@ -291,7 +292,7 @@ async function buildToolHint(tools, userId = null) {
     if (tools.some(t => t.function.name === 'generate_music')) integrations.push('Music generation (instrumental AI music via Lyria)');
     if (tools.some(t => t.function.name === 'generate_video')) integrations.push('Video generation (short AI video clips via Veo 3.1 — takes 1-3 minutes)');
     if (tools.some(t => t.function.name === 'agent_search')) integrations.push('Agent Search (AI-powered web search with reranking)');
-    if (tools.some(t => t.function.name.startsWith('workspace_'))) integrations.push('Workspace (read and write a persistent document alongside the conversation)');
+    if (tools.some(t => t.function.name.startsWith('workspace_') || t.function.name.startsWith('notebook_'))) integrations.push('Notebook (read and write a persistent rich-text document alongside the conversation)');
     if (tools.some(t => t.function.name === 'kb_search')) integrations.push('Knowledge Base Search (search internal knowledge base with custom queries — use this after reading emails or documents to find relevant internal information)');
     if (tools.some(t => t.function.name.startsWith('maps_'))) integrations.push('Google Maps (get directions between locations with route maps, search for places/businesses — IMPORTANT: after getting results, always output the map as a ```map-embed code block containing JSON with embedUrl, title, and mapsLink fields so it renders as an interactive map in the chat)');
     if (tools.some(t => t.function.name.startsWith('linkedin_'))) integrations.push('LinkedIn (create posts — user approves before publishing)');

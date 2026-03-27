@@ -38,7 +38,7 @@ router.get('/config', async (req, res) => {
         hasGoogleVertexServiceAccountKey: !!(await configStore.getSecret('google_vertex_service_account_key')),
         hasAzureEndpoint: !!(await configStore.getConfig('azure_endpoint')),
         hasAzureApiKey: !!(await configStore.getSecret('azure_api_key')),
-        azureApiVersion: await configStore.getConfig('azure_api_version') || '2024-04-01-preview',
+        azureApiVersion: await configStore.getConfig('azure_api_version') || '2025-04-01-preview',
         azureModels: await configStore.getConfig('azure_models') || '',
         hasFirefliesKey: !!(req.session?.user?.id && (await configStore.getSecret(`fireflies_api_key_user_${req.session.user.id}`))),
         hasAgentSearchUrl: !!process.env.SEARCH_SERVICE_URL || !!(await configStore.getConfig('agent_search_url')),
@@ -84,11 +84,23 @@ router.get('/config', async (req, res) => {
         hasServiceEmail: !!(await configStore.getConfig('service_email_address')) && !!(await configStore.getSecret('service_email_password')),
         serviceEmailAddress: await configStore.getConfig('service_email_address') || '',
         serviceEmailDisplayName: await configStore.getConfig('service_email_display_name') || '',
+        // Feature flags (runtime-togglable)
+        notebooksEnabled: await (async () => {
+            const val = await configStore.getConfig('feature_notebooks_enabled');
+            return val !== false && val !== 'false';
+        })(),
+        projectsEnabled: await (async () => {
+            const val = await configStore.getConfig('feature_projects_enabled');
+            return val !== false && val !== 'false';
+        })(),
     });
 });
 
-router.post('/config', async (req, res) => {
-    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, minimaxApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, llamaGuardConfig, moderationProvider, azureContentSafetyEndpoint, azureContentSafetyKey, azureContentSafetySeverityThreshold, azureContentSafetyCategories, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionScope, piiDetectionAction, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing, serviceEmailAddress, serviceEmailPassword, serviceEmailDisplayName, azureSpeechKey, azureSpeechRegion, transcriptionProvider } = req.body;
+router.post('/config', requireAuth, async (req, res) => {
+    if (!req.session.isAdmin) {
+        return res.status(403).json({ error: 'Admin access required' });
+    }
+    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, minimaxApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, llamaGuardConfig, moderationProvider, azureContentSafetyEndpoint, azureContentSafetyKey, azureContentSafetySeverityThreshold, azureContentSafetyCategories, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionScope, piiDetectionAction, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing, serviceEmailAddress, serviceEmailPassword, serviceEmailDisplayName, azureSpeechKey, azureSpeechRegion, transcriptionProvider, notebooksEnabled, projectsEnabled } = req.body;
     const existing = await getAIConfig();
 
     if (allowedModelsByAgentType !== undefined) {
@@ -193,6 +205,13 @@ router.post('/config', async (req, res) => {
     }
     if (serviceEmailDisplayName !== undefined) {
         await configStore.setConfig('service_email_display_name', serviceEmailDisplayName || '');
+    }
+    // Feature flags (runtime-togglable)
+    if (notebooksEnabled !== undefined) {
+        await configStore.setConfig('feature_notebooks_enabled', notebooksEnabled ? true : false);
+    }
+    if (projectsEnabled !== undefined) {
+        await configStore.setConfig('feature_projects_enabled', projectsEnabled ? true : false);
     }
 
     const success = await saveAIConfig({

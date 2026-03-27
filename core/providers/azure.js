@@ -9,16 +9,20 @@
  * Authentication (per Azure AI Foundry docs):
  *   - endpoint: Azure OpenAI resource URL (e.g. https://resource.cognitiveservices.azure.com/)
  *   - apiKey: Azure API key
- *   - apiVersion: API version (e.g. 2024-04-01-preview)
+ *   - apiVersion: API version (e.g. 2025-04-01-preview)
  *   - deployment: The deployment name (same as model name for Azure)
  *
- * IMPORTANT:
- *   - Azure AI Foundry does NOT support the Responses API (client.responses.create)
- *   - Only client.chat.completions.create is supported
- *   - The deployment parameter must be passed to the AzureOpenAI constructor
+ * Responses API support:
+ *   - Azure v1 API (GA August 2025) supports client.responses.create
+ *   - Requires apiVersion >= 2025-03-01-preview
+ *   - Enables reasoning summaries ("thinking" bubbles) for GPT-5/o-series
+ *   - Falls back to Chat Completions for older API versions
  */
 
 const OpenAIProvider = require('./openai');
+
+// API versions that support the Responses API
+const RESPONSES_API_MIN_VERSION = '2025-03-01';
 
 class AzureProvider extends OpenAIProvider {
     constructor() {
@@ -26,11 +30,21 @@ class AzureProvider extends OpenAIProvider {
         this.name = 'azure';
     }
 
-    // ─── Azure NEVER uses Responses API ─────────────────────────────
-    // Azure AI Foundry only supports Chat Completions API.
-    // Override parent to always return false.
+    // ─── Responses API: enabled for new API versions ────────────────
+    // Azure v1 API (2025+) supports Responses API with reasoning summaries.
+    // Older versions (2024-*) only support Chat Completions.
     shouldUseResponsesApi(model, options = {}) {
-        return false;
+        // First check if the model supports reasoning at all
+        if (!this.supportsReasoning(model)) return false;
+        if (options.reasoningEffort === 'none') return false;
+
+        // Check API version — only use Responses API with 2025+ versions
+        const apiVersion = options.apiVersion || '';
+        if (!apiVersion) return false;
+
+        // Extract the date portion (e.g. "2025-04-01" from "2025-04-01-preview")
+        const versionDate = apiVersion.substring(0, 10);
+        return versionDate >= RESPONSES_API_MIN_VERSION;
     }
 
     // ─── SDK Client (Azure mode) ─────────────────────────────────
@@ -50,7 +64,7 @@ class AzureProvider extends OpenAIProvider {
 
         // endpoint comes from the provider URL field
         const endpoint = options.endpoint || process.env.AZURE_OPENAI_ENDPOINT;
-        const apiVersion = options.apiVersion || process.env.AZURE_OPENAI_API_VERSION || '2024-04-01-preview';
+        const apiVersion = options.apiVersion || process.env.AZURE_OPENAI_API_VERSION || '2025-04-01-preview';
         const deployment = options.deployment || undefined;
 
         if (!endpoint) {
@@ -77,7 +91,11 @@ class AzureProvider extends OpenAIProvider {
             deployment: model,
         });
 
-        // Azure only supports Chat Completions API
+        // Choose API based on model capability and API version
+        if (this.shouldUseResponsesApi(model, options)) {
+            console.log('[Azure] Using Responses API for model:', model);
+            return this._chatResponses(client, model, messages, options);
+        }
         return this._chatCompletions(client, model, messages, options);
     }
 
@@ -88,7 +106,11 @@ class AzureProvider extends OpenAIProvider {
             deployment: model,
         });
 
-        // Azure only supports Chat Completions API
+        // Choose API based on model capability and API version
+        if (this.shouldUseResponsesApi(model, options)) {
+            console.log('[Azure] Using Responses API streaming for model:', model);
+            return this._streamResponses(client, model, messages, options, onEvent);
+        }
         return this._streamCompletions(client, model, messages, options, onEvent);
     }
 

@@ -315,9 +315,40 @@ async function ingestDocument(tenantId, kbId, content, title, sourceType, source
         tenantId, kbId, title, sourceType, sourceUri, hash
     );
 
-    // Send to search-service for chunking + embedding
+    // Send for chunking + embedding
     const azureParams = await getAzureIngestParams();
-    console.log(`[KBHelpers] Embedding: ${azureParams.use_azure ? 'Azure OpenAI (text-embedding-3-small)' : 'Local vLLM (bge-m3)'}`);
+
+    if (azureParams.use_azure) {
+        // ── Local ingestion path (Azure) ─────────────────────────────
+        // When Azure Document Processing is enabled, chunk + embed locally
+        // using Azure OpenAI — bypasses the external search-service.
+        console.log(`[KBHelpers] Embedding: Azure OpenAI (local path)`);
+        console.log(`[KBHelpers] Chunking + embedding ${content.length} chars locally`);
+
+        try {
+            const { ingestLocally } = require('./localKBIngest');
+            const result = await ingestLocally(tenantId, kbId, doc.id, content, {
+                title,
+                sourceUri,
+                lang,
+            });
+            await kbStore.updateChunkCount(doc.id, result.chunks_created || 0);
+            await kbStore.bumpKBVersion(kbId);
+
+            return {
+                document: doc,
+                chunks: result.chunks_created || 0,
+            };
+        } catch (localErr) {
+            console.error('[KBHelpers] Local ingestion failed:', localErr.message);
+            // Cleanup the document record on failure
+            await kbStore.deleteDocument(doc.id);
+            throw new Error(`Local ingestion failed: ${localErr.message}`);
+        }
+    }
+
+    // ── Search-service path (non-Azure) ──────────────────────────
+    console.log(`[KBHelpers] Embedding: Local vLLM (bge-m3) via search-service`);
     console.log(`[KBHelpers] Sending ${content.length} chars to search-service`);
 
     const ingestRes = await fetch(`${SEARCH_SERVICE_URL}/kb/ingest/json`, {
@@ -362,6 +393,13 @@ async function ingestDocument(tenantId, kbId, content, title, sourceType, source
  * @param {string} tenantId — user ID
  */
 async function deleteDocumentChunks(kbId, docId, tenantId) {
+    // Clean up local kb_chunks (for Azure-path ingested docs)
+    try {
+        const { deleteChunksLocally } = require('./localKBIngest');
+        await deleteChunksLocally(tenantId, kbId, docId);
+    } catch (_) { /* table may not exist yet — that's fine */ }
+
+    // Also clean up via search-service (for search-service-path ingested docs)
     try {
         await fetch(`${SEARCH_SERVICE_URL}/kb/${kbId}/documents/${docId}/chunks`, {
             method: 'DELETE',
