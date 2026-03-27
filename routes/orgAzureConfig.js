@@ -12,6 +12,7 @@ const configStore = require('../stores/configStore');
 const userStore = require('../stores/userStore');
 const { resolveUserOrgIds } = require('../auth');
 const { loadConfig, saveConfig } = require('../auth/permissions');
+const { syncAzureGroupsToOrg, getSyncSettings, setSyncSettings, getSyncStatus } = require('../integrations/azureGroupSync');
 
 function requireAuth(req, res, next) {
     if (req.session && req.session.user) return next();
@@ -161,6 +162,10 @@ router.get('/:orgId', requireAuth, async (req, res) => {
             ssoClientSecretMasked: maskSecret(msProvider.clientSecret),
             ssoTenantId: msProvider.tenantId || 'common',
             autoApproveSSO: org?.autoApproveSSO || false,
+
+            // Group Sync settings & status
+            groupSyncSettings: await getSyncSettings(orgId),
+            groupSyncStatus: await getSyncStatus(orgId),
         });
     } catch (e) {
         console.error('[OrgAzureConfig] GET error:', e);
@@ -281,6 +286,74 @@ router.put('/:orgId', requireAuth, async (req, res) => {
         res.json({ ok: true });
     } catch (e) {
         console.error('[OrgAzureConfig] PUT error:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════
+// ── Azure AD Group Sync Endpoints ─────────────────────────
+// ═══════════════════════════════════════════════════════════
+
+// POST /:orgId/sync-groups — trigger a sync
+router.post('/:orgId/sync-groups', requireAuth, async (req, res) => {
+    try {
+        const { orgId } = req.params;
+        const admin = await isOrgAdmin(req, orgId);
+        if (!admin) {
+            return res.status(403).json({ error: 'Only organization admins can trigger group sync' });
+        }
+
+        console.log(`[AzureGroupSync] Sync triggered for org ${orgId} by ${req.session.user.id}`);
+        const result = await syncAzureGroupsToOrg(orgId);
+        res.json(result);
+    } catch (e) {
+        console.error('[AzureGroupSync] Sync endpoint error:', e);
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
+// GET /:orgId/sync-groups/status — get last sync status
+router.get('/:orgId/sync-groups/status', requireAuth, async (req, res) => {
+    try {
+        const { orgId } = req.params;
+        const admin = await isOrgAdmin(req, orgId);
+        if (!admin) {
+            return res.status(403).json({ error: 'Only organization admins can view sync status' });
+        }
+
+        const status = await getSyncStatus(orgId);
+        const settings = await getSyncSettings(orgId);
+        res.json({ status, settings });
+    } catch (e) {
+        console.error('[AzureGroupSync] Status endpoint error:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// PUT /:orgId/sync-groups/settings — update sync settings
+router.put('/:orgId/sync-groups/settings', requireAuth, async (req, res) => {
+    try {
+        const { orgId } = req.params;
+        const admin = await isOrgAdmin(req, orgId);
+        if (!admin) {
+            return res.status(403).json({ error: 'Only organization admins can manage sync settings' });
+        }
+
+        const { destructiveSync, autoActivateUsers, periodicSync, syncIntervalHours } = req.body;
+        const updates = {};
+        if (destructiveSync !== undefined) updates.destructiveSync = !!destructiveSync;
+        if (autoActivateUsers !== undefined) updates.autoActivateUsers = !!autoActivateUsers;
+        if (periodicSync !== undefined) updates.periodicSync = !!periodicSync;
+        if (syncIntervalHours !== undefined) {
+            const hours = parseInt(syncIntervalHours, 10);
+            if (hours >= 1 && hours <= 168) updates.syncIntervalHours = hours;
+        }
+
+        const settings = await setSyncSettings(orgId, updates);
+        console.log(`[AzureGroupSync] Settings updated for org ${orgId} by ${req.session.user.id}:`, updates);
+        res.json({ ok: true, settings });
+    } catch (e) {
+        console.error('[AzureGroupSync] Settings endpoint error:', e);
         res.status(500).json({ error: e.message });
     }
 });
