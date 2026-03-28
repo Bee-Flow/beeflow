@@ -383,6 +383,10 @@ router.get('/user', async (req, res) => {
                 const configStore = require('../stores/configStore');
                 const notebooksEnabled = await configStore.getConfig('feature_notebooks_enabled');
                 const projectsEnabled = await configStore.getConfig('feature_projects_enabled');
+                const askAiEnabled = await configStore.getConfig('feature_ask_ai_enabled');
+                const exportEnabled = await configStore.getConfig('feature_export_enabled');
+                const openInNotebookEnabled = await configStore.getConfig('feature_open_in_notebook_enabled');
+                const notebooksMenuEnabled = await configStore.getConfig('feature_notebooks_menu_enabled');
                 return {
                     tasks: process.env.ENABLE_TASKS !== 'false',
                     monitoring: process.env.ENABLE_MONITORING !== 'false',
@@ -390,6 +394,10 @@ router.get('/user', async (req, res) => {
                     templates: process.env.ENABLE_TEMPLATES !== 'false',
                     notebooks: notebooksEnabled !== false && notebooksEnabled !== 'false',
                     projects: projectsEnabled !== false && projectsEnabled !== 'false',
+                    askAi: askAiEnabled !== false && askAiEnabled !== 'false',
+                    export: exportEnabled !== false && exportEnabled !== 'false',
+                    openInNotebook: openInNotebookEnabled !== false && openInNotebookEnabled !== 'false',
+                    notebooksMenu: notebooksMenuEnabled !== false && notebooksMenuEnabled !== 'false',
                     deploymentMode: process.env.DEPLOYMENT_MODE || 'cloud',
                 };
             })(),

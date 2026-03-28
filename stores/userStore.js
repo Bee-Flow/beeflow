@@ -129,6 +129,7 @@ async function initDB() {
     try { await exec(`ALTER TABLE groups ADD COLUMN IF NOT EXISTS "azureGroupId" TEXT`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE groups ADD COLUMN IF NOT EXISTS "source" TEXT DEFAULT 'manual'`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE groups ADD COLUMN IF NOT EXISTS "lastSyncedAt" TEXT`); } catch (e) { /* column already exists */ }
+    try { await exec(`ALTER TABLE groups ADD COLUMN IF NOT EXISTS "orgRole" TEXT DEFAULT ''`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS "azureUserId" TEXT`); } catch (e) { /* column already exists */ }
 
     initialized = true;
@@ -483,7 +484,7 @@ async function updateGroup(groupId, updates) {
     await initDB();
     const ex = await getOne('SELECT id FROM groups WHERE id = $1', [groupId]);
     if (!ex) return false;
-    const colMap = { name: 'name', description: 'description', azureGroupId: 'azureGroupId', source: 'source', lastSyncedAt: 'lastSyncedAt' };
+    const colMap = { name: 'name', description: 'description', azureGroupId: 'azureGroupId', source: 'source', lastSyncedAt: 'lastSyncedAt', orgRole: 'orgRole' };
     const updateMap = {};
     for (const [k, v] of Object.entries(colMap)) { if (updates[k] !== undefined) updateMap[k] = updates[k]; }
     if (updates.organizationId !== undefined) updateMap.organizationId = updates.organizationId;

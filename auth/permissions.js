@@ -228,9 +228,20 @@ async function getUserPermissions(userId, session = null) {
             ],
         };
 
+        // Apply user's direct orgRole
         if (user.orgRole && ORG_ROLE_PERMISSIONS[user.orgRole]) {
             for (const p of ORG_ROLE_PERMISSIONS[user.orgRole]) {
                 permSet.add(p);
+            }
+        }
+
+        // Apply group-level orgRoles (a group can grant a role to all its members)
+        for (const gid of groupIds) {
+            const group = allGroups.find(g => g.id === gid);
+            if (group?.orgRole && ORG_ROLE_PERMISSIONS[group.orgRole]) {
+                for (const p of ORG_ROLE_PERMISSIONS[group.orgRole]) {
+                    permSet.add(p);
+                }
             }
         }
 

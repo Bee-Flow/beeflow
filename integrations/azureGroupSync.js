@@ -100,18 +100,45 @@ async function graphGetAll(path, token) {
 }
 
 /**
- * Get groups assigned to the enterprise app via the service principal.
- * Uses: GET /servicePrincipals(appId='{clientId}')/appRoleAssignedTo
- * Filters for principalType === 'Group'
+ * Get the service principal's Object ID from the Application (Client) ID.
+ * The Enterprise App has its own Object ID that differs from the App Registration's Client ID.
  */
-async function getAssignedGroups(token, clientId) {
+async function getServicePrincipalId(token, clientId) {
+    const data = await graphGet(
+        `/servicePrincipals?$filter=appId eq '${clientId}'&$select=id,appId,displayName`,
+        token
+    );
+    
+    if (!data.value || data.value.length === 0) {
+        throw new Error(`No service principal found for appId ${clientId}. Ensure the Enterprise App exists in your tenant.`);
+    }
+
+    const sp = data.value[0];
+    console.log(`[AzureGroupSync] Resolved service principal: "${sp.displayName}" (objectId=${sp.id}, appId=${sp.appId})`);
+    return sp.id;
+}
+
+/**
+ * Get groups and users assigned to the enterprise app via the service principal.
+ * Uses: GET /servicePrincipals/{objectId}/appRoleAssignedTo
+ * Returns all assignments (groups AND directly assigned users).
+ */
+async function getAppRoleAssignments(token, clientId) {
+    // Step 1: Resolve the service principal's Object ID
+    const spObjectId = await getServicePrincipalId(token, clientId);
+
+    // Step 2: Get assignments using the Object ID (not appId shorthand)
     const assignments = await graphGetAll(
-        `/servicePrincipals(appId='${clientId}')/appRoleAssignedTo`,
+        `/servicePrincipals/${spObjectId}/appRoleAssignedTo`,
         token
     );
 
-    // Filter for group assignments only
-    return assignments.filter(a => a.principalType === 'Group');
+    console.log(`[AzureGroupSync] Raw appRoleAssignedTo returned ${assignments.length} assignment(s):`);
+    for (const a of assignments) {
+        console.log(`  - principalType=${a.principalType}, principalDisplayName="${a.principalDisplayName}", principalId=${a.principalId}`);
+    }
+
+    return assignments;
 }
 
 /**
@@ -134,6 +161,13 @@ async function getGroupMembers(token, groupId) {
     return members.filter(m =>
         m['@odata.type'] === '#microsoft.graph.user' || !m['@odata.type']
     );
+}
+
+/**
+ * Get a single user's details by their Azure Object ID
+ */
+async function getUserDetails(token, userId) {
+    return await graphGet(`/users/${userId}?$select=id,displayName,givenName,surname,mail,userPrincipalName`, token);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -218,13 +252,16 @@ async function syncAzureGroupsToOrg(orgId) {
         const token = await getClientCredentialsToken(msProvider.clientId, msProvider.clientSecret, tenantId);
         details.push('✓ Authenticated successfully');
 
-        // 4. Get groups assigned to the enterprise app
-        details.push('Fetching groups assigned to the enterprise app...');
-        const assignedGroups = await getAssignedGroups(token, msProvider.clientId);
-        details.push(`✓ Found ${assignedGroups.length} group(s) assigned to the app`);
+        // 4. Get all assignments (groups + direct users) from the enterprise app
+        details.push('Fetching assignments from the enterprise app...');
+        const allAssignments = await getAppRoleAssignments(token, msProvider.clientId);
 
-        if (assignedGroups.length === 0) {
-            details.push('No groups assigned to the enterprise app — nothing to sync');
+        const groupAssignments = allAssignments.filter(a => a.principalType === 'Group');
+        const directUserAssignments = allAssignments.filter(a => a.principalType === 'User');
+        details.push(`✓ Found ${groupAssignments.length} group(s) and ${directUserAssignments.length} direct user(s) assigned to the app`);
+
+        if (allAssignments.length === 0) {
+            details.push('No groups or users assigned to the enterprise app — nothing to sync');
             const status = {
                 lastSyncAt: new Date().toISOString(),
                 lastSyncResult: 'success',
@@ -241,16 +278,24 @@ async function syncAzureGroupsToOrg(orgId) {
         const azureGroupIds = new Set();
         const azureUserIds = new Set();
 
-        // 5. Process each group
-        for (const assignment of assignedGroups) {
+        // 5. Process each group assignment
+        for (const assignment of groupAssignments) {
             const azureGroupId = assignment.principalId;
             azureGroupIds.add(azureGroupId);
 
             try {
-                // Get group details from Graph API
-                const groupInfo = await getGroupDetails(token, azureGroupId);
-                const groupName = groupInfo.displayName || `Azure Group ${azureGroupId.substring(0, 8)}`;
-                const groupDescription = groupInfo.description || '';
+                // Use the name from the assignment itself (no extra API call needed)
+                let groupName = assignment.principalDisplayName || `Azure Group ${azureGroupId.substring(0, 8)}`;
+                let groupDescription = '';
+
+                // Try to get richer details if we have Group.Read.All permission
+                try {
+                    const groupInfo = await getGroupDetails(token, azureGroupId);
+                    groupName = groupInfo.displayName || groupName;
+                    groupDescription = groupInfo.description || '';
+                } catch (detailErr) {
+                    console.log(`[AzureGroupSync] Could not fetch group details (using assignment name): ${detailErr.message}`);
+                }
 
                 details.push(`Processing group: "${groupName}" (${azureGroupId})`);
 
@@ -304,90 +349,170 @@ async function syncAzureGroupsToOrg(orgId) {
 
                 syncedGroupCount++;
 
-                // 6. Process group members
-                const members = await getGroupMembers(token, azureGroupId);
-                details.push(`  Found ${members.length} member(s) in "${groupName}"`);
+                // 6. Process group members (requires GroupMember.Read.All)
+                try {
+                    const members = await getGroupMembers(token, azureGroupId);
+                    details.push(`  Found ${members.length} member(s) in "${groupName}"`);
 
-                for (const member of members) {
-                    const azureUserId = member.id;
-                    azureUserIds.add(azureUserId);
+                    for (const member of members) {
+                        const azureUserId = member.id;
+                        azureUserIds.add(azureUserId);
 
-                    try {
-                        const email = member.mail || member.userPrincipalName || '';
-                        const displayName = member.displayName || email.split('@')[0] || 'Azure User';
-                        const firstName = member.givenName || '';
-                        const lastName = member.surname || '';
+                        try {
+                            const email = member.mail || member.userPrincipalName || '';
+                            const displayName = member.displayName || email.split('@')[0] || 'Azure User';
+                            const firstName = member.givenName || '';
+                            const lastName = member.surname || '';
 
-                        // Check if user already exists
-                        let beeflowUser = await userStore.getUserByAzureId(azureUserId);
+                            // Check if user already exists
+                            let beeflowUser = await userStore.getUserByAzureId(azureUserId);
 
-                        if (!beeflowUser && email) {
-                            // Also check by email
-                            beeflowUser = await userStore.getUserByEmail(email);
-                        }
-
-                        if (beeflowUser) {
-                            // Update existing user — add to group if not already
-                            let groups = Array.isArray(beeflowUser.groups) ? beeflowUser.groups : [];
-                            try { if (typeof groups === 'string') groups = JSON.parse(groups); } catch (_) { groups = []; }
-
-                            if (beeflowGroup && !groups.includes(beeflowGroup.id)) {
-                                groups.push(beeflowGroup.id);
-                                await userStore.updateUser(beeflowUser.id, {
-                                    groups,
-                                    azureUserId: azureUserId,
-                                });
-                                details.push(`    ↻ Added "${displayName}" to group`);
-                            } else {
-                                // Just ensure azureUserId is set
-                                if (!beeflowUser.azureUserId) {
-                                    await userStore.updateUser(beeflowUser.id, { azureUserId });
-                                }
+                            if (!beeflowUser && email) {
+                                beeflowUser = await userStore.getUserByEmail(email);
                             }
-                        } else if (email) {
-                            // Create new user
-                            const userId = email.split('@')[0].toLowerCase().replace(/[^a-z0-9._-]+/g, '');
-                            const userStatus = settings.autoActivateUsers ? 'active' : 'pending';
 
-                            const newUser = {
-                                id: userId || `azure-${azureUserId.substring(0, 8)}`,
-                                username: userId || email,
-                                displayName,
-                                firstName,
-                                lastName,
-                                email,
-                                role: 'user',
-                                groups: beeflowGroup ? [beeflowGroup.id] : [],
-                                orgRole: '',
-                                organizationId: orgId,
-                                status: userStatus,
-                                azureUserId,
-                                passwordHash: '', // SSO users don't need a password
-                            };
+                            if (beeflowUser) {
+                                let groups = Array.isArray(beeflowUser.groups) ? beeflowUser.groups : [];
+                                try { if (typeof groups === 'string') groups = JSON.parse(groups); } catch (_) { groups = []; }
 
-                            const created = await userStore.createUser(newUser);
-                            if (created) {
-                                details.push(`    + Created user "${displayName}" (${email}) [${userStatus}]`);
-                                syncedUserCount++;
-                            } else {
-                                // User ID conflict — try with suffix
-                                newUser.id = `${userId}-${Date.now().toString(36)}`;
-                                if (await userStore.createUser(newUser)) {
-                                    details.push(`    + Created user "${displayName}" (${email}) as ${newUser.id} [${userStatus}]`);
+                                if (beeflowGroup && !groups.includes(beeflowGroup.id)) {
+                                    groups.push(beeflowGroup.id);
+                                    await userStore.updateUser(beeflowUser.id, {
+                                        groups,
+                                        azureUserId: azureUserId,
+                                    });
+                                    details.push(`    ↻ Added "${displayName}" to group`);
+                                } else {
+                                    if (!beeflowUser.azureUserId) {
+                                        await userStore.updateUser(beeflowUser.id, { azureUserId });
+                                    }
+                                }
+                            } else if (email) {
+                                const userId = email.split('@')[0].toLowerCase().replace(/[^a-z0-9._-]+/g, '');
+                                const userStatus = settings.autoActivateUsers ? 'active' : 'pending';
+
+                                const newUser = {
+                                    id: userId || `azure-${azureUserId.substring(0, 8)}`,
+                                    username: userId || email,
+                                    displayName,
+                                    firstName,
+                                    lastName,
+                                    email,
+                                    role: 'user',
+                                    groups: beeflowGroup ? [beeflowGroup.id] : [],
+                                    orgRole: '',
+                                    organizationId: orgId,
+                                    status: userStatus,
+                                    azureUserId,
+                                    passwordHash: '',
+                                };
+
+                                const created = await userStore.createUser(newUser);
+                                if (created) {
+                                    details.push(`    + Created user "${displayName}" (${email}) [${userStatus}]`);
                                     syncedUserCount++;
                                 } else {
-                                    errors.push(`Failed to create user "${displayName}" — ID conflict`);
+                                    newUser.id = `${userId}-${Date.now().toString(36)}`;
+                                    if (await userStore.createUser(newUser)) {
+                                        details.push(`    + Created user "${displayName}" (${email}) as ${newUser.id} [${userStatus}]`);
+                                        syncedUserCount++;
+                                    } else {
+                                        errors.push(`Failed to create user "${displayName}" — ID conflict`);
+                                    }
                                 }
+                            } else {
+                                errors.push(`Skipped member ${azureUserId} — no email address`);
                             }
-                        } else {
-                            errors.push(`Skipped member ${azureUserId} — no email address`);
+                        } catch (memberErr) {
+                            console.error('[AzureGroupSync] Member error:', memberErr);
+                            errors.push(`Error processing member ${member.id}: ${memberErr.message}`);
                         }
-                    } catch (memberErr) {
-                        errors.push(`Error processing member ${member.id}: ${memberErr.message}`);
                     }
+                } catch (membersErr) {
+                    console.log(`[AzureGroupSync] Could not fetch group members (need GroupMember.Read.All): ${membersErr.message}`);
+                    details.push(`  ⚠ Could not fetch members — grant GroupMember.Read.All permission to sync users`);
                 }
             } catch (groupErr) {
+                console.error('[AzureGroupSync] Group error:', groupErr);
                 errors.push(`Error processing group ${azureGroupId}: ${groupErr.message}`);
+            }
+        }
+
+        // 6b. Process directly-assigned users (not in a group)
+        if (directUserAssignments.length > 0) {
+            details.push(`Processing ${directUserAssignments.length} directly-assigned user(s)...`);
+            for (const assignment of directUserAssignments) {
+                const azureUserId = assignment.principalId;
+                azureUserIds.add(azureUserId);
+
+                try {
+                    // Try to get full user details; fall back to assignment data
+                    let email = '';
+                    let displayName = assignment.principalDisplayName || 'Azure User';
+                    let firstName = '';
+                    let lastName = '';
+
+                    try {
+                        const userInfo = await getUserDetails(token, azureUserId);
+                        email = userInfo.mail || userInfo.userPrincipalName || '';
+                        displayName = userInfo.displayName || displayName;
+                        firstName = userInfo.givenName || '';
+                        lastName = userInfo.surname || '';
+                    } catch (detailErr) {
+                        console.log(`[AzureGroupSync] Could not fetch user details for "${displayName}" (need User.Read.All): ${detailErr.message}`);
+                        details.push(`  ⚠ Could not fetch details for "${displayName}" — grant User.Read.All to sync user email/info`);
+                        continue; // Can't create user without email
+                    }
+
+                    // Check if user already exists in BeeFlow
+                    let beeflowUser = await userStore.getUserByAzureId(azureUserId);
+                    if (!beeflowUser && email) {
+                        beeflowUser = await userStore.getUserByEmail(email);
+                    }
+
+                    if (beeflowUser) {
+                        if (!beeflowUser.azureUserId) {
+                            await userStore.updateUser(beeflowUser.id, { azureUserId });
+                        }
+                        details.push(`  ↻ Direct user "${displayName}" already exists`);
+                    } else if (email) {
+                        const userId = email.split('@')[0].toLowerCase().replace(/[^a-z0-9._-]+/g, '');
+                        const userStatus = settings.autoActivateUsers ? 'active' : 'pending';
+
+                        const newUser = {
+                            id: userId || `azure-${azureUserId.substring(0, 8)}`,
+                            username: userId || email,
+                            displayName,
+                            firstName,
+                            lastName,
+                            email,
+                            role: 'user',
+                            groups: [],
+                            orgRole: '',
+                            organizationId: orgId,
+                            status: userStatus,
+                            azureUserId,
+                            passwordHash: '',
+                        };
+
+                        const created = await userStore.createUser(newUser);
+                        if (created) {
+                            details.push(`  + Created direct user "${displayName}" (${email}) [${userStatus}]`);
+                            syncedUserCount++;
+                        } else {
+                            newUser.id = `${userId}-${Date.now().toString(36)}`;
+                            if (await userStore.createUser(newUser)) {
+                                details.push(`  + Created direct user "${displayName}" (${email}) as ${newUser.id} [${userStatus}]`);
+                                syncedUserCount++;
+                            }
+                        }
+                    } else {
+                        details.push(`  ⚠ Skipped "${displayName}" — no email available`);
+                    }
+                } catch (userErr) {
+                    console.error('[AzureGroupSync] Direct user error:', userErr);
+                    errors.push(`Error processing direct user ${assignment.principalDisplayName}: ${userErr.message}`);
+                }
             }
         }
 
@@ -439,7 +564,11 @@ async function syncAzureGroupsToOrg(orgId) {
         await setSyncStatus(orgId, status);
 
         details.push(`\nSync complete: ${syncedGroupCount} group(s), ${syncedUserCount} new user(s)`);
-        if (errors.length > 0) details.push(`${errors.length} error(s) occurred`);
+        if (errors.length > 0) {
+            details.push(`${errors.length} error(s) occurred`);
+            console.error('[AzureGroupSync] Sync errors:', errors);
+        }
+        console.log(`[AzureGroupSync] Sync finished for org ${orgId}: ${syncedGroupCount} group(s), ${syncedUserCount} user(s), ${errors.length} error(s)`);
 
         return { ok: true, synced: { groups: syncedGroupCount, users: syncedUserCount }, details, errors };
 
@@ -512,8 +641,75 @@ async function initPeriodicSyncs() {
 // Auto-initialize periodic syncs after a brief delay (allows DB to be ready)
 setTimeout(() => initPeriodicSyncs(), 5000);
 
+/**
+ * Sync a single user's Azure group memberships on login.
+ *
+ * Called when a user authenticates via Microsoft SSO. Ensures the user's
+ * BeeFlow group list always reflects their current Azure AD enterprise app
+ * group assignments without waiting for a periodic sync.
+ *
+ * Errors are swallowed — login must never be blocked by a sync failure.
+ *
+ * @param {string} beeflowUserId - BeeFlow user ID
+ * @param {string} azureUserId   - Azure AD object ID for the user
+ * @param {string} orgId         - BeeFlow organisation ID
+ */
+async function syncUserGroupsOnLogin(beeflowUserId, azureUserId, orgId) {
+    if (!beeflowUserId || !azureUserId || !orgId) return;
+    try {
+        const authConfig = await loadConfig();
+        const msProvider = authConfig.providers?.microsoft || {};
+        if (!msProvider.clientId || !msProvider.clientSecret) return;
+
+        const tenantId = msProvider.tenantId || 'common';
+        const token = await getClientCredentialsToken(msProvider.clientId, msProvider.clientSecret, tenantId);
+
+        // Load Azure-sourced groups for this org
+        const allGroups = await userStore.getAllGroups();
+        const azureGroups = allGroups.filter(g => g.source === 'azure' && g.organizationId === orgId && g.azureGroupId);
+        if (azureGroups.length === 0) return;
+
+        const currentUser = await userStore.getUser(beeflowUserId);
+        if (!currentUser) return;
+
+        let userGroups = Array.isArray(currentUser.groups)
+            ? [...currentUser.groups]
+            : (() => { try { return JSON.parse(currentUser.groups || '[]'); } catch (_) { return []; } })();
+
+        let changed = false;
+
+        for (const azureGroup of azureGroups) {
+            try {
+                const members = await getGroupMembers(token, azureGroup.azureGroupId);
+                const isMember = members.some(m => m.id === azureUserId);
+
+                if (isMember && !userGroups.includes(azureGroup.id)) {
+                    userGroups.push(azureGroup.id);
+                    changed = true;
+                    console.log(`[AzureGroupSync/Login] Added "${beeflowUserId}" to group "${azureGroup.name}"`);
+                } else if (!isMember && userGroups.includes(azureGroup.id)) {
+                    userGroups = userGroups.filter(g => g !== azureGroup.id);
+                    changed = true;
+                    console.log(`[AzureGroupSync/Login] Removed "${beeflowUserId}" from group "${azureGroup.name}" (no longer in Azure AD)`);
+                }
+            } catch (_) {
+                // GroupMember.Read.All not granted — skip silently
+            }
+        }
+
+        if (changed) {
+            await userStore.updateUser(beeflowUserId, { groups: userGroups });
+            console.log(`[AzureGroupSync/Login] Group memberships updated for user "${beeflowUserId}"`);
+        }
+    } catch (err) {
+        // Never block login due to sync errors
+        console.warn(`[AzureGroupSync/Login] Non-fatal error for user "${beeflowUserId}":`, err.message);
+    }
+}
+
 module.exports = {
     syncAzureGroupsToOrg,
+    syncUserGroupsOnLogin,
     getSyncSettings,
     setSyncSettings,
     getSyncStatus,

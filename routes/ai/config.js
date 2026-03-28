@@ -93,6 +93,22 @@ router.get('/config', async (req, res) => {
             const val = await configStore.getConfig('feature_projects_enabled');
             return val !== false && val !== 'false';
         })(),
+        askAiEnabled: await (async () => {
+            const val = await configStore.getConfig('feature_ask_ai_enabled');
+            return val !== false && val !== 'false';
+        })(),
+        exportEnabled: await (async () => {
+            const val = await configStore.getConfig('feature_export_enabled');
+            return val !== false && val !== 'false';
+        })(),
+        openInNotebookEnabled: await (async () => {
+            const val = await configStore.getConfig('feature_open_in_notebook_enabled');
+            return val !== false && val !== 'false';
+        })(),
+        notebooksMenuEnabled: await (async () => {
+            const val = await configStore.getConfig('feature_notebooks_menu_enabled');
+            return val !== false && val !== 'false';
+        })(),
     });
 });
 
@@ -100,7 +116,7 @@ router.post('/config', requireAuth, async (req, res) => {
     if (!req.session.isAdmin) {
         return res.status(403).json({ error: 'Admin access required' });
     }
-    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, minimaxApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, llamaGuardConfig, moderationProvider, azureContentSafetyEndpoint, azureContentSafetyKey, azureContentSafetySeverityThreshold, azureContentSafetyCategories, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionScope, piiDetectionAction, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing, serviceEmailAddress, serviceEmailPassword, serviceEmailDisplayName, azureSpeechKey, azureSpeechRegion, transcriptionProvider, notebooksEnabled, projectsEnabled } = req.body;
+    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, minimaxApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, llamaGuardConfig, moderationProvider, azureContentSafetyEndpoint, azureContentSafetyKey, azureContentSafetySeverityThreshold, azureContentSafetyCategories, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionScope, piiDetectionAction, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing, serviceEmailAddress, serviceEmailPassword, serviceEmailDisplayName, azureSpeechKey, azureSpeechRegion, transcriptionProvider, notebooksEnabled, projectsEnabled, askAiEnabled, exportEnabled, openInNotebookEnabled, notebooksMenuEnabled } = req.body;
     const existing = await getAIConfig();
 
     if (allowedModelsByAgentType !== undefined) {
@@ -212,6 +228,18 @@ router.post('/config', requireAuth, async (req, res) => {
     }
     if (projectsEnabled !== undefined) {
         await configStore.setConfig('feature_projects_enabled', projectsEnabled ? true : false);
+    }
+    if (askAiEnabled !== undefined) {
+        await configStore.setConfig('feature_ask_ai_enabled', askAiEnabled ? true : false);
+    }
+    if (exportEnabled !== undefined) {
+        await configStore.setConfig('feature_export_enabled', exportEnabled ? true : false);
+    }
+    if (openInNotebookEnabled !== undefined) {
+        await configStore.setConfig('feature_open_in_notebook_enabled', openInNotebookEnabled ? true : false);
+    }
+    if (notebooksMenuEnabled !== undefined) {
+        await configStore.setConfig('feature_notebooks_menu_enabled', notebooksMenuEnabled ? true : false);
     }
 
     const success = await saveAIConfig({

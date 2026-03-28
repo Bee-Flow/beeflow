@@ -8,11 +8,14 @@
 
 const express = require('express');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const router = express.Router();
 
 const { loadConfig, saveConfig, requireAdmin, OAUTH_PROVIDERS } = require('./permissions');
 const { getOrCreateSSOUserDEKCompat, setupSSOUserDEK, unlockSSOUserDEK } = require('./encryption');
 const userStore = require('../stores/userStore');
+const { syncUserGroupsOnLogin } = require('../integrations/azureGroupSync');
 
 /**
  * Check if encryption is enabled for a user based on their org's subscription plan.
@@ -450,6 +453,32 @@ router.get('/callback/:provider', async (req, res) => {
                     provider: 'microsoft'
                 };
                 console.log(`[OAuth/Microsoft] Mapped user — id: ${user.id}, displayName: ${user.displayName}, email: ${user.email}`);
+
+                // Attempt to fetch profile picture
+                console.log(`[OAuth/Microsoft] Attempting to fetch user photo...`);
+                try {
+                    const photoResponse = await fetch('https://graph.microsoft.com/v1.0/me/photo/$value', {
+                        headers: { 'Authorization': `Bearer ${tokenData.access_token}` }
+                    });
+                    if (photoResponse.ok) {
+                        const arrayBuffer = await photoResponse.arrayBuffer();
+                        const buffer = Buffer.from(arrayBuffer);
+                        const uploadDir = path.join(__dirname, '..', 'data', 'uploads');
+                        if (!fs.existsSync(uploadDir)) {
+                            fs.mkdirSync(uploadDir, { recursive: true });
+                        }
+                        const safeId = user.id.replace(/[^a-zA-Z0-9]/g, '');
+                        const filename = `user-avatar-azure-${safeId}-${Date.now()}.jpg`;
+                        const filepath = path.join(uploadDir, filename);
+                        fs.writeFileSync(filepath, buffer);
+                        user.picture = `/uploads/${filename}`;
+                        console.log(`[OAuth/Microsoft] Saved user photo to ${filepath}`);
+                    } else {
+                        console.log(`[OAuth/Microsoft] User has no photo or access denied: ${photoResponse.status}`);
+                    }
+                } catch (photoErr) {
+                    console.log(`[OAuth/Microsoft] Error fetching photo: ${photoErr.message}`);
+                }
             } else {
                 const userErrorText = await userResponse.text();
                 console.error(`[OAuth/Microsoft] USER INFO FETCH FAILED (${userResponse.status}):`, userErrorText);
@@ -678,6 +707,14 @@ router.get('/callback/:provider', async (req, res) => {
         // Check if existing user is pending
         if (freshUser?.status === 'pending') {
             pendingApproval = true;
+        }
+
+        // ── Azure group sync on login ──────────────────────────────
+        // Fire-and-forget: update Azure group memberships for Microsoft SSO users.
+        // Never awaited so it cannot block or fail login.
+        if (provider === 'microsoft' && freshUser?.azureUserId && freshUser?.organizationId) {
+            syncUserGroupsOnLogin(freshUser.id, freshUser.azureUserId, freshUser.organizationId)
+                .catch(() => {}); // errors already logged inside the function
         }
 
         console.log(`[OAuth/${provider}] === SESSION SETUP ===`);
