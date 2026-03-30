@@ -13,34 +13,122 @@
 const { exec, getAll, getClient } = require('../db');
 const configStore = require('../stores/configStore');
 
-// ── Token-aware text chunking ───────────────────────────────────────
+// ── Structure-aware text chunking ───────────────────────────────────
 
 const CHUNK_SIZE = 500;    // tokens per chunk (larger = more context per hit)
 const CHUNK_OVERLAP = 100; // token overlap (ensures continuity between chunks)
+const CHUNK_SIZE_FLEX = Math.floor(CHUNK_SIZE * 1.8); // atomic blocks up to this size stay whole
 
 /**
- * Simple token counter based on whitespace + punctuation splitting.
+ * Simple token counter based on character-length heuristic.
  * Not as precise as tiktoken, but good enough for chunking.
  */
 function estimateTokens(text) {
     if (!text) return 0;
-    // Rough approximation: ~4 chars per token for English
     return Math.ceil(text.length / 4);
+}
+
+/**
+ * Extract structural blocks (HTML tables, markdown tables, fenced code blocks)
+ * from text and replace them with placeholders. Returns the cleaned text and
+ * a map of placeholder → original block.
+ *
+ * This ensures structural elements are treated as atomic units during chunking.
+ */
+function extractAtomicBlocks(text) {
+    const blocks = [];
+    let cleaned = text;
+
+    // 1. HTML tables: <table...>...</table> (dotAll via [\s\S])
+    cleaned = cleaned.replace(/<table[\s\S]*?<\/table>/gi, (match) => {
+        const idx = blocks.length;
+        blocks.push(match);
+        return `\n\n__ATOMIC_BLOCK_${idx}__\n\n`;
+    });
+
+    // 2. Fenced code blocks: ```...```
+    cleaned = cleaned.replace(/```[\s\S]*?```/g, (match) => {
+        const idx = blocks.length;
+        blocks.push(match);
+        return `\n\n__ATOMIC_BLOCK_${idx}__\n\n`;
+    });
+
+    // 3. Markdown tables: consecutive lines starting with |
+    cleaned = cleaned.replace(/((?:^|\n)\|[^\n]+\n(?:\|[^\n]+\n?){2,})/g, (match) => {
+        const idx = blocks.length;
+        blocks.push(match.trim());
+        return `\n\n__ATOMIC_BLOCK_${idx}__\n\n`;
+    });
+
+    return { cleaned, blocks };
+}
+
+/**
+ * Split an HTML table that exceeds CHUNK_SIZE into row-based sub-chunks.
+ * Preserves <table>, <caption>, and <thead> as a header for each sub-chunk.
+ */
+function splitHtmlTableByRows(tableHtml, chunkSize) {
+    // Extract table wrapper (opening <table> + <caption> + <thead>) and rows
+    const headerMatch = tableHtml.match(/^(<table[^>]*>(?:\s*<caption[^>]*>[\s\S]*?<\/caption>)?(?:\s*<thead[\s\S]*?<\/thead>)?)/i);
+    const tableHeader = headerMatch ? headerMatch[1] : '<table>';
+    const tableFooter = '</table>';
+
+    // Extract all <tr>...</tr> blocks from the tbody area
+    const rows = [];
+    const trRegex = /<tr[\s\S]*?<\/tr>/gi;
+    let rowMatch;
+    // Skip rows already in thead
+    const bodyStart = tableHtml.indexOf('</thead>');
+    const searchArea = bodyStart >= 0 ? tableHtml.slice(bodyStart) : tableHtml;
+    while ((rowMatch = trRegex.exec(searchArea)) !== null) {
+        rows.push(rowMatch[0]);
+    }
+
+    if (rows.length === 0) return [tableHtml]; // Can't split further
+
+    const subChunks = [];
+    let currentRows = [];
+    let currentSize = estimateTokens(tableHeader + tableFooter);
+
+    for (const row of rows) {
+        const rowTokens = estimateTokens(row);
+
+        if (currentSize + rowTokens > chunkSize && currentRows.length > 0) {
+            // Flush current sub-chunk
+            subChunks.push(`${tableHeader}\n<tbody>\n${currentRows.join('\n')}\n</tbody>\n${tableFooter}`);
+            currentRows = [];
+            currentSize = estimateTokens(tableHeader + tableFooter);
+        }
+
+        currentRows.push(row);
+        currentSize += rowTokens;
+    }
+
+    // Final sub-chunk
+    if (currentRows.length > 0) {
+        subChunks.push(`${tableHeader}\n<tbody>\n${currentRows.join('\n')}\n</tbody>\n${tableFooter}`);
+    }
+
+    return subChunks.length > 0 ? subChunks : [tableHtml];
 }
 
 /**
  * Split text into natural sections at heading and paragraph boundaries.
  */
 function splitIntoSections(text) {
-    // Split on markdown headings or double newlines
     const parts = text.split(/(?=(?:^|\n)#{1,6}\s)|(?:\n\n)+/);
     return parts.filter(p => p && p.trim());
 }
 
 /**
- * Split a long section by sentence boundaries.
+ * Split a long section by sentence boundaries (for regular text, not tables).
  */
 function splitLongSection(text, chunkSize) {
+    // If this is an HTML table, split by rows instead of sentences
+    if (/<table[\s\S]*<\/table>/i.test(text)) {
+        return splitHtmlTableByRows(text, chunkSize);
+    }
+
     const sentences = text.split(/(?<=[.!?])\s+/);
     const parts = [];
     let current = [];
@@ -51,7 +139,6 @@ function splitLongSection(text, chunkSize) {
 
         if (currentCount + sentTokens > chunkSize && current.length > 0) {
             parts.push(current.join(' '));
-            // Keep overlap
             const overlapText = current.slice(-1).join(' ');
             current = [overlapText, sentence];
             currentCount = estimateTokens(current.join(' '));
@@ -70,7 +157,8 @@ function splitLongSection(text, chunkSize) {
 
 /**
  * Chunk text into token-aware pieces with overlap.
- * Port of the Python splitter.py logic.
+ * Structure-aware: HTML tables, markdown tables, and code blocks are
+ * extracted as atomic units so they are never split mid-element.
  *
  * @param {string} text — input text to chunk
  * @returns {Array<{chunk_id: number, text: string, token_count: number}>}
@@ -78,7 +166,36 @@ function splitLongSection(text, chunkSize) {
 function chunkText(text) {
     if (!text || !text.trim()) return [];
 
-    const sections = splitIntoSections(text);
+    // Phase 1: Extract atomic blocks (tables, code blocks) → placeholders
+    const { cleaned, blocks } = extractAtomicBlocks(text);
+
+    // Phase 2: Split into natural sections (headings, paragraphs)
+    const rawSections = splitIntoSections(cleaned);
+
+    // Phase 3: Restore atomic blocks into the section stream
+    const sections = [];
+    for (const section of rawSections) {
+        const blockMatch = section.trim().match(/^__ATOMIC_BLOCK_(\d+)__$/);
+        if (blockMatch) {
+            // This section is an atomic block — restore original content
+            sections.push(blocks[parseInt(blockMatch[1], 10)]);
+        } else if (/__ATOMIC_BLOCK_\d+__/.test(section)) {
+            // Section contains a mix of text and placeholder(s) — split them apart
+            const parts = section.split(/(__ATOMIC_BLOCK_\d+__)/);
+            for (const part of parts) {
+                const innerMatch = part.match(/^__ATOMIC_BLOCK_(\d+)__$/);
+                if (innerMatch) {
+                    sections.push(blocks[parseInt(innerMatch[1], 10)]);
+                } else if (part.trim()) {
+                    sections.push(part);
+                }
+            }
+        } else {
+            sections.push(section);
+        }
+    }
+
+    // Phase 4: Build chunks, respecting atomic block boundaries
     const chunks = [];
     let currentParts = [];
     let currentTokenCount = 0;
@@ -86,21 +203,42 @@ function chunkText(text) {
 
     for (const section of sections) {
         const sectionTokens = estimateTokens(section);
+        const isAtomicBlock = /<table[\s\S]*<\/table>/i.test(section) ||
+                              /^```[\s\S]*```$/.test(section) ||
+                              /^(\|[^\n]+\n){2,}/.test(section);
+
+        // Atomic blocks up to CHUNK_SIZE_FLEX stay whole (even if > CHUNK_SIZE)
+        if (isAtomicBlock && sectionTokens <= CHUNK_SIZE_FLEX) {
+            // Flush current buffer first
+            if (currentParts.length > 0) {
+                const ct = currentParts.join('\n\n').trim();
+                if (ct) {
+                    chunks.push({ chunk_id: chunkId, text: ct, token_count: currentTokenCount });
+                    chunkId++;
+                }
+                currentParts = [];
+                currentTokenCount = 0;
+            }
+            // Emit the atomic block as its own chunk
+            chunks.push({ chunk_id: chunkId, text: section.trim(), token_count: sectionTokens });
+            chunkId++;
+            continue;
+        }
 
         // If this single section exceeds chunk_size, split it further
         if (sectionTokens > CHUNK_SIZE) {
             // Flush current buffer first
             if (currentParts.length > 0) {
-                const chunkText = currentParts.join('').trim();
-                if (chunkText) {
-                    chunks.push({ chunk_id: chunkId, text: chunkText, token_count: currentTokenCount });
+                const ct = currentParts.join('\n\n').trim();
+                if (ct) {
+                    chunks.push({ chunk_id: chunkId, text: ct, token_count: currentTokenCount });
                     chunkId++;
                 }
                 currentParts = [];
                 currentTokenCount = 0;
             }
 
-            // Split the long section by sentences
+            // Split the long section (tables by row, text by sentence)
             const subParts = splitLongSection(section, CHUNK_SIZE);
             for (const sp of subParts) {
                 const spTokens = estimateTokens(sp);
@@ -113,9 +251,9 @@ function chunkText(text) {
         // Check if adding this section exceeds chunk_size
         if (currentTokenCount + sectionTokens > CHUNK_SIZE) {
             // Flush current chunk
-            const chunkText = currentParts.join('').trim();
-            if (chunkText) {
-                chunks.push({ chunk_id: chunkId, text: chunkText, token_count: currentTokenCount });
+            const ct = currentParts.join('\n\n').trim();
+            if (ct) {
+                chunks.push({ chunk_id: chunkId, text: ct, token_count: currentTokenCount });
                 chunkId++;
             }
             // Keep overlap (last portion)
@@ -141,9 +279,9 @@ function chunkText(text) {
 
     // Final chunk
     if (currentParts.length > 0) {
-        const chunkText = currentParts.join('').trim();
-        if (chunkText) {
-            chunks.push({ chunk_id: chunkId, text: chunkText, token_count: currentTokenCount });
+        const ct = currentParts.join('\n\n').trim();
+        if (ct) {
+            chunks.push({ chunk_id: chunkId, text: ct, token_count: currentTokenCount });
         }
     }
 
@@ -513,11 +651,53 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
             .sort((a, b) => b.score - a.score)
             .slice(0, Math.max(topK, 20)); // Take extra candidates for reranking
 
-        // E. Rerank via local cross-encoder sidecar (if available)
-        const rerankerUrl = process.env.RERANKER_URL;
-        if (rerankerUrl && results.length > 0) {
+        // E. Rerank via Azure Cohere or local cross-encoder sidecar
+        const azureRerankerEndpoint = process.env.AZURE_RERANKER_ENDPOINT;
+        const azureRerankerKey = process.env.AZURE_RERANKER_KEY;
+        const azureRerankerModel = process.env.AZURE_RERANKER_MODEL || 'Cohere-rerank-v4.0-fast';
+        const localRerankerUrl = process.env.RERANKER_URL;
+
+        if (azureRerankerEndpoint && azureRerankerKey && results.length > 0) {
+            // ── Azure Cohere rerank ──
             try {
-                const rerankerRes = await fetch(`${rerankerUrl}/rerank`, {
+                const endpoint = azureRerankerEndpoint.replace(/\/+$/, '');
+                const rerankerRes = await fetch(`${endpoint}/providers/cohere/v2/rerank`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${azureRerankerKey}`,
+                    },
+                    body: JSON.stringify({
+                        model: azureRerankerModel,
+                        query,
+                        documents: results.map(r => r.content),
+                        top_n: topK,
+                    }),
+                    signal: AbortSignal.timeout(15000),
+                });
+
+                if (rerankerRes.ok) {
+                    const rerankerData = await rerankerRes.json();
+                    if (rerankerData.results && rerankerData.results.length > 0) {
+                        results = rerankerData.results.map(rr => ({
+                            content: results[rr.index].content,
+                            title: results[rr.index].title,
+                            source_uri: results[rr.index].source_uri,
+                            score: rr.relevance_score,
+                        }));
+                        console.log(`[LocalKBSearch] Azure Cohere reranked ${rerankerData.results.length} results (top=${results[0]?.score})`);
+                    }
+                } else {
+                    const errBody = await rerankerRes.text().catch(() => '');
+                    console.warn(`[LocalKBSearch] Azure reranker responded ${rerankerRes.status}: ${errBody.slice(0, 200)}, falling back to RRF`);
+                }
+            } catch (rerankerErr) {
+                console.warn(`[LocalKBSearch] Azure reranker error (${rerankerErr.message}), falling back to RRF`);
+            }
+        } else if (localRerankerUrl && results.length > 0) {
+            // ── Local cross-encoder sidecar ──
+            try {
+                const rerankerRes = await fetch(`${localRerankerUrl}/rerank`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -531,7 +711,6 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
                 if (rerankerRes.ok) {
                     const rerankerData = await rerankerRes.json();
                     if (rerankerData.results && rerankerData.results.length > 0) {
-                        // Replace RRF results with reranked results (scores in 0-1 range)
                         results = rerankerData.results.map(rr => ({
                             content: results[rr.index].content,
                             title: results[rr.index].title,

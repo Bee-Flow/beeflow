@@ -704,6 +704,9 @@ router.post('/signup', async (req, res) => {
             if (!PUBLIC_DOMAINS.includes(domain)) {
                 const existingOrgs = await userStore.getAllOrganizations();
                 const domainTaken = existingOrgs.find(o => {
+                    // Check allowedDomains array
+                    if (Array.isArray(o.allowedDomains) && o.allowedDomains.includes(domain)) return true;
+                    // Check org email domain
                     if (!o.email || !o.email.includes('@')) return false;
                     return o.email.split('@')[1].toLowerCase() === domain;
                 });

@@ -597,12 +597,15 @@ router.get('/callback/:provider', async (req, res) => {
             const orgId = newOrgName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
             const orgEmail = od.email || user.email || '';
 
-            // Check domain collision
+            // Check domain collision (against both org email and allowedDomains)
             let domainTaken = false;
             if (orgEmail && orgEmail.includes('@')) {
                 const domain = orgEmail.split('@')[1].toLowerCase();
                 const existingOrgs = await userStore.getAllOrganizations();
                 domainTaken = existingOrgs.find(o => {
+                    // Check allowedDomains array
+                    if (Array.isArray(o.allowedDomains) && o.allowedDomains.includes(domain)) return true;
+                    // Check org email domain
                     if (!o.email || !o.email.includes('@')) return false;
                     return o.email.split('@')[1].toLowerCase() === domain;
                 });
@@ -698,8 +701,13 @@ router.get('/callback/:provider', async (req, res) => {
             const userDomain = user.email.split('@')[1].toLowerCase();
             const allOrgs = await userStore.getAllOrganizations();
 
-            // Find org whose email domain matches the user's email domain
+            // Find org whose allowed domains (or email domain) matches the user's email domain
             const matchingOrg = allOrgs.find(org => {
+                // Check allowedDomains array first (multi-domain support)
+                if (Array.isArray(org.allowedDomains) && org.allowedDomains.length > 0) {
+                    return org.allowedDomains.includes(userDomain);
+                }
+                // Fallback: match on org email domain
                 if (!org.email || !org.email.includes('@')) return false;
                 return org.email.split('@')[1].toLowerCase() === userDomain;
             });

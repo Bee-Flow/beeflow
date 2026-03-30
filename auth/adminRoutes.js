@@ -432,7 +432,7 @@ router.post('/organizations', requireAdmin, async (req, res) => {
 
 router.put('/organizations/:id', requireOrgAdmin('id'), async (req, res) => {
     const { id } = req.params;
-    const { name, description, tagline, address, email, phone, website, kvk, vat, logo, footerText, defaultGroups, allowSignup, authMethod, enabledIntegrations, autoApproveSSO } = req.body;
+    const { name, description, tagline, address, email, phone, website, kvk, vat, logo, footerText, defaultGroups, allowSignup, authMethod, enabledIntegrations, autoApproveSSO, allowedDomains } = req.body;
 
     // authMethod can only be set once — if already set, ignore any change
     const existing = await userStore.getOrganization(id);
@@ -442,7 +442,42 @@ router.put('/organizations/:id', requireOrgAdmin('id'), async (req, res) => {
     const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
     const finalIntegrations = isSuperAdmin && enabledIntegrations !== undefined ? enabledIntegrations : undefined;
 
-    if (await userStore.updateOrganization(id, { name, description, tagline, address, email, phone, website, kvk, vat, logo, footerText, defaultGroups, allowSignup, authMethod: finalAuthMethod, enabledIntegrations: finalIntegrations, autoApproveSSO })) {
+    // ── allowedDomains validation (private-cloud only) ──
+    let finalAllowedDomains = undefined;
+    if (allowedDomains !== undefined && process.env.DEPLOYMENT_MODE === 'private-cloud') {
+        if (!Array.isArray(allowedDomains)) {
+            return res.status(400).json({ error: 'allowedDomains must be an array' });
+        }
+
+        // Validate domain formats
+        const domainRegex = /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$/;
+        const normalised = [];
+        for (const d of allowedDomains) {
+            const domain = String(d).trim().toLowerCase();
+            if (!domain) continue;
+            if (!domainRegex.test(domain)) {
+                return res.status(400).json({ error: `Invalid domain format: "${domain}"` });
+            }
+            normalised.push(domain);
+        }
+
+        // Collision check: no domain can belong to another org
+        if (normalised.length > 0) {
+            const allOrgs = await userStore.getAllOrganizations();
+            for (const domain of normalised) {
+                const collision = allOrgs.find(o =>
+                    o.id !== id && Array.isArray(o.allowedDomains) && o.allowedDomains.includes(domain)
+                );
+                if (collision) {
+                    return res.status(400).json({ error: `Domain "${domain}" is already assigned to organisation "${collision.name}"` });
+                }
+            }
+        }
+
+        finalAllowedDomains = normalised;
+    }
+
+    if (await userStore.updateOrganization(id, { name, description, tagline, address, email, phone, website, kvk, vat, logo, footerText, defaultGroups, allowSignup, authMethod: finalAuthMethod, enabledIntegrations: finalIntegrations, autoApproveSSO, allowedDomains: finalAllowedDomains })) {
         res.json({ success: true });
     } else {
         res.status(404).json({ error: 'Organization not found' });

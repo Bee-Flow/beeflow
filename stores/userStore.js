@@ -124,6 +124,7 @@ async function initDB() {
     try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS "activeIconPackId" TEXT`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "autoApproveSSO" TEXT DEFAULT '0'`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "enabledIntegrations" TEXT DEFAULT NULL`); } catch (e) { /* column already exists */ }
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "allowed_domains" TEXT DEFAULT NULL`); } catch (e) { /* column already exists */ }
 
     // ── Azure AD Group Sync columns ──
     try { await exec(`ALTER TABLE groups ADD COLUMN IF NOT EXISTS "azureGroupId" TEXT`); } catch (e) { /* column already exists */ }
@@ -372,28 +373,38 @@ async function updateUser(userId, updates) {
 }
 
 // ── Organizations ─────────────────────────────
+function parseOrg(o) {
+    return {
+        ...o,
+        defaultGroups: parseJSON(o.defaultGroups, []),
+        allowSignup: o.allowSignup === '1' || o.allowSignup === true,
+        autoApproveSSO: o.autoApproveSSO === '1' || o.autoApproveSSO === true,
+        allowedDomains: parseJSON(o.allowed_domains, []),
+    };
+}
+
 async function getAllOrganizations() {
     await initDB();
     const rows = await getAll('SELECT * FROM organizations');
-    return rows.map(o => ({ ...o, defaultGroups: parseJSON(o.defaultGroups, []), allowSignup: o.allowSignup === '1' || o.allowSignup === true, autoApproveSSO: o.autoApproveSSO === '1' || o.autoApproveSSO === true }));
+    return rows.map(parseOrg);
 }
 
 async function getOrganization(id) {
     await initDB();
     const o = await getOne('SELECT * FROM organizations WHERE id = $1', [id]);
     if (!o) return null;
-    return { ...o, defaultGroups: parseJSON(o.defaultGroups, []), allowSignup: o.allowSignup === '1' || o.allowSignup === true, autoApproveSSO: o.autoApproveSSO === '1' || o.autoApproveSSO === true };
+    return parseOrg(o);
 }
 
 async function createOrganization(orgData) {
     await initDB();
-    const { id, name, description, tagline, address, email, phone, website, kvk, vat, logo, footerText, defaultGroups, allowSignup, authMethod, autoApproveSSO, enabledIntegrations } = orgData;
+    const { id, name, description, tagline, address, email, phone, website, kvk, vat, logo, footerText, defaultGroups, allowSignup, authMethod, autoApproveSSO, enabledIntegrations, allowedDomains } = orgData;
     const ex = await getOne('SELECT id FROM organizations WHERE id = $1', [id]);
     if (ex) return false;
     try {
-        await run(`INSERT INTO organizations (id, name, description, tagline, address, email, phone, website, kvk, vat, logo, "footerText", "defaultGroups", "allowSignup", "authMethod", "autoApproveSSO", "enabledIntegrations")
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
-            [id, name, description || '', tagline || '', address || '', email || '', phone || '', website || '', kvk || '', vat || '', logo || '', footerText || '', JSON.stringify(defaultGroups || []), allowSignup ? '1' : '0', authMethod || null, autoApproveSSO ? '1' : '0', enabledIntegrations ? JSON.stringify(enabledIntegrations) : null]);
+        await run(`INSERT INTO organizations (id, name, description, tagline, address, email, phone, website, kvk, vat, logo, "footerText", "defaultGroups", "allowSignup", "authMethod", "autoApproveSSO", "enabledIntegrations", "allowed_domains")
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+            [id, name, description || '', tagline || '', address || '', email || '', phone || '', website || '', kvk || '', vat || '', logo || '', footerText || '', JSON.stringify(defaultGroups || []), allowSignup ? '1' : '0', authMethod || null, autoApproveSSO ? '1' : '0', enabledIntegrations ? JSON.stringify(enabledIntegrations) : null, allowedDomains ? JSON.stringify(allowedDomains) : null]);
         return true;
     } catch (e) { console.error(e); return false; }
 }
@@ -409,7 +420,8 @@ async function updateOrganization(orgId, updates) {
     if (updates.allowSignup !== undefined) updateMap.allowSignup = updates.allowSignup ? '1' : '0';
     if (updates.autoApproveSSO !== undefined) updateMap.autoApproveSSO = updates.autoApproveSSO ? '1' : '0';
     if (updates.enabledIntegrations !== undefined) updateMap.enabledIntegrations = updates.enabledIntegrations === null ? null : JSON.stringify(updates.enabledIntegrations);
-    const fullColMap = { ...colMap, defaultGroups: 'defaultGroups', allowSignup: 'allowSignup', autoApproveSSO: 'autoApproveSSO', enabledIntegrations: 'enabledIntegrations' };
+    if (updates.allowedDomains !== undefined) updateMap.allowed_domains = updates.allowedDomains === null ? null : JSON.stringify(updates.allowedDomains);
+    const fullColMap = { ...colMap, defaultGroups: 'defaultGroups', allowSignup: 'allowSignup', autoApproveSSO: 'autoApproveSSO', enabledIntegrations: 'enabledIntegrations', allowed_domains: 'allowed_domains' };
     try {
         const q = dynamicUpdate('organizations', orgId, updateMap, fullColMap);
         if (q) await run(q.sql, q.params);
