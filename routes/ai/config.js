@@ -80,6 +80,10 @@ router.get('/config', async (req, res) => {
         // WhisperX self-hosted
         hasWhisperxUrl: !!(await configStore.getSecret('whisperx_url')),
         hasWhisperxToken: !!(await configStore.getSecret('whisperx_token')),
+        // Azure Cohere Reranker
+        hasAzureRerankerEndpoint: !!(await configStore.getConfig('azure_reranker_endpoint')),
+        hasAzureRerankerKey: !!(await configStore.getSecret('azure_reranker_key')),
+        azureRerankerModel: await configStore.getConfig('azure_reranker_model') || 'Cohere-rerank-v4.0-fast',
         // Service Email (Gmail SMTP)
         hasServiceEmail: !!(await configStore.getConfig('service_email_address')) && !!(await configStore.getSecret('service_email_password')),
         serviceEmailAddress: await configStore.getConfig('service_email_address') || '',
@@ -116,7 +120,7 @@ router.post('/config', requireAuth, async (req, res) => {
     if (!req.session.isAdmin) {
         return res.status(403).json({ error: 'Admin access required' });
     }
-    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, minimaxApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, llamaGuardConfig, moderationProvider, azureContentSafetyEndpoint, azureContentSafetyKey, azureContentSafetySeverityThreshold, azureContentSafetyCategories, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionScope, piiDetectionAction, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing, serviceEmailAddress, serviceEmailPassword, serviceEmailDisplayName, azureSpeechKey, azureSpeechRegion, transcriptionProvider, notebooksEnabled, projectsEnabled, askAiEnabled, exportEnabled, openInNotebookEnabled, notebooksMenuEnabled } = req.body;
+    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, minimaxApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, llamaGuardConfig, moderationProvider, azureContentSafetyEndpoint, azureContentSafetyKey, azureContentSafetySeverityThreshold, azureContentSafetyCategories, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionScope, piiDetectionAction, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing, serviceEmailAddress, serviceEmailPassword, serviceEmailDisplayName, azureSpeechKey, azureSpeechRegion, transcriptionProvider, notebooksEnabled, projectsEnabled, askAiEnabled, exportEnabled, openInNotebookEnabled, notebooksMenuEnabled, azureRerankerEndpoint, azureRerankerKey, azureRerankerModel } = req.body;
     const existing = await getAIConfig();
 
     if (allowedModelsByAgentType !== undefined) {
@@ -241,6 +245,16 @@ router.post('/config', requireAuth, async (req, res) => {
     if (notebooksMenuEnabled !== undefined) {
         await configStore.setConfig('feature_notebooks_menu_enabled', notebooksMenuEnabled ? true : false);
     }
+    // Azure Cohere Reranker
+    if (azureRerankerEndpoint !== undefined) {
+        await configStore.setConfig('azure_reranker_endpoint', azureRerankerEndpoint || '');
+    }
+    if (azureRerankerKey !== undefined) {
+        await configStore.setSecret('azure_reranker_key', azureRerankerKey || '');
+    }
+    if (azureRerankerModel !== undefined) {
+        await configStore.setConfig('azure_reranker_model', azureRerankerModel || 'Cohere-rerank-v4.0-fast');
+    }
 
     const success = await saveAIConfig({
         url: url !== undefined ? url : existing.url,
@@ -290,6 +304,7 @@ const DELETABLE_KEYS = [
     'azure_doc_intelligence_key', 'azure_openai_embedding_key', 'azure_speech_key',
     'bing_search_key', 'linkedin_client_id', 'linkedin_client_secret',
     'service_email_password', 'whisperx_url', 'whisperx_token',
+    'azure_reranker_key',
 ];
 
 router.delete('/config/key/:keyName', requireAuth, async (req, res) => {
@@ -319,7 +334,7 @@ const DELETABLE_CONFIG_KEYS = [
     'azure_content_safety_endpoint', 'azure_doc_intelligence_endpoint',
     'azure_openai_embedding_endpoint', 'azure_openai_embedding_model',
     'azure_speech_region', 'agent_search_url', 'service_email_address',
-    'service_email_display_name',
+    'service_email_display_name', 'azure_reranker_endpoint', 'azure_reranker_model',
 ];
 
 router.delete('/config/setting/:keyName', requireAuth, async (req, res) => {
@@ -374,6 +389,57 @@ router.post('/config/test-service-email', requireAuth, async (req, res) => {
         }
     } catch (err) {
         console.error('[Config] Test service email error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ─── Test Azure Cohere Reranker ──────────────────────────────────
+
+router.post('/config/test-reranker', requireAuth, async (req, res) => {
+    try {
+        if (!req.session.isAdmin) {
+            return res.status(403).json({ error: 'Admin access required' });
+        }
+
+        const endpoint = (await configStore.getConfig('azure_reranker_endpoint') || process.env.AZURE_RERANKER_ENDPOINT || '').replace(/\/+$/, '');
+        const key = await configStore.getSecret('azure_reranker_key') || process.env.AZURE_RERANKER_KEY;
+        const model = await configStore.getConfig('azure_reranker_model') || process.env.AZURE_RERANKER_MODEL || 'Cohere-rerank-v4.0-fast';
+
+        if (!endpoint || !key) {
+            return res.status(400).json({ error: 'Azure reranker endpoint and key are required' });
+        }
+
+        const start = Date.now();
+        const rerankerRes = await fetch(`${endpoint}/providers/cohere/v2/rerank`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${key}`,
+            },
+            body: JSON.stringify({
+                model,
+                query: 'What is BeeFlow?',
+                documents: [
+                    'BeeFlow is an AI-powered productivity platform.',
+                    'The weather today is sunny.',
+                    'BeeFlow helps teams collaborate with intelligent agents.',
+                ],
+                top_n: 2,
+            }),
+            signal: AbortSignal.timeout(15000),
+        });
+
+        const latencyMs = Date.now() - start;
+
+        if (rerankerRes.ok) {
+            const data = await rerankerRes.json();
+            res.json({ success: true, latencyMs, results: data.results?.length || 0 });
+        } else {
+            const errBody = await rerankerRes.text().catch(() => '');
+            res.status(502).json({ error: `Reranker responded ${rerankerRes.status}: ${errBody.slice(0, 300)}` });
+        }
+    } catch (err) {
+        console.error('[Config] Test reranker error:', err);
         res.status(500).json({ error: err.message });
     }
 });

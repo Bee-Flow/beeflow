@@ -652,9 +652,9 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
             .slice(0, Math.max(topK, 20)); // Take extra candidates for reranking
 
         // E. Rerank via Azure Cohere or local cross-encoder sidecar
-        const azureRerankerEndpoint = process.env.AZURE_RERANKER_ENDPOINT;
-        const azureRerankerKey = process.env.AZURE_RERANKER_KEY;
-        const azureRerankerModel = process.env.AZURE_RERANKER_MODEL || 'Cohere-rerank-v4.0-fast';
+        const azureRerankerEndpoint = await configStore.getConfig('azure_reranker_endpoint') || process.env.AZURE_RERANKER_ENDPOINT;
+        const azureRerankerKey = await configStore.getSecret('azure_reranker_key') || process.env.AZURE_RERANKER_KEY;
+        const azureRerankerModel = await configStore.getConfig('azure_reranker_model') || process.env.AZURE_RERANKER_MODEL || 'Cohere-rerank-v4.0-fast';
         const localRerankerUrl = process.env.RERANKER_URL;
 
         if (azureRerankerEndpoint && azureRerankerKey && results.length > 0) {
