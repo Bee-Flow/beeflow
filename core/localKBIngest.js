@@ -658,45 +658,58 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
         const localRerankerUrl = process.env.RERANKER_URL;
 
         if (azureRerankerEndpoint && azureRerankerKey && results.length > 0) {
-            // ── Azure Cohere rerank ──
+            // ── Azure Cohere rerank (auto-discover correct path) ──
             try {
                 const endpoint = azureRerankerEndpoint.replace(/\/+$/, '');
-                // Azure AI Foundry serverless endpoints: use /v1/rerank
-                // AI Services hub endpoints (*.services.ai.azure.com): use /v2/rerank
-                const isServicesHub = endpoint.includes('.services.ai.azure.com');
-                const rerankerUrl = isServicesHub
-                    ? `${endpoint}/models/rerank`
-                    : `${endpoint}/v1/rerank`;
-                console.log(`[LocalKBSearch] Calling Azure reranker: ${rerankerUrl} (model=${azureRerankerModel}, docs=${results.length})`);
-                const rerankerRes = await fetch(rerankerUrl, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${azureRerankerKey}`,
-                    },
-                    body: JSON.stringify({
-                        model: azureRerankerModel,
-                        query,
-                        documents: results.map(r => r.content),
-                        top_n: topK,
-                    }),
-                    signal: AbortSignal.timeout(15000),
+                const requestBody = JSON.stringify({
+                    model: azureRerankerModel,
+                    query,
+                    documents: results.map(r => r.content),
+                    top_n: topK,
                 });
+                const headers = {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${azureRerankerKey}`,
+                };
 
-                if (rerankerRes.ok) {
-                    const rerankerData = await rerankerRes.json();
-                    if (rerankerData.results && rerankerData.results.length > 0) {
-                        results = rerankerData.results.map(rr => ({
-                            content: results[rr.index].content,
-                            title: results[rr.index].title,
-                            source_uri: results[rr.index].source_uri,
-                            score: rr.relevance_score,
-                        }));
-                        console.log(`[LocalKBSearch] Azure Cohere reranked ${rerankerData.results.length} results (top=${results[0]?.score})`);
+                // Try paths in order of likelihood — cache the working one
+                const RERANK_PATHS = ['/providers/cohere/v2/rerank', '/v1/rerank', '/v2/rerank'];
+                if (!global._azureRerankerPath) global._azureRerankerPath = null;
+
+                const pathsToTry = global._azureRerankerPath
+                    ? [global._azureRerankerPath]
+                    : RERANK_PATHS;
+
+                let rerankerData = null;
+                for (const path of pathsToTry) {
+                    const url = `${endpoint}${path}`;
+                    console.log(`[LocalKBSearch] Trying Azure reranker: ${url} (model=${azureRerankerModel}, docs=${results.length})`);
+                    const res = await fetch(url, {
+                        method: 'POST',
+                        headers,
+                        body: requestBody,
+                        signal: AbortSignal.timeout(15000),
+                    });
+                    if (res.ok) {
+                        rerankerData = await res.json();
+                        global._azureRerankerPath = path;  // cache for future calls
+                        break;
                     }
-                } else {
-                    const errBody = await rerankerRes.text().catch(() => '');
-                    console.warn(`[LocalKBSearch] Azure reranker responded ${rerankerRes.status}: ${errBody.slice(0, 200)}, falling back to RRF`);
+                    const errBody = await res.text().catch(() => '');
+                    console.warn(`[LocalKBSearch] Azure reranker ${path} → ${res.status}: ${errBody.slice(0, 200)}`);
+                    if (res.status === 401 || res.status === 403) break; // auth issue, no point trying other paths
+                }
+
+                if (rerankerData?.results?.length > 0) {
+                    results = rerankerData.results.map(rr => ({
+                        content: results[rr.index].content,
+                        title: results[rr.index].title,
+                        source_uri: results[rr.index].source_uri,
+                        score: rr.relevance_score,
+                    }));
+                    console.log(`[LocalKBSearch] Azure Cohere reranked ${rerankerData.results.length} results (top=${results[0]?.score})`);
+                } else if (!rerankerData) {
+                    console.warn(`[LocalKBSearch] All Azure reranker paths failed, falling back to RRF`);
                 }
             } catch (rerankerErr) {
                 console.warn(`[LocalKBSearch] Azure reranker error (${rerankerErr.message}), falling back to RRF`);

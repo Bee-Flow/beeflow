@@ -410,38 +410,45 @@ router.post('/config/test-reranker', requireAuth, async (req, res) => {
         }
 
         const start = Date.now();
-        const isServicesHub = endpoint.includes('.services.ai.azure.com');
-        const rerankerUrl = isServicesHub
-            ? `${endpoint}/models/rerank`
-            : `${endpoint}/v1/rerank`;
-        const rerankerRes = await fetch(rerankerUrl, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${key}`,
-            },
-            body: JSON.stringify({
-                model,
-                query: 'What is BeeFlow?',
-                documents: [
-                    'BeeFlow is an AI-powered productivity platform.',
-                    'The weather today is sunny.',
-                    'BeeFlow helps teams collaborate with intelligent agents.',
-                ],
-                top_n: 2,
-            }),
-            signal: AbortSignal.timeout(15000),
+        const requestBody = JSON.stringify({
+            model,
+            query: 'What is BeeFlow?',
+            documents: [
+                'BeeFlow is an AI-powered productivity platform.',
+                'The weather today is sunny.',
+                'BeeFlow helps teams collaborate with intelligent agents.',
+            ],
+            top_n: 2,
         });
+        const headers = {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${key}`,
+        };
 
-        const latencyMs = Date.now() - start;
+        // Try paths in order
+        const PATHS = ['/providers/cohere/v2/rerank', '/v1/rerank', '/v2/rerank'];
+        let lastError = '';
+        for (const path of PATHS) {
+            const url = `${endpoint}${path}`;
+            const rerankerRes = await fetch(url, {
+                method: 'POST',
+                headers,
+                body: requestBody,
+                signal: AbortSignal.timeout(15000),
+            });
 
-        if (rerankerRes.ok) {
-            const data = await rerankerRes.json();
-            res.json({ success: true, latencyMs, results: data.results?.length || 0 });
-        } else {
-            const errBody = await rerankerRes.text().catch(() => '');
-            res.status(502).json({ error: `Reranker responded ${rerankerRes.status}: ${errBody.slice(0, 300)}` });
+            const latencyMs = Date.now() - start;
+
+            if (rerankerRes.ok) {
+                const data = await rerankerRes.json();
+                return res.json({ success: true, latencyMs, results: data.results?.length || 0, path });
+            }
+            lastError = await rerankerRes.text().catch(() => '');
+            if (rerankerRes.status === 401 || rerankerRes.status === 403) {
+                return res.status(502).json({ error: `Auth failed (${rerankerRes.status}): ${lastError.slice(0, 300)}` });
+            }
         }
+        res.status(502).json({ error: `All paths failed. Last: ${lastError.slice(0, 300)}` });
     } catch (err) {
         console.error('[Config] Test reranker error:', err);
         res.status(500).json({ error: err.message });
