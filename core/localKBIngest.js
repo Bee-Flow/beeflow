@@ -501,8 +501,8 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
             if (!contentMap.has(row.id)) contentMap.set(row.id, row);
         });
 
-        // D. Sort by fused score and return
-        const results = Array.from(scores.entries())
+        // D. Sort by fused score and take top candidates for reranking
+        let results = Array.from(scores.entries())
             .map(([id, score]) => {
                 const row = contentMap.get(id);
                 return {
@@ -513,7 +513,44 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
                 };
             })
             .sort((a, b) => b.score - a.score)
-            .slice(0, topK);
+            .slice(0, Math.max(topK, 20)); // Take extra candidates for reranking
+
+        // E. Rerank via local cross-encoder sidecar (if available)
+        const rerankerUrl = process.env.RERANKER_URL;
+        if (rerankerUrl && results.length > 0) {
+            try {
+                const rerankerRes = await fetch(`${rerankerUrl}/rerank`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        query,
+                        documents: results.map(r => r.content),
+                        top_n: topK,
+                    }),
+                    signal: AbortSignal.timeout(10000),
+                });
+
+                if (rerankerRes.ok) {
+                    const rerankerData = await rerankerRes.json();
+                    if (rerankerData.results && rerankerData.results.length > 0) {
+                        // Replace RRF results with reranked results (scores in 0-1 range)
+                        results = rerankerData.results.map(rr => ({
+                            content: results[rr.index].content,
+                            title: results[rr.index].title,
+                            source_uri: results[rr.index].source_uri,
+                            score: rr.relevance_score,
+                        }));
+                        console.log(`[LocalKBSearch] Reranked ${rerankerData.results.length} results in ${rerankerData.latency_ms || '?'}ms (top=${results[0]?.score})`);
+                    }
+                } else {
+                    console.warn(`[LocalKBSearch] Reranker responded ${rerankerRes.status}, falling back to RRF`);
+                }
+            } catch (rerankerErr) {
+                console.warn(`[LocalKBSearch] Reranker unavailable (${rerankerErr.message}), falling back to RRF`);
+            }
+        }
+
+        results = results.slice(0, topK);
 
         console.log(`[LocalKBSearch] Found ${results.length} results (vec=${vectorResults.rows.length}, fts=${ftsResults.rows.length})`);
         return results;

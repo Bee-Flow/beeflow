@@ -67,9 +67,12 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
     }
 
     if (allKnowledgeResults.length > 0) {
-        allKnowledgeResults.sort((a, b) => (b.score || 0) - (a.score || 0));
-        
-        const MIN_SCORE = 0.25;
+        // Score threshold differs between backends:
+        //   - Search-service rerank scores are in 0..1 range → 0.25 is a reasonable cutoff
+        //   - Local RRF (Reciprocal Rank Fusion) scores are ~0.003-0.03 → skip threshold
+        const maxKBScore = Math.max(...allKnowledgeResults.map(r => r.score || 0), 0);
+        const isRRFScoring = maxKBScore > 0 && maxKBScore < 0.1;
+        const MIN_SCORE = isRRFScoring ? 0 : 0.25;
         allKnowledgeResults = allKnowledgeResults.filter(r => (r.score || 0) >= MIN_SCORE);
 
         const sourceMap = new Map();

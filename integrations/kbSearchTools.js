@@ -112,9 +112,17 @@ async function executeKbSearchTool(toolName, args, context = {}) {
             chunks = searchData.chunks || searchData.results || [];
         }
 
-        // Format results for the agent
+        // Format results for the agent.
+        // The score threshold differs between backends:
+        //   - Search-service rerank scores are in 0..1 range → 0.3 is a reasonable cutoff
+        //   - Local RRF (Reciprocal Rank Fusion) scores are in 0..0.03 range → no cutoff needed
+        //     because RRF already sorts by relevance and we respect topK
+        const maxScore = Math.max(...chunks.map(c => c.score || c.rerank_score || 0), 0);
+        const isRRF = maxScore > 0 && maxScore < 0.1; // RRF scores are always << 0.1
+        const scoreThreshold = isRRF ? 0 : 0.3;
+
         const results = chunks
-            .filter(c => (c.score || c.rerank_score || 0) >= 0.3)
+            .filter(c => (c.score || c.rerank_score || 0) >= scoreThreshold)
             .map((c, i) => ({
                 result_number: i + 1,
                 title: c.title || c.source_uri || 'Knowledge Base',
@@ -123,7 +131,7 @@ async function executeKbSearchTool(toolName, args, context = {}) {
                 score: Math.round((c.score || c.rerank_score || 0) * 1000) / 1000
             }));
 
-        console.log(`[KBSearch] Found ${results.length} results (from ${chunks.length} chunks)`);
+        console.log(`[KBSearch] Found ${results.length} results (from ${chunks.length} chunks, threshold=${scoreThreshold}, maxScore=${maxScore.toFixed(4)})`);
 
         return {
             _action: 'kb_sources',
