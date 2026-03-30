@@ -29,9 +29,12 @@ function estimateTokens(text) {
 }
 
 /**
- * Convert HTML tables (from Azure Document Intelligence) to markdown tables.
- * Azure Doc Intelligence v4.0+ outputs HTML tables in markdown mode for fidelity.
- * We convert them to clean markdown for better LLM readability and FTS indexing.
+ * Convert HTML tables (from Azure Document Intelligence) to markdown tables or plain text.
+ * Azure Doc Intelligence v4.0+ outputs HTML tables in markdown mode for fidelity,
+ * but also wraps regular paragraph text in table structures (layout tables).
+ *
+ * - Single-column tables → plain text (paragraphs)
+ * - Multi-column data tables → markdown tables
  */
 function convertHtmlTablesToMarkdown(text) {
     if (!text) return text;
@@ -49,6 +52,7 @@ function convertHtmlTablesToMarkdown(text) {
                 while ((cellMatch = cellRegex.exec(trMatch[0])) !== null) {
                     // Strip inner HTML tags, trim whitespace
                     const cellText = cellMatch[1]
+                        .replace(/<br\s*\/?>/gi, '\n')
                         .replace(/<[^>]+>/g, '')
                         .replace(/\s+/g, ' ')
                         .trim();
@@ -59,14 +63,25 @@ function convertHtmlTablesToMarkdown(text) {
 
             if (rows.length === 0) return tableHtml; // can't parse, keep original
 
-            // Normalize column count
+            // Detect layout tables: mostly single-cell rows or uniform 1-2 column text
             const maxCols = Math.max(...rows.map(r => r.length));
+            const singleCellRows = rows.filter(r => r.length === 1 || r.filter(c => c).length <= 1).length;
+            const isLayoutTable = maxCols <= 2 && singleCellRows > rows.length * 0.6;
+
+            if (isLayoutTable) {
+                // Layout table → extract as plain text paragraphs
+                const paragraphs = rows
+                    .map(r => r.filter(c => c).join(' '))
+                    .filter(p => p.trim());
+                return '\n\n' + paragraphs.join('\n\n') + '\n\n';
+            }
+
+            // Real data table → convert to markdown table
             const normalized = rows.map(r => {
                 while (r.length < maxCols) r.push('');
                 return r;
             });
 
-            // Build markdown table
             const lines = [];
             lines.push('| ' + normalized[0].join(' | ') + ' |');
             lines.push('| ' + normalized[0].map(() => '---').join(' | ') + ' |');
