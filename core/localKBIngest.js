@@ -661,7 +661,14 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
             // ── Azure Cohere rerank ──
             try {
                 const endpoint = azureRerankerEndpoint.replace(/\/+$/, '');
-                const rerankerRes = await fetch(`${endpoint}/providers/cohere/v2/rerank`, {
+                // Azure AI Foundry serverless endpoints: use /v1/rerank
+                // AI Services hub endpoints (*.services.ai.azure.com): use /v2/rerank
+                const isServicesHub = endpoint.includes('.services.ai.azure.com');
+                const rerankerUrl = isServicesHub
+                    ? `${endpoint}/models/rerank`
+                    : `${endpoint}/v1/rerank`;
+                console.log(`[LocalKBSearch] Calling Azure reranker: ${rerankerUrl} (model=${azureRerankerModel}, docs=${results.length})`);
+                const rerankerRes = await fetch(rerankerUrl, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',

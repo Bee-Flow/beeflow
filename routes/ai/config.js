@@ -410,7 +410,11 @@ router.post('/config/test-reranker', requireAuth, async (req, res) => {
         }
 
         const start = Date.now();
-        const rerankerRes = await fetch(`${endpoint}/providers/cohere/v2/rerank`, {
+        const isServicesHub = endpoint.includes('.services.ai.azure.com');
+        const rerankerUrl = isServicesHub
+            ? `${endpoint}/models/rerank`
+            : `${endpoint}/v1/rerank`;
+        const rerankerRes = await fetch(rerankerUrl, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
