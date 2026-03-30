@@ -573,7 +573,7 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
                 const vectorStr = `[${queryEmbedding[0].join(',')}]`;
 
                 vectorResults = await client.query(
-                    `SELECT id, title, content, source_uri,
+                    `SELECT id, title, content, source_uri, document_id, chunk_id,
                             1 - (embedding <=> $1::vector) AS vec_score
                      FROM kb_chunks
                      WHERE tenant_id = $2
@@ -597,7 +597,7 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
         if (sanitizedQuery.length > 0) {
             try {
                 ftsResults = await client.query(
-                    `SELECT id, title, content, source_uri,
+                    `SELECT id, title, content, source_uri, document_id, chunk_id,
                             GREATEST(
                                 ts_rank_cd(tsv, websearch_to_tsquery('dutch', $1)),
                                 ts_rank_cd(tsv, websearch_to_tsquery('english', $1)),
@@ -642,14 +642,59 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
             .map(([id, score]) => {
                 const row = contentMap.get(id);
                 return {
+                    id: row.id,
                     content: row.content,
                     title: row.title || '',
                     source_uri: row.source_uri || '',
                     score,
+                    document_id: row.document_id,
+                    chunk_id: row.chunk_id,
                 };
             })
             .sort((a, b) => b.score - a.score)
             .slice(0, Math.max(topK, 20)); // Take extra candidates for reranking
+
+        // D2. Context window expansion: fetch adjacent chunks for table completeness
+        //     When a table chunk is found, we also pull its neighbors (chunk_id ± 1)
+        //     from the same document to give the agent the full picture.
+        if (results.length > 0) {
+            try {
+                const existingIds = new Set(results.map(r => r.id));
+                const adjacentRows = await client.query(
+                    `SELECT DISTINCT ON (c.id) c.id, c.title, c.content, c.source_uri, c.document_id, c.chunk_id
+                     FROM kb_chunks c
+                     INNER JOIN (
+                         SELECT document_id, chunk_id FROM kb_chunks WHERE id = ANY($1::uuid[])
+                     ) h ON c.document_id = h.document_id
+                        AND c.chunk_id BETWEEN h.chunk_id - 1 AND h.chunk_id + 1
+                     WHERE c.tenant_id = $2
+                       AND c.id != ALL($1::uuid[])
+                     LIMIT 30`,
+                    [results.map(r => r.id), tenantId]
+                );
+
+                for (const adj of adjacentRows.rows) {
+                    if (!existingIds.has(adj.id)) {
+                        existingIds.add(adj.id);
+                        results.push({
+                            id: adj.id,
+                            content: adj.content,
+                            title: adj.title || '',
+                            source_uri: adj.source_uri || '',
+                            score: 0, // will be scored by reranker
+                            document_id: adj.document_id,
+                            chunk_id: adj.chunk_id,
+                        });
+                    }
+                }
+
+                if (adjacentRows.rows.length > 0) {
+                    console.log(`[LocalKBSearch] Context window: added ${adjacentRows.rows.length} adjacent chunks`);
+                }
+            } catch (adjErr) {
+                console.warn(`[LocalKBSearch] Context window expansion failed: ${adjErr.message}`);
+            }
+        }
 
         // E. Rerank via Azure Cohere or local cross-encoder sidecar
         const azureRerankerEndpoint = await configStore.getConfig('azure_reranker_endpoint') || process.env.AZURE_RERANKER_ENDPOINT;

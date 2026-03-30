@@ -78,22 +78,8 @@ async function extractFileContent(buffer, mime, filename) {
             console.warn('[KBHelpers] pdfExtractor failed:', e.message);
         }
 
-        // Fallback: Mistral OCR for scanned PDFs
-        if (!content || content.trim().length < 20) {
-            try {
-                const { getMistralOCRApiKey, mistralOCR } = require('./ocr');
-                if (await getMistralOCRApiKey()) {
-                    console.log(`[KBHelpers] Extraction: Mistral OCR (scanned PDF fallback)`);
-                    const base64 = buffer.toString('base64');
-                    content = await mistralOCR(base64, mime, filename);
-                }
-            } catch (e) {
-                console.warn('[KBHelpers] Mistral OCR fallback failed:', e.message);
-            }
-        }
-
         if (!content || content.trim().length < 10) {
-            throw new Error('Could not extract text from PDF. The file may be a scanned document without a text layer.');
+            throw new Error('Could not extract text from PDF. Enable Azure Document Intelligence for scanned documents, or ensure the PDF has a text layer.');
         }
         return content;
     }
