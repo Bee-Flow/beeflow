@@ -189,6 +189,20 @@ router.get('/callback', async (req, res) => {
 
 // === Multi-Provider OAuth Routes ===
 
+// When popup=1 (embedded iframe mode), we serve an intermediate HTML page
+// instead of a 302 redirect. This cleans the Referer header and severs the
+// iframe->popup->provider relationship so Google/Microsoft don't block it.
+function popupRedirect(res, url) {
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.send(`<!DOCTYPE html><html><head>
+<meta http-equiv="refresh" content="0;url=${url}">
+<meta name="referrer" content="no-referrer">
+</head><body>
+<script>window.location.replace(${JSON.stringify(url)});</script>
+<p style="font-family:sans-serif;text-align:center;margin-top:40px">Redirecting...</p>
+</body></html>`);
+}
+
 // Provider-specific login - redirects to OAuth provider
 router.get('/login/:provider', async (req, res) => {
     const { provider } = req.params;
@@ -197,6 +211,12 @@ router.get('/login/:provider', async (req, res) => {
     const returnTo = getReturnUrl(req);
     req.session.returnTo = returnTo;
     req.session.oauthProvider = provider;
+
+    // When ?popup=1 is set (embedded iframe mode), remember so the callback
+    // can render a postMessage page instead of a redirect.
+    if (req.query.popup === '1') {
+        req.session.oauthPopup = true;
+    }
 
     console.log(`[OAuth] Login SessionID: ${req.sessionID}`);
 
@@ -250,7 +270,10 @@ router.get('/login/:provider', async (req, res) => {
             prompt: 'consent'
         }).toString();
 
-        req.session.save(() => res.redirect(authUrl));
+        req.session.save(() => {
+            if (req.session.oauthPopup) return popupRedirect(res, authUrl);
+            res.redirect(authUrl);
+        });
 
     } else if (provider === 'microsoft') {
         const providerConfig = config.providers?.microsoft || {};
@@ -282,6 +305,7 @@ router.get('/login/:provider', async (req, res) => {
         req.session.save((err) => {
             if (err) console.error(`[OAuth/Microsoft] Session save error on login redirect:`, err);
             else console.log(`[OAuth/Microsoft] Session saved, redirecting to Microsoft...`);
+            if (req.session.oauthPopup) return popupRedirect(res, authUrl);
             res.redirect(authUrl);
         });
 
@@ -299,7 +323,10 @@ router.get('/login/:provider', async (req, res) => {
         }).toString();
 
         console.log(`[OAuth] Nextcloud State Saved: ${state}`);
-        req.session.save(() => res.redirect(authUrl));
+        req.session.save(() => {
+            if (req.session.oauthPopup) return popupRedirect(res, authUrl);
+            res.redirect(authUrl);
+        });
     } else {
         res.redirect(`${returnTo}?error=unknown_provider`);
     }
@@ -754,6 +781,26 @@ router.get('/callback/:provider', async (req, res) => {
         req.session.save((err) => {
             if (err) console.error(`[OAuth/${provider}] SESSION SAVE ERROR:`, err);
             else console.log(`[OAuth/${provider}] === LOGIN COMPLETE === Redirecting user ${user.id}`);
+
+            // Popup mode (embedded iframe): render a tiny HTML page that
+            // posts a message to the parent/opener and closes itself.
+            if (req.session.oauthPopup) {
+                delete req.session.oauthPopup;
+                req.session.save(); // persist the deletion
+                const html = `<!DOCTYPE html><html><head><title>Login Complete</title></head><body>
+<script>
+  try {
+    if (window.opener) {
+      window.opener.postMessage({ type: 'beeflow-oauth-complete' }, '*');
+    }
+  } catch(e) {}
+  window.close();
+</script>
+<p style="font-family:sans-serif;text-align:center;margin-top:40px">Login complete. You can close this window.</p>
+</body></html>`;
+                return res.send(html);
+            }
+
             res.redirect(returnTo);
         });
 

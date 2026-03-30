@@ -1397,8 +1397,20 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         try {
                             const conv = await agentStore.getConversationById(conversation.id, userAuth.encryptionKey);
                             if (conv && conv.messages) {
+                                // Find the LAST user message (more robust than index-based lookup)
+                                let lastUserIdx = -1;
+                                for (let i = conv.messages.length - 1; i >= 0; i--) {
+                                    if (conv.messages[i].role === 'user') {
+                                        lastUserIdx = i;
+                                        break;
+                                    }
+                                }
+                                if (lastUserIdx < 0) {
+                                    console.warn('[RegexGuard] No user message found for redaction');
+                                    return;
+                                }
                                 const updatedMessages = conv.messages.map((m, idx) => {
-                                    if (m.role === 'user' && idx === conv.messages.length - 2) {
+                                    if (idx === lastUserIdx) {
                                         return { ...m, content: redactedContent, isRedacted: true };
                                     }
                                     return m;
