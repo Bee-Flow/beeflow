@@ -29,6 +29,59 @@ function estimateTokens(text) {
 }
 
 /**
+ * Convert HTML tables (from Azure Document Intelligence) to markdown tables.
+ * Azure Doc Intelligence v4.0+ outputs HTML tables in markdown mode for fidelity.
+ * We convert them to clean markdown for better LLM readability and FTS indexing.
+ */
+function convertHtmlTablesToMarkdown(text) {
+    if (!text) return text;
+
+    return text.replace(/<table[\s\S]*?<\/table>/gi, (tableHtml) => {
+        try {
+            // Extract all rows
+            const rows = [];
+            const trRegex = /<tr[\s\S]*?<\/tr>/gi;
+            let trMatch;
+            while ((trMatch = trRegex.exec(tableHtml)) !== null) {
+                const cells = [];
+                const cellRegex = /<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi;
+                let cellMatch;
+                while ((cellMatch = cellRegex.exec(trMatch[0])) !== null) {
+                    // Strip inner HTML tags, trim whitespace
+                    const cellText = cellMatch[1]
+                        .replace(/<[^>]+>/g, '')
+                        .replace(/\s+/g, ' ')
+                        .trim();
+                    cells.push(cellText);
+                }
+                if (cells.length > 0) rows.push(cells);
+            }
+
+            if (rows.length === 0) return tableHtml; // can't parse, keep original
+
+            // Normalize column count
+            const maxCols = Math.max(...rows.map(r => r.length));
+            const normalized = rows.map(r => {
+                while (r.length < maxCols) r.push('');
+                return r;
+            });
+
+            // Build markdown table
+            const lines = [];
+            lines.push('| ' + normalized[0].join(' | ') + ' |');
+            lines.push('| ' + normalized[0].map(() => '---').join(' | ') + ' |');
+            for (let i = 1; i < normalized.length; i++) {
+                lines.push('| ' + normalized[i].join(' | ') + ' |');
+            }
+
+            return '\n' + lines.join('\n') + '\n';
+        } catch {
+            return tableHtml; // on any error, keep original
+        }
+    });
+}
+
+/**
  * Extract structural blocks (HTML tables, markdown tables, fenced code blocks)
  * from text and replace them with placeholders. Returns the cleaned text and
  * a map of placeholder → original block.
@@ -165,6 +218,9 @@ function splitLongSection(text, chunkSize) {
  */
 function chunkText(text) {
     if (!text || !text.trim()) return [];
+
+    // Phase 0: Convert HTML tables → Markdown tables (Azure Doc Intelligence outputs HTML)
+    text = convertHtmlTablesToMarkdown(text);
 
     // Phase 1: Extract atomic blocks (tables, code blocks) → placeholders
     const { cleaned, blocks } = extractAtomicBlocks(text);
@@ -664,11 +720,11 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
                     `SELECT DISTINCT ON (c.id) c.id, c.title, c.content, c.source_uri, c.document_id, c.chunk_id
                      FROM kb_chunks c
                      INNER JOIN (
-                         SELECT document_id, chunk_id FROM kb_chunks WHERE id = ANY($1::uuid[])
+                         SELECT document_id, chunk_id FROM kb_chunks WHERE id = ANY($1::bigint[])
                      ) h ON c.document_id = h.document_id
                         AND c.chunk_id BETWEEN h.chunk_id - 1 AND h.chunk_id + 1
                      WHERE c.tenant_id = $2
-                       AND c.id != ALL($1::uuid[])
+                       AND c.id != ALL($1::bigint[])
                      LIMIT 30`,
                     [results.map(r => r.id), tenantId]
                 );
