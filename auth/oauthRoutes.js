@@ -662,6 +662,8 @@ router.get('/callback/:provider', async (req, res) => {
         }
         // Also check if user has orgRole set directly
         if (freshUser?.orgRole) userHasOrg = true;
+        // Also check if user has an organizationId set directly (e.g. added manually by admin)
+        if (freshUser?.organizationId) userHasOrg = true;
 
         // If user has no org, try domain-matching
         let pendingApproval = false;
