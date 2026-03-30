@@ -15,8 +15,8 @@ const configStore = require('../stores/configStore');
 
 // ── Token-aware text chunking ───────────────────────────────────────
 
-const CHUNK_SIZE = 200;    // tokens per chunk
-const CHUNK_OVERLAP = 50;  // token overlap
+const CHUNK_SIZE = 500;    // tokens per chunk (larger = more context per hit)
+const CHUNK_OVERLAP = 100; // token overlap (ensures continuity between chunks)
 
 /**
  * Simple token counter based on whitespace + punctuation splitting.
@@ -450,13 +450,11 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
         }
 
         // B. Full-text search
+        // websearch_to_tsquery expects natural language — just sanitize special chars
         let ftsResults = { rows: [] };
         const sanitizedQuery = query
             .replace(/[\\\"'*^$(){}[\]\\\\]/g, '')
-            .split(/\s+/)
-            .filter(w => w.length > 1)
-            .filter(w => !/^(AND|OR|NOT|NEAR)$/i.test(w))
-            .join(' & ');
+            .trim();
 
         if (sanitizedQuery.length > 0) {
             try {

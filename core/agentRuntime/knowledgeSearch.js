@@ -91,7 +91,7 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
         mergedResults.sort((a, b) => (b.score || 0) - (a.score || 0));
         const topResults = mergedResults.slice(0, 10);
 
-        const MAX_CONTENT_CHARS = 800;
+        const MAX_CONTENT_CHARS = 2000;
         for (const result of topResults) {
             if (result.content && result.content.length > MAX_CONTENT_CHARS) {
                 result.content = result.content.slice(0, MAX_CONTENT_CHARS) + '…';
