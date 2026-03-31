@@ -349,8 +349,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     // Block content from reaching the AI when guardrails fire
     if (moderationViolation || guardrailViolation) {
         console.log(`[AgentRuntime] Guardrail block — content not sent to AI. moderation=${moderationViolation}, guardrail=${guardrailViolation}`);
-        onEvent('done', {});
-        return { response: '', toolCalls: [] };
+        return { response: '', toolCalls: [], guardrailViolation: true };
     }
 
     // ============ MEMORY INTEGRATION ============
