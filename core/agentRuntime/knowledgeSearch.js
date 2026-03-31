@@ -81,7 +81,50 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
         // merging then truncating was hiding most of the content from the model).
         // Sort by score, take top results for the system prompt.
         allKnowledgeResults.sort((a, b) => (b.score || 0) - (a.score || 0));
-        const topResults = allKnowledgeResults.slice(0, 12);
+
+        // ── Near-duplicate deduplication ─────────────────────────────
+        // Chunks with overlapping content (from sliding-window overlap or
+        // similar table structures) can flood the top-K. Remove chunks
+        // whose content is >85% similar (Jaccard on word tokens) to a
+        // higher-scoring chunk already in the list.
+        function getContentTokens(text) {
+            if (!text) return new Set();
+            // Strip heading breadcrumb lines for comparison
+            const body = text.replace(/^#{1,6}\s+.+$/gm, '').trim();
+            return new Set(body.toLowerCase().split(/\s+/).filter(t => t.length > 2));
+        }
+        function jaccardSimilarity(setA, setB) {
+            if (setA.size === 0 && setB.size === 0) return 1;
+            let intersection = 0;
+            for (const t of setA) { if (setB.has(t)) intersection++; }
+            return intersection / (setA.size + setB.size - intersection);
+        }
+
+        const deduped = [];
+        const dedupedTokenSets = [];
+        const SIMILARITY_THRESHOLD = 0.85;
+        const TOP_K_DEFAULT = 3;       // Show at least top 3
+        const TOP_K_MAX = 10;          // Never exceed 10
+        const HIGH_SCORE_THRESHOLD = 0.80; // Include all chunks scoring ≥ 80%
+        for (const result of allKnowledgeResults) {
+            const tokens = getContentTokens(result.content);
+            let isDuplicate = false;
+            for (const existing of dedupedTokenSets) {
+                if (jaccardSimilarity(tokens, existing) >= SIMILARITY_THRESHOLD) {
+                    isDuplicate = true;
+                    break;
+                }
+            }
+            if (!isDuplicate) {
+                const score = result.score || 0;
+                // Stop collecting once we've hit the default AND this chunk is below threshold
+                if (deduped.length >= TOP_K_DEFAULT && score < HIGH_SCORE_THRESHOLD) break;
+                deduped.push(result);
+                dedupedTokenSets.push(tokens);
+            }
+            if (deduped.length >= TOP_K_MAX) break;
+        }
+        const topResults = deduped;
 
         // Per-chunk content cap: keep context manageable for the model.
         const MAX_CHUNK_CHARS = 4000;
@@ -127,9 +170,17 @@ ${knowledgeText}
                 onEvent('kb_sources', {
                     sources: topResults.map((k, i) => {
                         const docTitle = k.metadata?.source || k.metadata?.source_uri || 'Unknown Source';
-                        // Extract section heading from chunk content for display
-                        const headingMatch = (k.content || '').match(/^#{1,6}\s+(.+)$/m);
-                        const sectionLabel = headingMatch ? headingMatch[1].trim() : `Chunk ${i + 1}`;
+                        // Extract the deepest (most specific) heading for display
+                        const headings = (k.content || '').match(/^#{1,6}\s+(.+)$/gm) || [];
+                        const deepestHeading = headings.length > 0
+                            ? headings[headings.length - 1].replace(/^#{1,6}\s+/, '').trim()
+                            : null;
+                        // Build section label: heading + content preview for disambiguation
+                        const bodyText = (k.content || '').replace(/^#{1,6}\s+.+$/gm, '').replace(/^\|.*$/gm, '').trim();
+                        const previewSnippet = bodyText.split(/[.!?\n]/).filter(s => s.trim().length > 10)[0]?.trim() || '';
+                        const sectionLabel = deepestHeading
+                            ? (previewSnippet ? `${deepestHeading} — ${previewSnippet.slice(0, 60)}` : deepestHeading)
+                            : (previewSnippet ? previewSnippet.slice(0, 80) : `Chunk ${i + 1}`);
                         return {
                             title: docTitle,
                             section: sectionLabel,

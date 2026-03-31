@@ -275,14 +275,23 @@ function chunkText(text) {
     }
 
     /**
-     * Prepend heading breadcrumb to text if it doesn't already start with a heading.
+     * Prepend heading breadcrumb to text for structural context.
+     * - If text has no headings: prepend full breadcrumb
+     * - If text starts with heading level N: prepend only parent levels (1..N-1)
      */
     function prependBreadcrumb(text) {
         if (!text) return text;
+        const firstHeadingMatch = text.match(/^(#{1,6})\s+/m);
+        if (firstHeadingMatch) {
+            // Text already has a heading — prepend only parent levels above it
+            const textLevel = firstHeadingMatch[1].length - 1; // 0-indexed
+            const parents = headingStack.slice(0, textLevel).filter(h => h);
+            if (parents.length === 0) return text;
+            return `${parents.join('\n')}\n\n${text}`;
+        }
+        // No heading in text — prepend full breadcrumb
         const breadcrumb = getHeadingBreadcrumb();
         if (!breadcrumb) return text;
-        // Don't prepend if text already starts with a heading
-        if (/^#{1,6}\s+/m.test(text)) return text;
         return `${breadcrumb}\n\n${text}`;
     }
 
@@ -302,7 +311,21 @@ function chunkText(text) {
 
         // Atomic blocks up to CHUNK_SIZE_FLEX stay whole (even if > CHUNK_SIZE)
         if (isAtomicBlock && sectionTokens <= CHUNK_SIZE_FLEX) {
-            // Flush current buffer first
+            // Check if the last buffered part is a short label/description
+            // (e.g. "**Salarisschaal 2024-01**") that should stay with the table
+            let labelPrefix = '';
+            const MAX_LABEL_TOKENS = 100;
+            if (currentParts.length > 0) {
+                const lastPart = currentParts[currentParts.length - 1];
+                const lastPartTokens = estimateTokens(lastPart);
+                if (lastPartTokens <= MAX_LABEL_TOKENS && !/^#{1,6}\s+/m.test(lastPart)) {
+                    // Short non-heading text — carry it forward as a label for this table
+                    labelPrefix = lastPart.trim();
+                    currentParts.pop();
+                    currentTokenCount -= lastPartTokens;
+                }
+            }
+            // Flush remaining buffer
             if (currentParts.length > 0) {
                 const ct = currentParts.join('\n\n').trim();
                 if (ct) {
@@ -312,8 +335,12 @@ function chunkText(text) {
                 currentParts = [];
                 currentTokenCount = 0;
             }
-            // Emit the atomic block as its own chunk with heading breadcrumb
-            let atomicText = prependBreadcrumb(section.trim());
+            // Emit the atomic block with heading breadcrumb + label prefix
+            let atomicText = section.trim();
+            if (labelPrefix) {
+                atomicText = `${labelPrefix}\n\n${atomicText}`;
+            }
+            atomicText = prependBreadcrumb(atomicText);
             const atomicTokens = estimateTokens(atomicText);
             chunks.push({ chunk_id: chunkId, text: atomicText, token_count: atomicTokens });
             chunkId++;

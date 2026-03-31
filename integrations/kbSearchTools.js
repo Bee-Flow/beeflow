@@ -133,13 +133,41 @@ async function executeKbSearchTool(toolName, args, context = {}) {
                 score: Math.round((c.score || c.rerank_score || 0) * 1000) / 1000
             }));
 
+        // ── Near-duplicate deduplication (Jaccard on word tokens) ────
+        function getTokenSet(text) {
+            if (!text) return new Set();
+            const body = text.replace(/^#{1,6}\s+.+$/gm, '').trim();
+            return new Set(body.toLowerCase().split(/\s+/).filter(t => t.length > 2));
+        }
+        function jaccard(a, b) {
+            if (a.size === 0 && b.size === 0) return 1;
+            let inter = 0;
+            for (const t of a) { if (b.has(t)) inter++; }
+            return inter / (a.size + b.size - inter);
+        }
+        const dedupResults = [];
+        const dedupSets = [];
+        for (const r of results) {
+            const ts = getTokenSet(r.content);
+            if (!dedupSets.some(ex => jaccard(ts, ex) >= 0.85)) {
+                dedupResults.push(r);
+                dedupSets.push(ts);
+            }
+        }
+
         const topScore = chunks.length > 0 ? Math.max(...chunks.map(c => c.score || c.rerank_score || 0)) : 0;
-        console.log(`[KBSearch] Found ${results.length} results (from ${chunks.length} chunks, reranker=${hasReranker}, topScore=${topScore.toFixed(4)})`);
+        console.log(`[KBSearch] Found ${dedupResults.length} results (from ${chunks.length} chunks, deduped from ${results.length}, reranker=${hasReranker}, topScore=${topScore.toFixed(4)})`);
         return {
             _action: 'kb_sources',
-            _sources: results.map((r, i) => {
-                const headingMatch = (r.content || '').match(/^#{1,6}\s+(.+)$/m);
-                const sectionLabel = headingMatch ? headingMatch[1].trim() : `Chunk ${i + 1}`;
+            _sources: dedupResults.map((r, i) => {
+                // Extract deepest heading + content preview for distinctive label
+                const headings = (r.content || '').match(/^#{1,6}\s+(.+)$/gm) || [];
+                const deepest = headings.length > 0 ? headings[headings.length - 1].replace(/^#{1,6}\s+/, '').trim() : null;
+                const body = (r.content || '').replace(/^#{1,6}\s+.+$/gm, '').replace(/^\|.*$/gm, '').trim();
+                const snippet = body.split(/[.!?\n]/).filter(s => s.trim().length > 10)[0]?.trim() || '';
+                const sectionLabel = deepest
+                    ? (snippet ? `${deepest} — ${snippet.slice(0, 60)}` : deepest)
+                    : (snippet ? snippet.slice(0, 80) : `Chunk ${i + 1}`);
                 return {
                     title: r.source_url || r.title,
                     section: sectionLabel,
@@ -149,9 +177,9 @@ async function executeKbSearchTool(toolName, args, context = {}) {
                 };
             }),
             query,
-            resultCount: results.length,
-            results,
-            instruction: results.length > 0
+            resultCount: dedupResults.length,
+            results: dedupResults,
+            instruction: dedupResults.length > 0
                 ? 'Use this knowledge base information to provide accurate and detailed answers. Cite sources when possible.'
                 : 'No relevant results found. You may try a different search query or answer based on general knowledge.'
         };
