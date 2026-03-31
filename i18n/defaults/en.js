@@ -149,6 +149,7 @@ const GUI_DEFAULTS = {
     'chat.guardrail_message_violation': 'Message Policy Violation',
     'chat.guardrail_will_redact': 'Sensitive content will be redacted in {seconds} seconds',
     'chat.guardrail_will_delete': 'This message will be deleted in {seconds} seconds',
+    'chat.message_removed': 'Message removed by security policy',
 
     // ── Common / Shared ─────────────────────────────────────────
     'common.save': 'Save',

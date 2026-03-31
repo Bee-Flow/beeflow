@@ -355,24 +355,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     const isStrictKnowledge = agent.config?.strictKnowledge === true;
     let systemPrompt = await buildSystemPrompt({ agent, tools, userId, messageMetadata, memoryContext, isStrictKnowledge });
 
-    // ============ VECTOR KNOWLEDGE BASE ============
-    try {
-        const kbExtension = await performKnowledgeSearch({ agent, userId, userMessage, isStrictKnowledge, onEvent });
-        if (kbExtension) {
-            systemPrompt += kbExtension;
-            // kb_search tool stays available for follow-up targeted searches.
-            // The auto-injection provides broad context; the agent can drill deeper if needed.
-        }
-    } catch (kErr) {
-        console.error('[AgentRuntime] Knowledge retrieval failed:', kErr.message);
-        // Continue without knowledge — kb_search tool stays available as fallback
-    }
-
-    // ============ WORKSPACE INTEGRATION ============
-    // Workspace streaming/parsing is handled in the stream loop below;
-    // no system prompt injection needed.
-
-    // Verify Guardrails if enabled (AI Content Moderation)
+    // ============ GUARDRAILS (before KB search — block early) ============
     const guardrailsResult = await runInputGuardrails({ agent, messages, userMessage, globalConfig, onEvent });
     let moderationViolation = guardrailsResult.moderationViolation;
     let guardrailViolation = guardrailsResult.guardrailViolation;
@@ -387,6 +370,82 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         if (messages[lastMsgIndex]?.role === 'user') {
             messages[lastMsgIndex].content = processedUserMessage;
         }
+    }
+
+    // ============ VECTOR KNOWLEDGE BASE ============
+    // Only search KB if guardrails did NOT fire — prevents leaking sensitive KB content
+    if (!moderationViolation && !guardrailViolation) {
+        try {
+            const kbExtension = await performKnowledgeSearch({ agent, userId, userMessage, isStrictKnowledge, onEvent });
+            if (kbExtension) {
+                systemPrompt += kbExtension;
+            }
+        } catch (kErr) {
+            console.error('[AgentRuntime] Knowledge retrieval failed:', kErr.message);
+        }
+    }
+
+    // ============ WORKSPACE INTEGRATION ============
+    // Workspace streaming/parsing is handled in the stream loop below;
+    // no system prompt injection needed.
+
+    // ── Hard block: skip AI entirely when guardrails/moderation fired ──
+    // The AI must never see the user message or KB context when a violation is detected.
+    const hasViolation = moderationViolation || guardrailViolation;
+    if (hasViolation) {
+        const violationType = moderationViolation || guardrailViolation;
+        const cannedResponse = `Je bericht is gemarkeerd als **"${violationType}"**.\n\nDit bericht is geblokkeerd door ons beveiligingsbeleid en kan niet worden verwerkt. Wil je je vraag opnieuw formuleren?`;
+
+        // Stream the canned response to the client
+        onEvent('content', { text: cannedResponse });
+
+        // Persist the conversation with the canned response
+        const assistantMsg = {
+            role: 'assistant',
+            content: cannedResponse,
+            parentId: messageMetadata.parentId || null
+        };
+        messages.push(assistantMsg);
+        if (!isEphemeral) {
+            await agentStore.updateConversation(conversation.id, messages, userAuth.encryptionKey, userAuth.userId);
+        }
+
+        // Server-side persistence: redact/remove the violating user message
+        if (!isEphemeral) {
+            setImmediate(async () => {
+                try {
+                    const conv = await agentStore.getConversationById(conversation.id, userAuth.encryptionKey);
+                    if (conv && conv.messages) {
+                        let lastUserIdx = -1;
+                        for (let i = conv.messages.length - 1; i >= 0; i--) {
+                            if (conv.messages[i].role === 'user') { lastUserIdx = i; break; }
+                        }
+                        if (lastUserIdx >= 0) {
+                            const redactedContent = guardrailViolation
+                                ? '[Message removed - policy violation]'
+                                : (processedUserMessage !== userMessage ? processedUserMessage : '[Message removed - policy violation]');
+                            const updatedMessages = conv.messages.map((m, idx) =>
+                                idx === lastUserIdx ? { ...m, content: redactedContent, isRedacted: true } : m
+                            );
+                            await agentStore.updateConversation(conversation.id, updatedMessages, userAuth.encryptionKey, userAuth.userId);
+                            console.log(`[AgentRuntime] Guardrail: server-side redaction completed for conversation ${conversation.id}`);
+                        }
+                    }
+                } catch (err) {
+                    console.error('[AgentRuntime] Guardrail: server-side redaction failed:', err.message);
+                }
+            });
+        }
+
+        console.log(`[AgentRuntime] Guardrail hard-block — skipped AI entirely (violation: ${violationType})`);
+        return {
+            message: cannedResponse,
+            toolCalls: [],
+            conversationLength: messages.length,
+            conversationId: conversation.id,
+            guardrailViolation: violationType,
+            model: modelToUse
+        };
     }
 
     // Phase-driven execution state for swarms
@@ -456,10 +515,20 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             // Inject guardrail violation context if detected
             let effectiveSystemPrompt = systemPrompt;
             if (guardrailViolation && iterations === 1) {
-                effectiveSystemPrompt += `\n\n[IMPORTANT: The user's message contains content that violates guardrail rule(s): "${guardrailViolation}". You must politely decline to process this request and explain that the content violates the "${guardrailViolation}" policy. Do not attempt to answer the request.]`;
+                effectiveSystemPrompt += `\n\n[IMPORTANT: The user's message was blocked by guardrail rule(s): "${guardrailViolation}". You must politely decline to process this request and explain that the content violates the "${guardrailViolation}" policy. Do not attempt to answer the request.]`;
+                // Strip the violating user message — only send a placeholder to the model
+                const lastIdx = messages.length - 1;
+                if (messages[lastIdx]?.role === 'user') {
+                    messages[lastIdx] = { ...messages[lastIdx], content: `[Message blocked by guardrail: ${guardrailViolation}]` };
+                }
             }
             if (moderationViolation && iterations === 1) {
                 effectiveSystemPrompt += `\n\n[IMPORTANT: The user's message was flagged by content moderation for: "${moderationViolation}". You must briefly explain that their message was flagged for "${moderationViolation}" and politely ask them to rephrase. Keep your response short (1-2 sentences). Do not process or answer the original request.]`;
+                // Strip the violating user message — only send a placeholder to the model
+                const lastIdx = messages.length - 1;
+                if (messages[lastIdx]?.role === 'user') {
+                    messages[lastIdx] = { ...messages[lastIdx], content: `[Message flagged by content moderation: ${moderationViolation}]` };
+                }
             }
 
             // For swarms: update system prompt and tools for the current phase

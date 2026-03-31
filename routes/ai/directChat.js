@@ -895,6 +895,18 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
         // Inject moderation violation context into system prompt so AI can explain
         if (moderationViolation) {
             messages[0].content += `\n\n[IMPORTANT: The user's message was flagged by our content safety policy. You must briefly explain that their message could not be processed because it was flagged by our content policy, and politely ask them to rephrase. Keep your response short (1-2 sentences). Do not reveal the specific violation category. Do not process or answer the original request.]`;
+            // Strip the violating user message — only send a placeholder to the model
+            const lastMsg = messages[messages.length - 1];
+            if (lastMsg?.role === 'user') {
+                if (typeof lastMsg.content === 'string') {
+                    lastMsg.content = `[Message flagged by content moderation]`;
+                } else if (Array.isArray(lastMsg.content)) {
+                    // Multimodal message — replace only text parts, keep structure
+                    lastMsg.content = lastMsg.content.map(part =>
+                        part.type === 'text' ? { type: 'text', text: '[Message flagged by content moderation]' } : part
+                    );
+                }
+            }
         }
 
         // ─── PII Detection (independent of content moderation) ──────
