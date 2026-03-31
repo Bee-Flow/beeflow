@@ -113,12 +113,15 @@ async function executeKbSearchTool(toolName, args, context = {}) {
         }
 
         // Format results for the agent.
-        // Score threshold logic:
-        //   - Azure reranker (Cohere) / search-service reranker → scores in 0..1 → threshold 0.3
-        //   - No reranker (pure RRF) → scores in 0..0.03 range → no threshold, respect topK
+        // When a reranker is active (Azure Cohere or local GPU) it already picked the best
+        // topK results — applying a score threshold on top would drop ranked results 2-5.
+        // We only filter out zero-score results (completely irrelevant) when using raw RRF
+        // with no reranker, to avoid returning noise.
         const azureRerankerConfigured = !!(await configStore.getConfig('azure_reranker_endpoint') || process.env.AZURE_RERANKER_ENDPOINT);
         const hasReranker = azureRerankerConfigured || (!useAzure && process.env.RERANKER_URL);
-        const scoreThreshold = hasReranker ? 0.3 : 0;
+        // No threshold when reranker is active — trust the reranker's ranking + topK.
+        // Minimal floor (0.01) when RRF-only to avoid completely irrelevant results.
+        const scoreThreshold = hasReranker ? 0 : 0.01;
 
         const results = chunks
             .filter(c => (c.score || c.rerank_score || 0) >= scoreThreshold)
@@ -131,7 +134,7 @@ async function executeKbSearchTool(toolName, args, context = {}) {
             }));
 
         const topScore = chunks.length > 0 ? Math.max(...chunks.map(c => c.score || c.rerank_score || 0)) : 0;
-        console.log(`[KBSearch] Found ${results.length} results (from ${chunks.length} chunks, threshold=${scoreThreshold}, topScore=${topScore.toFixed(4)})`);
+        console.log(`[KBSearch] Found ${results.length} results (from ${chunks.length} chunks, reranker=${hasReranker}, topScore=${topScore.toFixed(4)})`);
         return {
             _action: 'kb_sources',
             _sources: results.map(r => ({
