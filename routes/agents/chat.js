@@ -485,7 +485,7 @@ router.post('/:id/chat/stream', async (req, res) => {
         }
 
         // Send final result
-        sendEvent('done', result.guardrailViolation ? {} : result);
+        sendEvent('done', result);
         markEnded();
         res.end();
     } catch (error) {

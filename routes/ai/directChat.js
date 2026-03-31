@@ -855,7 +855,7 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
         const userOrgId = userOrgIds && userOrgIds.size > 0 ? Array.from(userOrgIds)[0] : null;
 
         // Check if org shield or global config enables moderation for direct chat
-        let moderationViolation = null; // eslint-disable-line -- kept for future soft-fail mode
+        let moderationViolation = null;
         const orgShield = userOrgId ? await configStore.getConfig(`org_privacy_shield_${userOrgId}`) : null;
         const globalModerationEnabled = (await getAIConfig()).llamaGuardConfig?.enabled;
         const moderationEnabled = (orgShield?.enabled && orgShield?.moderationEnabled) || globalModerationEnabled;
@@ -882,16 +882,19 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
                         outcome: guardError.outcome,
                         categories: violationLabels
                     });
-                    // Block — do NOT send flagged content to the AI
-                    console.log(`[DirectChat] Moderation violation detected: ${violationLabels.join(', ')} — blocking, content not sent to AI`);
-                    send('done', {});
-                    res.end();
-                    return;
+                    // Let the AI explain the violation instead of blocking
+                    moderationViolation = violationLabels.join(', ');
+                    console.log(`[DirectChat] Moderation violation detected: ${moderationViolation} — AI will respond`);
                 } else {
                     // Guard service error (not a violation) — fail-open, log and continue
                     console.warn(`[DirectChat] Guard service error (fail-open): ${guardError.message}`);
                 }
             }
+        }
+
+        // Inject moderation violation context into system prompt so AI can explain
+        if (moderationViolation) {
+            messages[0].content += `\n\n[IMPORTANT: The user's message was flagged by our content safety policy. You must briefly explain that their message could not be processed because it was flagged by our content policy, and politely ask them to rephrase. Keep your response short (1-2 sentences). Do not reveal the specific violation category. Do not process or answer the original request.]`;
         }
 
         // ─── PII Detection (independent of content moderation) ──────
