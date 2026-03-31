@@ -92,9 +92,8 @@ async function searchNotebookKB({ userId, kbIds, query, options = {} }) {
             // ── Local search path (Azure) ─────────────────────────
             const { searchLocally } = require('./localKBIngest');
             const localResults = await searchLocally(userId, kbIds, searchQuery, { topK });
-            chunks = localResults
-                .filter(c => (c.score || 0) >= minScore)
-                .map(c => ({ ...c, rerank_score: c.score }));
+            // When local search includes reranker, trust its ranking — don't apply score threshold
+            chunks = localResults.map(c => ({ ...c, rerank_score: c.score }));
         } else {
             // ── Search-service path ────────────────────────────────
             const searchRes = await fetch(`${SEARCH_SERVICE_URL}/tools/kb-search`, {

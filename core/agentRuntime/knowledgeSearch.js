@@ -18,6 +18,8 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
                 .replace(/^(can you|could you|would you|please|kun je|kunt u|wil je|zou je)\s*/i, '')
                 .replace(/^(tell me about|explain|describe|what is|what are|how do|how does|wat is|wat zijn|hoe werkt|hoe kan)\s*/i, '')
                 .replace(/^(i want to know about|i need info on|ik wil weten over|ik zoek informatie over)\s*/i, '')
+                .replace(/^(wat kan je|wat kun je|wat kunt u|what can you)\s+(vinden|vertellen|zeggen|weten|me vertellen)\s+(over|about|van|op)?\s*/i, '')
+                .replace(/^(wat|welke|hoeveel)\s+(kan|kun|kunt|zijn|is|staat|staan)\s+(er|je|jij|u|ik|we|wij)\s+/i, '')
                 .replace(/\?+$/g, '')
                 .replace(/^(voor ons event|voor mij|voor ons|for us|for me|for our)\s*/i, '')
                 .trim();
@@ -67,36 +69,28 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
     }
 
     if (allKnowledgeResults.length > 0) {
-        // Score threshold differs between backends:
-        //   - Search-service rerank scores are in 0..1 range → 0.25 is a reasonable cutoff
-        //   - Local RRF (Reciprocal Rank Fusion) scores are ~0.003-0.03 → skip threshold
-        const maxKBScore = Math.max(...allKnowledgeResults.map(r => r.score || 0), 0);
-        const isRRFScoring = maxKBScore > 0 && maxKBScore < 0.1;
-        const MIN_SCORE = isRRFScoring ? 0 : 0.25;
+        // Score threshold: use config-based detection (same logic as kbSearchTools.js)
+        // When Azure reranker is configured, no threshold — trust the reranker.
+        // When RRF-only, apply a minimal floor.
+        const azureRerankerEndpoint = await configStore.getConfig('azure_reranker_endpoint') || process.env.AZURE_RERANKER_ENDPOINT;
+        const hasReranker = !!(azureRerankerEndpoint || process.env.RERANKER_URL);
+        const MIN_SCORE = hasReranker ? 0 : 0.01;
         allKnowledgeResults = allKnowledgeResults.filter(r => (r.score || 0) >= MIN_SCORE);
 
-        const sourceMap = new Map();
-        for (const result of allKnowledgeResults) {
-            const source = result.metadata?.source || 'Unknown Source';
-            if (sourceMap.has(source)) {
-                const existing = sourceMap.get(source);
-                existing.content += '\n\n' + result.content;
-                existing.score = Math.max(existing.score || 0, result.score || 0);
-            } else {
-                sourceMap.set(source, { ...result });
-            }
-        }
-        
-        const mergedResults = Array.from(sourceMap.values());
-        mergedResults.sort((a, b) => (b.score || 0) - (a.score || 0));
-        const topResults = mergedResults.slice(0, 10);
+        // Keep individual chunks as separate results (do NOT merge by source —
+        // merging then truncating was hiding most of the content from the model).
+        // Sort by score, take top results for the system prompt.
+        allKnowledgeResults.sort((a, b) => (b.score || 0) - (a.score || 0));
+        const topResults = allKnowledgeResults.slice(0, 12);
 
-        const MAX_CONTENT_CHARS = 2000;
+        // Per-chunk content cap: keep context manageable for the model.
+        const MAX_CHUNK_CHARS = 4000;
         for (const result of topResults) {
-            if (result.content && result.content.length > MAX_CONTENT_CHARS) {
-                result.content = result.content.slice(0, MAX_CONTENT_CHARS) + '…';
+            if (result.content && result.content.length > MAX_CHUNK_CHARS) {
+                result.content = result.content.slice(0, MAX_CHUNK_CHARS) + '…';
             }
         }
+
 
         if (topResults.length > 0) {
             const includeRefs = agent.config?.includeSourceReferences === true;
@@ -131,12 +125,19 @@ ${knowledgeText}
 
             if (includeRefs && onEvent) {
                 onEvent('kb_sources', {
-                    sources: topResults.map(k => ({
-                        title: k.metadata?.source || k.metadata?.source_uri || 'Unknown Source',
-                        content: k.content,
-                        score: k.score || 0,
-                        type: k.metadata?.type || 'unknown'
-                    }))
+                    sources: topResults.map((k, i) => {
+                        const docTitle = k.metadata?.source || k.metadata?.source_uri || 'Unknown Source';
+                        // Extract section heading from chunk content for display
+                        const headingMatch = (k.content || '').match(/^#{1,6}\s+(.+)$/m);
+                        const sectionLabel = headingMatch ? headingMatch[1].trim() : `Chunk ${i + 1}`;
+                        return {
+                            title: docTitle,
+                            section: sectionLabel,
+                            content: k.content,
+                            score: k.score || 0,
+                            type: k.metadata?.type || 'unknown'
+                        };
+                    })
                 });
             }
         } else {

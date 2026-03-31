@@ -137,12 +137,17 @@ async function executeKbSearchTool(toolName, args, context = {}) {
         console.log(`[KBSearch] Found ${results.length} results (from ${chunks.length} chunks, reranker=${hasReranker}, topScore=${topScore.toFixed(4)})`);
         return {
             _action: 'kb_sources',
-            _sources: results.map(r => ({
-                title: r.source_url || r.title,
-                content: r.content,
-                score: r.score,
-                type: 'kb_chunk'
-            })),
+            _sources: results.map((r, i) => {
+                const headingMatch = (r.content || '').match(/^#{1,6}\s+(.+)$/m);
+                const sectionLabel = headingMatch ? headingMatch[1].trim() : `Chunk ${i + 1}`;
+                return {
+                    title: r.source_url || r.title,
+                    section: sectionLabel,
+                    content: r.content,
+                    score: r.score,
+                    type: 'kb_chunk'
+                };
+            }),
             query,
             resultCount: results.length,
             results,

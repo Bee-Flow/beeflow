@@ -209,7 +209,10 @@ function cleanAzureDocMarkdown(text) {
     // 6. Normalise excessive blank lines (max 2 consecutive empty lines)
     out = out.replace(/\n{4,}/g, '\n\n\n');
 
-    // 7. Trim trailing whitespace per line
+    // 7. Strip orphaned single characters on their own line (Azure DI artifacts like lone 'S', 'A', etc.)
+    out = out.replace(/^\s*[A-Z]\s*$/gm, '');
+
+    // 8. Trim trailing whitespace per line
     out = out.replace(/[ \t]+$/gm, '');
 
     return out.trim();

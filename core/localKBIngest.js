@@ -87,6 +87,7 @@ function splitHtmlTableByRows(tableHtml, chunkSize) {
 
     if (rows.length === 0) return [tableHtml]; // Can't split further
 
+    const TABLE_ROW_OVERLAP = 2; // Repeat last N rows from previous chunk for context
     const subChunks = [];
     let currentRows = [];
     let currentSize = estimateTokens(tableHeader + tableFooter);
@@ -97,8 +98,10 @@ function splitHtmlTableByRows(tableHtml, chunkSize) {
         if (currentSize + rowTokens > chunkSize && currentRows.length > 0) {
             // Flush current sub-chunk
             subChunks.push(`${tableHeader}\n<tbody>\n${currentRows.join('\n')}\n</tbody>\n${tableFooter}`);
-            currentRows = [];
-            currentSize = estimateTokens(tableHeader + tableFooter);
+            // Keep last N rows as overlap for the next sub-chunk
+            const overlapRows = currentRows.slice(-TABLE_ROW_OVERLAP);
+            currentRows = [...overlapRows];
+            currentSize = estimateTokens(tableHeader + tableFooter + overlapRows.join('\n'));
         }
 
         currentRows.push(row);
@@ -122,7 +125,8 @@ function splitIntoSections(text) {
 }
 
 /**
- * Split a long section by sentence boundaries (for regular text, not tables).
+ * Split a long section by sentence boundaries with sliding-window overlap.
+ * Carries over as many trailing sentences as fit within CHUNK_OVERLAP budget.
  */
 function splitLongSection(text, chunkSize) {
     // If this is an HTML table, split by rows instead of sentences
@@ -140,9 +144,20 @@ function splitLongSection(text, chunkSize) {
 
         if (currentCount + sentTokens > chunkSize && current.length > 0) {
             parts.push(current.join(' '));
-            const overlapText = current.slice(-1).join(' ');
-            current = [overlapText, sentence];
-            currentCount = estimateTokens(current.join(' '));
+
+            // Sliding-window overlap: carry back as many trailing sentences
+            // as fit within the CHUNK_OVERLAP token budget
+            const overlapSentences = [];
+            let overlapTokens = 0;
+            for (let i = current.length - 1; i >= 0; i--) {
+                const sTokens = estimateTokens(current[i]);
+                if (overlapTokens + sTokens > CHUNK_OVERLAP) break;
+                overlapSentences.unshift(current[i]);
+                overlapTokens += sTokens;
+            }
+
+            current = [...overlapSentences, sentence];
+            currentCount = overlapTokens + sentTokens;
         } else {
             current.push(sentence);
             currentCount += sentTokens;
@@ -157,12 +172,34 @@ function splitLongSection(text, chunkSize) {
 }
 
 /**
+ * Detect whether a chunk is a Table of Contents fragment.
+ * ToC tables have rows like: | number | title | page_number |
+ *
+ * @param {string} text
+ * @returns {boolean}
+ */
+function isTocChunk(text) {
+    const lines = text.split('\n').filter(l => l.trim().startsWith('|'));
+    if (lines.length < 3) return false;
+    // Skip separator lines (| --- | --- |)
+    const dataLines = lines.filter(l => !/^\|[\s-|]+\|$/.test(l.trim()));
+    if (dataLines.length < 2) return false;
+    // ToC pattern: most data rows have a number/section-ref, title, and page number
+    const tocRows = dataLines.filter(l => /\|\s*[\d.]+\s*\|.*\|\s*\d+\s*\|/.test(l));
+    return tocRows.length > dataLines.length * 0.4;
+}
+
+/**
  * Chunk text into token-aware pieces with overlap.
  * Structure-aware: HTML tables, markdown tables, and code blocks are
  * extracted as atomic units so they are never split mid-element.
  *
+ * Heading propagation: tracks the last-seen Markdown heading and prepends
+ * it to every chunk, so chunks that contain tables or continuation text
+ * become findable by their section heading (e.g. "## 3.2 Salarisschalen").
+ *
  * @param {string} text — input text to chunk
- * @returns {Array<{chunk_id: number, text: string, token_count: number}>}
+ * @returns {Array<{chunk_id: number, text: string, token_count: number, chunk_type: string}>}
  */
 function chunkText(text) {
     if (!text || !text.trim()) return [];
@@ -202,16 +239,66 @@ function chunkText(text) {
     }
 
     // Phase 4: Build chunks, respecting atomic block boundaries
+    // ─── Heading Hierarchy Stack ────────────────────────────────────
+    // Track the full heading hierarchy (# → ## → ### → etc.) so every
+    // chunk gets a breadcrumb prefix like "# Chapter 3\n## 3.2 Salaris…"
+    // This is "smart structural overlap" — gives embeddings full context
+    // without wasting tokens on repeated prose.
     const chunks = [];
     let currentParts = [];
     let currentTokenCount = 0;
     let chunkId = 0;
+
+    // headingStack[0] = last seen #, [1] = last seen ##, etc.
+    const headingStack = new Array(6).fill('');
+
+    /**
+     * Parse a heading line and update the stack.
+     * When a new heading at level N is seen, clear all deeper levels (N+1..6).
+     */
+    function updateHeadingStack(headingLine) {
+        const match = headingLine.match(/^(#{1,6})\s+/);
+        if (!match) return;
+        const level = match[1].length - 1; // 0-indexed: # = 0, ## = 1, etc.
+        headingStack[level] = headingLine.trim();
+        // Clear deeper levels (a new ## resets ###, ####, etc.)
+        for (let i = level + 1; i < 6; i++) headingStack[i] = '';
+    }
+
+    /**
+     * Build the heading breadcrumb prefix from the current stack.
+     * Returns the chain of active headings, e.g.:
+     *   "# 3. Arbeidsvoorwaarden\n## 3.2 Salarisschalen"
+     */
+    function getHeadingBreadcrumb() {
+        return headingStack.filter(h => h).join('\n');
+    }
+
+    /**
+     * Prepend heading breadcrumb to text if it doesn't already start with a heading.
+     */
+    function prependBreadcrumb(text) {
+        if (!text) return text;
+        const breadcrumb = getHeadingBreadcrumb();
+        if (!breadcrumb) return text;
+        // Don't prepend if text already starts with a heading
+        if (/^#{1,6}\s+/m.test(text)) return text;
+        return `${breadcrumb}\n\n${text}`;
+    }
 
     for (const section of sections) {
         const sectionTokens = estimateTokens(section);
         const isAtomicBlock = /<table[\s\S]*<\/table>/i.test(section) ||
                               /^```[\s\S]*```$/.test(section) ||
                               /^(\|[^\n]+\n){2,}/.test(section);
+
+        // Track ALL headings in this section and update the hierarchy stack
+        const headingMatches = section.match(/^#{1,6}\s+.+$/gm);
+        if (headingMatches) {
+            for (const h of headingMatches) {
+                updateHeadingStack(h);
+            }
+        }
 
         // Atomic blocks up to CHUNK_SIZE_FLEX stay whole (even if > CHUNK_SIZE)
         if (isAtomicBlock && sectionTokens <= CHUNK_SIZE_FLEX) {
@@ -225,8 +312,10 @@ function chunkText(text) {
                 currentParts = [];
                 currentTokenCount = 0;
             }
-            // Emit the atomic block as its own chunk
-            chunks.push({ chunk_id: chunkId, text: section.trim(), token_count: sectionTokens });
+            // Emit the atomic block as its own chunk with heading breadcrumb
+            let atomicText = prependBreadcrumb(section.trim());
+            const atomicTokens = estimateTokens(atomicText);
+            chunks.push({ chunk_id: chunkId, text: atomicText, token_count: atomicTokens });
             chunkId++;
             continue;
         }
@@ -246,9 +335,14 @@ function chunkText(text) {
 
             // Split the long section (tables by row, text by sentence)
             const subParts = splitLongSection(section, CHUNK_SIZE);
-            for (const sp of subParts) {
-                const spTokens = estimateTokens(sp);
-                chunks.push({ chunk_id: chunkId, text: sp.trim(), token_count: spTokens });
+            for (let spIdx = 0; spIdx < subParts.length; spIdx++) {
+                let spText = subParts[spIdx].trim();
+                // Prepend heading breadcrumb to continuation sub-parts
+                if (spIdx > 0) {
+                    spText = prependBreadcrumb(spText);
+                }
+                const spTokens = estimateTokens(spText);
+                chunks.push({ chunk_id: chunkId, text: spText, token_count: spTokens });
                 chunkId++;
             }
             continue;
@@ -257,22 +351,43 @@ function chunkText(text) {
         // Check if adding this section exceeds chunk_size
         if (currentTokenCount + sectionTokens > CHUNK_SIZE) {
             // Flush current chunk
-            const ct = currentParts.join('\n\n').trim();
+            let ct = currentParts.join('\n\n').trim();
             if (ct) {
-                chunks.push({ chunk_id: chunkId, text: ct, token_count: currentTokenCount });
+                ct = prependBreadcrumb(ct);
+                chunks.push({ chunk_id: chunkId, text: ct, token_count: estimateTokens(ct) });
                 chunkId++;
             }
-            // Keep overlap (last portion)
+            // Sliding-window overlap: carry over trailing sections/sentences
+            // that fit within the CHUNK_OVERLAP token budget
             if (currentParts.length > 0) {
-                const lastPart = currentParts[currentParts.length - 1];
-                const overlapTokens = estimateTokens(lastPart);
-                if (overlapTokens <= CHUNK_OVERLAP) {
-                    currentParts = [lastPart];
-                    currentTokenCount = overlapTokens;
-                } else {
-                    currentParts = [];
-                    currentTokenCount = 0;
+                const overlapParts = [];
+                let overlapTokens = 0;
+                // Walk backwards through sections to gather overlap material
+                for (let i = currentParts.length - 1; i >= 0; i--) {
+                    const partTokens = estimateTokens(currentParts[i]);
+                    if (partTokens > CHUNK_OVERLAP) {
+                        // Section too large — extract trailing sentences instead
+                        const sentences = currentParts[i].split(/(?<=[.!?])\s+/);
+                        const tailSentences = [];
+                        let tailTokens = 0;
+                        for (let j = sentences.length - 1; j >= 0; j--) {
+                            const sTokens = estimateTokens(sentences[j]);
+                            if (tailTokens + sTokens > CHUNK_OVERLAP - overlapTokens) break;
+                            tailSentences.unshift(sentences[j]);
+                            tailTokens += sTokens;
+                        }
+                        if (tailSentences.length > 0) {
+                            overlapParts.unshift(tailSentences.join(' '));
+                            overlapTokens += tailTokens;
+                        }
+                        break; // Don't look further back
+                    }
+                    if (overlapTokens + partTokens > CHUNK_OVERLAP) break;
+                    overlapParts.unshift(currentParts[i]);
+                    overlapTokens += partTokens;
                 }
+                currentParts = overlapParts;
+                currentTokenCount = overlapTokens;
             } else {
                 currentParts = [];
                 currentTokenCount = 0;
@@ -285,15 +400,21 @@ function chunkText(text) {
 
     // Final chunk
     if (currentParts.length > 0) {
-        const ct = currentParts.join('\n\n').trim();
+        let ct = currentParts.join('\n\n').trim();
         if (ct) {
-            chunks.push({ chunk_id: chunkId, text: ct, token_count: currentTokenCount });
+            ct = prependBreadcrumb(ct);
+            chunks.push({ chunk_id: chunkId, text: ct, token_count: estimateTokens(ct) });
         }
     }
 
     // Filter out tiny chunks (< 30 tokens)
     const MIN_TOKENS = 30;
     const filtered = chunks.filter(c => c.token_count >= MIN_TOKENS);
+
+    // Tag chunk types (ToC, content)
+    for (const chunk of filtered) {
+        chunk.chunk_type = isTocChunk(chunk.text) ? 'toc' : 'content';
+    }
 
     // Re-number chunk IDs
     filtered.forEach((c, i) => { c.chunk_id = i; });
@@ -380,6 +501,7 @@ async function ensureKBChunksTable(vectorDim = 1536) {
                 tsv           TSVECTOR,
                 embedding     VECTOR(${vectorDim}),
                 source_uri    TEXT,
+                chunk_type    TEXT DEFAULT 'content',
                 created_at    TIMESTAMPTZ DEFAULT now()
             )
         `);
@@ -396,6 +518,7 @@ async function ensureKBChunksTable(vectorDim = 1536) {
                 content       TEXT NOT NULL,
                 tsv           TSVECTOR,
                 source_uri    TEXT,
+                chunk_type    TEXT DEFAULT 'content',
                 created_at    TIMESTAMPTZ DEFAULT now()
             )
         `);
@@ -408,6 +531,9 @@ async function ensureKBChunksTable(vectorDim = 1536) {
     }
     try { await exec('CREATE INDEX IF NOT EXISTS idx_kb_chunks_tenant_kb ON kb_chunks (tenant_id, knowledge_base_id)'); } catch (_) {}
     try { await exec('CREATE INDEX IF NOT EXISTS idx_kb_chunks_tenant_kb_doc ON kb_chunks (tenant_id, knowledge_base_id, document_id)'); } catch (_) {}
+
+    // Ensure chunk_type column exists (safe migration for existing tables)
+    try { await exec("ALTER TABLE kb_chunks ADD COLUMN IF NOT EXISTS chunk_type TEXT DEFAULT 'content'"); } catch (_) {}
 
     schemaInitialized = true;
     console.log('[LocalKBIngest] kb_chunks table ensured');
@@ -485,32 +611,30 @@ async function ingestLocally(tenantId, kbId, docId, content, options = {}) {
                 await client.query(
                     `INSERT INTO kb_chunks (
                         tenant_id, knowledge_base_id, document_id,
-                        chunk_id, lang, title, content, tsv, embedding, source_uri
+                        chunk_id, lang, title, content, tsv, embedding, source_uri, chunk_type
                     ) VALUES (
                         $1, $2, $3,
                         $4, $5, $6, $7,
                         setweight(to_tsvector('dutch', $7), 'A') ||
-                        setweight(to_tsvector('english', $7), 'B') ||
-                        setweight(to_tsvector('simple', $7), 'C'),
+                        setweight(to_tsvector('simple', $7), 'B'),
                         $8::vector,
-                        $9
+                        $9, $10
                     )`,
-                    [tenantId, kbId, docId, chunk.chunk_id, lang, title, chunk.text, vectorStr, sourceUri]
+                    [tenantId, kbId, docId, chunk.chunk_id, lang, title, chunk.text, vectorStr, sourceUri, chunk.chunk_type || 'content']
                 );
             } else {
                 await client.query(
                     `INSERT INTO kb_chunks (
                         tenant_id, knowledge_base_id, document_id,
-                        chunk_id, lang, title, content, tsv, source_uri
+                        chunk_id, lang, title, content, tsv, source_uri, chunk_type
                     ) VALUES (
                         $1, $2, $3,
                         $4, $5, $6, $7,
                         setweight(to_tsvector('dutch', $7), 'A') ||
-                        setweight(to_tsvector('english', $7), 'B') ||
-                        setweight(to_tsvector('simple', $7), 'C'),
-                        $8
+                        setweight(to_tsvector('simple', $7), 'B'),
+                        $8, $9
                     )`,
-                    [tenantId, kbId, docId, chunk.chunk_id, lang, title, chunk.text, sourceUri]
+                    [tenantId, kbId, docId, chunk.chunk_id, lang, title, chunk.text, sourceUri, chunk.chunk_type || 'content']
                 );
             }
         }
@@ -556,6 +680,7 @@ async function deleteChunksLocally(tenantId, kbId, docId) {
  */
 async function searchLocally(tenantId, kbIds, query, options = {}) {
     const { topK = 10 } = options;
+    console.log(`[LocalKBSearch] searchLocally — tenantId="${tenantId}" kbIds=${JSON.stringify(kbIds)} query="${query.slice(0,60)}"`);
 
     // Get Azure credentials for embedding the query
     const endpoint = await configStore.getConfig('azure_openai_embedding_endpoint');
@@ -594,19 +719,27 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
         }
 
         // B. Full-text search
-        // websearch_to_tsquery expects natural language — just sanitize special chars
+        // Extract significant words (≥4 chars) and join with OR so that natural-language
+        // questions like "wat kan je vinden over Algemene bepalingen" still find the right
+        // chunks even when question verbs ("vinden") don't appear in the target content.
         let ftsResults = { rows: [] };
         const sanitizedQuery = query
             .replace(/[\\\"'*^$(){}[\]\\\\]/g, '')
             .trim();
 
-        if (sanitizedQuery.length > 0) {
+        // Build OR-based FTS string from meaningful words (skip short stop words)
+        const ftsOrQuery = sanitizedQuery
+            .split(/\s+/)
+            .filter(w => w.length >= 4)
+            .join(' OR ');
+        const ftsQueryStr = ftsOrQuery.length > 0 ? ftsOrQuery : sanitizedQuery;
+
+        if (ftsQueryStr.length > 0) {
             try {
                 ftsResults = await client.query(
-                    `SELECT id, title, content, source_uri, document_id, chunk_id,
+                    `SELECT id, title, content, source_uri, document_id, chunk_id, chunk_type,
                             GREATEST(
-                                ts_rank_cd(tsv, websearch_to_tsquery('dutch', $1)),
-                                ts_rank_cd(tsv, websearch_to_tsquery('english', $1)),
+                                ts_rank_cd(tsv, websearch_to_tsquery('dutch', $1)) * 1.5,
                                 ts_rank_cd(tsv, websearch_to_tsquery('simple', $1))
                             ) AS fts_score
                      FROM kb_chunks
@@ -614,13 +747,13 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
                        AND knowledge_base_id = ANY($3::text[])
                        AND (
                            tsv @@ websearch_to_tsquery('dutch', $1)
-                           OR tsv @@ websearch_to_tsquery('english', $1)
                            OR tsv @@ websearch_to_tsquery('simple', $1)
                        )
                      ORDER BY fts_score DESC
                      LIMIT 20`,
-                    [sanitizedQuery, tenantId, kbIds]
+                    [ftsQueryStr, tenantId, kbIds]
                 );
+                console.log(`[LocalKBSearch] FTS query: "${ftsQueryStr}" → ${ftsResults.rows.length} rows`);
             } catch (e) {
                 console.warn('[LocalKBSearch] FTS query failed:', e.message);
             }
@@ -643,16 +776,34 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
             if (!contentMap.has(row.id)) contentMap.set(row.id, row);
         });
 
-        // D. Sort by fused score and take top candidates for reranking
+        // D. Sort by fused score, deprioritize ToC chunks, and take top candidates for reranking
+        const queryWords = query.toLowerCase().split(/\s+/).filter(w => w.length >= 4);
         let results = Array.from(scores.entries())
             .map(([id, score]) => {
                 const row = contentMap.get(id);
+                let adjustedScore = score;
+
+                // Deprioritize ToC chunks (they match lots of keywords but have no real content)
+                if (row.chunk_type === 'toc') {
+                    adjustedScore *= 0.3;
+                }
+
+                // Heading boost: if chunk starts with a heading matching query terms, boost it
+                const headingMatch = (row.content || '').match(/^#{1,6}\s+(.+)$/m);
+                if (headingMatch && queryWords.length > 0) {
+                    const headingLower = headingMatch[1].toLowerCase();
+                    const matchCount = queryWords.filter(w => headingLower.includes(w)).length;
+                    if (matchCount > 0) {
+                        adjustedScore *= (1 + matchCount * 0.3); // 30% boost per matching word
+                    }
+                }
+
                 return {
                     id: row.id,
                     content: row.content,
                     title: row.title || '',
                     source_uri: row.source_uri || '',
-                    score,
+                    score: adjustedScore,
                     document_id: row.document_id,
                     chunk_id: row.chunk_id,
                 };

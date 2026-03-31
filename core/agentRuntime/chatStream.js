@@ -360,13 +360,8 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         const kbExtension = await performKnowledgeSearch({ agent, userId, userMessage, isStrictKnowledge, onEvent });
         if (kbExtension) {
             systemPrompt += kbExtension;
-            // KB context is already injected into the system prompt — remove the kb_search
-            // tool to prevent the LLM from making a redundant duplicate search call.
-            const beforeCount = tools.length;
-            tools = tools.filter(t => t.function?.name !== 'kb_search');
-            if (tools.length < beforeCount) {
-                console.log('[AgentRuntime] Removed kb_search tool (KB context already in system prompt)');
-            }
+            // kb_search tool stays available for follow-up targeted searches.
+            // The auto-injection provides broad context; the agent can drill deeper if needed.
         }
     } catch (kErr) {
         console.error('[AgentRuntime] Knowledge retrieval failed:', kErr.message);
