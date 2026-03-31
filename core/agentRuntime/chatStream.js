@@ -389,6 +389,13 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         }
     }
 
+    // Block content from reaching the AI when guardrails fire
+    if (moderationViolation || guardrailViolation) {
+        console.log(`[AgentRuntime] Guardrail block — content not sent to AI. moderation=${moderationViolation}, guardrail=${guardrailViolation}`);
+        onEvent('done', {});
+        return { response: '', toolCalls: [] };
+    }
+
     // Phase-driven execution state for swarms
     // Filter out disabled phases before execution
     if (isSwarm && swarm.phases) {
@@ -454,13 +461,9 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             }
 
             // Inject guardrail violation context if detected
+            // Note: moderation/guardrail violations now block & return early (line ~393),
+            // so this code path is only reached for non-violation cases.
             let effectiveSystemPrompt = systemPrompt;
-            if (guardrailViolation && iterations === 1) {
-                effectiveSystemPrompt += `\n\n[IMPORTANT: The user's message contains content that violates guardrail rule(s): "${guardrailViolation}". You must politely decline to process this request and explain that the content violates the "${guardrailViolation}" policy. Do not attempt to answer the request.]`;
-            }
-            if (moderationViolation && iterations === 1) {
-                effectiveSystemPrompt += `\n\n[IMPORTANT: The user's message was flagged by content moderation for: "${moderationViolation}". You must briefly explain that their message was flagged for "${moderationViolation}" and politely ask them to rephrase. Keep your response short (1-2 sentences). Do not process or answer the original request.]`;
-            }
 
             // For swarms: update system prompt and tools for the current phase
             if (isSwarm) {
