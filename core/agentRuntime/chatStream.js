@@ -328,6 +328,31 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         }
     }
 
+    // ============ GUARDRAILS (run first — before any AI processing) ============
+    const guardrailsResult = await runInputGuardrails({ agent, messages, userMessage, globalConfig, onEvent });
+    let moderationViolation = guardrailsResult.moderationViolation;
+    let guardrailViolation = guardrailsResult.guardrailViolation;
+    let processedUserMessage = guardrailsResult.processedUserMessage;
+    const regexConfig = guardrailsResult.regexConfig;
+    const webSearchGuardEnabled = guardrailsResult.webSearchGuardEnabled;
+    const orgShieldCategories = guardrailsResult.orgShieldCategories;
+
+    // If redaction occurred, update the user message in the messages array
+    if (processedUserMessage !== userMessage) {
+        const lastMsgIndex = messages.length - 1;
+        if (messages[lastMsgIndex]?.role === 'user') {
+            messages[lastMsgIndex].content = processedUserMessage;
+        }
+        userMessage = processedUserMessage;
+    }
+
+    // Block content from reaching the AI when guardrails fire
+    if (moderationViolation || guardrailViolation) {
+        console.log(`[AgentRuntime] Guardrail block — content not sent to AI. moderation=${moderationViolation}, guardrail=${guardrailViolation}`);
+        onEvent('done', {});
+        return { response: '', toolCalls: [] };
+    }
+
     // ============ MEMORY INTEGRATION ============
     // Skip memory for embed-enabled agents — private user memories must not leak into public embed chats
     let memoryContext = '';
@@ -372,29 +397,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     // Workspace streaming/parsing is handled in the stream loop below;
     // no system prompt injection needed.
 
-    // Verify Guardrails if enabled (AI Content Moderation)
-    const guardrailsResult = await runInputGuardrails({ agent, messages, userMessage, globalConfig, onEvent });
-    let moderationViolation = guardrailsResult.moderationViolation;
-    let guardrailViolation = guardrailsResult.guardrailViolation;
-    let processedUserMessage = guardrailsResult.processedUserMessage;
-    const regexConfig = guardrailsResult.regexConfig;
-    const webSearchGuardEnabled = guardrailsResult.webSearchGuardEnabled;
-    const orgShieldCategories = guardrailsResult.orgShieldCategories;
 
-    // If redaction occurred, update the user message in the messages array
-    if (processedUserMessage !== userMessage) {
-        const lastMsgIndex = messages.length - 1;
-        if (messages[lastMsgIndex]?.role === 'user') {
-            messages[lastMsgIndex].content = processedUserMessage;
-        }
-    }
-
-    // Block content from reaching the AI when guardrails fire
-    if (moderationViolation || guardrailViolation) {
-        console.log(`[AgentRuntime] Guardrail block — content not sent to AI. moderation=${moderationViolation}, guardrail=${guardrailViolation}`);
-        onEvent('done', {});
-        return { response: '', toolCalls: [] };
-    }
 
     // Phase-driven execution state for swarms
     // Filter out disabled phases before execution
