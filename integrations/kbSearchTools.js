@@ -113,13 +113,12 @@ async function executeKbSearchTool(toolName, args, context = {}) {
         }
 
         // Format results for the agent.
-        // The score threshold differs between backends:
-        //   - Search-service rerank scores are in 0..1 range → 0.3 is a reasonable cutoff
-        //   - Local RRF (Reciprocal Rank Fusion) scores are in 0..0.03 range → no cutoff needed
-        //     because RRF already sorts by relevance and we respect topK
-        const maxScore = Math.max(...chunks.map(c => c.score || c.rerank_score || 0), 0);
-        const isRRF = maxScore > 0 && maxScore < 0.1; // RRF scores are always << 0.1
-        const scoreThreshold = isRRF ? 0 : 0.3;
+        // Score threshold logic:
+        //   - Azure reranker (Cohere) / search-service reranker → scores in 0..1 → threshold 0.3
+        //   - No reranker (pure RRF) → scores in 0..0.03 range → no threshold, respect topK
+        const azureRerankerConfigured = !!(await configStore.getConfig('azure_reranker_endpoint') || process.env.AZURE_RERANKER_ENDPOINT);
+        const hasReranker = azureRerankerConfigured || (!useAzure && process.env.RERANKER_URL);
+        const scoreThreshold = hasReranker ? 0.3 : 0;
 
         const results = chunks
             .filter(c => (c.score || c.rerank_score || 0) >= scoreThreshold)
@@ -131,8 +130,8 @@ async function executeKbSearchTool(toolName, args, context = {}) {
                 score: Math.round((c.score || c.rerank_score || 0) * 1000) / 1000
             }));
 
-        console.log(`[KBSearch] Found ${results.length} results (from ${chunks.length} chunks, threshold=${scoreThreshold}, maxScore=${maxScore.toFixed(4)})`);
-
+        const topScore = chunks.length > 0 ? Math.max(...chunks.map(c => c.score || c.rerank_score || 0)) : 0;
+        console.log(`[KBSearch] Found ${results.length} results (from ${chunks.length} chunks, threshold=${scoreThreshold}, topScore=${topScore.toFixed(4)})`);
         return {
             _action: 'kb_sources',
             _sources: results.map(r => ({

@@ -6,10 +6,14 @@
  *
  * SDK: @azure-rest/ai-document-intelligence
  * Auth: AzureKeyCredential from @azure/core-auth
+ * API: 2024-11-30 GA (pinned — best Markdown quality)
  *
  * Config stored in configStore (same pattern as azurePiiDetection.js):
  *   - azure_doc_intelligence_endpoint (config)
  *   - azure_doc_intelligence_key (secret, encrypted at rest)
+ *
+ * Output: always clean Markdown — zero HTML tags, no Azure DI structural
+ * comments, all tables converted to Markdown table syntax.
  */
 
 const configStore = require('../stores/configStore');
@@ -62,7 +66,7 @@ async function extractWithAzure(buffer, filename = 'unknown') {
 
     const base64Source = buffer.toString('base64');
 
-    // Use the Layout model with Markdown output
+    // Use the Layout model with Markdown output (API pinned to 2024-11-30 GA)
     const initialResponse = await client
         .path('/documentModels/{modelId}:analyze', 'prebuilt-layout')
         .post({
@@ -71,6 +75,7 @@ async function extractWithAzure(buffer, filename = 'unknown') {
                 base64Source,
             },
             queryParameters: {
+                'api-version': '2024-11-30',
                 outputContentFormat: 'markdown',
             },
         });
@@ -109,15 +114,19 @@ async function extractWithAzure(buffer, filename = 'unknown') {
         const result = await pollResponse.json();
 
         if (result.status === 'succeeded') {
-            const content = result.analyzeResult?.content || '';
+            const rawContent = result.analyzeResult?.content || '';
             const pageCount = result.analyzeResult?.pages?.length || 0;
 
-            if (!content.trim()) {
+            if (!rawContent.trim()) {
                 console.warn(`[AzureDocIntelligence] No content extracted from ${filename} (${pageCount} pages)`);
                 return '';
             }
 
-            console.log(`[AzureDocIntelligence] Extracted ${content.length} chars from ${filename} (${pageCount} pages)`);
+            // Apply cleanup: strips Azure DI artifacts, converts HTML tables → Markdown
+            const { cleanAzureDocMarkdown } = require('./markdownCleanup');
+            const content = cleanAzureDocMarkdown(rawContent);
+
+            console.log(`[AzureDocIntelligence] Extracted ${rawContent.length} → ${content.length} chars from ${filename} (${pageCount} pages)`);
             return content;
         }
 

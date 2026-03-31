@@ -12,11 +12,12 @@
 
 const { exec, getAll, getClient } = require('../db');
 const configStore = require('../stores/configStore');
+const { convertAllHtmlTablesToMarkdown } = require('./markdownCleanup');
 
 // ── Structure-aware text chunking ───────────────────────────────────
 
-const CHUNK_SIZE = 500;    // tokens per chunk (larger = more context per hit)
-const CHUNK_OVERLAP = 100; // token overlap (ensures continuity between chunks)
+const CHUNK_SIZE = 800;    // tokens per chunk
+const CHUNK_OVERLAP = 150; // token overlap (ensures continuity)
 const CHUNK_SIZE_FLEX = Math.floor(CHUNK_SIZE * 1.8); // atomic blocks up to this size stay whole
 
 /**
@@ -26,74 +27,6 @@ const CHUNK_SIZE_FLEX = Math.floor(CHUNK_SIZE * 1.8); // atomic blocks up to thi
 function estimateTokens(text) {
     if (!text) return 0;
     return Math.ceil(text.length / 4);
-}
-
-/**
- * Convert HTML tables (from Azure Document Intelligence) to markdown tables or plain text.
- * Azure Doc Intelligence v4.0+ outputs HTML tables in markdown mode for fidelity,
- * but also wraps regular paragraph text in table structures (layout tables).
- *
- * - Single-column tables → plain text (paragraphs)
- * - Multi-column data tables → markdown tables
- */
-function convertHtmlTablesToMarkdown(text) {
-    if (!text) return text;
-
-    return text.replace(/<table[\s\S]*?<\/table>/gi, (tableHtml) => {
-        try {
-            // Extract all rows
-            const rows = [];
-            const trRegex = /<tr[\s\S]*?<\/tr>/gi;
-            let trMatch;
-            while ((trMatch = trRegex.exec(tableHtml)) !== null) {
-                const cells = [];
-                const cellRegex = /<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi;
-                let cellMatch;
-                while ((cellMatch = cellRegex.exec(trMatch[0])) !== null) {
-                    // Strip inner HTML tags, trim whitespace
-                    const cellText = cellMatch[1]
-                        .replace(/<br\s*\/?>/gi, '\n')
-                        .replace(/<[^>]+>/g, '')
-                        .replace(/\s+/g, ' ')
-                        .trim();
-                    cells.push(cellText);
-                }
-                if (cells.length > 0) rows.push(cells);
-            }
-
-            if (rows.length === 0) return tableHtml; // can't parse, keep original
-
-            // Detect layout tables: mostly single-cell rows or uniform 1-2 column text
-            const maxCols = Math.max(...rows.map(r => r.length));
-            const singleCellRows = rows.filter(r => r.length === 1 || r.filter(c => c).length <= 1).length;
-            const isLayoutTable = maxCols <= 2 && singleCellRows > rows.length * 0.6;
-
-            if (isLayoutTable) {
-                // Layout table → extract as plain text paragraphs
-                const paragraphs = rows
-                    .map(r => r.filter(c => c).join(' '))
-                    .filter(p => p.trim());
-                return '\n\n' + paragraphs.join('\n\n') + '\n\n';
-            }
-
-            // Real data table → convert to markdown table
-            const normalized = rows.map(r => {
-                while (r.length < maxCols) r.push('');
-                return r;
-            });
-
-            const lines = [];
-            lines.push('| ' + normalized[0].join(' | ') + ' |');
-            lines.push('| ' + normalized[0].map(() => '---').join(' | ') + ' |');
-            for (let i = 1; i < normalized.length; i++) {
-                lines.push('| ' + normalized[i].join(' | ') + ' |');
-            }
-
-            return '\n' + lines.join('\n') + '\n';
-        } catch {
-            return tableHtml; // on any error, keep original
-        }
-    });
 }
 
 /**
@@ -234,8 +167,10 @@ function splitLongSection(text, chunkSize) {
 function chunkText(text) {
     if (!text || !text.trim()) return [];
 
-    // Phase 0: Convert HTML tables → Markdown tables (Azure Doc Intelligence outputs HTML)
-    text = convertHtmlTablesToMarkdown(text);
+    // Phase 0: Convert any residual HTML tables → Markdown (defence-in-depth — input
+    //           should already be clean from azureDocIntelligence.js, but this protects
+    //           against content arriving from other sources like documentParser, URL fetch, etc.)
+    text = convertAllHtmlTablesToMarkdown(text);
 
     // Phase 1: Extract atomic blocks (tables, code blocks) → placeholders
     const { cleaned, blocks } = extractAtomicBlocks(text);
@@ -767,14 +702,16 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
             }
         }
 
-        // E. Rerank via Azure Cohere or local cross-encoder sidecar
+        // E. Rerank
+        // Priority: Azure Cohere (when configured) > local GPU cross-encoder
+        // If Azure reranker is configured it is used exclusively — no GPU needed.
         const azureRerankerEndpoint = await configStore.getConfig('azure_reranker_endpoint') || process.env.AZURE_RERANKER_ENDPOINT;
         const azureRerankerKey = await configStore.getSecret('azure_reranker_key') || process.env.AZURE_RERANKER_KEY;
         const azureRerankerModel = await configStore.getConfig('azure_reranker_model') || process.env.AZURE_RERANKER_MODEL || 'Cohere-rerank-v4.0-fast';
         const localRerankerUrl = process.env.RERANKER_URL;
 
         if (azureRerankerEndpoint && azureRerankerKey && results.length > 0) {
-            // ── Azure Cohere rerank (auto-discover correct path) ──
+            // ── Azure Cohere rerank (primary — no GPU required) ──
             try {
                 const endpoint = azureRerankerEndpoint.replace(/\/+$/, '');
                 const requestBody = JSON.stringify({
@@ -831,7 +768,7 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
                 console.warn(`[LocalKBSearch] Azure reranker error (${rerankerErr.message}), falling back to RRF`);
             }
         } else if (localRerankerUrl && results.length > 0) {
-            // ── Local cross-encoder sidecar ──
+            // ── Local GPU cross-encoder sidecar (only when Azure is NOT configured) ──
             try {
                 const rerankerRes = await fetch(`${localRerankerUrl}/rerank`, {
                     method: 'POST',
@@ -853,14 +790,16 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
                             source_uri: results[rr.index].source_uri,
                             score: rr.relevance_score,
                         }));
-                        console.log(`[LocalKBSearch] Reranked ${rerankerData.results.length} results in ${rerankerData.latency_ms || '?'}ms (top=${results[0]?.score})`);
+                        console.log(`[LocalKBSearch] Local GPU reranked ${rerankerData.results.length} results in ${rerankerData.latency_ms || '?'}ms (top=${results[0]?.score})`);
                     }
                 } else {
-                    console.warn(`[LocalKBSearch] Reranker responded ${rerankerRes.status}, falling back to RRF`);
+                    console.warn(`[LocalKBSearch] Local GPU reranker responded ${rerankerRes.status}, falling back to RRF`);
                 }
             } catch (rerankerErr) {
-                console.warn(`[LocalKBSearch] Reranker unavailable (${rerankerErr.message}), falling back to RRF`);
+                console.warn(`[LocalKBSearch] Local GPU reranker unavailable (${rerankerErr.message}), falling back to RRF`);
             }
+        } else {
+            console.log('[LocalKBSearch] No reranker configured — using RRF scores');
         }
 
         results = results.slice(0, topK);
