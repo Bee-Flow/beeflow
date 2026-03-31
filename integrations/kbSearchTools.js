@@ -125,6 +125,7 @@ async function executeKbSearchTool(toolName, args, context = {}) {
 
         const results = chunks
             .filter(c => (c.score || c.rerank_score || 0) >= scoreThreshold)
+            .filter(c => (c.score || c.rerank_score || 0) >= 0.60) // Minimum 60% relevance floor
             .map((c, i) => ({
                 result_number: i + 1,
                 title: c.title || c.source_uri || 'Knowledge Base',

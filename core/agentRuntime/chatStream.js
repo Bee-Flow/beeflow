@@ -394,15 +394,17 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     const hasViolation = moderationViolation || guardrailViolation;
     if (hasViolation) {
         const violationType = moderationViolation || guardrailViolation;
-        const cannedResponse = `Je bericht is gemarkeerd als **"${violationType}"**.\n\nDit bericht is geblokkeerd door ons beveiligingsbeleid en kan niet worden verwerkt. Wil je je vraag opnieuw formuleren?`;
 
-        // Stream the canned response to the client
-        onEvent('content', { text: cannedResponse });
+        // Send structured event so frontend can compose the translated message
+        onEvent('guardrail_blocked', { violation: violationType });
 
-        // Persist the conversation with the canned response
+        // English fallback for DB persistence (not shown to user — frontend overrides with t())
+        const persistedResponse = `Your message was flagged as **"${violationType}"**.\n\nThis message was blocked by our security policy and cannot be processed. Would you like to rephrase your question?`;
+
+        // Persist the conversation with the English fallback response
         const assistantMsg = {
             role: 'assistant',
-            content: cannedResponse,
+            content: persistedResponse,
             parentId: messageMetadata.parentId || null
         };
         messages.push(assistantMsg);
@@ -439,7 +441,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
 
         console.log(`[AgentRuntime] Guardrail hard-block — skipped AI entirely (violation: ${violationType})`);
         return {
-            message: cannedResponse,
+            message: persistedResponse,
             toolCalls: [],
             conversationLength: messages.length,
             conversationId: conversation.id,

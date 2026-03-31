@@ -100,6 +100,11 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
             return intersection / (setA.size + setB.size - intersection);
         }
 
+        // ── Minimum relevance floor ──────────────────────────────────
+        // Drop any chunk below 60% to keep only meaningful results.
+        const MIN_SCORE_THRESHOLD = 0.60;
+        allKnowledgeResults = allKnowledgeResults.filter(r => (r.score || 0) >= MIN_SCORE_THRESHOLD);
+
         const deduped = [];
         const dedupedTokenSets = [];
         const SIMILARITY_THRESHOLD = 0.85;
