@@ -130,6 +130,24 @@ async function _doInit() {
     // listConversations(agentId, userId) → WHERE agent_id=$1 AND user_id=$2 ORDER BY updated_at DESC
     await exec('CREATE INDEX IF NOT EXISTS idx_agent_conv_agent_user_updated ON agent_conversations(agent_id, user_id, updated_at DESC)');
 
+    // ── Phase 6: pg_trgm GIN indexes for fast ILIKE search ────────────────────
+    // pg_trgm accelerates ILIKE '%term%' queries from full-scan to index lookup.
+    // Wrapped in try/catch: CREATE EXTENSION requires superuser; if unavailable
+    // the ILIKE queries in searchConversations() still work, just without the
+    // index acceleration (~10–50x slower, but only affects the search endpoint).
+    try { await exec(`CREATE EXTENSION IF NOT EXISTS pg_trgm`); } catch (e) {
+        console.warn('[initSchema] pg_trgm unavailable (superuser needed) — search will use full scans');
+    }
+    try {
+        // Accelerates: conversation_messages.content ILIKE '%query%'
+        await exec(`CREATE INDEX IF NOT EXISTS idx_conv_messages_content_trgm
+            ON conversation_messages USING GIN (content gin_trgm_ops)`);
+    } catch (e) { /* pg_trgm not available — index skipped */ }
+    try {
+        // Accelerates: agent_conversations.title ILIKE '%query%'
+        await exec(`CREATE INDEX IF NOT EXISTS idx_agent_conv_title_trgm
+            ON agent_conversations USING GIN (title gin_trgm_ops)`);
+    } catch (e) { /* pg_trgm not available — index skipped */ }
 
     // Migration: Fix stale system agent model values (display labels → tier:fast)
     await exec(`UPDATE agents SET model = 'tier:fast' WHERE owner_id = 'system' AND model IS NOT NULL AND model != '' AND model NOT LIKE 'tier:%'`);

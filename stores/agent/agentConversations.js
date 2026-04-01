@@ -104,42 +104,117 @@ async function listAllConversations(userId) {
 
 async function searchConversations(userId, query, filters = {}, encryptionKey) {
     await initDB();
-    let sql = `SELECT c.id, c.agent_id, c.user_id, c.title, c.updated_at, c.messages_json, c.messages_migrated,
-        a.name as agent_name, a.avatar as agent_avatar
-        FROM agent_conversations c
-        LEFT JOIN agents a ON c.agent_id = a.id
-        WHERE c.user_id = $1`;
-    const params = [userId];
-    let idx = 2;
 
-    if (filters.agentId) { sql += ` AND c.agent_id = $${idx++}`; params.push(filters.agentId); }
-    if (filters.startDate) { sql += ` AND c.updated_at >= $${idx++}`; params.push(filters.startDate); }
-    sql += ' ORDER BY c.updated_at DESC';
+    // ── Phase 6: SQL-side search ──────────────────────────────────────────────
+    // Old approach: load every conversation + messages into Node.js, then do
+    //   JS string matching (O(n) queries + O(n) memory).
+    //
+    // New approach — three strategies, applied in priority order:
+    //
+    //  Strategy A (SQL JOIN — zero extra queries):
+    //    For title matches AND migrated-conversation content matches.
+    //    One query with LEFT JOIN on conversation_messages finds both in one shot.
+    //
+    //  Strategy B (SQL ILIKE on blob — no encryption):
+    //    If no encryption key, the messages_json blob is plain text, so we can
+    //    search it directly in SQL for non-migrated conversations.
+    //
+    //  Strategy C (JS fallback — encrypted blobs only):
+    //    Only reached when encryptionKey is set AND conversations aren't migrated
+    //    yet. Bounded to 200 rows max (vs. the old unbounded loop).
+    // ─────────────────────────────────────────────────────────────────────────
 
-    const candidates = await getAll(sql, params);
-    const results = [];
+    const likeQuery = `%${query}%`;
     const lowerQuery = query.toLowerCase();
 
-    for (const conv of candidates) {
-        try {
-            let messagesJson;
-            if (conv.messages_migrated) {
-                const msgs = await convMessages.getMessages(conv.id);
-                messagesJson = JSON.stringify(msgs);
-            } else {
-                messagesJson = decryptMessages(conv.messages_json || '[]', encryptionKey, conv.id, userId);
+    // Base filter params (userId is always $1)
+    const filterParams = [userId];
+    let filterClauses = '';
+    let filterIdx = 2;
+    if (filters.agentId) { filterClauses += ` AND c.agent_id = $${filterIdx++}`; filterParams.push(filters.agentId); }
+    if (filters.startDate) { filterClauses += ` AND c.updated_at >= $${filterIdx++}`; filterParams.push(filters.startDate); }
+
+    // likeQuery is the next param after the filter params
+    const likeIdx = filterIdx; // e.g. $2 if no filters, $3 if agentId, etc.
+
+    // ── Strategy A: title OR migrated message content (single JOIN query) ────
+    const stratA = await getAll(`
+        SELECT DISTINCT
+            c.id, c.agent_id, c.user_id, c.title, c.updated_at,
+            c.messages_migrated,
+            a.name AS agent_name, a.avatar AS agent_avatar
+        FROM agent_conversations c
+        LEFT JOIN agents a ON c.agent_id = a.id
+        LEFT JOIN conversation_messages cm
+            ON cm.conversation_id = c.id AND c.messages_migrated = TRUE
+        WHERE c.user_id = $1
+          AND (c.title ILIKE $${likeIdx} OR cm.content ILIKE $${likeIdx})
+          ${filterClauses}
+        ORDER BY c.updated_at DESC
+        LIMIT 50
+    `, [...filterParams, likeQuery]);
+
+    const results = [...stratA];
+    const matchedIds = new Set(results.map(r => r.id));
+
+    if (results.length < 50) {
+        if (!encryptionKey) {
+            // ── Strategy B: non-migrated blobs, no encryption — search in SQL ──
+            const remaining = 50 - results.length;
+            const stratB = await getAll(`
+                SELECT
+                    c.id, c.agent_id, c.user_id, c.title, c.updated_at,
+                    c.messages_migrated,
+                    a.name AS agent_name, a.avatar AS agent_avatar
+                FROM agent_conversations c
+                LEFT JOIN agents a ON c.agent_id = a.id
+                WHERE c.user_id = $1
+                  AND c.messages_migrated = FALSE
+                  AND c.messages_json ILIKE $${likeIdx}
+                  ${filterClauses}
+                ORDER BY c.updated_at DESC
+                LIMIT ${remaining}
+            `, [...filterParams, likeQuery]);
+
+            for (const r of stratB) {
+                if (!matchedIds.has(r.id)) { results.push(r); matchedIds.add(r.id); }
             }
-            const titleMatch = conv.title && conv.title.toLowerCase().includes(lowerQuery);
-            const messageMatch = messagesJson.toLowerCase().includes(lowerQuery);
-            if (titleMatch || messageMatch) {
-                results.push({ ...conv, messages_json: messagesJson });
+        } else {
+            // ── Strategy C: non-migrated encrypted blobs — bounded JS fallback ──
+            const remaining = 50 - results.length;
+            const encCandidates = await getAll(`
+                SELECT
+                    c.id, c.agent_id, c.user_id, c.title, c.updated_at,
+                    c.messages_json, c.messages_migrated,
+                    a.name AS agent_name, a.avatar AS agent_avatar
+                FROM agent_conversations c
+                LEFT JOIN agents a ON c.agent_id = a.id
+                WHERE c.user_id = $1
+                  AND c.messages_migrated = FALSE
+                  ${filterClauses}
+                ORDER BY c.updated_at DESC
+                LIMIT 200
+            `, filterParams);
+
+            for (const conv of encCandidates) {
+                if (matchedIds.has(conv.id) || results.length >= 50) break;
+                try {
+                    const decrypted = decryptMessages(conv.messages_json || '[]', encryptionKey, conv.id, userId);
+                    if (decrypted.toLowerCase().includes(lowerQuery)) {
+                        results.push({ ...conv, messages_json: decrypted });
+                        matchedIds.add(conv.id);
+                    }
+                } catch (e) {
+                    console.error('[AgentConversations] Search decrypt error:', e);
+                }
             }
-            if (results.length >= 50) break;
-        } catch (e) {
-            console.error('[AgentConversations] Search error:', e);
         }
     }
-    return results;
+
+    // Return unified results sorted by recency, capped at 50
+    return results
+        .sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at))
+        .slice(0, 50);
 }
 
 async function getConversationById(conversationId, encryptionKey = null) {
@@ -186,16 +261,17 @@ async function deleteConversationById(conversationId) {
 // ── Internal: read messages, preferring new table, lazy-migrating from blob ──
 
 async function _readMessages(row, encryptionKey) {
-    try {
-        const hasMigrated = await convMessages.isMigrated(row.id);
-        if (hasMigrated) {
+    // Phase 7a: Use the messages_migrated flag already present on the fetched row
+    // instead of calling isMigrated() which fires an extra SELECT LIMIT 1 per read.
+    if (row.messages_migrated) {
+        try {
             return await convMessages.getMessages(row.id);
+        } catch (e) {
+            console.warn('[AgentConversations] New table read failed, using blob fallback:', e.message);
         }
-    } catch (e) {
-        console.warn('[AgentConversations] New table read failed, using blob fallback:', e.message);
     }
 
-    // Legacy blob fallback
+    // Legacy blob fallback (row not yet migrated, or new-table read failed)
     const messagesJson = decryptMessages(row.messages_json || '[]', encryptionKey, row.id, row.user_id);
     const messages = JSON.parse(messagesJson);
 

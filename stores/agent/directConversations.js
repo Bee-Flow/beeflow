@@ -99,13 +99,14 @@ async function getDirectConversationWorkspace(id) {
 // ── Internal: read from new table first, lazy-migrate from blob if needed ────
 
 async function _readDirectMessages(row) {
-    try {
-        const hasMigrated = await convMessages.isMigrated(row.id);
-        if (hasMigrated) {
+    // Phase 7a: row.messages_migrated is already fetched on the parent SELECT *,
+    // so we check the flag directly — no extra SELECT LIMIT 1 round-trip.
+    if (row.messages_migrated) {
+        try {
             return await convMessages.getMessages(row.id);
+        } catch (e) {
+            console.warn('[DirectConversations] New table read failed, using blob fallback:', e.message);
         }
-    } catch (e) {
-        console.warn('[DirectConversations] New table read failed, using blob fallback:', e.message);
     }
 
     // Legacy blob fallback

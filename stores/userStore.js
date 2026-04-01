@@ -531,38 +531,30 @@ async function updateGroup(groupId, updates) {
 async function deleteGroup(groupId) {
     await initDB();
 
-    // Cascade: remove group from all users' groups arrays
-    const users = await getAll('SELECT id, groups FROM users');
-    for (const user of users) {
-        let groups = [];
-        try { groups = JSON.parse(user.groups || '[]'); } catch (_) {}
-        if (groups.includes(groupId)) {
-            groups = groups.filter(g => g !== groupId);
-            await run('UPDATE users SET groups = $1 WHERE id = $2', [JSON.stringify(groups), user.id]);
-        }
-    }
+    // Phase 7b: Replace 3 full-table-scan + JS loops with targeted SQL UPDATEs.
+    //
+    // Old approach: SELECT * FROM table → JS loop → N individual UPDATE round-trips
+    // New approach: single UPDATE per table using chained REPLACE on the JSON text.
+    //
+    // Four REPLACE passes handle all comma-adjacency edge cases:
+    //   ["a","b","c"] → delete "b" → "a","c" → ["a","c"]   (middle: fix ,,)
+    //   ["a","b"]     → delete "a" → ,"b"    → ["b"]        (first: fix [,)
+    //   ["a","b"]     → delete "b" → "a",    → ["a"]        (last: fix ,])
+    //   ["a"]         → delete "a" → ""      → []           (only: ,] + [, both clean)
 
-    // Cascade: remove group from all agents' shared_groups arrays
-    const agents = await getAll('SELECT id, shared_groups FROM agents');
-    for (const agent of agents) {
-        let sharedGroups = [];
-        try { sharedGroups = JSON.parse(agent.shared_groups || '[]'); } catch (_) {}
-        if (sharedGroups.includes(groupId)) {
-            sharedGroups = sharedGroups.filter(g => g !== groupId);
-            await run('UPDATE agents SET shared_groups = $1 WHERE id = $2', [JSON.stringify(sharedGroups), agent.id]);
-        }
-    }
+    const entry = `"${groupId}"`;       // e.g. "admins"
+    const like  = `%"${groupId}"%`;     // LIKE filter — only update rows that contain it
 
-    // Cascade: remove group from all organizations' defaultGroups arrays
-    const orgs = await getAll('SELECT id, "defaultGroups" FROM organizations');
-    for (const org of orgs) {
-        let defaultGroups = [];
-        try { defaultGroups = JSON.parse(org.defaultGroups || '[]'); } catch (_) {}
-        if (defaultGroups.includes(groupId)) {
-            defaultGroups = defaultGroups.filter(g => g !== groupId);
-            await run('UPDATE organizations SET "defaultGroups" = $1 WHERE id = $2', [JSON.stringify(defaultGroups), org.id]);
-        }
-    }
+    const replaceChain = (col) => `REPLACE(REPLACE(REPLACE(REPLACE(${col}, $1, ''), ',,', ','), ',]', ']'), '[,', '[')`;
+
+    // Remove groupId from users.groups
+    await run(`UPDATE users SET groups = ${replaceChain('groups')} WHERE groups LIKE $2`, [entry, like]);
+
+    // Remove groupId from agents.shared_groups
+    await run(`UPDATE agents SET shared_groups = ${replaceChain('shared_groups')} WHERE shared_groups LIKE $2`, [entry, like]);
+
+    // Remove groupId from organizations.defaultGroups
+    await run(`UPDATE organizations SET "defaultGroups" = ${replaceChain('"defaultGroups"')} WHERE "defaultGroups" LIKE $2`, [entry, like]);
 
     const { rowCount } = await run('DELETE FROM groups WHERE id = $1', [groupId]);
     return rowCount > 0;
