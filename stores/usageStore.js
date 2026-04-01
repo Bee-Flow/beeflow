@@ -35,7 +35,11 @@ async function initDB() {
     await exec(`CREATE INDEX IF NOT EXISTS idx_usage_user ON ai_usage_log(user_id)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_usage_org ON ai_usage_log(organization_id)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_usage_conversation ON ai_usage_log(conversation_id)`);
+    // Phase 2: composite index for the most common dashboard query pattern:
+    // filter by org + date range, ordered by most recent first
+    await exec(`CREATE INDEX IF NOT EXISTS idx_usage_org_timestamp ON ai_usage_log(organization_id, timestamp DESC)`);
     initialized = true;
+
 }
 
 initDB().catch(err => console.error('[UsageStore] Init error:', err.message));

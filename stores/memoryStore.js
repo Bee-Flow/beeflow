@@ -59,8 +59,11 @@ async function initDB() {
     await exec(`CREATE INDEX IF NOT EXISTS idx_memories_project ON user_memories(project_id)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_memories_dedupe ON user_memories(user_id, type, subject, attribute)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_memory_sources ON memory_sources(memory_id)`);
+    // Phase 2: composite index for the hot retrieve path (user_id+status filter)
+    await exec(`CREATE INDEX IF NOT EXISTS idx_memories_user_status_type ON user_memories(user_id, status, type)`);
     initialized = true;
 }
+
 
 initDB().catch(err => console.error('[MemoryStore] Init error:', err.message));
 

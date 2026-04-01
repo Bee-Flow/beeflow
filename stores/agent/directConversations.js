@@ -1,10 +1,15 @@
 /**
  * Direct Conversations - Chat without an agent (direct LLM access)
+ *
+ * Phase 4: Dual-write architecture (same pattern as agentConversations.js).
+ *   - Reads prefer conversation_messages table; fall back to messages_json blob.
+ *   - Writes go to both; blob kept for rollback safety.
  */
 
 const { v4: uuidv4 } = require('uuid');
 const { run, getOne, getAll } = require('../../db');
 const { initDB } = require('./initSchema');
+const convMessages = require('./conversationMessages');
 
 async function createDirectConversation(userId, modelTier = 'fast') {
     await initDB();
@@ -18,7 +23,8 @@ async function getDirectConversation(id, userId) {
     const row = await getOne('SELECT * FROM direct_conversations WHERE id = $1 AND user_id = $2', [id, userId]);
     if (!row) return null;
     const meta = JSON.parse(row.meta_json || '{}');
-    return { ...row, messages: JSON.parse(row.messages_json || '[]'), ...meta };
+    const messages = await _readDirectMessages(row);
+    return { ...row, messages, ...meta };
 }
 
 async function listDirectConversations(userId) {
@@ -38,10 +44,19 @@ async function setDirectConversationLabels(id, labels, userId) {
     return rowCount > 0;
 }
 
+/**
+ * Phase 4 dual-write: write to conversation_messages (new) + messages_json blob (legacy).
+ */
 async function updateDirectConversation(id, messages, userId, meta = null) {
     await initDB();
+
+    // ── New table write (Phase 4) — fire and forget ───────────────────────────
+    convMessages.replaceMessages(id, 'direct', messages).catch(err =>
+        console.error('[DirectConversations] conversation_messages write error:', err.message)
+    );
+
+    // ── Legacy blob write ─────────────────────────────────────────────────────
     if (meta && Object.keys(meta).length > 0) {
-        // Merge new metadata with existing
         const existing = await getOne('SELECT meta_json FROM direct_conversations WHERE id = $1 AND user_id = $2', [id, userId]);
         const existingMeta = JSON.parse(existing?.meta_json || '{}');
         const merged = { ...existingMeta, ...meta };
@@ -61,6 +76,7 @@ async function updateDirectConversationTitle(id, title, userId) {
 
 async function deleteDirectConversation(id, userId) {
     await initDB();
+    await run('DELETE FROM conversation_messages WHERE conversation_id = $1', [id]).catch(() => {});
     const { rowCount } = await run('DELETE FROM direct_conversations WHERE id = $1 AND user_id = $2', [id, userId]);
     return rowCount > 0;
 }
@@ -78,6 +94,29 @@ async function getDirectConversationWorkspace(id) {
     await initDB();
     const row = await getOne('SELECT workspace_content, workspace_notebook_id FROM direct_conversations WHERE id = $1', [id]);
     return row ? { content: row.workspace_content || '', notebookId: row.workspace_notebook_id || null } : null;
+}
+
+// ── Internal: read from new table first, lazy-migrate from blob if needed ────
+
+async function _readDirectMessages(row) {
+    try {
+        const hasMigrated = await convMessages.isMigrated(row.id);
+        if (hasMigrated) {
+            return await convMessages.getMessages(row.id);
+        }
+    } catch (e) {
+        console.warn('[DirectConversations] New table read failed, using blob fallback:', e.message);
+    }
+
+    // Legacy blob fallback
+    const messages = JSON.parse(row.messages_json || '[]');
+
+    // Lazy migration (non-blocking)
+    convMessages.migrateConversationIfNeeded(row.id, 'direct', messages).catch(err =>
+        console.error('[DirectConversations] Lazy migration error:', err.message)
+    );
+
+    return messages;
 }
 
 module.exports = {

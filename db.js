@@ -6,6 +6,15 @@
  *     (session store uses a separate `node-redis` client in index.js)
  *
  * All stores should import { pool, getRedis, ... } from '../db';
+ *
+ * Pool sizing rationale for 50 active users:
+ *   - max:40  — allows concurrent AI streaming (long-held connections) +
+ *               regular CRUD queries without timeouts.
+ *   - statement_timeout:30s — kills runaway queries before they occupy
+ *               a connection slot indefinitely.
+ *   - idle_in_transaction_session_timeout:60s — guards against hung
+ *               transactions that block pool slots.
+ *   - application_name — visible in pg_stat_activity for monitoring.
  */
 
 const { Pool } = require('pg');
@@ -16,14 +25,41 @@ const Redis = require('ioredis');
 const pool = new Pool({
     connectionString: process.env.CORE_DATABASE_URL
         || 'postgresql://beeflow:beeflow@localhost:5432/beeflow_core',
-    max: 20,
+    // 40 connections: comfortably handles 50 concurrent users with AI
+    // streaming (which holds connections open for 30–120 s each).
+    max: 40,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 5000,
+    // Kill queries that run longer than 30 s — prevents stuck queries
+    // from holding a pool slot and blocking other users.
+    statement_timeout: 30000,
+    // Kill transactions left open for > 60 s (e.g. a crashed request
+    // that never committed/rolled back).
+    idle_in_transaction_session_timeout: 60000,
+    // Visible in pg_stat_activity so you can identify beeflow connections.
+    application_name: 'beeflow-server',
 });
 
 pool.on('error', (err) => {
     console.error('[DB] Unexpected PG pool error:', err.message);
 });
+
+// ── Pool pressure monitoring ─────────────────────────────
+// Log a warning when >10 queries are queued waiting for a free
+// connection — an early signal that the pool is under pressure.
+const POOL_WARN_THRESHOLD = 10;
+let _poolWarnLogged = false;
+setInterval(() => {
+    const waiting = pool.waitingCount;
+    if (waiting > POOL_WARN_THRESHOLD) {
+        if (!_poolWarnLogged) {
+            console.warn(`[DB] Pool pressure: ${waiting} queries waiting for a free connection (total=${pool.totalCount}, idle=${pool.idleCount}). Consider scaling.`);
+            _poolWarnLogged = true;
+        }
+    } else {
+        _poolWarnLogged = false; // reset so we warn again if it spikes again
+    }
+}, 5000).unref(); // unref so this timer doesn't keep the process alive
 
 // ── Redis ───────────────────────────────────────────────
 // Wrapped in an object so getRedis() always returns the current state,
@@ -148,6 +184,17 @@ async function getClient() {
     return pool.connect();
 }
 
+/**
+ * Returns current pool statistics for health checks and monitoring.
+ */
+function getPoolStats() {
+    return {
+        total: pool.totalCount,
+        idle: pool.idleCount,
+        waiting: pool.waitingCount,
+    };
+}
+
 module.exports = {
     pool,
     getRedis,
@@ -158,4 +205,5 @@ module.exports = {
     getAll,
     exec,
     getClient,
+    getPoolStats,
 };

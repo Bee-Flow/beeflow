@@ -6,15 +6,13 @@
  *   - heads_up: Items awaiting approval, unusual patterns
  *   - urgent:   Task failed, auth expired, errors
  *
- * Uses the same pg Pool as taskStore for connection sharing.
+ * Uses the shared pg Pool from db.js rather than creating its own pool —
+ * this prevents a hidden connection leak where a private Pool would silently
+ * consume up to 10 extra connections outside of monitoring.
  */
 
 const crypto = require('crypto');
-const { Pool } = require('pg');
-
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL || 'postgresql://beeflow:beeflow@localhost:5432/beeflow_tasks',
-});
+const { pool } = require('../db');
 
 const INIT_SQL = `
 CREATE TABLE IF NOT EXISTS notifications (
