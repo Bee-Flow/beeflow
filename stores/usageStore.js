@@ -29,7 +29,7 @@ async function initDB() {
             conversation_id TEXT
         )
     `);
-    await exec(`CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON ai_usage_log(timestamp)`);
+    await exec(`CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON ai_usage_log(timestamp DESC)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_usage_model ON ai_usage_log(model)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_usage_agent ON ai_usage_log(agent_id)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_usage_user ON ai_usage_log(user_id)`);
@@ -38,6 +38,15 @@ async function initDB() {
     // Phase 2: composite index for the most common dashboard query pattern:
     // filter by org + date range, ordered by most recent first
     await exec(`CREATE INDEX IF NOT EXISTS idx_usage_org_timestamp ON ai_usage_log(organization_id, timestamp DESC)`);
+    // Phase 8: additional composite indexes for common filter combos
+    // user-scoped date-range queries (user dashboard)
+    await exec(`CREATE INDEX IF NOT EXISTS idx_usage_user_timestamp ON ai_usage_log(user_id, timestamp DESC)`);
+    // agent breakdown queries
+    await exec(`CREATE INDEX IF NOT EXISTS idx_usage_agent_timestamp ON ai_usage_log(agent_id, timestamp DESC)`);
+    // partial index: tool_name IS NOT NULL — getToolUsage() filters this column
+    try {
+        await exec(`CREATE INDEX IF NOT EXISTS idx_usage_tool_name ON ai_usage_log(tool_name) WHERE tool_name IS NOT NULL`);
+    } catch (e) { /* ignore */ }
     initialized = true;
 
 }
@@ -240,12 +249,19 @@ async function getRecentCalls(limit = 50, filters = {}) {
         conditions.push(`timestamp <= $${idx++}`);
         params.push(filters.endDate);
     }
+    // Phase 8: default 30-day guard when no date filter is set.
+    // Without this, getRecentCalls with no filters scans the entire table
+    // even though LIMIT is set — ORDER BY timestamp DESC + the timestamp index
+    // means PG stops after reading `limit` rows from the index.
+    if (!filters?.startDate && !filters?.endDate) {
+        conditions.push(`timestamp >= NOW() - INTERVAL '30 days'`);
+    }
 
     const where = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
     return getAll(`
         SELECT * FROM ai_usage_log
         ${where}
-        ORDER BY id DESC
+        ORDER BY timestamp DESC
         LIMIT $${idx}
     `, [...params, limit]);
 }
@@ -271,9 +287,12 @@ async function getCostTimeline(filters = {}, interval = 'day') {
 
 async function getUsageSources() {
     await initDB();
+    // Phase 8: use the timestamp index to scan only recent data for the distinct list;
+    // sources don't change often so last 90 days is representative
     const rows = await getAll(`
         SELECT DISTINCT source FROM ai_usage_log
         WHERE source IS NOT NULL
+          AND timestamp >= NOW() - INTERVAL '90 days'
         ORDER BY source ASC
     `);
     return rows.map(r => r.source);
@@ -281,9 +300,11 @@ async function getUsageSources() {
 
 async function getUsageModels() {
     await initDB();
+    // Phase 8: same bounded approach as getUsageSources
     const rows = await getAll(`
         SELECT DISTINCT model FROM ai_usage_log
         WHERE model IS NOT NULL
+          AND timestamp >= NOW() - INTERVAL '90 days'
         ORDER BY model ASC
     `);
     return rows.map(r => r.model);

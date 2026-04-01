@@ -1,5 +1,5 @@
 /**
- * Conversation Messages Store — Phase 4 Performance Fix
+ * Conversation Messages Store — Phase 5 Performance Fix
  *
  * Replaces the messages_json TEXT blob anti-pattern.
  * Each message is stored as an individual row, so appending a message
@@ -24,10 +24,18 @@
  *   - Once migrated, the blob column is no longer read.
  *   - The blob column is kept for emergency rollback — it stays in sync for
  *     a release cycle, then can be dropped.
+ *
+ * Phase 5 change:
+ *   replaceMessages() and migrateConversationIfNeeded() previously looped and
+ *   ran one INSERT per message (N round-trips). They now use a single
+ *   parameterized multi-row INSERT, shrinking N round-trips to 1
+ *   (or ceil(N/500) for very long conversations — PG parameter limit safety).
+ *   replaceMessages() also wraps the DELETE + INSERT in a transaction so
+ *   a crashed write never leaves a conversation message-less.
  */
 
 const { v4: uuidv4 } = require('uuid');
-const { run, getOne, getAll, exec } = require('../../db');
+const { run, getOne, getAll, exec, getClient } = require('../../db');
 
 let initialized = false;
 
@@ -117,12 +125,73 @@ function rowToMessage(row) {
     };
 }
 
+// ── Phase 5: Bulk INSERT helper ───────────────────────────────────────────────
+
+/**
+ * Insert an array of message rows in one (or a few) SQL statements.
+ *
+ * PostgreSQL supports at most 65535 bound parameters per query.
+ * With 8 columns per row that is ~8191 rows. We chunk at 500 rows
+ * (4000 params) to stay well within the limit and keep individual
+ * statements fast.
+ *
+ * @param {object[]} rows       - Output of messagesToRows()
+ * @param {object}   client     - PG client (from getClient()) for transaction, or null to use pool
+ * @param {string}   onConflict - Optional "ON CONFLICT ..." clause
+ */
+const COLS = 8;           // id, conversation_id, conversation_type, role, content, tool_name, meta_json, seq
+const CHUNK_SIZE = 500;   // max rows per INSERT — keeps pg params < 4000
+
+async function _bulkInsert(rows, client, onConflict = '') {
+    if (!rows || rows.length === 0) return;
+
+    const query = client
+        ? (sql, params) => client.query(sql, params)
+        : (sql, params) => run(sql, params);
+
+    // Process in chunks to respect PG parameter limit
+    for (let i = 0; i < rows.length; i += CHUNK_SIZE) {
+        const chunk = rows.slice(i, i + CHUNK_SIZE);
+        const valueClauses = [];
+        const params = [];
+        let idx = 1;
+
+        for (const r of chunk) {
+            valueClauses.push(
+                `($${idx},$${idx+1},$${idx+2},$${idx+3},$${idx+4},$${idx+5},$${idx+6},$${idx+7})`
+            );
+            params.push(
+                r.id,
+                r.conversation_id,
+                r.conversation_type,
+                r.role,
+                r.content,
+                r.tool_name,
+                r.meta_json,
+                r.seq
+            );
+            idx += COLS;
+        }
+
+        await query(
+            `INSERT INTO conversation_messages
+                (id, conversation_id, conversation_type, role, content, tool_name, meta_json, seq)
+             VALUES ${valueClauses.join(',')}
+             ${onConflict}`,
+            params
+        );
+    }
+}
+
+
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /**
  * Migrate a legacy messages_json blob into the conversation_messages table.
  * Safe to call multiple times — checks messages_migrated flag first.
  * Returns true if migration happened, false if already migrated or nothing to do.
+ *
+ * Phase 5: Uses bulk INSERT instead of N individual INSERTs.
  */
 async function migrateConversationIfNeeded(conversationId, type, messagesArray) {
     await initMessagesTable();
@@ -136,17 +205,9 @@ async function migrateConversationIfNeeded(conversationId, type, messagesArray) 
     if (existing) return false; // already has rows
 
     const rows = messagesToRows(conversationId, type, messagesArray);
-    // Bulk insert — use individual inserts with ON CONFLICT DO NOTHING to be safe
-    for (const r of rows) {
-        await run(
-            `INSERT INTO conversation_messages
-                (id, conversation_id, conversation_type, role, content, tool_name, meta_json, seq)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-             ON CONFLICT (id) DO NOTHING`,
-            [r.id, r.conversation_id, r.conversation_type, r.role,
-             r.content, r.tool_name, r.meta_json, r.seq]
-        );
-    }
+
+    // Phase 5: single bulk INSERT instead of N round-trips
+    await _bulkInsert(rows, null, 'ON CONFLICT (id) DO NOTHING');
 
     // Mark as migrated on the parent table
     const parentTable = type === 'direct' ? 'direct_conversations' : 'agent_conversations';
@@ -173,23 +234,39 @@ async function getMessages(conversationId) {
 
 /**
  * Replace all messages for a conversation (mirrors the old updateConversation behaviour).
- * Deletes existing rows and inserts the new full array atomically.
+ * Deletes existing rows and inserts the new full array atomically inside a transaction.
  * This is called by the dual-write shim in agentConversations / directConversations.
+ *
+ * Phase 5: Wraps DELETE + bulk INSERT in a single transaction.
+ *   - A failed write now leaves the old messages intact (ROLLBACK) rather than
+ *     leaving an empty conversation after a partial failure.
+ *   - N round-trips → 1 round-trip (or ceil(N/500) for very long conversations).
  */
 async function replaceMessages(conversationId, type, messagesArray) {
     await initMessagesTable();
-    // Delete old rows
-    await run('DELETE FROM conversation_messages WHERE conversation_id = $1', [conversationId]);
-    if (!messagesArray || messagesArray.length === 0) return;
-    const rows = messagesToRows(conversationId, type, messagesArray);
-    for (const r of rows) {
-        await run(
-            `INSERT INTO conversation_messages
-                (id, conversation_id, conversation_type, role, content, tool_name, meta_json, seq)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-            [r.id, r.conversation_id, r.conversation_type, r.role,
-             r.content, r.tool_name, r.meta_json, r.seq]
+
+    const client = await getClient();
+    try {
+        await client.query('BEGIN');
+
+        // 1. Wipe existing rows for this conversation
+        await client.query(
+            'DELETE FROM conversation_messages WHERE conversation_id = $1',
+            [conversationId]
         );
+
+        // 2. Bulk insert new rows (no-op if empty)
+        if (messagesArray && messagesArray.length > 0) {
+            const rows = messagesToRows(conversationId, type, messagesArray);
+            await _bulkInsert(rows, client);
+        }
+
+        await client.query('COMMIT');
+    } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+    } finally {
+        client.release();
     }
 }
 
