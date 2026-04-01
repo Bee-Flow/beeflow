@@ -122,6 +122,15 @@ async function _doInit() {
     await exec('CREATE INDEX IF NOT EXISTS idx_agent_conversations_user ON agent_conversations(user_id)');
     await exec('CREATE INDEX IF NOT EXISTS idx_direct_conversations_user ON direct_conversations(user_id)');
 
+    // ── Phase 2: Composite indexes for hot listing queries ─────────────────────
+    // listAllConversations(userId) → ORDER BY updated_at DESC
+    await exec('CREATE INDEX IF NOT EXISTS idx_agent_conv_user_updated ON agent_conversations(user_id, updated_at DESC)');
+    // listDirectConversations(userId) → ORDER BY updated_at DESC
+    await exec('CREATE INDEX IF NOT EXISTS idx_direct_conv_user_updated ON direct_conversations(user_id, updated_at DESC)');
+    // listConversations(agentId, userId) → WHERE agent_id=$1 AND user_id=$2 ORDER BY updated_at DESC
+    await exec('CREATE INDEX IF NOT EXISTS idx_agent_conv_agent_user_updated ON agent_conversations(agent_id, user_id, updated_at DESC)');
+
+
     // Migration: Fix stale system agent model values (display labels → tier:fast)
     await exec(`UPDATE agents SET model = 'tier:fast' WHERE owner_id = 'system' AND model IS NOT NULL AND model != '' AND model NOT LIKE 'tier:%'`);
 

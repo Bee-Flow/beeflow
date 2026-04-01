@@ -133,6 +133,12 @@ async function initDB() {
     try { await exec(`ALTER TABLE groups ADD COLUMN IF NOT EXISTS "orgRole" TEXT DEFAULT ''`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS "azureUserId" TEXT`); } catch (e) { /* column already exists */ }
 
+    // ── Phase 2: Indexes on hot auth/org query paths ──────────────────────────
+    // getUserByEmail() is called on every login — must be index-scanned
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_users_email ON users(LOWER(email)) WHERE email IS NOT NULL`); } catch (e) { /* ok */ }
+    // org-scoped queries (getUsersByOrg, admin lists)
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_users_org ON users("organizationId") WHERE "organizationId" IS NOT NULL AND "organizationId" != ''`); } catch (e) { /* ok */ }
+
     initialized = true;
 }
 
@@ -173,6 +179,7 @@ async function migrateJsonToDb() {
                     const wDek = u.wrappedDEK ? (typeof u.wrappedDEK === 'string' ? u.wrappedDEK : JSON.stringify(u.wrappedDEK)) : null;
                     await run(`INSERT INTO users (id, username, "displayName", "passwordHash", role, groups, "masterWrappedDEK", "wrappedDEK", "orgRole", "organizationId", "createdAt")
                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+
                         [id, u.username, u.displayName || u.username, u.passwordHash, u.role || 'user',
                             JSON.stringify(u.groups || []), mwDek, wDek, '', '',
                             u.createdAt || new Date().toISOString().split('T')[0]]);
@@ -250,12 +257,22 @@ function parseJSON(str, fallback) { if (!str) return fallback; try { return JSON
 // ── Users ─────────────────────────────
 async function getAllUsers() {
     await initDB();
-    const rows = await getAll('SELECT * FROM users');
+    // Phase 2: exclude avatar (base64 blob, up to 200 KB per user) from list
+    // queries — callers that need the avatar should use getUser(id) instead.
+    const rows = await getAll(`
+        SELECT id, username, "displayName", "firstName", "lastName", email, phone,
+               "avatarType", role, groups, "orgRole", "organizationId",
+               "masterWrappedDEK", "wrappedDEK", "kekSalt", "recoverySalt",
+               "recoveryWrappedDEK", "ssoEncryptionSetup", "passwordResetRequired",
+               "dekUnwrapFailures", "dekLockoutUntil", "kdfMode", "createdAt",
+               status, "activeIconPackId", "azureUserId"
+        FROM users
+    `);
     return rows.map(u => {
-        const { passwordHash, appPassword, ...safeUser } = u;
-        return { ...safeUser, groups: parseJSON(u.groups, []), masterWrappedDEK: parseJSON(u.masterWrappedDEK, u.masterWrappedDEK), wrappedDEK: parseJSON(u.wrappedDEK, u.wrappedDEK) };
+        return { ...u, groups: parseJSON(u.groups, []), masterWrappedDEK: parseJSON(u.masterWrappedDEK, u.masterWrappedDEK), wrappedDEK: parseJSON(u.wrappedDEK, u.wrappedDEK) };
     });
 }
+
 
 async function getUser(userId) {
     await initDB();

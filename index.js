@@ -91,31 +91,44 @@ app.use(bodyParser.json({ limit: '20mb' }));
 // ── Sessions ──────────────────────────────────────────────────────────────────────
 const pgSession = require('connect-pg-simple')(session);
 const { pool, getRedis, disconnectRedis } = require('./db');
+const { wrapWithRedisCache } = require('./auth/sessionCache');
 
-// Sessions: Use PostgreSQL as primary store (persistent across deploys).
-// Redis is ephemeral (no persistent volume) — sessions would be lost on container restart.
+// Sessions: PostgreSQL is the durable source of truth (survives Redis restarts).
+// Redis is wired as a read-through cache layer on top — cache hit avoids a DB
+// round-trip for the session lookup that happens on every authenticated request.
 let sessionStore;
 let _sessionRedisClient = null; // kept for graceful shutdown
 
 // Primary: PostgreSQL (persistent via beeflow-pgdata volume)
-sessionStore = new pgSession({ pool, tableName: 'user_sessions', createTableIfMissing: true, pruneSessionInterval: 900 });
+const pgStore = new pgSession({ pool, tableName: 'user_sessions', createTableIfMissing: true, pruneSessionInterval: 900 });
 console.log('[Sessions] Using PostgreSQL session store (persistent across deploys)');
 
-// Still connect Redis for caching (session tokens, etc.) but NOT for session storage
+// Phase 3: Redis session cache — read-through layer over pgStore.
+// Falls back transparently to pgStore if Redis is unavailable.
 if (process.env.REDIS_URL) {
     try {
         const { createClient } = require('redis');
         _sessionRedisClient = createClient({ url: process.env.REDIS_URL });
         _sessionRedisClient.on('error', (err) => console.warn('[Sessions] Redis error:', err.message));
         _sessionRedisClient.connect().then(() => {
-            console.log('[Sessions] Redis connected for caching');
+            console.log('[Sessions] Redis connected — activating session read-through cache');
+            // Re-wrap the store now that Redis is confirmed ready.
+            // express-session holds a reference to sessionStore.get/set/destroy
+            // so we patch the prototype methods in-place via the wrapper.
+            const cached = wrapWithRedisCache(pgStore, _sessionRedisClient);
+            // Copy the wrapped methods onto the live store object
+            sessionStore.get     = cached.get.bind(cached);
+            sessionStore.set     = cached.set.bind(cached);
+            sessionStore.touch   = cached.touch.bind(cached);
+            sessionStore.destroy = cached.destroy.bind(cached);
         }).catch((err) => {
-            console.warn('[Sessions] Redis connect failed:', err.message);
+            console.warn('[Sessions] Redis connect failed, using PG-only sessions:', err.message);
         });
     } catch (err) {
         console.warn('[Sessions] Failed to create Redis client:', err.message);
     }
 }
+sessionStore = pgStore;
 
 app.use(session({
     store: sessionStore,
