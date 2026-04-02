@@ -536,8 +536,9 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
 
             for (const att of attachments) {
                 if (att.type && att.type.startsWith('image/') && att.content) {
-                    // Upload image to RustFS for persistence
+                    // Upload image to RustFS for persistence + inference URL
                     let imageProxyUrl = null;
+                    let inferenceUrl = null;
                     try {
                         if (storageStore.isAvailable()) {
                             const base64Data = att.content.split(',')[1] || att.content;
@@ -548,13 +549,22 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
                             imageProxyUrl = storageStore.buildProxyUrl(key);
                             console.log(`[DirectChat] Uploaded image to RustFS: ${key}`);
                             persistedAttachments.push({ name: att.name, type: att.type, storageKey: key, url: imageProxyUrl });
+
+                            // Generate temp URL for AI inference (URL is ~200 chars vs 500-1000 KB base64)
+                            const { generateTempDownloadUrl } = require('../../routes/storageProxy');
+                            inferenceUrl = generateTempDownloadUrl(key, 900);
+                            console.log(`[DirectChat] Image uploaded to RustFS → using URL for inference (${att.name})`);
                         }
                     } catch (e) {
                         console.warn(`[DirectChat] Failed to upload image to RustFS: ${e.message}`);
                     }
                     // Send as image data only if the current model supports vision
                     if (adapter.supportsVision(modelId)) {
-                        contentParts.push({ type: 'image_url', image_url: { url: att.content } });
+                        const imageDataUrl = inferenceUrl || att.content;
+                        contentParts.push({ type: 'image_url', image_url: { url: imageDataUrl, detail: 'auto' } });
+                        if (!inferenceUrl) {
+                            console.log(`[DirectChat] RustFS unavailable — using base64 for ${att.name || 'unnamed'}`);
+                        }
                     } else {
                         // Non-vision model: add a descriptive text note instead of a broken image reference
                         contentParts.push({ type: 'text', text: `[Attached image: ${att.name || 'image'} — this model does not support vision. To analyze this image, switch to a vision-capable model such as GPT-4o, Claude 3, Gemini, or Pixtral.]` });
