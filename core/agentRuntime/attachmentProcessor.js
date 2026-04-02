@@ -36,6 +36,8 @@ async function uploadImageForInference(base64DataUrl, mimeType, userId, filename
         // Generate a 15-minute HMAC-signed temp URL (served by our own proxy)
         const { generateTempDownloadUrl } = require('../../routes/storageProxy');
         const url = generateTempDownloadUrl(key, 900);
+        console.log(`[AttachmentProcessor] Generated inference URL: ${url}`);
+        console.log(`[AttachmentProcessor] SERVER_PUBLIC_HOST=${process.env.SERVER_PUBLIC_HOST || '(unset)'}, SERVER_PROTOCOL=${process.env.SERVER_PROTOCOL || '(unset)'}`);
         return url;
     } catch (err) {
         console.warn('[AttachmentProcessor] Could not upload image to RustFS:', err.message);
