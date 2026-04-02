@@ -304,12 +304,11 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         });
     }
 
-    // ============ STRIP IMAGES FROM HISTORY ============
-    // Images from previous turns should not be re-sent on every turn:
-    //  - base64 data URIs cause context window overflow (500KB+ each)
-    //  - temp HTTPS URLs expire after 15 minutes and would fail on follow-up
-    // Only the CURRENT (last) user message keeps full image data — older messages
-    // get ALL image_url entries replaced with a lightweight text placeholder.
+    // ============ REFRESH IMAGE URLS IN HISTORY ============
+    // Images from previous turns need special handling:
+    //  - base64 data URIs are stripped (500KB+ each — causes context overflow)
+    //  - temp HTTPS URLs (from RustFS) are regenerated with fresh expiry so the AI
+    //    can still see images from earlier turns when user asks follow-up questions
     for (let i = 0; i < messages.length - 1; i++) {
         const msg = messages[i];
         if (Array.isArray(msg.content)) {
@@ -318,13 +317,39 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 messages[i] = {
                     ...msg,
                     content: msg.content.map(part => {
-                        if (part.type === 'image_url') {
+                        if (part.type !== 'image_url') return part;
+                        const url = part.image_url?.url || '';
+
+                        // Strip base64 — too large for context window
+                        if (url.startsWith('data:')) {
                             return { type: 'text', text: '[Previously attached image]' };
                         }
+
+                        // Regenerate fresh temp URL for RustFS images
+                        if (url.includes('/api/storage/tmp/')) {
+                            try {
+                                const parsedUrl = new URL(url);
+                                const key = parsedUrl.searchParams.get('key');
+                                if (key) {
+                                    const { generateTempDownloadUrl } = require('../../routes/storageProxy');
+                                    const freshUrl = generateTempDownloadUrl(key, 900);
+                                    console.log(`[AgentRuntime] Refreshed temp URL for historical image (key: ${key.substring(0, 40)}...)`);
+                                    return {
+                                        type: 'image_url',
+                                        image_url: { url: freshUrl, detail: 'auto' }
+                                    };
+                                }
+                            } catch (e) {
+                                console.warn(`[AgentRuntime] Failed to refresh image URL: ${e.message}`);
+                            }
+                            // Fallback if URL parsing fails
+                            return { type: 'text', text: '[Previously attached image]' };
+                        }
+
+                        // Unknown URL format — keep as-is (could be external URL)
                         return part;
                     })
                 };
-                console.log(`[AgentRuntime] Stripped image from historical message ${i}`);
             }
         }
     }
