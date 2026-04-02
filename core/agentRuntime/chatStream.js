@@ -295,13 +295,77 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         messages = [...historyOverride];
     } else {
         messages = [...conversation.messages];
+
+        // Build persisted attachments (strip base64, upload to RustFS for persistent URLs)
+        const persistedAttachments = [];
+        if (messageMetadata?.attachments && messageMetadata.attachments.length > 0) {
+            const storageStore = require('../../stores/storageStore');
+            const crypto = require('crypto');
+            for (const att of messageMetadata.attachments) {
+                if (att.type && att.type.startsWith('image/') && att.content) {
+                    // Upload image to RustFS for persistence
+                    let imageProxyUrl = null;
+                    let storageKey = null;
+                    try {
+                        if (storageStore.isAvailable()) {
+                            const base64Data = att.content.split(',')[1] || att.content;
+                            const ext = att.type.includes('jpeg') || att.type.includes('jpg') ? 'jpg' : 'png';
+                            const filename = `upload_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.${ext}`;
+                            const key = storageStore.buildKey(userId, 'uploads', filename);
+                            await storageStore.uploadFile(key, Buffer.from(base64Data, 'base64'), att.type);
+                            imageProxyUrl = storageStore.buildProxyUrl(key);
+                            storageKey = key;
+                            console.log(`[AgentRuntime] Uploaded attachment image to RustFS: ${key}`);
+                        }
+                    } catch (e) {
+                        console.warn(`[AgentRuntime] Failed to upload attachment image to RustFS: ${e.message}`);
+                    }
+                    persistedAttachments.push({ name: att.name, type: att.type, storageKey, url: imageProxyUrl });
+                } else if (att.type && att.type.includes('pdf')) {
+                    // PDF — persist metadata without base64 content
+                    let pdfProxyUrl = null;
+                    try {
+                        if (storageStore.isAvailable()) {
+                            const base64Data = att.content.split(',')[1] || att.content;
+                            const filename = `upload_${Date.now()}_${crypto.randomBytes(4).toString('hex')}_${(att.name || 'document').replace(/[^a-zA-Z0-9.\-_]/g, '_')}`;
+                            const key = storageStore.buildKey(userId, 'uploads', filename);
+                            await storageStore.uploadFile(key, Buffer.from(base64Data, 'base64'), att.type);
+                            pdfProxyUrl = storageStore.buildProxyUrl(key);
+                            console.log(`[AgentRuntime] Uploaded attachment PDF to RustFS: ${key}`);
+                        }
+                    } catch (e) {
+                        console.warn(`[AgentRuntime] Failed to upload attachment PDF to RustFS: ${e.message}`);
+                    }
+                    persistedAttachments.push({ name: att.name, type: att.type, url: pdfProxyUrl });
+                } else if (att.name) {
+                    // Other file types — persist metadata only
+                    let fileProxyUrl = null;
+                    try {
+                        if (att.content && storageStore.isAvailable()) {
+                            const base64Data = att.content.split(',')[1] || att.content;
+                            const filename = `upload_${Date.now()}_${crypto.randomBytes(4).toString('hex')}_${(att.name || 'file').replace(/[^a-zA-Z0-9.\-_]/g, '_')}`;
+                            const key = storageStore.buildKey(userId, 'uploads', filename);
+                            await storageStore.uploadFile(key, Buffer.from(base64Data, 'base64'), att.type || 'application/octet-stream');
+                            fileProxyUrl = storageStore.buildProxyUrl(key);
+                            console.log(`[AgentRuntime] Uploaded attachment file to RustFS: ${key}`);
+                        }
+                    } catch (e) {
+                        console.warn(`[AgentRuntime] Failed to upload attachment file to RustFS: ${e.message}`);
+                    }
+                    persistedAttachments.push({ name: att.name, type: att.type, url: fileProxyUrl });
+                }
+            }
+        }
+
         // Include id and parentId for persistence
-        messages.push({
+        const userMsg = {
             id: messageMetadata.messageId,
             role: 'user',
             content: userMessage,
             parentId: messageMetadata.parentId || null
-        });
+        };
+        if (persistedAttachments.length > 0) userMsg.attachments = persistedAttachments;
+        messages.push(userMsg);
     }
 
     // ============ REFRESH IMAGE URLS IN HISTORY ============
