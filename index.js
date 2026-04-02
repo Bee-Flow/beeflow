@@ -410,6 +410,12 @@ app.listen(PORT, '0.0.0.0', () => {
     const { runBootInit } = require('./boot-init');
     runBootInit().catch(err => console.error('[boot-init] Fatal:', err));
 
+    // Initialize RustFS object storage (non-blocking — falls back gracefully if unavailable)
+    require('./stores/storageStore').init().catch(err =>
+        console.warn('[Server] RustFS storage init failed:', err.message)
+    );
+
+
     try {
         containerManager.ensureDockerImage();
         containerManager.startCleanupTimer();
