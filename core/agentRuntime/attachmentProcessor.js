@@ -18,7 +18,7 @@ const { v4: uuidv4 } = require('uuid');
  */
 async function uploadImageForInference(base64DataUrl, mimeType, userId, filename = 'image.png') {
     try {
-        const storageStore = require('../stores/storageStore');
+        const storageStore = require('../../stores/storageStore');
         if (!storageStore.isAvailable()) return null;
 
         // Strip data URL prefix
