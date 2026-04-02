@@ -53,7 +53,10 @@ router.get('/tmp/:token', async (req, res) => {
         const key = req.query.key;
         const expires = parseInt(req.query.expires, 10);
 
+        console.log(`[StorageProxy] Temp download request: key=${key}, UA=${req.get('User-Agent')?.substring(0, 80)}, IP=${req.ip}`);
+
         if (!key || !expires || !token) {
+            console.warn('[StorageProxy] Temp download: missing parameters');
             return res.status(400).json({ error: 'Missing parameters' });
         }
 
@@ -64,6 +67,7 @@ router.get('/tmp/:token', async (req, res) => {
 
         // Check expiry
         if (Math.floor(Date.now() / 1000) > expires) {
+            console.warn(`[StorageProxy] Temp download: URL expired for key=${key}`);
             return res.status(410).json({ error: 'URL expired' });
         }
 
@@ -80,10 +84,14 @@ router.get('/tmp/:token', async (req, res) => {
 
         const { stream, contentType, contentLength } = await storageStore.streamFile(key);
 
-        res.setHeader('Content-Type', contentType || 'audio/wav');
+        // Set proper Content-Type (default to octet-stream, not audio/wav which was the old transcription default)
+        res.setHeader('Content-Type', contentType || 'application/octet-stream');
         if (contentLength) res.setHeader('Content-Length', contentLength);
         res.setHeader('Cache-Control', 'no-store');
+        // Allow cross-origin image fetching (Azure AI, etc.)
+        res.setHeader('Access-Control-Allow-Origin', '*');
 
+        console.log(`[StorageProxy] Serving temp file: key=${key}, type=${contentType}, size=${contentLength || 'unknown'}`);
         stream.pipe(res);
     } catch (err) {
         if (err.name === 'NoSuchKey' || err.$metadata?.httpStatusCode === 404) {
