@@ -204,12 +204,12 @@ class GoogleProvider extends BaseProvider {
                     if (part.type === 'text') {
                         parts.push({ text: part.text });
                     } else if (part.type === 'image_url') {
-                        // Convert image URL (data URL or http)
-                        const url = typeof part.image_url === 'string'
-                            ? part.image_url
-                            : part.image_url?.url || '';
+                        // Convert image: data URL → inlineData, https URL → fileData
+                        const imgObj = part.image_url;
+                        const url = typeof imgObj === 'string' ? imgObj : (imgObj?.url || '');
                         if (url.startsWith('data:')) {
                             const match = url.match(/^data:([^;]+);base64,(.+)$/);
+
                             if (match) {
                                 parts.push({
                                     inlineData: {
@@ -218,8 +218,14 @@ class GoogleProvider extends BaseProvider {
                                     },
                                 });
                             }
-                        } else {
-                            parts.push({ text: `[Image: ${url}]` });
+                        } else if (url.startsWith('http')) {
+                            // Use fileData for URLs — Gemini fetches the image from the URL
+                            parts.push({
+                                fileData: {
+                                    fileUri: url,
+                                    mimeType: imgObj?.mimeType || 'image/png',
+                                },
+                            });
                         }
                     }
                 }

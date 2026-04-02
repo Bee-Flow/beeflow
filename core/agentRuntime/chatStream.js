@@ -512,7 +512,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             // Handle attachments if present
             if (messageMetadata?.attachments && messageMetadata.attachments.length > 0) {
                 console.log(`[Agent] Processing ${messageMetadata.attachments.length} attachments...`);
-                await processAttachments(messageMetadata.attachments, lastMsg);
+                await processAttachments(messageMetadata.attachments, lastMsg, userId);
             }
 
             // Inject guardrail violation context if detected

@@ -124,10 +124,12 @@ class OpenAIProvider extends BaseProvider {
                         return { type: 'input_text', text: part.text };
                     }
                     if (part.type === 'image_url') {
-                        const url = typeof part.image_url === 'string'
-                            ? part.image_url
-                            : part.image_url?.url || '';
-                        return { type: 'input_image', image_url: url };
+                        const imgObj = part.image_url;
+                        const url = typeof imgObj === 'string' ? imgObj : (imgObj?.url || '');
+                        const detail = typeof imgObj === 'object' ? imgObj?.detail : undefined;
+                        const result = { type: 'input_image', image_url: url };
+                        if (detail) result.detail = detail;
+                        return result;
                     }
                     return part;
                 });

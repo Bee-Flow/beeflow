@@ -23,14 +23,17 @@ const HMAC_SECRET = process.env.SESSION_SECRET || 'beeflow-tmp-download';
 
 /**
  * Generate a time-limited, HMAC-signed public URL for a RustFS key.
- * Only allowed for keys under `transcription-tmp/`.
+ * Allowed key prefixes:
+ *   - `transcription-tmp/`            — audio files for Azure Whisper batch
+ *   - `users/{userId}/attachments/`   — images uploaded for AI inference
+ *
  * @param {string} key - RustFS object key
  * @param {number} ttlSeconds - URL lifetime (default: 900 = 15 min)
  * @returns {string} Full public URL
  */
 function generateTempDownloadUrl(key, ttlSeconds = 900) {
-    if (!key.startsWith('transcription-tmp/')) {
-        throw new Error('Temp download URLs only allowed for transcription-tmp/ keys');
+    if (!key.startsWith('transcription-tmp/') && !key.match(/^users\/[^/]+\/attachments\//)) {
+        throw new Error('Temp download URLs only allowed for transcription-tmp/ or users/{id}/attachments/ keys');
     }
     const expires = Math.floor(Date.now() / 1000) + ttlSeconds;
     const payload = `${key}:${expires}`;
@@ -54,8 +57,8 @@ router.get('/tmp/:token', async (req, res) => {
             return res.status(400).json({ error: 'Missing parameters' });
         }
 
-        // Only allow transcription-tmp/ keys
-        if (!key.startsWith('transcription-tmp/')) {
+        // Only allow permitted prefixes
+        if (!key.startsWith('transcription-tmp/') && !key.match(/^users\/[^/]+\/attachments\//)) {
             return res.status(403).json({ error: 'Forbidden' });
         }
 
