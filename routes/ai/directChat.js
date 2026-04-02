@@ -1226,8 +1226,23 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
                             });
                         } catch (e) { /* ignore */ }
 
+                        // Return raw toolResult so draft dedup can run sequentially after Promise.all
+                        return {
+                            _toolResult: toolResult,
+                            role: 'tool',
+                            tool_call_id: toolCall.id,
+                            content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult)
+                        };
+                    });
+
+                    const toolResults = await Promise.all(toolPromises);
+
+                    // Process draft SSE events sequentially (after all tools settle) to avoid race conditions
+                    for (const tr of toolResults) {
+                        const toolResult = tr._toolResult;
+                        if (!toolResult) continue;
                         // Emit email_draft SSE event for user approval (with dedup)
-                        if (toolResult?._action === 'email_draft') {
+                        if (toolResult._action === 'email_draft') {
                             const draftKey = JSON.stringify({ to: toolResult.draft?.to, subject: toolResult.draft?.subject, body: toolResult.draft?.body });
                             const alreadySent = collectedEmailDrafts.some(d => JSON.stringify({ to: d.to, subject: d.subject, body: d.body }) === draftKey);
                             if (!alreadySent) {
@@ -1236,7 +1251,7 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
                             }
                         }
                         // Emit calendar_draft SSE event for user approval (with dedup)
-                        if (toolResult?._action === 'calendar_draft') {
+                        if (toolResult._action === 'calendar_draft') {
                             const draftKey = JSON.stringify({ summary: toolResult.draft?.summary, start: toolResult.draft?.start, end: toolResult.draft?.end });
                             const alreadySent = collectedCalendarDrafts.some(d => JSON.stringify({ summary: d.summary, start: d.start, end: d.end }) === draftKey);
                             if (!alreadySent) {
@@ -1245,58 +1260,52 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
                             }
                         }
                         // Emit linkedin_draft SSE event for user approval
-                        if (toolResult?._action === 'linkedin_draft') {
+                        if (toolResult._action === 'linkedin_draft') {
                             send('linkedin_draft', toolResult.draft);
                         }
                         // Emit whatsapp_draft SSE event for user approval
-                        if (toolResult?._action === 'whatsapp_draft') {
+                        if (toolResult._action === 'whatsapp_draft') {
                             send('whatsapp_draft', toolResult.draft);
                         }
                         // Emit contacts_draft SSE event for user approval
-                        if (toolResult?._action === 'contacts_draft') {
+                        if (toolResult._action === 'contacts_draft') {
                             send('contacts_draft', toolResult.draft);
                         }
                         // Emit keep_draft SSE event for user approval
-                        if (toolResult?._action === 'keep_draft') {
+                        if (toolResult._action === 'keep_draft') {
                             send('keep_draft', toolResult.draft);
                         }
                         // Emit sheets_result SSE event for visual card (read operations)
-                        if (toolResult?._action === 'sheets_result') {
+                        if (toolResult._action === 'sheets_result') {
                             send('sheets_result', toolResult._sheetsData);
                             collectedSheetsResults.push(toolResult._sheetsData);
                         }
                         // Emit sheets_draft SSE event for user approval (write operations)
-                        if (toolResult?._action === 'sheets_draft') {
+                        if (toolResult._action === 'sheets_draft') {
                             send('sheets_draft', toolResult._sheetsDraft);
                             collectedSheetsDrafts.push({ ...toolResult._sheetsDraft, status: 'pending' });
                         }
                         // Emit sheets_report SSE event for report/dashboard view
-                        if (toolResult?._action === 'sheets_report') {
+                        if (toolResult._action === 'sheets_report') {
                             send('sheets_report', toolResult._sheetsReport);
                             collectedSheetsReports.push(toolResult._sheetsReport);
                         }
                         // Emit workspace_update SSE event
-                        if (toolResult?._action === 'workspace_update') {
+                        if (toolResult._action === 'workspace_update') {
                             send('workspace_update', { content: toolResult.content });
                         }
                         // Emit kb_sources SSE event
-                        if (toolResult?._action === 'kb_sources' && toolResult._sources?.length > 0) {
+                        if (toolResult._action === 'kb_sources' && toolResult._sources?.length > 0) {
                             send('kb_sources', { sources: toolResult._sources });
                         }
                         // Track audio URLs for persistence
-                        if (toolResult?.audioUrl) {
-                            generatedAudio.push({ url: toolResult.audioUrl, source: toolName });
+                        if (toolResult.audioUrl) {
+                            generatedAudio.push({ url: toolResult.audioUrl, source: tr.name });
                         }
+                    }
 
-                        return {
-                            role: 'tool',
-                            tool_call_id: toolCall.id,
-                            content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult)
-                        };
-                    });
-
-                    const toolResults = await Promise.all(toolPromises);
-                    messages.push(...toolResults);
+                    // Strip internal _toolResult before pushing to messages
+                    messages.push(...toolResults.map(({ _toolResult, ...rest }) => rest));
                     continue;
                 }
             }
@@ -1502,68 +1511,6 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
                     resultPreview: (typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult || '')).slice(0, 200),
                 });
 
-                // Emit email_draft SSE event for user approval (with dedup)
-                if (toolResult?._action === 'email_draft') {
-                    const draftKey = JSON.stringify({ to: toolResult.draft?.to, subject: toolResult.draft?.subject, body: toolResult.draft?.body });
-                    const alreadySent = collectedEmailDrafts.some(d => JSON.stringify({ to: d.to, subject: d.subject, body: d.body }) === draftKey);
-                    if (!alreadySent) {
-                        send('email_draft', toolResult.draft);
-                        collectedEmailDrafts.push(toolResult.draft);
-                    }
-                }
-                // Emit calendar_draft SSE event for user approval (with dedup)
-                if (toolResult?._action === 'calendar_draft') {
-                    const draftKey = JSON.stringify({ summary: toolResult.draft?.summary, start: toolResult.draft?.start, end: toolResult.draft?.end });
-                    const alreadySent = collectedCalendarDrafts.some(d => JSON.stringify({ summary: d.summary, start: d.start, end: d.end }) === draftKey);
-                    if (!alreadySent) {
-                        send('calendar_draft', toolResult.draft);
-                        collectedCalendarDrafts.push(toolResult.draft);
-                    }
-                }
-                // Emit linkedin_draft SSE event for user approval
-                if (toolResult?._action === 'linkedin_draft') {
-                    send('linkedin_draft', toolResult.draft);
-                }
-                // Emit whatsapp_draft SSE event for user approval
-                if (toolResult?._action === 'whatsapp_draft') {
-                    send('whatsapp_draft', toolResult.draft);
-                }
-                // Emit contacts_draft SSE event for user approval
-                if (toolResult?._action === 'contacts_draft') {
-                    send('contacts_draft', toolResult.draft);
-                }
-                // Emit keep_draft SSE event for user approval
-                if (toolResult?._action === 'keep_draft') {
-                    send('keep_draft', toolResult.draft);
-                }
-                // Emit sheets_result SSE event for visual card (read operations)
-                if (toolResult?._action === 'sheets_result') {
-                    send('sheets_result', toolResult._sheetsData);
-                    collectedSheetsResults.push(toolResult._sheetsData);
-                }
-                // Emit sheets_draft SSE event for user approval (write operations)
-                if (toolResult?._action === 'sheets_draft') {
-                    send('sheets_draft', toolResult._sheetsDraft);
-                    collectedSheetsDrafts.push({ ...toolResult._sheetsDraft, status: 'pending' });
-                }
-                // Emit sheets_report SSE event for report/dashboard view
-                if (toolResult?._action === 'sheets_report') {
-                    send('sheets_report', toolResult._sheetsReport);
-                    collectedSheetsReports.push(toolResult._sheetsReport);
-                }
-                // Emit workspace_update SSE event
-                if (toolResult?._action === 'workspace_update') {
-                    send('workspace_update', { content: toolResult.content });
-                }
-                // Emit kb_sources SSE event
-                if (toolResult?._action === 'kb_sources' && toolResult._sources?.length > 0) {
-                    send('kb_sources', { sources: toolResult._sources });
-                }
-                // Track audio URLs for persistence
-                if (toolResult?.audioUrl) {
-                    generatedAudio.push({ url: toolResult.audioUrl, source: toolName });
-                }
-
                 // Log tool usage
                 try {
                     const usageStore = require('../../stores/usageStore');
@@ -1578,12 +1525,16 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
                         conversation_id: convId || null,
                     });
                 } catch (e) { /* ignore */ }
+
                 // Ensure toolResult is an object before stringifying (avoid double-encoding strings)
                 let resultObj = toolResult;
                 if (typeof toolResult === 'string') {
                     try { resultObj = JSON.parse(toolResult); } catch (e) { resultObj = { result: toolResult }; }
                 }
+                // Return raw toolResult so draft dedup can run sequentially after Promise.all
                 return {
+                    _toolResult: toolResult,
+                    _toolName: toolName,
                     role: 'tool',
                     tool_call_id: toolCall.id,
                     content: JSON.stringify(resultObj)
@@ -1591,7 +1542,76 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
             });
 
             const toolResults = await Promise.all(toolPromises);
-            messages.push(...toolResults);
+
+            // Process draft SSE events sequentially (after all tools settle) to avoid race conditions
+            for (const tr of toolResults) {
+                const toolResult = tr._toolResult;
+                if (!toolResult) continue;
+                // Emit email_draft SSE event for user approval (with dedup)
+                if (toolResult._action === 'email_draft') {
+                    const draftKey = JSON.stringify({ to: toolResult.draft?.to, subject: toolResult.draft?.subject, body: toolResult.draft?.body });
+                    const alreadySent = collectedEmailDrafts.some(d => JSON.stringify({ to: d.to, subject: d.subject, body: d.body }) === draftKey);
+                    if (!alreadySent) {
+                        send('email_draft', toolResult.draft);
+                        collectedEmailDrafts.push(toolResult.draft);
+                    }
+                }
+                // Emit calendar_draft SSE event for user approval (with dedup)
+                if (toolResult._action === 'calendar_draft') {
+                    const draftKey = JSON.stringify({ summary: toolResult.draft?.summary, start: toolResult.draft?.start, end: toolResult.draft?.end });
+                    const alreadySent = collectedCalendarDrafts.some(d => JSON.stringify({ summary: d.summary, start: d.start, end: d.end }) === draftKey);
+                    if (!alreadySent) {
+                        send('calendar_draft', toolResult.draft);
+                        collectedCalendarDrafts.push(toolResult.draft);
+                    }
+                }
+                // Emit linkedin_draft SSE event for user approval
+                if (toolResult._action === 'linkedin_draft') {
+                    send('linkedin_draft', toolResult.draft);
+                }
+                // Emit whatsapp_draft SSE event for user approval
+                if (toolResult._action === 'whatsapp_draft') {
+                    send('whatsapp_draft', toolResult.draft);
+                }
+                // Emit contacts_draft SSE event for user approval
+                if (toolResult._action === 'contacts_draft') {
+                    send('contacts_draft', toolResult.draft);
+                }
+                // Emit keep_draft SSE event for user approval
+                if (toolResult._action === 'keep_draft') {
+                    send('keep_draft', toolResult.draft);
+                }
+                // Emit sheets_result SSE event for visual card (read operations)
+                if (toolResult._action === 'sheets_result') {
+                    send('sheets_result', toolResult._sheetsData);
+                    collectedSheetsResults.push(toolResult._sheetsData);
+                }
+                // Emit sheets_draft SSE event for user approval (write operations)
+                if (toolResult._action === 'sheets_draft') {
+                    send('sheets_draft', toolResult._sheetsDraft);
+                    collectedSheetsDrafts.push({ ...toolResult._sheetsDraft, status: 'pending' });
+                }
+                // Emit sheets_report SSE event for report/dashboard view
+                if (toolResult._action === 'sheets_report') {
+                    send('sheets_report', toolResult._sheetsReport);
+                    collectedSheetsReports.push(toolResult._sheetsReport);
+                }
+                // Emit workspace_update SSE event
+                if (toolResult._action === 'workspace_update') {
+                    send('workspace_update', { content: toolResult.content });
+                }
+                // Emit kb_sources SSE event
+                if (toolResult._action === 'kb_sources' && toolResult._sources?.length > 0) {
+                    send('kb_sources', { sources: toolResult._sources });
+                }
+                // Track audio URLs for persistence
+                if (toolResult.audioUrl) {
+                    generatedAudio.push({ url: toolResult.audioUrl, source: tr._toolName });
+                }
+            }
+
+            // Strip internal fields before pushing to messages
+            messages.push(...toolResults.map(({ _toolResult, _toolName, ...rest }) => rest));
 
             // Stream the follow-up response after tool execution (with tools for multi-round)
             fullContent = '';

@@ -465,6 +465,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     let toolCalls = [];
     let fullResponse = '';
     let _emailDrafts = [];
+    let _calendarDrafts = [];
     let _linkedInDrafts = [];
     let _sheetsResults = [];
     let _sheetsDrafts = [];
@@ -1096,6 +1097,15 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                             _emailDrafts.push({ ...finalToolResult.draft, status: 'pending' });
                         }
                     }
+                    // Emit calendar_draft SSE event for user approval (with dedup)
+                    if (finalToolResult?._action === 'calendar_draft') {
+                        const draftKey = JSON.stringify({ summary: finalToolResult.draft?.summary, start: finalToolResult.draft?.start, end: finalToolResult.draft?.end });
+                        const alreadySent = _calendarDrafts.some(d => JSON.stringify({ summary: d.summary, start: d.start, end: d.end }) === draftKey);
+                        if (!alreadySent) {
+                            onEvent('calendar_draft', finalToolResult.draft);
+                            _calendarDrafts.push({ ...finalToolResult.draft, status: 'pending' });
+                        }
+                    }
                     // Emit linkedin_draft SSE event for user approval
                     if (finalToolResult?._action === 'linkedin_draft') {
                         onEvent('linkedin_draft', finalToolResult.draft);
@@ -1378,6 +1388,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
 
             // Attach persisted metadata
             if (_emailDrafts.length > 0) assistantMsg.emailDrafts = _emailDrafts;
+            if (_calendarDrafts.length > 0) assistantMsg.calendarDrafts = _calendarDrafts;
             if (_linkedInDrafts.length > 0) assistantMsg.linkedInDrafts = _linkedInDrafts;
             if (_sheetsResults.length > 0) assistantMsg.sheetsResults = _sheetsResults;
             if (_sheetsDrafts.length > 0) assistantMsg.sheetsDrafts = _sheetsDrafts;
