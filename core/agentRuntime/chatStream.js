@@ -304,11 +304,12 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         });
     }
 
-    // ============ STRIP BASE64 IMAGES FROM HISTORY ============
-    // Images from previous turns are persisted as full base64 data URIs in the
-    // conversation. Re-sending them on every turn causes context window overflow.
+    // ============ STRIP IMAGES FROM HISTORY ============
+    // Images from previous turns should not be re-sent on every turn:
+    //  - base64 data URIs cause context window overflow (500KB+ each)
+    //  - temp HTTPS URLs expire after 15 minutes and would fail on follow-up
     // Only the CURRENT (last) user message keeps full image data — older messages
-    // get image_url entries replaced with a lightweight text placeholder.
+    // get ALL image_url entries replaced with a lightweight text placeholder.
     for (let i = 0; i < messages.length - 1; i++) {
         const msg = messages[i];
         if (Array.isArray(msg.content)) {
@@ -317,13 +318,13 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 messages[i] = {
                     ...msg,
                     content: msg.content.map(part => {
-                        if (part.type === 'image_url' && part.image_url?.url?.startsWith('data:')) {
+                        if (part.type === 'image_url') {
                             return { type: 'text', text: '[Previously attached image]' };
                         }
                         return part;
                     })
                 };
-                console.log(`[AgentRuntime] Stripped base64 image from historical message ${i}`);
+                console.log(`[AgentRuntime] Stripped image from historical message ${i}`);
             }
         }
     }
