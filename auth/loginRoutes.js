@@ -361,7 +361,7 @@ router.get('/user', async (req, res) => {
                 firstName: freshUser?.firstName || req.session.user.firstName || '',
                 lastName: freshUser?.lastName || req.session.user.lastName || '',
                 email: freshUser?.email || req.session.user.email,
-                isAdmin: req.session.isAdmin || false,
+                isAdmin: req.session.isAdmin || freshUser?.role === 'admin' || false,
                 isDemo: req.session.isDemo || false,
                 role: freshUser?.role || req.session.user.role || 'user',
                 avatar: freshUser?.avatar || req.session.user.avatar || req.session.user.picture || null,

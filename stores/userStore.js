@@ -328,6 +328,7 @@ async function deleteUser(userId) {
         const configStore = require('./configStore');
         const configKeys = [
             `fireflies_api_key_user_${userId}`, `youtrack_url_user_${userId}`, `youtrack_token_user_${userId}`,
+            `signrequest_subdomain_user_${userId}`, `signrequest_token_user_${userId}`,
             `gamma_api_key_user_${userId}`, `gads_developer_token_user_${userId}`, `gads_manager_id_user_${userId}`,
             `gads_customer_id_user_${userId}`, `enabled_apps_user_${userId}`,
         ];

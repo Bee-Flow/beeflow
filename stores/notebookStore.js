@@ -40,6 +40,11 @@ async function initDB() {
         await exec(`ALTER TABLE notebooks ADD COLUMN IF NOT EXISTS document_content TEXT DEFAULT ''`);
     } catch (_) {}
 
+    // Migration: add type column for proposals support
+    try {
+        await exec(`ALTER TABLE notebooks ADD COLUMN IF NOT EXISTS type TEXT DEFAULT 'notebook'`);
+    } catch (_) {}
+
     // ── Notebook Sources table ───────────────────────────────────────
     await exec(`
         CREATE TABLE IF NOT EXISTS notebook_sources (
@@ -80,37 +85,43 @@ initDB().catch(err => console.error('[NotebookStore] Init error:', err.message))
 
 // ── Notebook CRUD ──────────────────────────────────────────────────
 
-async function createNotebook({ userId, name, description, instructions, knowledgeBaseIds, settings }) {
+async function createNotebook({ userId, name, description, instructions, knowledgeBaseIds, settings, type }) {
     await initDB();
     const id = crypto.randomUUID();
+    const notebookType = type || 'notebook';
     await run(
-        `INSERT INTO notebooks (id, user_id, name, description, instructions, knowledge_base_ids, settings, document_content)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        `INSERT INTO notebooks (id, user_id, name, description, instructions, knowledge_base_ids, settings, document_content, type)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
         [id, userId, name || 'Untitled Notebook', description || '', instructions || '',
-         JSON.stringify(knowledgeBaseIds || []), JSON.stringify(settings || {}), '']
+         JSON.stringify(knowledgeBaseIds || []), JSON.stringify(settings || {}), '', notebookType]
     );
-    console.log(`[NotebookStore] Created notebook "${name}" for user ${userId}`);
+    console.log(`[NotebookStore] Created ${notebookType} "${name}" for user ${userId}`);
     return {
         id, userId, name: name || 'Untitled Notebook', description: description || '',
         instructions: instructions || '', knowledgeBaseIds: knowledgeBaseIds || [],
-        settings: settings || {}, documentContent: '', createdAt: new Date().toISOString()
+        settings: settings || {}, documentContent: '', type: notebookType,
+        createdAt: new Date().toISOString()
     };
 }
 
-async function getNotebooks(userId, { limit = 50, offset = 0 } = {}) {
+async function getNotebooks(userId, { limit = 50, offset = 0, type } = {}) {
     await initDB();
-    const rows = await getAll(
-        `SELECT n.*,
+    let query = `SELECT n.*,
                 COALESCE(s.source_count, 0) AS source_count
          FROM notebooks n
          LEFT JOIN (
              SELECT notebook_id, COUNT(*) AS source_count
              FROM notebook_sources GROUP BY notebook_id
          ) s ON s.notebook_id = n.id
-         WHERE n.user_id = $1
-         ORDER BY n.updated_at DESC LIMIT $2 OFFSET $3`,
-        [userId, limit, offset]
-    );
+         WHERE n.user_id = $1`;
+    const params = [userId];
+    if (type) {
+        query += ` AND n.type = $${params.length + 1}`;
+        params.push(type);
+    }
+    query += ` ORDER BY n.updated_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    params.push(limit, offset);
+    const rows = await getAll(query, params);
     return rows.map(mapNotebookRow);
 }
 
@@ -242,6 +253,7 @@ function mapNotebookRow(r) {
         knowledgeBaseIds: parseJSON(r.knowledge_base_ids, []),
         settings: parseJSON(r.settings, {}),
         documentContent: r.document_content || '',
+        type: r.type || 'notebook',
         sourceCount: parseInt(r.source_count) || 0,
         createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
         updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : null,

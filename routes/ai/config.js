@@ -117,7 +117,7 @@ router.get('/config', async (req, res) => {
 });
 
 router.post('/config', requireAuth, async (req, res) => {
-    if (!req.session.isAdmin) {
+    if (!req.session.isAdmin && req.session.user?.role !== 'admin') {
         return res.status(403).json({ error: 'Admin access required' });
     }
     const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, minimaxApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, llamaGuardConfig, moderationProvider, azureContentSafetyEndpoint, azureContentSafetyKey, azureContentSafetySeverityThreshold, azureContentSafetyCategories, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionScope, piiDetectionAction, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing, serviceEmailAddress, serviceEmailPassword, serviceEmailDisplayName, azureSpeechKey, azureSpeechRegion, transcriptionProvider, notebooksEnabled, projectsEnabled, askAiEnabled, exportEnabled, openInNotebookEnabled, notebooksMenuEnabled, azureRerankerEndpoint, azureRerankerKey, azureRerankerModel } = req.body;
@@ -309,7 +309,7 @@ const DELETABLE_KEYS = [
 
 router.delete('/config/key/:keyName', requireAuth, async (req, res) => {
     try {
-        if (!req.session.isAdmin) {
+        if (!req.session.isAdmin && req.session.user?.role !== 'admin') {
             return res.status(403).json({ error: 'Admin access required' });
         }
 
@@ -339,7 +339,7 @@ const DELETABLE_CONFIG_KEYS = [
 
 router.delete('/config/setting/:keyName', requireAuth, async (req, res) => {
     try {
-        if (!req.session.isAdmin) {
+        if (!req.session.isAdmin && req.session.user?.role !== 'admin') {
             return res.status(403).json({ error: 'Admin access required' });
         }
 
@@ -397,7 +397,7 @@ router.post('/config/test-service-email', requireAuth, async (req, res) => {
 
 router.post('/config/test-reranker', requireAuth, async (req, res) => {
     try {
-        if (!req.session.isAdmin) {
+        if (!req.session.isAdmin && req.session.user?.role !== 'admin') {
             return res.status(403).json({ error: 'Admin access required' });
         }
 
@@ -737,6 +737,7 @@ router.get('/user-settings', requireAuth, async (req, res) => {
     res.json({
         hasFirefliesKey: !!(await configStore.getSecret(`fireflies_api_key_user_${userId}`)),
         hasYouTrackConfig: !!(await configStore.getSecret(`youtrack_url_user_${userId}`)) && !!(await configStore.getSecret(`youtrack_token_user_${userId}`)),
+        hasSignRequestConfig: !!(await configStore.getSecret(`signrequest_subdomain_user_${userId}`)) && !!(await configStore.getSecret(`signrequest_token_user_${userId}`)),
         hasGammaKey: !!(await configStore.getSecret(`gamma_api_key_user_${userId}`)),
         hasLinkedInConfig: !!(await configStore.getSecret('linkedin_client_id')) && !!(await configStore.getSecret('linkedin_client_secret')),
         hasGoogleKey: !!(await configStore.getSecret('google_api_key')),
@@ -754,7 +755,7 @@ router.get('/user-settings', requireAuth, async (req, res) => {
 
 router.post('/user-settings', requireAuth, async (req, res) => {
     const userId = req.session.user.id;
-    const { firefliesApiKey, youtrackUrl, youtrackToken, gammaApiKey, enabledApps } = req.body;
+    const { firefliesApiKey, youtrackUrl, youtrackToken, gammaApiKey, signrequestSubdomain, signrequestToken, enabledApps } = req.body;
 
     if (firefliesApiKey !== undefined) {
         await configStore.setSecret(`fireflies_api_key_user_${userId}`, firefliesApiKey || '');
@@ -773,6 +774,13 @@ router.post('/user-settings', requireAuth, async (req, res) => {
         await configStore.setSecret(`youtrack_token_user_${userId}`, youtrackToken || '');
     }
 
+    if (signrequestSubdomain !== undefined) {
+        await configStore.setSecret(`signrequest_subdomain_user_${userId}`, signrequestSubdomain || '');
+    }
+    if (signrequestToken !== undefined) {
+        await configStore.setSecret(`signrequest_token_user_${userId}`, signrequestToken || '');
+    }
+
     if (enabledApps !== undefined) {
         await configStore.setConfig(`enabled_apps_user_${userId}`, enabledApps);
     }
@@ -785,7 +793,7 @@ router.post('/user-settings', requireAuth, async (req, res) => {
 // ─── AI Regex Generator ──────────────────────────────────────────
 router.post('/generate-regex', requireAuth, async (req, res) => {
     // Only admins can generate regex rules
-    if (!req.session.isAdmin) {
+    if (!req.session.isAdmin && req.session.user?.role !== 'admin') {
         return res.status(403).json({ error: 'Admin access required' });
     }
 
@@ -918,7 +926,7 @@ async function requireOrgAdminForN8n(req, res, next) {
     const userStore = require('../../stores/userStore');
     const user = await userStore.getUser(userId);
     // Super admins (global) can always manage n8n config
-    if (req.session.isAdmin) {
+    if (req.session.isAdmin || req.session.user?.role === 'admin') {
         req.orgId = user?.organizationId || null;
         return next();
     }

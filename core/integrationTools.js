@@ -19,6 +19,7 @@ const { KEEP_TOOLS } = require('../integrations/keepTools');
 const { GOOGLE_GROUPS_TOOLS } = require('../integrations/googleGroupsTools');
 const { FIREFLIES_TOOLS } = require('../integrations/firefliesTools');
 const { YOUTRACK_TOOLS } = require('../integrations/youtrackTools');
+const { SIGNREQUEST_TOOLS } = require('../integrations/signrequestTools');
 const { GAMMA_TOOLS } = require('../integrations/gammaTools');
 const { buildN8nTools } = require('../integrations/n8nTools');
 const { AGENT_SEARCH_TOOLS } = require('../integrations/agentSearchTools');
@@ -178,6 +179,12 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
         addTools(GAMMA_TOOLS);
     }
 
+    // SignRequest — requires user subdomain + token
+    const hasSignRequestConfig = !!(await configStore.getSecret(`signrequest_subdomain_user_${userId}`)) && !!(await configStore.getSecret(`signrequest_token_user_${userId}`));
+    if (hasSignRequestConfig && isAppOn('signrequest')) {
+        addTools(SIGNREQUEST_TOOLS);
+    }
+
     // N8N workflows — org-level config
     try {
         if (userOrgId) {
@@ -282,6 +289,7 @@ async function buildToolHint(tools, userId = null) {
     if (tools.some(t => t.function.name.startsWith('keep_'))) integrations.push('Google Keep (list, get, create, delete notes — create/delete require user approval, enterprise Workspace only)');
     if (tools.some(t => t.function.name.startsWith('groups_'))) integrations.push('Google Groups (list conversations in a group, read full conversation threads, reply to group conversations — replies require user approval before sending)');
     if (tools.some(t => t.function.name.startsWith('youtrack_'))) integrations.push('YouTrack (search, create, update issues)');
+    if (tools.some(t => t.function.name.startsWith('signrequest_'))) integrations.push('SignRequest (send documents for e-signature, check signing status, list documents, cancel requests)');
     if (tools.some(t => t.function.name.startsWith('fireflies_'))) integrations.push('Fireflies (meeting transcripts)');
     if (tools.some(t => t.function.name.startsWith('gamma_'))) integrations.push('Gamma (presentation generation)');
     if (tools.some(t => t.function.name.startsWith('n8n_'))) {

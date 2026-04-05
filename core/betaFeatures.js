@@ -28,6 +28,8 @@ const BETA_FEATURES = [
     { id: 'tasks', name: 'Tasks', description: 'AI-proposed task queue with mandatory human approval before execution' },
     { id: 'monitoring', name: 'Monitoring', description: 'Custom monitoring dashboards with SQL queries and data visualizations' },
     { id: 'e2e_testing', name: 'E2E Testing', description: 'AI-powered E2E test generation and execution dashboard' },
+    { id: 'slides', name: 'Slides', description: 'AI-powered slide deck creation and presentation builder' },
+    { id: 'sheets', name: 'Sheets', description: 'AI-powered spreadsheet creation and data analysis' },
 ];
 
 // ──────────────────────────────────────────────

@@ -48,6 +48,8 @@ const STORE_MODULES = [
     { name: 'importStore', file: './stores/importStore' },
     { name: 'iconStore', file: './stores/iconStore' },
     { name: 'notebookStore', file: './stores/notebookStore' },
+    { name: 'slidesStore', file: './stores/slidesStore' },
+    { name: 'sheetStore', file: './stores/sheetStore' },
 ];
 
 console.log('');

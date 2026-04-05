@@ -381,6 +381,49 @@ const notebookFeatureGate = async (req, res, next) => {
 };
 app.use('/api/notebooks', notebookFeatureGate, require('./routes/notebooks'));
 app.use('/api/notebooks', notebookFeatureGate, require('./routes/notebookExport'));
+app.use('/api/proposals', require('./routes/proposals'));
+// Slides feature gate middleware (feature flag + beta feature)
+const slidesFeatureGate = async (req, res, next) => {
+    try {
+        const configStore = require('./stores/configStore');
+        const enabled = await configStore.getConfig('feature_slides_enabled');
+        if (enabled === false) {
+            return res.status(403).json({ error: 'Slides feature is disabled' });
+        }
+    } catch (_) { /* allow on error — fail open */ }
+    // Beta feature gate — admins bypass, others need 'slides' beta feature
+    try {
+        const { userHasBetaFeature } = require('./core/betaFeatures');
+        const userId = req.session?.user?.id;
+        if (userId && !(await userHasBetaFeature(userId, 'slides', req.session))) {
+            return res.status(403).json({ error: "Beta feature 'slides' is not enabled for your organization" });
+        }
+    } catch (_) { /* fail open */ }
+    next();
+};
+app.use('/api/slides', slidesFeatureGate, require('./routes/slides'));
+app.use('/api/slides', slidesFeatureGate, require('./routes/slidesExport'));
+// Sheets feature gate middleware (feature flag + beta feature)
+const sheetsFeatureGate = async (req, res, next) => {
+    try {
+        const configStore = require('./stores/configStore');
+        const enabled = await configStore.getConfig('feature_sheets_enabled');
+        if (enabled === false) {
+            return res.status(403).json({ error: 'Sheets feature is disabled' });
+        }
+    } catch (_) { /* allow on error — fail open */ }
+    // Beta feature gate — admins bypass, others need 'sheets' beta feature
+    try {
+        const { userHasBetaFeature } = require('./core/betaFeatures');
+        const userId = req.session?.user?.id;
+        if (userId && !(await userHasBetaFeature(userId, 'sheets', req.session))) {
+            return res.status(403).json({ error: "Beta feature 'sheets' is not enabled for your organization" });
+        }
+    } catch (_) { /* fail open */ }
+    next();
+};
+app.use('/api/sheets', sheetsFeatureGate, require('./routes/sheets'));
+app.use('/api/sheets', sheetsFeatureGate, require('./routes/sheetsExport'));
 app.use('/api/transcriptions', require('./routes/transcriptions'));
 app.use('/api/meet-bot', require('./routes/meetBot'));
 app.use('/', require('./routes/knowledge'));

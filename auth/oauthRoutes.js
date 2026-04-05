@@ -162,7 +162,9 @@ router.get('/callback', async (req, res) => {
         req.session.refreshToken = tokenData.refresh_token;
         req.session.user = user;
         req.session.isAuthenticated = true;
-        req.session.isAdmin = false;
+        // Check stored user role — SSO users can also be admins
+        const freshUserLegacy = await userStore.getUser(user?.id || 'oauth-user');
+        req.session.isAdmin = freshUserLegacy?.role === 'admin';
         // Handle SSO encryption with backward compatibility
         const encryptionEnabled = await isEncryptionEnabledForUser(user?.id || 'oauth-user');
         const ssoResult = await getOrCreateSSOUserDEKCompat(user?.id || 'oauth-user', encryptionEnabled);
@@ -760,7 +762,7 @@ router.get('/callback/:provider', async (req, res) => {
         req.session.refreshToken = tokenData.refresh_token;
         req.session.user = user;
         req.session.isAuthenticated = true;
-        req.session.isAdmin = false;
+        req.session.isAdmin = freshUser?.role === 'admin';
         req.session.oauthProvider = provider;
         if (pendingApproval) {
             req.session.pendingApproval = true;

@@ -23,6 +23,7 @@ const { isKeepTool, executeKeepTool } = require('../integrations/keepTools');
 const { isGoogleGroupsTool, executeGoogleGroupsTool } = require('../integrations/googleGroupsTools');
 const { isFirefliesTool, executeFirefliesTool } = require('../integrations/firefliesTools');
 const { isYouTrackTool, executeYouTrackTool } = require('../integrations/youtrackTools');
+const { isSignRequestTool, executeSignRequestTool } = require('../integrations/signrequestTools');
 const { isGammaTool, executeGammaTool } = require('../integrations/gammaTools');
 const { isN8nTool, executeN8nTool } = require('../integrations/n8nTools');
 const { isAgentSearchTool, executeAgentSearchTool } = require('../integrations/agentSearchTools');
@@ -157,6 +158,9 @@ async function executeTool(toolName, toolArgs, context = {}) {
     }
     if (isYouTrackTool(toolName)) {
         return await executeYouTrackTool(toolName, toolArgs, userId);
+    }
+    if (isSignRequestTool(toolName)) {
+        return await executeSignRequestTool(toolName, toolArgs, userId);
     }
     if (isGammaTool(toolName)) {
         return await executeGammaTool(toolName, toolArgs, userId);

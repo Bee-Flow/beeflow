@@ -430,12 +430,12 @@ router.post('/:id/generate/:type', requireAuth, async (req, res) => {
 
         // Type-specific prompts
         const typePrompts = {
-            faq: `Generate a comprehensive FAQ (Frequently Asked Questions) document based on the source material below. 
-Format as a well-structured markdown document with clear Q&A pairs grouped by topic.`,
+            faq: `Generate a focused FAQ (Frequently Asked Questions) document based on the source material below. 
+Format as a well-structured markdown document with clear Q&A pairs grouped by topic. Keep answers concise (2-3 sentences each).`,
             summary: `Generate an executive summary based on the source material below. Include Key Findings and Conclusions.`,
-            briefing_doc: `Generate a comprehensive Briefing Document based on the source material below. Include an Executive Summary, Detailed Analysis, and Strategic Recommendations.`,
+            briefing_doc: `Generate a Briefing Document based on the source material below. Include an Executive Summary, Key Analysis, and Recommendations. Write concisely — prioritize substance over volume.`,
             blog_post: `Draft an engaging, well-written Blog Post based on the core themes of the source material. Use a catchy title, headings, and an accessible tone.`,
-            studyGuide: `Generate a comprehensive study guide based on the source material below. Include Learning Objectives, Key Concepts, Important Terms, and Review Questions.`,
+            studyGuide: `Generate a study guide based on the source material below. Include Learning Objectives, Key Concepts, Important Terms, and Review Questions. Be concise and direct.`,
             flashcards: `Generate a set of 10-15 Flashcards for studying the source material. Format them exactly like this:
 **Q:** [Question]
 **A:** [Answer]`,
@@ -510,12 +510,31 @@ CRITICAL RULES:
 - All questions, answers, facts and claims must be directly traceable to the source text below.
 - Cite sources using [Source Name] notation when referencing specific information.
 
+MERMAID DIAGRAMS:
+- When it adds value (e.g. architecture overviews, process flows, timelines, relationships), include Mermaid.js diagrams using fenced code blocks:
+  \`\`\`mermaid
+  graph TD
+      A[Start] --> B{Decision}
+  \`\`\`
+- Use diagram types like: graph/flowchart, sequenceDiagram, mindmap, gantt, pie, classDiagram, stateDiagram, erDiagram, timeline.
+- Keep diagrams clean and focused — avoid excessive nodes or overly complex layouts.
+- Always place diagrams in their own paragraph, not inline with text.
+
+FORMATTING & SPACING:
+- Write in a compact, professional style. Avoid filler phrases and redundant introductions.
+- NEVER insert double blank lines between sections. Use a single blank line between headings and paragraphs.
+- Keep paragraphs concise: 2-4 sentences max. Prefer short, direct sentences.
+- Use bullet points and tables where they convey information more efficiently than paragraphs.
+- Do NOT add excessive whitespace, padding paragraphs, or "fluff" content.
+- Start sections directly with substantive content — skip generic opening sentences like "In this section we will..."
+- The output will be rendered on paginated A4/Letter pages, so space-efficient writing is critical.
+
 [SOURCE MATERIAL]
 ${allContent.slice(0, 50000)}`;
 
         const messages = [
             { role: 'system', content: systemPrompt },
-            { role: 'user', content: `Generate the ${type === 'studyGuide' ? 'study guide' : type} now. Be thorough and comprehensive.` }
+            { role: 'user', content: `Generate the ${type === 'studyGuide' ? 'study guide' : type} now. Be thorough but concise — prioritize substance over volume. Use compact formatting with minimal whitespace. Where appropriate, include Mermaid diagrams to visualize key concepts, processes, or relationships.` }
         ];
 
         const chatOptions = {
