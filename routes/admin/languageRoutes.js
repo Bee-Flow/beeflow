@@ -278,6 +278,122 @@ Do NOT add any explanation, markdown formatting, or code fences — output raw J
     }
 });
 
+// POST /admin/languages/:code/ai-translate-prompts — Use AI to auto-translate system prompts
+router.post('/:code/ai-translate-prompts', requireAdmin, async (req, res) => {
+    const locale = req.params.code;
+    const { modelTier = 'fast', promptIds: requestedIds } = req.body;
+
+    if (locale === 'en') {
+        return res.status(400).json({ error: 'Cannot AI-translate the base English locale' });
+    }
+
+    try {
+        const llmClient = require('../../core/llmClient');
+        const { resolveModelForTierName } = require('../../core/modelResolver');
+
+        // ── Resolve model ───────────────────────────────────────────
+        const resolvedTier = modelTier || 'fast';
+        let modelId;
+        try {
+            modelId = await resolveModelForTierName(resolvedTier, { fallback: 'mistral-small-latest' });
+        } catch (_) {
+            const { getAIConfig } = require('../../core/aiAgent');
+            const config = await getAIConfig();
+            modelId = config.model || 'mistral-small-latest';
+        }
+
+        console.log(`[Languages AI] Translating prompts to ${locale} using model ${modelId} (tier: ${resolvedTier})`);
+
+        // ── Resolve locale name ─────────────────────────────────────
+        const locales = await languageStore.getAvailableLocales();
+        const localeInfo = locales.find(l => l.code === locale);
+        const languageName = localeInfo?.name || locale;
+
+        // ── Gather untranslated prompts ──────────────────────────────
+        const existingTranslations = await languageStore.getAllPromptTranslations(locale);
+        const defaults = await getAllDefaults();
+        const idsToTranslate = (requestedIds || PROMPT_IDS).filter(id =>
+            !existingTranslations[id] && defaults[id]
+        );
+
+        if (idsToTranslate.length === 0) {
+            return res.json({ success: true, translated: 0, total: PROMPT_IDS.length, message: 'All prompts are already translated' });
+        }
+
+        // ── Translate each prompt individually (they are long-form) ──
+        const systemPrompt = `You are a professional translator specializing in AI system prompts and technical documentation.
+Translate the following system prompt from English to ${languageName} (${locale}).
+
+RULES:
+- Translate the ENTIRE prompt faithfully. Do not summarize or skip sections.
+- Preserve ALL Markdown formatting (headings, lists, bold, code blocks, etc).
+- Preserve placeholder tokens like {name}, {count}, {{variable}}, etc — do NOT translate these.
+- Preserve technical terms, tool names, function names, and API references exactly as-is (e.g. "notebook_read", "json-research", "vega-lite").
+- Keep code examples and JSON structures unchanged.
+- Maintain the same tone and instruction style.
+- Output ONLY the translated prompt text — no explanations, no wrapping, no code fences.`;
+
+        let translatedCount = 0;
+        let errors = 0;
+
+        // Process prompts in parallel (max 3 concurrent to avoid rate limits)
+        const CONCURRENCY = 3;
+        for (let i = 0; i < idsToTranslate.length; i += CONCURRENCY) {
+            const batch = idsToTranslate.slice(i, i + CONCURRENCY);
+            const results = await Promise.allSettled(batch.map(async (promptId) => {
+                const defaultText = defaults[promptId];
+                if (!defaultText || defaultText.trim().length < 10) return null; // Skip empty/tiny prompts
+
+                const result = await llmClient.chat(modelId, [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: defaultText },
+                ], { maxTokens: 8192, temperature: 0.3 });
+
+                const translated = (result.content || '').trim();
+                if (translated && translated.length > 20) {
+                    await languageStore.setPromptTranslation(locale, promptId, translated);
+                    console.log(`[Languages AI] Translated prompt "${promptId}" (${translated.length} chars)`);
+                    return promptId;
+                }
+                return null;
+            }));
+
+            for (const result of results) {
+                if (result.status === 'fulfilled' && result.value) {
+                    translatedCount++;
+                } else if (result.status === 'rejected') {
+                    console.error(`[Languages AI] Prompt translation failed:`, result.reason?.message);
+                    errors++;
+                }
+            }
+        }
+
+        // ── Clear prompt cache ──────────────────────────────────────
+        const { clearDefaultsCache } = require('../../i18n/defaults/promptDefaults');
+        clearDefaultsCache();
+
+        const totalPrompts = PROMPT_IDS.filter(id => defaults[id]).length;
+        const totalTranslated = Object.keys(existingTranslations).length + translatedCount;
+
+        console.log(`[Languages AI] Prompt translation done: ${translatedCount} new for ${locale} (${errors} errors)`);
+
+        res.json({
+            success: true,
+            translated: translatedCount,
+            total: totalPrompts,
+            totalTranslated,
+            progress: totalPrompts > 0 ? Math.round((totalTranslated / totalPrompts) * 100) : 0,
+            errors,
+            message: errors > 0
+                ? `Translated ${translatedCount} prompts with ${errors} error(s)`
+                : `Successfully translated ${translatedCount} prompts`,
+        });
+    } catch (err) {
+        console.error('[Languages AI] Prompt translation error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ── Prompt Translations ─────────────────────────────────────────
 
 // GET /admin/languages/defaults/prompts — Get all default prompt texts
