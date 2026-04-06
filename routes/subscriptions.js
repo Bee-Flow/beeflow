@@ -372,30 +372,41 @@ router.get('/audit', async (req, res) => {
 });
 
 // ═══════════════════════════════════════
-//  Consumer Account Usage
+//  Consumer Account Usage & Subscription
 // ═══════════════════════════════════════
 
-// GET /api/subscriptions/consumer/usage — consumer account limits + usage
+// GET /api/subscriptions/consumer/usage — consumer account limits + usage + subscription status
 router.get('/consumer/usage', async (req, res) => {
     try {
         const userId = req.session?.user?.id;
         if (!userId) return res.status(401).json({ error: 'Not authenticated' });
 
-        // Get __consumer_default__ plan
-        const allPlans = await userStore.getAllPlans();
-        const consumerPlan = allPlans.find(p => p.name === '__consumer_default__');
+        // Check if user has a paid consumer subscription
+        const consumerSub = await userStore.getConsumerSubscription(userId);
+        let activePlan = null;
 
-        // Build limits from consumer plan (or return nulls = unlimited)
+        if (consumerSub && consumerSub.plan_id && ['active', 'trialing'].includes(consumerSub.status)) {
+            activePlan = await userStore.getPlan(consumerSub.plan_id);
+        }
+
+        // Fallback to the default consumer plan
+        if (!activePlan) {
+            const allPlans = await userStore.getAllPlans();
+            activePlan = allPlans.find(p => p.plan_type === 'consumer' && p.is_default)
+                || allPlans.find(p => p.name === '__consumer_default__');
+        }
+
+        // Build limits from active plan (or return nulls = unlimited)
         const limits = {
-            max_messages_per_month: consumerPlan?.max_messages_per_month ?? null,
-            max_tokens_per_month: consumerPlan?.max_tokens_per_month ?? null,
-            max_cost_per_month: consumerPlan?.max_cost_per_month ?? null,
-            max_agents: consumerPlan?.max_agents ?? null,
-            max_knowledge_sources: consumerPlan?.max_knowledge_sources ?? null,
-            max_messages_by_type: consumerPlan?.max_messages_by_type ?? null,
-            allowed_features: consumerPlan?.allowed_features ?? [],
-            allowed_models: consumerPlan?.allowed_models ?? [],
-            plan_name: consumerPlan?.name || 'Free',
+            max_messages_per_month: activePlan?.max_messages_per_month ?? null,
+            max_tokens_per_month: activePlan?.max_tokens_per_month ?? null,
+            max_cost_per_month: activePlan?.max_cost_per_month ?? null,
+            max_agents: activePlan?.max_agents ?? null,
+            max_knowledge_sources: activePlan?.max_knowledge_sources ?? null,
+            max_messages_by_type: activePlan?.max_messages_by_type ?? null,
+            allowed_features: activePlan?.allowed_features ?? [],
+            allowed_models: activePlan?.allowed_models ?? [],
+            plan_name: activePlan?.name === '__consumer_default__' ? 'Free' : (activePlan?.name || 'Free'),
         };
 
         // Get current period usage for this user
@@ -417,6 +428,15 @@ router.get('/consumer/usage', async (req, res) => {
                 start: startDate,
                 end: new Date(now.getFullYear(), now.getMonth() + 1, 1).toISOString(),
             },
+            subscription: consumerSub ? {
+                status: consumerSub.status,
+                plan_id: consumerSub.plan_id,
+                plan_name: consumerSub.plan_name,
+                payment_status: consumerSub.payment_status,
+                stripe_customer_id: !!consumerSub.stripe_customer_id,
+                stripe_subscription_id: !!consumerSub.stripe_subscription_id,
+                trial_end_date: consumerSub.trial_end_date,
+            } : null,
         });
     } catch (e) {
         console.error('[Subscriptions] consumer usage error:', e);
@@ -425,3 +445,4 @@ router.get('/consumer/usage', async (req, res) => {
 });
 
 module.exports = router;
+

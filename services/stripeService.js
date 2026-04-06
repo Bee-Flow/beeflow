@@ -131,22 +131,38 @@ async function syncPlanToStripe(plan) {
 
 /**
  * Create a Stripe Checkout Session for a plan.
+ * Supports both organization and consumer subscriptions.
  * 
  * @param {object} options
  * @param {object} options.plan - BeeFlow plan object
- * @param {string} options.orgId - Organization ID
- * @param {string} options.orgName - Organization name
+ * @param {string} [options.orgId] - Organization ID (org checkout)
+ * @param {string} [options.orgName] - Organization name (org checkout)
+ * @param {string} [options.userId] - User ID (consumer checkout)
+ * @param {string} [options.subscriberType] - 'organization' or 'consumer'
  * @param {string} options.userEmail - User email for pre-fill
  * @param {string} options.successUrl - Redirect URL on success
  * @param {string} options.cancelUrl - Redirect URL on cancel
  * @param {string} [options.stripeCustomerId] - Existing Stripe customer ID
  * @returns {object} Stripe Checkout Session
  */
-async function createCheckoutSession({ plan, orgId, orgName, userEmail, successUrl, cancelUrl, stripeCustomerId }) {
+async function createCheckoutSession({ plan, orgId, orgName, userId, subscriberType = 'organization', userEmail, successUrl, cancelUrl, stripeCustomerId }) {
     const stripe = await getClient();
 
     if (!plan.stripe_price_id) {
         throw new Error('Plan has not been synced to Stripe yet. Ask your administrator to sync the plan.');
+    }
+
+    const isConsumer = subscriberType === 'consumer';
+
+    // Build metadata based on subscriber type
+    const metadata = {
+        beeflow_plan_id: plan.id,
+        beeflow_subscriber_type: subscriberType,
+    };
+    if (isConsumer) {
+        metadata.beeflow_user_id = userId;
+    } else {
+        metadata.beeflow_org_id = orgId;
     }
 
     const sessionParams = {
@@ -154,17 +170,9 @@ async function createCheckoutSession({ plan, orgId, orgName, userEmail, successU
         line_items: [{ price: plan.stripe_price_id, quantity: 1 }],
         success_url: successUrl,
         cancel_url: cancelUrl,
-        client_reference_id: orgId,
-        metadata: {
-            beeflow_org_id: orgId,
-            beeflow_plan_id: plan.id,
-        },
-        subscription_data: {
-            metadata: {
-                beeflow_org_id: orgId,
-                beeflow_plan_id: plan.id,
-            },
-        },
+        client_reference_id: isConsumer ? userId : orgId,
+        metadata,
+        subscription_data: { metadata },
     };
 
     // Re-use existing customer or pre-fill email
@@ -183,6 +191,10 @@ async function createCheckoutSession({ plan, orgId, orgName, userEmail, successU
     const taxEnabled = await configStore.getConfig('stripe_tax_enabled');
     if (taxEnabled) {
         sessionParams.automatic_tax = { enabled: true };
+        // Collect billing address so Stripe can calculate tax
+        sessionParams.billing_address_collection = 'required';
+        // Allow B2B customers to enter VAT numbers
+        sessionParams.tax_id_collection = { enabled: true };
     }
 
     // Allow promo codes
@@ -220,6 +232,140 @@ async function constructWebhookEvent(rawBody, signature) {
     return stripe.webhooks.constructEvent(rawBody, signature, secret);
 }
 
+
+// ═══════════════════════════════════════════
+//  Promotion / Discount Codes
+// ═══════════════════════════════════════════
+
+/**
+ * Create a Stripe Coupon + Promotion Code.
+ * 
+ * Stripe model: Coupon (defines the discount) → Promotion Code (user-facing code).
+ * 
+ * @param {object} options
+ * @param {string} options.code - The promo code string (e.g. "LAUNCH20")
+ * @param {string} options.discountType - 'percent' or 'fixed'
+ * @param {number} options.discountValue - Percentage (1-100) or amount in cents
+ * @param {string} [options.currency] - Required for fixed amount (e.g. 'eur')
+ * @param {string} [options.duration] - 'once', 'repeating', 'forever' (default 'once')
+ * @param {number} [options.durationMonths] - Required when duration is 'repeating'
+ * @param {number} [options.maxRedemptions] - Max number of times the code can be used
+ * @param {string} [options.expiresAt] - ISO date string for expiration
+ * @param {boolean} [options.firstTimeOnly] - Only allow first-time customers
+ * @param {number} [options.minAmount] - Minimum order amount in cents
+ * @param {string} [options.name] - Internal name/description
+ * @returns {{ couponId: string, promoCodeId: string, code: string }}
+ */
+async function createPromoCode(options) {
+    const stripe = await getClient();
+
+    // 1. Create the Coupon (defines the discount)
+    const couponParams = {
+        duration: options.duration || 'once',
+        name: options.name || `Promo: ${options.code}`,
+        metadata: { beeflow_promo: 'true' },
+    };
+
+    if (options.discountType === 'percent') {
+        couponParams.percent_off = options.discountValue;
+    } else {
+        couponParams.amount_off = options.discountValue;
+        couponParams.currency = (options.currency || 'eur').toLowerCase();
+    }
+
+    if (options.duration === 'repeating' && options.durationMonths) {
+        couponParams.duration_in_months = options.durationMonths;
+    }
+
+    const coupon = await stripe.coupons.create(couponParams);
+
+    // 2. Create the Promotion Code (user-facing code string)
+    const promoParams = {
+        coupon: coupon.id,
+        code: options.code.toUpperCase().replace(/\s+/g, ''),
+        metadata: { beeflow_promo: 'true' },
+    };
+
+    if (options.maxRedemptions) {
+        promoParams.max_redemptions = options.maxRedemptions;
+    }
+
+    if (options.expiresAt) {
+        promoParams.expires_at = Math.floor(new Date(options.expiresAt).getTime() / 1000);
+    }
+
+    if (options.firstTimeOnly) {
+        promoParams.restrictions = { first_time_transaction: true };
+    }
+
+    if (options.minAmount) {
+        promoParams.restrictions = {
+            ...(promoParams.restrictions || {}),
+            minimum_amount: options.minAmount,
+            minimum_amount_currency: (options.currency || 'eur').toLowerCase(),
+        };
+    }
+
+    const promoCode = await stripe.promotionCodes.create(promoParams);
+
+    return {
+        couponId: coupon.id,
+        promoCodeId: promoCode.id,
+        code: promoCode.code,
+    };
+}
+
+/**
+ * List all BeeFlow-created promotion codes from Stripe.
+ * @param {number} [limit=25] - Max codes to return
+ * @returns {Array} Promotion code objects
+ */
+async function listPromoCodes(limit = 25) {
+    const stripe = await getClient();
+
+    const result = await stripe.promotionCodes.list({
+        limit,
+        expand: ['data.coupon'],
+    });
+
+    return result.data.map(pc => ({
+        id: pc.id,
+        code: pc.code,
+        active: pc.active,
+        couponId: pc.coupon?.id,
+        discountType: pc.coupon?.percent_off ? 'percent' : 'fixed',
+        discountValue: pc.coupon?.percent_off || pc.coupon?.amount_off,
+        currency: pc.coupon?.currency || 'eur',
+        duration: pc.coupon?.duration,
+        durationMonths: pc.coupon?.duration_in_months,
+        maxRedemptions: pc.max_redemptions,
+        timesRedeemed: pc.times_redeemed,
+        expiresAt: pc.expires_at ? new Date(pc.expires_at * 1000).toISOString() : null,
+        firstTimeOnly: pc.restrictions?.first_time_transaction || false,
+        minAmount: pc.restrictions?.minimum_amount || null,
+        name: pc.coupon?.name || '',
+        created: new Date(pc.created * 1000).toISOString(),
+    }));
+}
+
+/**
+ * Deactivate a promotion code (cannot be deleted, only deactivated).
+ * @param {string} promoCodeId - Stripe promotion code ID
+ */
+async function deactivatePromoCode(promoCodeId) {
+    const stripe = await getClient();
+    return stripe.promotionCodes.update(promoCodeId, { active: false });
+}
+
+/**
+ * Re-activate a previously deactivated promotion code.
+ * @param {string} promoCodeId - Stripe promotion code ID
+ */
+async function activatePromoCode(promoCodeId) {
+    const stripe = await getClient();
+    return stripe.promotionCodes.update(promoCodeId, { active: true });
+}
+
 module.exports = {
     getClient,
     isEnabled,
@@ -228,4 +374,8 @@ module.exports = {
     createCheckoutSession,
     createPortalSession,
     constructWebhookEvent,
+    createPromoCode,
+    listPromoCodes,
+    deactivatePromoCode,
+    activatePromoCode,
 };

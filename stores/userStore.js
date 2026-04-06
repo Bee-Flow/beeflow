@@ -169,6 +169,25 @@ async function initDB() {
     try { await exec(`ALTER TABLE organization_subscriptions ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT`); } catch (e) { }
     try { await exec(`ALTER TABLE organization_subscriptions ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT`); } catch (e) { }
     try { await exec(`ALTER TABLE organization_subscriptions ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'none'`); } catch (e) { }
+    try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS plan_type TEXT DEFAULT 'organization'`); } catch (e) { }
+    // Auto-migrate legacy __consumer_default__ plan
+    try { await exec(`UPDATE subscription_plans SET plan_type = 'consumer' WHERE name = '__consumer_default__' AND (plan_type IS NULL OR plan_type = 'organization')`); } catch (e) { }
+    // Consumer subscriptions table (per-user, org-less)
+    try {
+        await exec(`CREATE TABLE IF NOT EXISTS consumer_subscriptions (
+            id TEXT PRIMARY KEY,
+            user_id TEXT REFERENCES users(id),
+            plan_id TEXT REFERENCES subscription_plans(id),
+            status TEXT DEFAULT 'active',
+            stripe_customer_id TEXT,
+            stripe_subscription_id TEXT,
+            payment_status TEXT DEFAULT 'none',
+            billing_cycle_start TEXT,
+            trial_end_date TEXT,
+            created_at TIMESTAMPTZ,
+            updated_at TIMESTAMPTZ
+        )`);
+    } catch (e) { }
 
     // ── Phase 2: Indexes on hot auth/org query paths ──────────────────────────
     // getUserByEmail() is called on every login — must be index-scanned
@@ -694,7 +713,7 @@ initDefaultRoles().catch(err => console.error('[UserStore] initDefaultRoles erro
 
 // ── Subscription Plans ─────────────────────────────
 function parsePlan(p) {
-    return { ...p, allowed_features: parseJSON(p.allowed_features, []), allowed_models: parseJSON(p.allowed_models, []), max_messages_by_type: parseJSON(p.max_messages_by_type, {}), is_default: !!p.is_default, is_public: !!p.is_public };
+    return { ...p, allowed_features: parseJSON(p.allowed_features, []), allowed_models: parseJSON(p.allowed_models, []), max_messages_by_type: parseJSON(p.max_messages_by_type, {}), is_default: !!p.is_default, is_public: !!p.is_public, plan_type: p.plan_type || 'organization' };
 }
 
 async function getAllPlans() {
@@ -719,14 +738,14 @@ async function createPlan(data) {
     const now = new Date().toISOString();
     try {
         if (data.is_default) await run('UPDATE subscription_plans SET is_default = FALSE WHERE is_default = TRUE');
-        await run(`INSERT INTO subscription_plans (id, name, description, max_messages_per_month, max_messages_by_type, max_tokens_per_month, max_cost_per_month, max_users, max_agents, max_knowledge_sources, allowed_features, allowed_models, is_default, price, currency, billing_interval, trial_days, sort_order, is_public, stripe_price_id, stripe_product_id, created_at, updated_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+        await run(`INSERT INTO subscription_plans (id, name, description, max_messages_per_month, max_messages_by_type, max_tokens_per_month, max_cost_per_month, max_users, max_agents, max_knowledge_sources, allowed_features, allowed_models, is_default, price, currency, billing_interval, trial_days, sort_order, is_public, stripe_price_id, stripe_product_id, plan_type, created_at, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`,
             [id, data.name.trim(), data.description || '', data.max_messages_per_month ?? null, JSON.stringify(data.max_messages_by_type || {}),
                 data.max_tokens_per_month ?? null, data.max_cost_per_month ?? null, data.max_users ?? null, data.max_agents ?? null,
                 data.max_knowledge_sources ?? null, JSON.stringify(data.allowed_features || []), JSON.stringify(data.allowed_models || []),
                 !!data.is_default, data.price ?? null, data.currency || 'EUR', data.billing_interval || 'monthly',
                 data.trial_days ?? 0, data.sort_order ?? 0, !!data.is_public,
-                data.stripe_price_id || null, data.stripe_product_id || null, now, now]);
+                data.stripe_price_id || null, data.stripe_product_id || null, data.plan_type || 'organization', now, now]);
         return parsePlan(await getOne('SELECT * FROM subscription_plans WHERE id = $1', [id]));
     } catch (e) { console.error('[UserStore] createPlan error:', e); return null; }
 }
@@ -762,7 +781,8 @@ async function updatePlan(planId, data) {
         if (data.stripe_price_id !== undefined) updateMap.stripe_price_id = data.stripe_price_id;
         if (data.stripe_product_id !== undefined) updateMap.stripe_product_id = data.stripe_product_id;
         updateMap.updated_at = now;
-        const colMap = { name: 'name', description: 'description', max_messages_per_month: 'max_messages_per_month', max_messages_by_type: 'max_messages_by_type', max_tokens_per_month: 'max_tokens_per_month', max_cost_per_month: 'max_cost_per_month', max_users: 'max_users', max_agents: 'max_agents', max_knowledge_sources: 'max_knowledge_sources', allowed_features: 'allowed_features', allowed_models: 'allowed_models', is_default: 'is_default', price: 'price', currency: 'currency', billing_interval: 'billing_interval', trial_days: 'trial_days', sort_order: 'sort_order', is_public: 'is_public', stripe_price_id: 'stripe_price_id', stripe_product_id: 'stripe_product_id', updated_at: 'updated_at' };
+        if (data.plan_type !== undefined) updateMap.plan_type = data.plan_type;
+        const colMap = { name: 'name', description: 'description', max_messages_per_month: 'max_messages_per_month', max_messages_by_type: 'max_messages_by_type', max_tokens_per_month: 'max_tokens_per_month', max_cost_per_month: 'max_cost_per_month', max_users: 'max_users', max_agents: 'max_agents', max_knowledge_sources: 'max_knowledge_sources', allowed_features: 'allowed_features', allowed_models: 'allowed_models', is_default: 'is_default', price: 'price', currency: 'currency', billing_interval: 'billing_interval', trial_days: 'trial_days', sort_order: 'sort_order', is_public: 'is_public', stripe_price_id: 'stripe_price_id', stripe_product_id: 'stripe_product_id', plan_type: 'plan_type', updated_at: 'updated_at' };
         const q = dynamicUpdate('subscription_plans', planId, updateMap, colMap);
         if (q) await run(q.sql, q.params);
         return true;
@@ -903,6 +923,60 @@ async function getEffectiveLimits(orgId) {
     return effective;
 }
 
+// ── Consumer Subscriptions (per-user, org-less) ─────────────────────────────
+async function getConsumerSubscription(userId) {
+    await initDB();
+    const s = await getOne('SELECT cs.*, sp.name as plan_name FROM consumer_subscriptions cs LEFT JOIN subscription_plans sp ON cs.plan_id = sp.id WHERE cs.user_id = $1', [userId]);
+    if (!s) return null;
+    return s;
+}
+
+async function setConsumerSubscription(userId, data) {
+    await initDB();
+    if (data.status && !['active', 'suspended', 'cancelled', 'trialing', 'past_due'].includes(data.status)) {
+        throw new Error(`Invalid subscription status: ${data.status}`);
+    }
+    const existing = await getConsumerSubscription(userId);
+    const now = new Date().toISOString();
+    try {
+        if (existing) {
+            const updateMap = {};
+            if (data.plan_id !== undefined) updateMap.plan_id = data.plan_id;
+            if (data.status !== undefined) updateMap.status = data.status;
+            if (data.stripe_customer_id !== undefined) updateMap.stripe_customer_id = data.stripe_customer_id;
+            if (data.stripe_subscription_id !== undefined) updateMap.stripe_subscription_id = data.stripe_subscription_id;
+            if (data.payment_status !== undefined) updateMap.payment_status = data.payment_status;
+            if (data.billing_cycle_start !== undefined) updateMap.billing_cycle_start = data.billing_cycle_start;
+            if (data.trial_end_date !== undefined) updateMap.trial_end_date = data.trial_end_date;
+            updateMap.updated_at = now;
+            const colMap = { plan_id: 'plan_id', status: 'status', stripe_customer_id: 'stripe_customer_id', stripe_subscription_id: 'stripe_subscription_id', payment_status: 'payment_status', billing_cycle_start: 'billing_cycle_start', trial_end_date: 'trial_end_date', updated_at: 'updated_at' };
+            const q = dynamicUpdate('consumer_subscriptions', userId, updateMap, colMap, 'user_id');
+            if (q) await run(q.sql, q.params);
+        } else {
+            const id = crypto.randomUUID();
+            await run(`INSERT INTO consumer_subscriptions (id, user_id, plan_id, status, stripe_customer_id, stripe_subscription_id, payment_status, billing_cycle_start, trial_end_date, created_at, updated_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+                [id, userId, data.plan_id || null, data.status || 'active',
+                    data.stripe_customer_id || null, data.stripe_subscription_id || null,
+                    data.payment_status || 'none', data.billing_cycle_start || now,
+                    data.trial_end_date || null, now, now]);
+        }
+        return true;
+    } catch (e) { console.error('[UserStore] setConsumerSubscription error:', e); return false; }
+}
+
+async function deleteConsumerSubscription(userId) {
+    await initDB();
+    const { rowCount } = await run('DELETE FROM consumer_subscriptions WHERE user_id = $1', [userId]);
+    return rowCount > 0;
+}
+
+async function getAllConsumerSubscriptions() {
+    await initDB();
+    const rows = await getAll('SELECT cs.*, sp.name as plan_name, u.username, u.email, u."displayName" FROM consumer_subscriptions cs LEFT JOIN subscription_plans sp ON cs.plan_id = sp.id LEFT JOIN users u ON cs.user_id = u.id ORDER BY cs.created_at DESC');
+    return rows;
+}
+
 // ── Audit Logging ─────────────────────────────
 async function logSubscriptionAudit(action, targetType, targetId, changedBy, oldValues, newValues) {
     try {
@@ -939,5 +1013,6 @@ module.exports = {
     getAllRoles, createRole, updateRole, deleteRole,
     getAllPlans, getPlan, createPlan, updatePlan, deletePlan,
     getAllOrgSubscriptions, getOrgSubscription, setOrgSubscription, deleteOrgSubscription, getEffectiveLimits,
+    getConsumerSubscription, setConsumerSubscription, deleteConsumerSubscription, getAllConsumerSubscriptions,
     getBillingPeriod, logSubscriptionAudit, getAuditLog,
 };

@@ -253,6 +253,7 @@ const GUI_DEFAULTS = {
     'settings.connected': 'Connected',
     'settings.profile_section': 'Profile',
     'settings.workspace_section': 'Workspace',
+    'settings.account_section': 'Account',
     'settings.connections': 'Connections',
     'settings.usage_monitoring': 'Usage & Monitoring',
     'settings.users_groups': 'Users & Groups',
