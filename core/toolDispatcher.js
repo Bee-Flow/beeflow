@@ -14,9 +14,7 @@ const configStore = require('../stores/configStore');
 // ─── Integration imports ────────────────────────────────────────
 const { isGmailTool, executeGmailTool } = require('../integrations/gmailTools');
 const { isCalendarTool, executeCalendarTool } = require('../integrations/calendarTools');
-const { isSlidesTool, executeSlidesTool } = require('../integrations/slidesTools');
 const { isDriveTool, executeDriveTool } = require('../integrations/driveTools');
-const { isSheetsTool, executeSheetsTool } = require('../integrations/sheetsTools');
 const { isDocsTool, executeDocsTool } = require('../integrations/docsTools');
 const { isContactsTool, executeContactsTool } = require('../integrations/contactsTools');
 const { isKeepTool, executeKeepTool } = require('../integrations/keepTools');
@@ -101,15 +99,8 @@ async function executeTool(toolName, toolArgs, context = {}) {
         }
     }
 
-    // ─── Terminal Tools ─────────────────────────────────────────
-    try {
-        const { TERMINAL_TOOLS } = require('../terminal/tools');
-        const isTerminalTool = TERMINAL_TOOLS.some(t => t.function.name === toolName);
-        if (isTerminalTool && terminalCtx) {
-            const { executeTool: executeTerminalTool } = require('../terminal/orchestrator');
-            return await executeTerminalTool(toolName, toolArgs, terminalCtx);
-        }
-    } catch (e) { /* terminal tools may not be available */ }
+    // ─── Terminal Tools (removed — module no longer exists) ────
+    // Terminal container system has been removed from the platform
 
     // ─── Image Generation ───────────────────────────────────────
     if (toolName === 'generate_image') {
@@ -170,12 +161,6 @@ async function executeTool(toolName, toolArgs, context = {}) {
     }
     if (isCalendarTool(toolName)) {
         return await executeCalendarTool(toolName, toolArgs, session);
-    }
-    if (isSlidesTool(toolName)) {
-        return await executeSlidesTool(toolName, toolArgs, session);
-    }
-    if (isSheetsTool(toolName)) {
-        return await executeSheetsTool(toolName, toolArgs, session);
     }
     if (isDocsTool(toolName)) {
         return await executeDocsTool(toolName, toolArgs, session);

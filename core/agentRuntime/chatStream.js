@@ -10,9 +10,7 @@ const agentStore = require('../../stores/agentStore');
 const { sanitizeToolResult } = require('../../utils/sanitize');
 const fs = require('fs');
 const path = require('path');
-const swarmStore = require('../../stores/swarmStore');
-const swarmOrchestrator = require('../../agents/swarm/orchestrator');
-const HiveMind = require('../../agents/swarm/hiveMind');
+// Legacy swarm modules removed — isSwarm is always false
 const usageStore = require('../../stores/usageStore');
 
 const { classifyPromptComplexity } = require('../promptClassifier');
@@ -102,30 +100,10 @@ async function retryStreamCall(fn, maxRetries = 3) {
 }
 
 async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, onEvent, historyOverride = null, messageMetadata = {}) {
-    // Check swarm first to prioritize virtual agent definition
-    const swarm = await swarmStore.getSwarm(agentId);
-    let agent = null;
+    const swarm = null; // Swarm agents removed
+    let agent = await agentStore.getAgent(agentId);
     let isSwarm = false;
     let brain = null;
-
-    if (swarm) {
-        isSwarm = true;
-        brain = new HiveMind(agentId);
-        // Ensure placeholder exists for FKs
-        await agentStore.ensurePlaceholderAgent(swarm.id, swarm.name, swarm.description);
-
-        // For phase-driven execution, the system prompt will be set per-phase
-        agent = {
-            id: swarm.id,
-            name: swarm.name,
-            model: swarm.model || null,
-            system_prompt: swarmOrchestrator.generatePhasePrompt(swarm, 0, []),
-            config: swarm.config
-        };
-    } else {
-
-        agent = await agentStore.getAgent(agentId);
-    }
 
     if (!agent) {
         throw new Error('Agent not found');
@@ -182,7 +160,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         ? swarmOrchestrator.getSwarmToolsForPhase(swarm, 0)
         : await getAgentTools(agentId);
 
-    // ── Inject integration tools (Gmail, Calendar, Sheets, etc.) ──────
+    // ── Inject integration tools (Gmail, Calendar, etc.) ──────
     // These require OAuth tokens from the user session
     let n8nOrgId = null;
     try {
@@ -557,9 +535,6 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     let _emailDrafts = [];
     let _calendarDrafts = [];
     let _linkedInDrafts = [];
-    let _sheetsResults = [];
-    let _sheetsDrafts = [];
-    let _sheetsReports = [];
     let _mapEmbeds = [];
     let _audioFiles = [];
     let _toolHistory = []; // Track tool calls for persistence
@@ -1205,21 +1180,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     if (finalToolResult?._action === 'whatsapp_draft') {
                         onEvent('whatsapp_draft', finalToolResult.draft);
                     }
-                    // Emit sheets_result SSE event for visual card
-                    if (finalToolResult?._action === 'sheets_result') {
-                        onEvent('sheets_result', finalToolResult._sheetsData);
-                        _sheetsResults.push(finalToolResult._sheetsData);
-                    }
-                    // Emit sheets_draft SSE event for user approval
-                    if (finalToolResult?._action === 'sheets_draft') {
-                        onEvent('sheets_draft', finalToolResult._sheetsDraft);
-                        _sheetsDrafts.push({ ...finalToolResult._sheetsDraft, status: 'pending' });
-                    }
-                    // Emit sheets_report SSE event for report/dashboard view
-                    if (finalToolResult?._action === 'sheets_report') {
-                        onEvent('sheets_report', finalToolResult._sheetsReport);
-                        _sheetsReports.push(finalToolResult._sheetsReport);
-                    }
+
 
                     // Emit map_embed SSE event so map renders persist on messages
                     if (finalToolResult?._action === 'map_embed' && finalToolResult._mapEmbed) {
@@ -1260,7 +1221,12 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     messages.push({
                         role: 'tool',
                         tool_call_id: toolCall.id,
-                        content: typeof finalToolResult === 'string' ? finalToolResult : JSON.stringify(finalToolResult)
+                        content: typeof finalToolResult === 'string' ? finalToolResult : JSON.stringify(
+                            // Strip bulky notebook content — LLM only needs the confirmation message
+                            (typeof finalToolResult === 'object' && finalToolResult?._action === 'workspace_update' && finalToolResult?.message)
+                                ? { action: 'notebook_updated', message: finalToolResult.message }
+                                : finalToolResult
+                        )
                     });
                 }
 
@@ -1480,9 +1446,6 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             if (_emailDrafts.length > 0) assistantMsg.emailDrafts = _emailDrafts;
             if (_calendarDrafts.length > 0) assistantMsg.calendarDrafts = _calendarDrafts;
             if (_linkedInDrafts.length > 0) assistantMsg.linkedInDrafts = _linkedInDrafts;
-            if (_sheetsResults.length > 0) assistantMsg.sheetsResults = _sheetsResults;
-            if (_sheetsDrafts.length > 0) assistantMsg.sheetsDrafts = _sheetsDrafts;
-            if (_sheetsReports.length > 0) assistantMsg.sheetsReports = _sheetsReports;
             if (_mapEmbeds.length > 0) assistantMsg.mapEmbeds = _mapEmbeds;
             if (_audioFiles.length > 0) assistantMsg.audioFiles = _audioFiles;
             if (_toolHistory.length > 0) assistantMsg.toolHistory = _toolHistory;

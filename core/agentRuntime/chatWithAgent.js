@@ -4,9 +4,7 @@
 const { getAIConfig, getProviderForModel, resolveModelId } = require('../aiAgent');
 const { getAdapter } = require('../providers');
 const agentStore = require('../../stores/agentStore');
-const swarmStore = require('../../stores/swarmStore');
-const swarmOrchestrator = require('../../agents/swarm/orchestrator');
-const HiveMind = require('../../agents/swarm/hiveMind');
+// Legacy swarm modules removed
 const usageStore = require('../../stores/usageStore');
 const { sanitizeToolResult } = require('../../utils/sanitize');
 const { sanitizeMessages } = require('../../utils/messageUtils');
@@ -19,29 +17,10 @@ const { validateInput } = require('../moderation');
 const { validateInputForPii } = require('../azurePiiDetection');
 
 async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
-    // Check swarm first to prioritize virtual agent definition
-    const swarm = await swarmStore.getSwarm(agentId);
-    let agent = null;
+    const swarm = null; // Swarm agents removed
+    let agent = await agentStore.getAgent(agentId);
     let isSwarm = false;
     let brain = null;
-
-    if (swarm) {
-        isSwarm = true;
-        brain = new HiveMind(agentId);
-        // Ensure placeholder exists for FKs
-        await agentStore.ensurePlaceholderAgent(swarm.id, swarm.name, swarm.description);
-
-        // Create Virtual Agent for the Swarm Orchestrator
-        agent = {
-            id: swarm.id,
-            name: swarm.name,
-            model: swarm.model || null, // Use swarm config or default
-            system_prompt: swarmOrchestrator.generateOrchestratorPrompt(swarm),
-            config: swarm.config
-        };
-    } else {
-        agent = await agentStore.getAgent(agentId);
-    }
 
     if (!agent) {
         throw new Error('Agent not found');

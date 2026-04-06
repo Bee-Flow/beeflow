@@ -901,8 +901,6 @@ const ALL_INTEGRATIONS = [
     { id: 'gmail', label: 'Gmail' },
     { id: 'google-calendar', label: 'Calendar' },
     { id: 'google-drive', label: 'Drive' },
-    { id: 'google-slides', label: 'Slides' },
-    { id: 'google-sheets', label: 'Sheets' },
     { id: 'google-docs', label: 'Docs' },
     { id: 'image-gen', label: 'Image Generation' },
     { id: 'fireflies', label: 'Fireflies' },

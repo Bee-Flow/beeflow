@@ -4,13 +4,10 @@
  */
 
 const memoryStore = require('../../stores/memoryStore');
-const agentStore = require('../../stores/agentStore'); // Import agentStore
-const { getAIConfig, resolveModelId } = require('../../core/aiAgent');
+const agentStore = require('../../stores/agentStore');
+const { resolveModelWithGlobalFallback } = require('../../core/modelResolver');
 
-
-
-// Extraction prompt for identifying memories with evidence
-// Extraction prompt is now managed via the system agent (stored in DB)
+// Extraction prompt is managed via the system agent (stored in DB)
 
 // JSON Schema for structured output (OpenAI-compatible)
 const MEMORY_SCHEMA = {
@@ -66,7 +63,6 @@ function verifyEvidence(memory, sourceText) {
  * @param {string} projectId - Optional project ID for scoping memory
  */
 async function extractFromConversation(userId, agentId, messages, conversationId = null, projectId = null) {
-    const config = await getAIConfig();
 
     // Only analyze the LATEST user message (not last 5 - prevents blending)
     const userMessages = messages.filter(m => m.role === 'user').slice(-1);
@@ -93,26 +89,12 @@ async function extractFromConversation(userId, agentId, messages, conversationId
     }
 
     try {
-        const apiKey = config.apiKey;
-
         // Fetch System Agent for config
-        const extractorAgent = await agentStore.getMemoryExtractorAgent();
+        const extractorAgent = await agentStore.getSystemAgent('system-memory-extractor');
         const systemPrompt = extractorAgent?.system_prompt || 'Extract user memories.';
 
-        // Resolve model — handle tier: prefix (e.g. 'tier:fast' → actual model ID)
-        let rawModel = extractorAgent?.model;
-        let extractionModel;
-        if (rawModel && rawModel.startsWith('tier:')) {
-            const tierName = rawModel.substring(5);
-            const configStore = require('../../stores/configStore');
-            const tiers = await configStore.getConfig('chat_model_tiers') || {};
-            extractionModel = tiers[tierName]?.modelId || tiers.fast?.modelId || config.model;
-        } else {
-            // Not tier-based — resolve via tier:fast
-            const configStore = require('../../stores/configStore');
-            const fallbackTiers = await configStore.getConfig('chat_model_tiers') || {};
-            extractionModel = resolveModelId(rawModel) || fallbackTiers.fast?.modelId || config.model;
-        }
+        // Resolve model via centralized resolver
+        const extractionModel = await resolveModelWithGlobalFallback(extractorAgent?.model, { fallbackTier: 'fast' });
 
         const messages = [
             { role: 'system', content: systemPrompt },

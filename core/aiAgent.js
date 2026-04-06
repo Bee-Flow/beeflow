@@ -615,7 +615,11 @@ async function setDefaultProvider(providerId) {
     }
 }
 
-const SYSTEM_PROMPT = `You are BeeFlow's component designer. You create and maintain Node.js workflow components.
+// System prompt for the Component Designer is now loaded from the DB (seeded from prompts/component-designer.md).
+// This fallback is only used if the system agent doesn't exist in the DB.
+const SYSTEM_PROMPT_FALLBACK = 'You are a BeeFlow component designer. You create and maintain Node.js workflow components.';
+
+const _UNUSED_LEGACY_PROMPT_REMOVED = `Legacy prompt removed — see server/stores/agent/prompts/component-designer.md
 
 ## Core Rules
 1. **Generate immediately** -- never ask clarifying questions unless truly ambiguous. Make sensible defaults.
@@ -848,23 +852,22 @@ class AIAgent {
                 headers['Authorization'] = `Bearer ${config.apiKey}`;
             }
 
-            // Dynamic System Prompt based on Context
-            let currentSystemPrompt = SYSTEM_PROMPT;
+            // Dynamic System Prompt — loaded from DB system agent, with context override
+            let currentSystemPrompt = SYSTEM_PROMPT_FALLBACK;
 
-            // Allow manual override via context
             if (this.currentContext?.systemPrompt) {
+                // Allow manual override via context
                 currentSystemPrompt = this.currentContext.systemPrompt;
             } else {
-                // Try to load system agent config to override default
+                // Load from system agent DB entry
                 try {
-                    const designerAgent = await agentStore.getComponentDesignerAgent();
+                    const designerAgent = await agentStore.getSystemAgent('system-component-designer');
                     if (designerAgent) {
                         if (designerAgent.system_prompt) currentSystemPrompt = designerAgent.system_prompt;
-                        // ALWAYS use agent's model if set (prioritize over default config)
                         if (designerAgent.model) config.model = designerAgent.model;
                     }
                 } catch (e) {
-                    console.warn('Failed to load designer agent config:', e.message);
+                    console.warn('[AIAgent] Failed to load designer agent config:', e.message);
                 }
             }
 
@@ -1099,7 +1102,7 @@ async function getProviderForModel(modelId) {
 
 module.exports = {
     AIAgent,
-    SYSTEM_PROMPT,
+    SYSTEM_PROMPT: SYSTEM_PROMPT_FALLBACK,
     getOrCreateAgent,
     clearConversation,
     getAIConfig,

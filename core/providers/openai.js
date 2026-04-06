@@ -281,7 +281,12 @@ class OpenAIProvider extends BaseProvider {
                     prompt_tokens: chunk.usage.prompt_tokens || 0,
                     completion_tokens: chunk.usage.completion_tokens || 0,
                     total_tokens: chunk.usage.total_tokens || 0,
+                    // OpenAI automatic prompt caching — track cache hits
+                    cached_tokens: chunk.usage.prompt_tokens_details?.cached_tokens || 0,
                 };
+                if (streamUsage.cached_tokens > 0) {
+                    console.log(`[OpenAI] ⚡ Cache hit: ${streamUsage.cached_tokens} cached prompt tokens`);
+                }
             }
             const delta = chunk.choices?.[0]?.delta;
             if (delta?.content) {
@@ -405,7 +410,12 @@ class OpenAIProvider extends BaseProvider {
                         prompt_tokens: usage.input_tokens || 0,
                         completion_tokens: usage.output_tokens || 0,
                         total_tokens: (usage.input_tokens || 0) + (usage.output_tokens || 0),
+                        // Responses API: cache hits are in input_tokens_details
+                        cached_tokens: usage.input_tokens_details?.cached_tokens || 0,
                     };
+                    if (streamUsage.cached_tokens > 0) {
+                        console.log(`[OpenAI] ⚡ Responses API cache hit: ${streamUsage.cached_tokens} cached tokens`);
+                    }
                 }
                 // Capture response ID for chaining
                 if (event.response?.id) {

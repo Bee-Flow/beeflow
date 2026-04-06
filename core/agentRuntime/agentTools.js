@@ -3,18 +3,11 @@
  */
 const componentManager = require('../componentManager');
 const agentStore = require('../../stores/agentStore');
-const swarmStore = require('../../stores/swarmStore');
-const swarmOrchestrator = require('../../agents/swarm/orchestrator');
+// Legacy swarm modules removed
 const { componentToTool, SYSTEM_TOOLS } = require('../toolExecution');
 
 
 async function getAgentTools(agentId) {
-    // Check if it's a swarm first
-    const swarm = await swarmStore.getSwarm(agentId);
-    if (swarm) {
-        return swarmOrchestrator.getSwarmTools(swarm);
-    }
-
     const componentIds = await agentStore.getAgentTools(agentId);
     const allComponents = componentManager.getComponents();
     const workflowStore = require('../../stores/workflowStore');

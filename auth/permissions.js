@@ -19,10 +19,6 @@ const SYSTEM_PERMISSIONS = [
     // ── Admin Pages ──
     { id: 'admin_agents', name: 'All Agents', description: 'Admin: Access to all agent types', group: 'admin' },
     { id: 'admin_agents_chat', name: 'Agent', description: 'Admin: Agent configuration', group: 'admin' },
-    { id: 'admin_agents_swarm', name: 'Swarm Agents', description: 'Admin: Swarm agent configuration', group: 'admin' },
-    { id: 'admin_agents_browser', name: 'Browser Agents', description: 'Admin: Browser agent configuration', group: 'admin' },
-    { id: 'admin_agents_terminal', name: 'Terminal Agents', description: 'Admin: Terminal agent configuration', group: 'admin' },
-    { id: 'admin_agents_group', name: 'Round Table', description: 'Admin: Round table configuration', group: 'admin' },
     { id: 'admin_agents_system', name: 'System Agents', description: 'Admin: System agent configuration', group: 'admin' },
     { id: 'admin_agents_pipeline', name: 'Pipeline', description: 'Admin: Pipeline configuration', group: 'admin' },
     { id: 'admin_components', name: 'Components', description: 'Admin: Component builder', group: 'admin' },
@@ -212,14 +208,12 @@ async function getUserPermissions(userId, session = null) {
         const ORG_ROLE_PERMISSIONS = {
             org_admin: [
                 'org_admin', 'manage_users', 'manage_agents', 'page_settings',
-                'admin_agents', 'admin_agents_chat', 'admin_agents_swarm',
-                'admin_agents_browser', 'admin_agents_terminal', 'admin_agents_group',
+                'admin_agents', 'admin_agents_chat',
                 'admin_agents_pipeline', 'admin_security', 'admin_monitoring',
             ],
             agent_admin: [
                 'agent_admin', 'manage_agents',
-                'admin_agents', 'admin_agents_chat', 'admin_agents_swarm',
-                'admin_agents_browser', 'admin_agents_terminal', 'admin_agents_group',
+                'admin_agents', 'admin_agents_chat',
                 'admin_agents_pipeline',
             ],
             agent_editor: [

@@ -1,35 +1,27 @@
 /**
  * Prompt Defaults Registry
- * 
+ *
  * Maps prompt IDs to their default English text.
  * These are the built-in prompts that serve as the fallback for any locale.
- * 
- * System agent prompts are loaded from systemAgents.js at runtime.
+ *
+ * System agent prompts are auto-derived from the systemAgentRegistry —
+ * no need to hardcode IDs or labels here.
  * Markdown prompt files are loaded from disk.
  */
 
 const fs = require('fs');
 const path = require('path');
+const { REGISTRY } = require('../../stores/agent/systemAgentRegistry');
 
-// ── All prompt IDs managed by the i18n system ───────────────────
+// ── Auto-derive system agent IDs and labels from the registry ────
 
-const PROMPT_IDS = [
-    // System agents (from systemAgents.js)
-    'system-title-generator',
-    'system-memory-extractor',
-    'system-component-designer',
-    'system-pdf-extractor',
-    'system-prompt-designer',
-    'system-conversation-starters',
-    'system-description-improver',
-    'system-identity-improver',
-    'system-orgintel-scout',
-    'system-regex-generator',
-    // Agent-type system prompts (markdown files)
-    'browser-agent',
-    'terminal-agent',
-    'security-agent',
-    // Master template
+const systemAgentIds = REGISTRY.map(a => a.id);
+const systemAgentLabels = Object.fromEntries(REGISTRY.map(a => [a.id, a.name]));
+
+// ── Non-system prompt IDs ────────────────────────────────────────
+
+const EXTRA_PROMPT_IDS = [
+    // Templates
     'master-template',
     // Pipeline prompts (markdown files)
     'web-researcher',
@@ -40,22 +32,7 @@ const PROMPT_IDS = [
     'verwerkersovereenkomst-reviewer',
 ];
 
-// ── Human-readable labels for prompt IDs ────────────────────────
-
-const PROMPT_LABELS = {
-    'system-title-generator': 'Title Generator',
-    'system-memory-extractor': 'Memory Extractor',
-    'system-component-designer': 'AI Component Designer',
-    'system-pdf-extractor': 'PDF Extractor',
-    'system-prompt-designer': 'System Prompt Designer',
-    'system-conversation-starters': 'Conversation Starter Generator',
-    'system-description-improver': 'Description Improver',
-    'system-identity-improver': 'Identity Improver',
-    'system-orgintel-scout': 'OrgIntel Scout',
-    'system-regex-generator': 'Regex Rule Generator',
-    'browser-agent': 'Browser Agent',
-    'terminal-agent': 'Terminal Agent',
-    'security-agent': 'Security Agent',
+const EXTRA_PROMPT_LABELS = {
     'master-template': 'Master System Prompt Template',
     'web-researcher': 'Web Researcher',
     'report-writer': 'Report Writer',
@@ -65,29 +42,20 @@ const PROMPT_LABELS = {
     'verwerkersovereenkomst-reviewer': 'Verwerkersovereenkomst Reviewer',
 };
 
-// ── Prompt categories for UI grouping ───────────────────────────
+// ── Combined exports ─────────────────────────────────────────────
+
+const PROMPT_IDS = [...systemAgentIds, ...EXTRA_PROMPT_IDS];
+
+const PROMPT_LABELS = {
+    ...systemAgentLabels,
+    ...EXTRA_PROMPT_LABELS,
+};
+
+// ── Prompt categories for UI grouping ────────────────────────────
 
 const PROMPT_CATEGORIES = {
-    'System Agents': [
-        'system-title-generator',
-        'system-memory-extractor',
-        'system-component-designer',
-        'system-pdf-extractor',
-        'system-prompt-designer',
-        'system-conversation-starters',
-        'system-description-improver',
-        'system-identity-improver',
-        'system-orgintel-scout',
-        'system-regex-generator',
-    ],
-    'Agent Types': [
-        'browser-agent',
-        'terminal-agent',
-        'security-agent',
-    ],
-    'Templates': [
-        'master-template',
-    ],
+    'System Agents': systemAgentIds,
+    'Templates': ['master-template'],
     'Pipeline Prompts': [
         'web-researcher',
         'report-writer',
@@ -98,12 +66,9 @@ const PROMPT_CATEGORIES = {
     ],
 };
 
-// ── Markdown file paths (relative to server root) ───────────────
+// ── Markdown file paths (relative to server root) ────────────────
 
 const MD_PROMPT_PATHS = {
-    'browser-agent': path.join(__dirname, '..', '..', 'browser', 'system-prompt.md'),
-    'terminal-agent': path.join(__dirname, '..', '..', 'terminal', 'system-prompt.md'),
-    'security-agent': path.join(__dirname, '..', '..', 'security', 'system-prompt.md'),
     'master-template': path.join(__dirname, '..', '..', 'templates', 'system_prompt_master.md'),
     'web-researcher': path.join(__dirname, '..', '..', 'prompts', 'web-researcher-prompt.md'),
     'report-writer': path.join(__dirname, '..', '..', 'prompts', 'report-writer-prompt.md'),
@@ -113,7 +78,7 @@ const MD_PROMPT_PATHS = {
     'verwerkersovereenkomst-reviewer': path.join(__dirname, '..', '..', 'prompts', 'verwerkersovereenkomst-reviewer-prompt.md'),
 };
 
-// ── Cache for loaded defaults ───────────────────────────────────
+// ── Cache for loaded defaults ────────────────────────────────────
 
 let _defaultsCache = null;
 
@@ -129,7 +94,6 @@ async function loadAllDefaults() {
     // Load system agent prompts from the database
     try {
         const { getOne } = require('../../db');
-        const systemAgentIds = PROMPT_IDS.filter(id => id.startsWith('system-'));
         for (const agentId of systemAgentIds) {
             const row = await getOne('SELECT system_prompt FROM agents WHERE id = $1', [agentId]);
             if (row?.system_prompt) {

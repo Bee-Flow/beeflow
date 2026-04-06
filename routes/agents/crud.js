@@ -2,18 +2,7 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const agentStore = require('../../stores/agentStore');
-const swarmStore = require('../../stores/swarmStore');
-const browserAgentStore = require('../../stores/browserAgentStore');
 const agentRuntime = require('../../core/agentRuntime');
-const browserAgentRuntime = require('../../browser/orchestrator');
-const groupChatStore = require('../../stores/groupChatStore');
-const groupChatRuntime = require('../../agents/groupChat/runtime');
-const terminalAgentStore = require('../../stores/terminalAgentStore');
-const terminalAgentRuntime = require('../../terminal/orchestrator');
-const containerManager = require('../../terminal/containerManager');
-const securityAgentStore = require('../../stores/securityAgentStore');
-const securityAgentRuntime = require('../../security/orchestrator');
-const securityContainerManager = require('../../security/containerManager');
 const { getAIConfig, getProviderForModel } = require('../../core/aiAgent');
 const configStore = require('../../stores/configStore');
 const { requirePermission } = require('../../auth');
@@ -30,7 +19,7 @@ const router = express.Router();
 
 // ============ Agent CRUD ============
 
-// List all agents for current user (regular agents only — swarms are managed separately)
+// List all agents for current user
 router.get('/', async (req, res) => {
     const userId = getEffectiveUserId(req);
     const agents = await agentStore.getAgents(userId);
@@ -79,101 +68,9 @@ router.delete('/categories/:id', requirePermission('manage_agents'), async (req,
     }
 });
 
-// Get single agent (or Swarm or Browser Agent)
+// Get single agent
 router.get('/:id', async (req, res) => {
     const id = req.params.id;
-    // Check Swarm first
-    const swarm = await swarmStore.getSwarm(id);
-    if (swarm) {
-        return res.json({
-            id: swarm.id,
-            name: swarm.name,
-            description: swarm.description,
-            system_prompt: '',
-            model: null,
-            owner_id: 'system',
-            is_published: 1,
-            starter_prompts: [],
-            avatar: swarm.icon || '🔬',
-            threads_enabled: 1,
-            copy_enabled: 1,
-            workspace_enabled: 0,
-            config: swarm.config,
-            created_at: swarm.created_at,
-            updated_at: swarm.updated_at,
-            is_swarm: true
-        });
-    }
-
-    // Check Browser Agent
-    const browserAgent = await browserAgentStore.getBrowserAgent(id);
-    if (browserAgent) {
-        return res.json({
-            id: browserAgent.id,
-            name: browserAgent.name,
-            description: browserAgent.description,
-            system_prompt: browserAgent.system_prompt || '',
-            model: browserAgent.model,
-            owner_id: 'system',
-            is_published: 1,
-            starter_prompts: [],
-            avatar: browserAgent.icon || '🌐',
-            threads_enabled: 1,
-            copy_enabled: 1,
-            workspace_enabled: 0,
-            config: browserAgent.config,
-            created_at: browserAgent.created_at,
-            updated_at: browserAgent.updated_at,
-            is_browser_agent: true
-        });
-    }
-
-    // Check Terminal Agent
-    const terminalAgent = await terminalAgentStore.getTerminalAgent(id);
-    if (terminalAgent) {
-        return res.json({
-            id: terminalAgent.id,
-            name: terminalAgent.name,
-            description: terminalAgent.description,
-            system_prompt: terminalAgent.system_prompt || '',
-            model: terminalAgent.model,
-            owner_id: 'system',
-            is_published: 1,
-            starter_prompts: [],
-            avatar: terminalAgent.icon || '💻',
-            threads_enabled: 1,
-            copy_enabled: 1,
-            workspace_enabled: 0,
-            config: terminalAgent.config,
-            created_at: terminalAgent.created_at,
-            updated_at: terminalAgent.updated_at,
-            is_terminal_agent: true
-        });
-    }
-
-    // Check Security Agent
-    const securityAgent = await securityAgentStore.getSecurityAgent(id);
-    if (securityAgent) {
-        return res.json({
-            id: securityAgent.id,
-            name: securityAgent.name,
-            description: securityAgent.description,
-            system_prompt: securityAgent.system_prompt || '',
-            model: securityAgent.model,
-            owner_id: 'system',
-            is_published: 1,
-            starter_prompts: [],
-            avatar: securityAgent.icon || '🛡️',
-            threads_enabled: 1,
-            copy_enabled: 1,
-            workspace_enabled: 0,
-            config: securityAgent.config,
-            created_at: securityAgent.created_at,
-            updated_at: securityAgent.updated_at,
-            is_security_agent: true
-        });
-    }
-
     const agent = await agentStore.getAgent(id);
     if (agent) {
         return res.json(agent);

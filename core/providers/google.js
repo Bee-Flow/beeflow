@@ -559,10 +559,11 @@ class GoogleProvider extends BaseProvider {
                         prompt_tokens: chunk.usageMetadata.promptTokenCount || 0,
                         completion_tokens: chunk.usageMetadata.candidatesTokenCount || 0,
                         total_tokens: chunk.usageMetadata.totalTokenCount || 0,
+                        cached_tokens: chunk.usageMetadata.cachedContentTokenCount || 0,
                     };
                     // Log cache hits for monitoring
                     if (chunk.usageMetadata.cachedContentTokenCount > 0) {
-                        console.log(`[Google] Cache hit: ${chunk.usageMetadata.cachedContentTokenCount} cached tokens`);
+                        console.log(`[Google] ⚡ Cache hit: ${chunk.usageMetadata.cachedContentTokenCount} cached tokens`);
                     }
                 }
                 if (chunk.candidates?.[0]?.content?.parts) {

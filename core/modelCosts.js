@@ -77,24 +77,54 @@ function getModelCost(modelName) {
 }
 
 /**
+ * Get the cache discount multiplier for a model's provider.
+ * Cached input tokens are billed at this fraction of the normal input rate.
+ * @param {string} model
+ * @returns {number} Discount multiplier (e.g. 0.1 = pay 10% of normal rate)
+ */
+function getCacheDiscount(model) {
+    if (!model) return 1;
+    const m = model.toLowerCase();
+    // Anthropic/Claude: cache reads cost 10% of normal input
+    if (/claude/.test(m)) return 0.1;
+    // Google/Gemini: cached content costs 25% of normal input
+    if (/gemini/.test(m)) return 0.25;
+    // OpenAI: cached prompts cost 50% of normal input
+    if (/gpt|o\d/.test(m)) return 0.5;
+    // Default: no discount (treat cached same as uncached)
+    return 1;
+}
+
+/**
  * Compute estimated cost for a single API call.
+ * Supports cache-aware pricing — cached input tokens are billed at a discount.
+ * @param {string} model
+ * @param {number} promptTokens - Total input tokens (including cached)
+ * @param {number} completionTokens - Output tokens
+ * @param {number} cachedTokens - Input tokens served from cache (subset of promptTokens)
  * @returns {number} cost in USD
  */
-function computeCost(model, promptTokens = 0, completionTokens = 0) {
+function computeCost(model, promptTokens = 0, completionTokens = 0, cachedTokens = 0) {
     const rates = getModelCost(model);
     if (!rates) return 0;
-    return ((promptTokens / 1_000_000) * rates.input) + ((completionTokens / 1_000_000) * rates.output);
+    const uncachedInput = Math.max(0, promptTokens - cachedTokens);
+    const cacheRate = rates.input * getCacheDiscount(model);
+    return ((uncachedInput / 1_000_000) * rates.input)
+         + ((cachedTokens / 1_000_000) * cacheRate)
+         + ((completionTokens / 1_000_000) * rates.output);
 }
 
 /**
  * Compute estimated cost split into input and output.
  * @returns {{ input_cost: number, output_cost: number }}
  */
-function computeCostSplit(model, promptTokens = 0, completionTokens = 0) {
+function computeCostSplit(model, promptTokens = 0, completionTokens = 0, cachedTokens = 0) {
     const rates = getModelCost(model);
     if (!rates) return { input_cost: 0, output_cost: 0 };
+    const uncachedInput = Math.max(0, promptTokens - cachedTokens);
+    const cacheRate = rates.input * getCacheDiscount(model);
     return {
-        input_cost: (promptTokens / 1_000_000) * rates.input,
+        input_cost: ((uncachedInput / 1_000_000) * rates.input) + ((cachedTokens / 1_000_000) * cacheRate),
         output_cost: (completionTokens / 1_000_000) * rates.output,
     };
 }
@@ -179,6 +209,7 @@ function getModelCostsForConfig(modelEntries = []) {
 
 module.exports = {
     getModelCost,
+    getCacheDiscount,
     computeCost,
     computeCostSplit,
     getAllModelCosts,

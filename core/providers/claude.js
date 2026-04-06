@@ -56,7 +56,7 @@ class ClaudeProvider extends BaseProvider {
     }
 
     normalizeMessages(messages) {
-        return messages
+        const normalized = messages
             .filter((m) => m && m.role && m.role !== "system")
             .map((m) => {
                 if (m.role === "tool") {
@@ -95,6 +95,42 @@ class ClaudeProvider extends BaseProvider {
                     content: this.normalizeContent(m.content),
                 };
             });
+
+        // ─── Prompt caching: mark the last genuine user text message for cache_control
+        // This creates a cache breakpoint so the entire prefix (system + tools +
+        // all history up to this point) can be reused on the next turn.
+        // Only applies when there's enough history to benefit from caching (4+ messages).
+        // Skips tool_result blocks (converted from tool role) — cache_control is only
+        // valid on text-type content blocks.
+        if (normalized.length >= 4) {
+            for (let i = normalized.length - 1; i >= 0; i--) {
+                const msg = normalized[i];
+                if (msg.role !== 'user') continue;
+                // Skip tool_result messages (originally role:"tool", converted to role:"user")
+                if (Array.isArray(msg.content) && msg.content.some(b => b.type === 'tool_result')) {
+                    continue;
+                }
+                if (typeof msg.content === 'string' && msg.content.trim()) {
+                    // Convert string content to block format with cache_control
+                    msg.content = [{
+                        type: "text",
+                        text: msg.content,
+                        cache_control: { type: "ephemeral" },
+                    }];
+                } else if (Array.isArray(msg.content) && msg.content.length > 0) {
+                    // Find the last text block and add cache_control to it
+                    for (let j = msg.content.length - 1; j >= 0; j--) {
+                        if (msg.content[j].type === 'text') {
+                            msg.content[j].cache_control = { type: "ephemeral" };
+                            break;
+                        }
+                    }
+                }
+                break; // Only mark one message
+            }
+        }
+
+        return normalized;
     }
 
     extractSystem(messages) {
@@ -113,25 +149,27 @@ class ClaudeProvider extends BaseProvider {
     buildThinking(model, options = {}) {
         if (!this.supportsReasoning(model)) return undefined;
 
-        // Direct budget_tokens override from UI takes priority
+        // Direct budget_tokens override from UI (legacy support)
         if (options.budgetTokens && options.budgetTokens > 0) {
             return { type: "enabled", budget_tokens: options.budgetTokens };
         }
 
-        // Fall back to label-based effort mapping
+        // Map effort label → adaptive effort level
+        // Default to 'medium' when no explicit setting — ensures thinking always activates
         const effortRaw = options.reasoningEffort;
-        if (!effortRaw || effortRaw === "none") return undefined;
+        if (effortRaw === 'none') return undefined; // Explicitly disabled
 
-        // Claude API uses { type: "enabled", budget_tokens: N }
-        const BUDGET_MAP = {
-            low: 5000,
-            minimal: 5000,
-            medium: 10000,
-            high: 20000,
-            xhigh: 50000,
+        // Claude 4+ models: use adaptive thinking (recommended by Anthropic)
+        // Maps: low → low, minimal → low, medium → medium, high → high, xhigh → max
+        const EFFORT_MAP = {
+            low: 'low',
+            minimal: 'low',
+            medium: 'medium',
+            high: 'high',
+            xhigh: 'max',
         };
-        const budget = BUDGET_MAP[effortRaw] || 10000;
-        return { type: "enabled", budget_tokens: budget };
+        const effort = EFFORT_MAP[effortRaw] || 'medium'; // Default to medium
+        return { type: "adaptive", effort };
     }
 
     supportsReasoning(modelId) {
@@ -191,8 +229,12 @@ class ClaudeProvider extends BaseProvider {
             params.thinking = thinking;
             // Anthropic requires temperature=1 when thinking is enabled
             params.temperature = 1;
-            // Ensure max_tokens covers budget + answer room
-            if (thinking.budget_tokens && params.max_tokens < thinking.budget_tokens + 1024) {
+            if (thinking.type === 'adaptive') {
+                // Adaptive thinking: model allocates thinking from max_tokens dynamically
+                // Ensure enough room for thinking + answer
+                if (params.max_tokens < 16384) params.max_tokens = 16384;
+            } else if (thinking.budget_tokens && params.max_tokens < thinking.budget_tokens + 1024) {
+                // Legacy budget_tokens mode
                 params.max_tokens = thinking.budget_tokens + 1024;
             }
         }
@@ -322,7 +364,16 @@ class ClaudeProvider extends BaseProvider {
                         prompt_tokens: finalMessage.usage.input_tokens || 0,
                         completion_tokens: finalMessage.usage.output_tokens || 0,
                         total_tokens: (finalMessage.usage.input_tokens || 0) + (finalMessage.usage.output_tokens || 0),
+                        // Cache metrics — track cache reads and creation for cost optimization
+                        cached_tokens: finalMessage.usage.cache_read_input_tokens || 0,
+                        cache_creation_tokens: finalMessage.usage.cache_creation_input_tokens || 0,
                     };
+                    if (streamUsage.cached_tokens > 0) {
+                        console.log(`[Claude] ⚡ Cache hit: ${streamUsage.cached_tokens} cached input tokens (saved ~${Math.round(streamUsage.cached_tokens * 0.9)} token-equivalents)`);
+                    }
+                    if (streamUsage.cache_creation_tokens > 0) {
+                        console.log(`[Claude] 📦 Cache created: ${streamUsage.cache_creation_tokens} tokens cached for future requests`);
+                    }
                 }
             } catch (e) {
                 // already consumed

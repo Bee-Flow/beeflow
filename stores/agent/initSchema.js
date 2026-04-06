@@ -72,50 +72,8 @@ async function _doInit() {
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     `);
-    await exec(`
-        CREATE TABLE IF NOT EXISTS swarm_orchestrator (
-            id INTEGER PRIMARY KEY DEFAULT 1,
-            model TEXT,
-            temperature REAL DEFAULT 0.3,
-            max_tokens INTEGER DEFAULT 2000,
-            system_prompt TEXT,
-            worker_timeout INTEGER DEFAULT 180000,
-            max_retries INTEGER DEFAULT 3,
-            auto_test BOOLEAN DEFAULT TRUE,
-            skip_form_simple BOOLEAN DEFAULT TRUE,
-            builder_max_iterations INTEGER DEFAULT 15,
-            updated_at TIMESTAMPTZ DEFAULT NOW()
-        )
-    `);
-    await exec(`
-        CREATE TABLE IF NOT EXISTS swarm_workers (
-            id TEXT PRIMARY KEY,
-            swarm_id TEXT NOT NULL,
-            phase_id TEXT DEFAULT 'research',
-            worker_key TEXT NOT NULL,
-            enabled BOOLEAN DEFAULT TRUE,
-            name TEXT NOT NULL,
-            icon TEXT DEFAULT '',
-            color TEXT DEFAULT '#888',
-            description TEXT DEFAULT '',
-            model TEXT,
-            temperature REAL DEFAULT 0.3,
-            max_tokens INTEGER DEFAULT 2000,
-            use_tools BOOLEAN DEFAULT FALSE,
-            system_prompt TEXT,
-            sort_order INTEGER DEFAULT 0,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    `);
-    await exec(`
-        CREATE TABLE IF NOT EXISTS swarm_phases (
-            phase_key TEXT PRIMARY KEY,
-            phase_number INTEGER NOT NULL,
-            name TEXT NOT NULL,
-            goal TEXT NOT NULL,
-            sort_order INTEGER DEFAULT 0
-        )
-    `);
+    // Legacy swarm tables (swarm_orchestrator, swarm_workers, swarm_phases) removed.
+    // The Swarm system was purged — see conversation e9a327a6.
     await exec('CREATE INDEX IF NOT EXISTS idx_agents_owner ON agents(owner_id)');
     await exec('CREATE INDEX IF NOT EXISTS idx_agent_tools_agent ON agent_tools(agent_id)');
     await exec('CREATE INDEX IF NOT EXISTS idx_agent_conversations_agent ON agent_conversations(agent_id)');

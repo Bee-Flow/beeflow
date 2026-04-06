@@ -37,40 +37,15 @@ async function buildSystemPrompt({ agent, tools, userId, messageMetadata, memory
     // ─── Notebook context injection ─────────────────────────────
     if (messageMetadata?.workspaceContent) {
         systemPrompt += `\n\n[NOTEBOOK]
-The user has a rich-text Notebook open alongside the chat. You have 4 notebook tools:
-- notebook_read: Read current content as Markdown (ALWAYS call this before notebook_replace)
-- notebook_write: Replace ALL content (use for new documents or full rewrites)
-- notebook_replace: Replace a SPECIFIC portion (preferred for edits — uses find_text + replace_text)
-- notebook_insert: Insert content at start, end, or after a specific heading/text (preferred for adding new sections)
+The user has a Notebook panel open. You have 4 tools:
+- notebook_read: Read content. Modes: "outline" (default—headings+stats), "section" (one section by heading), "search" (find text), "full" (entire doc). Use outline first, then section/search for targeted access.
+- notebook_write: Replace ALL content (for new documents or full rewrites). Write in Markdown.
+- notebook_replace: Replace a SPECIFIC portion (find_text + replace_text). Preferred for edits.
+- notebook_insert: Add content at "start", "end", or "after" a heading.
 
-NOTEBOOK RULES:
-1. Write content in Markdown — the notebook renders it as rich text automatically
-2. For partial edits, prefer notebook_replace over notebook_write
-3. To add new sections without touching existing content, use notebook_insert
-4. Before using notebook_replace, call notebook_read first to see the EXACT current content
-5. Copy find_text EXACTLY from notebook_read output — character by character
-6. The notebook persists across messages — content stays until explicitly changed
-
-RICH-TEXT FORMATTING — Use these Markdown features for full styling:
-• Headings: # H1, ## H2, ### H3 (up to 6 levels)
-• Bold: **text**, Italic: *text*, Strikethrough: ~~text~~, Underline: use <u>text</u>
-• Text color: <span style="color: #e74c3c">red text</span> or any hex/named color
-• Highlight: <mark>highlighted text</mark> or <mark style="background-color: #ffeaa7">custom color</mark>
-• Font family: <span style="font-family: Georgia">serif text</span> (supports any web font)
-• Inline code: \`code\`, Code blocks: \`\`\`language\\ncode\\n\`\`\`
-• Bullet lists: - item, Numbered lists: 1. item
-• Task lists: - [ ] unchecked, - [x] checked
-• Tables: | Header | Header |\\n|--------|--------|\\n| Cell | Cell |
-• Blockquotes: > text (nestable: > > nested)
-• Links: [text](url), Images: ![alt](url)
-• Math formulas: $inline$ or $$block$$  (LaTeX/KaTeX)
-• Mermaid diagrams: \`\`\`mermaid\\ngraph TD; A-->B\\n\`\`\`
-• Horizontal rules: ---
-• Emoji shortcodes: :smile: :rocket: :warning:
-• Combine formatting freely: **<span style="color: #2ecc71">bold green</span>**, *<mark>italic highlighted</mark>*
-• Nested lists and complex table structures are fully supported`;
+RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="section" to get exact text. 2) Copy find_text EXACTLY from read output. 3) For partial edits always prefer notebook_replace over notebook_write. 4) Use Markdown for rich text (headings, bold, tables, code blocks, lists, etc.).`;
         if (messageMetadata.workspaceSelection && messageMetadata.workspaceSelection.trim()) {
-            systemPrompt += `\n\n[SELECTED TEXT IN NOTEBOOK]\nThe user has selected this text in the notebook:\n\`\`\`\n${messageMetadata.workspaceSelection}\n\`\`\`\nUse notebook_replace with find_text set to EXACTLY this text (including any ** # - formatting). Set replace_text to the new version. To remove, set replace_text to empty string.`;
+            systemPrompt += `\n\n[SELECTED TEXT IN NOTEBOOK]\nThe user selected this text:\n\`\`\`\n${messageMetadata.workspaceSelection}\n\`\`\`\nUse notebook_replace with find_text set to EXACTLY this text. Set replace_text to the new version.`;
         }
     }
 

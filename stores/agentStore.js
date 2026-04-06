@@ -11,31 +11,33 @@ const agentTools = require('./agent/agentTools');
 const agentConversations = require('./agent/agentConversations');
 const directConversations = require('./agent/directConversations');
 const systemAgents = require('./agent/systemAgents');
-const swarmPipelineConfig = require('./agent/swarmPipelineConfig');
 const agentStats = require('./agent/agentStats');
 const conversationLabels = require('./agent/conversationLabels');
 
 module.exports = {
-    // Agent CRUD
+    // ── Agent CRUD ───────────────────────────────────────────────────────────
     createAgent: agentCrud.createAgent,
     getAgents: agentCrud.getAgents,
     getAgent: agentCrud.getAgent,
     updateAgent: agentCrud.updateAgent,
     deleteAgent: agentCrud.deleteAgent,
     forceDeleteAgent: agentCrud.forceDeleteAgent,
-    // Published Agents
+
+    // ── Published Agents ─────────────────────────────────────────────────────
     getPublishedAgents: agentCrud.getPublishedAgents,
     getAllAgents: agentCrud.getAllAgents,
     setAgentPublished: agentCrud.setAgentPublished,
     getPublishedAgentsForUser: agentCrud.getPublishedAgentsForUser,
     getSystemAgents: agentCrud.getSystemAgents,
     ensurePlaceholderAgent: agentCrud.ensurePlaceholderAgent,
-    // Agent Tools
+
+    // ── Agent Tools ──────────────────────────────────────────────────────────
     getAgentTools: agentTools.getAgentTools,
     getAgentToolsWithParams: agentTools.getAgentToolsWithParams,
     updateAgentToolParams: agentTools.updateAgentToolParams,
     setAgentTools: agentTools.setAgentTools,
-    // Conversations
+
+    // ── Conversations ────────────────────────────────────────────────────────
     getConversation: agentConversations.getConversation,
     getOrCreateConversation: agentConversations.getOrCreateConversation,
     createNewConversation: agentConversations.createNewConversation,
@@ -43,7 +45,8 @@ module.exports = {
     clearConversation: agentConversations.clearConversation,
     updateConversationWorkspace: agentConversations.updateConversationWorkspace,
     getConversationWorkspace: agentConversations.getConversationWorkspace,
-    // Multi-Conversation
+
+    // ── Multi-Conversation ───────────────────────────────────────────────────
     listConversations: agentConversations.listConversations,
     listAllConversations: agentConversations.listAllConversations,
     searchConversations: agentConversations.searchConversations,
@@ -54,12 +57,21 @@ module.exports = {
     setConversationLabels: agentConversations.setConversationLabels,
     updateThreadTitles: agentConversations.updateThreadTitles,
     deleteConversationById: agentConversations.deleteConversationById,
-    // System Agents
+
+    // ── System Agents (unified API) ──────────────────────────────────────────
+    getSystemAgent: systemAgents.getSystemAgent,
+    seedSystemAgents: systemAgents.seedSystemAgents,
+    SYSTEM_AGENT_IDS: systemAgents.SYSTEM_AGENT_IDS,
+    REGISTRY: systemAgents.REGISTRY,
+    REGISTRY_MAP: systemAgents.REGISTRY_MAP,
+
+    // Backward-compat individual getters (will be removed after consumer migration)
     getTitleGeneratorAgent: systemAgents.getTitleGeneratorAgent,
     TITLE_GENERATOR_AGENT_ID: systemAgents.TITLE_GENERATOR_AGENT_ID,
     getMemoryExtractorAgent: systemAgents.getMemoryExtractorAgent,
     MEMORY_EXTRACTOR_AGENT_ID: systemAgents.MEMORY_EXTRACTOR_AGENT_ID,
     getComponentDesignerAgent: systemAgents.getComponentDesignerAgent,
+    AI_COMPONENT_DESIGNER_AGENT_ID: systemAgents.AI_COMPONENT_DESIGNER_AGENT_ID,
     getPDFExtractorAgent: systemAgents.getPDFExtractorAgent,
     getSystemPromptDesignerAgent: systemAgents.getSystemPromptDesignerAgent,
     SYSTEM_PROMPT_DESIGNER_AGENT_ID: systemAgents.SYSTEM_PROMPT_DESIGNER_AGENT_ID,
@@ -71,18 +83,14 @@ module.exports = {
     IDENTITY_IMPROVER_AGENT_ID: systemAgents.IDENTITY_IMPROVER_AGENT_ID,
     getOrgIntelScoutAgent: systemAgents.getOrgIntelScoutAgent,
     ORGINTEL_SCOUT_AGENT_ID: systemAgents.ORGINTEL_SCOUT_AGENT_ID,
-    AI_COMPONENT_DESIGNER_AGENT_ID: systemAgents.AI_COMPONENT_DESIGNER_AGENT_ID,
     getRegexGeneratorAgent: systemAgents.getRegexGeneratorAgent,
     REGEX_GENERATOR_AGENT_ID: systemAgents.REGEX_GENERATOR_AGENT_ID,
-    // Reporting Stats
+
+    // ── Reporting Stats ──────────────────────────────────────────────────────
     getSystemStats: agentStats.getSystemStats,
     getAgentStats: agentStats.getAgentStats,
-    // Swarm Pipeline Config
-    getSwarmConfig: swarmPipelineConfig.getSwarmConfig,
-    saveSwarmConfig: swarmPipelineConfig.saveSwarmConfig,
-    getSwarmPhases: swarmPipelineConfig.getSwarmPhases,
-    getSwarmPhase: swarmPipelineConfig.getSwarmPhase,
-    // Direct Conversations (no agent)
+
+    // ── Direct Conversations (no agent) ──────────────────────────────────────
     createDirectConversation: directConversations.createDirectConversation,
     getDirectConversation: directConversations.getDirectConversation,
     listDirectConversations: directConversations.listDirectConversations,
@@ -93,12 +101,14 @@ module.exports = {
     deleteDirectConversation: directConversations.deleteDirectConversation,
     updateDirectConversationWorkspace: directConversations.updateDirectConversationWorkspace,
     getDirectConversationWorkspace: directConversations.getDirectConversationWorkspace,
-    // Conversation Labels
+
+    // ── Conversation Labels ──────────────────────────────────────────────────
     listLabels: conversationLabels.listLabels,
     createLabel: conversationLabels.createLabel,
     updateLabel: conversationLabels.updateLabel,
     deleteLabel: conversationLabels.deleteLabel,
-    // Agent Categories
+
+    // ── Agent Categories ─────────────────────────────────────────────────────
     getAgentCategories: agentCrud.getAgentCategories,
     createAgentCategory: agentCrud.createAgentCategory,
     deleteAgentCategory: agentCrud.deleteAgentCategory,

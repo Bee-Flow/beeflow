@@ -1,8 +1,8 @@
 /**
  * Integration Tools — Shared tool injection for direct chat and agent chat
  * 
- * Builds the list of available integration tools (Gmail, Calendar, Sheets,
- * Docs, Drive, Slides, Fireflies, YouTrack, Gamma, N8N, Tavily, Image Gen,
+ * Builds the list of available integration tools (Gmail, Calendar,
+ * Docs, Drive, Fireflies, YouTrack, Gamma, N8N, Tavily, Image Gen,
  * Video Gen, Terminal, Regex Generator) based on user session,
  * org settings, and enabled apps.
  */
@@ -10,9 +10,7 @@
 const configStore = require('../stores/configStore');
 const { GMAIL_TOOLS } = require('../integrations/gmailTools');
 const { CALENDAR_TOOLS } = require('../integrations/calendarTools');
-const { SLIDES_TOOLS } = require('../integrations/slidesTools');
 const { DRIVE_TOOLS } = require('../integrations/driveTools');
-const { SHEETS_TOOLS } = require('../integrations/sheetsTools');
 const { DOCS_TOOLS } = require('../integrations/docsTools');
 const { CONTACTS_TOOLS } = require('../integrations/contactsTools');
 const { KEEP_TOOLS } = require('../integrations/keepTools');
@@ -118,9 +116,7 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
     if (session?.oauthProvider === 'google' && session?.accessToken) {
         if (isAppOn('gmail')) addTools(GMAIL_TOOLS);
         if (isAppOn('google-calendar')) addTools(CALENDAR_TOOLS);
-        if (isAppOn('google-slides')) addTools(SLIDES_TOOLS);
         if (isAppOn('google-drive')) addTools(DRIVE_TOOLS);
-        if (isAppOn('google-sheets')) addTools(SHEETS_TOOLS);
         if (isAppOn('google-docs')) addTools(DOCS_TOOLS);
         if (isAppOn('google-contacts')) addTools(CONTACTS_TOOLS);
         if (isAppOn('google-keep')) addTools(KEEP_TOOLS);
@@ -281,9 +277,7 @@ async function buildToolHint(tools, userId = null) {
     const integrations = [];
     if (tools.some(t => t.function.name.startsWith('gmail_'))) integrations.push('Gmail (search, read, compose, send, and reply to emails — the user approves before anything is sent)');
     if (tools.some(t => t.function.name.startsWith('calendar_'))) integrations.push('Google Calendar (list, search, create, update, delete events)');
-    if (tools.some(t => t.function.name.startsWith('slides_'))) integrations.push('Google Slides (list, read, create presentations and slides)');
     if (tools.some(t => t.function.name.startsWith('drive_'))) integrations.push('Google Drive (search, list, manage files and folders)');
-    if (tools.some(t => t.function.name.startsWith('sheets_'))) integrations.push('Google Sheets (create, read, append, update spreadsheets)');
     if (tools.some(t => t.function.name.startsWith('docs_'))) integrations.push('Google Docs (create, read, append, replace text in documents)');
     if (tools.some(t => t.function.name.startsWith('contacts_'))) integrations.push('Google Contacts (search, list, create, update contacts — create/update require user approval)');
     if (tools.some(t => t.function.name.startsWith('keep_'))) integrations.push('Google Keep (list, get, create, delete notes — create/delete require user approval, enterprise Workspace only)');

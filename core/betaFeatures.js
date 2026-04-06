@@ -25,11 +25,6 @@ const BETA_FEATURES = [
     { id: 'advanced_analytics', name: 'Advanced Analytics', description: 'Extended analytics dashboards and reporting' },
     { id: 'ai_code_execution', name: 'AI Code Execution', description: 'Allow the AI agent to execute code in a sandboxed environment' },
     { id: 'custom_themes', name: 'Custom Themes', description: 'Organization-level custom branding and theme support' },
-    { id: 'tasks', name: 'Tasks', description: 'AI-proposed task queue with mandatory human approval before execution' },
-    { id: 'monitoring', name: 'Monitoring', description: 'Custom monitoring dashboards with SQL queries and data visualizations' },
-    { id: 'e2e_testing', name: 'E2E Testing', description: 'AI-powered E2E test generation and execution dashboard' },
-    { id: 'slides', name: 'Slides', description: 'AI-powered slide deck creation and presentation builder' },
-    { id: 'sheets', name: 'Sheets', description: 'AI-powered spreadsheet creation and data analysis' },
 ];
 
 // ──────────────────────────────────────────────

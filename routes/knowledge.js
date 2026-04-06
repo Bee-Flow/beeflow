@@ -182,7 +182,7 @@ router.post('/agents/:id/knowledge/upload', requireAuth, upload.single('file'), 
                             console.log(`[Knowledge] Mode is ${mode}, processing OCR content with LLM...`);
 
                             try {
-                                const pdfAgent = await agentStore.getPDFExtractorAgent();
+                                const pdfAgent = await agentStore.getSystemAgent('system-pdf-extractor');
                                 const summaryConfig = { ...config };
                                 if (pdfAgent?.model) summaryConfig.model = pdfAgent.model;
 
@@ -243,7 +243,7 @@ router.post('/agents/:id/knowledge/upload', requireAuth, upload.single('file'), 
             if (!content && req.file.mimetype.startsWith('image/')) {
                 console.log(`[Knowledge] Using Vision Model to extract text from image...`);
 
-                const pdfAgent = await agentStore.getPDFExtractorAgent();
+                const pdfAgent = await agentStore.getSystemAgent('system-pdf-extractor');
                 if (!pdfAgent) {
                     return res.status(500).json({ error: 'PDF Extractor Agent not found' });
                 }
@@ -352,17 +352,13 @@ router.post('/agents/:id/knowledge/upload', requireAuth, upload.single('file'), 
 router.post('/agents/:id/knowledge/url', requireAuth, async (req, res) => {
     const userId = getEffectiveUserId(req);
     const agentId = req.params.id;
-    const { url, mode, swarmId } = req.body;
+    const { url, mode } = req.body;
 
     if (!userId) return res.status(401).json({ error: 'Not authenticated' });
 
     const agent = await agentStore.getAgent(agentId);
-    // For swarm agents, getAgent may return null — check swarmStore as fallback
-    if (!agent) {
-        const swarmStore = require('../stores/swarmStore');
-        const swarm = await swarmStore.getSwarm(agentId);
-        if (!swarm) return res.status(404).json({ error: 'Agent not found' });
-    } else if (agent.owner_id !== userId && !['swarm', 'system'].includes(agent.owner_id)) {
+    if (!agent) return res.status(404).json({ error: 'Agent not found' });
+    if (agent.owner_id !== userId && !['swarm', 'system'].includes(agent.owner_id)) {
         return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -370,63 +366,6 @@ router.post('/agents/:id/knowledge/url', requireAuth, async (req, res) => {
         return res.status(400).json({ error: 'URL is required' });
     }
 
-    // --- Swarm Agent Processing Path ---
-    if (swarmId) {
-        try {
-            console.log(`[Knowledge:URL] Running swarm "${swarmId}" for URL: ${url}`);
-            const agentRuntime = require('../core/agentRuntime');
-            const userAuth = { encryptionKey: req.session?.encryptionKey };
-
-            const result = await agentRuntime.chatWithAgentStream(
-                swarmId, userId, url, userAuth,
-                () => { }, // no-op event handler
-                null, {}
-            );
-
-            const content = result?.response || result?.message || '';
-            if (!content || content.trim().length < 20) {
-                return res.status(400).json({ error: 'Swarm agent returned no meaningful content' });
-            }
-
-            console.log(`[Knowledge:URL] Swarm returned ${content.length} chars, chunking...`);
-
-            const chunks = chunkMarkdownContent(content);
-            const validChunks = chunks.filter(c => c.text.length >= 10);
-
-            const swarmStore = require('../stores/swarmStore');
-            const swarm = await swarmStore.getSwarm(swarmId);
-            const swarmName = swarm?.name || swarmId;
-
-            // Batch embed
-            const embeddedChunks = await batchGenerateEmbeddings(validChunks, agentId);
-
-            let addedCount = 0;
-            for (const { chunk, embedding } of embeddedChunks) {
-                const finalMetadata = {
-                    source: url,
-                    type: 'swarm_import',
-                    swarm_agent: swarmName,
-                    section_path: chunk.metadata.section_path.join(' > '),
-                    token_est: chunk.tokens
-                };
-                knowledgeStore.addKnowledge(agentId, chunk.text, embedding, finalMetadata);
-                addedCount++;
-            }
-
-            console.log(`[Knowledge:URL] Stored ${addedCount} chunks from swarm "${swarmName}"`);
-            return res.status(201).json({
-                success: true,
-                message: `Swarm "${swarmName}" processed URL and generated ${addedCount} knowledge chunks`,
-                chunks: addedCount,
-                source: url,
-                swarm: swarmName
-            });
-
-        } catch (error) {
-            console.error('[Knowledge:URL] Swarm processing error:', error);
-            return res.status(500).json({ error: error.message || 'Swarm agent failed to process URL' });
-        }
-    }
 
     // Basic URL validation
     let parsedUrl;
@@ -507,7 +446,7 @@ router.post('/agents/:id/knowledge/url', requireAuth, async (req, res) => {
 
             try {
                 const config = await getAIConfig();
-                const pdfAgent = await agentStore.getPDFExtractorAgent();
+                const pdfAgent = await agentStore.getSystemAgent('system-pdf-extractor');
                 const summaryConfig = { ...config };
                 if (pdfAgent?.model) summaryConfig.model = pdfAgent.model;
 

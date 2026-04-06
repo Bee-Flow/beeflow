@@ -20,6 +20,20 @@ const { getAdapter } = require('../../core/providers');
 const agentStore = require('../../stores/agentStore');
 const { executeTool: dispatchTool } = require('../../core/toolDispatcher');
 const { WORKSPACE_TOOLS } = require('../../integrations/workspaceTools');
+
+/**
+ * Strip bulky fields from tool results before they become LLM messages.
+ * The full content is already sent via SSE to the frontend;
+ * the LLM only needs the compact confirmation message.
+ */
+function compactToolResultForLLM(toolResult) {
+    if (typeof toolResult !== 'object' || !toolResult) return toolResult;
+    // For workspace_update results, only keep the message (strip full content)
+    if (toolResult._action === 'workspace_update' && toolResult.message) {
+        return { action: 'notebook_updated', message: toolResult.message };
+    }
+    return toolResult;
+}
 const { getIntegrationTools, buildToolHint } = require('../../core/integrationTools');
 const { checkRegexPatterns } = require('../../core/guardrails');
 const { checkSubscriptionLimits, resolveOrgId } = require('../../core/limits');
@@ -447,40 +461,15 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         let workspaceContext = '';
         if (notebooksEnabled && workspaceContent) {
             workspaceContext = `\n\n[NOTEBOOK]
-The user has a rich-text Notebook open alongside the chat. You have 4 notebook tools:
-- notebook_read: Read current content as Markdown (ALWAYS call this before notebook_replace)
-- notebook_write: Replace ALL content (use for new documents or full rewrites)
-- notebook_replace: Replace a SPECIFIC portion (preferred for edits — uses find_text + replace_text)
-- notebook_insert: Insert content at start, end, or after a specific heading/text (preferred for adding new sections)
+The user has a Notebook panel open. You have 4 tools:
+- notebook_read: Read content. Modes: "outline" (default—headings+stats), "section" (one section by heading), "search" (find text), "full" (entire doc). Use outline first, then section/search for targeted access.
+- notebook_write: Replace ALL content (for new documents or full rewrites). Write in Markdown.
+- notebook_replace: Replace a SPECIFIC portion (find_text + replace_text). Preferred for edits.
+- notebook_insert: Add content at "start", "end", or "after" a heading.
 
-NOTEBOOK RULES:
-1. Write content in Markdown — the notebook renders it as rich text automatically
-2. For partial edits, prefer notebook_replace over notebook_write
-3. To add new sections without touching existing content, use notebook_insert
-4. Before using notebook_replace, call notebook_read first to see the EXACT current content
-5. Copy find_text EXACTLY from notebook_read output — character by character
-6. The notebook persists across messages — content stays until explicitly changed
-
-RICH-TEXT FORMATTING — Use these Markdown features for full styling:
-• Headings: # H1, ## H2, ### H3 (up to 6 levels)
-• Bold: **text**, Italic: *text*, Strikethrough: ~~text~~, Underline: use <u>text</u>
-• Text color: <span style="color: #e74c3c">red text</span> or any hex/named color
-• Highlight: <mark>highlighted text</mark> or <mark style="background-color: #ffeaa7">custom color</mark>
-• Font family: <span style="font-family: Georgia">serif text</span> (supports any web font)
-• Inline code: \`code\`, Code blocks: \`\`\`language\\ncode\\n\`\`\`
-• Bullet lists: - item, Numbered lists: 1. item
-• Task lists: - [ ] unchecked, - [x] checked
-• Tables: | Header | Header |\\n|--------|--------|\\n| Cell | Cell |
-• Blockquotes: > text (nestable: > > nested)
-• Links: [text](url), Images: ![alt](url)
-• Math formulas: $inline$ or $$block$$  (LaTeX/KaTeX)
-• Mermaid diagrams: \`\`\`mermaid\\ngraph TD; A-->B\\n\`\`\`
-• Horizontal rules: ---
-• Emoji shortcodes: :smile: :rocket: :warning:
-• Combine formatting freely: **<span style="color: #2ecc71">bold green</span>**, *<mark>italic highlighted</mark>*
-• Nested lists and complex table structures are fully supported`;
+RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="section" to get exact text. 2) Copy find_text EXACTLY from read output. 3) For partial edits always prefer notebook_replace over notebook_write. 4) Use Markdown for rich text (headings, bold, tables, code blocks, lists, etc.).`;
             if (workspaceSelection && workspaceSelection.trim()) {
-                workspaceContext += `\n\n[SELECTED TEXT IN NOTEBOOK]\nThe user has selected this text in the notebook:\n\`\`\`\n${workspaceSelection}\n\`\`\`\nUse notebook_replace with find_text set to EXACTLY this text (including any ** # - formatting). Set replace_text to the new version. To remove, set replace_text to empty string.`;
+                workspaceContext += `\n\n[SELECTED TEXT IN NOTEBOOK]\nThe user selected this text:\n\`\`\`\n${workspaceSelection}\n\`\`\`\nUse notebook_replace with find_text set to EXACTLY this text. Set replace_text to the new version.`;
             }
         }
 
@@ -628,33 +617,13 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
                             contentParts.push({ type: 'text', text: docText });
                             persistedAttachments.push({ name: att.name, type: att.type, url: pdfProxyUrl, extractedText: docText });
                         } else {
-                            // Both extraction methods failed — fall back to container upload
-                            hasDocumentAttachment = true;
-                            if (!convId) {
-                                const conv = await agentStore.createDirectConversation(userId, modelTier || 'fast');
-                                convId = conv.id;
-                                send('conversation_created', { conversationId: convId });
-                            }
-                            const containerManager = require('../../terminal/containerManager');
-                            const os = require('os');
-                            const fs = require('fs');
-                            const path = require('path');
-
-                            const containerKey = `direct-${convId}`;
-                            await containerManager.getOrCreateContainer(containerKey, `user-${userId}`);
-
-                            const filename = att.name.replace(/[^a-zA-Z0-9.\-_]/g, '_');
-                            const tmpHostPath = path.join(os.tmpdir(), `direct_att_${crypto.randomBytes(8).toString('hex')}_${filename}`);
-                            fs.writeFileSync(tmpHostPath, pdfBuffer);
-                            containerManager.copyToContainer(containerKey, tmpHostPath, `/workspace/${filename}`);
-                            fs.unlinkSync(tmpHostPath);
-
+                            // PDF extraction failed — terminal containers have been removed
                             contentParts.push({
                                 type: 'text',
-                                text: `[Uploaded document: ${filename}] This file has been placed in your secure terminal workspace at /workspace/${filename}. Use terminal tools to analyze it.`
+                                text: `[PDF: ${att.name} — could not extract text. The document may be scanned or image-based. Try re-uploading a text-selectable version.]`
                             });
                             persistedAttachments.push({ name: att.name, type: att.type, url: pdfProxyUrl });
-                            console.log(`[DirectChat] PDF extraction failed, fell back to container: ${att.name}`);
+                            console.log(`[DirectChat] PDF extraction failed for ${att.name}, no container fallback available`);
                         }
                     } catch (e) {
                         console.error(`[DirectChat] PDF processing failed for ${att.name}:`, e.message);
@@ -788,55 +757,29 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
                         });
                     }
                 } else if (att.content) {
-                    hasDocumentAttachment = true;
-                    if (!convId) {
-                        const conv = await agentStore.createDirectConversation(userId, modelTier || 'fast');
-                        convId = conv.id;
-                        send('conversation_created', { conversationId: convId });
-                    }
+                    // Generic file — upload to RustFS for persistent access
+                    const base64Data = att.content.split(',')[1] || att.content;
+                    const buffer = Buffer.from(base64Data, 'base64');
+                    const filename = att.name.replace(/[^a-zA-Z0-9.\-_]/g, '_');
 
+                    let fileProxyUrl = null;
                     try {
-                        const containerManager = require('../../terminal/containerManager');
-                        const os = require('os');
-                        const fs = require('fs');
-                        const path = require('path');
-
-                        const containerKey = `direct-${convId}`;
-                        await containerManager.getOrCreateContainer(containerKey, `user-${userId}`);
-
-                        const base64Data = att.content.split(',')[1] || att.content;
-                        const buffer = Buffer.from(base64Data, 'base64');
-                        const filename = att.name.replace(/[^a-zA-Z0-9.\-_]/g, '_');
-                        const tmpHostPath = path.join(os.tmpdir(), `direct_att_${crypto.randomBytes(8).toString('hex')}_${filename}`);
-                        fs.writeFileSync(tmpHostPath, buffer);
-                        containerManager.copyToContainer(containerKey, tmpHostPath, `/workspace/${filename}`);
-                        fs.unlinkSync(tmpHostPath);
-
-                        // Also upload to RustFS for persistent access
-                        let fileProxyUrl = null;
-                        try {
-                            if (storageStore.isAvailable()) {
-                                const storageName = `upload_${Date.now()}_${crypto.randomBytes(4).toString('hex')}_${filename}`;
-                                const key = storageStore.buildKey(userId, 'uploads', storageName);
-                                await storageStore.uploadFile(key, buffer, att.type || 'application/octet-stream');
-                                fileProxyUrl = storageStore.buildProxyUrl(key);
-                                console.log(`[DirectChat] Uploaded file to RustFS: ${key}`);
-                            }
-                        } catch (storErr) {
-                            console.warn(`[DirectChat] Failed to upload file to RustFS: ${storErr.message}`);
+                        if (storageStore.isAvailable()) {
+                            const storageName = `upload_${Date.now()}_${crypto.randomBytes(4).toString('hex')}_${filename}`;
+                            const key = storageStore.buildKey(userId, 'uploads', storageName);
+                            await storageStore.uploadFile(key, buffer, att.type || 'application/octet-stream');
+                            fileProxyUrl = storageStore.buildProxyUrl(key);
+                            console.log(`[DirectChat] Uploaded file to RustFS: ${key}`);
                         }
-
-                        contentParts.push({
-                            type: 'text',
-                            text: `[Uploaded document: ${filename}] This file has been placed in your secure terminal workspace at /workspace/${filename}. Use terminal tools (like convert_document_to_text, run_command, python_exec) to analyze it.`
-                        });
-                        persistedAttachments.push({ name: att.name, type: att.type, url: fileProxyUrl });
-                    } catch (e) {
-                        contentParts.push({
-                            type: 'text',
-                            text: `[File: ${att.name}, failed to upload to workspace: ${e.message}]`
-                        });
+                    } catch (storErr) {
+                        console.warn(`[DirectChat] Failed to upload file to RustFS: ${storErr.message}`);
                     }
+
+                    contentParts.push({
+                        type: 'text',
+                        text: `[Attached file: ${filename}] This file has been uploaded${fileProxyUrl ? ' and stored' : ''}.${att.type ? ' Type: ' + att.type : ''}`
+                    });
+                    persistedAttachments.push({ name: att.name, type: att.type, url: fileProxyUrl });
                 }
             }
             messages.push({ role: 'user', content: contentParts });
@@ -844,18 +787,22 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
             messages.push({ role: 'user', content: message });
         }
 
-        // Add terminal tools when document attachments are present OR when integrations
-        // that handle attachments (Gmail, etc.) are loaded — so the AI can use
-        // convert_document_to_text and other terminal tools on Gmail attachments.
+        // Add terminal tools when integrations that handle attachments
+        // (Gmail, etc.) are loaded — for convert_document_to_text etc.
+        // Note: terminal containers removed, but terminal tools module may still exist
         const hasIntegrationWithAttachments = directChatTools.some(t =>
             t.function?.name?.startsWith('gmail_') || t.function?.name?.startsWith('drive_')
         );
-        if (hasDocumentAttachment || hasIntegrationWithAttachments) {
-            const { TERMINAL_TOOLS } = require('../../terminal/tools');
-            for (const tTool of TERMINAL_TOOLS) {
-                if (!directChatTools.find(t => t.function.name === tTool.function.name)) {
-                    directChatTools.push(tTool);
+        if (hasIntegrationWithAttachments) {
+            try {
+                const { TERMINAL_TOOLS } = require('../../terminal/tools');
+                for (const tTool of TERMINAL_TOOLS) {
+                    if (!directChatTools.find(t => t.function.name === tTool.function.name)) {
+                        directChatTools.push(tTool);
+                    }
                 }
+            } catch (e) {
+                // Terminal tools module not available
             }
         }
 
@@ -1057,6 +1004,7 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
         // Summarize old messages to reduce token usage on long conversations
         try {
             const { compactMessages } = require('../../core/compaction');
+            const convMessageCount = messages.filter(m => m.role !== 'system').length;
             const compactionResult = await compactMessages(messages, {
                 existingSummary: conversationSummary,
                 summaryModelId: 'tier:fast',
@@ -1064,6 +1012,13 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
             messages = compactionResult.messages;
             if (compactionResult.newSummary) {
                 conversationSummary = compactionResult.newSummary;
+                const compactedCount = messages.filter(m => m.role !== 'system').length;
+                send('token_savings', {
+                    type: 'compaction',
+                    messagesBefore: convMessageCount,
+                    messagesAfter: compactedCount,
+                });
+                console.log(`[DirectChat] 📦 Compaction: ${convMessageCount} → ${compactedCount} messages`);
             }
         } catch (err) {
             console.warn('[DirectChat] Compaction failed, using full history:', err.message);
@@ -1092,9 +1047,6 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
         const MAX_TOOL_ROUNDS = 5;
         const generatedImages = []; // Track images for persistence
         const generatedAudio = []; // Track audio for persistence
-        const collectedSheetsResults = [];
-        const collectedSheetsDrafts = [];
-        const collectedSheetsReports = [];
         const collectedEmailDrafts = [];
         const collectedCalendarDrafts = [];
         const collectedMapEmbeds = [];
@@ -1241,7 +1193,7 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
                             _toolResult: toolResult,
                             role: 'tool',
                             tool_call_id: toolCall.id,
-                            content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult)
+                            content: typeof toolResult === 'string' ? toolResult : JSON.stringify(compactToolResultForLLM(toolResult))
                         };
                     });
 
@@ -1284,21 +1236,6 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
                         // Emit keep_draft SSE event for user approval
                         if (toolResult._action === 'keep_draft') {
                             send('keep_draft', toolResult.draft);
-                        }
-                        // Emit sheets_result SSE event for visual card (read operations)
-                        if (toolResult._action === 'sheets_result') {
-                            send('sheets_result', toolResult._sheetsData);
-                            collectedSheetsResults.push(toolResult._sheetsData);
-                        }
-                        // Emit sheets_draft SSE event for user approval (write operations)
-                        if (toolResult._action === 'sheets_draft') {
-                            send('sheets_draft', toolResult._sheetsDraft);
-                            collectedSheetsDrafts.push({ ...toolResult._sheetsDraft, status: 'pending' });
-                        }
-                        // Emit sheets_report SSE event for report/dashboard view
-                        if (toolResult._action === 'sheets_report') {
-                            send('sheets_report', toolResult._sheetsReport);
-                            collectedSheetsReports.push(toolResult._sheetsReport);
                         }
                         // Emit workspace_update SSE event
                         if (toolResult._action === 'workspace_update') {
@@ -1420,6 +1357,7 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
                 prompt_tokens: streamUsage?.prompt_tokens || 0,
                 completion_tokens: streamUsage?.completion_tokens || 0,
                 total_tokens: streamUsage?.total_tokens || ((streamUsage?.prompt_tokens || 0) + (streamUsage?.completion_tokens || 0)),
+                cached_tokens: streamUsage?.cached_tokens || 0,
                 source: 'direct_chat',
                 duration_ms: Date.now() - streamStartTime,
                 organization_id: userOrgId || null,
@@ -1547,7 +1485,7 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
                     _toolName: toolName,
                     role: 'tool',
                     tool_call_id: toolCall.id,
-                    content: JSON.stringify(resultObj)
+                    content: JSON.stringify(compactToolResultForLLM(resultObj))
                 };
             });
 
@@ -1590,21 +1528,6 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
                 // Emit keep_draft SSE event for user approval
                 if (toolResult._action === 'keep_draft') {
                     send('keep_draft', toolResult.draft);
-                }
-                // Emit sheets_result SSE event for visual card (read operations)
-                if (toolResult._action === 'sheets_result') {
-                    send('sheets_result', toolResult._sheetsData);
-                    collectedSheetsResults.push(toolResult._sheetsData);
-                }
-                // Emit sheets_draft SSE event for user approval (write operations)
-                if (toolResult._action === 'sheets_draft') {
-                    send('sheets_draft', toolResult._sheetsDraft);
-                    collectedSheetsDrafts.push({ ...toolResult._sheetsDraft, status: 'pending' });
-                }
-                // Emit sheets_report SSE event for report/dashboard view
-                if (toolResult._action === 'sheets_report') {
-                    send('sheets_report', toolResult._sheetsReport);
-                    collectedSheetsReports.push(toolResult._sheetsReport);
                 }
                 // Emit workspace_update SSE event
                 if (toolResult._action === 'workspace_update') {
@@ -1759,9 +1682,6 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
                 });
             }
             if (generatedAudio.length > 0) assistantSave.audioFiles = generatedAudio;
-            if (collectedSheetsResults.length > 0) assistantSave.sheetsResults = collectedSheetsResults;
-            if (collectedSheetsDrafts.length > 0) assistantSave.sheetsDrafts = collectedSheetsDrafts;
-            if (collectedSheetsReports.length > 0) assistantSave.sheetsReports = collectedSheetsReports;
             if (collectedEmailDrafts.length > 0) assistantSave.emailDrafts = collectedEmailDrafts;
             if (collectedCalendarDrafts.length > 0) assistantSave.calendarDrafts = collectedCalendarDrafts;
             if (collectedMapEmbeds.length > 0) assistantSave.mapEmbeds = collectedMapEmbeds;
@@ -1794,28 +1714,13 @@ RICH-TEXT FORMATTING — Use these Markdown features for full styling:
             if (savedMessages.length <= 2 && !moderationViolation) {
                 try {
                     const llmClient = require('../../core/llmClient');
-                    const titleAgent = await agentStore.getTitleGeneratorAgent();
-                    // Always use the fast tier for title generation (cheap, quick)
-                    // If the title agent has an explicit tier: model, honour it; otherwise default to fast tier.
-                    let titleModel;
-                    {
-                        const rawTitleModel = titleAgent?.model || 'tier:fast';
-                        const tierName = rawTitleModel.startsWith('tier:') ? rawTitleModel.substring(5) : 'fast';
-                        let titleTiers = await configStore.getConfig('chat_model_tiers') || {};
-                        // EU mode override for title generation
-                        if (userOrgForTiers) {
-                            const titleShield = await configStore.getConfig(`org_privacy_shield_${userOrgForTiers}`);
-                            if (titleShield?.enabled && titleShield?.euModeEnabled) {
-                                const euTitleTiers = await configStore.getConfig('chat_model_tiers_eu') || {};
-                                const mergedTitleTiers = { ...titleTiers };
-                                for (const [tn, euT] of Object.entries(euTitleTiers)) {
-                                    if (euT?.modelId) mergedTitleTiers[tn] = { ...mergedTitleTiers[tn], ...euT };
-                                }
-                                titleTiers = mergedTitleTiers;
-                            }
-                        }
-                        titleModel = titleTiers[tierName]?.modelId || titleTiers.fast?.modelId || modelId;
-                    }
+                    const { resolveModelWithGlobalFallback } = require('../../core/modelResolver');
+                    const titleAgent = await agentStore.getSystemAgent('system-title-generator');
+                    const rawTitleModel = titleAgent?.model || 'tier:fast';
+                    const titleModel = await resolveModelWithGlobalFallback(rawTitleModel, {
+                        userOrgId: userOrgForTiers || null,
+                        fallbackTier: 'fast',
+                    }) || modelId;
                     console.log(`[DirectChat] Title: generating with model=${titleModel}`);
                     const title = await llmClient.generateTitle(
                         titleModel,

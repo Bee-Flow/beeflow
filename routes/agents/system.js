@@ -1,59 +1,73 @@
 const express = require('express');
-const path = require('path');
-const fs = require('fs');
 const agentStore = require('../../stores/agentStore');
-const swarmStore = require('../../stores/swarmStore');
-const browserAgentStore = require('../../stores/browserAgentStore');
-const agentRuntime = require('../../core/agentRuntime');
-const browserAgentRuntime = require('../../browser/orchestrator');
-const groupChatStore = require('../../stores/groupChatStore');
-const groupChatRuntime = require('../../agents/groupChat/runtime');
-const terminalAgentStore = require('../../stores/terminalAgentStore');
-const terminalAgentRuntime = require('../../terminal/orchestrator');
-const containerManager = require('../../terminal/containerManager');
-const securityAgentStore = require('../../stores/securityAgentStore');
-const securityAgentRuntime = require('../../security/orchestrator');
-const securityContainerManager = require('../../security/containerManager');
-const { getAIConfig, getProviderForModel } = require('../../core/aiAgent');
-const configStore = require('../../stores/configStore');
-const { requirePermission } = require('../../auth');
-const MemoryStore = require('../../stores/memoryStore');
-const { resolveUserOrgIds } = require('../../auth');
-const { getEffectiveUserId, getUserAuth } = require('../../utils/routeHelpers');
+const { getProviderForModel } = require('../../core/aiAgent');
+const { resolveModelWithGlobalFallback, getTierConfig } = require('../../core/modelResolver');
 const llmClient = require('../../core/llmClient');
-
-/**
- * Resolve a model string — handles tier: prefixes (e.g. 'tier:fast') and falls back to config default.
- */
-async function resolveModelTier(rawModel, userOrgId = null) {
-    if (rawModel && rawModel.startsWith('tier:')) {
-        const tierName = rawModel.substring(5);
-        let tiers = await configStore.getConfig('chat_model_tiers') || {};
-        if (userOrgId) {
-            const shield = await configStore.getConfig(`org_privacy_shield_${userOrgId}`);
-            if (shield?.enabled && shield?.euModeEnabled) {
-                const euTiers = await configStore.getConfig('chat_model_tiers_eu') || {};
-                for (const [tn, euTier] of Object.entries(euTiers)) {
-                    if (euTier?.modelId) tiers[tn] = { ...tiers[tn], ...euTier };
-                }
-            }
-        }
-        return tiers[tierName]?.modelId || tiers.fast?.modelId || rawModel;
-    }
-    if (!rawModel) {
-        const globalConfig = await getAIConfig();
-        return globalConfig.model;
-    }
-    return rawModel;
-}
-const userStore = require('../../stores/userStore');
-const usageStore = require('../../stores/usageStore');
-const { checkSubscriptionLimits: checkSubLimits, checkResourceLimits } = require('../../core/limits');
-const { setupSSE, sendSSEError, persistAndTitle, getOrCreateAgentConversation } = require('../../core/sseHelpers');
+const { resolveUserOrgIds } = require('../../auth');
 
 const router = express.Router();
 
-// Get System Agents (for Admin Dashboard)
+// ── Generic system agent handler factory ─────────────────────────────────────
+//
+// Eliminates the 90% boilerplate duplication across the 4 utility endpoints.
+// Each endpoint is now a thin config object.
+
+/**
+ * @param {Object} opts
+ * @param {string}   opts.agentId       - System agent ID
+ * @param {string}   opts.tier          - Model tier to use (e.g. 'smart', 'thinking')
+ * @param {number}   opts.maxTokens     - Max tokens for the LLM call
+ * @param {Function} opts.buildPrompt   - (body) => user message string
+ * @param {Function} opts.parseResult   - (content, body) => response JSON
+ * @param {Function} [opts.validate]    - (body) => error string | null
+ */
+function createHandler({ agentId, tier, maxTokens, buildPrompt, parseResult, validate }) {
+    return async (req, res) => {
+        try {
+            // Optional validation
+            if (validate) {
+                const validationError = validate(req.body);
+                if (validationError) {
+                    return res.status(400).json({ error: validationError });
+                }
+            }
+
+            // Load agent config from DB
+            const agent = await agentStore.getSystemAgent(agentId);
+            if (!agent) {
+                return res.status(404).json({ error: `System agent ${agentId} not found` });
+            }
+
+            // Resolve model — try the configured tier, validate it exists, fallback gracefully
+            let model = await resolveModelWithGlobalFallback(`tier:${tier}`);
+            try {
+                await getProviderForModel(model);
+            } catch (_) {
+                model = await resolveModelWithGlobalFallback(null);
+                console.warn(`[SystemAgent:${agentId}] ${tier} tier model not found, falling back to: ${model}`);
+            }
+
+            if (!model) {
+                return res.status(500).json({ error: 'No model configured. Check your model tier configuration.' });
+            }
+
+            // Build messages and call LLM
+            const messages = [
+                { role: 'system', content: agent.system_prompt },
+                { role: 'user', content: buildPrompt(req.body) },
+            ];
+
+            const result = await llmClient.chat(model, messages, { maxTokens });
+            res.json(parseResult(result.content, req.body));
+        } catch (error) {
+            console.error(`[SystemAgent:${agentId}] Error:`, error);
+            res.status(500).json({ error: error.message });
+        }
+    };
+}
+
+// ── GET /system — List all system agents (Admin Dashboard) ───────────────────
+
 router.get('/system', async (req, res) => {
     try {
         let agents = await agentStore.getSystemAgents();
@@ -70,7 +84,11 @@ router.get('/system', async (req, res) => {
     }
 });
 
-// System Prompt Designer SSE Streaming Endpoint (uses thinking tier)
+// ── POST /system/prompt-designer/stream — SSE streaming ──────────────────────
+//
+// This endpoint uses SSE streaming, so it can't use the generic handler factory.
+// It stays as a standalone implementation.
+
 router.post('/system/prompt-designer/stream', async (req, res) => {
     try {
         const { message } = req.body;
@@ -78,16 +96,13 @@ router.post('/system/prompt-designer/stream', async (req, res) => {
             return res.status(400).json({ error: 'Message is required' });
         }
 
-        const { getSystemPromptDesignerAgent } = agentStore;
-        const agent = await getSystemPromptDesignerAgent();
-
+        const agent = await agentStore.getSystemAgent('system-prompt-designer');
         if (!agent) {
             return res.status(404).json({ error: 'System Prompt Designer agent not found' });
         }
 
-        // Resolve thinking tier model from chat_model_tiers config
-        const tiers = await configStore.getConfig('chat_model_tiers') || {};
-        const thinkingTier = tiers['thinking'] || tiers['smart'] || tiers['fast'] || {};
+        // Get thinking tier config (model + params)
+        const thinkingTier = await getTierConfig('thinking');
         const modelId = thinkingTier.modelId;
 
         if (!modelId) {
@@ -96,7 +111,7 @@ router.post('/system/prompt-designer/stream', async (req, res) => {
 
         console.log(`[PromptDesigner] Using thinking tier model: ${modelId}`);
 
-        // Set up SSE (matches setupSSE pattern — flushHeaders is required for Nginx Proxy Manager)
+        // Set up SSE (flushHeaders required for Nginx Proxy Manager)
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
@@ -111,12 +126,10 @@ router.post('/system/prompt-designer/stream', async (req, res) => {
 
         const messages = [
             { role: 'system', content: agent.system_prompt },
-            { role: 'user', content: message }
+            { role: 'user', content: message },
         ];
 
-        // Stream via llmClient
         let fullContent = '';
-        let thinkingContent = '';
 
         await llmClient.stream(modelId, messages, {
             maxTokens: thinkingTier.maxTokens || 16384,
@@ -128,18 +141,14 @@ router.post('/system/prompt-designer/stream', async (req, res) => {
                 fullContent += data.text;
                 send('content', { text: data.text });
             } else if (type === 'thinking') {
-                thinkingContent += data.text;
                 send('thinking', { text: data.text });
             } else if (type === 'error') {
                 send('error', data);
-            } else if (type === 'done') {
-                // done handled below
             }
         });
 
         send('done', { fullContent });
         res.end();
-
     } catch (error) {
         console.error('[PromptDesigner] Error:', error);
         if (res.headersSent) {
@@ -151,163 +160,74 @@ router.post('/system/prompt-designer/stream', async (req, res) => {
     }
 });
 
-// Conversation Starter Generator Endpoint
-router.post('/system/conversation-starters/generate', async (req, res) => {
-    try {
-        const { agentName, agentDescription, systemPrompt } = req.body;
+// ── POST /system/conversation-starters/generate ──────────────────────────────
 
-        const { getConversationStarterAgent } = agentStore;
-        const agent = await getConversationStarterAgent();
-
-        if (!agent) {
-            return res.status(404).json({ error: 'Conversation Starter Generator agent not found' });
-        }
-
-        // Ignore hardcoded model and use the smart tier (with fallback to default)
-        let modelToUse = await resolveModelTier('tier:smart');
-        try {
-            await getProviderForModel(modelToUse);
-        } catch (_) {
-            const globalConfig = await getAIConfig();
-            modelToUse = globalConfig.model;
-            console.warn(`[ConversationStarters] Smart tier model not found, falling back to: ${modelToUse}`);
-        }
-        console.log(`[ConversationStarters] Using model: ${modelToUse}`);
-
-        const contextMessage = `Generate 4 conversation starters for an agent with:
-- Name: ${agentName || '(not set)'}
-- Description: ${agentDescription || '(not set)'}
-- System Prompt: ${systemPrompt || '(empty)'}`;
-
-        const messages = [
-            { role: 'system', content: agent.system_prompt },
-            { role: 'user', content: contextMessage }
-        ];
-
-        const result = await llmClient.chat(modelToUse, messages, { maxTokens: 500 });
-        const content = result.content;
-
-        // Parse the JSON array from the response
-        try {
-            const jsonMatch = content.match(/\[[\s\S]*\]/);
-            const starters = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
-            res.json({ starters: starters.slice(0, 4) });
-        } catch (parseError) {
-            console.error('[ConversationStarters] Parse error:', parseError);
-            res.json({ starters: [] });
-        }
-
-    } catch (error) {
-        console.error('[ConversationStarters] Error:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Description Improver Endpoint
-router.post('/system/description-improver/generate', async (req, res) => {
-    try {
-        const { agentName, currentDescription, systemPrompt } = req.body;
-
-        const { getDescriptionImproverAgent } = agentStore;
-        const agent = await getDescriptionImproverAgent();
-
-        if (!agent) {
-            return res.status(404).json({ error: 'Description Improver agent not found' });
-        }
-
-        // Ignore hardcoded model and use the smart tier (with fallback to default)
-        let modelToUse = await resolveModelTier('tier:smart');
-        try {
-            await getProviderForModel(modelToUse);
-        } catch (_) {
-            const globalConfig = await getAIConfig();
-            modelToUse = globalConfig.model;
-            console.warn(`[DescriptionImprover] Smart tier model not found, falling back to: ${modelToUse}`);
-        }
-        console.log(`[DescriptionImprover] Using model: ${modelToUse}`);
-
-        const promptContext = systemPrompt ? systemPrompt.substring(0, 1000) : '';
-
-        const contextMessage = promptContext
-            ? `Based on this system prompt, generate a concise role description:\n\n---\n${promptContext}\n---\n\nAgent name: ${agentName || 'Unknown'}\nCurrent description: ${currentDescription || '(none)'}`
-            : `Generate a description for an agent named "${agentName || 'AI Assistant'}"${currentDescription ? `\nCurrent description to improve: "${currentDescription}"` : ''}`;
-
-        const messages = [
-            { role: 'system', content: agent.system_prompt },
-            { role: 'user', content: contextMessage }
-        ];
-
-        const result = await llmClient.chat(modelToUse, messages, { maxTokens: 200 });
-        const description = result.content;
-
-        const cleanDescription = description.replace(/^["']|["']$/g, '').trim();
-        res.json({ description: cleanDescription });
-
-    } catch (error) {
-        console.error('[DescriptionImprover] Error:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Identity Improver Endpoint (generates both name and description)
-router.post('/system/identity-improver/generate', async (req, res) => {
-    try {
-        const { currentName, currentDescription, systemPrompt } = req.body;
-
-        if (!systemPrompt) {
-            return res.status(400).json({ error: 'System prompt is required to generate identity' });
-        }
-
-        const { getIdentityImproverAgent } = agentStore;
-        const agent = await getIdentityImproverAgent();
-
-        if (!agent) {
-            return res.status(404).json({ error: 'Identity Improver agent not found' });
-        }
-
-        // Ignore hardcoded model and use the smart tier (with fallback to default)
-        let modelToUse = await resolveModelTier('tier:smart');
-        try {
-            await getProviderForModel(modelToUse);
-        } catch (_) {
-            // Smart tier model not available — fall back to global default
-            const globalConfig = await getAIConfig();
-            modelToUse = globalConfig.model;
-            console.warn(`[IdentityImprover] Smart tier model not found, falling back to: ${modelToUse}`);
-        }
-        console.log(`[IdentityImprover] Using model: ${modelToUse}`);
-
-        const contextMessage = `Based on this system prompt, generate a name and description:\n\n---\n${systemPrompt.substring(0, 1500)}\n---\n\nCurrent name: ${currentName || '(none)'}\nCurrent description: ${currentDescription || '(none)'}`;
-
-        const messages = [
-            { role: 'system', content: agent.system_prompt },
-            { role: 'user', content: contextMessage }
-        ];
-
-        const result = await llmClient.chat(modelToUse, messages, { maxTokens: 200 });
-        const content = result.content;
-
-        try {
-            const jsonMatch = content.match(/\{[\s\S]*\}/);
-            if (jsonMatch) {
-                const identity = JSON.parse(jsonMatch[0]);
-                res.json({
-                    avatar: identity.avatar || '',
-                    name: identity.name || currentName || '',
-                    description: identity.description || currentDescription || ''
-                });
-            } else {
-                res.status(500).json({ error: 'Invalid response format' });
+router.post('/system/conversation-starters/generate',
+    createHandler({
+        agentId: 'system-conversation-starters',
+        tier: 'smart',
+        maxTokens: 500,
+        buildPrompt: ({ agentName, agentDescription, systemPrompt }) =>
+            `Generate 4 conversation starters for an agent with:\n- Name: ${agentName || '(not set)'}\n- Description: ${agentDescription || '(not set)'}\n- System Prompt: ${systemPrompt || '(empty)'}`,
+        parseResult: (content) => {
+            try {
+                const jsonMatch = content.match(/\[[\s\S]*\]/);
+                const starters = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+                return { starters: starters.slice(0, 4) };
+            } catch (_) {
+                return { starters: [] };
             }
-        } catch (parseError) {
-            console.error('[IdentityImprover] Parse Error:', parseError, content);
-            res.status(500).json({ error: 'Failed to parse response' });
-        }
+        },
+    })
+);
 
-    } catch (error) {
-        console.error('[IdentityImprover] Error:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
+// ── POST /system/description-improver/generate ───────────────────────────────
+
+router.post('/system/description-improver/generate',
+    createHandler({
+        agentId: 'system-description-improver',
+        tier: 'smart',
+        maxTokens: 200,
+        buildPrompt: ({ agentName, currentDescription, systemPrompt }) => {
+            const promptContext = systemPrompt ? systemPrompt.substring(0, 1000) : '';
+            return promptContext
+                ? `Based on this system prompt, generate a concise role description:\n\n---\n${promptContext}\n---\n\nAgent name: ${agentName || 'Unknown'}\nCurrent description: ${currentDescription || '(none)'}`
+                : `Generate a description for an agent named "${agentName || 'AI Assistant'}"${currentDescription ? `\nCurrent description to improve: "${currentDescription}"` : ''}`;
+        },
+        parseResult: (content) => ({
+            description: content.replace(/^["']|["']$/g, '').trim(),
+        }),
+    })
+);
+
+// ── POST /system/identity-improver/generate ──────────────────────────────────
+
+router.post('/system/identity-improver/generate',
+    createHandler({
+        agentId: 'system-identity-improver',
+        tier: 'smart',
+        maxTokens: 200,
+        validate: ({ systemPrompt }) =>
+            systemPrompt ? null : 'System prompt is required to generate identity',
+        buildPrompt: ({ currentName, currentDescription, systemPrompt }) =>
+            `Based on this system prompt, generate a name and description:\n\n---\n${systemPrompt.substring(0, 1500)}\n---\n\nCurrent name: ${currentName || '(none)'}\nCurrent description: ${currentDescription || '(none)'}`,
+        parseResult: (content, { currentName, currentDescription }) => {
+            try {
+                const jsonMatch = content.match(/\{[\s\S]*\}/);
+                if (jsonMatch) {
+                    const identity = JSON.parse(jsonMatch[0]);
+                    return {
+                        avatar: identity.avatar || '',
+                        name: identity.name || currentName || '',
+                        description: identity.description || currentDescription || '',
+                    };
+                }
+            } catch (_) {
+                // Fall through to error
+            }
+            return { error: 'Failed to parse response' };
+        },
+    })
+);
 
 module.exports = router;
