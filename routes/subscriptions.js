@@ -89,6 +89,24 @@ router.post('/plans', async (req, res) => {
         if (!plan) return res.status(400).json({ error: 'Failed to create plan' });
 
         await userStore.logSubscriptionAudit('create_plan', 'plan', plan.id, getAdminId(req), null, { name: plan.name, price: plan.price, billing_interval: plan.billing_interval });
+
+        // Auto-sync to Stripe if enabled and plan has a price
+        if (plan.price > 0) {
+            try {
+                const stripeService = require('../services/stripeService');
+                if (await stripeService.isEnabled()) {
+                    const { productId, priceId } = await stripeService.syncPlanToStripe(plan);
+                    await userStore.updatePlan(plan.id, { stripe_product_id: productId, stripe_price_id: priceId });
+                    plan.stripe_product_id = productId;
+                    plan.stripe_price_id = priceId;
+                    console.log(`[Subscriptions] Auto-synced plan ${plan.id} to Stripe: ${productId}`);
+                }
+            } catch (err) {
+                console.warn(`[Subscriptions] Stripe auto-sync failed for plan ${plan.id}:`, err.message);
+                // Don't fail the plan creation — Stripe sync is optional
+            }
+        }
+
         res.status(201).json(plan);
     } catch (e) {
         console.error('[Subscriptions] createPlan error:', e);
@@ -118,6 +136,27 @@ router.put('/plans/:id', async (req, res) => {
 
         const updated = await userStore.getPlan(req.params.id);
         await userStore.logSubscriptionAudit('update_plan', 'plan', req.params.id, getAdminId(req), oldPlan, req.body);
+
+        // Auto-sync to Stripe if enabled 
+        // Trigger if: price changed, name changed, or billing interval changed
+        const priceChanged = req.body.price !== undefined && req.body.price !== oldPlan?.price;
+        const nameChanged = req.body.name !== undefined && req.body.name !== oldPlan?.name;
+        const intervalChanged = req.body.billing_interval !== undefined && req.body.billing_interval !== oldPlan?.billing_interval;
+        if (updated.price > 0 && (priceChanged || nameChanged || intervalChanged)) {
+            try {
+                const stripeService = require('../services/stripeService');
+                if (await stripeService.isEnabled()) {
+                    const { productId, priceId } = await stripeService.syncPlanToStripe(updated);
+                    await userStore.updatePlan(updated.id, { stripe_product_id: productId, stripe_price_id: priceId });
+                    updated.stripe_product_id = productId;
+                    updated.stripe_price_id = priceId;
+                    console.log(`[Subscriptions] Auto-synced plan ${updated.id} to Stripe: ${productId}`);
+                }
+            } catch (err) {
+                console.warn(`[Subscriptions] Stripe auto-sync failed for plan ${updated.id}:`, err.message);
+            }
+        }
+
         res.json(updated);
     } catch (e) {
         console.error('[Subscriptions] updatePlan error:', e);
@@ -136,6 +175,32 @@ router.delete('/plans/:id', async (req, res) => {
         res.json({ success: true });
     } catch (e) {
         console.error('[Subscriptions] deletePlan error:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// POST /api/subscriptions/plans/:id/sync-stripe — Manually sync a plan to Stripe
+router.post('/plans/:id/sync-stripe', async (req, res) => {
+    try {
+        const stripeService = require('../services/stripeService');
+        if (!(await stripeService.isEnabled())) {
+            return res.status(400).json({ error: 'Stripe is not enabled. Configure Stripe in the Stripe settings tab first.' });
+        }
+
+        const plan = await userStore.getPlan(req.params.id);
+        if (!plan) return res.status(404).json({ error: 'Plan not found' });
+        if (!plan.price || plan.price <= 0) {
+            return res.status(400).json({ error: 'Plan must have a price greater than 0 to sync to Stripe' });
+        }
+
+        const { productId, priceId } = await stripeService.syncPlanToStripe(plan);
+        await userStore.updatePlan(plan.id, { stripe_product_id: productId, stripe_price_id: priceId });
+
+        await userStore.logSubscriptionAudit('update_plan', 'plan', plan.id, getAdminId(req), null, { stripe_product_id: productId, stripe_price_id: priceId });
+
+        res.json({ success: true, stripe_product_id: productId, stripe_price_id: priceId });
+    } catch (e) {
+        console.error('[Subscriptions] syncPlanToStripe error:', e);
         res.status(500).json({ error: e.message });
     }
 });

@@ -11,7 +11,6 @@
 const express = require('express');
 const stripeService = require('../services/stripeService');
 const userStore = require('../stores/userStore');
-const usageStore = require('../stores/usageStore');
 
 const router = express.Router();
 
@@ -105,7 +104,7 @@ router.post('/checkout', requireAuth, async (req, res) => {
         const cancelUrl = `${origin}/app/settings?tab=license&checkout=cancelled`;
 
         // Get org name for Stripe metadata
-        const orgs = await userStore.listOrganizations();
+        const orgs = await userStore.getAllOrganizations();
         const org = orgs.find(o => o.id === orgId);
 
         const session = await stripeService.createCheckoutSession({
@@ -250,13 +249,7 @@ async function handleCheckoutCompleted(session) {
     const success = await userStore.setOrgSubscription(orgId, subData);
     if (success) {
         // Audit log
-        await userStore.addAuditLog({
-            action: 'assign_subscription',
-            target_type: 'organization',
-            target_id: orgId,
-            changed_by: 'stripe_webhook',
-            new_values: { plan_id: planId, stripe_subscription_id: session.subscription, payment_status: 'paid' },
-        });
+        await userStore.logSubscriptionAudit('assign_subscription', 'organization', orgId, 'stripe_webhook', null, { plan_id: planId, stripe_subscription_id: session.subscription, payment_status: 'paid' });
         console.log(`[Stripe Webhook] ✓ Subscription assigned to org ${orgId}`);
     } else {
         console.error(`[Stripe Webhook] ✗ Failed to assign subscription to org ${orgId}`);
@@ -318,13 +311,7 @@ async function handleSubscriptionUpdated(subscription) {
 
     const success = await userStore.setOrgSubscription(orgId, updateData);
 
-    await userStore.addAuditLog({
-        action: 'update_subscription',
-        target_type: 'organization',
-        target_id: orgId,
-        changed_by: 'stripe_webhook',
-        new_values: { stripe_status: subscription.status, beeflow_status: updateData.status },
-    });
+    await userStore.logSubscriptionAudit('update_subscription', 'organization', orgId, 'stripe_webhook', null, { stripe_status: subscription.status, beeflow_status: updateData.status });
 
     console.log(`[Stripe Webhook] Subscription updated for org ${orgId}: ${subscription.status} → ${updateData.status}`);
 }
@@ -354,13 +341,7 @@ async function handleSubscriptionDeletedForOrg(orgId, subscription) {
         payment_status: 'cancelled',
     });
 
-    await userStore.addAuditLog({
-        action: 'update_subscription',
-        target_type: 'organization',
-        target_id: orgId,
-        changed_by: 'stripe_webhook',
-        new_values: { status: 'cancelled', reason: 'stripe_subscription_deleted' },
-    });
+    await userStore.logSubscriptionAudit('update_subscription', 'organization', orgId, 'stripe_webhook', null, { status: 'cancelled', reason: 'stripe_subscription_deleted' });
 
     console.log(`[Stripe Webhook] Subscription cancelled for org ${orgId}`);
 }
@@ -399,13 +380,7 @@ async function handleInvoicePaymentFailed(invoice) {
         payment_status: 'failed',
     });
 
-    await userStore.addAuditLog({
-        action: 'update_subscription',
-        target_type: 'organization',
-        target_id: match.organization_id,
-        changed_by: 'stripe_webhook',
-        new_values: { payment_status: 'failed', invoice_id: invoice.id },
-    });
+    await userStore.logSubscriptionAudit('update_subscription', 'organization', match.organization_id, 'stripe_webhook', null, { payment_status: 'failed', invoice_id: invoice.id });
 
     console.log(`[Stripe Webhook] Payment failed for org ${match.organization_id}`);
 }
