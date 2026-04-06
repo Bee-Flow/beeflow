@@ -595,4 +595,36 @@ router.get('/user/strings/:locale', requireAuth, async (req, res) => {
     }
 });
 
+// ── Public (no-auth) endpoints for pre-login language detection ───
+
+// GET /api/languages/public/locales — List available locales without auth
+// Used by login page language picker
+router.get('/public/locales', async (req, res) => {
+    try {
+        const locales = await languageStore.getAvailableLocales();
+        res.set('Cache-Control', 'public, max-age=600');
+        res.json(locales.map(l => ({ code: l.code, name: l.name })));
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET /api/languages/public/strings/:locale — Get effective GUI strings without auth
+// Used by the login page to serve translations before user authenticates
+router.get('/public/strings/:locale', async (req, res) => {
+    try {
+        const locale = req.params.locale;
+        // Only serve locales that are actually configured
+        const locales = await languageStore.getAvailableLocales();
+        if (!locales.find(l => l.code === locale)) {
+            return res.status(404).json({ error: 'Locale not available' });
+        }
+        const strings = await languageStore.getEffectiveGUIStrings(locale);
+        res.set('Cache-Control', 'public, max-age=600');
+        res.json(strings);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 module.exports = router;

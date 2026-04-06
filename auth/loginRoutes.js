@@ -88,6 +88,15 @@ router.get('/setup-status', async (req, res) => {
     const serverUrl = process.env.SERVER_PUBLIC_HOST
         ? `${process.env.SERVER_PROTOCOL || 'https'}://${process.env.SERVER_PUBLIC_HOST}`
         : '';
+    // Include available locales for pre-auth language picker
+    let availableLocales = [];
+    try {
+        const languageStore = require('../stores/languageStore');
+        const locales = await languageStore.getAvailableLocales();
+        availableLocales = locales.map(l => ({ code: l.code, name: l.name }));
+    } catch (err) {
+        console.error('[Auth] setup-status — failed to load locales:', err.message);
+    }
     res.json({
         isSetupComplete,
         isOAuthConfigured,
@@ -97,6 +106,7 @@ router.get('/setup-status', async (req, res) => {
         deploymentMode: process.env.DEPLOYMENT_MODE || 'cloud',
         allowSignups: process.env.ALLOW_SIGNUPS !== 'false',
         allowPasswordLogin: process.env.ALLOW_PASSWORD_LOGIN !== 'false',
+        availableLocales,
     });
 });
 
