@@ -476,14 +476,29 @@ ${emailSamples}`;
 
         // Call LLM for analysis
         const llmClient = require('../../core/llmClient');
-        const configStore = require('../../stores/configStore');
+        const { resolveModelForTierName } = require('../../core/modelResolver');
+
+        // Resolve user's org for EU-mode
+        let userOrgId = null;
+        try {
+            const { resolveUserOrgIds } = require('../../auth');
+            const orgIds = await resolveUserOrgIds(req);
+            if (orgIds && orgIds.size > 0) userOrgId = Array.from(orgIds)[0];
+            if (!userOrgId) {
+                const userStore = require('../../stores/userStore');
+                const dbUser = await userStore.getUser(userId);
+                if (dbUser?.organizationId) userOrgId = dbUser.organizationId;
+            }
+        } catch (_) {}
 
         // Get the deep thinking tier model (with fallback to writing, then fast)
-        const tiers = await configStore.getConfig('chat_model_tiers') || {};
-        const modelId = tiers.deep?.modelId || tiers.writing?.modelId || tiers.fast?.modelId;
+        let modelId = await resolveModelForTierName('deep', { userOrgId });
+        if (!modelId || modelId === 'gemini-2.0-flash-lite') {
+            modelId = await resolveModelForTierName('writing', { userOrgId });
+        }
         if (!modelId) {
             return res.status(500).json({
-                error: 'No fast-tier model configured. Please configure a model in Settings → AI Models.'
+                error: 'No model configured. Please configure a model in Settings → AI Models.'
             });
         }
 

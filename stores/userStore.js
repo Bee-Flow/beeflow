@@ -94,6 +94,14 @@ async function initDB() {
             allowed_features TEXT DEFAULT '[]',
             allowed_models TEXT DEFAULT '[]',
             is_default BOOLEAN DEFAULT FALSE,
+            price REAL,
+            currency TEXT DEFAULT 'EUR',
+            billing_interval TEXT DEFAULT 'monthly',
+            trial_days INTEGER DEFAULT 0,
+            sort_order INTEGER DEFAULT 0,
+            is_public BOOLEAN DEFAULT FALSE,
+            stripe_price_id TEXT,
+            stripe_product_id TEXT,
             created_at TIMESTAMPTZ,
             updated_at TIMESTAMPTZ
         );
@@ -114,8 +122,23 @@ async function initDB() {
             allowed_models TEXT,
             billing_cycle_start TEXT,
             notes TEXT,
+            trial_end_date TEXT,
+            stripe_customer_id TEXT,
+            stripe_subscription_id TEXT,
+            payment_status TEXT DEFAULT 'none',
             created_at TIMESTAMPTZ,
             updated_at TIMESTAMPTZ
+        );
+
+        CREATE TABLE IF NOT EXISTS subscription_audit_log (
+            id TEXT PRIMARY KEY,
+            action TEXT NOT NULL,
+            target_type TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            changed_by TEXT,
+            old_values TEXT,
+            new_values TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW()
         )
     `);
 
@@ -133,11 +156,27 @@ async function initDB() {
     try { await exec(`ALTER TABLE groups ADD COLUMN IF NOT EXISTS "orgRole" TEXT DEFAULT ''`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS "azureUserId" TEXT`); } catch (e) { /* column already exists */ }
 
+    // ── Subscription schema migrations ──
+    try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS price REAL`); } catch (e) { }
+    try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'EUR'`); } catch (e) { }
+    try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS billing_interval TEXT DEFAULT 'monthly'`); } catch (e) { }
+    try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS trial_days INTEGER DEFAULT 0`); } catch (e) { }
+    try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0`); } catch (e) { }
+    try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS is_public BOOLEAN DEFAULT FALSE`); } catch (e) { }
+    try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS stripe_price_id TEXT`); } catch (e) { }
+    try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS stripe_product_id TEXT`); } catch (e) { }
+    try { await exec(`ALTER TABLE organization_subscriptions ADD COLUMN IF NOT EXISTS trial_end_date TEXT`); } catch (e) { }
+    try { await exec(`ALTER TABLE organization_subscriptions ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT`); } catch (e) { }
+    try { await exec(`ALTER TABLE organization_subscriptions ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT`); } catch (e) { }
+    try { await exec(`ALTER TABLE organization_subscriptions ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'none'`); } catch (e) { }
+
     // ── Phase 2: Indexes on hot auth/org query paths ──────────────────────────
     // getUserByEmail() is called on every login — must be index-scanned
     try { await exec(`CREATE INDEX IF NOT EXISTS idx_users_email ON users(LOWER(email)) WHERE email IS NOT NULL`); } catch (e) { /* ok */ }
     // org-scoped queries (getUsersByOrg, admin lists)
     try { await exec(`CREATE INDEX IF NOT EXISTS idx_users_org ON users("organizationId") WHERE "organizationId" IS NOT NULL AND "organizationId" != ''`); } catch (e) { /* ok */ }
+    // Audit log index
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_audit_target ON subscription_audit_log(target_type, target_id)`); } catch (e) { }
 
     initialized = true;
 }
@@ -146,7 +185,7 @@ initDB().catch(err => console.error('[UserStore] Init error:', err.message));
 
 // ── Dynamic UPDATE helper ─────────────────────────────
 // PG has no COALESCE(?, col) trick so we build SET clauses dynamically
-function dynamicUpdate(table, id, updates, columnMapping) {
+function dynamicUpdate(table, id, updates, columnMapping, whereCol = 'id') {
     const setClauses = [];
     const params = [];
     let idx = 1;
@@ -158,7 +197,7 @@ function dynamicUpdate(table, id, updates, columnMapping) {
     }
     if (setClauses.length === 0) return null;
     params.push(id);
-    return { sql: `UPDATE ${table} SET ${setClauses.join(', ')} WHERE id = $${idx}`, params };
+    return { sql: `UPDATE ${table} SET ${setClauses.join(', ')} WHERE "${whereCol}" = $${idx}`, params };
 }
 
 // ── Migration from JSON ─────────────────────────────
@@ -423,6 +462,14 @@ async function createOrganization(orgData) {
         await run(`INSERT INTO organizations (id, name, description, tagline, address, email, phone, website, kvk, vat, logo, "footerText", "defaultGroups", "allowSignup", "authMethod", "autoApproveSSO", "enabledIntegrations", "allowed_domains")
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
             [id, name, description || '', tagline || '', address || '', email || '', phone || '', website || '', kvk || '', vat || '', logo || '', footerText || '', JSON.stringify(defaultGroups || []), allowSignup ? '1' : '0', authMethod || null, autoApproveSSO ? '1' : '0', enabledIntegrations ? JSON.stringify(enabledIntegrations) : null, allowedDomains ? JSON.stringify(allowedDomains) : null]);
+        // Auto-assign default subscription plan if one exists
+        try {
+            const defaultPlan = await getOne('SELECT id FROM subscription_plans WHERE is_default = TRUE LIMIT 1');
+            if (defaultPlan) {
+                await setOrgSubscription(id, { plan_id: defaultPlan.id, status: 'active' });
+                console.log(`[UserStore] Auto-assigned default plan '${defaultPlan.id}' to new org '${id}'`);
+            }
+        } catch (e) { console.warn('[UserStore] Failed to auto-assign default plan:', e.message); }
         return true;
     } catch (e) { console.error(e); return false; }
 }
@@ -646,43 +693,55 @@ async function initDefaultRoles() {
 initDefaultRoles().catch(err => console.error('[UserStore] initDefaultRoles error:', err.message));
 
 // ── Subscription Plans ─────────────────────────────
+function parsePlan(p) {
+    return { ...p, allowed_features: parseJSON(p.allowed_features, []), allowed_models: parseJSON(p.allowed_models, []), max_messages_by_type: parseJSON(p.max_messages_by_type, {}), is_default: !!p.is_default, is_public: !!p.is_public };
+}
+
 async function getAllPlans() {
     await initDB();
-    const rows = await getAll('SELECT * FROM subscription_plans ORDER BY name');
-    return rows.map(p => ({ ...p, allowed_features: parseJSON(p.allowed_features, []), allowed_models: parseJSON(p.allowed_models, []), max_messages_by_type: parseJSON(p.max_messages_by_type, {}), is_default: !!p.is_default }));
+    const rows = await getAll('SELECT * FROM subscription_plans ORDER BY sort_order ASC, name ASC');
+    return rows.map(parsePlan);
 }
 
 async function getPlan(planId) {
     await initDB();
     const p = await getOne('SELECT * FROM subscription_plans WHERE id = $1', [planId]);
     if (!p) return null;
-    return { ...p, allowed_features: parseJSON(p.allowed_features, []), allowed_models: parseJSON(p.allowed_models, []), max_messages_by_type: parseJSON(p.max_messages_by_type, {}), is_default: !!p.is_default };
+    return parsePlan(p);
 }
 
 async function createPlan(data) {
     await initDB();
+    if (!data.name || typeof data.name !== 'string' || !data.name.trim()) {
+        throw new Error('Plan name is required');
+    }
     const id = data.id || crypto.randomUUID();
     const now = new Date().toISOString();
     try {
         if (data.is_default) await run('UPDATE subscription_plans SET is_default = FALSE WHERE is_default = TRUE');
-        await run(`INSERT INTO subscription_plans (id, name, description, max_messages_per_month, max_messages_by_type, max_tokens_per_month, max_cost_per_month, max_users, max_agents, max_knowledge_sources, allowed_features, allowed_models, is_default, created_at, updated_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
-            [id, data.name, data.description || '', data.max_messages_per_month ?? null, JSON.stringify(data.max_messages_by_type || {}),
+        await run(`INSERT INTO subscription_plans (id, name, description, max_messages_per_month, max_messages_by_type, max_tokens_per_month, max_cost_per_month, max_users, max_agents, max_knowledge_sources, allowed_features, allowed_models, is_default, price, currency, billing_interval, trial_days, sort_order, is_public, stripe_price_id, stripe_product_id, created_at, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+            [id, data.name.trim(), data.description || '', data.max_messages_per_month ?? null, JSON.stringify(data.max_messages_by_type || {}),
                 data.max_tokens_per_month ?? null, data.max_cost_per_month ?? null, data.max_users ?? null, data.max_agents ?? null,
                 data.max_knowledge_sources ?? null, JSON.stringify(data.allowed_features || []), JSON.stringify(data.allowed_models || []),
-                !!data.is_default, now, now]);
-        return { id, ...data, created_at: now, updated_at: now };
+                !!data.is_default, data.price ?? null, data.currency || 'EUR', data.billing_interval || 'monthly',
+                data.trial_days ?? 0, data.sort_order ?? 0, !!data.is_public,
+                data.stripe_price_id || null, data.stripe_product_id || null, now, now]);
+        return parsePlan(await getOne('SELECT * FROM subscription_plans WHERE id = $1', [id]));
     } catch (e) { console.error('[UserStore] createPlan error:', e); return null; }
 }
 
 async function updatePlan(planId, data) {
     await initDB();
     if (!(await getOne('SELECT id FROM subscription_plans WHERE id = $1', [planId]))) return false;
+    if (data.name !== undefined && (!data.name || typeof data.name !== 'string' || !data.name.trim())) {
+        throw new Error('Plan name cannot be empty');
+    }
     const now = new Date().toISOString();
     try {
         if (data.is_default) await run('UPDATE subscription_plans SET is_default = FALSE WHERE is_default = TRUE');
         const updateMap = {};
-        if (data.name !== undefined) updateMap.name = data.name;
+        if (data.name !== undefined) updateMap.name = data.name.trim();
         if (data.description !== undefined) updateMap.description = data.description;
         if (data.max_messages_per_month !== undefined) updateMap.max_messages_per_month = data.max_messages_per_month;
         if (data.max_messages_by_type !== undefined) updateMap.max_messages_by_type = JSON.stringify(data.max_messages_by_type);
@@ -694,8 +753,16 @@ async function updatePlan(planId, data) {
         if (data.allowed_features !== undefined) updateMap.allowed_features = JSON.stringify(data.allowed_features);
         if (data.allowed_models !== undefined) updateMap.allowed_models = JSON.stringify(data.allowed_models);
         if (data.is_default !== undefined) updateMap.is_default = !!data.is_default;
+        if (data.price !== undefined) updateMap.price = data.price;
+        if (data.currency !== undefined) updateMap.currency = data.currency;
+        if (data.billing_interval !== undefined) updateMap.billing_interval = data.billing_interval;
+        if (data.trial_days !== undefined) updateMap.trial_days = data.trial_days;
+        if (data.sort_order !== undefined) updateMap.sort_order = data.sort_order;
+        if (data.is_public !== undefined) updateMap.is_public = !!data.is_public;
+        if (data.stripe_price_id !== undefined) updateMap.stripe_price_id = data.stripe_price_id;
+        if (data.stripe_product_id !== undefined) updateMap.stripe_product_id = data.stripe_product_id;
         updateMap.updated_at = now;
-        const colMap = { name: 'name', description: 'description', max_messages_per_month: 'max_messages_per_month', max_messages_by_type: 'max_messages_by_type', max_tokens_per_month: 'max_tokens_per_month', max_cost_per_month: 'max_cost_per_month', max_users: 'max_users', max_agents: 'max_agents', max_knowledge_sources: 'max_knowledge_sources', allowed_features: 'allowed_features', allowed_models: 'allowed_models', is_default: 'is_default', updated_at: 'updated_at' };
+        const colMap = { name: 'name', description: 'description', max_messages_per_month: 'max_messages_per_month', max_messages_by_type: 'max_messages_by_type', max_tokens_per_month: 'max_tokens_per_month', max_cost_per_month: 'max_cost_per_month', max_users: 'max_users', max_agents: 'max_agents', max_knowledge_sources: 'max_knowledge_sources', allowed_features: 'allowed_features', allowed_models: 'allowed_models', is_default: 'is_default', price: 'price', currency: 'currency', billing_interval: 'billing_interval', trial_days: 'trial_days', sort_order: 'sort_order', is_public: 'is_public', stripe_price_id: 'stripe_price_id', stripe_product_id: 'stripe_product_id', updated_at: 'updated_at' };
         const q = dynamicUpdate('subscription_plans', planId, updateMap, colMap);
         if (q) await run(q.sql, q.params);
         return true;
@@ -725,6 +792,9 @@ async function getOrgSubscription(orgId) {
 
 async function setOrgSubscription(orgId, data) {
     await initDB();
+    if (data.status && !['active', 'suspended', 'cancelled', 'trialing', 'past_due'].includes(data.status)) {
+        throw new Error(`Invalid subscription status: ${data.status}`);
+    }
     const existing = await getOrgSubscription(orgId);
     const now = new Date().toISOString();
     try {
@@ -743,25 +813,27 @@ async function setOrgSubscription(orgId, data) {
             if (data.allowed_models !== undefined) updateMap.allowed_models = JSON.stringify(data.allowed_models);
             if (data.billing_cycle_start !== undefined) updateMap.billing_cycle_start = data.billing_cycle_start;
             if (data.notes !== undefined) updateMap.notes = data.notes;
+            if (data.trial_end_date !== undefined) updateMap.trial_end_date = data.trial_end_date;
+            if (data.stripe_customer_id !== undefined) updateMap.stripe_customer_id = data.stripe_customer_id;
+            if (data.stripe_subscription_id !== undefined) updateMap.stripe_subscription_id = data.stripe_subscription_id;
+            if (data.payment_status !== undefined) updateMap.payment_status = data.payment_status;
             updateMap.updated_at = now;
-            const colMap = { plan_id: 'plan_id', status: 'status', max_messages_per_month: 'max_messages_per_month', max_messages_by_type: 'max_messages_by_type', max_tokens_per_month: 'max_tokens_per_month', max_cost_per_month: 'max_cost_per_month', max_users: 'max_users', max_agents: 'max_agents', max_knowledge_sources: 'max_knowledge_sources', allowed_features: 'allowed_features', allowed_models: 'allowed_models', billing_cycle_start: 'billing_cycle_start', notes: 'notes', updated_at: 'updated_at' };
-            const q = dynamicUpdate('organization_subscriptions', orgId, updateMap, colMap);
-            if (q) {
-                // Fix: dynamicUpdate uses id column, but org subs use organization_id
-                const sql = q.sql.replace('WHERE id =', 'WHERE organization_id =');
-                await run(sql, q.params);
-            }
+            const colMap = { plan_id: 'plan_id', status: 'status', max_messages_per_month: 'max_messages_per_month', max_messages_by_type: 'max_messages_by_type', max_tokens_per_month: 'max_tokens_per_month', max_cost_per_month: 'max_cost_per_month', max_users: 'max_users', max_agents: 'max_agents', max_knowledge_sources: 'max_knowledge_sources', allowed_features: 'allowed_features', allowed_models: 'allowed_models', billing_cycle_start: 'billing_cycle_start', notes: 'notes', trial_end_date: 'trial_end_date', stripe_customer_id: 'stripe_customer_id', stripe_subscription_id: 'stripe_subscription_id', payment_status: 'payment_status', updated_at: 'updated_at' };
+            const q = dynamicUpdate('organization_subscriptions', orgId, updateMap, colMap, 'organization_id');
+            if (q) await run(q.sql, q.params);
         } else {
             const id = crypto.randomUUID();
-            await run(`INSERT INTO organization_subscriptions (id, organization_id, plan_id, status, max_messages_per_month, max_messages_by_type, max_tokens_per_month, max_cost_per_month, max_users, max_agents, max_knowledge_sources, allowed_features, allowed_models, billing_cycle_start, notes, created_at, updated_at)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+            await run(`INSERT INTO organization_subscriptions (id, organization_id, plan_id, status, max_messages_per_month, max_messages_by_type, max_tokens_per_month, max_cost_per_month, max_users, max_agents, max_knowledge_sources, allowed_features, allowed_models, billing_cycle_start, notes, trial_end_date, stripe_customer_id, stripe_subscription_id, payment_status, created_at, updated_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
                 [id, orgId, data.plan_id || null, data.status || 'active',
                     data.max_messages_per_month ?? null, data.max_messages_by_type ? JSON.stringify(data.max_messages_by_type) : null,
                     data.max_tokens_per_month ?? null, data.max_cost_per_month ?? null, data.max_users ?? null,
                     data.max_agents ?? null, data.max_knowledge_sources ?? null,
                     data.allowed_features ? JSON.stringify(data.allowed_features) : null,
                     data.allowed_models ? JSON.stringify(data.allowed_models) : null,
-                    data.billing_cycle_start || now, data.notes || '', now, now]);
+                    data.billing_cycle_start || now, data.notes || '',
+                    data.trial_end_date || null, data.stripe_customer_id || null,
+                    data.stripe_subscription_id || null, data.payment_status || 'none', now, now]);
         }
         return true;
     } catch (e) { console.error('[UserStore] setOrgSubscription error:', e); return false; }
@@ -773,12 +845,51 @@ async function deleteOrgSubscription(orgId) {
     return rowCount > 0;
 }
 
+/**
+ * Compute the billing period start/end dates for an org subscription.
+ * Uses billing_cycle_start (day of month) to determine period boundaries,
+ * falling back to calendar month if not set.
+ */
+function getBillingPeriod(sub) {
+    const now = new Date();
+    if (sub?.billing_cycle_start) {
+        const cycleStart = new Date(sub.billing_cycle_start);
+        const cycleDay = cycleStart.getDate();
+        // Find current period start
+        let periodStart = new Date(now.getFullYear(), now.getMonth(), cycleDay);
+        if (periodStart > now) {
+            // We haven't reached the cycle day this month, so period started last month
+            periodStart = new Date(now.getFullYear(), now.getMonth() - 1, cycleDay);
+        }
+        const periodEnd = new Date(periodStart.getFullYear(), periodStart.getMonth() + 1, cycleDay);
+        return { startDate: periodStart.toISOString(), endDate: periodEnd.toISOString() };
+    }
+    // Fallback: calendar month
+    return {
+        startDate: new Date(now.getFullYear(), now.getMonth(), 1).toISOString(),
+        endDate: new Date(now.getFullYear(), now.getMonth() + 1, 1).toISOString(),
+    };
+}
+
 async function getEffectiveLimits(orgId) {
     const sub = await getOrgSubscription(orgId);
     if (!sub) return null;
+    // Check trial: if in trial and trial hasn't expired, status is 'trialing'
+    if (sub.trial_end_date) {
+        const trialEnd = new Date(sub.trial_end_date);
+        if (trialEnd > new Date() && sub.status === 'trialing') {
+            // Trial is active — treat as active
+            sub.status = 'active';
+        } else if (trialEnd <= new Date() && sub.status === 'trialing') {
+            // Trial expired — treat as suspended unless payment is set up
+            if (sub.payment_status !== 'paid') {
+                sub.status = 'suspended';
+            }
+        }
+    }
     const plan = sub.plan_id ? await getPlan(sub.plan_id) : null;
     const LIMIT_FIELDS = ['max_messages_per_month', 'max_tokens_per_month', 'max_cost_per_month', 'max_users', 'max_agents', 'max_knowledge_sources'];
-    const effective = { status: sub.status };
+    const effective = { status: sub.status, billing_cycle_start: sub.billing_cycle_start };
     for (const field of LIMIT_FIELDS) {
         effective[field] = sub[field] !== null && sub[field] !== undefined ? sub[field] : (plan ? plan[field] : null);
     }
@@ -792,6 +903,34 @@ async function getEffectiveLimits(orgId) {
     return effective;
 }
 
+// ── Audit Logging ─────────────────────────────
+async function logSubscriptionAudit(action, targetType, targetId, changedBy, oldValues, newValues) {
+    try {
+        await initDB();
+        const id = crypto.randomUUID();
+        await run(`INSERT INTO subscription_audit_log (id, action, target_type, target_id, changed_by, old_values, new_values) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+            [id, action, targetType, targetId, changedBy || 'system',
+                oldValues ? JSON.stringify(oldValues) : null,
+                newValues ? JSON.stringify(newValues) : null]);
+    } catch (e) { console.error('[UserStore] Audit log error:', e.message); }
+}
+
+async function getAuditLog(opts = {}) {
+    await initDB();
+    const { targetType, targetId, limit = 50, offset = 0 } = opts;
+    let sql = 'SELECT * FROM subscription_audit_log';
+    const params = [];
+    const conditions = [];
+    let idx = 1;
+    if (targetType) { conditions.push(`target_type = $${idx++}`); params.push(targetType); }
+    if (targetId) { conditions.push(`target_id = $${idx++}`); params.push(targetId); }
+    if (conditions.length > 0) sql += ' WHERE ' + conditions.join(' AND ');
+    sql += ` ORDER BY created_at DESC LIMIT $${idx++} OFFSET $${idx++}`;
+    params.push(limit, offset);
+    const rows = await getAll(sql, params);
+    return rows.map(r => ({ ...r, old_values: parseJSON(r.old_values, null), new_values: parseJSON(r.new_values, null) }));
+}
+
 module.exports = {
     getAllUsers, getUser, getUserByEmail, createUser, updateUser, deleteUser,
     getAllOrganizations, getOrganization, createOrganization, updateOrganization, deleteOrganization,
@@ -800,4 +939,5 @@ module.exports = {
     getAllRoles, createRole, updateRole, deleteRole,
     getAllPlans, getPlan, createPlan, updatePlan, deletePlan,
     getAllOrgSubscriptions, getOrgSubscription, setOrgSubscription, deleteOrgSubscription, getEffectiveLimits,
+    getBillingPeriod, logSubscriptionAudit, getAuditLog,
 };

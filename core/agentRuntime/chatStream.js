@@ -623,8 +623,8 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             let tierSettings = {};
             if (agent.model && agent.model.startsWith('tier:')) {
                 const tierName = agent.model.substring(5);
-                const allTiers = await configStore.getConfig('chat_model_tiers') || {};
-                tierSettings = allTiers[tierName] || {};
+                const { getTierConfig } = require('./modelResolver');
+                tierSettings = await getTierConfig(tierName, { userOrgId: messageMetadata?.userOrgId || null });
             }
 
             // ─── Native SDK adapter streaming (Google, OpenAI, Claude, Mistral) ─────

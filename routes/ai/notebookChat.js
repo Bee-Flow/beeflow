@@ -43,12 +43,10 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
     const sources = await notebookStore.getSources(notebookId);
     const readySources = sources.filter(s => s.status === 'ready');
 
-    // Resolve model from tier config
-    let tiers = await configStore.getConfig('chat_model_tiers') || {};
-
     // EU mode + org privacy shield: resolve user's org (matches direct chat)
     const { resolveUserOrgIds: resolveOrgIdsForTiers } = require('../../auth');
     const userStore = require('../../stores/userStore');
+    const { getEUAwareTiers } = require('../../core/modelResolver');
     const orgIdsForTiers = await resolveOrgIdsForTiers(req);
     let userOrgForTiers = orgIdsForTiers && orgIdsForTiers.size > 0 ? Array.from(orgIdsForTiers)[0] : null;
     if (!userOrgForTiers) {
@@ -68,17 +66,12 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
             }
         } catch (_) {}
     }
+
+    // Resolve model from tier config (EU-aware via centralized modelResolver)
+    let tiers = await getEUAwareTiers({ userOrgId: userOrgForTiers });
     if (userOrgForTiers) {
         const shield = await configStore.getConfig(`org_privacy_shield_${userOrgForTiers}`);
         if (shield?.enabled && shield.euModeEnabled) {
-            const euTiers = await configStore.getConfig('chat_model_tiers_eu') || {};
-            const mergedTiers = { ...tiers };
-            for (const [tierName, euTier] of Object.entries(euTiers)) {
-                if (euTier?.modelId) {
-                    mergedTiers[tierName] = { ...mergedTiers[tierName], ...euTier };
-                }
-            }
-            tiers = mergedTiers;
             console.log(`[NotebookChat] EU mode active for org ${userOrgForTiers}`);
         }
     }
@@ -89,7 +82,7 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
     if (resolvedTier === 'auto') {
         try {
             const { classifyWithLLM } = require('../../core/promptClassifier');
-            const result = await classifyWithLLM(message, tiers);
+            const result = await classifyWithLLM(message, tiers, { userOrgId: userOrgForTiers });
             resolvedTier = result.tier;
             console.log(`[NotebookChat] Auto: tier="${resolvedTier}" (${result.method}: ${result.reason})`);
         } catch (err) {

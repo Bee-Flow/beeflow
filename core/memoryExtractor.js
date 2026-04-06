@@ -56,21 +56,23 @@ Respond with ONLY the JSON array, no other text.`;
  * @param {string} assistantResponse
  * @param {string} agentId - Optional agent ID for agent-specific memories
  * @param {string} projectId - Optional project ID for project-scoped memories
+ * @param {string|null} userOrgId - Optional org ID for EU-mode tier overrides
  */
-async function extractMemories(userId, userMessage, assistantResponse, agentId = null, projectId = null) {
+async function extractMemories(userId, userMessage, assistantResponse, agentId = null, projectId = null, userOrgId = null) {
     const llmClient = require('./llmClient');
 
     // Skip short/trivial messages
     if (!userMessage || userMessage.length < 20) return;
     if (!assistantResponse || assistantResponse.length < 20) return;
 
-    // Resolve tier:fast → actual model ID
-    let modelId = 'gemini-2.0-flash-lite'; // sensible fallback
+    // Resolve tier:fast → actual model ID (EU-aware)
+    let modelId;
     try {
-        const configStore = require('../stores/configStore');
-        const tiers = await configStore.getConfig('chat_model_tiers') || {};
-        if (tiers.fast?.modelId) modelId = tiers.fast.modelId;
-    } catch (e) { /* use fallback */ }
+        const { resolveModelForTierName } = require('./modelResolver');
+        modelId = await resolveModelForTierName('fast', { userOrgId, fallback: 'gemini-2.0-flash-lite' });
+    } catch (e) {
+        modelId = 'gemini-2.0-flash-lite';
+    }
 
     // Truncate to avoid sending too much context (expand limit for detailed memories)
     const truncatedUser = userMessage.substring(0, 20000);

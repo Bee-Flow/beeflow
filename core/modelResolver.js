@@ -97,8 +97,52 @@ async function getTierConfig(tierName, { userOrgId = null } = {}) {
     return tiers[tierName] || tiers['fast'] || {};
 }
 
+/**
+ * Convenience: resolve a plain tier name (e.g. 'fast', 'smart') to a model ID.
+ * Shorthand for resolveModelForTier('tier:' + tierName, opts).
+ *
+ * @param {string} tierName      - Plain tier name (e.g. 'fast', 'smart', 'thinking')
+ * @param {Object} [opts]
+ * @param {string|null} opts.userOrgId - Org ID for EU-mode overrides
+ * @param {string}      opts.fallback  - Fallback model ID if resolution fails
+ * @returns {Promise<string>} Resolved model ID
+ */
+async function resolveModelForTierName(tierName, { userOrgId = null, fallback = 'gemini-2.0-flash-lite' } = {}) {
+    const resolved = await resolveModelForTier(`tier:${tierName}`, { userOrgId, fallbackTier: 'fast' });
+    return resolved || fallback;
+}
+
+/**
+ * Get the full EU-aware tiers map (merged with EU overrides if applicable).
+ * Useful for consumers that need to iterate available tiers (e.g. promptClassifier).
+ *
+ * @param {Object} [opts]
+ * @param {string|null} opts.userOrgId - Org ID for EU-mode overrides
+ * @returns {Promise<Object>} Merged tiers config
+ */
+async function getEUAwareTiers({ userOrgId = null } = {}) {
+    let tiers = await configStore.getConfig('chat_model_tiers') || {};
+
+    if (userOrgId) {
+        const shield = await configStore.getConfig(`org_privacy_shield_${userOrgId}`);
+        if (shield?.enabled && shield?.euModeEnabled) {
+            const euTiers = await configStore.getConfig('chat_model_tiers_eu') || {};
+            tiers = { ...tiers };
+            for (const [tierName, euTier] of Object.entries(euTiers)) {
+                if (euTier?.modelId) {
+                    tiers[tierName] = { ...tiers[tierName], ...euTier };
+                }
+            }
+        }
+    }
+
+    return tiers;
+}
+
 module.exports = {
     resolveModelForTier,
     resolveModelWithGlobalFallback,
     getTierConfig,
+    resolveModelForTierName,
+    getEUAwareTiers,
 };

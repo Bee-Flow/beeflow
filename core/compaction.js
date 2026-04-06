@@ -19,6 +19,7 @@ const TOOL_RESULT_MAX_LEN = 500; // Truncate tool results beyond this in recent 
  * @param {object} options
  * @param {string} options.existingSummary - Previous compaction summary (from meta_json)
  * @param {string} options.summaryModelId - Model to use for summary generation (tier:fast)
+ * @param {string|null} options.userOrgId - Org ID for EU-mode tier overrides
  * @returns {Promise<{ messages: Array, newSummary: string|null }>}
  */
 async function compactMessages(messages, options = {}) {
@@ -36,7 +37,7 @@ async function compactMessages(messages, options = {}) {
     const recentMessages = convMessages.slice(convMessages.length - RECENT_WINDOW);
 
     // Generate summary of old messages (incorporates existing summary if present)
-    const newSummary = await generateSummary(oldMessages, options.existingSummary, options.summaryModelId);
+    const newSummary = await generateSummary(oldMessages, options.existingSummary, options.summaryModelId, options.userOrgId);
 
     // Build compacted message array: system + summary-as-context + recent messages
     const compacted = [
@@ -64,7 +65,7 @@ async function compactMessages(messages, options = {}) {
 /**
  * Generate a summary of conversation messages using the fast tier model.
  */
-async function generateSummary(oldMessages, existingSummary, summaryModelId) {
+async function generateSummary(oldMessages, existingSummary, summaryModelId, userOrgId = null) {
     const llmClient = require('./llmClient');
 
     // Build the content to summarize
@@ -98,14 +99,13 @@ async function generateSummary(oldMessages, existingSummary, summaryModelId) {
         }
     }
 
-    // Resolve model — handle tier: prefix
+    // Resolve model — handle tier: prefix (EU-aware)
     let modelId = summaryModelId || 'tier:fast';
     if (modelId.startsWith('tier:')) {
-        const tierName = modelId.substring(5);
         try {
-            const configStore = require('../stores/configStore');
-            const tiers = await configStore.getConfig('chat_model_tiers') || {};
-            modelId = tiers[tierName]?.modelId || 'gemini-2.0-flash-lite';
+            const { resolveModelForTierName } = require('./modelResolver');
+            const tierName = modelId.substring(5);
+            modelId = await resolveModelForTierName(tierName, { userOrgId, fallback: 'gemini-2.0-flash-lite' });
         } catch (e) {
             modelId = 'gemini-2.0-flash-lite';
         }

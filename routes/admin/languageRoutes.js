@@ -169,16 +169,15 @@ router.post('/:code/ai-translate', requireAdmin, async (req, res) => {
     }
 
     try {
-        const configStore = require('../../stores/configStore');
         const llmClient = require('../../core/llmClient');
+        const { resolveModelForTierName } = require('../../core/modelResolver');
 
-        // ── Resolve model from tier (same as directChat.js) ─────────
-        const tiers = await configStore.getConfig('chat_model_tiers') || {};
+        // ── Resolve model from tier (centralized, admin context — no EU override) ─────────
         const resolvedTier = modelTier || 'fast';
-        const tier = tiers[resolvedTier] || {};
-        let modelId = tier.modelId;
-
-        if (!modelId) {
+        let modelId;
+        try {
+            modelId = await resolveModelForTierName(resolvedTier, { fallback: 'mistral-small-latest' });
+        } catch (_) {
             const { getAIConfig } = require('../../core/aiAgent');
             const config = await getAIConfig();
             modelId = config.model || 'mistral-small-latest';

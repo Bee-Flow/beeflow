@@ -99,7 +99,7 @@ router.get('/:orgId', requireAuth, async (req, res) => {
 router.put('/:orgId', requireAuth, async (req, res) => {
     try {
         const { orgId } = req.params;
-        if (!isOrgAdmin(req, orgId)) {
+        if (!(await isOrgAdmin(req, orgId))) {
             return res.status(403).json({ error: 'Only organization admins can manage the privacy shield' });
         }
 

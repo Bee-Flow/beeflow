@@ -15,7 +15,9 @@ const {
     requirePluginAdmin,
     hasPermission,
     getUserPermissions,
-    resolveUserOrgIds
+    resolveUserOrgIds,
+    requireOrgAdmin,
+    invalidatePermissionCache
 } = require('./permissions');
 
 // Mount sub-routers
@@ -32,5 +34,7 @@ module.exports = {
     requirePluginAdmin,
     hasPermission,
     getUserPermissions,
-    resolveUserOrgIds
+    resolveUserOrgIds,
+    requireOrgAdmin,
+    invalidatePermissionCache
 };

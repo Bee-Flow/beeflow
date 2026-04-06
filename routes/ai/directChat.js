@@ -87,12 +87,10 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         return res.status(400).json({ error: 'Message or attachments required' });
     }
 
-    // Resolve model from tier config
-    let tiers = await configStore.getConfig('chat_model_tiers') || {};
-
     // EU mode + org privacy shield: resolve user's org early
     const { resolveUserOrgIds: resolveOrgIdsForTiers } = require('../../auth');
     const userStore = require('../../stores/userStore');
+    const { getEUAwareTiers, resolveModelForTier } = require('../../core/modelResolver');
     const orgIdsForTiers = await resolveOrgIdsForTiers(req);
     let userOrgForTiers = orgIdsForTiers && orgIdsForTiers.size > 0 ? Array.from(orgIdsForTiers)[0] : null;
     // resolveUserOrgIds returns null for super admins — look up from DB
@@ -114,19 +112,14 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
             }
         } catch (_) {}
     }
+
+    // Resolve model from tier config (EU-aware via centralized modelResolver)
+    let tiers = await getEUAwareTiers({ userOrgId: userOrgForTiers });
     let disableSearchOnUpload = false;
     if (userOrgForTiers) {
         const shield = await configStore.getConfig(`org_privacy_shield_${userOrgForTiers}`);
         if (shield?.enabled) {
             if (shield.euModeEnabled) {
-                const euTiers = await configStore.getConfig('chat_model_tiers_eu') || {};
-                const mergedTiers = { ...tiers };
-                for (const [tierName, euTier] of Object.entries(euTiers)) {
-                    if (euTier?.modelId) {
-                        mergedTiers[tierName] = { ...mergedTiers[tierName], ...euTier };
-                    }
-                }
-                tiers = mergedTiers;
                 console.log(`[DirectChat] EU mode active for org ${userOrgForTiers}`);
             }
             disableSearchOnUpload = !!shield.disableSearchOnUpload;
@@ -139,7 +132,7 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
     if (resolvedTier === 'auto') {
         try {
             const { classifyWithLLM } = require('../../core/promptClassifier');
-            const result = await classifyWithLLM(message, tiers);
+            const result = await classifyWithLLM(message, tiers, { userOrgId: userOrgForTiers });
             resolvedTier = result.tier;
             console.log(`[DirectChat] Auto: tier="${resolvedTier}" (${result.method}: ${result.reason})`);
         } catch (err) {
@@ -184,8 +177,8 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
     console.log(`[DirectChat] Using model: ${modelId} (tier: ${resolvedTier}${modelTier === 'auto' ? ', auto-selected' : ''})`);
 
     // ── Subscription limit enforcement ──
-    const limitOrgId = resolveOrgId(req);
-    const limitError = checkSubscriptionLimits(limitOrgId, 'chat');
+    const limitOrgId = await resolveOrgId(req);
+    const limitError = await checkSubscriptionLimits(limitOrgId, 'chat');
     if (limitError) {
         res.writeHead(200, {
             'Content-Type': 'text/event-stream',
@@ -1008,6 +1001,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             const compactionResult = await compactMessages(messages, {
                 existingSummary: conversationSummary,
                 summaryModelId: 'tier:fast',
+                userOrgId: userOrgForTiers,
             });
             messages = compactionResult.messages;
             if (compactionResult.newSummary) {
@@ -1665,7 +1659,24 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
 
         const conv = await agentStore.getDirectConversation(convId, userId);
         if (conv) {
-            const savedMessages = conv.messages || [];
+            // When the frontend sends a truncated history (retry / edit), use that as
+            // the persistence base instead of the full DB history.  This ensures the
+            // retried messages are permanently deleted from the database.
+            const dbMessages = conv.messages || [];
+            let savedMessages;
+            if (history && Array.isArray(history) && history.length < dbMessages.length) {
+                // Retry / edit scenario — map the slim history back to rich saved format
+                savedMessages = history.map(h => {
+                    // Try to find the matching rich message in DB (preserves timestamps, attachments, etc.)
+                    const match = dbMessages.find(
+                        d => d.role === h.role && d.content === h.content
+                    );
+                    return match || { role: h.role, content: h.content, timestamp: new Date().toISOString() };
+                });
+                console.log(`[DirectChat] Retry detected — truncated DB messages from ${dbMessages.length} → ${savedMessages.length}`);
+            } else {
+                savedMessages = dbMessages;
+            }
             const userSave = { role: 'user', content: moderationViolation ? '[Message removed - policy violation]' : message, timestamp: new Date().toISOString() };
             if (persistedAttachments.length > 0) userSave.attachments = persistedAttachments;
             savedMessages.push(userSave);
@@ -1703,7 +1714,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             if (!moderationViolation && message && fullContent) {
                 try {
                     const { extractMemories } = require('../../core/memoryExtractor');
-                    extractMemories(userId, message, fullContent, null, extractMemoriesEnabled ? projectId : null).catch(e =>
+                    extractMemories(userId, message, fullContent, null, extractMemoriesEnabled ? projectId : null, userOrgForTiers).catch(e =>
                         console.warn('[DirectChat] Memory extraction error:', e.message)
                     );
                 } catch (e) { /* ignore */ }

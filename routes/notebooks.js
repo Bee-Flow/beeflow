@@ -457,18 +457,31 @@ Keep the total script length to around 300 words. Focus on the most interesting 
 
         // Resolve model
         const { getAIConfig, getProviderForModel } = require('../core/aiAgent');
-        const configStore = require('../stores/configStore');
+        const { resolveModelForTier, getEUAwareTiers } = require('../core/modelResolver');
         const { getAdapter } = require('../core/providers');
 
-        let tiers = await configStore.getConfig('chat_model_tiers') || {};
+        // Resolve user's org for EU-mode tier overrides
+        let userOrgId = null;
+        try {
+            const { resolveUserOrgIds } = require('../auth');
+            const orgIds = await resolveUserOrgIds(req);
+            if (orgIds && orgIds.size > 0) userOrgId = Array.from(orgIds)[0];
+            if (!userOrgId) {
+                const userStore = require('../stores/userStore');
+                const dbUser = await userStore.getUser(userId);
+                if (dbUser?.organizationId) userOrgId = dbUser.organizationId;
+            }
+        } catch (_) {}
+
         let resolvedTier = modelTier || 'balanced';
 
         // Auto mode: classify using the generation type as a pseudo-message
         if (resolvedTier === 'auto') {
             try {
+                const tiers = await getEUAwareTiers({ userOrgId });
                 const { classifyWithLLM } = require('../core/promptClassifier');
                 const pseudoMessage = `Generate a comprehensive ${type.replace(/([A-Z])/g, ' $1').toLowerCase()} from my notebook sources`;
-                const result = await classifyWithLLM(pseudoMessage, tiers);
+                const result = await classifyWithLLM(pseudoMessage, tiers, { userOrgId });
                 resolvedTier = result.tier;
                 console.log(`[Notebooks] Auto: tier="${resolvedTier}" (${result.method}: ${result.reason}) for ${type}`);
             } catch (err) {
@@ -477,8 +490,7 @@ Keep the total script length to around 300 words. Focus on the most interesting 
             }
         }
 
-        const tier = tiers[resolvedTier] || {};
-        let modelId = tier.modelId;
+        let modelId = await resolveModelForTier(`tier:${resolvedTier}`, { userOrgId, fallbackTier: 'fast' });
         if (!modelId) {
             const config = await getAIConfig();
             modelId = config.model;
@@ -695,21 +707,33 @@ router.post('/:id/ai-fill', requireAuth, async (req, res) => {
 
         // Resolve model  
         const { getAIConfig, getProviderForModel } = require('../core/aiAgent');
-        const configStore = require('../stores/configStore');
+        const { resolveModelForTier, getEUAwareTiers } = require('../core/modelResolver');
         const { getAdapter } = require('../core/providers');
 
-        let tiers = await configStore.getConfig('chat_model_tiers') || {};
+        // Resolve user's org for EU-mode tier overrides
+        let userOrgId = null;
+        try {
+            const { resolveUserOrgIds } = require('../auth');
+            const orgIds = await resolveUserOrgIds(req);
+            if (orgIds && orgIds.size > 0) userOrgId = Array.from(orgIds)[0];
+            if (!userOrgId) {
+                const userStore = require('../stores/userStore');
+                const dbUser = await userStore.getUser(userId);
+                if (dbUser?.organizationId) userOrgId = dbUser.organizationId;
+            }
+        } catch (_) {}
+
         let resolvedTier = modelTier || 'balanced';
         if (resolvedTier === 'auto') {
             try {
+                const tiers = await getEUAwareTiers({ userOrgId });
                 const { classifyWithLLM } = require('../core/promptClassifier');
-                const result = await classifyWithLLM('Fill in template parameters in a document using source information', tiers);
+                const result = await classifyWithLLM('Fill in template parameters in a document using source information', tiers, { userOrgId });
                 resolvedTier = result.tier;
             } catch { resolvedTier = 'balanced'; }
         }
 
-        const tier = tiers[resolvedTier] || {};
-        let modelId = tier.modelId;
+        let modelId = await resolveModelForTier(`tier:${resolvedTier}`, { userOrgId, fallbackTier: 'fast' });
         if (!modelId) {
             const config = await getAIConfig();
             modelId = config.model;

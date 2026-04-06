@@ -12,7 +12,7 @@ const multer = require('multer');
 const router = express.Router();
 
 const userStore = require('../stores/userStore');
-const { loadConfig, saveConfig, requireAuth, requireAdmin, getUserPermissions, SYSTEM_PERMISSIONS } = require('./permissions');
+const { loadConfig, saveConfig, requireAuth, requireAdmin, getUserPermissions, SYSTEM_PERMISSIONS, invalidatePermissionCache, resolveUserOrgIds } = require('./permissions');
 const { rewrapUserDEKCompat, adminResetUser, getOrCreateUserDEKCompat } = require('./encryption');
 const { checkResourceLimits } = require('../core/limits');
 
@@ -106,8 +106,19 @@ async function requireOrgAdminForUser(req, res, next) {
 
 // === User Management API (Admin Only) ===
 
-// Get all users
+// Get all users — requires manage_users, admin_security, or org_admin
 router.get('/users', requireAuth, async (req, res) => {
+    // Non-super-admins must have user management permissions
+    const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
+    if (!isSuperAdmin) {
+        const userId = req.session.user?.id;
+        const perms = await getUserPermissions(userId, req.session);
+        const canView = perms.includes('all') || perms.includes('manage_users') || perms.includes('admin_security') || perms.includes('org_admin');
+        if (!canView) {
+            return res.status(403).json({ error: 'Permission required to view users' });
+        }
+    }
+
     const users = await userStore.getAllUsers();
     const config = await loadConfig();
     const superAdmin = {
@@ -120,25 +131,11 @@ router.get('/users', requireAuth, async (req, res) => {
 
     let allUsers = [superAdmin, ...users.filter(u => u.id !== 'admin')];
 
-    // Org-scoped filtering
-    const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
+    // Org-scoped filtering using canonical resolver
     if (!isSuperAdmin) {
-        const userId = req.session.user?.id;
-        const currentUser = await userStore.getUser(userId);
-        if (currentUser) {
-            const myOrgIds = new Set();
-            // Direct org assignment
-            if (currentUser.organizationId) myOrgIds.add(currentUser.organizationId);
-            // Group-based org detection
-            let myGroups = [];
-            try { myGroups = Array.isArray(currentUser.groups) ? currentUser.groups : JSON.parse(currentUser.groups || '[]'); } catch (_) { }
-
+        const myOrgIds = await resolveUserOrgIds(req);
+        if (myOrgIds && myOrgIds.size > 0) {
             const allGroups = await userStore.getAllGroups();
-            for (const gid of myGroups) {
-                const group = allGroups.find(g => g.id === gid);
-                if (group?.organizationId) myOrgIds.add(group.organizationId);
-            }
-
             const orgGroupIds = new Set();
             for (const group of allGroups) {
                 if (group.organizationId && myOrgIds.has(group.organizationId)) {
@@ -148,9 +145,7 @@ router.get('/users', requireAuth, async (req, res) => {
 
             allUsers = allUsers.filter(u => {
                 if (u.isSystem) return false;
-                // Include users directly assigned to the same org
                 if (u.organizationId && myOrgIds.has(u.organizationId)) return true;
-                // Include users in org-scoped groups
                 let uGroups = [];
                 try { uGroups = Array.isArray(u.groups) ? u.groups : JSON.parse(u.groups || '[]'); } catch (_) { }
                 return uGroups.some(gid => orgGroupIds.has(gid));
@@ -385,24 +380,23 @@ router.post('/change-password', requireAuth, async (req, res) => {
 // === Organizations Management API (Admin Only) ===
 
 router.get('/organizations', requireAuth, async (req, res) => {
-    let orgs = await userStore.getAllOrganizations();
-
+    // Non-super-admins must have org-level permissions
     const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
     if (!isSuperAdmin) {
         const userId = req.session.user?.id;
-        const currentUser = await userStore.getUser(userId);
-        if (currentUser) {
-            const myOrgIds = new Set();
-            // Direct org assignment
-            if (currentUser.organizationId) myOrgIds.add(currentUser.organizationId);
-            // Group-based org detection
-            let myGroups = [];
-            try { myGroups = Array.isArray(currentUser.groups) ? currentUser.groups : JSON.parse(currentUser.groups || '[]'); } catch (_) { }
-            const allGroups = await userStore.getAllGroups();
-            for (const gid of myGroups) {
-                const group = allGroups.find(g => g.id === gid);
-                if (group?.organizationId) myOrgIds.add(group.organizationId);
-            }
+        const perms = await getUserPermissions(userId, req.session);
+        const canView = perms.includes('all') || perms.includes('manage_users') || perms.includes('admin_security') || perms.includes('org_admin');
+        if (!canView) {
+            return res.status(403).json({ error: 'Permission required to view organisations' });
+        }
+    }
+
+    let orgs = await userStore.getAllOrganizations();
+
+    // Org-scoped filtering using canonical resolver
+    if (!isSuperAdmin) {
+        const myOrgIds = await resolveUserOrgIds(req);
+        if (myOrgIds) {
             orgs = orgs.filter(o => myOrgIds.has(o.id));
         }
     }
@@ -540,24 +534,23 @@ router.delete('/organizations/:id/logo', requireOrgAdmin('id'), async (req, res)
 // === Group Management API (Admin Only) ===
 
 router.get('/groups', requireAuth, async (req, res) => {
-    let groups = await userStore.getAllGroups();
-
+    // Non-super-admins must have group management permissions
     const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
     if (!isSuperAdmin) {
         const userId = req.session.user?.id;
-        const currentUser = await userStore.getUser(userId);
-        if (currentUser) {
-            const myOrgIds = new Set();
-            // Direct org assignment
-            if (currentUser.organizationId) myOrgIds.add(currentUser.organizationId);
-            // Group-based detection
-            let myGroups = [];
-            try { myGroups = Array.isArray(currentUser.groups) ? currentUser.groups : JSON.parse(currentUser.groups || '[]'); } catch (_) { }
-            const allGroups = await userStore.getAllGroups();
-            for (const gid of myGroups) {
-                const group = allGroups.find(g => g.id === gid);
-                if (group?.organizationId) myOrgIds.add(group.organizationId);
-            }
+        const perms = await getUserPermissions(userId, req.session);
+        const canView = perms.includes('all') || perms.includes('manage_users') || perms.includes('admin_security') || perms.includes('org_admin');
+        if (!canView) {
+            return res.status(403).json({ error: 'Permission required to view groups' });
+        }
+    }
+
+    let groups = await userStore.getAllGroups();
+
+    // Org-scoped filtering using canonical resolver
+    if (!isSuperAdmin) {
+        const myOrgIds = await resolveUserOrgIds(req);
+        if (myOrgIds) {
             groups = groups.filter(g => g.organizationId && myOrgIds.has(g.organizationId));
         }
     }
@@ -708,7 +701,7 @@ router.delete('/groups/:id', requireAuth, async (req, res) => {
 
 // === Roles Management API (Admin Only) ===
 
-router.get('/roles', requireAuth, async (req, res) => {
+router.get('/roles', requireAdmin, async (req, res) => {
     const roles = await userStore.getAllRoles();
     res.json(roles);
 });

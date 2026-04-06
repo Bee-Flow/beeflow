@@ -1,0 +1,29 @@
+{
+    "org_admin": {
+        "label": "Organisation Admin",
+        "permissions": [
+            "org_admin", "manage_users", "manage_agents", "page_settings",
+            "admin_agents", "admin_agents_chat",
+            "admin_agents_pipeline", "admin_security", "admin_monitoring"
+        ]
+    },
+    "agent_admin": {
+        "label": "Agent Admin",
+        "permissions": [
+            "agent_admin", "manage_agents",
+            "admin_agents", "admin_agents_chat",
+            "admin_agents_pipeline"
+        ]
+    },
+    "agent_editor": {
+        "label": "Agent Editor",
+        "permissions": [
+            "agent_editor", "manage_agents",
+            "admin_agents", "admin_agents_chat"
+        ]
+    },
+    "member": {
+        "label": "Member",
+        "permissions": []
+    }
+}

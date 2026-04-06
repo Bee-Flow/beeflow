@@ -44,15 +44,48 @@ router.post('/chat/template/stream', requireAuth, async (req, res) => {
         return res.status(404).json({ error: 'Template not found' });
     }
 
-    // Resolve model from tier config
-    let tiers = await configStore.getConfig('chat_model_tiers') || {};
+    // Resolve user's org for EU-mode tier overrides
+    const { resolveModelForTier, getTierConfig } = require('../../core/modelResolver');
+    const { resolveUserOrgIds } = require('../../auth');
+    let userOrgId = null;
+    try {
+        const orgIds = await resolveUserOrgIds(req);
+        if (orgIds && orgIds.size > 0) {
+            userOrgId = Array.from(orgIds)[0];
+        }
+        if (!userOrgId) {
+            const userStore = require('../../stores/userStore');
+            const dbUser = await userStore.getUser(userId);
+            if (dbUser?.organizationId) {
+                userOrgId = dbUser.organizationId;
+            } else {
+                const groups = Array.isArray(dbUser?.groups) ? dbUser.groups : (() => { try { return JSON.parse(dbUser?.groups || '[]'); } catch (_) { return []; } })();
+                if (groups.length > 0) {
+                    const allGroups = await userStore.getAllGroups();
+                    for (const gid of groups) {
+                        const g = allGroups.find(gr => gr.id === gid);
+                        if (g?.organizationId) { userOrgId = g.organizationId; break; }
+                    }
+                }
+            }
+        }
+    } catch (_) {}
+
+    // Resolve model from tier config (EU-aware)
     let resolvedTier = modelTier || 'fast';
-    const tier = tiers[resolvedTier] || {};
-    let modelId = tier.modelId;
+    const tierConfig = await getTierConfig(resolvedTier, { userOrgId });
+    let modelId = await resolveModelForTier(`tier:${resolvedTier}`, { userOrgId, fallbackTier: 'fast' });
 
     if (!modelId) {
         const config = await getAIConfig();
         modelId = config.model || 'mistral-small-latest';
+    }
+
+    if (userOrgId) {
+        const shield = await configStore.getConfig(`org_privacy_shield_${userOrgId}`);
+        if (shield?.euModeEnabled) {
+            console.log(`[TemplateChat] EU mode active for org ${userOrgId}`);
+        }
     }
 
     // Resolve provider

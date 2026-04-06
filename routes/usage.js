@@ -83,10 +83,10 @@ router.get('/summary', async (req, res) => {
     }
 });
 
-// 2. Timeline
+// 2. Timeline (supports ?interval=hour|day from frontend)
 router.get('/timeline', async (req, res) => {
     try {
-        const interval = (parseInt(req.query.days, 10) || 30) <= 7 ? 'hour' : 'day';
+        const interval = req.query.interval === 'hour' ? 'hour' : 'day';
         const timeline = await usageStore.getUsageTimeline(req.usageFilters, interval);
         res.json(timeline || []);
     } catch (err) {
@@ -95,7 +95,19 @@ router.get('/timeline', async (req, res) => {
     }
 });
 
-// 3. Usage by User
+// 3. Cost Timeline
+router.get('/cost-timeline', async (req, res) => {
+    try {
+        const interval = req.query.interval === 'hour' ? 'hour' : 'day';
+        const data = await usageStore.getCostTimeline(req.usageFilters, interval);
+        res.json(data || []);
+    } catch (err) {
+        console.error('[Usage API] /cost-timeline error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch cost timeline data' });
+    }
+});
+
+// 4. Usage by User
 router.get('/users', async (req, res) => {
     try {
         const usersUsage = await usageStore.getUsageByUser(req.usageFilters);
@@ -110,8 +122,23 @@ router.get('/users', async (req, res) => {
         res.status(500).json({ error: 'Failed to fetch user usage' });
     }
 });
+// Alias: frontend calls /by-user
+router.get('/by-user', async (req, res) => {
+    try {
+        const usersUsage = await usageStore.getUsageByUser(req.usageFilters);
+        const userMap = await getUserMap();
+        const enriched = (usersUsage || []).map(u => ({
+            ...u,
+            display_name: userMap.get(u.user_id) || u.user_id || 'Unknown'
+        }));
+        res.json(enriched);
+    } catch (err) {
+        console.error('[Usage API] /by-user error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch user usage' });
+    }
+});
 
-// 4. Usage by App Area (Source)
+// 5. Usage by App Area (Source)
 router.get('/sources', async (req, res) => {
     try {
         const sources = await usageStore.getUsageBySource(req.usageFilters);
@@ -122,7 +149,7 @@ router.get('/sources', async (req, res) => {
     }
 });
 
-// 5. Usage by Agent
+// 6. Usage by Agent
 router.get('/agents', async (req, res) => {
     try {
         const agents = await usageStore.getUsageByAgent(req.usageFilters);
@@ -132,8 +159,18 @@ router.get('/agents', async (req, res) => {
         res.status(500).json({ error: 'Failed to fetch agent usage' });
     }
 });
+// Alias: frontend calls /by-agent
+router.get('/by-agent', async (req, res) => {
+    try {
+        const agents = await usageStore.getUsageByAgent(req.usageFilters);
+        res.json(enrichWithCostSplit(agents));
+    } catch (err) {
+        console.error('[Usage API] /by-agent error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch agent usage' });
+    }
+});
 
-// 6. Usage by Model (with input/output cost)
+// 7. Usage by Model (with input/output cost)
 router.get('/models', async (req, res) => {
     try {
         const models = await usageStore.getUsageByModel(req.usageFilters);
@@ -143,8 +180,85 @@ router.get('/models', async (req, res) => {
         res.status(500).json({ error: 'Failed to fetch model usage' });
     }
 });
+// Alias: frontend calls /by-model
+router.get('/by-model', async (req, res) => {
+    try {
+        const models = await usageStore.getUsageByModel(req.usageFilters);
+        res.json(enrichWithCostSplit(models));
+    } catch (err) {
+        console.error('[Usage API] /by-model error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch model usage' });
+    }
+});
 
-// 7. Model × Agent breakdown (with input/output cost)
+// 8. Usage by Conversation
+router.get('/by-conversation', async (req, res) => {
+    try {
+        const data = await usageStore.getUsageByConversation(req.usageFilters);
+        res.json(data || []);
+    } catch (err) {
+        console.error('[Usage API] /by-conversation error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch conversation usage' });
+    }
+});
+
+// 9. Tool usage
+router.get('/tools', async (req, res) => {
+    try {
+        const tools = await usageStore.getToolUsage(req.usageFilters);
+        res.json(tools || []);
+    } catch (err) {
+        console.error('[Usage API] /tools error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch tool usage' });
+    }
+});
+
+// 10. Recent calls
+router.get('/recent', async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit, 10) || 100;
+        const data = await usageStore.getRecentCalls(limit, req.usageFilters);
+        res.json(data || []);
+    } catch (err) {
+        console.error('[Usage API] /recent error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch recent calls' });
+    }
+});
+
+// 11. Filter options: distinct sources
+router.get('/filters/sources', async (req, res) => {
+    try {
+        const sources = await usageStore.getUsageSources();
+        res.json(sources || []);
+    } catch (err) {
+        console.error('[Usage API] /filters/sources error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch source filters' });
+    }
+});
+
+// 12. Filter options: distinct models
+router.get('/filters/models', async (req, res) => {
+    try {
+        const models = await usageStore.getUsageModels();
+        res.json(models || []);
+    } catch (err) {
+        console.error('[Usage API] /filters/models error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch model filters' });
+    }
+});
+
+// 13. Organizations usage summary
+router.get('/organizations', async (req, res) => {
+    try {
+        // Return empty array — org-level breakdown is only for multi-tenant setups
+        res.json([]);
+    } catch (err) {
+        console.error('[Usage API] /organizations error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch organizations' });
+    }
+});
+
+// 14. Model × Agent breakdown (with input/output cost)
 router.get('/models-by-agent', async (req, res) => {
     try {
         const data = await usageStore.getUsageByModelAndAgent(req.usageFilters);
@@ -155,7 +269,7 @@ router.get('/models-by-agent', async (req, res) => {
     }
 });
 
-// 8. Model × User breakdown (with input/output cost + display names)
+// 15. Model × User breakdown (with input/output cost + display names)
 router.get('/models-by-user', async (req, res) => {
     try {
         const data = await usageStore.getUsageByModelAndUser(req.usageFilters);

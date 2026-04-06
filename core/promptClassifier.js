@@ -234,11 +234,16 @@ Rules:
  * Uses llmClient for proper provider resolution.
  * 
  * @param {string} message - User message to classify
- * @param {Object} tiers - Tier config from configStore (or pass directly)
+ * @param {Object} tiers - Tier config (or pass directly). If null, resolved from configStore.
+ * @param {Object} [opts] - Options
+ * @param {string|null} opts.userOrgId - Org ID for EU-mode tier overrides
  * @returns {Promise<{tier: string, method: string, reason: string}>}
  */
-async function classifyWithLLM(message, tiers) {
-    if (!tiers) tiers = configStore.getConfig('chat_model_tiers') || {};
+async function classifyWithLLM(message, tiers, { userOrgId = null } = {}) {
+    if (!tiers) {
+        const { getEUAwareTiers } = require('./modelResolver');
+        tiers = await getEUAwareTiers({ userOrgId });
+    }
 
     const availableTiers = Object.entries(tiers)
         .filter(([_, t]) => t.modelId)

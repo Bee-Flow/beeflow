@@ -151,7 +151,7 @@ class ClaudeProvider extends BaseProvider {
 
         // Direct budget_tokens override from UI (legacy support)
         if (options.budgetTokens && options.budgetTokens > 0) {
-            return { type: "enabled", budget_tokens: options.budgetTokens };
+            return { thinking: { type: "enabled", budget_tokens: options.budgetTokens } };
         }
 
         // Map effort label → adaptive effort level
@@ -159,7 +159,8 @@ class ClaudeProvider extends BaseProvider {
         const effortRaw = options.reasoningEffort;
         if (effortRaw === 'none') return undefined; // Explicitly disabled
 
-        // Claude 4+ models: use adaptive thinking (recommended by Anthropic)
+        // Claude 4.6+ models: use adaptive thinking (recommended by Anthropic)
+        // The `effort` param is TOP-LEVEL in the API, NOT nested inside thinking.
         // Maps: low → low, minimal → low, medium → medium, high → high, xhigh → max
         const EFFORT_MAP = {
             low: 'low',
@@ -169,7 +170,8 @@ class ClaudeProvider extends BaseProvider {
             xhigh: 'max',
         };
         const effort = EFFORT_MAP[effortRaw] || 'medium'; // Default to medium
-        return { type: "adaptive", effort };
+        // Return both: thinking config + effort as separate top-level param
+        return { thinking: { type: "adaptive" }, effort };
     }
 
     supportsReasoning(modelId) {
@@ -224,18 +226,21 @@ class ClaudeProvider extends BaseProvider {
             }
         }
 
-        const thinking = this.buildThinking(model, options);
-        if (thinking) {
-            params.thinking = thinking;
+        const thinkingConfig = this.buildThinking(model, options);
+        if (thinkingConfig) {
+            params.thinking = thinkingConfig.thinking;
             // Anthropic requires temperature=1 when thinking is enabled
             params.temperature = 1;
-            if (thinking.type === 'adaptive') {
-                // Adaptive thinking: model allocates thinking from max_tokens dynamically
+            if (thinkingConfig.thinking.type === 'adaptive') {
+                // effort belongs inside output_config per SDK v0.78.0 OutputConfig interface
+                if (thinkingConfig.effort) {
+                    params.output_config = { effort: thinkingConfig.effort };
+                }
                 // Ensure enough room for thinking + answer
                 if (params.max_tokens < 16384) params.max_tokens = 16384;
-            } else if (thinking.budget_tokens && params.max_tokens < thinking.budget_tokens + 1024) {
+            } else if (thinkingConfig.thinking.budget_tokens && params.max_tokens < thinkingConfig.thinking.budget_tokens + 1024) {
                 // Legacy budget_tokens mode
-                params.max_tokens = thinking.budget_tokens + 1024;
+                params.max_tokens = thinkingConfig.thinking.budget_tokens + 1024;
             }
         }
 
@@ -291,6 +296,7 @@ class ClaudeProvider extends BaseProvider {
             max_tokens: params.max_tokens,
             temperature: params.temperature,
             thinking: params.thinking || 'disabled',
+            output_config: params.output_config || 'n/a',
             tools: params.tools ? `${params.tools.length} tool(s)` : 'none',
             messageCount: params.messages?.length || 0,
         }));

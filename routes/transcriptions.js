@@ -48,22 +48,47 @@ const upload = multer({
 const llmClient = require('../core/llmClient');
 
 /**
- * Resolve the smart-tier model ID from admin config.
+ * Resolve the user's organization ID from a request for EU-mode tier overrides.
+ */
+async function resolveUserOrgFromReq(req) {
+    try {
+        const userId = req.session?.user?.id;
+        if (!userId) return null;
+        const { resolveUserOrgIds } = require('../auth');
+        const orgIds = await resolveUserOrgIds(req);
+        if (orgIds && orgIds.size > 0) return Array.from(orgIds)[0];
+        const userStore = require('../stores/userStore');
+        const dbUser = await userStore.getUser(userId);
+        if (dbUser?.organizationId) return dbUser.organizationId;
+        const groups = Array.isArray(dbUser?.groups) ? dbUser.groups : (() => { try { return JSON.parse(dbUser?.groups || '[]'); } catch (_) { return []; } })();
+        if (groups.length > 0) {
+            const allGroups = await userStore.getAllGroups();
+            for (const gid of groups) {
+                const g = allGroups.find(gr => gr.id === gid);
+                if (g?.organizationId) return g.organizationId;
+            }
+        }
+    } catch (_) {}
+    return null;
+}
+
+/**
+ * Resolve the smart-tier model ID from admin config (EU-aware).
  * Falls back to fast tier, then a safe default.
  */
-async function resolveSmartModel() {
+async function resolveSmartModel(userOrgId = null) {
     try {
-        const tiers = await configStore.getConfig('chat_model_tiers') || {};
-        return tiers['smart']?.modelId || tiers['fast']?.modelId || 'gemini-2.0-flash';
+        const { resolveModelForTierName } = require('../core/modelResolver');
+        return await resolveModelForTierName('smart', { userOrgId, fallback: 'gemini-2.0-flash' });
     } catch (_) {
         return 'gemini-2.0-flash';
     }
 }
 
-async function resolveFastModel() {
+async function resolveFastModel(userOrgId = null) {
     try {
-        const tiers = await configStore.getConfig('chat_model_tiers') || {};
-        return tiers['fast']?.modelId || 'gemini-2.0-flash-lite';
+        const { resolveModelForTierName } = require('../core/modelResolver');
+        return await resolveModelForTierName('fast', { userOrgId, fallback: 'gemini-2.0-flash-lite' });
     } catch (_) {
         return 'gemini-2.0-flash-lite';
     }
@@ -72,18 +97,12 @@ async function resolveFastModel() {
 /**
  * Use Claude to identify speaker names from transcript context.
  */
-async function identifySpeakerNames(transcript, speakerIds, language, userName) {
+async function identifySpeakerNames(transcript, speakerIds, language, userName, userOrgId = null) {
     try {
         const llmClient = require('../core/llmClient');
 
-        // Resolve fast tier model (same pattern as compaction.js)
-        let modelId;
-        try {
-            const tiers = await configStore.getConfig('chat_model_tiers') || {};
-            modelId = tiers['fast']?.modelId || 'gemini-2.0-flash-lite';
-        } catch (_) {
-            modelId = 'gemini-2.0-flash-lite';
-        }
+        // Resolve fast tier model (EU-aware)
+        const modelId = await resolveFastModel(userOrgId);
 
         const speakerList = speakerIds.join(', ');
         const userHint = userName
@@ -135,9 +154,9 @@ No explanation, no markdown, ONLY valid JSON.`;
 /**
  * Generate a structured meeting summary using the smart-tier LLM.
  */
-async function generateMeetingSummary(transcript, language) {
+async function generateMeetingSummary(transcript, language, userOrgId = null) {
     try {
-        const modelId = await resolveSmartModel();
+        const modelId = await resolveSmartModel(userOrgId);
         const langName = { nl: 'Dutch', en: 'English', de: 'German', fr: 'French', es: 'Spanish', it: 'Italian', pt: 'Portuguese' }[language] || language;
 
         const result = await llmClient.chat(modelId, [
@@ -178,9 +197,9 @@ Keep it concise and actionable. Skip empty sections.`,
 /**
  * Generate a short, descriptive meeting title using the fast-tier LLM.
  */
-async function generateMeetingTitle(summary, language) {
+async function generateMeetingTitle(summary, language, userOrgId = null) {
     try {
-        const modelId = await resolveFastModel();
+        const modelId = await resolveFastModel(userOrgId);
         const langName = { nl: 'Dutch', en: 'English', de: 'German', fr: 'French', es: 'Spanish', it: 'Italian', pt: 'Portuguese' }[language] || language;
 
         const result = await llmClient.chat(modelId, [
@@ -202,9 +221,9 @@ async function generateMeetingTitle(summary, language) {
 /**
  * Extract structured action items from the transcript using the smart-tier LLM.
  */
-async function extractActionItems(transcript, language) {
+async function extractActionItems(transcript, language, userOrgId = null) {
     try {
-        const modelId = await resolveSmartModel();
+        const modelId = await resolveSmartModel(userOrgId);
         const langName = { nl: 'Dutch', en: 'English', de: 'German', fr: 'French', es: 'Spanish', it: 'Italian', pt: 'Portuguese' }[language] || language;
 
         const result = await llmClient.chat(modelId, [
@@ -440,6 +459,7 @@ router.get('/:id', requireAuth, async (req, res) => {
 
 router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
     const userId = req.session.user.id;
+    const userOrgId = await resolveUserOrgFromReq(req);
 
     if (!req.file) {
         return res.status(400).json({ error: 'No audio file uploaded' });
@@ -619,10 +639,10 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
             const audioPathW = path.join(audioDirW, audioNameW);
             try { fs.copyFileSync(req.file.path, audioPathW); fs.unlinkSync(req.file.path); } catch (_) { try { fs.unlinkSync(req.file.path); } catch (_) {} }
 
-            const summaryW = await generateMeetingSummary(whisperResult.transcript, language);
+            const summaryW = await generateMeetingSummary(whisperResult.transcript, language, userOrgId);
             let titleW = title;
-            if (summaryW) { const aiT = await generateMeetingTitle(summaryW, language); if (aiT) titleW = aiT; }
-            const actionItemsW = await extractActionItems(whisperResult.transcript, language);
+            if (summaryW) { const aiT = await generateMeetingTitle(summaryW, language, userOrgId); if (aiT) titleW = aiT; }
+            const actionItemsW = await extractActionItems(whisperResult.transcript, language, userOrgId);
 
             const savedW = await transcriptionStore.createTranscription({
                 userId, title: titleW, fileName, language,
@@ -716,7 +736,7 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
 
         // Identify speaker names using fast-tier model
         const speakerIds = Object.keys(speakerMap);
-        const nameMapping = await identifySpeakerNames(transcript, speakerIds, language, userName);
+        const nameMapping = await identifySpeakerNames(transcript, speakerIds, language, userName, userOrgId);
 
         if (nameMapping) {
             // Apply name mapping to segments
@@ -748,16 +768,16 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
         }));
 
         // Generate meeting summary with Claude
-        const summary = await generateMeetingSummary(transcript, language);
+        const summary = await generateMeetingSummary(transcript, language, userOrgId);
 
         // Always generate AI title from summary
         if (summary) {
-            const aiTitle = await generateMeetingTitle(summary, language);
+            const aiTitle = await generateMeetingTitle(summary, language, userOrgId);
             if (aiTitle) title = aiTitle;
         }
 
         // Extract structured action items
-        const actionItems = await extractActionItems(transcript, language);
+        const actionItems = await extractActionItems(transcript, language, userOrgId);
 
 
         // Save audio permanently for playback
@@ -852,6 +872,7 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
 router.post('/:id/reprocess', requireAuth, async (req, res) => {
     try {
         const userId = req.session.user.id;
+        const userOrgId = await resolveUserOrgFromReq(req);
         const transcription = await transcriptionStore.getTranscription(req.params.id, userId);
         if (!transcription) return res.status(404).json({ error: 'Not found' });
         if (!transcription.audioPath || !fs.existsSync(transcription.audioPath)) {
@@ -939,7 +960,7 @@ router.post('/:id/reprocess', requireAuth, async (req, res) => {
         // Look up user name for reprocess route too
         let reprocessUserName = null;
         try { const { getUser } = require('../stores/userStore'); const u = await getUser(req.session.user.id); reprocessUserName = u?.firstName || u?.displayName || null; } catch (_) {}
-        const nameMapping = await identifySpeakerNames(transcript, speakerIds, language, reprocessUserName);
+        const nameMapping = await identifySpeakerNames(transcript, speakerIds, language, reprocessUserName, userOrgId);
         if (nameMapping) {
             for (const seg of merged) { if (nameMapping[seg.speaker]) seg.speaker = nameMapping[seg.speaker]; }
             transcript = merged.map(s => `[${s.speaker}] ${formatTime(s.start)} - ${formatTime(s.end)}: ${s.text}`).join('\n');
@@ -962,7 +983,7 @@ router.post('/:id/reprocess', requireAuth, async (req, res) => {
         }));
 
         // Summary
-        const summary = await generateMeetingSummary(transcript, language);
+        const summary = await generateMeetingSummary(transcript, language, userOrgId);
 
         // Update the existing record
         const { run } = require('../stores/db');
@@ -1026,6 +1047,7 @@ router.patch('/:id', requireAuth, async (req, res) => {
 router.post('/:id/regenerate-summary', requireAuth, async (req, res) => {
     try {
         const userId = req.session.user.id;
+        const userOrgId = await resolveUserOrgFromReq(req);
         const { template = 'general' } = req.body;
         const transcription = await transcriptionStore.getTranscription(req.params.id, userId);
         if (!transcription) return res.status(404).json({ error: 'Not found' });
@@ -1034,7 +1056,7 @@ router.post('/:id/regenerate-summary', requireAuth, async (req, res) => {
         const templatePrompt = SUMMARY_TEMPLATES[template] || SUMMARY_TEMPLATES.general;
         const langName = { nl: 'Dutch', en: 'English', de: 'German', fr: 'French', es: 'Spanish', it: 'Italian', pt: 'Portuguese' }[transcription.language] || transcription.language;
 
-        const modelId = await resolveSmartModel();
+        const modelId = await resolveSmartModel(userOrgId);
         const result = await llmClient.chat(modelId, [
             { role: 'system', content: `You are a meeting assistant. Write the summary in ${langName}.
 
@@ -1044,7 +1066,7 @@ ${templatePrompt}` },
 
         const summary = (result.content || '').trim();
         // Also re-extract action items
-        const actionItems = await extractActionItems(transcription.transcript, transcription.language);
+        const actionItems = await extractActionItems(transcription.transcript, transcription.language, userOrgId);
 
         await transcriptionStore.updateTranscription(req.params.id, userId, { summary, actionItems });
         res.json({ success: true, summary, actionItems });

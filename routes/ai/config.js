@@ -113,14 +113,22 @@ router.get('/config', async (req, res) => {
             const val = await configStore.getConfig('feature_notebooks_menu_enabled');
             return val !== false && val !== 'false';
         })(),
+        // Stripe Payment Integration
+        hasStripeSecretKey: !!(await configStore.getSecret('stripe_secret_key')),
+        hasStripeWebhookSecret: !!(await configStore.getSecret('stripe_webhook_secret')),
+        stripePublishableKey: await configStore.getConfig('stripe_publishable_key') || '',
+        stripeEnabled: !!(await configStore.getConfig('stripe_enabled')),
+        stripeTaxEnabled: !!(await configStore.getConfig('stripe_tax_enabled')),
+        stripeTaxCountry: await configStore.getConfig('stripe_tax_country') || 'NL',
     });
 });
 
 router.post('/config', requireAuth, async (req, res) => {
+    try {
     if (!req.session.isAdmin && req.session.user?.role !== 'admin') {
         return res.status(403).json({ error: 'Admin access required' });
     }
-    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, minimaxApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, llamaGuardConfig, moderationProvider, azureContentSafetyEndpoint, azureContentSafetyKey, azureContentSafetySeverityThreshold, azureContentSafetyCategories, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionScope, piiDetectionAction, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing, serviceEmailAddress, serviceEmailPassword, serviceEmailDisplayName, azureSpeechKey, azureSpeechRegion, transcriptionProvider, notebooksEnabled, projectsEnabled, askAiEnabled, exportEnabled, openInNotebookEnabled, notebooksMenuEnabled, azureRerankerEndpoint, azureRerankerKey, azureRerankerModel } = req.body;
+    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, minimaxApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, llamaGuardConfig, moderationProvider, azureContentSafetyEndpoint, azureContentSafetyKey, azureContentSafetySeverityThreshold, azureContentSafetyCategories, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionScope, piiDetectionAction, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing, serviceEmailAddress, serviceEmailPassword, serviceEmailDisplayName, azureSpeechKey, azureSpeechRegion, transcriptionProvider, notebooksEnabled, projectsEnabled, askAiEnabled, exportEnabled, openInNotebookEnabled, notebooksMenuEnabled, azureRerankerEndpoint, azureRerankerKey, azureRerankerModel, stripeSecretKey, stripeWebhookSecret, stripePublishableKey, stripeEnabled, stripeTaxEnabled, stripeTaxCountry } = req.body;
     const existing = await getAIConfig();
 
     if (allowedModelsByAgentType !== undefined) {
@@ -255,6 +263,25 @@ router.post('/config', requireAuth, async (req, res) => {
     if (azureRerankerModel !== undefined) {
         await configStore.setConfig('azure_reranker_model', azureRerankerModel || 'Cohere-rerank-v4.0-fast');
     }
+    // Stripe Payment Integration
+    if (stripeSecretKey !== undefined) {
+        await configStore.setSecret('stripe_secret_key', stripeSecretKey || '');
+    }
+    if (stripeWebhookSecret !== undefined) {
+        await configStore.setSecret('stripe_webhook_secret', stripeWebhookSecret || '');
+    }
+    if (stripePublishableKey !== undefined) {
+        await configStore.setConfig('stripe_publishable_key', stripePublishableKey || '');
+    }
+    if (stripeEnabled !== undefined) {
+        await configStore.setConfig('stripe_enabled', stripeEnabled ? 'true' : '');
+    }
+    if (stripeTaxEnabled !== undefined) {
+        await configStore.setConfig('stripe_tax_enabled', stripeTaxEnabled ? 'true' : '');
+    }
+    if (stripeTaxCountry !== undefined) {
+        await configStore.setConfig('stripe_tax_country', stripeTaxCountry || 'NL');
+    }
 
     const success = await saveAIConfig({
         url: url !== undefined ? url : existing.url,
@@ -292,6 +319,10 @@ router.post('/config', requireAuth, async (req, res) => {
     } else {
         res.status(500).json({ error: 'Failed to save configuration' });
     }
+    } catch (err) {
+        console.error('[Config] POST /config error:', err);
+        res.status(500).json({ error: err.message || 'Internal server error' });
+    }
 });
 
 // ─── Delete API Key ──────────────────────────────────────────────
@@ -304,7 +335,7 @@ const DELETABLE_KEYS = [
     'azure_doc_intelligence_key', 'azure_openai_embedding_key', 'azure_speech_key',
     'bing_search_key', 'linkedin_client_id', 'linkedin_client_secret',
     'service_email_password', 'whisperx_url', 'whisperx_token',
-    'azure_reranker_key',
+    'azure_reranker_key', 'stripe_secret_key', 'stripe_webhook_secret',
 ];
 
 router.delete('/config/key/:keyName', requireAuth, async (req, res) => {
@@ -335,6 +366,7 @@ const DELETABLE_CONFIG_KEYS = [
     'azure_openai_embedding_endpoint', 'azure_openai_embedding_model',
     'azure_speech_region', 'agent_search_url', 'service_email_address',
     'service_email_display_name', 'azure_reranker_endpoint', 'azure_reranker_model',
+    'stripe_publishable_key', 'stripe_tax_country',
 ];
 
 router.delete('/config/setting/:keyName', requireAuth, async (req, res) => {
@@ -516,8 +548,25 @@ router.post('/config/chat-models-eu', requireAuth, async (req, res) => {
             writer: writer || { modelId: '', label: 'Writer' },
             pro: pro || { modelId: '', label: 'Pro' }
         };
+
+        // Validate that specified model IDs exist in configured providers
+        const warnings = [];
+        const { getProviderForModel } = require('../../core/aiAgent');
+        for (const [tierName, tierConfig] of Object.entries(tiers)) {
+            if (tierConfig.modelId) {
+                try {
+                    await getProviderForModel(tierConfig.modelId);
+                } catch (_) {
+                    warnings.push(`EU tier "${tierName}": model "${tierConfig.modelId}" not found in any configured provider`);
+                }
+            }
+        }
+
         await configStore.setConfig('chat_model_tiers_eu', tiers);
-        res.json({ success: true });
+        if (warnings.length > 0) {
+            console.warn('[Config] EU tier validation warnings:', warnings);
+        }
+        res.json({ success: true, warnings });
     } catch (e) {
         console.error('Failed to save EU chat model tiers:', e);
         res.status(500).json({ error: 'Failed to save config' });

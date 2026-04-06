@@ -135,7 +135,7 @@ router.post('/', requirePermission('manage_agents'), async (req, res) => {
     if (assignOrgId) {
         const allAgents = await agentStore.getAllAgents();
         const orgAgentCount = allAgents.filter(a => a.organization_id === assignOrgId).length;
-        const limitErr = checkResourceLimits(assignOrgId, 'agents', orgAgentCount);
+        const limitErr = await checkResourceLimits(assignOrgId, 'agents', orgAgentCount);
         if (limitErr) {
             return res.status(403).json({ error: limitErr });
         }

@@ -27,11 +27,9 @@ const GUI_DEFAULTS = {
 
     // ── Admin → AI Config sidebar ───────────────────────────────
     'admin.ai_api_keys': 'API Keys',
-    'admin.ai_models': 'Models',
     'admin.ai_agent_models': 'Agent Models',
     'admin.ai_chat_models': 'Chat Models',
     'admin.ai_direct_chat': 'Direct Chat',
-    'admin.ai_model_costs': 'Model Costs',
     'admin.ai_configuration': 'AI Configuration',
 
     // ── Admin → Security sidebar ────────────────────────────────
@@ -69,6 +67,7 @@ const GUI_DEFAULTS = {
 
     // ── Admin → Monitoring sidebar ──────────────────────────────
     'admin.mon_overview': 'Overview',
+    'admin.mon_usage_explorer': 'Usage Explorer',
     'admin.mon_models': 'Models',
     'admin.mon_agents': 'Agents',
     'admin.mon_users': 'Users',

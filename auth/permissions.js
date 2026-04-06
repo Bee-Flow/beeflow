@@ -5,6 +5,8 @@
  * and auth config load/save via configStore.
  */
 
+const path = require('path');
+const fs = require('fs');
 const userStore = require('../stores/userStore');
 
 // System-wide permission definitions
@@ -25,6 +27,7 @@ const SYSTEM_PERMISSIONS = [
     { id: 'admin_ai_config', name: 'AI Config', description: 'Admin: AI model configuration', group: 'admin' },
     { id: 'admin_security', name: 'Security', description: 'Admin: Users, SSO, guardrails', group: 'admin' },
     { id: 'admin_monitoring', name: 'Monitoring', description: 'Admin: Usage & cost monitoring', group: 'admin' },
+    { id: 'admin_subscriptions', name: 'Subscriptions', description: 'Admin: Subscription management', group: 'admin' },
 
     // ── Actions ──
     { id: 'manage_users', name: 'Manage Users', description: 'Create, edit, and delete users', group: 'actions' },
@@ -32,6 +35,26 @@ const SYSTEM_PERMISSIONS = [
     { id: 'manage_components', name: 'Manage Components', description: 'Create and edit workflow components', group: 'actions' },
     { id: 'manage_apps', name: 'Manage Apps', description: 'Create and publish apps', group: 'actions' },
 ];
+
+// ── Load org role → permissions mapping from config file ──
+let _orgRolePermissions = null;
+function getOrgRolePermissions() {
+    if (_orgRolePermissions) return _orgRolePermissions;
+    try {
+        const configPath = path.join(__dirname, '..', 'config', 'orgRoles.json');
+        const raw = fs.readFileSync(configPath, 'utf-8');
+        const config = JSON.parse(raw);
+        // Transform { role: { permissions: [...] } } → { role: [...] }
+        _orgRolePermissions = {};
+        for (const [role, def] of Object.entries(config)) {
+            _orgRolePermissions[role] = def.permissions || [];
+        }
+        return _orgRolePermissions;
+    } catch (err) {
+        console.error('[Auth] Failed to load orgRoles.json, using empty fallback:', err.message);
+        return {};
+    }
+}
 
 // OAuth Provider Configurations
 const OAUTH_PROVIDERS = {
@@ -98,6 +121,8 @@ function saveConfig(config) {
 const { getRedis } = require('../db');
 const _userExistsCache = new Map(); // in-memory fallback when Redis unavailable
 const USER_CHECK_TTL = 5; // seconds
+const PERM_CACHE_TTL = 30; // seconds — permission cache TTL
+const _permCache = new Map(); // in-memory fallback for permission caching
 
 const requireAuth = async (req, res, next) => {
     if (!req.session.isAuthenticated || !req.session.user) {
@@ -148,15 +173,46 @@ const requireAuth = async (req, res, next) => {
             req.session.destroy(() => { });
             return res.status(401).json({ error: 'User no longer exists' });
         }
+
+        // ── Revalidate isAdmin flag (prevent stale elevation after demotion) ──
+        // Piggyback on the user-exists check — we already fetched the user above
+        // Re-check every USER_CHECK_TTL seconds alongside the existence check
+        try {
+            const user = await userStore.getUser(userId);
+            if (user) {
+                const shouldBeAdmin = user.role === 'admin';
+                if (req.session.isAdmin !== shouldBeAdmin) {
+                    req.session.isAdmin = shouldBeAdmin;
+                    req.session.user.role = user.role;
+                    req.session.user.isAdmin = shouldBeAdmin;
+                }
+            }
+        } catch (_) { /* DB error — don't block the request */ }
     }
 
     next();
 };
 
 // Helper function to get user's current permissions dynamically
+// Results are cached in Redis (or in-memory fallback) for PERM_CACHE_TTL seconds.
 async function getUserPermissions(userId, session = null) {
     // Demo users or admin-flagged sessions get full access
     if (session?.isDemo || session?.isAdmin) return ['all'];
+
+    // ── Check permission cache ──
+    const r = getRedis();
+    const permCacheKey = `bf:perms:${userId}`;
+    try {
+        if (r) {
+            const cached = await r.get(permCacheKey);
+            if (cached) return JSON.parse(cached);
+        } else {
+            const cached = _permCache.get(userId);
+            if (cached && (Date.now() - cached.ts) <= PERM_CACHE_TTL * 1000) {
+                return cached.perms;
+            }
+        }
+    } catch (_) { /* cache miss — resolve from DB */ }
 
     try {
         const user = await userStore.getUser(userId);
@@ -203,24 +259,8 @@ async function getUserPermissions(userId, session = null) {
             }
         }
 
-        // ── Organisation role → permissions mapping ──
-        // orgRole grants org-scoped capabilities independent of group/role assignments
-        const ORG_ROLE_PERMISSIONS = {
-            org_admin: [
-                'org_admin', 'manage_users', 'manage_agents', 'page_settings',
-                'admin_agents', 'admin_agents_chat',
-                'admin_agents_pipeline', 'admin_security', 'admin_monitoring',
-            ],
-            agent_admin: [
-                'agent_admin', 'manage_agents',
-                'admin_agents', 'admin_agents_chat',
-                'admin_agents_pipeline',
-            ],
-            agent_editor: [
-                'agent_editor', 'manage_agents',
-                'admin_agents', 'admin_agents_chat',
-            ],
-        };
+        // ── Organisation role → permissions mapping (loaded from config) ──
+        const ORG_ROLE_PERMISSIONS = getOrgRolePermissions();
 
         // Apply user's direct orgRole
         if (user.orgRole && ORG_ROLE_PERMISSIONS[user.orgRole]) {
@@ -245,10 +285,35 @@ async function getUserPermissions(userId, session = null) {
         // Ensure at least chat access for any authenticated user
         permSet.add('page_chat');
 
-        return [...permSet];
+        const result = [...permSet];
+
+        // ── Write to cache ──
+        try {
+            if (r) {
+                await r.set(permCacheKey, JSON.stringify(result), 'EX', PERM_CACHE_TTL);
+            } else {
+                _permCache.set(userId, { perms: result, ts: Date.now() });
+            }
+        } catch (_) { /* cache write failure is non-fatal */ }
+
+        return result;
     } catch (err) {
         console.error('[Auth] getUserPermissions error:', err);
         return ['page_chat'];
+    }
+}
+
+/**
+ * Invalidate the cached permission set for a specific user.
+ * Call this after user/group/role mutations (create, update, delete).
+ */
+async function invalidatePermissionCache(userId) {
+    if (!userId) return;
+    const r = getRedis();
+    if (r) {
+        try { await r.del(`bf:perms:${userId}`); } catch (_) { }
+    } else {
+        _permCache.delete(userId);
     }
 }
 
@@ -341,6 +406,49 @@ const resolveUserOrgIds = async (req) => {
     return myOrgIds;
 };
 
+/**
+ * Shared middleware factory: require org admin access for the org
+ * specified by req.params[paramName].
+ * Use this across all route files instead of local copies.
+ */
+function requireOrgAdmin(paramName = 'id') {
+    return async (req, res, next) => {
+        if (!req.session?.user) return res.status(401).json({ error: 'Unauthorized' });
+        const orgId = req.params[paramName];
+        if (!orgId) return res.status(400).json({ error: 'Organization ID required' });
+
+        // Super admin — always allowed
+        if (req.session.isAdmin || req.session.user?.role === 'admin') return next();
+
+        const userId = req.session.user.id;
+        if (!userId) return res.status(403).json({ error: 'Organization admin access required' });
+
+        const user = await userStore.getUser(userId);
+        if (!user || user.orgRole !== 'org_admin') {
+            return res.status(403).json({ error: 'Organization admin access required' });
+        }
+
+        // Must belong to the target org
+        if (user.organizationId === orgId) return next();
+
+        // Check group-based membership as fallback
+        let groupIds = [];
+        if (Array.isArray(user.groups)) groupIds = user.groups;
+        else { try { groupIds = JSON.parse(user.groups || '[]'); } catch (_) { } }
+
+        const allGroups = await userStore.getAllGroups();
+        const isMember = groupIds.some(gid => {
+            const g = allGroups.find(gr => gr.id === gid);
+            return g?.organizationId === orgId;
+        });
+
+        if (!isMember) {
+            return res.status(403).json({ error: 'Organization admin access required' });
+        }
+        next();
+    };
+}
+
 module.exports = {
     SYSTEM_PERMISSIONS,
     OAUTH_PROVIDERS,
@@ -352,5 +460,7 @@ module.exports = {
     requireAdmin,
     requirePermission,
     requirePluginAdmin,
-    resolveUserOrgIds
+    resolveUserOrgIds,
+    requireOrgAdmin,
+    invalidatePermissionCache
 };

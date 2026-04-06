@@ -14,22 +14,21 @@ const usageStore = require('../stores/usageStore');
  * 
  * @param {string|null} orgId - Organisation ID
  * @param {string} agentType - 'chat' | 'browser' | 'terminal' | 'security' | 'swarm'
- * @returns {string|null} Error message if limit exceeded, null otherwise
+ * @returns {Promise<string|null>} Error message if limit exceeded, null otherwise
  */
-function checkSubscriptionLimits(orgId, agentType) {
+async function checkSubscriptionLimits(orgId, agentType) {
     if (!orgId) return null; // No org = no limits
-    const limits = userStore.getEffectiveLimits(orgId);
+    const limits = await userStore.getEffectiveLimits(orgId);
     if (!limits) return null; // No subscription = no limits
 
     // Suspended or cancelled orgs are fully blocked
     if (limits.status === 'suspended') return 'Your organization\'s subscription is suspended. Please contact your administrator.';
     if (limits.status === 'cancelled') return 'Your organization\'s subscription has been cancelled. Please contact your administrator.';
 
-    // Get current month usage
-    const now = new Date();
-    const startDate = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
-    const endDate = now.toISOString();
-    const summary = usageStore.getUsageSummary({ startDate, endDate, organizationId: orgId });
+    // Get usage for the current billing period (respects billing_cycle_start)
+    const sub = await userStore.getOrgSubscription(orgId);
+    const period = userStore.getBillingPeriod(sub);
+    const summary = await usageStore.getUsageSummary({ startDate: period.startDate, endDate: new Date().toISOString(), organizationId: orgId });
 
     // Check total messages limit
     if (limits.max_messages_per_month !== null && limits.max_messages_per_month !== undefined) {
@@ -56,7 +55,7 @@ function checkSubscriptionLimits(orgId, agentType) {
     if (limits.max_messages_by_type && agentType && limits.max_messages_by_type[agentType] !== undefined) {
         const typeLimit = limits.max_messages_by_type[agentType];
         if (typeLimit !== null) {
-            const byType = usageStore.getUsageByAgentType({ startDate, endDate, organizationId: orgId });
+            const byType = await usageStore.getUsageByAgentType({ startDate: period.startDate, endDate: new Date().toISOString(), organizationId: orgId });
             const typeUsage = byType.find(t => t.agent_type === agentType);
             if (typeUsage && typeUsage.calls >= typeLimit) {
                 const typeLabels = { chat: 'Chat', browser: 'Browser Agent', terminal: 'Terminal Agent', security: 'Security Agent', swarm: 'Swarm' };
@@ -75,11 +74,11 @@ function checkSubscriptionLimits(orgId, agentType) {
  * @param {string|null} orgId - Organisation ID
  * @param {'users'|'agents'|'knowledge_sources'} resourceType - Type of resource
  * @param {number} currentCount - Current count of resources
- * @returns {string|null} Error message if limit exceeded, null otherwise
+ * @returns {Promise<string|null>} Error message if limit exceeded, null otherwise
  */
-function checkResourceLimits(orgId, resourceType, currentCount) {
+async function checkResourceLimits(orgId, resourceType, currentCount) {
     if (!orgId) return null;
-    const limits = userStore.getEffectiveLimits(orgId);
+    const limits = await userStore.getEffectiveLimits(orgId);
     if (!limits) return null;
 
     const fieldMap = {
@@ -104,13 +103,13 @@ function checkResourceLimits(orgId, resourceType, currentCount) {
  * Resolve the user's primary org ID from request session.
  * Returns orgId string or null.
  */
-function resolveOrgId(req) {
+async function resolveOrgId(req) {
     const userId = req.session?.user?.id;
     if (!userId) return null;
     // Super admin has no org restriction
     if (req.session?.isAdmin || req.session?.user?.role === 'admin') return null;
     try {
-        const user = userStore.getUser(userId);
+        const user = await userStore.getUser(userId);
         if (user?.organizationId) return user.organizationId;
     } catch (_) { }
     return null;

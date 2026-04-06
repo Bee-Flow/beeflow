@@ -150,7 +150,7 @@ router.post('/agents/:id/knowledge/upload', requireAuth, upload.single('file'), 
         const agentOrgId = ownership.agent?.organization_id;
         if (agentOrgId) {
             const existingCount = knowledgeStore.listKnowledge(agentId)?.length || 0;
-            const limitErr = checkResourceLimits(agentOrgId, 'knowledge_sources', existingCount);
+            const limitErr = await checkResourceLimits(agentOrgId, 'knowledge_sources', existingCount);
             if (limitErr) {
                 return res.status(403).json({ error: limitErr });
             }
