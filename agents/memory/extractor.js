@@ -61,8 +61,9 @@ function verifyEvidence(memory, sourceText) {
  * @param {Array} messages - Array of {role, content} messages
  * @param {string} conversationId - Conversation ID for source tracking
  * @param {string} projectId - Optional project ID for scoping memory
+ * @param {string} userOrgId - Optional org ID for EU-mode model overrides
  */
-async function extractFromConversation(userId, agentId, messages, conversationId = null, projectId = null) {
+async function extractFromConversation(userId, agentId, messages, conversationId = null, projectId = null, userOrgId = null) {
 
     // Only analyze the LATEST user message (not last 5 - prevents blending)
     const userMessages = messages.filter(m => m.role === 'user').slice(-1);
@@ -94,7 +95,7 @@ async function extractFromConversation(userId, agentId, messages, conversationId
         const systemPrompt = extractorAgent?.system_prompt || 'Extract user memories.';
 
         // Resolve model via centralized resolver
-        const extractionModel = await resolveModelWithGlobalFallback(extractorAgent?.model, { fallbackTier: 'fast' });
+        const extractionModel = await resolveModelWithGlobalFallback(extractorAgent?.model, { userOrgId, userId, fallbackTier: 'fast' });
 
         const messages = [
             { role: 'system', content: systemPrompt },

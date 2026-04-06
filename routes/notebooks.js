@@ -478,10 +478,10 @@ Keep the total script length to around 300 words. Focus on the most interesting 
         // Auto mode: classify using the generation type as a pseudo-message
         if (resolvedTier === 'auto') {
             try {
-                const tiers = await getEUAwareTiers({ userOrgId });
+                const tiers = await getEUAwareTiers({ userOrgId, userId });
                 const { classifyWithLLM } = require('../core/promptClassifier');
                 const pseudoMessage = `Generate a comprehensive ${type.replace(/([A-Z])/g, ' $1').toLowerCase()} from my notebook sources`;
-                const result = await classifyWithLLM(pseudoMessage, tiers, { userOrgId });
+                const result = await classifyWithLLM(pseudoMessage, tiers, { userOrgId, userId });
                 resolvedTier = result.tier;
                 console.log(`[Notebooks] Auto: tier="${resolvedTier}" (${result.method}: ${result.reason}) for ${type}`);
             } catch (err) {
@@ -490,7 +490,7 @@ Keep the total script length to around 300 words. Focus on the most interesting 
             }
         }
 
-        let modelId = await resolveModelForTier(`tier:${resolvedTier}`, { userOrgId, fallbackTier: 'fast' });
+        let modelId = await resolveModelForTier(`tier:${resolvedTier}`, { userOrgId, userId, fallbackTier: 'fast' });
         if (!modelId) {
             const config = await getAIConfig();
             modelId = config.model;
@@ -726,14 +726,14 @@ router.post('/:id/ai-fill', requireAuth, async (req, res) => {
         let resolvedTier = modelTier || 'balanced';
         if (resolvedTier === 'auto') {
             try {
-                const tiers = await getEUAwareTiers({ userOrgId });
+                const tiers = await getEUAwareTiers({ userOrgId, userId });
                 const { classifyWithLLM } = require('../core/promptClassifier');
-                const result = await classifyWithLLM('Fill in template parameters in a document using source information', tiers, { userOrgId });
+                const result = await classifyWithLLM('Fill in template parameters in a document using source information', tiers, { userOrgId, userId });
                 resolvedTier = result.tier;
             } catch { resolvedTier = 'balanced'; }
         }
 
-        let modelId = await resolveModelForTier(`tier:${resolvedTier}`, { userOrgId, fallbackTier: 'fast' });
+        let modelId = await resolveModelForTier(`tier:${resolvedTier}`, { userOrgId, userId, fallbackTier: 'fast' });
         if (!modelId) {
             const config = await getAIConfig();
             modelId = config.model;

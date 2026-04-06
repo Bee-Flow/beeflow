@@ -4,12 +4,12 @@
 const agentStore = require('../../stores/agentStore');
 const { resolveModelWithGlobalFallback } = require('../modelResolver');
 
-async function generateChatTitle(userMessage, modelOverride = null, userOrgId = null) {
+async function generateChatTitle(userMessage, modelOverride = null, userOrgId = null, userId = null) {
     const titleAgent = await agentStore.getSystemAgent('system-title-generator');
 
     // Resolve model — modelOverride takes precedence, then agent config, then tier:fast
     const rawModel = modelOverride || titleAgent?.model;
-    const model = await resolveModelWithGlobalFallback(rawModel, { userOrgId, fallbackTier: 'fast' });
+    const model = await resolveModelWithGlobalFallback(rawModel, { userOrgId, userId, fallbackTier: 'fast' });
 
     if (!model) {
         console.error('[generateChatTitle] No model resolved for title generation');

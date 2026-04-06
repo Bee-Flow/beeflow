@@ -182,7 +182,7 @@ router.post('/:id/chat/stream', async (req, res) => {
                 console.log('[Title Gen] Triggering title generation with context:', userMessages.slice(0, 100));
                 // Use the System Agent's configured model (default behavior)
                 try {
-                    const title = await agentRuntime.generateChatTitle(userMessages, null, orgId);
+                    const title = await agentRuntime.generateChatTitle(userMessages, null, orgId, userId);
                     console.log('[Title Gen] Generated title:', title);
                     if (title && title !== 'New Chat') {
                         await agentStore.updateConversationTitle(result.conversationId, title);
@@ -230,7 +230,7 @@ router.post('/thread/title', async (req, res) => {
     try {
         const threadOrgIds = await resolveUserOrgIds(req);
         const threadOrgId = threadOrgIds && threadOrgIds.size > 0 ? Array.from(threadOrgIds)[0] : null;
-        const title = await agentRuntime.generateChatTitle(content, null, threadOrgId);
+        const title = await agentRuntime.generateChatTitle(content, null, threadOrgId, req.session?.user?.id || null);
         res.json({ title });
     } catch (error) {
         console.error('Thread title generation error:', error);

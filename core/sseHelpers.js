@@ -76,7 +76,7 @@ async function persistAndTitle({ conversation, messages, encryptionKey, userId, 
     // Generate title for new conversations (skip if moderation violation)
     if (messages.length <= 3 && generateTitle && !skipTitle) {
         try {
-            const title = await generateTitle(userMessage, null, orgId);
+            const title = await generateTitle(userMessage, null, orgId, userId);
             if (title && title !== 'New Chat') {
                 await agentStore.updateConversationTitle(conversation.id, title);
                 sendEvent('title_update', { title, conversationId: conversation.id });

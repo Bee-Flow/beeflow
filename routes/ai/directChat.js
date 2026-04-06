@@ -1730,6 +1730,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                     const rawTitleModel = titleAgent?.model || 'tier:fast';
                     const titleModel = await resolveModelWithGlobalFallback(rawTitleModel, {
                         userOrgId: userOrgForTiers || null,
+                        userId,
                         fallbackTier: 'fast',
                     }) || modelId;
                     console.log(`[DirectChat] Title: generating with model=${titleModel}`);
@@ -1757,7 +1758,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         if (!moderationViolation) {
             try {
                 const memoryExtractor = require('../../agents/memory/extractor');
-                memoryExtractor.extractFromConversation(userId, null, messages, convId, validProjectId || null)
+                memoryExtractor.extractFromConversation(userId, null, messages, convId, validProjectId || null, userOrgForTiers || null)
                     .then(extracted => {
                         if (extracted.length > 0) {
                             console.log(`[DirectChat] Extracted ${extracted.length} memories`);

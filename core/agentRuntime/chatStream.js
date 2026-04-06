@@ -1490,7 +1490,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 if (!shouldSkipMemoryExtraction) {
                     try {
                         const memoryExtractor = require('../../agents/memory/extractor');
-                        memoryExtractor.extractFromConversation(userId, agentId, messages, conversation.id, extractMemoriesEnabled ? validProjectId : null)
+                        memoryExtractor.extractFromConversation(userId, agentId, messages, conversation.id, extractMemoriesEnabled ? validProjectId : null, messageMetadata?.userOrgId || null)
                             .then(extracted => {
 
                                 if (extracted.length > 0) {
@@ -1584,7 +1584,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 if (!shouldSkipMemoryExtraction) {
                     const memoryExtractor = require('../../agents/memory/extractor');
 
-                    memoryExtractor.extractFromConversation(userId, agentId, messages, conversation.id, extractMemoriesEnabled ? validProjectId : null)
+                    memoryExtractor.extractFromConversation(userId, agentId, messages, conversation.id, extractMemoriesEnabled ? validProjectId : null, messageMetadata?.userOrgId || null)
                         .catch(err => {
 
                         });

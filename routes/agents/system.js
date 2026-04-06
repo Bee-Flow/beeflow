@@ -38,12 +38,17 @@ function createHandler({ agentId, tier, maxTokens, buildPrompt, parseResult, val
                 return res.status(404).json({ error: `System agent ${agentId} not found` });
             }
 
+            // Resolve org and user IDs for EU-mode tier overrides
+            const orgIds = await resolveUserOrgIds(req);
+            const userOrgId = orgIds && orgIds.size > 0 ? Array.from(orgIds)[0] : null;
+            const userId = req.session?.user?.id || null;
+
             // Resolve model — try the configured tier, validate it exists, fallback gracefully
-            let model = await resolveModelWithGlobalFallback(`tier:${tier}`);
+            let model = await resolveModelWithGlobalFallback(`tier:${tier}`, { userOrgId, userId });
             try {
                 await getProviderForModel(model);
             } catch (_) {
-                model = await resolveModelWithGlobalFallback(null);
+                model = await resolveModelWithGlobalFallback(null, { userOrgId, userId });
                 console.warn(`[SystemAgent:${agentId}] ${tier} tier model not found, falling back to: ${model}`);
             }
 
@@ -101,8 +106,13 @@ router.post('/system/prompt-designer/stream', async (req, res) => {
             return res.status(404).json({ error: 'System Prompt Designer agent not found' });
         }
 
+        // Resolve org and user IDs for EU-mode tier overrides
+        const orgIds = await resolveUserOrgIds(req);
+        const userOrgId = orgIds && orgIds.size > 0 ? Array.from(orgIds)[0] : null;
+        const userId = req.session?.user?.id || null;
+
         // Get thinking tier config (model + params)
-        const thinkingTier = await getTierConfig('thinking');
+        const thinkingTier = await getTierConfig('thinking', { userOrgId, userId });
         const modelId = thinkingTier.modelId;
 
         if (!modelId) {
