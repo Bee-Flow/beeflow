@@ -8,6 +8,8 @@
  * - Chat completions (non-streaming + streaming)
  * - Tool calling
  * - Model listing
+ * - Magistral native reasoning (thinking chunks)
+ * - Adjustable reasoning (reasoning_effort for mistral-small)
  */
 
 const BaseProvider = require('./base');
@@ -22,6 +24,57 @@ class MistralProvider extends BaseProvider {
     createClient(apiKey) {
         const { Mistral } = require('@mistralai/mistralai');
         return new Mistral({ apiKey });
+    }
+
+    // ─── Helpers ─────────────────────────────────────────────────
+
+    /** Check if model is a native reasoning (Magistral) model */
+    isReasoningModel(modelId) {
+        return /magistral/i.test(modelId);
+    }
+
+    /**
+     * Extract thinking and text content from Mistral's content block array.
+     *
+     * Magistral (-2509+) returns content as an array of typed blocks:
+     *   [
+     *     { type: 'thinking', thinking: [{ type: 'text', text: '...' }] },
+     *     { type: 'text', text: 'final answer' }
+     *   ]
+     *
+     * Non-reasoning models return content as a plain string.
+     */
+    parseContentBlocks(content) {
+        if (typeof content === 'string') return { thinking: null, text: content };
+        if (!Array.isArray(content)) return { thinking: null, text: String(content || '') };
+
+        let thinking = '';
+        let text = '';
+
+        for (const block of content) {
+            if (typeof block === 'string') {
+                text += block;
+                continue;
+            }
+
+            if (block.type === 'thinking') {
+                // Thinking block contains nested array: block.thinking = [{ type: 'text', text: '...' }]
+                if (Array.isArray(block.thinking)) {
+                    thinking += block.thinking
+                        .map(t => (typeof t === 'string' ? t : (t.text || '')))
+                        .join('');
+                } else if (typeof block.thinking === 'string') {
+                    thinking += block.thinking;
+                }
+            } else if (block.type === 'text') {
+                text += block.text || '';
+            } else {
+                // Unknown block — extract whatever text we can
+                text += block.text || block.content || '';
+            }
+        }
+
+        return { thinking: thinking || null, text };
     }
 
     // ─── Message Normalization ───────────────────────────────────
@@ -81,23 +134,26 @@ class MistralProvider extends BaseProvider {
             params.toolChoice = options.toolChoice || 'auto';
         }
 
+        // Adjustable reasoning for mistral-small
+        if (options.reasoningEffort && !this.isReasoningModel(model)) {
+            params.reasoningEffort = options.reasoningEffort;
+        }
+
         console.log('[Mistral] SDK chat for model:', model);
         const response = await client.chat.complete(params);
 
         const message = response.choices?.[0]?.message;
-        // Content can be a string or an array of content blocks
-        let content = message?.content;
-        if (Array.isArray(content)) {
-            content = content
-                .map(block => typeof block === 'string' ? block : (block.text || block.content || ''))
-                .join('');
-        }
-        return {
-            content: content || null,
+        const { thinking, text } = this.parseContentBlocks(message?.content);
+
+        const result = {
+            content: text || null,
             toolCalls: message?.toolCalls || null,
             usage: response.usage || null,
             raw: response,
         };
+        if (thinking) result.thinking = thinking;
+
+        return result;
     }
 
     /**
@@ -106,6 +162,7 @@ class MistralProvider extends BaseProvider {
      */
     async stream(apiKey, baseUrl, model, messages, options = {}, onEvent) {
         const client = this.createClient(apiKey);
+        const isReasoning = this.isReasoningModel(model);
 
         const params = { model, messages: this.normalizeMessages(messages), stream: true };
         if (options.maxTokens !== undefined) params.maxTokens = options.maxTokens;
@@ -115,7 +172,12 @@ class MistralProvider extends BaseProvider {
             params.toolChoice = options.toolChoice || 'auto';
         }
 
-        console.log('[Mistral] SDK streaming for model:', model);
+        // Adjustable reasoning for mistral-small
+        if (options.reasoningEffort && !isReasoning) {
+            params.reasoningEffort = options.reasoningEffort;
+        }
+
+        console.log('[Mistral] SDK streaming for model:', model, isReasoning ? '(reasoning)' : '');
         const stream = await client.chat.stream(params);
 
         // Accumulate tool calls across streaming chunks
@@ -133,18 +195,36 @@ class MistralProvider extends BaseProvider {
             }
             const delta = event.data?.choices?.[0]?.delta;
             if (delta?.content) {
-                // Content can be a string or an array of content blocks
-                let text;
+                // Content can be a string or an array of typed content blocks
                 if (typeof delta.content === 'string') {
-                    text = delta.content;
+                    onEvent('text', { text: delta.content });
                 } else if (Array.isArray(delta.content)) {
-                    text = delta.content
-                        .map(block => typeof block === 'string' ? block : (block.text || block.content || ''))
-                        .join('');
+                    // Magistral models: content is an array of { type, text/thinking } blocks
+                    for (const block of delta.content) {
+                        if (typeof block === 'string') {
+                            onEvent('text', { text: block });
+                        } else if (block.type === 'thinking') {
+                            // Extract text from thinking block
+                            let thinkText = '';
+                            if (Array.isArray(block.thinking)) {
+                                thinkText = block.thinking
+                                    .map(t => (typeof t === 'string' ? t : (t.text || '')))
+                                    .join('');
+                            } else if (typeof block.thinking === 'string') {
+                                thinkText = block.thinking;
+                            }
+                            if (thinkText) onEvent('thinking', { text: thinkText });
+                        } else if (block.type === 'text') {
+                            if (block.text) onEvent('text', { text: block.text });
+                        } else {
+                            // Unknown block type — try to extract text
+                            const t = block.text || block.content || '';
+                            if (t) onEvent('text', { text: t });
+                        }
+                    }
                 } else {
-                    text = String(delta.content);
+                    onEvent('text', { text: String(delta.content) });
                 }
-                if (text) onEvent('text', { text });
             }
             // Accumulate tool call deltas
             if (delta?.toolCalls) {
@@ -153,12 +233,14 @@ class MistralProvider extends BaseProvider {
                     if (!toolCallAccumulator[idx]) {
                         toolCallAccumulator[idx] = {
                             id: tc.id || '',
-                            name: tc.function?.name || '',
+                            name: '',
                             arguments: '',
                         };
                     }
                     if (tc.id) toolCallAccumulator[idx].id = tc.id;
-                    if (tc.function?.name) toolCallAccumulator[idx].name += tc.function.name;
+                    // Name comes once in the first chunk — set, don't append
+                    if (tc.function?.name) toolCallAccumulator[idx].name = tc.function.name;
+                    // Arguments stream in across multiple chunks — append
                     if (tc.function?.arguments) toolCallAccumulator[idx].arguments += tc.function.arguments;
                 }
             }

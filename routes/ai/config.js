@@ -770,18 +770,34 @@ router.get('/user-settings', requireAuth, async (req, res) => {
         }
     } catch (e) { /* ignore */ }
 
-    // Check org privacy shield for disableSearchOnUpload
+    // Check org privacy shield for disableSearchOnUpload + EU mode
     let disableSearchOnUpload = false;
+    let orgEuModeForced = false;
+    let userOrgId = null;
     try {
         const userStore2 = require('../../stores/userStore');
         const currentUser2 = await userStore2.getUser(userId);
         if (currentUser2?.organizationId) {
-            const shield = await configStore.getConfig(`org_privacy_shield_${currentUser2.organizationId}`);
+            userOrgId = currentUser2.organizationId;
+            const shield = await configStore.getConfig(`org_privacy_shield_${userOrgId}`);
             if (shield?.enabled && shield.disableSearchOnUpload) {
                 disableSearchOnUpload = true;
             }
+            if (shield?.enabled && shield.euModeEnabled) {
+                orgEuModeForced = true;
+            }
         }
     } catch (e) { /* ignore */ }
+
+    // Personal EU mode preference
+    const userEuModeEnabled = !!(await configStore.getConfig(`user_eu_mode_${userId}`));
+
+    // Check if EU models are configured at all (admin must set these up)
+    let hasEuModelsConfigured = false;
+    try {
+        const euTiers = await configStore.getConfig('chat_model_tiers_eu') || {};
+        hasEuModelsConfigured = Object.values(euTiers).some(t => t?.modelId?.trim());
+    } catch (_) {}
 
     res.json({
         hasFirefliesKey: !!(await configStore.getSecret(`fireflies_api_key_user_${userId}`)),
@@ -799,12 +815,16 @@ router.get('/user-settings', requireAuth, async (req, res) => {
         hasGoogleMapsKey: !!(await configStore.getSecret('google_maps_api_key')),
         disableSearchOnUpload,
         searchProvider: await configStore.getConfig('search_provider') || 'agent-search',
+        // EU model preference
+        userEuModeEnabled,
+        orgEuModeForced,
+        hasEuModelsConfigured,
     });
 });
 
 router.post('/user-settings', requireAuth, async (req, res) => {
     const userId = req.session.user.id;
-    const { firefliesApiKey, youtrackUrl, youtrackToken, gammaApiKey, signrequestSubdomain, signrequestToken, enabledApps } = req.body;
+    const { firefliesApiKey, youtrackUrl, youtrackToken, gammaApiKey, signrequestSubdomain, signrequestToken, enabledApps, userEuModeEnabled } = req.body;
 
     if (firefliesApiKey !== undefined) {
         await configStore.setSecret(`fireflies_api_key_user_${userId}`, firefliesApiKey || '');
@@ -813,8 +833,6 @@ router.post('/user-settings', requireAuth, async (req, res) => {
     if (gammaApiKey !== undefined) {
         await configStore.setSecret(`gamma_api_key_user_${userId}`, gammaApiKey || '');
     }
-
-
 
     if (youtrackUrl !== undefined) {
         await configStore.setSecret(`youtrack_url_user_${userId}`, youtrackUrl || '');
@@ -834,7 +852,10 @@ router.post('/user-settings', requireAuth, async (req, res) => {
         await configStore.setConfig(`enabled_apps_user_${userId}`, enabledApps);
     }
 
-
+    if (userEuModeEnabled !== undefined) {
+        await configStore.setConfig(`user_eu_mode_${userId}`, !!userEuModeEnabled);
+        console.log(`[UserSettings] User ${userId} set EU-only models: ${!!userEuModeEnabled}`);
+    }
 
     res.json({ success: true });
 });

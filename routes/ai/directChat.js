@@ -114,7 +114,7 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
     }
 
     // Resolve model from tier config (EU-aware via centralized modelResolver)
-    let tiers = await getEUAwareTiers({ userOrgId: userOrgForTiers });
+    let tiers = await getEUAwareTiers({ userOrgId: userOrgForTiers, userId });
     let disableSearchOnUpload = false;
     if (userOrgForTiers) {
         const shield = await configStore.getConfig(`org_privacy_shield_${userOrgForTiers}`);
@@ -132,7 +132,7 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
     if (resolvedTier === 'auto') {
         try {
             const { classifyWithLLM } = require('../../core/promptClassifier');
-            const result = await classifyWithLLM(message, tiers, { userOrgId: userOrgForTiers });
+            const result = await classifyWithLLM(message, tiers, { userOrgId: userOrgForTiers, userId });
             resolvedTier = result.tier;
             console.log(`[DirectChat] Auto: tier="${resolvedTier}" (${result.method}: ${result.reason})`);
         } catch (err) {
