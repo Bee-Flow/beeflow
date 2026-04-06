@@ -143,4 +143,47 @@ router.put('/:orgId', requireAuth, async (req, res) => {
     }
 });
 
+
+// ═══════════════════════════════════════
+//  User-level Privacy Shield (Consumer Accounts)
+// ═══════════════════════════════════════
+
+// GET /user/me — get user-level shield config (consumer accounts)
+router.get('/user/me', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const config = await configStore.getConfig(`user_privacy_shield_${userId}`) || {
+            enabled: false,
+            euModeEnabled: false,
+            disableSearchOnUpload: false,
+        };
+        res.json(config);
+    } catch (e) {
+        console.error('[UserPrivacyShield] GET error:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// PUT /user/me — save user-level shield config (consumer accounts)
+router.put('/user/me', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const { enabled, euModeEnabled, disableSearchOnUpload } = req.body;
+        const config = {
+            enabled: !!enabled,
+            euModeEnabled: !!euModeEnabled,
+            disableSearchOnUpload: !!disableSearchOnUpload,
+            updatedAt: new Date().toISOString(),
+            updatedBy: userId,
+        };
+
+        await configStore.setConfig(`user_privacy_shield_${userId}`, config);
+        console.log(`[UserPrivacyShield] Saved config for user ${userId}`);
+        res.json({ ok: true, config });
+    } catch (e) {
+        console.error('[UserPrivacyShield] PUT error:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 module.exports = router;

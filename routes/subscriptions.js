@@ -43,6 +43,11 @@ router.use((req, res, next) => {
         req.params.orgId = req.params.orgId || orgMatch[1];
         return requireAuthOrOrgMember(req, res, next);
     }
+    // GET /consumer/usage — allow any authenticated user (consumer accounts)
+    if (req.method === 'GET' && req.path === '/consumer/usage') {
+        if (!req.session?.isAuthenticated) return res.status(401).json({ error: 'Not authenticated' });
+        return next();
+    }
     // Everything else requires super admin
     return requireAdmin(req, res, next);
 });
@@ -297,6 +302,59 @@ router.get('/audit', async (req, res) => {
         res.json(logs);
     } catch (e) {
         console.error('[Subscriptions] getAuditLog error:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ═══════════════════════════════════════
+//  Consumer Account Usage
+// ═══════════════════════════════════════
+
+// GET /api/subscriptions/consumer/usage — consumer account limits + usage
+router.get('/consumer/usage', async (req, res) => {
+    try {
+        const userId = req.session?.user?.id;
+        if (!userId) return res.status(401).json({ error: 'Not authenticated' });
+
+        // Get __consumer_default__ plan
+        const allPlans = await userStore.getAllPlans();
+        const consumerPlan = allPlans.find(p => p.name === '__consumer_default__');
+
+        // Build limits from consumer plan (or return nulls = unlimited)
+        const limits = {
+            max_messages_per_month: consumerPlan?.max_messages_per_month ?? null,
+            max_tokens_per_month: consumerPlan?.max_tokens_per_month ?? null,
+            max_cost_per_month: consumerPlan?.max_cost_per_month ?? null,
+            max_agents: consumerPlan?.max_agents ?? null,
+            max_knowledge_sources: consumerPlan?.max_knowledge_sources ?? null,
+            max_messages_by_type: consumerPlan?.max_messages_by_type ?? null,
+            allowed_features: consumerPlan?.allowed_features ?? [],
+            allowed_models: consumerPlan?.allowed_models ?? [],
+            plan_name: consumerPlan?.name || 'Free',
+        };
+
+        // Get current period usage for this user
+        const now = new Date();
+        const startDate = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+        const endDate = now.toISOString();
+        const summary = await usageStore.getUsageSummary({ startDate, endDate, userId });
+        const byType = await usageStore.getUsageByAgentType({ startDate, endDate, userId });
+
+        res.json({
+            limits,
+            usage: {
+                total_calls: summary.total_calls || 0,
+                total_tokens: summary.total_tokens || 0,
+                total_estimated_cost: summary.total_estimated_cost || 0,
+                by_type: byType || [],
+            },
+            billing_period: {
+                start: startDate,
+                end: new Date(now.getFullYear(), now.getMonth() + 1, 1).toISOString(),
+            },
+        });
+    } catch (e) {
+        console.error('[Subscriptions] consumer usage error:', e);
         res.status(500).json({ error: e.message });
     }
 });

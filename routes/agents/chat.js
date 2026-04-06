@@ -120,7 +120,7 @@ router.post('/:id/chat/stream', async (req, res) => {
     const orgIds = await resolveUserOrgIds(req);
     const orgId = orgIds && orgIds.size > 0 ? Array.from(orgIds)[0] : null;
     const agentType = 'chat';
-    const limitError = await checkSubscriptionLimits(orgId, agentType);
+    const limitError = await checkSubscriptionLimits(orgId, agentType, userId);
     if (limitError) {
         sendSSEError(res, limitError);
         return;

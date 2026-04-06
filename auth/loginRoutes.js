@@ -377,6 +377,7 @@ router.get('/user', async (req, res) => {
             encryptionEnabled: await isEncryptionEnabledForUser(req.session.user.id),
             // Organisation membership for SSO users
             noOrganization: req.session.noOrganization || false,
+            isConsumerAccount: !freshUser?.organizationId && !req.session.noOrganization && process.env.DEPLOYMENT_MODE === 'cloud',
             pendingApproval: req.session.pendingApproval || false,
             // Feature flags from env + configStore
             featureFlags: await (async () => {
@@ -788,6 +789,12 @@ router.post('/signup', async (req, res) => {
         }
         // Invited users are auto-approved; self-signup depends on org allowSignup
         var userStatus = (inviteData || org.allowSignup) ? 'active' : 'pending';
+    } else if (process.env.DEPLOYMENT_MODE === 'cloud') {
+        // Consumer account — no organization required in cloud mode
+        orgId = null;
+        groups = [];
+        var userStatus = 'active';
+        console.log(`[Signup] Consumer account (no org) for user '${username}'`);
     } else {
         return res.status(400).json({ error: 'Organization is required' });
     }

@@ -80,6 +80,8 @@ app.use(cors({
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Session-Token']
 }));
 
+// Stripe webhook needs raw body for signature verification — must be BEFORE bodyParser.json
+app.use('/api/stripe/webhook', express.raw({ type: 'application/json' }));
 app.use(bodyParser.json({ limit: '20mb' }));
 
 // ── Sessions ──────────────────────────────────────────────────────────────────────
@@ -266,6 +268,7 @@ app.get('/api/guard/health', async (req, res) => {
     } catch { res.json({ status: 'unavailable' }); }
 });
 app.use('/api/subscriptions', require('./routes/subscriptions'));
+app.use('/api/stripe', require('./routes/stripe'));
 app.use('/api/documents', require('./routes/documents'));
 app.use('/api/notifications', require('./routes/notifications'));
 // Project feature gate middleware

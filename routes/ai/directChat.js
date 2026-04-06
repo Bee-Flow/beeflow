@@ -228,7 +228,7 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
 
     // ── Subscription limit enforcement ──
     const limitOrgId = await resolveOrgId(req);
-    const limitError = await checkSubscriptionLimits(limitOrgId, 'chat');
+    const limitError = await checkSubscriptionLimits(limitOrgId, 'chat', userId);
     if (limitError) {
         res.writeHead(200, {
             'Content-Type': 'text/event-stream',
