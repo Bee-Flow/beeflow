@@ -756,6 +756,15 @@ const GUI_DEFAULTS = {
     'signup.choose_auth_carefully_desc': 'Once saved, this cannot be changed. Each user\'s data is protected with a unique key that is tied to how they sign in. Switching later would make existing conversations unreadable.',
     'signup.sign_in_with_provider': 'Sign in with {provider} to complete your account setup. Your name and email will be imported automatically.',
     'signup.continue_with_provider': 'Continue with {provider}',
+    'signup.privacy_off': 'No Protection',
+    'signup.privacy_off_desc': 'No content filtering. You can enable protection later in organisation settings.',
+    'signup.privacy_basic': 'Basic Protection',
+    'signup.privacy_basic_desc': 'AI-powered moderation filters harmful content categories (hate speech, violence, self-harm, etc.)',
+    'signup.privacy_strict': 'Strict Protection',
+    'signup.privacy_strict_desc': 'AI moderation plus PII filtering. Blocks personal data like names, emails, phone numbers, and addresses.',
+    'signup.eu_only_models': 'EU-only models',
+    'signup.eu_only_models_desc': 'Restrict AI to EU-hosted models only',
+    'signup.privacy_tune_later': 'You can fine-tune these settings later in Organisation Settings → Privacy Shield.',
 
     // ── Login Form ──────────────────────────────────────────────
     'login.sign_in_btn': 'Sign In',
