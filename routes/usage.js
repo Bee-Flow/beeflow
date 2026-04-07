@@ -285,4 +285,77 @@ router.get('/models-by-user', async (req, res) => {
     }
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// GUARDRAIL / SAFETY MONITORING ENDPOINTS
+// ════════════════════════════════════════════════════════════════════════════
+const guardrailEventStore = require('../stores/guardrailEventStore');
+
+// 16. Guardrail Summary
+router.get('/guardrails/summary', async (req, res) => {
+    try {
+        const summary = await guardrailEventStore.getGuardrailSummary(req.usageFilters);
+        res.json(summary || { total_events: 0, moderation_count: 0, pii_count: 0, regex_count: 0, input_count: 0, output_count: 0, unique_users: 0 });
+    } catch (err) {
+        console.error('[Usage API] /guardrails/summary error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch guardrail summary' });
+    }
+});
+
+// 17. Guardrail Timeline
+router.get('/guardrails/timeline', async (req, res) => {
+    try {
+        const interval = req.query.interval === 'hour' ? 'hour' : 'day';
+        const timeline = await guardrailEventStore.getGuardrailTimeline(req.usageFilters, interval);
+        res.json(timeline || []);
+    } catch (err) {
+        console.error('[Usage API] /guardrails/timeline error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch guardrail timeline' });
+    }
+});
+
+// 18. Guardrail Events by User
+router.get('/guardrails/by-user', async (req, res) => {
+    try {
+        const data = await guardrailEventStore.getGuardrailByUser(req.usageFilters);
+        const userMap = await getUserMap();
+        const enriched = (data || []).map(row => ({
+            ...row,
+            display_name: userMap.get(row.user_id) || row.user_id || 'Unknown'
+        }));
+        res.json(enriched);
+    } catch (err) {
+        console.error('[Usage API] /guardrails/by-user error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch guardrail user data' });
+    }
+});
+
+// 19. Guardrail Events by Category
+router.get('/guardrails/by-category', async (req, res) => {
+    try {
+        const data = await guardrailEventStore.getGuardrailByCategory(req.usageFilters);
+        res.json(data || []);
+    } catch (err) {
+        console.error('[Usage API] /guardrails/by-category error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch guardrail category data' });
+    }
+});
+
+// 20. Recent Guardrail Events
+router.get('/guardrails/recent', async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit, 10) || 50;
+        const data = await guardrailEventStore.getRecentGuardrailEvents(limit, req.usageFilters);
+        const userMap = await getUserMap();
+        const enriched = (data || []).map(row => ({
+            ...row,
+            display_name: userMap.get(row.user_id) || row.user_id || 'Unknown'
+        }));
+        res.json(enriched);
+    } catch (err) {
+        console.error('[Usage API] /guardrails/recent error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch recent guardrail events' });
+    }
+});
+
 module.exports = router;
+

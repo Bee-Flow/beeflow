@@ -3,8 +3,9 @@ const { validateInput } = require('../moderation');
 const { validateInputForPii } = require('../azurePiiDetection');
 const { resolveOrgShield, mergeWithOrgShield } = require('../orgShield');
 const { checkRegexPatterns } = require('../guardrails');
+const guardrailEventStore = require('../../stores/guardrailEventStore');
 
-async function runInputGuardrails({ agent, messages, userMessage, globalConfig, onEvent }) {
+async function runInputGuardrails({ agent, messages, userMessage, globalConfig, onEvent, userId, conversationId, source, model }) {
     let moderationViolation = null;
     let guardrailViolation = null;
     let processedUserMessage = userMessage;
@@ -25,6 +26,17 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
     const webSearchGuardPiiCategories = (orgShield?.enabled && Array.isArray(orgShield?.webSearchGuardPiiCategories) && orgShield.webSearchGuardPiiCategories.length > 0)
         ? orgShield.webSearchGuardPiiCategories : null;
     const orgShieldCategories = orgShield?.moderationCategories || null;
+
+    // Context for guardrail event logging
+    const eventCtx = {
+        organization_id: agent.organization_id || null,
+        user_id: userId || null,
+        agent_id: agent.id || null,
+        agent_name: agent.name || null,
+        conversation_id: conversationId || null,
+        source: source || 'unknown',
+        model: model || null,
+    };
 
     // Agent-level llamaGuard only fires when the org hasn't explicitly disabled moderation.
     // If org has an active Privacy Shield with moderationEnabled=false, agent config is overridden.
@@ -53,6 +65,15 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
                     });
                 }
                 moderationViolation = violationLabels.join(', ');
+
+                // Log moderation event (fire-and-forget)
+                guardrailEventStore.logGuardrailEvent({
+                    ...eventCtx,
+                    violation_type: 'moderation',
+                    violation_categories: violationLabels.join(', '),
+                    direction: 'input',
+                    action_taken: 'hard_block',
+                }).catch(() => {});
             }
         }
     }
@@ -85,6 +106,15 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
                     });
                 }
                 moderationViolation = `PII Detected: ${labelList}`;
+
+                // Log PII event (fire-and-forget)
+                guardrailEventStore.logGuardrailEvent({
+                    ...eventCtx,
+                    violation_type: 'pii',
+                    violation_categories: labelList,
+                    direction: 'input',
+                    action_taken: 'blocked',
+                }).catch(() => {});
             }
             // Other errors (service unavailable etc.) → fail-open, log and continue
         }
@@ -144,11 +174,29 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
                         autoRedactSeconds: 5
                     });
                 }
+
+                // Log regex redact event (fire-and-forget)
+                guardrailEventStore.logGuardrailEvent({
+                    ...eventCtx,
+                    violation_type: 'regex',
+                    violation_categories: ruleNames,
+                    direction: 'input',
+                    action_taken: 'redacted',
+                }).catch(() => {});
             } else {
                 guardrailViolation = ruleNames;
                 if (onEvent) {
                     onEvent('guardrail_violation', { rules: ruleNames, autoDeleteSeconds: 5 });
                 }
+
+                // Log regex block event (fire-and-forget)
+                guardrailEventStore.logGuardrailEvent({
+                    ...eventCtx,
+                    violation_type: 'regex',
+                    violation_categories: ruleNames,
+                    direction: 'input',
+                    action_taken: 'blocked',
+                }).catch(() => {});
             }
         }
     }

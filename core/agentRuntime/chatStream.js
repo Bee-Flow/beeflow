@@ -29,6 +29,7 @@ const { processSystemPrompt } = require('../promptUtils');
 const { buildSystemPrompt } = require('./contextBuilder');
 const { performKnowledgeSearch } = require('./knowledgeSearch');
 const { runInputGuardrails } = require('./guardrailsRunner');
+const guardrailEventStore = require('../../stores/guardrailEventStore');
 const { processAttachments } = require('./attachmentProcessor');
 
 // ============ RETRY & ERROR HELPERS ============
@@ -424,7 +425,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     let systemPrompt = await buildSystemPrompt({ agent, tools, userId, messageMetadata, memoryContext, isStrictKnowledge });
 
     // ============ GUARDRAILS (before KB search — block early) ============
-    const guardrailsResult = await runInputGuardrails({ agent, messages, userMessage, globalConfig, onEvent });
+    const guardrailsResult = await runInputGuardrails({ agent, messages, userMessage, globalConfig, onEvent, userId, conversationId: conversation?.id, source: isSwarm ? 'swarm_orchestrator' : 'agent_stream', model: modelToUse });
     let moderationViolation = guardrailsResult.moderationViolation;
     let guardrailViolation = guardrailsResult.guardrailViolation;
     let processedUserMessage = guardrailsResult.processedUserMessage;
@@ -435,10 +436,14 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     const orgShieldCategories = guardrailsResult.orgShieldCategories;
 
     // Filter out web search if org policy disables it on file uploads
-    const hasAttachments = messageMetadata?.attachments && messageMetadata.attachments.length > 0;
-    if (disableSearchOnUpload && hasAttachments) {
-        tools = tools.filter(t => t.function?.name !== 'agent_search');
-        console.log('[AgentRuntime] Web search disabled — files attached (org policy)');
+    // Check both current attachments AND conversation history for past uploads
+    if (disableSearchOnUpload) {
+        const hasCurrentAttachments = messageMetadata?.attachments && messageMetadata.attachments.length > 0;
+        const hasHistoryAttachments = conversation?.messages?.some(m => m.attachments && m.attachments.length > 0);
+        if (hasCurrentAttachments || hasHistoryAttachments) {
+            tools = tools.filter(t => t.function?.name !== 'agent_search');
+            console.log(`[AgentRuntime] Web search disabled — ${hasCurrentAttachments ? 'current files attached' : 'files in conversation history'} (org policy)`);
+        }
     }
 
     // If redaction occurred, update the user message in the messages array
@@ -1462,6 +1467,21 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                             fullResponse = `⚠️ This response was blocked by content moderation (${violationLabels.join(', ')}). The AI's response contained content that violates organization safety policies.`;
                             onEvent('content_replace', { text: fullResponse });
                             moderationViolation = violationLabels.join(', ');
+
+                            // Log output moderation event (fire-and-forget)
+                            guardrailEventStore.logGuardrailEvent({
+                                organization_id: agent.organization_id || null,
+                                user_id: userId,
+                                agent_id: agentId,
+                                agent_name: agent.name,
+                                conversation_id: conversation?.id || null,
+                                violation_type: 'moderation',
+                                violation_categories: violationLabels.join(', '),
+                                direction: 'output',
+                                action_taken: 'soft_block',
+                                source: isSwarm ? 'swarm_orchestrator' : 'agent_stream',
+                                model: modelToUse,
+                            }).catch(() => {});
                         }
                     }
                 }

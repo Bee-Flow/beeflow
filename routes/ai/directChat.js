@@ -20,6 +20,7 @@ const { getAdapter } = require('../../core/providers');
 const agentStore = require('../../stores/agentStore');
 const { executeTool: dispatchTool } = require('../../core/toolDispatcher');
 const { WORKSPACE_TOOLS } = require('../../integrations/workspaceTools');
+const guardrailEventStore = require('../../stores/guardrailEventStore');
 
 /**
  * Strip bulky fields from tool results before they become LLM messages.
@@ -409,9 +410,15 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         }
 
         // Filter out web search if org policy disables it on file uploads
-        if (disableSearchOnUpload && attachments && attachments.length > 0) {
-            directChatTools = directChatTools.filter(t => t.function.name !== 'agent_search');
-            console.log('[DirectChat] Web search disabled — files attached (org policy)');
+        // Check both current attachments AND past messages in this conversation
+        if (disableSearchOnUpload) {
+            const hasCurrentAttachments = attachments && attachments.length > 0;
+            // Check conversation history for past file uploads
+            const hasHistoryAttachments = history && Array.isArray(history) && history.some(m => m.attachments && m.attachments.length > 0);
+            if (hasCurrentAttachments || hasHistoryAttachments) {
+                directChatTools = directChatTools.filter(t => t.function.name !== 'agent_search');
+                console.log(`[DirectChat] Web search disabled — ${hasCurrentAttachments ? 'current files attached' : 'files in conversation history'} (org policy)`);
+            }
         }
 
         // Build messages array
@@ -558,6 +565,11 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                         } else {
                             console.log('[DirectChat] Model changed, invalidating lastResponseId');
                         }
+                    }
+                    // Check DB messages for past file uploads (disableSearchOnUpload policy)
+                    if (disableSearchOnUpload && existingConv.messages?.some(m => m.attachments && m.attachments.length > 0)) {
+                        directChatTools = directChatTools.filter(t => t.function.name !== 'agent_search');
+                        console.log('[DirectChat] Web search disabled — files found in conversation history DB (org policy)');
                     }
                 }
             } catch (e) { /* ignore */ }
@@ -890,6 +902,19 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                     // Let the AI explain the violation instead of blocking
                     moderationViolation = violationLabels.join(', ');
                     console.log(`[DirectChat] Moderation violation detected: ${moderationViolation} — AI will respond`);
+
+                    // Log moderation event (fire-and-forget)
+                    guardrailEventStore.logGuardrailEvent({
+                        organization_id: userOrgId || null,
+                        user_id: userId,
+                        conversation_id: convId || null,
+                        violation_type: 'moderation',
+                        violation_categories: moderationViolation,
+                        direction: 'input',
+                        action_taken: 'soft_block',
+                        source: 'direct',
+                        model: modelId || null,
+                    }).catch(() => {});
                 } else {
                     // Guard service error (not a violation) — fail-open, log and continue
                     console.warn(`[DirectChat] Guard service error (fail-open): ${guardError.message}`);
@@ -945,6 +970,19 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                     entities: piiResult.entities.map(e => ({ label: e.label, category: e.category })),
                     tokenCount: Object.keys(piiResult.tokenMap).length,
                 });
+
+                // Log PII tokenize event (fire-and-forget)
+                guardrailEventStore.logGuardrailEvent({
+                    organization_id: userOrgId || null,
+                    user_id: userId,
+                    conversation_id: convId || null,
+                    violation_type: 'pii',
+                    violation_categories: piiResult.entities.map(e => e.label || e.category).join(', '),
+                    direction: 'input',
+                    action_taken: 'tokenized',
+                    source: 'direct',
+                    model: modelId || null,
+                }).catch(() => {});
             }
         } catch (piiError) {
             if (piiError.piiEntities) {
@@ -959,6 +997,20 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                     piiEntities: piiError.piiEntities,
                     autoDeleteSeconds: 5,
                 });
+
+                // Log PII block event (fire-and-forget)
+                guardrailEventStore.logGuardrailEvent({
+                    organization_id: userOrgId || null,
+                    user_id: userId,
+                    conversation_id: convId || null,
+                    violation_type: 'pii',
+                    violation_categories: categoryList,
+                    direction: 'input',
+                    action_taken: 'blocked',
+                    source: 'direct',
+                    model: modelId || null,
+                }).catch(() => {});
+
                 send('done', {});
                 res.end();
                 return;
@@ -1724,6 +1776,19 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                     console.log(`[DirectChat] Agent output moderation violation: ${violationLabels.join(', ')}`);
                     send('content_replace', { text: `⚠️ This response was blocked by content moderation (${violationLabels.join(', ')}). The AI's response contained content that violates organization safety policies.` });
                     fullContent = '[Response blocked by content moderation]';
+
+                    // Log output moderation event (fire-and-forget)
+                    guardrailEventStore.logGuardrailEvent({
+                        organization_id: userOrgId || null,
+                        user_id: userId,
+                        conversation_id: convId || null,
+                        violation_type: 'moderation',
+                        violation_categories: violationLabels.join(', '),
+                        direction: 'output',
+                        action_taken: 'soft_block',
+                        source: 'direct',
+                        model: modelId || null,
+                    }).catch(() => {});
                 }
             }
         }
