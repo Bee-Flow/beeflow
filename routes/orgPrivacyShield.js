@@ -31,6 +31,9 @@ async function isOrgAdmin(req, orgId) {
     const user = await userStore.getUser(userId);
     if (!user) return false;
 
+    // Check user's direct orgRole (set when user creates or is assigned to an org)
+    if (user.organizationId === orgId && user.orgRole === 'org_admin') return true;
+
     let groupIds = [];
     if (Array.isArray(user.groups)) groupIds = user.groups;
     else { try { groupIds = JSON.parse(user.groups || '[]'); } catch (_) { } }
