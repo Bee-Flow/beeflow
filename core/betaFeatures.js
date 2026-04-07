@@ -22,6 +22,7 @@ const { exec, getOne, run } = require('../db');
 // Add new features here. This is the single source of truth.
 // ──────────────────────────────────────────────
 const BETA_FEATURES = [
+    { id: 'meeting_notes', name: 'Meeting Notes', description: 'Audio transcription, meeting summaries, and action item extraction' },
     { id: 'advanced_analytics', name: 'Advanced Analytics', description: 'Extended analytics dashboards and reporting' },
     { id: 'ai_code_execution', name: 'AI Code Execution', description: 'Allow the AI agent to execute code in a sandboxed environment' },
     { id: 'custom_themes', name: 'Custom Themes', description: 'Organization-level custom branding and theme support' },

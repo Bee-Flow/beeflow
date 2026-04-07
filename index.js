@@ -309,8 +309,10 @@ const notebookFeatureGate = async (req, res, next) => {
 };
 app.use('/api/notebooks', notebookFeatureGate, require('./routes/notebooks'));
 app.use('/api/notebooks', notebookFeatureGate, require('./routes/notebookExport'));
-app.use('/api/transcriptions', require('./routes/transcriptions'));
-app.use('/api/meet-bot', require('./routes/meetBot'));
+// Meeting Notes beta feature gate
+const { requireBetaFeature } = require('./core/betaFeatures');
+app.use('/api/transcriptions', requireBetaFeature('meeting_notes'), require('./routes/transcriptions'));
+app.use('/api/meet-bot', requireBetaFeature('meeting_notes'), require('./routes/meetBot'));
 app.use('/', require('./routes/knowledge'));
 app.use('/api/kb', require('./routes/knowledgeBases'));
 app.use('/api/languages', require('./routes/admin/languageRoutes'));
