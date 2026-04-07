@@ -430,7 +430,16 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     let processedUserMessage = guardrailsResult.processedUserMessage;
     const regexConfig = guardrailsResult.regexConfig;
     const webSearchGuardEnabled = guardrailsResult.webSearchGuardEnabled;
+    const disableSearchOnUpload = guardrailsResult.disableSearchOnUpload;
+    const webSearchGuardPiiCategories = guardrailsResult.webSearchGuardPiiCategories;
     const orgShieldCategories = guardrailsResult.orgShieldCategories;
+
+    // Filter out web search if org policy disables it on file uploads
+    const hasAttachments = messageMetadata?.attachments && messageMetadata.attachments.length > 0;
+    if (disableSearchOnUpload && hasAttachments) {
+        tools = tools.filter(t => t.function?.name !== 'agent_search');
+        console.log('[AgentRuntime] Web search disabled — files attached (org policy)');
+    }
 
     // If redaction occurred, update the user message in the messages array
     if (processedUserMessage !== userMessage) {
@@ -1056,6 +1065,29 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                                 finalToolResult: `[Web search blocked — the search query "${toolArgs.query}" was flagged by the safety guard. Please rephrase or use a different approach.]`,
                                 blocked: true
                             };
+                        }
+                    }
+
+                    // Web Search Guard — PII detection on search queries
+                    if (webSearchGuardPiiCategories && toolName === 'agent_search' && toolArgs?.query) {
+                        try {
+                            const { detectPii } = require('../azurePiiDetection');
+                            const piiResult = await detectPii(toolArgs.query, webSearchGuardPiiCategories);
+                            if (piiResult?.hasPii) {
+                                const cats = [...new Set(piiResult.entities.map(e => e.label))].join(', ');
+                                console.log(`[WebSearchGuard] Search query BLOCKED by PII (${cats}): "${toolArgs.query.substring(0, 80)}"`);
+                                onEvent('tool_end', { name: toolName, result: `[Web search blocked — query contains sensitive information (${cats})]` });
+                                return {
+                                    toolCall,
+                                    toolName,
+                                    toolArgs,
+                                    finalToolResult: `[Web search blocked — the search query contains sensitive personal information (${cats}). Please rephrase without including PII.]`,
+                                    blocked: true
+                                };
+                            }
+                            console.log(`[WebSearchGuard] Search query PII check passed`);
+                        } catch (piiErr) {
+                            console.warn(`[WebSearchGuard] PII check failed (fail-open):`, piiErr.message);
                         }
                     }
 

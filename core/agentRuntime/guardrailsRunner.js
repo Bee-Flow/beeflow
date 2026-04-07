@@ -21,6 +21,9 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
         : { userInput: true, agentOutput: true };
 
     const webSearchGuardEnabled = !!(orgShield?.enabled && orgShield?.webSearchGuardEnabled) || !!agent.config?.webSearchGuardEnabled;
+    const disableSearchOnUpload = !!(orgShield?.enabled && orgShield?.disableSearchOnUpload);
+    const webSearchGuardPiiCategories = (orgShield?.enabled && Array.isArray(orgShield?.webSearchGuardPiiCategories) && orgShield.webSearchGuardPiiCategories.length > 0)
+        ? orgShield.webSearchGuardPiiCategories : null;
     const orgShieldCategories = orgShield?.moderationCategories || null;
 
     // Agent-level llamaGuard only fires when the org hasn't explicitly disabled moderation.
@@ -156,6 +159,8 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
         processedUserMessage, 
         regexConfig, 
         webSearchGuardEnabled,
+        disableSearchOnUpload,
+        webSearchGuardPiiCategories,
         orgShieldCategories
     };
 }

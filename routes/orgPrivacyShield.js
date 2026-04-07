@@ -75,6 +75,7 @@ router.get('/:orgId', requireAuth, async (req, res) => {
             azureEnabledCategories: ['Hate', 'Violence', 'Sexual', 'SelfHarm'],
             piiDetectionCategories: [],
             piiDetectionConfidenceThreshold: 0.7,
+            webSearchGuardPiiCategories: [],
         };
 
         // Also pull current global AI config values so the UI stays in sync
@@ -106,7 +107,7 @@ router.put('/:orgId', requireAuth, async (req, res) => {
             return res.status(403).json({ error: 'Only organization admins can manage the privacy shield' });
         }
 
-        const { enabled, collectionIds, scope, action, moderationEnabled, moderationCategories, euModeEnabled, webSearchGuardEnabled, disableSearchOnUpload, azurePiiEnabled, azureSeverityThreshold, azureEnabledCategories, piiDetectionCategories, piiDetectionConfidenceThreshold } = req.body;
+        const { enabled, collectionIds, scope, action, moderationEnabled, moderationCategories, euModeEnabled, webSearchGuardEnabled, disableSearchOnUpload, azurePiiEnabled, azureSeverityThreshold, azureEnabledCategories, piiDetectionCategories, piiDetectionConfidenceThreshold, webSearchGuardPiiCategories } = req.body;
         const config = {
             enabled: !!enabled,
             collectionIds: Array.isArray(collectionIds) ? collectionIds : [],
@@ -122,6 +123,7 @@ router.put('/:orgId', requireAuth, async (req, res) => {
             azureEnabledCategories: Array.isArray(azureEnabledCategories) ? azureEnabledCategories : ['Hate', 'Violence', 'Sexual', 'SelfHarm'],
             piiDetectionCategories: Array.isArray(piiDetectionCategories) ? piiDetectionCategories : [],
             piiDetectionConfidenceThreshold: typeof piiDetectionConfidenceThreshold === 'number' ? piiDetectionConfidenceThreshold : 0.7,
+            webSearchGuardPiiCategories: Array.isArray(webSearchGuardPiiCategories) ? webSearchGuardPiiCategories : [],
             updatedAt: new Date().toISOString(),
             updatedBy: req.session.user.id,
         };
