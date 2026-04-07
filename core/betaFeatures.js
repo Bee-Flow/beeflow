@@ -28,7 +28,7 @@ const BETA_FEATURES = [
     { id: 'custom_themes', name: 'Custom Themes', description: 'Organization-level custom branding and theme support' },
 ];
 
-// ──────────────────────────────────────────────
+// -──────────────────────────────────────────────
 // Lazy migration — ensure the column exists (deferred until first use)
 // ──────────────────────────────────────────────
 let migrated = false;
