@@ -1305,6 +1305,31 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                             });
                         } catch (e) { /* ignore */ }
 
+                        // ── Integration Activity Logging (async, non-blocking) ──
+                        try {
+                            const { resolveIntegration } = require('../../core/integrationToolMap');
+                            const integMeta = resolveIntegration(toolName, toolArgs || {});
+                            if (integMeta) {
+                                configStore.getConfig(`org_privacy_shield_${userOrgId}`).then(shield => {
+                                    if (shield?.monitorIntegrations) {
+                                        const integStore = require('../../stores/integrationActivityStore');
+                                        integStore.logIntegrationActivity({
+                                            organization_id: userOrgId || null,
+                                            user_id: userId,
+                                            conversation_id: convId || null,
+                                            tool_name: toolName,
+                                            integration_type: integMeta.integration,
+                                            server_endpoint: integMeta.server,
+                                            data_direction: integMeta.direction,
+                                            data_categories: integMeta.dataCategories,
+                                            source: 'direct_chat',
+                                            model: modelId || null,
+                                        }).catch(e => console.error('[IntegrationActivityLog] Error:', e.message));
+                                    }
+                                }).catch(() => {});
+                            }
+                        } catch (e) { /* ignore */ }
+
                         // Return raw toolResult so draft dedup can run sequentially after Promise.all
                         return {
                             _toolResult: toolResult,
@@ -1605,6 +1630,31 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                         organization_id: userOrgId || null,
                         conversation_id: convId || null,
                     });
+                } catch (e) { /* ignore */ }
+
+                // ── Integration Activity Logging (async, non-blocking) ──
+                try {
+                    const { resolveIntegration } = require('../../core/integrationToolMap');
+                    const integMeta = resolveIntegration(toolName, toolArgs || {});
+                    if (integMeta) {
+                        configStore.getConfig(`org_privacy_shield_${userOrgId}`).then(shield => {
+                            if (shield?.monitorIntegrations) {
+                                const integStore = require('../../stores/integrationActivityStore');
+                                integStore.logIntegrationActivity({
+                                    organization_id: userOrgId || null,
+                                    user_id: userId,
+                                    conversation_id: convId || null,
+                                    tool_name: toolName,
+                                    integration_type: integMeta.integration,
+                                    server_endpoint: integMeta.server,
+                                    data_direction: integMeta.direction,
+                                    data_categories: integMeta.dataCategories,
+                                    source: 'direct_chat',
+                                    model: modelId || null,
+                                }).catch(e => console.error('[IntegrationActivityLog] Error:', e.message));
+                            }
+                        }).catch(() => {});
+                    }
                 } catch (e) { /* ignore */ }
 
                 // Ensure toolResult is an object before stringifying (avoid double-encoding strings)

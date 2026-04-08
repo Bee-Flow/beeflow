@@ -5,7 +5,7 @@
  * - notebook_doc_read/write/replace: Read and modify the TipTap document editor
  * - agent_search: Web research
  * - notebook_add_source: Add web search results directly as notebook sources
- * - gmail_*/drive_*: Tax assistant integration tools (when notebook type is tax_assistant)
+ * - gmail_*, drive_*: Tax assistant integration tools (when notebook type is tax_assistant)
  */
 
 const express = require('express');

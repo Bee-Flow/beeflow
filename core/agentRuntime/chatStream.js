@@ -12,6 +12,8 @@ const fs = require('fs');
 const path = require('path');
 // Legacy swarm modules removed — isSwarm is always false
 const usageStore = require('../../stores/usageStore');
+const integrationActivityStore = require('../../stores/integrationActivityStore');
+const { resolveIntegration } = require('../integrationToolMap');
 
 const { classifyPromptComplexity } = require('../promptClassifier');
 const configStore = require('../../stores/configStore');
@@ -1254,6 +1256,33 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                             conversation_id: conversation?.id || null,
                         });
                     } catch (e) { /* ignore */ }
+
+                    // ── Integration Activity Logging (async, non-blocking) ──
+                    try {
+                        const integMeta = resolveIntegration(toolName, toolArgs || {});
+                        if (integMeta) {
+                            // Fire-and-forget: check shield config + log
+                            const shieldKey = `org_privacy_shield_${agent.organization_id}`;
+                            configStore.getConfig(shieldKey).then(shield => {
+                                if (shield?.monitorIntegrations) {
+                                    integrationActivityStore.logIntegrationActivity({
+                                        organization_id: agent.organization_id || null,
+                                        user_id: userId,
+                                        agent_id: agentId,
+                                        agent_name: agent.name,
+                                        conversation_id: conversation?.id || null,
+                                        tool_name: toolName,
+                                        integration_type: integMeta.integration,
+                                        server_endpoint: integMeta.server,
+                                        data_direction: integMeta.direction,
+                                        data_categories: integMeta.dataCategories,
+                                        source: isSwarm ? 'swarm_orchestrator' : 'agent_stream',
+                                        model: modelToUse,
+                                    }).catch(e => console.error('[IntegrationActivityLog] Error:', e.message));
+                                }
+                            }).catch(() => {});
+                        }
+                    } catch (e) { /* ignore integration logging errors */ }
 
                     messages.push({
                         role: 'tool',

@@ -357,5 +357,94 @@ router.get('/guardrails/recent', async (req, res) => {
     }
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// INTEGRATION ACTIVITY MONITORING ENDPOINTS (Data Sovereignty)
+// ════════════════════════════════════════════════════════════════════════════
+const integrationActivityStore = require('../stores/integrationActivityStore');
+
+// 21. Integration Summary
+router.get('/integrations/summary', async (req, res) => {
+    try {
+        const summary = await integrationActivityStore.getIntegrationSummary(req.usageFilters);
+        res.json(summary || { total_calls: 0, unique_integrations: 0, unique_servers: 0, sent_count: 0, received_count: 0, pii_events: 0, unique_users: 0 });
+    } catch (err) {
+        console.error('[Usage API] /integrations/summary error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch integration summary' });
+    }
+});
+
+// 22. Integration Timeline
+router.get('/integrations/timeline', async (req, res) => {
+    try {
+        const interval = req.query.interval === 'hour' ? 'hour' : 'day';
+        const timeline = await integrationActivityStore.getIntegrationTimeline(req.usageFilters, interval);
+        res.json(timeline || []);
+    } catch (err) {
+        console.error('[Usage API] /integrations/timeline error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch integration timeline' });
+    }
+});
+
+// 23. Integration by Type
+router.get('/integrations/by-type', async (req, res) => {
+    try {
+        const data = await integrationActivityStore.getIntegrationByType(req.usageFilters);
+        res.json(data || []);
+    } catch (err) {
+        console.error('[Usage API] /integrations/by-type error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch integration type data' });
+    }
+});
+
+// 24. Integration by Tool
+router.get('/integrations/by-tool', async (req, res) => {
+    try {
+        const data = await integrationActivityStore.getIntegrationByTool(req.usageFilters);
+        res.json(data || []);
+    } catch (err) {
+        console.error('[Usage API] /integrations/by-tool error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch integration tool data' });
+    }
+});
+
+// 25. Integration PII Summary
+router.get('/integrations/pii-summary', async (req, res) => {
+    try {
+        const data = await integrationActivityStore.getIntegrationPiiSummary(req.usageFilters);
+        res.json(data || []);
+    } catch (err) {
+        console.error('[Usage API] /integrations/pii-summary error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch integration PII data' });
+    }
+});
+
+// 26. Integration Servers / Endpoints
+router.get('/integrations/servers', async (req, res) => {
+    try {
+        const data = await integrationActivityStore.getIntegrationServers(req.usageFilters);
+        res.json(data || []);
+    } catch (err) {
+        console.error('[Usage API] /integrations/servers error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch server data' });
+    }
+});
+
+// 27. Recent Integration Activity
+router.get('/integrations/recent', async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit, 10) || 50;
+        const data = await integrationActivityStore.getRecentIntegrationActivity(limit, req.usageFilters);
+        const userMap = await getUserMap();
+        const enriched = (data || []).map(row => ({
+            ...row,
+            display_name: userMap.get(row.user_id) || row.user_id || 'Unknown'
+        }));
+        res.json(enriched);
+    } catch (err) {
+        console.error('[Usage API] /integrations/recent error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch recent integration activity' });
+    }
+});
+
 module.exports = router;
 
