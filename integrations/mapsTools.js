@@ -100,9 +100,13 @@ async function executeMapsTool(toolName, args) {
 
         console.log(`[Maps] Directions: ${origin} → ${destination} (${mode})`);
 
-        // Call Directions API
+        // Call Directions API with real-time traffic data
         let url = `https://maps.googleapis.com/maps/api/directions/json?origin=${encodeURIComponent(origin)}&destination=${encodeURIComponent(destination)}&mode=${mode}&key=${apiKey}`;
         if (avoid) url += `&avoid=${encodeURIComponent(avoid)}`;
+        // Request real-time traffic data for driving mode
+        if (mode === 'driving') {
+            url += `&departure_time=now&traffic_model=best_guess`;
+        }
 
         const res = await fetch(url);
         const data = await res.json();
@@ -125,6 +129,9 @@ async function executeMapsTool(toolName, args) {
             travelMode: step.travel_mode
         }));
 
+        // Use duration_in_traffic (real-time) when available, else fall back to standard duration
+        const realTimeDuration = leg.duration_in_traffic ? leg.duration_in_traffic.text : leg.duration.text;
+
         // Build embed URL (free, unlimited usage)
         const embedUrl = `https://www.google.com/maps/embed/v1/directions?key=${apiKey}&origin=${encodeURIComponent(origin)}&destination=${encodeURIComponent(destination)}&mode=${mode}`;
 
@@ -137,7 +144,9 @@ async function executeMapsTool(toolName, args) {
             origin: leg.start_address,
             destination: leg.end_address,
             mode,
-            duration: leg.duration.text,
+            duration: realTimeDuration,
+            duration_without_traffic: leg.duration.text,
+            duration_in_traffic: leg.duration_in_traffic ? leg.duration_in_traffic.text : null,
             distance: leg.distance.text,
             steps: steps.slice(0, 15), // Cap at 15 steps to keep response manageable
             totalSteps: steps.length,
@@ -145,7 +154,7 @@ async function executeMapsTool(toolName, args) {
             mapsLink,
             summary: route.summary,
             warnings: route.warnings || [],
-            message: 'Route from ' + leg.start_address + ' to ' + leg.end_address + ': ' + leg.distance.text + ', ' + leg.duration.text + ' (' + mode + ')'
+            message: 'Route from ' + leg.start_address + ' to ' + leg.end_address + ': ' + leg.distance.text + ', ' + realTimeDuration + (leg.duration_in_traffic ? ' (with current traffic)' : '') + ' (' + mode + ')'
         };
 
     } else if (toolName === 'maps_search_places') {
