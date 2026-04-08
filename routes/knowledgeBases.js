@@ -498,6 +498,31 @@ router.post('/:id/ingest/sitemap', requireAuth, async (req, res) => {
 });
 
 /**
+ * Get n8n workflows that are configured with allowKbIngestion=true
+ */
+router.get('/n8n/ingestible', requireAuth, async (req, res) => {
+    try {
+        const userStore = require('../stores/userStore');
+        const user = await userStore.getUser(getUserId(req));
+        if (!user || !user.organizationId) {
+            return res.json([]);
+        }
+        
+        const orgWorkflows = await configStore.getConfig(`n8n_workflows_org_${user.organizationId}`);
+        if (!orgWorkflows || !Array.isArray(orgWorkflows)) {
+            return res.json([]);
+        }
+
+        const ingestible = orgWorkflows.filter(wf => wf.allowKbIngestion === true);
+        res.json(ingestible);
+    } catch (e) {
+        console.error('[KB] Error fetching ingestible n8n workflows:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+
+/**
  * Ingest an n8n workflow definition into a KB
  * 
  * Fetches the workflow from the connected n8n instance, converts it
@@ -526,6 +551,12 @@ router.post('/:id/ingest/n8n', requireAuth, async (req, res) => {
         const n8nApiKey = await configStore.getSecret(`n8n_api_key_org_${orgId}`);
         if (!n8nUrl || !n8nApiKey) {
             return res.status(400).json({ error: 'n8n is not configured for your organisation' });
+        }
+
+        const orgWorkflows = await configStore.getConfig(`n8n_workflows_org_${orgId}`) || [];
+        const configuredWf = orgWorkflows.find(w => w.id === workflowId);
+        if (!configuredWf || !configuredWf.allowKbIngestion) {
+            return res.status(403).json({ error: 'This n8n workflow has not been enabled for KB ingestion by your Organisation administrator' });
         }
 
         // Fetch the full workflow definition from n8n
