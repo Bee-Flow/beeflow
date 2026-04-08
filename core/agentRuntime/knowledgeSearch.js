@@ -30,11 +30,17 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
                 // Search locally-ingested chunks directly from PostgreSQL
                 const { searchLocally } = require('../localKBIngest');
                 const chunks = await searchLocally(userId, kbIds, searchQuery, { topK: 15 });
-                allKnowledgeResults.push(...chunks.map(c => ({
-                    content: c.content,
-                    metadata: { source: c.source_uri || c.title || 'KB', type: 'kb_chunk' },
-                    score: c.score || 0
-                })));
+                allKnowledgeResults.push(...chunks.map(c => {
+                    // Prefer title over opaque internal URIs (n8n://, etc.)
+                    const srcUri = c.source_uri || '';
+                    const isInternalUri = srcUri.startsWith('n8n://') || srcUri.startsWith('internal://');
+                    const displaySource = (isInternalUri && c.title) ? c.title : (srcUri || c.title || 'KB');
+                    return {
+                        content: c.content,
+                        metadata: { source: displaySource, type: 'kb_chunk' },
+                        score: c.score || 0
+                    };
+                }));
             } else {
                 // ── Search-service path ─────────────────────────────────
                 const searchUrl = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
@@ -56,11 +62,16 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
                 if (searchRes.ok) {
                     const searchData = await searchRes.json();
                     const chunks = searchData.chunks || searchData.results || [];
-                    allKnowledgeResults.push(...chunks.map(c => ({
-                        content: c.content,
-                        metadata: { source: c.source_uri || c.title || 'KB', type: 'kb_chunk' },
-                        score: c.score || c.rerank_score || 0
-                    })));
+                    allKnowledgeResults.push(...chunks.map(c => {
+                        const srcUri = c.source_uri || '';
+                        const isInternalUri = srcUri.startsWith('n8n://') || srcUri.startsWith('internal://');
+                        const displaySource = (isInternalUri && c.title) ? c.title : (srcUri || c.title || 'KB');
+                        return {
+                            content: c.content,
+                            metadata: { source: displaySource, type: 'kb_chunk' },
+                            score: c.score || c.rerank_score || 0
+                        };
+                    }));
                 }
             }
         } catch (searchErr) {
@@ -150,8 +161,8 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
             }).join('\n');
 
             const citationInstruction = includeRefs
-                ? 'When relevant, include the source URL at the end of your response so the user can verify the information.'
-                : 'Do NOT include citations (e.g. [Source 1]) or source URLs in your final response.';
+                ? 'When relevant, cite the source name or URL (from the "Source N:" headers above) at the end of your response so the user can verify the information.'
+                : 'Do NOT include citations (e.g. [Source 1]) or source references in your final response.';
 
             if (isStrictKnowledge) {
                 systemPromptExtension += `\n\n## KNOWLEDGE BASE RESULTS

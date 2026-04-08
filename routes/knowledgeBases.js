@@ -619,7 +619,7 @@ router.post('/:id/ingest/n8n', requireAuth, async (req, res) => {
                 documentsToIngest.push({
                     title: itemTitle,
                     markdown: itemMarkdown,
-                    sourceUri: `n8n://workflow/${workflowId}/run/${Date.now()}/${idx}`
+                    sourceUri: itemTitle
                 });
             });
         }
