@@ -178,9 +178,9 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
             }
             disableSearchOnUpload = !!shield.disableSearchOnUpload;
             if (disableSearchOnUpload) console.log(`[DirectChat] Org ${userOrgForTiers}: disableSearchOnUpload=true`);
-            if (shield.webSearchGuardEnabled && Array.isArray(shield.webSearchGuardPiiCategories) && shield.webSearchGuardPiiCategories.length > 0) {
+            if (Array.isArray(shield.webSearchGuardPiiCategories) && shield.webSearchGuardPiiCategories.length > 0) {
                 webSearchGuardPiiCategories = shield.webSearchGuardPiiCategories;
-                console.log(`[DirectChat] Org ${userOrgForTiers}: webSearchGuardPiiCategories=${webSearchGuardPiiCategories.length} categories`);
+                console.log(`[DirectChat] Org ${userOrgForTiers}: webSearchGuardPiiCategories=${webSearchGuardPiiCategories.length} categories (monitoring${shield.webSearchGuardEnabled ? ' + blocking' : ' only'})`);
             }
         }
     }
@@ -1279,14 +1279,14 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                                         return { role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify({ error: 'Web search blocked — query violates content policy. Please rephrase.' }) };
                                     }
                                 }
-                                // 3. PII Detection on search query
+                                // 3. PII Detection on search query (always runs for monitoring)
                                 if (webSearchGuardPiiCategories && webSearchGuardPiiCategories.length > 0) {
                                     try {
                                         const { detectPii } = require('../../core/azurePiiDetection');
                                         const piiResult = await detectPii(toolArgs.query, webSearchGuardPiiCategories);
                                         if (piiResult?.hasPii) {
                                             const cats = [...new Set(piiResult.entities.map(e => e.label))].join(', ');
-                                            console.log(`[DirectChat WebSearchGuard] Search query BLOCKED by PII (${cats})`);
+                                            // Always log PII detection for monitoring
                                             guardrailEventStore.logGuardrailEvent({
                                                 organization_id: userOrgId || null,
                                                 user_id: userId,
@@ -1294,12 +1294,18 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                                                 violation_type: 'pii',
                                                 violation_categories: cats,
                                                 direction: 'input',
-                                                action_taken: 'search_blocked',
+                                                action_taken: webSearchGuardEnabled ? 'search_blocked' : 'pii_detected',
                                                 source: 'direct',
                                                 model: modelId || null,
                                             }).catch(() => {});
-                                            send('tool_end', { name: toolName, result: `[Web search blocked — query contains sensitive information (${cats})]` });
-                                            return { role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify({ error: `Web search blocked — query contains sensitive personal information (${cats}). Please rephrase without PII.` }) };
+                                            // Only block when Web Search Guard is enabled
+                                            if (webSearchGuardEnabled) {
+                                                console.log(`[DirectChat WebSearchGuard] Search query BLOCKED by PII (${cats})`);
+                                                send('tool_end', { name: toolName, result: `[Web search blocked — query contains sensitive information (${cats})]` });
+                                                return { role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify({ error: `Web search blocked — query contains sensitive personal information (${cats}). Please rephrase without PII.` }) };
+                                            } else {
+                                                console.log(`[DirectChat WebSearchGuard] PII detected in search query (${cats}) — monitoring only, search allowed`);
+                                            }
                                         }
                                         console.log(`[DirectChat WebSearchGuard] Search query PII check passed`);
                                     } catch (piiErr) {
@@ -1639,14 +1645,14 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                                 return { role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify({ error: 'Web search blocked — query violates content policy. Please rephrase.' }) };
                             }
                         }
-                        // 3. PII Detection on search query
+                        // 3. PII Detection on search query (always runs for monitoring)
                         if (webSearchGuardPiiCategories && webSearchGuardPiiCategories.length > 0) {
                             try {
                                 const { detectPii } = require('../../core/azurePiiDetection');
                                 const piiResult = await detectPii(toolArgs.query, webSearchGuardPiiCategories);
                                 if (piiResult?.hasPii) {
                                     const cats = [...new Set(piiResult.entities.map(e => e.label))].join(', ');
-                                    console.log(`[DirectChat WebSearchGuard] Streamed search query BLOCKED by PII (${cats})`);
+                                    // Always log PII detection for monitoring
                                     guardrailEventStore.logGuardrailEvent({
                                         organization_id: userOrgId || null,
                                         user_id: userId,
@@ -1654,12 +1660,18 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                                         violation_type: 'pii',
                                         violation_categories: cats,
                                         direction: 'input',
-                                        action_taken: 'search_blocked',
+                                        action_taken: webSearchGuardEnabled ? 'search_blocked' : 'pii_detected',
                                         source: 'direct',
                                         model: modelId || null,
                                     }).catch(() => {});
-                                    send('tool_end', { name: toolName, result: `[Web search blocked — query contains sensitive information (${cats})]` });
-                                    return { role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify({ error: `Web search blocked — query contains sensitive personal information (${cats}). Please rephrase without PII.` }) };
+                                    // Only block when Web Search Guard is enabled
+                                    if (webSearchGuardEnabled) {
+                                        console.log(`[DirectChat WebSearchGuard] Streamed search query BLOCKED by PII (${cats})`);
+                                        send('tool_end', { name: toolName, result: `[Web search blocked — query contains sensitive information (${cats})]` });
+                                        return { role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify({ error: `Web search blocked — query contains sensitive personal information (${cats}). Please rephrase without PII.` }) };
+                                    } else {
+                                        console.log(`[DirectChat WebSearchGuard] PII detected in streamed search query (${cats}) — monitoring only, search allowed`);
+                                    }
                                 }
                                 console.log(`[DirectChat WebSearchGuard] Streamed search query PII check passed`);
                             } catch (piiErr) {

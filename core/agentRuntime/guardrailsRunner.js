@@ -23,7 +23,7 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
 
     const webSearchGuardEnabled = !!(orgShield?.enabled && orgShield?.webSearchGuardEnabled) || !!agent.config?.webSearchGuardEnabled;
     const disableSearchOnUpload = !!(orgShield?.enabled && orgShield?.disableSearchOnUpload);
-    const webSearchGuardPiiCategories = (webSearchGuardEnabled && Array.isArray(orgShield?.webSearchGuardPiiCategories) && orgShield.webSearchGuardPiiCategories.length > 0)
+    const webSearchGuardPiiCategories = (orgShield?.enabled && Array.isArray(orgShield?.webSearchGuardPiiCategories) && orgShield.webSearchGuardPiiCategories.length > 0)
         ? orgShield.webSearchGuardPiiCategories : null;
     const orgShieldCategories = orgShield?.moderationCategories || null;
 

@@ -361,6 +361,7 @@ router.get('/guardrails/recent', async (req, res) => {
 // INTEGRATION ACTIVITY MONITORING ENDPOINTS (Data Sovereignty)
 // ════════════════════════════════════════════════════════════════════════════
 const integrationActivityStore = require('../stores/integrationActivityStore');
+const { batchResolveServerGeo } = require('../core/serverGeoResolver');
 
 // 21. Integration Summary
 router.get('/integrations/summary', async (req, res) => {
@@ -422,6 +423,25 @@ router.get('/integrations/pii-summary', async (req, res) => {
 router.get('/integrations/servers', async (req, res) => {
     try {
         const data = await integrationActivityStore.getIntegrationServers(req.usageFilters);
+        // Enrich with geo-location data
+        try {
+            const endpoints = (data || []).map(d => d.server_endpoint).filter(Boolean);
+            const geoMap = await batchResolveServerGeo(endpoints);
+            for (const row of (data || [])) {
+                const geo = geoMap.get(row.server_endpoint);
+                if (geo) {
+                    row.country_code = geo.country_code;
+                    row.country_name = geo.country_name;
+                    row.country_flag = geo.flag;
+                    row.is_eu = geo.is_eu;
+                    row.server_ip = geo.ip;
+                    row.server_region = geo.region;
+                    row.server_city = geo.city;
+                }
+            }
+        } catch (geoErr) {
+            console.warn('[Usage API] Geo enrichment failed (non-fatal):', geoErr.message);
+        }
         res.json(data || []);
     } catch (err) {
         console.error('[Usage API] /integrations/servers error:', err.message);
@@ -439,6 +459,22 @@ router.get('/integrations/recent', async (req, res) => {
             ...row,
             display_name: userMap.get(row.user_id) || row.user_id || 'Unknown'
         }));
+        // Enrich with geo-location data
+        try {
+            const endpoints = enriched.map(d => d.server_endpoint).filter(Boolean);
+            const geoMap = await batchResolveServerGeo(endpoints);
+            for (const row of enriched) {
+                const geo = geoMap.get(row.server_endpoint);
+                if (geo) {
+                    row.country_code = geo.country_code;
+                    row.country_name = geo.country_name;
+                    row.country_flag = geo.flag;
+                    row.is_eu = geo.is_eu;
+                }
+            }
+        } catch (geoErr) {
+            console.warn('[Usage API] Geo enrichment failed (non-fatal):', geoErr.message);
+        }
         res.json(enriched);
     } catch (err) {
         console.error('[Usage API] /integrations/recent error:', err.message);
