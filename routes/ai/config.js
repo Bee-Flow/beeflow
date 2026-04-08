@@ -986,7 +986,7 @@ router.post('/generate-regex', requireAuth, async (req, res) => {
 
 // ─── n8n Integration Config (Org-Level) ───────────────────────
 
-const { listActiveWebhookWorkflows } = require('../../integrations/n8nTools');
+const { listActiveWebhookWorkflows, fetchWorkflowById } = require('../../integrations/n8nTools');
 
 // Helper: get org ID from session
 async function getOrgId(req) {
@@ -1137,6 +1137,25 @@ router.put('/n8n/workflows', requireOrgAdminForN8n, async (req, res) => {
         await configStore.setConfig(`n8n_workflows_org_${orgId}`, workflows || []);
         res.json({ success: true });
     } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET /ai/n8n/workflow/:workflowId — fetch a single workflow's full definition from n8n
+router.get('/n8n/workflow/:workflowId', requireOrgAdminForN8n, async (req, res) => {
+    try {
+        const orgId = req.orgId;
+        const n8nUrl = await configStore.getConfig(`n8n_url_org_${orgId}`);
+        const apiKey = await configStore.getSecret(`n8n_api_key_org_${orgId}`);
+
+        if (!n8nUrl || !apiKey) {
+            return res.status(400).json({ error: 'n8n URL and API key must be configured first' });
+        }
+
+        const workflow = await fetchWorkflowById(n8nUrl, apiKey, req.params.workflowId);
+        res.json({ workflow });
+    } catch (err) {
+        console.error('[n8n] Error fetching workflow:', err.message);
         res.status(500).json({ error: err.message });
     }
 });

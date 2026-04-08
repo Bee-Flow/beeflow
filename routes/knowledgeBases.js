@@ -497,6 +497,80 @@ router.post('/:id/ingest/sitemap', requireAuth, async (req, res) => {
     }
 });
 
+/**
+ * Ingest an n8n workflow definition into a KB
+ * 
+ * Fetches the workflow from the connected n8n instance, converts it
+ * to structured Markdown, and ingests it as a KB document.
+ */
+router.post('/:id/ingest/n8n', requireAuth, async (req, res) => {
+    try {
+        const kb = await kbStore.getKB(req.params.id);
+        if (!kb) return res.status(404).json({ error: 'KB not found' });
+        if (kb.tenant_id !== getUserId(req)) return res.status(403).json({ error: 'Access denied' });
+
+        const { workflowId } = req.body;
+        if (!workflowId) {
+            return res.status(400).json({ error: 'workflowId is required' });
+        }
+
+        // Get org-level n8n config
+        const userStore = require('../stores/userStore');
+        const user = await userStore.getUser(getUserId(req));
+        const orgId = user?.organizationId;
+        if (!orgId) {
+            return res.status(400).json({ error: 'No organization configured' });
+        }
+
+        const n8nUrl = await configStore.getConfig(`n8n_url_org_${orgId}`);
+        const n8nApiKey = await configStore.getSecret(`n8n_api_key_org_${orgId}`);
+        if (!n8nUrl || !n8nApiKey) {
+            return res.status(400).json({ error: 'n8n is not configured for your organisation' });
+        }
+
+        // Fetch the full workflow definition from n8n
+        const { fetchWorkflowById } = require('../integrations/n8nTools');
+        const workflow = await fetchWorkflowById(n8nUrl, n8nApiKey, workflowId);
+
+        if (!workflow || !workflow.nodes) {
+            return res.status(400).json({ error: 'Invalid workflow data received from n8n' });
+        }
+
+        // Convert to Markdown
+        const { convertN8nWorkflowToMarkdown } = require('../core/n8nWorkflowConverter');
+        const markdown = convertN8nWorkflowToMarkdown(workflow);
+
+        if (!markdown || markdown.trim().length < 10) {
+            return res.status(400).json({ error: 'Workflow produced no meaningful content' });
+        }
+
+        // Ingest into KB
+        const title = `n8n Workflow: ${workflow.name || 'Untitled'}`;
+        const sourceUri = `n8n://workflow/${workflowId}`;
+
+        const result = await ingestDocument(
+            kb.tenant_id, kb.id, markdown,
+            title, 'n8n', sourceUri,
+            { lang: kb.default_lang }
+        );
+
+        console.log(`[KB] n8n workflow "${workflow.name}" ingested: ${result.chunks} chunks`);
+
+        res.status(201).json({
+            success: true,
+            document: result.document,
+            chunks: result.chunks,
+            workflowName: workflow.name,
+        });
+    } catch (e) {
+        if (e.code === 'DUPLICATE') {
+            return res.status(409).json({ error: 'This workflow is already imported in this KB', documentId: e.documentId });
+        }
+        console.error('[KB] n8n ingest error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // ── Search ──────────────────────────────────────────────────────────
 
 /**

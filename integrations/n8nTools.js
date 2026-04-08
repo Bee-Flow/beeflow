@@ -399,10 +399,33 @@ function isN8nTool(toolName) {
     return toolName && toolName.startsWith('n8n_');
 }
 
+/**
+ * Fetch a single workflow's full definition from the n8n API.
+ * Returns the complete workflow JSON including nodes, connections, and settings.
+ */
+async function fetchWorkflowById(apiBaseUrl, apiKey, workflowId) {
+    const headers = {
+        'X-N8N-API-KEY': apiKey,
+        'Content-Type': 'application/json',
+    };
+    const base = apiBaseUrl.replace(/\/+$/, '');
+    const apiBase = base.includes('/api/v1') ? base : `${base}/api/v1`;
+
+    const res = await fetch(`${apiBase}/workflows/${workflowId}`, {
+        headers,
+        timeout: 10000,
+    });
+    if (!res.ok) {
+        throw new Error(`Failed to fetch n8n workflow ${workflowId}: ${res.status} ${await res.text()}`);
+    }
+    return res.json();
+}
+
 // ─── Exports ───────────────────────────────────────────────────
 
 module.exports = {
     listActiveWebhookWorkflows,
+    fetchWorkflowById,
     triggerWebhookWorkflow,
     buildN8nTools,
     executeN8nTool,
