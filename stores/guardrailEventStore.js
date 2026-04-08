@@ -200,11 +200,26 @@ async function getRecentGuardrailEvents(limit = 50, filters = {}) {
     `, [...params, limit]);
 }
 
+async function getGuardrailByAction(filters = {}) {
+    await initDB();
+    const { where, params } = buildFilters(filters);
+    return getAll(`
+        SELECT
+            action_taken,
+            violation_type,
+            COUNT(*) as count
+        FROM guardrail_events ${where}
+        GROUP BY action_taken, violation_type
+        ORDER BY count DESC
+    `, params);
+}
+
 module.exports = {
     logGuardrailEvent,
     getGuardrailSummary,
     getGuardrailTimeline,
     getGuardrailByUser,
     getGuardrailByCategory,
+    getGuardrailByAction,
     getRecentGuardrailEvents,
 };

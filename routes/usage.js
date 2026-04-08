@@ -357,6 +357,17 @@ router.get('/guardrails/recent', async (req, res) => {
     }
 });
 
+// 21. Guardrail Events by Action Taken
+router.get('/guardrails/by-action', async (req, res) => {
+    try {
+        const data = await guardrailEventStore.getGuardrailByAction(req.usageFilters);
+        res.json(data || []);
+    } catch (err) {
+        console.error('[Usage API] /guardrails/by-action error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch guardrail action data' });
+    }
+});
+
 // ════════════════════════════════════════════════════════════════════════════
 // INTEGRATION ACTIVITY MONITORING ENDPOINTS (Data Sovereignty)
 // ════════════════════════════════════════════════════════════════════════════
