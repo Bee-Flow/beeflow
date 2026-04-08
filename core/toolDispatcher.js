@@ -182,10 +182,15 @@ async function executeTool(toolName, toolArgs, context = {}) {
     }
     if (isAgentSearchTool(toolName)) {
         // Check if admin configured Bing as the search provider
-        const searchProvider = await configStore.getConfig('search_provider');
-        if (searchProvider === 'bing') {
-            const { executeBingSearchTool } = require('../integrations/bingSearchTools');
-            return await executeBingSearchTool(toolName, toolArgs);
+        // Wrapped in try-catch to survive transient PostgreSQL DNS failures (EAI_AGAIN)
+        try {
+            const searchProvider = await configStore.getConfig('search_provider');
+            if (searchProvider === 'bing') {
+                const { executeBingSearchTool } = require('../integrations/bingSearchTools');
+                return await executeBingSearchTool(toolName, toolArgs);
+            }
+        } catch (cfgErr) {
+            console.warn(`[ToolDispatcher] Config lookup failed (search_provider), using default: ${cfgErr.message}`);
         }
         return await executeAgentSearchTool(toolName, toolArgs);
     }

@@ -99,11 +99,15 @@ async function executeTaskToolCall(toolName, toolArgs) {
         const configStore = require('../stores/configStore');
 
         if (toolName === 'agent_search') {
-            // Check if admin configured Bing as the search provider
-            const searchProvider = await configStore.getConfig('search_provider');
-            if (searchProvider === 'bing') {
-                const { executeBingSearchTool } = require('../integrations/bingSearchTools');
-                return await executeBingSearchTool(toolName, toolArgs);
+            // Check if admin configured Bing as the search provider (resilient to transient DB failures)
+            try {
+                const searchProvider = await configStore.getConfig('search_provider');
+                if (searchProvider === 'bing') {
+                    const { executeBingSearchTool } = require('../integrations/bingSearchTools');
+                    return await executeBingSearchTool(toolName, toolArgs);
+                }
+            } catch (cfgErr) {
+                console.warn(`[AITaskRunner] Config lookup failed (search_provider), using default: ${cfgErr.message}`);
             }
             const { executeAgentSearchTool } = require('../integrations/agentSearchTools');
             return await executeAgentSearchTool(toolName, toolArgs);

@@ -1228,8 +1228,13 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                         console.log(`[DirectChat] Executing tool: ${toolName}`, toolArgs);
                         send('tool_start', { name: toolName, args: toolArgs });
 
-                        const tierToolParams = await configStore.getConfig('direct_chat_tier_tool_params') || {};
-                        const tierOverrides = tierToolParams[resolvedTier]?.[toolName] || null;
+                        let tierOverrides = null;
+                        try {
+                            const tierToolParams = await configStore.getConfig('direct_chat_tier_tool_params') || {};
+                            tierOverrides = tierToolParams[resolvedTier]?.[toolName] || null;
+                        } catch (cfgErr) {
+                            console.warn(`[DirectChat] Config lookup failed (tier_tool_params): ${cfgErr.message}`);
+                        }
 
                         let toolResult;
                         try {
@@ -1594,8 +1599,13 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                 console.log(`[DirectChat] Executing streamed tool: ${toolName}`, toolArgs);
                 send('tool_start', { name: toolName, args: toolArgs });
 
-                const tierToolParams = await configStore.getConfig('direct_chat_tier_tool_params') || {};
-                const tierOverrides = tierToolParams[resolvedTier]?.[toolName] || null;
+                let tierOverrides = null;
+                try {
+                    const tierToolParams = await configStore.getConfig('direct_chat_tier_tool_params') || {};
+                    tierOverrides = tierToolParams[resolvedTier]?.[toolName] || null;
+                } catch (cfgErr) {
+                    console.warn(`[DirectChat] Config lookup failed (tier_tool_params, streamed): ${cfgErr.message}`);
+                }
 
                 let toolResult;
                 try {

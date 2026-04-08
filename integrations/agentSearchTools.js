@@ -78,7 +78,12 @@ CITATION RULES:
 
 async function executeAgentSearchTool(toolName, args) {
     const envUrl = process.env.SEARCH_SERVICE_URL;
-    const configUrl = !envUrl ? await configStore.getConfig('agent_search_url') : null;
+    let configUrl = null;
+    try {
+        configUrl = !envUrl ? await configStore.getConfig('agent_search_url') : null;
+    } catch (cfgErr) {
+        console.warn(`[AgentSearch] Config lookup failed (agent_search_url), using env only: ${cfgErr.message}`);
+    }
     const searchUrl = envUrl || configUrl;
     console.log(`[AgentSearch] URL resolved: "${searchUrl}" (source: ${envUrl ? 'env SEARCH_SERVICE_URL' : configUrl ? 'admin config (agent_search_url)' : 'NONE'})`);
     if (!searchUrl) {
@@ -93,8 +98,13 @@ async function executeAgentSearchTool(toolName, args) {
     const { query, mode, max_results, fetch_top_n, detail_level } = args;
     if (!query) return { error: 'query is required' };
 
-    // Load admin-configured defaults
-    const defaults = (await configStore.getConfig('agent_search_defaults')) || {};
+    // Load admin-configured defaults (resilient to transient DB failures)
+    let defaults = {};
+    try {
+        defaults = (await configStore.getConfig('agent_search_defaults')) || {};
+    } catch (cfgErr) {
+        console.warn(`[AgentSearch] Config lookup failed (agent_search_defaults), using built-in defaults: ${cfgErr.message}`);
+    }
 
     // Determine effective mode
     const searchMode = ['web', 'web_fast', 'kb', 'auto'].includes(mode) ? mode : (defaults.mode || 'web');
@@ -122,8 +132,13 @@ async function executeAgentSearchTool(toolName, args) {
     };
 
     try {
-        // Forward Serper API key if configured in admin dashboard
-        const serperKey = await configStore.getSecret('serper_api_key');
+        // Forward Serper API key if configured in admin dashboard (resilient to DB failures)
+        let serperKey = null;
+        try {
+            serperKey = await configStore.getSecret('serper_api_key');
+        } catch (cfgErr) {
+            console.warn(`[AgentSearch] Secret lookup failed (serper_api_key): ${cfgErr.message}`);
+        }
         const headers = { 'Content-Type': 'application/json' };
         if (serperKey) headers['X-Serper-Key'] = serperKey;
         const apiKey = process.env.SERVICES_API_KEY;
