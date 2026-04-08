@@ -614,7 +614,7 @@ router.post('/:id/ingest/n8n', requireAuth, async (req, res) => {
             }
 
             parsedArray.forEach((item, idx) => {
-                let itemMarkdown = item.markdown || item.text || `\`\`\`json\n${JSON.stringify(item, null, 2)}\n\`\`\``;
+                let itemMarkdown = item.markdown || item.text || item.content || `\`\`\`json\n${JSON.stringify(item, null, 2)}\n\`\`\``;
                 let itemTitle = item.fileName || item.filename || item.title || item.name || `n8n Output: ${workflow.name} (Item ${idx + 1})`;
                 documentsToIngest.push({
                     title: itemTitle,
