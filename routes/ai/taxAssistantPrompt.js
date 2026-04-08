@@ -4,7 +4,12 @@
  * Generates a context-rich system prompt for the Dutch Tax Assistant notebook type.
  * Includes Dutch tax law context, period-specific instructions, and integration
  * tool guidance for automated document gathering.
+ *
+ * Key optimization: instructs the AI to use email metadata (subject, sender, snippet)
+ * to infer invoice details BEFORE resorting to expensive OCR/PDF parsing.
  */
+
+const { buildGatheredSummary } = require('../../core/taxInference');
 
 /**
  * Compute the start/end date strings for a tax period.
@@ -58,6 +63,7 @@ function buildTaxAssistantPrompt({
     hasGmail,
     hasDrive,
     timezone,
+    existingSources,
 }) {
     const { periodType, year, quarter, entityType, btwNumber, kvkNumber } = taxConfig || {};
     const dateRange = getDateRange(periodType || 'quarterly', year || new Date().getFullYear(), quarter);
@@ -69,6 +75,9 @@ function buildTaxAssistantPrompt({
     }[entityType] || 'Dutch business';
 
     const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+
+    // Build deduplication summary from existing sources
+    const dedupSection = buildGatheredSummary(existingSources || []);
 
     // Build integration tools section
     let integrationSection = '';
@@ -82,8 +91,8 @@ You have direct access to the user's connected integrations for automated tax do
     • "subject:(factuur OR invoice OR rekening) after:${dateRange.start.replace(/-/g, '/')} before:${dateRange.end.replace(/-/g, '/')} has:attachment"
     • "from:belastingdienst after:${dateRange.start.replace(/-/g, '/')} before:${dateRange.end.replace(/-/g, '/')}"
     • "(subject:betaling OR subject:payment OR subject:overschrijving) after:${dateRange.start.replace(/-/g, '/')} before:${dateRange.end.replace(/-/g, '/')}"
-- gmail_read: Read the full body of a specific email
-- gmail_read_attachment: Extract text from PDF invoice attachments using OCR — essential for reading invoice data`;
+- gmail_read: Read the full body of a specific email (use ONLY when snippet is insufficient)
+- gmail_read_attachment: Extract text from PDF invoice attachments using OCR — EXPENSIVE, use only when metadata is insufficient (see rules below)`;
         }
         if (hasDrive) {
             integrationSection += `
@@ -92,14 +101,82 @@ You have direct access to the user's connected integrations for automated tax do
 - drive_get_content: Read the contents of a specific Drive file`;
         }
         integrationSection += `
+${dedupSection}
+## EFFICIENCY-FIRST GATHERING RULES ##
 
-GATHERING WORKFLOW:
-1. Start with gmail_search using the recommended queries above
-2. For each relevant email with attachments, use gmail_read_attachment to extract invoice data via OCR
-3. Extract key fields: date, invoice number, sender/payee, amount (excl. BTW), BTW amount, BTW rate, total
-4. Use drive_search to find additional documents not sent via email
-5. Add gathered data as notebook sources using notebook_add_source
-6. After gathering, write a structured summary in the document editor`;
+You MUST follow these rules to minimize unnecessary processing:
+
+### STEP 1: Search (cheap — always do this first)
+Use gmail_search with the recommended queries above. This returns email metadata:
+subject, sender, date, snippet (first ~100 chars), attachment filenames.
+
+### STEP 2: Analyze metadata before reading (FREE — use your reasoning)
+For each email result, check if you can ALREADY determine:
+- **Vendor**: from the sender name/email (e.g. billing@github.com → GitHub)
+- **Invoice number**: from the subject (e.g. "Factuur 265029963")
+- **Amount**: from the subject or snippet (e.g. "€7.50" or "EUR 12.95")
+- **Date**: from the email date
+- **Category**: income (your own invoice to a client) vs expense (vendor billing you)
+
+### STEP 3: Decide — OCR or skip?
+
+✅ **SKIP OCR** (use metadata only) when ALL of these are true:
+- Subject contains "factuur", "invoice", or "rekening" — confirming it's an invoice
+- You can identify the vendor from the sender
+- The amount appears in the subject, snippet, or is a known subscription
+- Examples: "MoveMove Factuur 265029963 €7.50", "GitHub Invoice for $4.00"
+
+⚠️ **READ EMAIL BODY** (gmail_read, not attachment) when:
+- Subject confirms an invoice but amount is missing from subject/snippet
+- The email body likely contains the amount inline (subscription receipts, payment confirmations)
+- Don't read the PDF attachment yet — the email body might be sufficient
+
+🔍 **USE OCR** (gmail_read_attachment) ONLY when:
+- Amount cannot be determined from email metadata OR email body
+- The PDF contains a scan/image (not text-based)
+- Multiple attachments and you need to identify which is the invoice
+- Unfamiliar sender with opaque subject like "Document attached"
+- The vendor is unknown and you can't categorize from metadata alone
+
+### STEP 4: Add as source with FULL metadata
+When adding each invoice, ALWAYS call notebook_add_source with the metadata object:
+\`\`\`json
+{
+  "name": "[Vendor] Factuur [Number]",
+  "content": "[invoice summary — vendor, date, amounts, description]",
+  "metadata": {
+    "taxCategory": "expense",
+    "amount": 7.50,
+    "btwAmount": 1.58,
+    "btwRate": 21,
+    "totalAmount": 9.08,
+    "vendor": "MoveMove",
+    "invoiceNumber": "265029963",
+    "invoiceDate": "2026-01-15",
+    "isInvoice": true,
+    "sourceType": "gmail",
+    "emailMessageId": "18f2a3b4c5d6e7f8"
+  }
+}
+\`\`\`
+This metadata populates the dashboard stats instantly — DO NOT omit it.
+
+If you can't determine the exact BTW amount, estimate using:
+- 21% standard rate (most services/goods): btwAmount = totalAmount - (totalAmount / 1.21)
+- 9% reduced rate (food, books, accommodation): btwAmount = totalAmount - (totalAmount / 1.09)
+
+### STEP 5: Drive search (if connected)
+After Gmail, search Drive for additional financial documents:
+- Look for PDFs with names like "Factuur-*.pdf", "Invoice-*.pdf"
+- Check folders named "Administratie", "Boekhouding", "Facturen"
+- Use drive_get_content to read promising files
+- Apply the same metadata rules when adding as source
+
+### STEP 6: Summary
+After gathering, report:
+- "Found X emails, gathered Y new invoices (Z already existed, W skipped — not invoices)"
+- Brief per-invoice summary: vendor, amount, category
+- Total income and expenses found`;
     } else {
         integrationSection = `\n[NOTE: No email or cloud storage integrations are currently connected. The user will need to manually upload invoices and documents as notebook sources. Encourage them to connect their Google account for automated gathering.]`;
     }

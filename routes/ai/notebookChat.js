@@ -23,6 +23,7 @@ const { AGENT_SEARCH_TOOLS, executeAgentSearchTool, isAgentSearchTool } = requir
 const { searchNotebookKB, executeNotebookKBSearchTool, NOTEBOOK_KB_SEARCH_TOOL } = require('../../core/notebookKnowledgeSearch');
 const { buildTaxAssistantPrompt } = require('./taxAssistantPrompt');
 const { executeTool: dispatchTool } = require('../../core/toolDispatcher');
+const { isDuplicate, buildGatheredSummary } = require('../../core/taxInference');
 
 // Tax-relevant integration tool names (only these are injected for tax notebooks)
 const TAX_TOOL_NAMES = ['gmail_search', 'gmail_read', 'gmail_read_attachment', 'drive_search', 'drive_get_content'];
@@ -238,6 +239,7 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
             systemPrompt = buildTaxAssistantPrompt({
                 notebook, taxConfig, sourceSummary, kbContext, documentContext,
                 searchAvailable, hasGmail, hasDrive, timezone,
+                existingSources: sources,
             });
         } else {
             systemPrompt = `You are an intelligent notebook assistant. Today is ${today}.
@@ -434,7 +436,8 @@ Now: ${new Date().toLocaleString('sv-SE', { timeZone: timezone || 'UTC', timeZon
         // Track mutable document content (updated by tool calls)
         let currentDocContent = documentContent || '';
         let toolCallRounds = 0;
-        const MAX_TOOL_ROUNDS = 5;
+        // Tax gathering needs many more rounds (search + read + add_source per invoice)
+        const MAX_TOOL_ROUNDS = isTaxAssistant ? 15 : 5;
 
         while (toolCallRounds < MAX_TOOL_ROUNDS) {
             let result;
@@ -490,26 +493,39 @@ Now: ${new Date().toLocaleString('sv-SE', { timeZone: timezone || 'UTC', timeZon
                         const { ingestTextSource } = require('../../agents/notebooks/sourceIngestion');
                         const sourceName = toolArgs.name || 'AI Research';
                         const sourceContent = toolArgs.content || '';
+                        const sourceMeta = toolArgs.metadata || {};
 
                         if (!sourceContent.trim()) {
                             toolResult = { error: 'Content is required to add a source.' };
+                        }
+                        // Deduplication: check if this doc was already gathered
+                        else if (isTaxAssistant && isDuplicate(sources, sourceMeta)) {
+                            toolResult = {
+                                alreadyExists: true,
+                                message: `Source "${sourceName}" was already gathered. Skipped to avoid duplicates.`,
+                            };
+                            console.log(`[NotebookChat] Dedup: skipped "${sourceName}" (already exists)`);
                         } else {
-                            // Create the source record
+                            // Create the source record with structured metadata
                             const source = await notebookStore.addSource({
                                 notebookId,
                                 type: 'text',
                                 name: sourceName,
+                                metadata: sourceMeta,
                                 wordCount: sourceContent.split(/\s+/).length,
                             });
+
+                            // Track new source for in-flight dedup within same session
+                            sources.push({ ...source, metadata: sourceMeta });
 
                             // Background ingest (chunk + index)
                             ingestTextSource(notebookId, source.id, userId, sourceContent, sourceName).catch(err => {
                                 console.error(`[NotebookChat] Source ingestion failed:`, err.message);
                             });
 
-                            // Notify frontend
+                            // Notify frontend with metadata for instant dashboard update
                             send('notebook_source_added', {
-                                source: { id: source.id, name: sourceName, type: 'text', status: 'processing' }
+                                source: { id: source.id, name: sourceName, type: 'text', status: 'processing', metadata: sourceMeta }
                             });
 
                             toolResult = {
@@ -517,7 +533,7 @@ Now: ${new Date().toLocaleString('sv-SE', { timeZone: timezone || 'UTC', timeZon
                                 message: `Source "${sourceName}" added to the notebook. It's being indexed and will be available for citation shortly.`,
                                 sourceId: source.id
                             };
-                            console.log(`[NotebookChat] Added source "${sourceName}" (${sourceContent.split(/\s+/).length} words)`);
+                            console.log(`[NotebookChat] Added source "${sourceName}" (${sourceContent.split(/\s+/).length} words, vendor: ${sourceMeta.vendor || 'unknown'})`);
                         }
                     } catch (err) {
                         console.error('[NotebookChat] Add source failed:', err.message);
@@ -628,16 +644,21 @@ Now: ${new Date().toLocaleString('sv-SE', { timeZone: timezone || 'UTC', timeZon
                         const { ingestTextSource } = require('../../agents/notebooks/sourceIngestion');
                         const sourceName = toolArgs.name || 'AI Research';
                         const sourceContent = toolArgs.content || '';
-                        if (sourceContent.trim()) {
+                        const sourceMeta = toolArgs.metadata || {};
+                        if (!sourceContent.trim()) {
+                            toolResult = { error: 'Content is required.' };
+                        } else if (isTaxAssistant && isDuplicate(sources, sourceMeta)) {
+                            toolResult = { alreadyExists: true, message: `Source "${sourceName}" already exists. Skipped.` };
+                        } else {
                             const source = await notebookStore.addSource({
                                 notebookId, type: 'text', name: sourceName,
+                                metadata: sourceMeta,
                                 wordCount: sourceContent.split(/\s+/).length,
                             });
+                            sources.push({ ...source, metadata: sourceMeta });
                             ingestTextSource(notebookId, source.id, userId, sourceContent, sourceName).catch(() => {});
-                            send('notebook_source_added', { source: { id: source.id, name: sourceName, type: 'text', status: 'processing' } });
-                            toolResult = { success: true, message: `Source "${sourceName}" added.` };
-                        } else {
-                            toolResult = { error: 'Content is required.' };
+                            send('notebook_source_added', { source: { id: source.id, name: sourceName, type: 'text', status: 'processing', metadata: sourceMeta } });
+                            toolResult = { success: true, message: `Source "${sourceName}" added.`, sourceId: source.id };
                         }
                     } catch (err) {
                         toolResult = { error: err.message };

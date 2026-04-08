@@ -110,6 +110,23 @@ const DRIVE_TOOLS = [
                 required: ['name']
             }
         }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'drive_get_content',
+            description: 'Download and read the text content of a Google Drive file. Supports Google Docs (exported as plain text), Google Sheets (exported as CSV), PDFs (text extracted), and plain text files. Use this after drive_search to read the actual content of financial documents, invoices, or spreadsheets stored in Drive.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    fileId: {
+                        type: 'string',
+                        description: 'The file ID from drive_search or drive_list_files results'
+                    }
+                },
+                required: ['fileId']
+            }
+        }
     }
 ];
 
@@ -278,13 +295,118 @@ async function executeDriveTool(toolName, args, session) {
             };
         }
 
+        case 'drive_get_content': {
+            if (!args.fileId) return { error: 'fileId is required' };
+
+            // Get file metadata first to determine how to read it
+            const fileMeta = await drive.files.get({
+                fileId: args.fileId,
+                fields: 'id, name, mimeType, size',
+                supportsAllDrives: true,
+            });
+            const mimeType = fileMeta.data.mimeType;
+            const fileName = fileMeta.data.name;
+            const MAX_CHARS = 80000;
+
+            let content = '';
+
+            // Google Docs → export as plain text
+            if (mimeType === 'application/vnd.google-apps.document') {
+                const exp = await drive.files.export({
+                    fileId: args.fileId,
+                    mimeType: 'text/plain',
+                });
+                content = typeof exp.data === 'string' ? exp.data : String(exp.data);
+            }
+            // Google Sheets → export as CSV
+            else if (mimeType === 'application/vnd.google-apps.spreadsheet') {
+                const exp = await drive.files.export({
+                    fileId: args.fileId,
+                    mimeType: 'text/csv',
+                });
+                content = typeof exp.data === 'string' ? exp.data : String(exp.data);
+            }
+            // Google Slides → export as plain text
+            else if (mimeType === 'application/vnd.google-apps.presentation') {
+                const exp = await drive.files.export({
+                    fileId: args.fileId,
+                    mimeType: 'text/plain',
+                });
+                content = typeof exp.data === 'string' ? exp.data : String(exp.data);
+            }
+            // PDF → download + extract text
+            else if (mimeType === 'application/pdf') {
+                try {
+                    const dlRes = await drive.files.get({
+                        fileId: args.fileId,
+                        alt: 'media',
+                        supportsAllDrives: true,
+                    }, { responseType: 'arraybuffer' });
+                    const pdfBuffer = Buffer.from(dlRes.data);
+
+                    // Try Mistral OCR first, then local PDF extractor
+                    let extracted = '';
+                    try {
+                        const { mistralOCR } = require('../core/ocr');
+                        const base64 = pdfBuffer.toString('base64');
+                        extracted = await mistralOCR(base64, 'application/pdf', fileName);
+                    } catch (ocrErr) {
+                        console.log(`[Drive] OCR failed for ${fileName}: ${ocrErr.message}, trying local...`);
+                    }
+                    if (!extracted) {
+                        try {
+                            const { extractTextFromPDF } = require('../core/pdfExtractor');
+                            extracted = await extractTextFromPDF(pdfBuffer, fileName);
+                        } catch (pdfErr) {
+                            console.log(`[Drive] Local PDF extraction failed for ${fileName}: ${pdfErr.message}`);
+                        }
+                    }
+                    content = extracted || `[PDF: ${fileName} — could not extract text]`;
+                } catch (dlErr) {
+                    return { error: `Failed to download PDF: ${dlErr.message}`, fileName };
+                }
+            }
+            // Plain text / CSV / other downloadable formats
+            else if (
+                mimeType?.startsWith('text/') ||
+                mimeType === 'application/json' ||
+                mimeType === 'application/csv' ||
+                mimeType === 'application/xml'
+            ) {
+                const dlRes = await drive.files.get({
+                    fileId: args.fileId,
+                    alt: 'media',
+                    supportsAllDrives: true,
+                }, { responseType: 'text' });
+                content = typeof dlRes.data === 'string' ? dlRes.data : String(dlRes.data);
+            }
+            // Unsupported format
+            else {
+                return {
+                    error: `Cannot read content of ${mimeType} files. Supported: Google Docs, Sheets, Slides, PDF, and text files.`,
+                    fileName, mimeType,
+                };
+            }
+
+            return {
+                fileId: args.fileId,
+                fileName,
+                mimeType,
+                content: content.length > MAX_CHARS
+                    ? content.substring(0, MAX_CHARS) + '\n\n[... truncated, file too large ...]'
+                    : content,
+                charCount: content.length,
+                truncated: content.length > MAX_CHARS,
+            };
+        }
+
         default:
             return { error: `Unknown drive tool: ${toolName}` };
     }
 }
 
 function isDriveTool(toolName) {
-    return ['drive_search', 'drive_list_files', 'drive_get_file', 'drive_move_file', 'drive_create_folder'].includes(toolName);
+    return ['drive_search', 'drive_list_files', 'drive_get_file', 'drive_get_content', 'drive_move_file', 'drive_create_folder'].includes(toolName);
 }
 
 module.exports = {

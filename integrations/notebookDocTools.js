@@ -72,17 +72,71 @@ const NOTEBOOK_ADD_SOURCE_TOOL = {
     type: 'function',
     function: {
         name: 'notebook_add_source',
-        description: 'Add content as a new source to the notebook. Use this to directly pass web search results, research findings, or any text content as a notebook source for future reference. The content will be indexed and available for citation in future queries. This is perfect for saving web search results as a source — pass the search results directly without re-fetching.',
+        description: 'Add content as a new source to the notebook. Use this to directly pass web search results, research findings, or any text content as a notebook source for future reference. The content will be indexed and available for citation in future queries. For tax notebooks: ALWAYS include the metadata object with structured financial fields — this powers the dashboard stats.',
         parameters: {
             type: 'object',
             properties: {
                 name: {
                     type: 'string',
-                    description: 'A short descriptive name for the source (e.g. "Web Search: AI trends 2026", "React Documentation", "Market Analysis")'
+                    description: 'A short descriptive name for the source (e.g. "MoveMove Factuur 265029963", "GitHub Invoice INV-2026-04")'
                 },
                 content: {
                     type: 'string',
-                    description: 'The full text content to add as a source. For web search results, pass the complete search results text including titles, content, and URLs.'
+                    description: 'The full text content to add as a source. For invoices, include all extracted financial data. For web search results, pass the complete text.'
+                },
+                metadata: {
+                    type: 'object',
+                    description: 'Structured metadata for the source. For tax notebooks, ALWAYS populate the financial fields below — they power the dashboard statistics.',
+                    properties: {
+                        taxCategory: {
+                            type: 'string',
+                            description: 'Classification: "income" for sales/revenue invoices, "expense" for cost/purchase invoices'
+                        },
+                        amount: {
+                            type: 'number',
+                            description: 'Amount excluding BTW/VAT (e.g. 7.50)'
+                        },
+                        btwAmount: {
+                            type: 'number',
+                            description: 'BTW/VAT amount (e.g. 1.58)'
+                        },
+                        btwRate: {
+                            type: 'number',
+                            description: 'BTW rate as percentage: 0, 9, or 21'
+                        },
+                        totalAmount: {
+                            type: 'number',
+                            description: 'Total amount including BTW (e.g. 9.08)'
+                        },
+                        vendor: {
+                            type: 'string',
+                            description: 'Vendor/customer name (e.g. "MoveMove", "GitHub")'
+                        },
+                        invoiceNumber: {
+                            type: 'string',
+                            description: 'Invoice/receipt number'
+                        },
+                        invoiceDate: {
+                            type: 'string',
+                            description: 'Invoice date in YYYY-MM-DD format'
+                        },
+                        isInvoice: {
+                            type: 'boolean',
+                            description: 'Whether this document is an invoice'
+                        },
+                        sourceType: {
+                            type: 'string',
+                            description: 'Origin: "gmail", "drive", "upload", or "manual"'
+                        },
+                        emailMessageId: {
+                            type: 'string',
+                            description: 'Gmail message ID — used for deduplication to prevent re-processing'
+                        },
+                        driveFileId: {
+                            type: 'string',
+                            description: 'Google Drive file ID — used for deduplication'
+                        }
+                    }
                 }
             },
             required: ['name', 'content']

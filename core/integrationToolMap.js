@@ -53,7 +53,7 @@ const INTEGRATION_TOOL_MAP = {
     agent_search: {
         integration: 'web_search',
         label: 'Web Search',
-        serverFn: () => 'google.com/search (via SerpAPI)',
+        serverFn: () => 'api.serper.dev (Google Search)',
         direction: 'sent',
         dataCategories: 'search_query',
     },
