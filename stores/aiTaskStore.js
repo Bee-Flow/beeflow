@@ -32,7 +32,7 @@ async function initDB() {
             tools_enabled TEXT DEFAULT '["agent_search"]',
             max_result_length INTEGER DEFAULT 50000,
             run_count INTEGER DEFAULT 0,
-            timezone TEXT DEFAULT 'UTC',
+            timezone TEXT DEFAULT 'Europe/Amsterdam',
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
 
@@ -94,7 +94,7 @@ async function createTask({ userId, title, prompt, repeatInterval, nextRunAt, mo
             repeatInterval || null,
             nextRunAt,
             modelTier || 'fast',
-            timezone || 'UTC',
+            timezone || 'Europe/Amsterdam',
             JSON.stringify(toolsEnabled || ['agent_search']),
         ]
     );
@@ -107,7 +107,7 @@ async function createTask({ userId, title, prompt, repeatInterval, nextRunAt, mo
         is_active: true, model_tier: modelTier || 'fast',
         tools_enabled: JSON.stringify(toolsEnabled || ['agent_search']),
         max_result_length: 2000, run_count: 0,
-        timezone: timezone || 'UTC',
+        timezone: timezone || 'Europe/Amsterdam',
         created_at: new Date().toISOString(),
     });
 }

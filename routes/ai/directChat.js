@@ -551,7 +551,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         }
 
         // Build Now: with explicit UTC offset so the AI knows the user's local time
-        const _tz = timezone || 'UTC';
+        const _tz = timezone || 'Europe/Amsterdam';
         let _nowStr;
         try {
             const _now = new Date();
@@ -1347,6 +1347,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                                 nanoBananaSettings,
                                 req,
                                 attachments,
+                                timezone: timezone || 'Europe/Amsterdam',
                                 onImageGenerated: (data) => generatedImages.push(data),
                                 terminalCtx: {
                                     agentId: `user-${userId}`,
@@ -1731,6 +1732,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                         nanoBananaSettings,
                         req,
                         attachments,
+                        timezone: timezone || 'Europe/Amsterdam',
                         onImageGenerated: (data) => generatedImages.push(data),
                         terminalCtx: {
                             agentId: `user-${userId}`,

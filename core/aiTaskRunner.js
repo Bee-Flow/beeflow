@@ -23,7 +23,7 @@ const MAX_TOOL_ITERATIONS = 5;
  */
 function buildTaskSystemPrompt(task, toolHint) {
     // Compute "Now:" in the task's timezone with explicit offset
-    const tz = task.timezone || 'UTC';
+    const tz = task.timezone || 'Europe/Amsterdam';
     let nowStr;
     try {
         const now = new Date();
