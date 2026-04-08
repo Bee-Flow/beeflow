@@ -1241,6 +1241,17 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                                     if (qMatches.length > 0) {
                                         const ruleNames = qMatches.map(m => m.ruleName).join(', ');
                                         console.log(`[DirectChat WebSearchGuard] Search query BLOCKED by regex: ${ruleNames}`);
+                                        guardrailEventStore.logGuardrailEvent({
+                                            organization_id: userOrgId || null,
+                                            user_id: userId,
+                                            conversation_id: convId || null,
+                                            violation_type: 'regex',
+                                            violation_categories: ruleNames,
+                                            direction: 'input',
+                                            action_taken: 'search_blocked',
+                                            source: 'direct',
+                                            model: modelId || null,
+                                        }).catch(() => {});
                                         send('tool_end', { name: toolName, result: '[Web search blocked — query violates content policy]' });
                                         return { role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify({ error: 'Web search blocked — query violates content policy. Please rephrase.' }) };
                                     }
@@ -1253,6 +1264,17 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                                         console.log(`[DirectChat WebSearchGuard] Search query passed`);
                                     } catch (guardErr) {
                                         console.log(`[DirectChat WebSearchGuard] Search query BLOCKED: ${guardErr.message}`);
+                                        guardrailEventStore.logGuardrailEvent({
+                                            organization_id: userOrgId || null,
+                                            user_id: userId,
+                                            conversation_id: convId || null,
+                                            violation_type: 'moderation',
+                                            violation_categories: 'Web Search Guard',
+                                            direction: 'input',
+                                            action_taken: 'search_blocked',
+                                            source: 'direct',
+                                            model: modelId || null,
+                                        }).catch(() => {});
                                         send('tool_end', { name: toolName, result: '[Web search blocked — query violates content policy]' });
                                         return { role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify({ error: 'Web search blocked — query violates content policy. Please rephrase.' }) };
                                     }
@@ -1265,6 +1287,17 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                                         if (piiResult?.hasPii) {
                                             const cats = [...new Set(piiResult.entities.map(e => e.label))].join(', ');
                                             console.log(`[DirectChat WebSearchGuard] Search query BLOCKED by PII (${cats})`);
+                                            guardrailEventStore.logGuardrailEvent({
+                                                organization_id: userOrgId || null,
+                                                user_id: userId,
+                                                conversation_id: convId || null,
+                                                violation_type: 'pii',
+                                                violation_categories: cats,
+                                                direction: 'input',
+                                                action_taken: 'search_blocked',
+                                                source: 'direct',
+                                                model: modelId || null,
+                                            }).catch(() => {});
                                             send('tool_end', { name: toolName, result: `[Web search blocked — query contains sensitive information (${cats})]` });
                                             return { role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify({ error: `Web search blocked — query contains sensitive personal information (${cats}). Please rephrase without PII.` }) };
                                         }
@@ -1568,6 +1601,17 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                             if (qMatches.length > 0) {
                                 const ruleNames = qMatches.map(m => m.ruleName).join(', ');
                                 console.log(`[DirectChat WebSearchGuard] Streamed search query BLOCKED by regex: ${ruleNames}`);
+                                guardrailEventStore.logGuardrailEvent({
+                                    organization_id: userOrgId || null,
+                                    user_id: userId,
+                                    conversation_id: convId || null,
+                                    violation_type: 'regex',
+                                    violation_categories: ruleNames,
+                                    direction: 'input',
+                                    action_taken: 'search_blocked',
+                                    source: 'direct',
+                                    model: modelId || null,
+                                }).catch(() => {});
                                 send('tool_end', { name: toolName, result: '[Web search blocked — query violates content policy]' });
                                 return { role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify({ error: 'Web search blocked — query violates content policy. Please rephrase.' }) };
                             }
@@ -1580,6 +1624,17 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                                 console.log(`[DirectChat WebSearchGuard] Streamed search query passed`);
                             } catch (guardErr) {
                                 console.log(`[DirectChat WebSearchGuard] Streamed search query BLOCKED: ${guardErr.message}`);
+                                guardrailEventStore.logGuardrailEvent({
+                                    organization_id: userOrgId || null,
+                                    user_id: userId,
+                                    conversation_id: convId || null,
+                                    violation_type: 'moderation',
+                                    violation_categories: 'Web Search Guard',
+                                    direction: 'input',
+                                    action_taken: 'search_blocked',
+                                    source: 'direct',
+                                    model: modelId || null,
+                                }).catch(() => {});
                                 send('tool_end', { name: toolName, result: '[Web search blocked — query violates content policy]' });
                                 return { role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify({ error: 'Web search blocked — query violates content policy. Please rephrase.' }) };
                             }
@@ -1592,6 +1647,17 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                                 if (piiResult?.hasPii) {
                                     const cats = [...new Set(piiResult.entities.map(e => e.label))].join(', ');
                                     console.log(`[DirectChat WebSearchGuard] Streamed search query BLOCKED by PII (${cats})`);
+                                    guardrailEventStore.logGuardrailEvent({
+                                        organization_id: userOrgId || null,
+                                        user_id: userId,
+                                        conversation_id: convId || null,
+                                        violation_type: 'pii',
+                                        violation_categories: cats,
+                                        direction: 'input',
+                                        action_taken: 'search_blocked',
+                                        source: 'direct',
+                                        model: modelId || null,
+                                    }).catch(() => {});
                                     send('tool_end', { name: toolName, result: `[Web search blocked — query contains sensitive information (${cats})]` });
                                     return { role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify({ error: `Web search blocked — query contains sensitive personal information (${cats}). Please rephrase without PII.` }) };
                                 }

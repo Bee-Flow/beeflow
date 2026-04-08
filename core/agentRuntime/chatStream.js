@@ -1086,6 +1086,19 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                             console.log(`[WebSearchGuard] Search query passed: "${toolArgs.query.substring(0, 80)}"`);
                         } catch (guardError) {
                             console.log(`[WebSearchGuard] Search query BLOCKED: "${toolArgs.query.substring(0, 80)}" — ${guardError.message}`);
+                            guardrailEventStore.logGuardrailEvent({
+                                organization_id: agent.organization_id || null,
+                                user_id: userId,
+                                agent_id: agentId,
+                                agent_name: agent.name,
+                                conversation_id: conversation?.id || null,
+                                violation_type: 'moderation',
+                                violation_categories: 'Web Search Guard',
+                                direction: 'input',
+                                action_taken: 'search_blocked',
+                                source: isSwarm ? 'swarm_orchestrator' : 'agent_stream',
+                                model: modelToUse,
+                            }).catch(() => {});
                             onEvent('tool_end', { name: toolName, result: `[Web search blocked — query violates content policy]` });
                             return {
                                 toolCall,
@@ -1105,6 +1118,19 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                             if (piiResult?.hasPii) {
                                 const cats = [...new Set(piiResult.entities.map(e => e.label))].join(', ');
                                 console.log(`[WebSearchGuard] Search query BLOCKED by PII (${cats}): "${toolArgs.query.substring(0, 80)}"`);
+                                guardrailEventStore.logGuardrailEvent({
+                                    organization_id: agent.organization_id || null,
+                                    user_id: userId,
+                                    agent_id: agentId,
+                                    agent_name: agent.name,
+                                    conversation_id: conversation?.id || null,
+                                    violation_type: 'pii',
+                                    violation_categories: cats,
+                                    direction: 'input',
+                                    action_taken: 'search_blocked',
+                                    source: isSwarm ? 'swarm_orchestrator' : 'agent_stream',
+                                    model: modelToUse,
+                                }).catch(() => {});
                                 onEvent('tool_end', { name: toolName, result: `[Web search blocked — query contains sensitive information (${cats})]` });
                                 return {
                                     toolCall,
