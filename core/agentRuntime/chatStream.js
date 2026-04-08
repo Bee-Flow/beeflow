@@ -478,11 +478,20 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         }
     }
 
+    // KB source references accumulator (declared early because performKnowledgeSearch emits before the main loop)
+    let _kbSources = [];
+
     // ============ VECTOR KNOWLEDGE BASE ============
     // Only search KB if guardrails did NOT fire — prevents leaking sensitive KB content
     if (!moderationViolation && !guardrailViolation) {
         try {
-            const kbExtension = await performKnowledgeSearch({ agent, userId, userMessage, isStrictKnowledge, onEvent });
+            const kbExtension = await performKnowledgeSearch({ agent, userId, userMessage, isStrictKnowledge, onEvent: (type, data) => {
+                // Intercept kb_sources to accumulate for persistence
+                if (type === 'kb_sources' && data?.sources) {
+                    _kbSources.push(...data.sources);
+                }
+                onEvent(type, data);
+            } });
             if (kbExtension) {
                 systemPrompt += kbExtension;
             }
@@ -1289,6 +1298,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     // Emit kb_sources SSE event so frontend shows knowledge base sources
                     if (finalToolResult?._action === 'kb_sources' && finalToolResult._sources?.length > 0) {
                         onEvent('kb_sources', { sources: finalToolResult._sources });
+                        _kbSources.push(...finalToolResult._sources);
                     }
 
                     // Track audio files for persistence (sent via SSE by the tool)
@@ -1597,6 +1607,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             if (_mapEmbeds.length > 0) assistantMsg.mapEmbeds = _mapEmbeds;
             if (_audioFiles.length > 0) assistantMsg.audioFiles = _audioFiles;
             if (_toolHistory.length > 0) assistantMsg.toolHistory = _toolHistory;
+            if (_kbSources.length > 0) assistantMsg.kbSources = _kbSources;
 
             // Emit phase completion for the last phase
             if (isSwarm && swarm.phases?.length > 0) {

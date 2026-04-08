@@ -112,9 +112,13 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
         }
 
         // ── Minimum relevance floor ──────────────────────────────────
-        // Drop any chunk below 60% to keep only meaningful results.
-        const MIN_SCORE_THRESHOLD = 0.60;
-        allKnowledgeResults = allKnowledgeResults.filter(r => (r.score || 0) >= MIN_SCORE_THRESHOLD);
+        // When a reranker is active, scores are calibrated 0-1 → apply 60% floor.
+        // Without reranker, scores are RRF fusion values (typically 0.01-0.03) →
+        // skip this filter (the MIN_SCORE check above already handles the floor).
+        if (hasReranker) {
+            const MIN_SCORE_THRESHOLD = 0.60;
+            allKnowledgeResults = allKnowledgeResults.filter(r => (r.score || 0) >= MIN_SCORE_THRESHOLD);
+        }
 
         const deduped = [];
         const dedupedTokenSets = [];
@@ -141,6 +145,8 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
             if (deduped.length >= TOP_K_MAX) break;
         }
         const topResults = deduped;
+
+        console.log(`[KnowledgeSearch] Results: ${allKnowledgeResults.length} after filters → ${topResults.length} after dedup (hasReranker=${hasReranker}, includeRefs=${agent.config?.includeSourceReferences})`);
 
         // Per-chunk content cap: keep context manageable for the model.
         const MAX_CHUNK_CHARS = 4000;
