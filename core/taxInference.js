@@ -73,12 +73,12 @@ const AMOUNT_PATTERNS = [
 // ── Invoice number patterns ─────────────────────────────────────────
 
 const INVOICE_NUMBER_PATTERNS = [
-    // "Factuur 12345" / "Invoice #12345" / "Factuurnummer: 12345"
-    /(?:factuur(?:nummer)?|invoice|inv|receipt)\s*[#:.\s-]*(\w[\w-]{3,})/i,
-    // "INV-2026-001" style
+    // "Factuur 12345" / "Invoice #12345" / "Factuurnummer: 12345" — must start with digit
+    /(?:factuur(?:nummer)?|invoice|inv|receipt)\s*[#:.\s-]*(\d[\w-]{2,})/i,
+    // "INV-2026-001" style (standalone)
     /\b(INV-\d[\w-]+)\b/i,
-    // Filename patterns: Factuur-2026-001.pdf
-    /(?:factuur|invoice|inv)[_\s-]*(\d[\w-]+)/i,
+    // Filename patterns: Factuur-2026-001.pdf — must start with digit
+    /(?:factuur|invoice|inv)[_\s-]+(\d[\w-]+)/i,
 ];
 
 // ── Invoice keyword detection ───────────────────────────────────────
