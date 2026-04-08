@@ -585,6 +585,8 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     let _mapEmbeds = [];
     let _audioFiles = [];
     let _toolHistory = []; // Track tool calls for persistence
+    let _thinking = '';    // Accumulate model reasoning for persistence
+    let _orchestratorThinking = ''; // Accumulate swarm orchestrator thinking
 
     // Abort signal from the route handler (client disconnect)
     const signal = messageMetadata.signal || null;
@@ -747,12 +749,15 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                                 onEvent('content', { text: textChunk });
                             } else {
                                 onEvent('orchestrator_thinking', { text: textChunk });
+                                _orchestratorThinking += textChunk;
                             }
                         } else if (type === 'thinking') {
                             if (isSwarm) {
                                 onEvent('orchestrator_thinking', { text: data.text });
+                                _orchestratorThinking += data.text;
                             } else {
                                 onEvent('thinking', { text: data.text });
+                                _thinking += data.text;
                             }
                         } else if (type === 'tool_use') {
                             // Accumulate tool calls for post-stream processing
@@ -916,8 +921,10 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                                                 if (thinkText) {
                                                     if (isSwarm) {
                                                         onEvent('orchestrator_thinking', { text: thinkText });
+                                                        _orchestratorThinking += thinkText;
                                                     } else {
                                                         onEvent('thinking', { text: thinkText });
+                                                        _thinking += thinkText;
                                                     }
                                                 }
                                             } else if (chunk.type === 'text' && chunk.text) {
@@ -950,6 +957,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                                         } else {
                                             // In swarm mode, emit orchestrator text as thinking so the UI can show it
                                             onEvent('orchestrator_thinking', { text: textChunk });
+                                            _orchestratorThinking += textChunk;
                                         }
                                     }
                                 }
@@ -1608,6 +1616,8 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             if (_audioFiles.length > 0) assistantMsg.audioFiles = _audioFiles;
             if (_toolHistory.length > 0) assistantMsg.toolHistory = _toolHistory;
             if (_kbSources.length > 0) assistantMsg.kbSources = _kbSources;
+            if (_thinking) assistantMsg.thinking = _thinking;
+            if (_orchestratorThinking) assistantMsg.orchestratorThinking = _orchestratorThinking;
 
             // Emit phase completion for the last phase
             if (isSwarm && swarm.phases?.length > 0) {
