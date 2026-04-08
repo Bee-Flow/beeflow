@@ -163,30 +163,39 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         ? swarmOrchestrator.getSwarmToolsForPhase(swarm, 0)
         : await getAgentTools(agentId);
 
+    // ── Check per-agent external tools disable flag ──────
+    const disableExternalTools = agent.config?.disableExternalTools === true;
+
     // ── Inject integration tools (Gmail, Calendar, etc.) ──────
     // These require OAuth tokens from the user session
     let n8nOrgId = null;
-    try {
-        const { getIntegrationTools, buildToolHint } = require('../integrationTools');
-        const session = userAuth?.session;
-        const integrationResult = await getIntegrationTools({
-            userId,
-            session,
-            isAdmin: session?.user?.isAdmin || false,
-            agentConfig: agent.config,
-        });
-        if (integrationResult.tools.length > 0) {
-            // Deduplicate — don't add integration tools that overlap with component tools
-            for (const intTool of integrationResult.tools) {
-                if (!tools.find(t => t.function?.name === intTool.function?.name)) {
-                    tools.push(intTool);
+    if (!disableExternalTools) {
+        try {
+            const { getIntegrationTools, buildToolHint } = require('../integrationTools');
+            const session = userAuth?.session;
+            const integrationResult = await getIntegrationTools({
+                userId,
+                session,
+                isAdmin: session?.user?.isAdmin || false,
+                agentConfig: agent.config,
+            });
+            if (integrationResult.tools.length > 0) {
+                // Deduplicate — don't add integration tools that overlap with component tools
+                for (const intTool of integrationResult.tools) {
+                    if (!tools.find(t => t.function?.name === intTool.function?.name)) {
+                        tools.push(intTool);
+                    }
                 }
+                console.log(`[AgentRuntime] Injected ${integrationResult.tools.length} integration tools for agent ${agentId}`);
             }
-            console.log(`[AgentRuntime] Injected ${integrationResult.tools.length} integration tools for agent ${agentId}`);
+            n8nOrgId = integrationResult.n8nOrgId;
+        } catch (intErr) {
+            console.warn('[AgentRuntime] Integration tools injection failed:', intErr.message);
         }
-        n8nOrgId = integrationResult.n8nOrgId;
-    } catch (intErr) {
-        console.warn('[AgentRuntime] Integration tools injection failed:', intErr.message);
+    } else {
+        // Also strip web search when external tools are disabled
+        tools = tools.filter(t => t.function?.name !== 'agent_search');
+        console.log(`[AgentRuntime] External tools disabled for agent ${agentId} — skipping integrations and web search`);
     }
 
     // ── Built-in: set_reminder tool (always available) ────────────
