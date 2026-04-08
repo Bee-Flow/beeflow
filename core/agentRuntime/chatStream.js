@@ -13,7 +13,7 @@ const path = require('path');
 // Legacy swarm modules removed — isSwarm is always false
 const usageStore = require('../../stores/usageStore');
 const integrationActivityStore = require('../../stores/integrationActivityStore');
-const { resolveIntegration } = require('../integrationToolMap');
+const { resolveIntegration, scanOutputForPii } = require('../integrationToolMap');
 
 const { classifyPromptComplexity } = require('../promptClassifier');
 const configStore = require('../../stores/configStore');
@@ -1315,6 +1315,9 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     try {
                         const integMeta = resolveIntegration(toolName, toolArgs || {});
                         if (integMeta) {
+                            // Scan tool output for PII (lightweight regex, no API calls)
+                            const resultText = typeof finalToolResult === 'string' ? finalToolResult : JSON.stringify(finalToolResult || '');
+                            const piiDetected = scanOutputForPii(resultText);
                             // Fire-and-forget: check shield config + log
                             const shieldKey = `org_privacy_shield_${agent.organization_id}`;
                             configStore.getConfig(shieldKey).then(shield => {
@@ -1330,6 +1333,8 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                                         server_endpoint: integMeta.server,
                                         data_direction: integMeta.direction,
                                         data_categories: integMeta.dataCategories,
+                                        pii_categories_detected: piiDetected || null,
+                                        pii_scan_enabled: true,
                                         source: isSwarm ? 'swarm_orchestrator' : 'agent_stream',
                                         model: modelToUse,
                                     }).catch(e => console.error('[IntegrationActivityLog] Error:', e.message));

@@ -213,7 +213,7 @@ async function executeTask(task) {
         }
 
         // Truncate if needed
-        const maxLen = task.maxResultLength || 2000;
+        const maxLen = task.maxResultLength || 10000;
         if (finalResponse.length > maxLen) {
             finalResponse = finalResponse.substring(0, maxLen) + '\n\n… (truncated)';
         }

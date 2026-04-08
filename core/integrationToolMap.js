@@ -303,9 +303,34 @@ function resolveIntegration(toolName, toolArgs = {}, ctx = {}) {
     return null;
 }
 
+/**
+ * Lightweight regex-based PII scanner for tool output.
+ * Runs entirely in-process — no external API calls.
+ * Returns a comma-separated string of detected PII categories, or empty string.
+ */
+const PII_PATTERNS = [
+    { category: 'Email Address', pattern: /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g },
+    { category: 'Phone Number', pattern: /(?:\+?\d{1,4}[\s\-]?)?(?:\(?\d{2,4}\)?[\s\-]?)?\d{3,4}[\s\-]?\d{4}/g },
+    { category: 'IBAN', pattern: /\b[A-Z]{2}\d{2}[A-Z0-9]{8,30}\b/g },
+    { category: 'Credit Card', pattern: /\b(?:\d{4}[\s\-]?){3}\d{1,4}\b/g },
+    { category: 'IP Address', pattern: /\b(?:\d{1,3}\.){3}\d{1,3}\b/g },
+    { category: 'EU National ID / BSN', pattern: /\b\d{9}\b/g },
+];
+
+function scanOutputForPii(text) {
+    if (!text || typeof text !== 'string' || text.length < 5) return '';
+    const found = new Set();
+    for (const { category, pattern } of PII_PATTERNS) {
+        pattern.lastIndex = 0;
+        if (pattern.test(text)) found.add(category);
+    }
+    return [...found].join(', ');
+}
+
 module.exports = {
     INTEGRATION_TOOL_MAP,
     INTEGRATION_PREFIXES,
     PII_CATEGORIES,
     resolveIntegration,
+    scanOutputForPii,
 };

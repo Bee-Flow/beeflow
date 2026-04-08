@@ -249,10 +249,10 @@ async function getIntegrationServers(filters = {}) {
             COUNT(*) FILTER (WHERE data_direction = 'sent') as sent,
             COUNT(*) FILTER (WHERE data_direction = 'received') as received,
             MAX(timestamp) as last_contact,
-            -- Geo data (from the most recent record for this endpoint)
-            (array_agg(server_ip ORDER BY timestamp DESC))[1] as server_ip,
-            (array_agg(country_code ORDER BY timestamp DESC))[1] as country_code,
-            (array_agg(country_name ORDER BY timestamp DESC))[1] as country_name,
+            -- Geo data: all distinct IPs and countries observed for this endpoint
+            array_agg(DISTINCT server_ip) FILTER (WHERE server_ip IS NOT NULL) as server_ips,
+            array_agg(DISTINCT country_code) FILTER (WHERE country_code IS NOT NULL) as country_codes,
+            array_agg(DISTINCT country_name) FILTER (WHERE country_name IS NOT NULL) as country_names,
             bool_or(is_eu) as is_eu
         FROM integration_activity_log ${where}
             ${where ? 'AND' : 'WHERE'} server_endpoint IS NOT NULL

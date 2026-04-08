@@ -423,9 +423,9 @@ router.get('/integrations/pii-summary', async (req, res) => {
 router.get('/integrations/servers', async (req, res) => {
     try {
         const data = await integrationActivityStore.getIntegrationServers(req.usageFilters);
-        // Add flag emoji from stored country_code
+        // Add flag emojis for all observed country codes
         for (const row of (data || [])) {
-            row.country_flag = countryFlag(row.country_code);
+            row.country_flags = (row.country_codes || []).map(c => countryFlag(c));
         }
         res.json(data || []);
     } catch (err) {
