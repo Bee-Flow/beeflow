@@ -7,63 +7,82 @@
  *
  * Used by the tool dispatcher in chatStream.js / directChat.js to decide
  * whether a tool call should be logged in the integration_activity_log.
+ *
+ * ── Auto-Detection ──────────────────────────────────────────────────
+ * Any tool whose name prefix matches an INTEGRATION_PREFIX entry is
+ * automatically treated as an integration tool — no manual registration
+ * needed. The static INTEGRATION_TOOL_MAP provides optional overrides
+ * for server endpoints, data categories, and direction.
+ * New integrations and MCP servers are detected automatically.
  */
 
+// ── Prefix → Integration metadata (auto-detection) ──────────────────
+// When a tool's prefix matches one of these, it's automatically logged
+// as an integration tool. New integrations just need a prefix entry here.
+const INTEGRATION_PREFIXES = {
+    // Google Workspace
+    gmail_:         { integration: 'gmail',           label: 'Gmail',               server: 'gmail.googleapis.com' },
+    calendar_:      { integration: 'google_calendar', label: 'Google Calendar',     server: 'www.googleapis.com/calendar' },
+    drive_:         { integration: 'google_drive',    label: 'Google Drive',        server: 'www.googleapis.com/drive' },
+    docs_:          { integration: 'google_docs',     label: 'Google Docs',         server: 'docs.googleapis.com' },
+    contacts_:      { integration: 'google_contacts', label: 'Google Contacts',     server: 'people.googleapis.com' },
+    keep_:          { integration: 'google_keep',     label: 'Google Keep',         server: 'keep.googleapis.com' },
+    groups_:        { integration: 'google_groups',   label: 'Google Groups',       server: 'www.googleapis.com/groups' },
+
+    // Microsoft 365
+    outlook_:       { integration: 'outlook',         label: 'Outlook',             server: 'graph.microsoft.com' },
+    ms_calendar_:   { integration: 'ms_calendar',     label: 'Microsoft Calendar',  server: 'graph.microsoft.com' },
+    ms_contacts_:   { integration: 'ms_contacts',     label: 'Microsoft Contacts',  server: 'graph.microsoft.com' },
+    onedrive_:      { integration: 'onedrive',        label: 'OneDrive',            server: 'graph.microsoft.com' },
+
+    // Third-party SaaS
+    fireflies_:     { integration: 'fireflies',       label: 'Fireflies',           server: 'api.fireflies.ai' },
+    youtrack_:      { integration: 'youtrack',        label: 'YouTrack',            server: process.env.YOUTRACK_URL || 'youtrack.cloud' },
+    signrequest_:   { integration: 'signrequest',     label: 'SignRequest',         server: 'api.signrequest.com' },
+    gamma_:         { integration: 'gamma',           label: 'Gamma',               server: 'gamma.app' },
+    linkedin_:      { integration: 'linkedin',        label: 'LinkedIn',            server: 'api.linkedin.com' },
+    whatsapp_:      { integration: 'whatsapp',        label: 'WhatsApp',            server: 'web.whatsapp.com (local bridge)' },
+    github_:        { integration: 'github',          label: 'GitHub',              server: 'api.github.com' },
+
+    // Media generation
+    generate_:      { integration: 'media_gen',       label: 'Media Generation',    server: 'ai-generation-service' },
+
+    // Search & Maps
+    maps_:          { integration: 'maps',            label: 'Google Maps',         server: 'maps.googleapis.com' },
+    keyword_planner_: { integration: 'keyword_planner', label: 'Keyword Planner',   server: 'googleads.googleapis.com' },
+
+    // Transcription
+    transcribe_:    { integration: 'transcription',   label: 'Transcription',       server: process.env.WHISPER_URL || 'whisper-service (local)' },
+};
+
+// ── Static overrides for specific tools ──────────────────────────────
+// These provide precise metadata for tools that need custom server endpoints,
+// direction, or data categories. Entries here override the prefix-based defaults.
 const INTEGRATION_TOOL_MAP = {
-    // ── Gmail ────────────────────────────────────────────────
-    gmail_search: {
-        integration: 'gmail',
-        label: 'Gmail',
-        serverFn: () => 'gmail.googleapis.com',
-        direction: 'both',
-        dataCategories: 'email_content, search_query',
-    },
-    gmail_read: {
-        integration: 'gmail',
-        label: 'Gmail',
-        serverFn: () => 'gmail.googleapis.com',
-        direction: 'received',
-        dataCategories: 'email_content, senders, subject',
-    },
-    gmail_read_attachment: {
-        integration: 'gmail',
-        label: 'Gmail',
-        serverFn: () => 'gmail.googleapis.com',
-        direction: 'received',
-        dataCategories: 'email_attachment, file_content',
-    },
-    gmail_compose: {
-        integration: 'gmail',
-        label: 'Gmail',
-        serverFn: () => 'gmail.googleapis.com',
+    // ── Exact-match tools (no prefix pattern) ────────────────
+    agent_search: {
+        integration: 'web_search',
+        label: 'Web Search',
+        serverFn: () => 'api.serper.dev (Google Search)',
         direction: 'sent',
-        dataCategories: 'email_content, recipients, subject',
+        dataCategories: 'search_query',
+    },
+    kb_search: {
+        integration: 'kb_search',
+        label: 'Knowledge Base',
+        serverFn: () => 'local (embedded search)',
+        direction: 'received',
+        dataCategories: 'search_query, document_content',
+    },
+    web_search: {
+        integration: 'web_search',
+        label: 'Web Search (Tavily)',
+        serverFn: () => 'api.tavily.com',
+        direction: 'sent',
+        dataCategories: 'search_query',
     },
 
-    // ── Outlook ──────────────────────────────────────────────
-    outlook_search: {
-        integration: 'outlook',
-        label: 'Outlook',
-        serverFn: () => 'graph.microsoft.com',
-        direction: 'both',
-        dataCategories: 'email_content, search_query',
-    },
-    outlook_read: {
-        integration: 'outlook',
-        label: 'Outlook',
-        serverFn: () => 'graph.microsoft.com',
-        direction: 'received',
-        dataCategories: 'email_content, senders, subject',
-    },
-    outlook_compose: {
-        integration: 'outlook',
-        label: 'Outlook',
-        serverFn: () => 'graph.microsoft.com',
-        direction: 'sent',
-        dataCategories: 'email_content, recipients, subject',
-    },
-
-    // ── Legacy Email (generic) ──────────────────────────────
+    // ── Legacy email tools (generic provider) ────────────────
     send_email: {
         integration: 'email',
         label: 'Email',
@@ -86,50 +105,13 @@ const INTEGRATION_TOOL_MAP = {
         dataCategories: 'email_content, search_query',
     },
 
-    // ── Google Calendar ──────────────────────────────────────
-    calendar_list_events: {
-        integration: 'google_calendar',
-        label: 'Google Calendar',
-        serverFn: () => 'www.googleapis.com/calendar',
-        direction: 'received',
-        dataCategories: 'calendar_events, attendees',
-    },
-    calendar_search_events: {
-        integration: 'google_calendar',
-        label: 'Google Calendar',
-        serverFn: () => 'www.googleapis.com/calendar',
-        direction: 'both',
-        dataCategories: 'calendar_events, search_query',
-    },
-    calendar_create_event: {
-        integration: 'google_calendar',
-        label: 'Google Calendar',
-        serverFn: () => 'www.googleapis.com/calendar',
-        direction: 'sent',
-        dataCategories: 'calendar_events, attendees, location',
-    },
-    calendar_update_event: {
-        integration: 'google_calendar',
-        label: 'Google Calendar',
-        serverFn: () => 'www.googleapis.com/calendar',
-        direction: 'sent',
-        dataCategories: 'calendar_events, attendees',
-    },
-    calendar_delete_event: {
-        integration: 'google_calendar',
-        label: 'Google Calendar',
-        serverFn: () => 'www.googleapis.com/calendar',
-        direction: 'sent',
-        dataCategories: 'calendar_events',
-    },
-
-    // ── Legacy Calendar (generic) ────────────────────────────
+    // ── Legacy calendar/map tools ────────────────────────────
     read_calendar: {
         integration: 'calendar',
         label: 'Calendar',
         serverFn: () => 'graph.microsoft.com',
         direction: 'received',
-        dataCategories: 'calendar_events, attendees, organizer',
+        dataCategories: 'calendar_events, attendees',
     },
     create_calendar_event: {
         integration: 'calendar',
@@ -137,391 +119,6 @@ const INTEGRATION_TOOL_MAP = {
         serverFn: () => 'graph.microsoft.com',
         direction: 'sent',
         dataCategories: 'calendar_events, attendees, location',
-    },
-
-    // ── Microsoft Calendar ───────────────────────────────────
-    ms_calendar_list_events: {
-        integration: 'ms_calendar',
-        label: 'Microsoft Calendar',
-        serverFn: () => 'graph.microsoft.com',
-        direction: 'received',
-        dataCategories: 'calendar_events, attendees',
-    },
-    ms_calendar_search_events: {
-        integration: 'ms_calendar',
-        label: 'Microsoft Calendar',
-        serverFn: () => 'graph.microsoft.com',
-        direction: 'both',
-        dataCategories: 'calendar_events, search_query',
-    },
-    ms_calendar_create_event: {
-        integration: 'ms_calendar',
-        label: 'Microsoft Calendar',
-        serverFn: () => 'graph.microsoft.com',
-        direction: 'sent',
-        dataCategories: 'calendar_events, attendees, location',
-    },
-    ms_calendar_update_event: {
-        integration: 'ms_calendar',
-        label: 'Microsoft Calendar',
-        serverFn: () => 'graph.microsoft.com',
-        direction: 'sent',
-        dataCategories: 'calendar_events, attendees',
-    },
-    ms_calendar_delete_event: {
-        integration: 'ms_calendar',
-        label: 'Microsoft Calendar',
-        serverFn: () => 'graph.microsoft.com',
-        direction: 'sent',
-        dataCategories: 'calendar_events',
-    },
-
-    // ── Google Drive ─────────────────────────────────────────
-    drive_search: {
-        integration: 'google_drive',
-        label: 'Google Drive',
-        serverFn: () => 'www.googleapis.com/drive',
-        direction: 'both',
-        dataCategories: 'file_metadata, search_query',
-    },
-    drive_list_files: {
-        integration: 'google_drive',
-        label: 'Google Drive',
-        serverFn: () => 'www.googleapis.com/drive',
-        direction: 'received',
-        dataCategories: 'file_metadata',
-    },
-    drive_get_file: {
-        integration: 'google_drive',
-        label: 'Google Drive',
-        serverFn: () => 'www.googleapis.com/drive',
-        direction: 'received',
-        dataCategories: 'file_metadata',
-    },
-    drive_get_content: {
-        integration: 'google_drive',
-        label: 'Google Drive',
-        serverFn: () => 'www.googleapis.com/drive',
-        direction: 'received',
-        dataCategories: 'file_content',
-    },
-    drive_move_file: {
-        integration: 'google_drive',
-        label: 'Google Drive',
-        serverFn: () => 'www.googleapis.com/drive',
-        direction: 'sent',
-        dataCategories: 'file_metadata',
-    },
-    drive_create_folder: {
-        integration: 'google_drive',
-        label: 'Google Drive',
-        serverFn: () => 'www.googleapis.com/drive',
-        direction: 'sent',
-        dataCategories: 'folder_metadata',
-    },
-
-    // ── OneDrive ─────────────────────────────────────────────
-    onedrive_search: {
-        integration: 'onedrive',
-        label: 'OneDrive',
-        serverFn: () => 'graph.microsoft.com',
-        direction: 'both',
-        dataCategories: 'file_metadata, search_query',
-    },
-    onedrive_list_files: {
-        integration: 'onedrive',
-        label: 'OneDrive',
-        serverFn: () => 'graph.microsoft.com',
-        direction: 'received',
-        dataCategories: 'file_metadata',
-    },
-    onedrive_get_file: {
-        integration: 'onedrive',
-        label: 'OneDrive',
-        serverFn: () => 'graph.microsoft.com',
-        direction: 'received',
-        dataCategories: 'file_content',
-    },
-    onedrive_create_folder: {
-        integration: 'onedrive',
-        label: 'OneDrive',
-        serverFn: () => 'graph.microsoft.com',
-        direction: 'sent',
-        dataCategories: 'folder_metadata',
-    },
-
-    // ── Google Docs ──────────────────────────────────────────
-    docs_create: {
-        integration: 'google_docs',
-        label: 'Google Docs',
-        serverFn: () => 'docs.googleapis.com',
-        direction: 'sent',
-        dataCategories: 'document_content',
-    },
-    docs_read: {
-        integration: 'google_docs',
-        label: 'Google Docs',
-        serverFn: () => 'docs.googleapis.com',
-        direction: 'received',
-        dataCategories: 'document_content',
-    },
-    docs_append: {
-        integration: 'google_docs',
-        label: 'Google Docs',
-        serverFn: () => 'docs.googleapis.com',
-        direction: 'sent',
-        dataCategories: 'document_content',
-    },
-    docs_replace_text: {
-        integration: 'google_docs',
-        label: 'Google Docs',
-        serverFn: () => 'docs.googleapis.com',
-        direction: 'sent',
-        dataCategories: 'document_content',
-    },
-
-    // ── Google Contacts ──────────────────────────────────────
-    contacts_search: {
-        integration: 'google_contacts',
-        label: 'Google Contacts',
-        serverFn: () => 'people.googleapis.com',
-        direction: 'both',
-        dataCategories: 'contact_info, search_query',
-    },
-    contacts_list: {
-        integration: 'google_contacts',
-        label: 'Google Contacts',
-        serverFn: () => 'people.googleapis.com',
-        direction: 'received',
-        dataCategories: 'contact_info',
-    },
-    contacts_create: {
-        integration: 'google_contacts',
-        label: 'Google Contacts',
-        serverFn: () => 'people.googleapis.com',
-        direction: 'sent',
-        dataCategories: 'contact_info',
-    },
-    contacts_update: {
-        integration: 'google_contacts',
-        label: 'Google Contacts',
-        serverFn: () => 'people.googleapis.com',
-        direction: 'sent',
-        dataCategories: 'contact_info',
-    },
-
-    // ── Microsoft Contacts ───────────────────────────────────
-    ms_contacts_search: {
-        integration: 'ms_contacts',
-        label: 'Microsoft Contacts',
-        serverFn: () => 'graph.microsoft.com',
-        direction: 'both',
-        dataCategories: 'contact_info, search_query',
-    },
-    ms_contacts_list: {
-        integration: 'ms_contacts',
-        label: 'Microsoft Contacts',
-        serverFn: () => 'graph.microsoft.com',
-        direction: 'received',
-        dataCategories: 'contact_info',
-    },
-    ms_contacts_create: {
-        integration: 'ms_contacts',
-        label: 'Microsoft Contacts',
-        serverFn: () => 'graph.microsoft.com',
-        direction: 'sent',
-        dataCategories: 'contact_info',
-    },
-    ms_contacts_update: {
-        integration: 'ms_contacts',
-        label: 'Microsoft Contacts',
-        serverFn: () => 'graph.microsoft.com',
-        direction: 'sent',
-        dataCategories: 'contact_info',
-    },
-
-    // ── Google Keep ──────────────────────────────────────────
-    keep_list: {
-        integration: 'google_keep',
-        label: 'Google Keep',
-        serverFn: () => 'keep.googleapis.com',
-        direction: 'received',
-        dataCategories: 'notes',
-    },
-    keep_get: {
-        integration: 'google_keep',
-        label: 'Google Keep',
-        serverFn: () => 'keep.googleapis.com',
-        direction: 'received',
-        dataCategories: 'notes',
-    },
-    keep_create: {
-        integration: 'google_keep',
-        label: 'Google Keep',
-        serverFn: () => 'keep.googleapis.com',
-        direction: 'sent',
-        dataCategories: 'notes',
-    },
-    keep_delete: {
-        integration: 'google_keep',
-        label: 'Google Keep',
-        serverFn: () => 'keep.googleapis.com',
-        direction: 'sent',
-        dataCategories: 'notes',
-    },
-
-    // ── Google Groups ────────────────────────────────────────
-    groups_list_conversations: {
-        integration: 'google_groups',
-        label: 'Google Groups',
-        serverFn: () => 'www.googleapis.com/groups',
-        direction: 'received',
-        dataCategories: 'group_messages',
-    },
-    groups_read_conversation: {
-        integration: 'google_groups',
-        label: 'Google Groups',
-        serverFn: () => 'www.googleapis.com/groups',
-        direction: 'received',
-        dataCategories: 'group_messages, participants',
-    },
-    groups_reply: {
-        integration: 'google_groups',
-        label: 'Google Groups',
-        serverFn: () => 'www.googleapis.com/groups',
-        direction: 'sent',
-        dataCategories: 'group_messages',
-    },
-
-    // ── Fireflies ────────────────────────────────────────────
-    fireflies_list_transcripts: {
-        integration: 'fireflies',
-        label: 'Fireflies',
-        serverFn: () => 'api.fireflies.ai',
-        direction: 'received',
-        dataCategories: 'meeting_metadata',
-    },
-    fireflies_get_summary: {
-        integration: 'fireflies',
-        label: 'Fireflies',
-        serverFn: () => 'api.fireflies.ai',
-        direction: 'received',
-        dataCategories: 'meeting_summary, participants, action_items',
-    },
-    fireflies_get_transcript: {
-        integration: 'fireflies',
-        label: 'Fireflies',
-        serverFn: () => 'api.fireflies.ai',
-        direction: 'received',
-        dataCategories: 'meeting_transcript, participants',
-    },
-
-    // ── YouTrack ─────────────────────────────────────────────
-    youtrack_search_issues: {
-        integration: 'youtrack',
-        label: 'YouTrack',
-        serverFn: () => process.env.YOUTRACK_URL || 'youtrack.cloud',
-        direction: 'both',
-        dataCategories: 'issue_data, search_query',
-    },
-    youtrack_get_issue: {
-        integration: 'youtrack',
-        label: 'YouTrack',
-        serverFn: () => process.env.YOUTRACK_URL || 'youtrack.cloud',
-        direction: 'received',
-        dataCategories: 'issue_data',
-    },
-    youtrack_create_issue: {
-        integration: 'youtrack',
-        label: 'YouTrack',
-        serverFn: () => process.env.YOUTRACK_URL || 'youtrack.cloud',
-        direction: 'sent',
-        dataCategories: 'issue_data',
-    },
-    youtrack_add_comment: {
-        integration: 'youtrack',
-        label: 'YouTrack',
-        serverFn: () => process.env.YOUTRACK_URL || 'youtrack.cloud',
-        direction: 'sent',
-        dataCategories: 'issue_comment',
-    },
-    youtrack_update_issue: {
-        integration: 'youtrack',
-        label: 'YouTrack',
-        serverFn: () => process.env.YOUTRACK_URL || 'youtrack.cloud',
-        direction: 'sent',
-        dataCategories: 'issue_data',
-    },
-    youtrack_list_projects: {
-        integration: 'youtrack',
-        label: 'YouTrack',
-        serverFn: () => process.env.YOUTRACK_URL || 'youtrack.cloud',
-        direction: 'received',
-        dataCategories: 'project_metadata',
-    },
-
-    // ── SignRequest ───────────────────────────────────────────
-    signrequest_send_document: {
-        integration: 'signrequest',
-        label: 'SignRequest',
-        serverFn: () => 'api.signrequest.com',
-        direction: 'sent',
-        dataCategories: 'document_content, signers',
-    },
-    signrequest_check_status: {
-        integration: 'signrequest',
-        label: 'SignRequest',
-        serverFn: () => 'api.signrequest.com',
-        direction: 'received',
-        dataCategories: 'document_status',
-    },
-    signrequest_list_documents: {
-        integration: 'signrequest',
-        label: 'SignRequest',
-        serverFn: () => 'api.signrequest.com',
-        direction: 'received',
-        dataCategories: 'document_metadata',
-    },
-    signrequest_cancel: {
-        integration: 'signrequest',
-        label: 'SignRequest',
-        serverFn: () => 'api.signrequest.com',
-        direction: 'sent',
-        dataCategories: 'document_metadata',
-    },
-
-    // ── Gamma (Presentations) ────────────────────────────────
-    gamma_create_presentation: {
-        integration: 'gamma',
-        label: 'Gamma',
-        serverFn: () => 'gamma.app',
-        direction: 'sent',
-        dataCategories: 'presentation_content',
-    },
-
-    // ── Web Search ───────────────────────────────────────────
-    agent_search: {
-        integration: 'web_search',
-        label: 'Web Search',
-        serverFn: () => 'api.serper.dev (Google Search)',
-        direction: 'sent',
-        dataCategories: 'search_query',
-    },
-
-    // ── Maps / Places ────────────────────────────────────────
-    maps_search_places: {
-        integration: 'maps',
-        label: 'Google Maps',
-        serverFn: () => 'maps.googleapis.com',
-        direction: 'both',
-        dataCategories: 'location_query, coordinates',
-    },
-    maps_directions: {
-        integration: 'maps',
-        label: 'Google Maps',
-        serverFn: () => 'maps.googleapis.com',
-        direction: 'both',
-        dataCategories: 'addresses, coordinates',
     },
     search_maps: {
         integration: 'maps',
@@ -538,92 +135,7 @@ const INTEGRATION_TOOL_MAP = {
         dataCategories: 'addresses, coordinates',
     },
 
-    // ── LinkedIn ─────────────────────────────────────────────
-    linkedin_create_post: {
-        integration: 'linkedin',
-        label: 'LinkedIn',
-        serverFn: () => 'api.linkedin.com',
-        direction: 'sent',
-        dataCategories: 'social_post_content',
-    },
-
-    // ── WhatsApp ─────────────────────────────────────────────
-    whatsapp_list_chats: {
-        integration: 'whatsapp',
-        label: 'WhatsApp',
-        serverFn: () => 'web.whatsapp.com (local bridge)',
-        direction: 'received',
-        dataCategories: 'chat_metadata',
-    },
-    whatsapp_read_messages: {
-        integration: 'whatsapp',
-        label: 'WhatsApp',
-        serverFn: () => 'web.whatsapp.com (local bridge)',
-        direction: 'received',
-        dataCategories: 'messages, participants',
-    },
-    whatsapp_compose: {
-        integration: 'whatsapp',
-        label: 'WhatsApp',
-        serverFn: () => 'web.whatsapp.com (local bridge)',
-        direction: 'sent',
-        dataCategories: 'messages, recipients',
-    },
-
-    // ── GitHub ────────────────────────────────────────────────
-    github_list_repos: {
-        integration: 'github',
-        label: 'GitHub',
-        serverFn: () => 'api.github.com',
-        direction: 'received',
-        dataCategories: 'repository_metadata',
-    },
-    github_get_repo: {
-        integration: 'github',
-        label: 'GitHub',
-        serverFn: () => 'api.github.com',
-        direction: 'received',
-        dataCategories: 'repository_metadata',
-    },
-    github_create_repo: {
-        integration: 'github',
-        label: 'GitHub',
-        serverFn: () => 'api.github.com',
-        direction: 'sent',
-        dataCategories: 'repository_metadata',
-    },
-    github_list_branches: {
-        integration: 'github',
-        label: 'GitHub',
-        serverFn: () => 'api.github.com',
-        direction: 'received',
-        dataCategories: 'branch_metadata',
-    },
-    github_get_file: {
-        integration: 'github',
-        label: 'GitHub',
-        serverFn: () => 'api.github.com',
-        direction: 'received',
-        dataCategories: 'file_content',
-    },
-    github_list_contents: {
-        integration: 'github',
-        label: 'GitHub',
-        serverFn: () => 'api.github.com',
-        direction: 'received',
-        dataCategories: 'file_metadata',
-    },
-
-    // ── Transcription ────────────────────────────────────────
-    transcribe_audio: {
-        integration: 'transcription',
-        label: 'Transcription',
-        serverFn: () => process.env.WHISPER_URL || 'whisper-service (local)',
-        direction: 'both',
-        dataCategories: 'audio_content, transcript',
-    },
-
-    // ── Media Generation ─────────────────────────────────────
+    // ── Media gen (precise endpoints) ────────────────────────
     generate_image: {
         integration: 'image_gen',
         label: 'Image Generation',
@@ -667,7 +179,7 @@ const INTEGRATION_TOOL_MAP = {
         dataCategories: 'prompt, generated_audio',
     },
 
-    // ── n8n Workflows ────────────────────────────────────────
+    // ── n8n (dynamic URL) ────────────────────────────────────
     n8n_execute: {
         integration: 'n8n',
         label: 'n8n Workflow',
@@ -675,10 +187,16 @@ const INTEGRATION_TOOL_MAP = {
         direction: 'both',
         dataCategories: 'workflow_payload',
     },
-
-    // ── MCP (Model Context Protocol) ─────────────────────────
-    // MCP tools are dynamic — handled via a pattern match in resolveIntegration()
 };
+
+// Excluded tools — internal tools that should NOT be logged as integrations
+// even if they match a prefix pattern (e.g. regex_* is internal)
+const INTERNAL_TOOL_PREFIXES = new Set([
+    'regex_',       // Regex generator (internal utility)
+    'notebook_',    // Notebook tools (internal workspace)
+    'workspace_',   // Workspace tools (internal)
+    'set_',         // set_reminder, set_ai_task (internal)
+]);
 
 // PII category descriptions for data sovereignty reports
 const PII_CATEGORIES = [
@@ -688,30 +206,79 @@ const PII_CATEGORIES = [
 ];
 
 /**
- * Resolve tool metadata for logging.
+ * Infer data direction from tool name action part.
+ * e.g. "gmail_compose" → "sent", "drive_list_files" → "received"
+ */
+function inferDirection(toolName) {
+    const action = toolName.split('_').slice(-1)[0]; // last segment
+    const fullAction = toolName.split('_').slice(1).join('_'); // everything after prefix
+
+    // Sending / writing
+    if (['compose', 'send', 'create', 'update', 'delete', 'cancel', 'reply', 'append', 'move', 'replace'].some(a => fullAction.includes(a))) {
+        return 'sent';
+    }
+    // Reading / receiving
+    if (['read', 'get', 'list', 'search', 'check', 'view'].some(a => fullAction.includes(a))) {
+        return 'received';
+    }
+    return 'both';
+}
+
+/**
+ * Resolve tool metadata for integration activity logging.
+ *
+ * Resolution order:
+ *   1. Static INTEGRATION_TOOL_MAP (exact tool name match — highest priority)
+ *   2. INTEGRATION_PREFIXES (prefix match — auto-detects new tools)
+ *   3. MCP tool pattern (mcp__<server>__<tool> or mcp_<server>)
+ *   4. n8n dynamic tools (n8n_* prefix)
+ *   5. null (not an integration tool — internal tools like set_reminder, notebook_*)
  *
  * @param {string} toolName - The tool_name from the function call
  * @param {object} toolArgs - The arguments passed to the tool
  * @param {object} ctx - Runtime context (n8n URL, MCP config, etc.)
- * @returns {object|null} { integration, label, server, direction, dataCategories } or null for non-integration tools
+ * @returns {object|null} { integration, label, server, direction, dataCategories } or null
  */
 function resolveIntegration(toolName, toolArgs = {}, ctx = {}) {
-    // Direct match
+    if (!toolName) return null;
+
+    // Skip internal tools
+    for (const prefix of INTERNAL_TOOL_PREFIXES) {
+        if (toolName.startsWith(prefix)) return null;
+    }
+
+    // 1. Exact match in static map (highest priority — custom metadata)
     const mapped = INTEGRATION_TOOL_MAP[toolName];
     if (mapped) {
         return {
             integration: mapped.integration,
             label: mapped.label,
             server: typeof mapped.serverFn === 'function' ? mapped.serverFn(toolArgs, ctx) : mapped.serverFn,
-            direction: mapped.direction,
-            dataCategories: mapped.dataCategories,
+            direction: mapped.direction || inferDirection(toolName),
+            dataCategories: mapped.dataCategories || 'unknown',
         };
     }
 
-    // MCP tool pattern: mcp__<server>__<tool>
-    if (toolName?.startsWith('mcp__') || toolName?.startsWith('mcp_')) {
+    // 2. Prefix match (auto-detection for known integration families)
+    //    Sort by longest prefix first to match ms_calendar_ before ms_
+    const sortedPrefixes = Object.keys(INTEGRATION_PREFIXES).sort((a, b) => b.length - a.length);
+    for (const prefix of sortedPrefixes) {
+        if (toolName.startsWith(prefix)) {
+            const meta = INTEGRATION_PREFIXES[prefix];
+            return {
+                integration: meta.integration,
+                label: meta.label,
+                server: meta.server,
+                direction: inferDirection(toolName),
+                dataCategories: 'auto_detected',
+            };
+        }
+    }
+
+    // 3. MCP tool pattern: mcp__<server>__<tool> or mcp_<anything>
+    if (toolName.startsWith('mcp__') || toolName.startsWith('mcp_')) {
         const parts = toolName.split('__');
-        const mcpServer = parts[1] || 'unknown';
+        const mcpServer = parts[1] || toolName.replace(/^mcp_/, '').split('_')[0] || 'unknown';
         return {
             integration: 'mcp',
             label: `MCP: ${mcpServer}`,
@@ -721,8 +288,8 @@ function resolveIntegration(toolName, toolArgs = {}, ctx = {}) {
         };
     }
 
-    // n8n dynamic tools (prefixed)
-    if (toolName?.startsWith('n8n_')) {
+    // 4. n8n dynamic tools (catch-all for any n8n_ prefix not in static map)
+    if (toolName.startsWith('n8n_')) {
         return {
             integration: 'n8n',
             label: 'n8n Workflow',
@@ -732,12 +299,13 @@ function resolveIntegration(toolName, toolArgs = {}, ctx = {}) {
         };
     }
 
-    // Not an external integration tool
+    // 5. Not an integration tool
     return null;
 }
 
 module.exports = {
     INTEGRATION_TOOL_MAP,
+    INTEGRATION_PREFIXES,
     PII_CATEGORIES,
     resolveIntegration,
 };
