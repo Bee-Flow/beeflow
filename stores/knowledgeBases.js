@@ -46,6 +46,10 @@ async function initDB() {
     await exec(`CREATE INDEX IF NOT EXISTS idx_documents_tenant ON documents(tenant_id)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(knowledge_base_id, content_hash)`);
 
+    // ── Column migrations ──
+    try { await exec(`ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS organization_id TEXT`); } catch (e) { /* column already exists */ }
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_kb_org ON knowledge_bases(organization_id) WHERE organization_id IS NOT NULL`); } catch (e) { /* index already exists */ }
+
     initialized = true;
     console.log('[KnowledgeBases] Tables initialized');
 }
@@ -56,19 +60,95 @@ initDB().catch(err => console.error('[KnowledgeBases] Init error:', err.message)
 const KnowledgeBasesStore = {
     // ── KB CRUD ─────────────────────────────────────────────────────────
 
-    createKB: async (tenantId, name, description = '', defaultLang = 'unknown') => {
+    /**
+     * Create a new KB.
+     * @param {string} tenantId - Owner user ID
+     * @param {string} name
+     * @param {string} description
+     * @param {string} defaultLang
+     * @param {string|null} organizationId - Organization this KB belongs to (null = personal)
+     */
+    createKB: async (tenantId, name, description = '', defaultLang = 'unknown', organizationId = null) => {
         await initDB();
         const row = await getOne(
-            `INSERT INTO knowledge_bases (tenant_id, name, description, default_lang)
-             VALUES ($1, $2, $3, $4)
+            `INSERT INTO knowledge_bases (tenant_id, name, description, default_lang, organization_id)
+             VALUES ($1, $2, $3, $4, $5)
              RETURNING *`,
-            [tenantId, name, description, defaultLang]
+            [tenantId, name, description, defaultLang, organizationId || null]
         );
         return row;
     },
 
-    listKBs: async (tenantId) => {
+    /**
+     * List KBs accessible to the user.
+     * @param {string} tenantId - The user's ID
+     * @param {Set|null} orgIds - User's org IDs from resolveUserOrgIds().
+     *   null = super admin (see all), Set with values = org member, empty Set = no org
+     */
+    listKBs: async (tenantId, orgIds = undefined) => {
         await initDB();
+
+        // Legacy fallback: if orgIds not provided, show only user's own KBs
+        if (orgIds === undefined) {
+            return getAll(
+                `SELECT kb.*, 
+                        COALESCE(d.doc_count, 0) AS document_count,
+                        COALESCE(d.total_chunks, 0) AS total_chunks
+                 FROM knowledge_bases kb
+                 LEFT JOIN (
+                     SELECT knowledge_base_id, 
+                            COUNT(*) AS doc_count,
+                            SUM(chunk_count) AS total_chunks
+                     FROM documents 
+                     GROUP BY knowledge_base_id
+                 ) d ON d.knowledge_base_id = kb.id
+                 WHERE kb.tenant_id = $1
+                 ORDER BY kb.created_at DESC`,
+                [tenantId]
+            );
+        }
+
+        // Super admin — see all KBs
+        if (orgIds === null) {
+            return getAll(
+                `SELECT kb.*, 
+                        COALESCE(d.doc_count, 0) AS document_count,
+                        COALESCE(d.total_chunks, 0) AS total_chunks
+                 FROM knowledge_bases kb
+                 LEFT JOIN (
+                     SELECT knowledge_base_id, 
+                            COUNT(*) AS doc_count,
+                            SUM(chunk_count) AS total_chunks
+                     FROM documents 
+                     GROUP BY knowledge_base_id
+                 ) d ON d.knowledge_base_id = kb.id
+                 ORDER BY kb.created_at DESC`
+            );
+        }
+
+        const orgIdArray = Array.from(orgIds);
+
+        if (orgIdArray.length === 0) {
+            // No org membership — only personal KBs
+            return getAll(
+                `SELECT kb.*, 
+                        COALESCE(d.doc_count, 0) AS document_count,
+                        COALESCE(d.total_chunks, 0) AS total_chunks
+                 FROM knowledge_bases kb
+                 LEFT JOIN (
+                     SELECT knowledge_base_id, 
+                            COUNT(*) AS doc_count,
+                            SUM(chunk_count) AS total_chunks
+                     FROM documents 
+                     GROUP BY knowledge_base_id
+                 ) d ON d.knowledge_base_id = kb.id
+                 WHERE kb.tenant_id = $1
+                 ORDER BY kb.created_at DESC`,
+                [tenantId]
+            );
+        }
+
+        // Org member — personal KBs + KBs from user's org(s)
         return getAll(
             `SELECT kb.*, 
                     COALESCE(d.doc_count, 0) AS document_count,
@@ -81,9 +161,9 @@ const KnowledgeBasesStore = {
                  FROM documents 
                  GROUP BY knowledge_base_id
              ) d ON d.knowledge_base_id = kb.id
-             WHERE kb.tenant_id = $1
+             WHERE kb.tenant_id = $1 OR kb.organization_id = ANY($2)
              ORDER BY kb.created_at DESC`,
-            [tenantId]
+            [tenantId, orgIdArray]
         );
     },
 

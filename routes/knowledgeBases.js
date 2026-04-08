@@ -9,7 +9,7 @@ const router = express.Router();
 const multer = require('multer');
 const kbStore = require('../stores/knowledgeBases');
 const configStore = require('../stores/configStore');
-const { requireAuth } = require('../auth');
+const { requireAuth, resolveUserOrgIds } = require('../auth');
 
 const SEARCH_SERVICE_URL = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
 const { getServiceHeaders } = require('../core/serviceAuth');
@@ -24,6 +24,22 @@ const {
 // Auth helper
 const getUserId = (req) => req.session?.user?.id || null;
 
+/**
+ * Centralized KB access check.
+ * Returns true if the user can access the given KB.
+ * - Owner (tenant_id) always has access
+ * - Super admin (resolveUserOrgIds returns null) always has access
+ * - Org member has access if KB's organization_id is in their org set
+ */
+async function canAccessKB(req, kb) {
+    const userId = getUserId(req);
+    if (kb.tenant_id === userId) return true;
+    const orgIds = await resolveUserOrgIds(req);
+    if (orgIds === null) return true; // super admin
+    if (kb.organization_id && orgIds.has(kb.organization_id)) return true;
+    return false;
+}
+
 // Multer for file uploads
 const upload = multer({
     storage: multer.memoryStorage(),
@@ -33,12 +49,13 @@ const upload = multer({
 // ── KB CRUD ─────────────────────────────────────────────────────────
 
 /**
- * List all KBs for the current user
+ * List all KBs accessible to the current user (personal + org-scoped)
  */
 router.get('/', requireAuth, async (req, res) => {
     try {
         const userId = getUserId(req);
-        const kbs = await kbStore.listKBs(userId);
+        const orgIds = await resolveUserOrgIds(req);
+        const kbs = await kbStore.listKBs(userId, orgIds);
         res.json(kbs);
     } catch (e) {
         console.error('[KB] List error:', e.message);
@@ -47,16 +64,26 @@ router.get('/', requireAuth, async (req, res) => {
 });
 
 /**
- * Create a new KB
+ * Create a new KB (auto-assigns to user's organization)
  */
 router.post('/', requireAuth, async (req, res) => {
     try {
         const userId = getUserId(req);
-        const { name, description, defaultLang } = req.body;
+        const { name, description, defaultLang, organizationId } = req.body;
         if (!name || !name.trim()) {
             return res.status(400).json({ error: 'Name is required' });
         }
-        const kb = await kbStore.createKB(userId, name.trim(), description || '', defaultLang);
+
+        // Auto-assign the user's first organization if none provided
+        let assignOrgId = organizationId;
+        if (!assignOrgId) {
+            const orgIds = await resolveUserOrgIds(req);
+            if (orgIds !== null && orgIds.size > 0) {
+                assignOrgId = Array.from(orgIds)[0];
+            }
+        }
+
+        const kb = await kbStore.createKB(userId, name.trim(), description || '', defaultLang, assignOrgId || null);
         res.status(201).json(kb);
     } catch (e) {
         console.error('[KB] Create error:', e.message);
@@ -71,7 +98,7 @@ router.get('/:id', requireAuth, async (req, res) => {
     try {
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
-        if (kb.tenant_id !== getUserId(req)) return res.status(403).json({ error: 'Access denied' });
+        if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
 
         const documents = await kbStore.listDocuments(kb.id);
         res.json({ ...kb, documents });
@@ -88,7 +115,7 @@ router.patch('/:id', requireAuth, async (req, res) => {
     try {
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
-        if (kb.tenant_id !== getUserId(req)) return res.status(403).json({ error: 'Access denied' });
+        if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
 
         const updated = await kbStore.updateKB(kb.id, req.body);
         res.json(updated);
@@ -105,7 +132,7 @@ router.delete('/:id', requireAuth, async (req, res) => {
     try {
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
-        if (kb.tenant_id !== getUserId(req)) return res.status(403).json({ error: 'Access denied' });
+        if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
 
         // Delete chunks from search-service
         try {
@@ -136,7 +163,7 @@ router.get('/:id/documents', requireAuth, async (req, res) => {
     try {
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
-        if (kb.tenant_id !== getUserId(req)) return res.status(403).json({ error: 'Access denied' });
+        if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
 
         const docs = await kbStore.listDocuments(kb.id);
         res.json(docs);
@@ -153,7 +180,7 @@ router.delete('/:id/documents/:docId', requireAuth, async (req, res) => {
     try {
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
-        if (kb.tenant_id !== getUserId(req)) return res.status(403).json({ error: 'Access denied' });
+        if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
 
         const doc = await kbStore.getDocument(req.params.docId);
         if (!doc || doc.knowledge_base_id !== kb.id) {
@@ -177,7 +204,7 @@ router.post('/:id/ingest/text', requireAuth, async (req, res) => {
     try {
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
-        if (kb.tenant_id !== getUserId(req)) return res.status(403).json({ error: 'Access denied' });
+        if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
 
         const { content, title } = req.body;
         if (!content || typeof content !== 'string' || content.trim().length < 3) {
@@ -211,7 +238,7 @@ router.post('/:id/ingest/file', requireAuth, upload.single('file'), async (req, 
     try {
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
-        if (kb.tenant_id !== getUserId(req)) return res.status(403).json({ error: 'Access denied' });
+        if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
 
         if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
@@ -252,7 +279,7 @@ router.post('/:id/ingest/url', requireAuth, async (req, res) => {
     try {
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
-        if (kb.tenant_id !== getUserId(req)) return res.status(403).json({ error: 'Access denied' });
+        if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
 
         const { url } = req.body;
         if (!url) return res.status(400).json({ error: 'URL is required' });
@@ -294,7 +321,7 @@ router.post('/:id/ingest/sitemap', requireAuth, async (req, res) => {
     try {
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
-        if (kb.tenant_id !== getUserId(req)) return res.status(403).json({ error: 'Access denied' });
+        if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
 
         const { url, maxPages = 50 } = req.body;
         if (!url) return res.status(400).json({ error: 'URL is required' });
@@ -532,7 +559,7 @@ router.post('/:id/ingest/n8n', requireAuth, async (req, res) => {
     try {
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
-        if (kb.tenant_id !== getUserId(req)) return res.status(403).json({ error: 'Access denied' });
+        if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
 
         const { workflowId, mode = 'data' } = req.body;
         if (!workflowId) {
@@ -743,7 +770,7 @@ router.post('/:id/reindex', requireAuth, async (req, res) => {
     try {
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
-        if (kb.tenant_id !== getUserId(req)) return res.status(403).json({ error: 'Access denied' });
+        if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
 
         const docs = await kbStore.listDocuments(kb.id);
         if (docs.length === 0) {

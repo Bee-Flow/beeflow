@@ -535,6 +535,9 @@ async function deleteOrganization(orgId) {
         await run('DELETE FROM agents WHERE organization_id = $1', [orgId]);
     } catch (e) { }
 
+    // Knowledge bases cleanup
+    try { await run('DELETE FROM knowledge_bases WHERE organization_id = $1', [orgId]); } catch (e) { }
+
     try { await run('DELETE FROM swarm_configs WHERE organization_id = $1', [orgId]); } catch (e) { }
     try { await run('DELETE FROM group_chats WHERE organization_id = $1', [orgId]); } catch (e) { }
 

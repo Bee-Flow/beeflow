@@ -13,6 +13,7 @@ const express = require('express');
 const router = express.Router();
 const aiTaskStore = require('../stores/aiTaskStore');
 const configStore = require('../stores/configStore');
+const { executeTask } = require('../core/aiTaskRunner');
 
 // Default max tasks per user (admin-configurable via configStore)
 const DEFAULT_MAX_TASKS = 10;
@@ -141,8 +142,7 @@ router.post('/:id/run-now', async (req, res) => {
         // Execute asynchronously — don't block the response
         setImmediate(async () => {
             try {
-                const { executeTask } = require('../core/aiTaskRunner');
-                await executeTask(existing);
+                await executeTask(existing, { manual: true });
             } catch (err) {
                 console.error(`[AITasks] Run-now failed for ${req.params.id}:`, err.message);
             }

@@ -89,7 +89,7 @@ async function resolveUserSession(userId) {
 /**
  * Execute a single AI task.
  */
-async function executeTask(task) {
+async function executeTask(task, { manual = false } = {}) {
     const startTime = Date.now();
     console.log(`[AITaskRunner] ▶ Executing task "${task.title}" (${task.id})`);
 
@@ -232,10 +232,12 @@ async function executeTask(task) {
             message: finalResponse,
         });
 
-        // Advance schedule
-        if (task.repeatInterval) {
+        // Advance schedule (skip if this was a manual run-now trigger)
+        if (task.repeatInterval && !manual) {
             const next = await aiTaskStore.advanceSchedule(task.id, task.nextRunAt, task.repeatInterval);
             console.log(`[AITaskRunner] ✅ Task "${task.title}" completed (${Date.now() - startTime}ms), next run: ${next}`);
+        } else if (task.repeatInterval && manual) {
+            console.log(`[AITaskRunner] ✅ Task "${task.title}" completed manually (${Date.now() - startTime}ms), next scheduled run unchanged: ${task.nextRunAt}`);
         } else {
             // One-time task → deactivate
             await aiTaskStore.updateTask(task.id, { isActive: false });
@@ -245,8 +247,8 @@ async function executeTask(task) {
         console.error(`[AITaskRunner] ❌ Task "${task.title}" failed:`, err.message);
         await aiTaskStore.markError(task.id, err);
 
-        // Still advance schedule on error (don't let errors block future runs)
-        if (task.repeatInterval) {
+        // Still advance schedule on error (don't let errors block future runs) — but not for manual runs
+        if (task.repeatInterval && !manual) {
             await aiTaskStore.advanceSchedule(task.id, task.nextRunAt, task.repeatInterval);
         }
 

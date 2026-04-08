@@ -314,8 +314,7 @@ app.use('/api/notebooks', notebookFeatureGate, require('./routes/notebookExport'
 const { requireBetaFeature } = require('./core/betaFeatures');
 app.use('/api/transcriptions', requireBetaFeature('meeting_notes'), require('./routes/transcriptions'));
 app.use('/api/meet-bot', requireBetaFeature('meeting_notes'), require('./routes/meetBot'));
-// Dutch Tax Assistant
-app.use('/api/tax-assistant', require('./routes/taxNotebook'));
+
 app.use('/', require('./routes/knowledge'));
 app.use('/api/kb', require('./routes/knowledgeBases'));
 app.use('/api/languages', require('./routes/admin/languageRoutes'));
