@@ -11,6 +11,11 @@
 const configStore = require('../stores/configStore');
 const fetch = require('node-fetch');
 const FormData = require('form-data');
+const https = require('https');
+
+// Create a permissive agent to allow connecting to self-hosted n8n instances
+// with invalid or self-signed certificates.
+const n8nAgent = new https.Agent({ rejectUnauthorized: false });
 
 // ─── n8n API Client ────────────────────────────────────────────
 
@@ -31,6 +36,7 @@ async function listActiveWebhookWorkflows(apiBaseUrl, apiKey) {
     const listRes = await fetch(`${apiBase}/workflows?active=true&limit=250`, {
         headers,
         timeout: 10000,
+        agent: n8nAgent,
     });
     if (!listRes.ok) {
         throw new Error(`Failed to list n8n workflows: ${listRes.status} ${await listRes.text()}`);
@@ -51,7 +57,7 @@ async function listActiveWebhookWorkflows(apiBaseUrl, apiKey) {
             const results = await Promise.all(
                 batch.map(async (wf) => {
                     try {
-                        const res = await fetch(`${apiBase}/workflows/${wf.id}`, { headers, timeout: 8000 });
+                        const res = await fetch(`${apiBase}/workflows/${wf.id}`, { headers, timeout: 8000, agent: n8nAgent });
                         if (!res.ok) return null;
                         return res.json();
                     } catch (e) { return null; }
@@ -125,6 +131,7 @@ async function triggerWebhookWorkflow(n8nBaseUrl, webhookPath, method, payload, 
             method: method || 'POST',
             body: form,
             headers: form.getHeaders(),
+            agent: n8nAgent,
         });
 
         if (!res.ok) {
@@ -143,6 +150,7 @@ async function triggerWebhookWorkflow(n8nBaseUrl, webhookPath, method, payload, 
             method: method || 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload || {}),
+            agent: n8nAgent,
         });
 
         if (!res.ok) {
@@ -414,6 +422,7 @@ async function fetchWorkflowById(apiBaseUrl, apiKey, workflowId) {
     const res = await fetch(`${apiBase}/workflows/${workflowId}`, {
         headers,
         timeout: 10000,
+        agent: n8nAgent,
     });
     if (!res.ok) {
         throw new Error(`Failed to fetch n8n workflow ${workflowId}: ${res.status} ${await res.text()}`);
