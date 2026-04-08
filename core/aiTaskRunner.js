@@ -22,15 +22,25 @@ const MAX_TOOL_ITERATIONS = 5;
  * Build a minimal system prompt for task execution.
  */
 function buildTaskSystemPrompt(task, toolHint) {
-    // Compute "Now:" in the task's timezone
+    // Compute "Now:" in the task's timezone with explicit offset
+    const tz = task.timezone || 'UTC';
     let nowStr;
     try {
-        nowStr = new Date().toLocaleString('en-US', {
-            timeZone: task.timezone || 'UTC',
+        const now = new Date();
+        // Format: "Tuesday, April 8, 2026, 15:12:30" 
+        const datePart = now.toLocaleString('en-US', {
+            timeZone: tz,
             weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
             hour: '2-digit', minute: '2-digit', second: '2-digit',
             hour12: false,
         });
+        // Compute explicit UTC offset like "+02:00"
+        const localParts = new Date(now.toLocaleString('en-US', { timeZone: tz }));
+        const offsetMin = Math.round((localParts - now) / 60000);
+        const sign = offsetMin >= 0 ? '+' : '-';
+        const absOff = Math.abs(offsetMin);
+        const offStr = `${sign}${String(Math.floor(absOff / 60)).padStart(2, '0')}:${String(absOff % 60).padStart(2, '0')}`;
+        nowStr = `${datePart} (UTC${offStr}, ${tz})`;
     } catch (_) {
         nowStr = new Date().toISOString();
     }
@@ -45,9 +55,10 @@ Your job is to complete the task described below concisely and deliver actionabl
 - Do NOT ask follow-up questions — this runs unattended.
 - Include sources/links when available.
 - Use the user's connected integrations when relevant to the task.
+- IMPORTANT: The current time shown below is in the USER'S local timezone. Use this time for all time references.
 ${toolHint ? '\n' + toolHint : ''}
 
-Now: ${nowStr} (${task.timezone || 'UTC'})`;
+Now: ${nowStr}`;
 }
 
 /**

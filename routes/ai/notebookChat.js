@@ -367,7 +367,7 @@ ${searchAvailable ? `[WEB SEARCH & SOURCES]
 - You can add search results or any text directly as a notebook source using notebook_add_source
 - When adding web search results as a source, pass the complete results text directly — no need to re-fetch
 ` : ''}${kbContext}${documentContext}
-Now: ${new Date().toLocaleString('sv-SE', { timeZone: timezone || 'UTC', timeZoneName: 'short' })}`;
+Now: ${(() => { const _tz = timezone || 'UTC'; try { const _now = new Date(); const _dp = _now.toLocaleString('sv-SE', { timeZone: _tz }); const _lp = new Date(_now.toLocaleString('en-US', { timeZone: _tz })); const _om = Math.round((_lp - _now) / 60000); const _s = _om >= 0 ? '+' : '-'; const _a = Math.abs(_om); return `${_dp} UTC${_s}${String(Math.floor(_a/60)).padStart(2,'0')}:${String(_a%60).padStart(2,'0')} (${_tz})`; } catch(_) { return new Date().toISOString(); } })()}`;
         }
 
         let messages = [{ role: 'system', content: systemPrompt }];

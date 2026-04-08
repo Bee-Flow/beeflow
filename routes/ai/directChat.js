@@ -550,9 +550,25 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             }
         }
 
+        // Build Now: with explicit UTC offset so the AI knows the user's local time
+        const _tz = timezone || 'UTC';
+        let _nowStr;
+        try {
+            const _now = new Date();
+            const _datePart = _now.toLocaleString('sv-SE', { timeZone: _tz });
+            const _localParts = new Date(_now.toLocaleString('en-US', { timeZone: _tz }));
+            const _offsetMin = Math.round((_localParts - _now) / 60000);
+            const _sign = _offsetMin >= 0 ? '+' : '-';
+            const _absOff = Math.abs(_offsetMin);
+            const _offStr = `${_sign}${String(Math.floor(_absOff / 60)).padStart(2, '0')}:${String(_absOff % 60).padStart(2, '0')}`;
+            _nowStr = `${_datePart} UTC${_offStr} (${_tz})`;
+        } catch (_) {
+            _nowStr = new Date().toISOString();
+        }
+
         let messages = [
             {
-                role: 'system', content: basePrompt + toolHint + memoryContext + workspaceContext + projectContext + `\nNow: ${new Date().toLocaleString('sv-SE', { timeZone: timezone || 'UTC', timeZoneName: 'short' })}`
+                role: 'system', content: basePrompt + toolHint + memoryContext + workspaceContext + projectContext + `\nNow: ${_nowStr}`
             }
         ];
 
