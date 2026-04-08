@@ -192,6 +192,7 @@ router.post('/admin-login', async (req, res) => {
 
     let user = null;
     let isAdmin = false;
+    let storedUser = null;
 
     // 1. Check Config Admin
     if (config.admin.passwordHash && username === config.admin.username) {
@@ -204,7 +205,7 @@ router.post('/admin-login', async (req, res) => {
 
     // 2. Check UserStore Users (if not already logged in as admin)
     if (!user) {
-        let storedUser = await userStore.getUser(username);
+        storedUser = await userStore.getUser(username);
         // Fallback: if not found by ID and input looks like an email, try email lookup
         if (!storedUser && username.includes('@')) {
             storedUser = await userStore.getUserByEmail(username);
