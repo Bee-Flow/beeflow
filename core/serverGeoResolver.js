@@ -2,15 +2,15 @@
  * Server Geo-Location Resolver
  *
  * Resolves server endpoints (hostnames) to geo-location data (country, region, city)
- * using DNS resolution + geoip-lite, with Redis caching (7-day TTL).
+ * using DNS resolution + geoip-lite, with ip-api.com fallback for CDN/Cloudflare IPs.
  *
- * Used by the Integration Activity Monitor to show which country data flows to/from.
+ * Used at integration activity LOG TIME — geo data is stored directly in the DB row,
+ * so the dashboard reads pre-resolved data with zero extra lookups.
  *
- * Flow: hostname → Redis cache check → DNS resolve → geoip-lite lookup → cache & return
+ * Flow: hostname → DNS resolve → geoip-lite → (fallback: ip-api.com) → return
  */
 
 const dns = require('dns').promises;
-const { getRedis } = require('../db');
 
 let geoip = null;
 try {
@@ -18,9 +18,6 @@ try {
 } catch (e) {
     console.warn('[GeoResolver] geoip-lite not available:', e.message);
 }
-
-const CACHE_PREFIX = 'geo:';
-const CACHE_TTL = 7 * 24 * 60 * 60; // 7 days in seconds
 
 // EU/EEA country codes for GDPR jurisdiction highlighting
 const EU_EEA_COUNTRIES = new Set([
@@ -57,7 +54,7 @@ function countryFlag(code) {
 
 /**
  * Extract a resolvable hostname from a server endpoint label.
- * e.g. "google.com/search (via SerpAPI)" → "google.com"
+ * e.g. "api.serper.dev (Google Search)" → "api.serper.dev"
  *      "graph.microsoft.com" → "graph.microsoft.com"
  *      "mcp-server://filesystem" → null (not resolvable)
  */
@@ -73,7 +70,7 @@ function extractHostname(endpoint) {
     // Strip port
     host = host.split(':')[0];
 
-    // Strip parenthetical labels like "(via SerpAPI)"
+    // Strip parenthetical labels like "(Google Search)"
     host = host.replace(/\s*\(.*\)\s*$/, '').trim();
 
     // Must look like a hostname (has dots, not just a word like "smtp/imap")
@@ -86,7 +83,9 @@ function extractHostname(endpoint) {
  * Resolve a single server endpoint to geo-location data.
  * Returns null on any failure (fail-open — never blocks tool execution).
  *
- * @param {string} serverEndpoint - e.g. "google.com/search (via SerpAPI)"
+ * Called at log time (fire-and-forget), so latency doesn't affect the user.
+ *
+ * @param {string} serverEndpoint - e.g. "api.fireflies.ai"
  * @returns {Promise<object|null>} { ip, country_code, country_name, region, city, is_eu, flag, hostname }
  */
 async function resolveServerGeo(serverEndpoint) {
@@ -94,20 +93,7 @@ async function resolveServerGeo(serverEndpoint) {
     if (!hostname) return null;
 
     try {
-        // 1. Check Redis cache
-        const redis = getRedis();
-        if (redis) {
-            try {
-                const cached = await redis.get(`${CACHE_PREFIX}${hostname}`);
-                if (cached) {
-                    return JSON.parse(cached);
-                }
-            } catch (e) {
-                // Redis read error — proceed without cache
-            }
-        }
-
-        // 2. DNS resolve hostname → IP
+        // 1. DNS resolve hostname → IP
         let ip;
         try {
             const addresses = await dns.resolve4(hostname);
@@ -124,7 +110,7 @@ async function resolveServerGeo(serverEndpoint) {
 
         if (!ip) return null;
 
-        // 3. GeoIP lookup (local database)
+        // 2. GeoIP lookup (local database — instant, ~0.1ms)
         let countryCode = null;
         let region = null;
         let city = null;
@@ -138,7 +124,7 @@ async function resolveServerGeo(serverEndpoint) {
             }
         }
 
-        // 4. Fallback: HTTP API for Cloudflare/CDN IPs where geoip-lite has no data
+        // 3. Fallback: HTTP API for Cloudflare/CDN IPs where geoip-lite has no data
         if (!countryCode) {
             try {
                 const controller = new AbortController();
@@ -151,16 +137,14 @@ async function resolveServerGeo(serverEndpoint) {
                         countryCode = apiGeo.countryCode;
                         region = apiGeo.regionName || null;
                         city = apiGeo.city || null;
-                        console.log(`[GeoResolver] Fallback API: ${ip} → ${countryCode}`);
                     }
                 }
             } catch (apiErr) {
                 // Fallback failed — proceed with unknown
-                console.warn(`[GeoResolver] Fallback API failed for ${ip}: ${apiErr.message}`);
             }
         }
 
-        const result = {
+        return {
             ip,
             hostname,
             country_code: countryCode || null,
@@ -169,67 +153,15 @@ async function resolveServerGeo(serverEndpoint) {
             city: city || null,
             is_eu: EU_EEA_COUNTRIES.has(countryCode),
             flag: countryFlag(countryCode),
-            resolved_at: new Date().toISOString(),
         };
-
-        // 5. Cache in Redis (fire-and-forget)
-        if (redis) {
-            redis.setex(`${CACHE_PREFIX}${hostname}`, CACHE_TTL, JSON.stringify(result)).catch(() => {});
-        }
-
-        console.log(`[GeoResolver] ${hostname} → ${ip} → ${result.flag} ${result.country_name} (${result.country_code})`);
-        return result;
     } catch (err) {
         console.warn(`[GeoResolver] Failed to resolve ${hostname}:`, err.message);
         return null;
     }
 }
 
-/**
- * Batch-resolve multiple server endpoints.
- * Returns a Map<endpoint, geoResult>.
- * Deduplicates hostnames so each is only resolved once.
- */
-async function batchResolveServerGeo(endpoints) {
-    const results = new Map();
-    if (!endpoints || !Array.isArray(endpoints) || endpoints.length === 0) return results;
-
-    // Deduplicate by hostname
-    const hostnameMap = new Map(); // hostname → [endpoint1, endpoint2, ...]
-    for (const ep of endpoints) {
-        const hostname = extractHostname(ep);
-        if (!hostname) continue;
-        if (!hostnameMap.has(hostname)) hostnameMap.set(hostname, []);
-        hostnameMap.get(hostname).push(ep);
-    }
-
-    // Resolve all unique hostnames in parallel (max 10 concurrent)
-    const hostnames = [...hostnameMap.keys()];
-    const BATCH_SIZE = 10;
-
-    for (let i = 0; i < hostnames.length; i += BATCH_SIZE) {
-        const batch = hostnames.slice(i, i + BATCH_SIZE);
-        const geoResults = await Promise.all(
-            batch.map(h => resolveServerGeo(h).catch(() => null))
-        );
-
-        for (let j = 0; j < batch.length; j++) {
-            const geo = geoResults[j];
-            if (geo) {
-                // Map result back to all original endpoint strings that share this hostname
-                for (const ep of hostnameMap.get(batch[j])) {
-                    results.set(ep, geo);
-                }
-            }
-        }
-    }
-
-    return results;
-}
-
 module.exports = {
     resolveServerGeo,
-    batchResolveServerGeo,
     extractHostname,
     countryFlag,
     EU_EEA_COUNTRIES,

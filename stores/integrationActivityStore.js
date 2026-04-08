@@ -4,9 +4,13 @@
  *
  * Logs which integrations are used, what server endpoints they connect to,
  * what data direction (sent/received), and what PII categories were detected.
+ *
+ * Geo-location is resolved at LOG TIME (fire-and-forget) and stored directly
+ * in the DB — the dashboard reads pre-resolved data with zero extra lookups.
  */
 
 const { run, getOne, getAll, exec } = require('../db');
+const { resolveServerGeo } = require('../core/serverGeoResolver');
 
 let initialized = false;
 async function initDB() {
@@ -29,9 +33,19 @@ async function initDB() {
             pii_scan_enabled BOOLEAN DEFAULT false,
             data_summary TEXT,
             source TEXT DEFAULT 'unknown',
-            model TEXT
+            model TEXT,
+            server_ip TEXT,
+            country_code TEXT,
+            country_name TEXT,
+            is_eu BOOLEAN DEFAULT false
         )
     `);
+    // Add geo columns if they don't exist (migration for existing tables)
+    await exec(`ALTER TABLE integration_activity_log ADD COLUMN IF NOT EXISTS server_ip TEXT`).catch(() => {});
+    await exec(`ALTER TABLE integration_activity_log ADD COLUMN IF NOT EXISTS country_code TEXT`).catch(() => {});
+    await exec(`ALTER TABLE integration_activity_log ADD COLUMN IF NOT EXISTS country_name TEXT`).catch(() => {});
+    await exec(`ALTER TABLE integration_activity_log ADD COLUMN IF NOT EXISTS is_eu BOOLEAN DEFAULT false`).catch(() => {});
+
     await exec(`CREATE INDEX IF NOT EXISTS idx_integ_timestamp ON integration_activity_log(timestamp DESC)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_integ_org ON integration_activity_log(organization_id)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_integ_org_timestamp ON integration_activity_log(organization_id, timestamp DESC)`);
@@ -49,13 +63,30 @@ console.log('[IntegrationActivityStore] Initialized (PostgreSQL)');
 async function logIntegrationActivity(event) {
     await initDB();
     try {
+        // Resolve geo at log time (non-blocking — runs in background)
+        let serverIp = null, countryCode = null, countryName = null, isEu = false;
+        if (event.server_endpoint) {
+            try {
+                const geo = await resolveServerGeo(event.server_endpoint);
+                if (geo) {
+                    serverIp = geo.ip;
+                    countryCode = geo.country_code;
+                    countryName = geo.country_name;
+                    isEu = geo.is_eu;
+                }
+            } catch (geoErr) {
+                // Geo resolution failed — log without geo data (fail-open)
+            }
+        }
+
         await run(`
             INSERT INTO integration_activity_log
                 (timestamp, organization_id, user_id, agent_id, agent_name, conversation_id,
                  tool_name, integration_type, server_endpoint, data_direction,
                  data_categories, pii_categories_detected, pii_scan_enabled,
-                 data_summary, source, model)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+                 data_summary, source, model,
+                 server_ip, country_code, country_name, is_eu)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
         `, [
             event.timestamp || new Date().toISOString(),
             event.organization_id || null,
@@ -73,6 +104,10 @@ async function logIntegrationActivity(event) {
             event.data_summary || null,
             event.source || 'unknown',
             event.model || null,
+            serverIp,
+            countryCode,
+            countryName,
+            isEu,
         ]);
     } catch (e) {
         console.error('[IntegrationActivityStore] Failed to log:', e.message);
@@ -213,7 +248,12 @@ async function getIntegrationServers(filters = {}) {
             array_agg(DISTINCT integration_type) as integrations,
             COUNT(*) FILTER (WHERE data_direction = 'sent') as sent,
             COUNT(*) FILTER (WHERE data_direction = 'received') as received,
-            MAX(timestamp) as last_contact
+            MAX(timestamp) as last_contact,
+            -- Geo data (from the most recent record for this endpoint)
+            (array_agg(server_ip ORDER BY timestamp DESC))[1] as server_ip,
+            (array_agg(country_code ORDER BY timestamp DESC))[1] as country_code,
+            (array_agg(country_name ORDER BY timestamp DESC))[1] as country_name,
+            bool_or(is_eu) as is_eu
         FROM integration_activity_log ${where}
             ${where ? 'AND' : 'WHERE'} server_endpoint IS NOT NULL
         GROUP BY server_endpoint
