@@ -10,6 +10,7 @@ const bcrypt = require('bcryptjs');
 const router = express.Router();
 
 const userStore = require('../stores/userStore');
+const configStore = require('../stores/configStore');
 const { loadConfig, saveConfig, requireAuth, requireAdmin, getUserPermissions } = require('./permissions');
 const { getOrCreateUserDEKCompat, getFallbackEncryptionKey, setupSSOUserDEK, unlockSSOUserDEK, unlockWithRecoveryKey, secureClear } = require('./encryption');
 
@@ -97,6 +98,13 @@ router.get('/setup-status', async (req, res) => {
     } catch (err) {
         console.error('[Auth] setup-status — failed to load locales:', err.message);
     }
+    // ── Granular signup toggles (database-backed, fallback to env) ──
+    const envAllowSignups = process.env.ALLOW_SIGNUPS !== 'false';
+    const allowOrgSignups = envAllowSignups ? ((await configStore.getConfig('signup_org_enabled')) ?? true) : false;
+    const allowConsumerSignups = envAllowSignups ? ((await configStore.getConfig('signup_consumer_enabled')) ?? true) : false;
+    const waitlistEnabled = (await configStore.getConfig('signup_waitlist_enabled')) ?? false;
+    const consumerLoginMethods = (await configStore.getConfig('consumer_login_methods')) ?? ['password', 'google', 'microsoft'];
+
     res.json({
         isSetupComplete,
         isOAuthConfigured,
@@ -104,7 +112,11 @@ router.get('/setup-status', async (req, res) => {
         isMicrosoftConfigured,
         serverUrl,
         deploymentMode: process.env.DEPLOYMENT_MODE || 'cloud',
-        allowSignups: process.env.ALLOW_SIGNUPS !== 'false',
+        allowSignups: allowOrgSignups || allowConsumerSignups,
+        allowOrgSignups,
+        allowConsumerSignups,
+        waitlistEnabled,
+        consumerLoginMethods,
         allowPasswordLogin: process.env.ALLOW_PASSWORD_LOGIN !== 'false',
         availableLocales,
     });
@@ -231,6 +243,16 @@ router.post('/admin-login', async (req, res) => {
         ...user,
         isAdmin
     };
+
+    // ── Block waitlisted / pending users ──
+    if (storedUser && (storedUser.status === 'waitlist' || storedUser.status === 'pending')) {
+        req.session.pendingApproval = true;
+        req.session.save((err) => {
+            if (err) console.error('Session save error:', err);
+            res.json({ success: true, pendingApproval: true, user: req.session.user });
+        });
+        return;
+    }
     // Derive and store encryption key — only when encryption is enabled for user's plan
     const encryptionEnabled = await isEncryptionEnabledForUser(user.id);
     try {
@@ -656,7 +678,30 @@ router.post('/pending-signup', async (req, res) => {
     if (process.env.ALLOW_SIGNUPS === 'false') {
         return res.status(403).json({ error: 'Account creation is disabled on this server.' });
     }
-    const { newOrgName, orgDetails } = req.body;
+    const { signupType, authMethod, newOrgName, orgDetails } = req.body;
+
+    // Consumer OAuth signup
+    if (signupType === 'consumer') {
+        const consumerSignupsEnabled = (await configStore.getConfig('signup_consumer_enabled')) ?? true;
+        if (!consumerSignupsEnabled) {
+            return res.status(403).json({ error: 'Consumer registration is currently disabled.' });
+        }
+        req.session.pendingSignup = { signupType: 'consumer', authMethod: authMethod || 'google' };
+        return req.session.save((err) => {
+            if (err) {
+                console.error('[PendingSignup] Session save error:', err);
+                return res.status(500).json({ error: 'Failed to save pending signup' });
+            }
+            console.log(`[PendingSignup] Stored consumer signup in session ${req.sessionID}`);
+            res.json({ ok: true });
+        });
+    }
+
+    // Org OAuth signup
+    const orgSignupsEnabled = (await configStore.getConfig('signup_org_enabled')) ?? true;
+    if (!orgSignupsEnabled) {
+        return res.status(403).json({ error: 'Organization registration is currently disabled.' });
+    }
     if (!newOrgName) {
         return res.status(400).json({ error: 'Organization name is required' });
     }
@@ -669,6 +714,108 @@ router.post('/pending-signup', async (req, res) => {
         console.log(`[PendingSignup] Stored org "${newOrgName}" in session ${req.sessionID}`);
         res.json({ ok: true });
     });
+});
+
+// ═══════════════════════════════════════════════════════════
+// ── Admin: Signup Settings ────────────────────────────────
+// ═══════════════════════════════════════════════════════════
+router.get('/admin/signup-settings', requireAdmin, async (req, res) => {
+    try {
+        const orgEnabled = (await configStore.getConfig('signup_org_enabled')) ?? true;
+        const consumerEnabled = (await configStore.getConfig('signup_consumer_enabled')) ?? true;
+        const waitlistEnabled = (await configStore.getConfig('signup_waitlist_enabled')) ?? false;
+        const consumerLoginMethods = (await configStore.getConfig('consumer_login_methods')) ?? ['password', 'google', 'microsoft'];
+        res.json({ allowOrgSignups: orgEnabled, allowConsumerSignups: consumerEnabled, waitlistEnabled, consumerLoginMethods });
+    } catch (err) {
+        console.error('[Auth] Failed to get signup settings:', err.message);
+        res.status(500).json({ error: 'Failed to load signup settings' });
+    }
+});
+
+router.put('/admin/signup-settings', requireAdmin, async (req, res) => {
+    try {
+        const { allowOrgSignups, allowConsumerSignups, waitlistEnabled, consumerLoginMethods } = req.body;
+        if (typeof allowOrgSignups === 'boolean') {
+            await configStore.setConfig('signup_org_enabled', allowOrgSignups);
+        }
+        if (typeof allowConsumerSignups === 'boolean') {
+            await configStore.setConfig('signup_consumer_enabled', allowConsumerSignups);
+        }
+        if (typeof waitlistEnabled === 'boolean') {
+            await configStore.setConfig('signup_waitlist_enabled', waitlistEnabled);
+        }
+        if (Array.isArray(consumerLoginMethods)) {
+            const valid = consumerLoginMethods.filter(m => ['password', 'google', 'microsoft'].includes(m));
+            await configStore.setConfig('consumer_login_methods', valid);
+        }
+        console.log(`[Auth] Signup settings updated — org: ${allowOrgSignups}, consumer: ${allowConsumerSignups}, waitlist: ${waitlistEnabled}, consumerMethods: ${consumerLoginMethods}`);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[Auth] Failed to save signup settings:', err.message);
+        res.status(500).json({ error: 'Failed to save signup settings' });
+    }
+});
+
+// ── Waitlist Management ──────────────────────────────────────
+router.get('/admin/waitlist', requireAdmin, async (req, res) => {
+    try {
+        const allUsers = await userStore.getAllUsers();
+        const waitlisted = allUsers
+            .filter(u => u.status === 'waitlist')
+            .map(u => ({
+                id: u.id,
+                username: u.username,
+                displayName: u.displayName,
+                email: u.email,
+                organizationId: u.organizationId,
+                createdAt: u.createdAt,
+            }));
+        res.json(waitlisted);
+    } catch (err) {
+        console.error('[Auth] Failed to fetch waitlist:', err.message);
+        res.status(500).json({ error: 'Failed to load waitlist' });
+    }
+});
+
+router.post('/admin/waitlist/:userId/approve', requireAdmin, async (req, res) => {
+    try {
+        const user = await userStore.getUser(req.params.userId);
+        if (!user) return res.status(404).json({ error: 'User not found' });
+        if (user.status !== 'waitlist') return res.status(400).json({ error: 'User is not on the waitlist' });
+
+        await userStore.updateUser(user.id, { status: 'active' });
+        console.log(`[Auth] Waitlist approved: ${user.id} (${user.email || 'no email'})`);
+
+        // Send approval email if user has an email
+        if (user.email) {
+            try {
+                const { sendWaitlistApprovedEmail } = require('../utils/emailService');
+                await sendWaitlistApprovedEmail({ email: user.email, displayName: user.displayName || user.username });
+            } catch (emailErr) {
+                console.error('[Auth] Failed to send approval email:', emailErr.message);
+            }
+        }
+
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[Auth] Waitlist approve error:', err.message);
+        res.status(500).json({ error: 'Failed to approve user' });
+    }
+});
+
+router.post('/admin/waitlist/:userId/reject', requireAdmin, async (req, res) => {
+    try {
+        const user = await userStore.getUser(req.params.userId);
+        if (!user) return res.status(404).json({ error: 'User not found' });
+        if (user.status !== 'waitlist') return res.status(400).json({ error: 'User is not on the waitlist' });
+
+        await userStore.deleteUser(user.id);
+        console.log(`[Auth] Waitlist rejected & deleted: ${user.id}`);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[Auth] Waitlist reject error:', err.message);
+        res.status(500).json({ error: 'Failed to reject user' });
+    }
 });
 
 // Public signup — create user + optionally a new organization
@@ -702,6 +849,12 @@ router.post('/signup', async (req, res) => {
     let orgId = inviteData ? inviteData.organization_id : organizationId;
 
     if (newOrgName) {
+        // ── Granular check: org signups ──
+        const orgSignupsEnabled = (await configStore.getConfig('signup_org_enabled')) ?? true;
+        if (!orgSignupsEnabled && !inviteData) {
+            return res.status(403).json({ error: 'Organization registration is currently disabled.' });
+        }
+
         // --- Create a new organization with full details ---
         orgId = newOrgName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
         const od = orgDetails || {};
@@ -800,6 +953,11 @@ router.post('/signup', async (req, res) => {
         // Invited users are auto-approved; self-signup depends on org allowSignup
         var userStatus = (inviteData || org.allowSignup) ? 'active' : 'pending';
     } else if (process.env.DEPLOYMENT_MODE === 'cloud') {
+        // ── Granular check: consumer signups ──
+        const consumerSignupsEnabled = (await configStore.getConfig('signup_consumer_enabled')) ?? true;
+        if (!consumerSignupsEnabled) {
+            return res.status(403).json({ error: 'Consumer account registration is currently disabled.' });
+        }
         // Consumer account — no organization required in cloud mode
         orgId = null;
         groups = [];
@@ -810,7 +968,17 @@ router.post('/signup', async (req, res) => {
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
-    const resolvedStatus = typeof userStatus !== 'undefined' ? userStatus : 'active';
+    let resolvedStatus = typeof userStatus !== 'undefined' ? userStatus : 'active';
+
+    // ── Waitlist override (invited users bypass) ──
+    if (resolvedStatus === 'active' && !inviteData) {
+        const waitlistOn = (await configStore.getConfig('signup_waitlist_enabled')) ?? false;
+        if (waitlistOn) {
+            resolvedStatus = 'waitlist';
+            console.log(`[Signup] Waitlist mode — user '${username}' placed on waitlist`);
+        }
+    }
+
     const newUser = {
         id: username, username,
         displayName: displayName || username,
@@ -840,8 +1008,8 @@ router.post('/signup', async (req, res) => {
         }
     }
 
-    // If user is pending approval, notify but don't fully log in
-    if (resolvedStatus === 'pending') {
+    // If user is pending approval or waitlisted, notify but don't fully log in
+    if (resolvedStatus === 'pending' || resolvedStatus === 'waitlist') {
         req.session.isAuthenticated = true;
         req.session.isAdmin = false;
         req.session.pendingApproval = true;

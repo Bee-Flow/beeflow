@@ -13,17 +13,20 @@ const { GUI_DEFAULTS, getGUINamespaces } = require('../../i18n/defaults/en');
 
 // ── Middleware ───────────────────────────────────────────────────
 
+const { hasPermission } = require('../../auth/permissions');
+
 function requireAuth(req, res, next) {
     if (req.session && req.session.user) return next();
     res.status(401).json({ error: 'Unauthorized' });
 }
 
-function requireAdmin(req, res, next) {
+async function requireAdmin(req, res, next) {
     if (!req.session?.user) return res.status(401).json({ error: 'Unauthorized' });
-    if (!req.session.isAdmin && req.session.user?.role !== 'admin') {
-        return res.status(403).json({ error: 'Admin access required' });
-    }
-    next();
+    if (req.session.isAdmin || req.session.user?.role === 'admin') return next();
+    // Check RBAC permissions
+    const userId = req.session.user?.id;
+    if (userId && await hasPermission(userId, 'all', req.session)) return next();
+    return res.status(403).json({ error: 'Admin access required' });
 }
 
 // ══════════════════════════════════════════════════════════════════

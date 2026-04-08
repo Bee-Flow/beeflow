@@ -5,6 +5,7 @@
  * - notebook_doc_read/write/replace: Read and modify the TipTap document editor
  * - agent_search: Web research
  * - notebook_add_source: Add web search results directly as notebook sources
+ * - gmail_*/drive_*: Tax assistant integration tools (when notebook type is tax_assistant)
  */
 
 const express = require('express');
@@ -20,6 +21,11 @@ const notebookStore = require('../../stores/notebookStore');
 const { NOTEBOOK_DOC_TOOLS, NOTEBOOK_ADD_SOURCE_TOOL, executeNotebookDocTool } = require('../../integrations/notebookDocTools');
 const { AGENT_SEARCH_TOOLS, executeAgentSearchTool, isAgentSearchTool } = require('../../integrations/agentSearchTools');
 const { searchNotebookKB, executeNotebookKBSearchTool, NOTEBOOK_KB_SEARCH_TOOL } = require('../../core/notebookKnowledgeSearch');
+const { buildTaxAssistantPrompt } = require('./taxAssistantPrompt');
+const { executeTool: dispatchTool } = require('../../core/toolDispatcher');
+
+// Tax-relevant integration tool names (only these are injected for tax notebooks)
+const TAX_TOOL_NAMES = ['gmail_search', 'gmail_read', 'gmail_read_attachment', 'drive_search', 'drive_get_content'];
 
 function requireAuth(req, res, next) {
     if (req.session && req.session.user) return next();
@@ -201,7 +207,40 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
         const hasBingSearchKey = !!(await configStore.getSecret('bing_search_key'));
         const searchAvailable = searchProvider !== 'disabled' && ((searchProvider === 'bing' && hasBingSearchKey) || hasAgentSearchUrl);
 
-        const systemPrompt = `You are an intelligent notebook assistant. Today is ${today}.
+        // ── Tax Assistant: detect type and resolve integrations ─────
+        const isTaxAssistant = notebook.type === 'tax_assistant';
+        const taxConfig = isTaxAssistant ? (notebook.settings?.taxConfig || {}) : null;
+        let taxIntegrationTools = [];
+        let hasGmail = false;
+        let hasDrive = false;
+
+        if (isTaxAssistant) {
+            try {
+                const { getIntegrationTools } = require('../../core/integrationTools');
+                const integrationResult = await getIntegrationTools({
+                    userId, session: req.session, isAdmin: req.session.isAdmin
+                });
+                taxIntegrationTools = integrationResult.tools
+                    .filter(t => TAX_TOOL_NAMES.includes(t.function?.name));
+                hasGmail = taxIntegrationTools.some(t => t.function?.name?.startsWith('gmail_'));
+                hasDrive = taxIntegrationTools.some(t => t.function?.name?.startsWith('drive_'));
+                if (taxIntegrationTools.length > 0) {
+                    console.log(`[NotebookChat] Tax assistant: injecting ${taxIntegrationTools.length} integration tools (Gmail: ${hasGmail}, Drive: ${hasDrive})`);
+                }
+            } catch (intErr) {
+                console.warn('[NotebookChat] Tax integration tools failed:', intErr.message);
+            }
+        }
+
+        // ── Build system prompt (tax-specific or standard) ──────────
+        let systemPrompt;
+        if (isTaxAssistant) {
+            systemPrompt = buildTaxAssistantPrompt({
+                notebook, taxConfig, sourceSummary, kbContext, documentContext,
+                searchAvailable, hasGmail, hasDrive, timezone,
+            });
+        } else {
+            systemPrompt = `You are an intelligent notebook assistant. Today is ${today}.
 
 [NOTEBOOK: "${notebook.name}"]
 ${notebook.description ? `Description: ${notebook.description}` : ''}
@@ -327,6 +366,7 @@ ${searchAvailable ? `[WEB SEARCH & SOURCES]
 - When adding web search results as a source, pass the complete results text directly — no need to re-fetch
 ` : ''}${kbContext}${documentContext}
 Now: ${new Date().toLocaleString('sv-SE', { timeZone: timezone || 'UTC', timeZoneName: 'short' })}`;
+        }
 
         let messages = [{ role: 'system', content: systemPrompt }];
 
@@ -377,6 +417,11 @@ Now: ${new Date().toLocaleString('sv-SE', { timeZone: timezone || 'UTC', timeZon
         // Add web search tools if available (searchAvailable computed earlier for system prompt)
         if (searchAvailable) {
             notebookTools.push(...AGENT_SEARCH_TOOLS);
+        }
+
+        // Add tax assistant integration tools (Gmail, Drive)
+        if (isTaxAssistant && taxIntegrationTools.length > 0) {
+            notebookTools.push(...taxIntegrationTools);
         }
 
         // ── Tool calling loop ────────────────────────────────────────
@@ -495,6 +540,19 @@ Now: ${new Date().toLocaleString('sv-SE', { timeZone: timezone || 'UTC', timeZon
                         toolResult = { error: `Search failed: ${err.message}` };
                     }
                 }
+                // Integration tools (Gmail, Drive — tax assistant)
+                else if (isTaxAssistant && TAX_TOOL_NAMES.includes(toolName)) {
+                    try {
+                        send('thinking', { text: `🧾 Tax: ${toolName}...` });
+                        toolResult = await dispatchTool(toolName, toolArgs, {
+                            userId, session: req.session,
+                            userAuth: { userId, session: req.session },
+                            send,
+                        });
+                    } catch (err) {
+                        toolResult = { error: `Integration tool failed: ${err.message}` };
+                    }
+                }
                 // Unknown tool
                 else {
                     toolResult = { error: `Unknown tool: ${toolName}` };
@@ -590,6 +648,16 @@ Now: ${new Date().toLocaleString('sv-SE', { timeZone: timezone || 'UTC', timeZon
                 } else if (isAgentSearchTool(toolName)) {
                     try { toolResult = await executeAgentSearchTool(toolName, toolArgs); }
                     catch (err) { toolResult = { error: err.message }; }
+                } else if (isTaxAssistant && TAX_TOOL_NAMES.includes(toolName)) {
+                    try {
+                        toolResult = await dispatchTool(toolName, toolArgs, {
+                            userId, session: req.session,
+                            userAuth: { userId, session: req.session },
+                            send,
+                        });
+                    } catch (err) {
+                        toolResult = { error: `Integration tool failed: ${err.message}` };
+                    }
                 } else {
                     toolResult = { error: `Unknown tool: ${toolName}` };
                 }

@@ -591,10 +591,24 @@ router.get('/callback/:provider', async (req, res) => {
             console.log(`[OAuth] Updated user in store: ${user.id} (${user.displayName})`);
         }
 
-        // Handle pending signup — create organization if stored in session
+        // Handle pending signup — create organization or consumer account
         if (req.session.pendingSignup) {
-            const { newOrgName, orgDetails: od } = req.session.pendingSignup;
+            const pendingData = req.session.pendingSignup;
             delete req.session.pendingSignup;
+
+            if (pendingData.signupType === 'consumer') {
+                // Consumer OAuth signup — mark user as consumer, no org
+                const configStore = require('../stores/configStore');
+                const waitlistEnabled = (await configStore.getConfig('signup_waitlist_enabled')) ?? false;
+                const userStatus = waitlistEnabled ? 'waitlist' : 'active';
+                await userStore.updateUser(user.id, {
+                    isConsumer: true,
+                    status: userStatus,
+                });
+                console.log(`[OAuth] Consumer account created for ${user.id} (status: ${userStatus})`);
+            } else {
+                // Org OAuth signup
+                const { newOrgName, orgDetails: od } = pendingData;
 
             const orgId = newOrgName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
             const orgEmail = od.email || user.email || '';
@@ -678,6 +692,7 @@ router.get('/callback/:provider', async (req, res) => {
             } else {
                 console.warn(`[OAuth] Domain already taken, skipping org creation`);
             }
+            } // end org OAuth signup else
         }
 
         // Check if user belongs to any organisation

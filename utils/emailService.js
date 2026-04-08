@@ -204,8 +204,73 @@ async function sendInvitationEmail({ email, orgName, inviterName, inviteUrl, rol
     });
 }
 
+/**
+ * Send a branded waitlist approval email.
+ * @param {{ email: string, displayName: string }} opts
+ */
+async function sendWaitlistApprovedEmail({ email, displayName }) {
+    const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}`;
+    const logoUrl = `${clientHost}/bee-flow-logo.svg`;
+    const loginUrl = clientHost;
+
+    const html = `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="margin:0;padding:0;background:#f5f5f5;font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f5f5f5;padding:48px 20px;">
+    <tr><td align="center">
+      <table width="520" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:16px;border:1px solid rgba(0,0,0,0.06);overflow:hidden;box-shadow:0 4px 12px rgba(0,0,0,0.05);">
+        <!-- Header -->
+        <tr><td style="padding:36px 40px 28px;text-align:center;border-bottom:1px solid #f0f0f0;">
+          <img src="${logoUrl}" alt="BeeFlow" width="56" height="56" style="display:block;margin:0 auto 16px;border-radius:14px;" />
+          <h1 style="margin:0;font-size:22px;font-weight:700;color:#0f172a;letter-spacing:-0.3px;">You're approved! 🎉</h1>
+        </td></tr>
+        <!-- Body -->
+        <tr><td style="padding:32px 40px 36px;">
+          <p style="margin:0 0 16px;font-size:15px;line-height:1.65;color:#334155;">
+            Hi <strong style="color:#0f172a;">${displayName}</strong>,
+          </p>
+          <p style="margin:0 0 16px;font-size:15px;line-height:1.65;color:#334155;">
+            Great news — your BeeFlow account has been approved! You can now log in and start using the platform.
+          </p>
+          <!-- CTA -->
+          <table width="100%" cellpadding="0" cellspacing="0">
+            <tr><td align="center">
+              <a href="${loginUrl}" target="_blank" style="display:inline-block;padding:14px 40px;background:#0f172a;color:#ffffff;font-size:15px;font-weight:600;text-decoration:none;border-radius:12px;">
+                Log In Now
+              </a>
+            </td></tr>
+          </table>
+          <p style="margin:28px 0 0;font-size:12px;line-height:1.5;color:#94a3b8;">
+            If you didn't create an account on BeeFlow, you can safely ignore this email.
+          </p>
+        </td></tr>
+        <!-- Footer -->
+        <tr><td style="padding:20px 40px;text-align:center;background:#fafafa;border-top:1px solid #f0f0f0;">
+          <p style="margin:0;font-size:11px;color:#94a3b8;">
+            Sent by BeeFlow · <a href="${clientHost}" style="color:#6b7280;text-decoration:none;">${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}</a>
+          </p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`.trim();
+
+    const text = `Hi ${displayName},\n\nGreat news — your BeeFlow account has been approved! You can now log in and start using the platform.\n\nLog in: ${loginUrl}\n\nIf you didn't create an account on BeeFlow, you can safely ignore this email.`;
+
+    return sendServiceEmail({
+        to: email,
+        subject: 'Your BeeFlow account has been approved!',
+        text,
+        html,
+    });
+}
+
 module.exports = {
     getServiceEmailConfig,
     sendServiceEmail,
     sendInvitationEmail,
+    sendWaitlistApprovedEmail,
 };

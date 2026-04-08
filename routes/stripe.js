@@ -509,12 +509,15 @@ async function handleInvoicePaymentFailed(invoice) {
 //  Promo Code Admin Routes
 // ═══════════════════════════════════════════
 
-function requireAdmin(req, res, next) {
+const { hasPermission } = require('../auth/permissions');
+
+async function requireAdmin(req, res, next) {
     if (!req.session?.isAuthenticated) return res.status(401).json({ error: 'Not authenticated' });
-    if (!req.session.isAdmin && req.session.user?.role !== 'admin') {
-        return res.status(403).json({ error: 'Admin access required' });
-    }
-    next();
+    if (req.session.isAdmin || req.session.user?.role === 'admin') return next();
+    // Check RBAC permissions
+    const userId = req.session.user?.id;
+    if (userId && await hasPermission(userId, 'all', req.session)) return next();
+    return res.status(403).json({ error: 'Admin access required' });
 }
 
 // GET /api/stripe/promo-codes — List all promo codes

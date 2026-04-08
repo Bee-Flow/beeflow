@@ -2,9 +2,10 @@
     "org_admin": {
         "label": "Organisation Admin",
         "permissions": [
-            "org_admin", "manage_users", "manage_agents", "page_settings",
-            "admin_agents", "admin_agents_chat",
-            "admin_agents_pipeline", "admin_security", "admin_monitoring"
+            "org_admin", "manage_users", "manage_agents", "manage_components", "page_settings",
+            "admin_agents", "admin_agents_chat", "admin_agents_system",
+            "admin_agents_pipeline", "admin_components", "admin_ai_config",
+            "admin_security", "admin_monitoring", "admin_subscriptions"
         ]
     },
     "agent_admin": {

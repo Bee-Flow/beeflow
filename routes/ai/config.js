@@ -11,11 +11,19 @@ const {
     saveAIConfig,
 } = require('../../core/aiAgent');
 const configStore = require('../../stores/configStore');
+const { hasPermission } = require('../../auth/permissions');
 
 // Authentication middleware
 function requireAuth(req, res, next) {
     if (req.session && req.session.user) return next();
     res.status(401).json({ error: 'Unauthorized' });
+}
+
+async function isAdminUser(req) {
+    if (req.session.isAdmin || req.session.user?.role === 'admin') return true;
+    const userId = req.session.user?.id;
+    if (!userId) return false;
+    return await hasPermission(userId, 'admin_ai_config', req.session);
 }
 
 // ─── General AI Config ───────────────────────────────────────────
@@ -125,7 +133,7 @@ router.get('/config', async (req, res) => {
 
 router.post('/config', requireAuth, async (req, res) => {
     try {
-    if (!req.session.isAdmin && req.session.user?.role !== 'admin') {
+    if (!(await isAdminUser(req))) {
         return res.status(403).json({ error: 'Admin access required' });
     }
     const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, minimaxApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, llamaGuardConfig, moderationProvider, azureContentSafetyEndpoint, azureContentSafetyKey, azureContentSafetySeverityThreshold, azureContentSafetyCategories, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionScope, piiDetectionAction, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing, serviceEmailAddress, serviceEmailPassword, serviceEmailDisplayName, azureSpeechKey, azureSpeechRegion, transcriptionProvider, notebooksEnabled, projectsEnabled, askAiEnabled, exportEnabled, openInNotebookEnabled, notebooksMenuEnabled, azureRerankerEndpoint, azureRerankerKey, azureRerankerModel, stripeSecretKey, stripeWebhookSecret, stripePublishableKey, stripeEnabled, stripeTaxEnabled, stripeTaxCountry } = req.body;
@@ -340,7 +348,7 @@ const DELETABLE_KEYS = [
 
 router.delete('/config/key/:keyName', requireAuth, async (req, res) => {
     try {
-        if (!req.session.isAdmin && req.session.user?.role !== 'admin') {
+        if (!(await isAdminUser(req))) {
             return res.status(403).json({ error: 'Admin access required' });
         }
 
@@ -371,7 +379,7 @@ const DELETABLE_CONFIG_KEYS = [
 
 router.delete('/config/setting/:keyName', requireAuth, async (req, res) => {
     try {
-        if (!req.session.isAdmin && req.session.user?.role !== 'admin') {
+        if (!(await isAdminUser(req))) {
             return res.status(403).json({ error: 'Admin access required' });
         }
 
@@ -429,7 +437,7 @@ router.post('/config/test-service-email', requireAuth, async (req, res) => {
 
 router.post('/config/test-reranker', requireAuth, async (req, res) => {
     try {
-        if (!req.session.isAdmin && req.session.user?.role !== 'admin') {
+        if (!(await isAdminUser(req))) {
             return res.status(403).json({ error: 'Admin access required' });
         }
 
@@ -863,7 +871,7 @@ router.post('/user-settings', requireAuth, async (req, res) => {
 // ─── AI Regex Generator ──────────────────────────────────────────
 router.post('/generate-regex', requireAuth, async (req, res) => {
     // Only admins can generate regex rules
-    if (!req.session.isAdmin && req.session.user?.role !== 'admin') {
+    if (!(await isAdminUser(req))) {
         return res.status(403).json({ error: 'Admin access required' });
     }
 

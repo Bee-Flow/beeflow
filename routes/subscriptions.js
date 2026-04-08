@@ -8,20 +8,25 @@ const userStore = require('../stores/userStore');
 const usageStore = require('../stores/usageStore');
 
 const router = express.Router();
+const { hasPermission } = require('../auth/permissions');
 
-function isSuperAdmin(req) {
-    return req.session?.isAdmin || req.session?.user?.role === 'admin';
+async function isSuperAdmin(req) {
+    if (req.session?.isAdmin || req.session?.user?.role === 'admin') return true;
+    // Check RBAC: user may have admin_subscriptions or all permission via groups/roles
+    const userId = req.session?.user?.id;
+    if (!userId) return false;
+    return await hasPermission(userId, 'admin_subscriptions', req.session);
 }
 
-function requireAdmin(req, res, next) {
-    if (!isSuperAdmin(req)) return res.status(403).json({ error: 'Admin access required' });
+async function requireAdmin(req, res, next) {
+    if (!(await isSuperAdmin(req))) return res.status(403).json({ error: 'Admin access required' });
     next();
 }
 
 // Allow authenticated users to read their own org's subscription, super admins can access all
-function requireAuthOrOrgMember(req, res, next) {
+async function requireAuthOrOrgMember(req, res, next) {
     if (!req.session?.isAuthenticated) return res.status(401).json({ error: 'Not authenticated' });
-    if (isSuperAdmin(req)) return next();
+    if (await isSuperAdmin(req)) return next();
     const orgId = req.params.orgId;
     const sessionUser = req.session.user;
     if (orgId && sessionUser) {
