@@ -1373,30 +1373,38 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
 
                         // ── Integration Activity Logging (async, non-blocking) ──
                         try {
-                            const { resolveIntegration, scanOutputForPii } = require('../../core/integrationToolMap');
+                            const { resolveIntegration } = require('../../core/integrationToolMap');
                             const integMeta = resolveIntegration(toolName, toolArgs || {});
                             if (integMeta) {
-                                // Scan tool output for PII (lightweight regex, no API calls)
                                 const resultText = typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult || '');
-                                const piiDetected = scanOutputForPii(resultText);
-                                configStore.getConfig(`org_privacy_shield_${userOrgId}`).then(shield => {
-                                    if (shield?.monitorIntegrations) {
-                                        const integStore = require('../../stores/integrationActivityStore');
-                                        integStore.logIntegrationActivity({
-                                            organization_id: userOrgId || null,
-                                            user_id: userId,
-                                            conversation_id: convId || null,
-                                            tool_name: toolName,
-                                            integration_type: integMeta.integration,
-                                            server_endpoint: integMeta.server,
-                                            data_direction: integMeta.direction,
-                                            data_categories: integMeta.dataCategories,
-                                            pii_categories_detected: piiDetected || null,
-                                            pii_scan_enabled: true,
-                                            source: 'direct_chat',
-                                            model: modelId || null,
-                                        }).catch(e => console.error('[IntegrationActivityLog] Error:', e.message));
-                                    }
+                                configStore.getConfig(`org_privacy_shield_${userOrgId}`).then(async shield => {
+                                    if (!shield?.monitorIntegrations) return;
+                                    // PII scan: use Azure/CPU model with ALL categories, respect org confidence threshold
+                                    let piiDetected = null;
+                                    try {
+                                        const { detectPii } = require('../../core/azurePiiDetection');
+                                        const threshold = typeof shield.piiDetectionConfidenceThreshold === 'number'
+                                            ? shield.piiDetectionConfidenceThreshold : 0.7;
+                                        const piiResult = await detectPii(resultText.slice(0, 5000), null, threshold);
+                                        if (piiResult?.hasPii) {
+                                            piiDetected = [...new Set(piiResult.entities.map(e => e.label))].join(', ');
+                                        }
+                                    } catch (piiErr) { /* fail-open: log without PII data */ }
+                                    const integStore = require('../../stores/integrationActivityStore');
+                                    integStore.logIntegrationActivity({
+                                        organization_id: userOrgId || null,
+                                        user_id: userId,
+                                        conversation_id: convId || null,
+                                        tool_name: toolName,
+                                        integration_type: integMeta.integration,
+                                        server_endpoint: integMeta.server,
+                                        data_direction: integMeta.direction,
+                                        data_categories: integMeta.dataCategories,
+                                        pii_categories_detected: piiDetected || null,
+                                        pii_scan_enabled: true,
+                                        source: 'direct_chat',
+                                        model: modelId || null,
+                                    }).catch(e => console.error('[IntegrationActivityLog] Error:', e.message));
                                 }).catch(() => {});
                             }
                         } catch (e) { /* ignore */ }
@@ -1749,30 +1757,38 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
 
                 // ── Integration Activity Logging (async, non-blocking) ──
                 try {
-                    const { resolveIntegration, scanOutputForPii } = require('../../core/integrationToolMap');
+                    const { resolveIntegration } = require('../../core/integrationToolMap');
                     const integMeta = resolveIntegration(toolName, toolArgs || {});
                     if (integMeta) {
-                        // Scan tool output for PII (lightweight regex, no API calls)
                         const resultText = typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult || '');
-                        const piiDetected = scanOutputForPii(resultText);
-                        configStore.getConfig(`org_privacy_shield_${userOrgId}`).then(shield => {
-                            if (shield?.monitorIntegrations) {
-                                const integStore = require('../../stores/integrationActivityStore');
-                                integStore.logIntegrationActivity({
-                                    organization_id: userOrgId || null,
-                                    user_id: userId,
-                                    conversation_id: convId || null,
-                                    tool_name: toolName,
-                                    integration_type: integMeta.integration,
-                                    server_endpoint: integMeta.server,
-                                    data_direction: integMeta.direction,
-                                    data_categories: integMeta.dataCategories,
-                                    pii_categories_detected: piiDetected || null,
-                                    pii_scan_enabled: true,
-                                    source: 'direct_chat',
-                                    model: modelId || null,
-                                }).catch(e => console.error('[IntegrationActivityLog] Error:', e.message));
-                            }
+                        configStore.getConfig(`org_privacy_shield_${userOrgId}`).then(async shield => {
+                            if (!shield?.monitorIntegrations) return;
+                            // PII scan: use Azure/CPU model with ALL categories, respect org confidence threshold
+                            let piiDetected = null;
+                            try {
+                                const { detectPii } = require('../../core/azurePiiDetection');
+                                const threshold = typeof shield.piiDetectionConfidenceThreshold === 'number'
+                                    ? shield.piiDetectionConfidenceThreshold : 0.7;
+                                const piiResult = await detectPii(resultText.slice(0, 5000), null, threshold);
+                                if (piiResult?.hasPii) {
+                                    piiDetected = [...new Set(piiResult.entities.map(e => e.label))].join(', ');
+                                }
+                            } catch (piiErr) { /* fail-open: log without PII data */ }
+                            const integStore = require('../../stores/integrationActivityStore');
+                            integStore.logIntegrationActivity({
+                                organization_id: userOrgId || null,
+                                user_id: userId,
+                                conversation_id: convId || null,
+                                tool_name: toolName,
+                                integration_type: integMeta.integration,
+                                server_endpoint: integMeta.server,
+                                data_direction: integMeta.direction,
+                                data_categories: integMeta.dataCategories,
+                                pii_categories_detected: piiDetected || null,
+                                pii_scan_enabled: true,
+                                source: 'direct_chat',
+                                model: modelId || null,
+                            }).catch(e => console.error('[IntegrationActivityLog] Error:', e.message));
                         }).catch(() => {});
                     }
                 } catch (e) { /* ignore */ }

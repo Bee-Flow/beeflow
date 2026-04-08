@@ -4,31 +4,24 @@
  * Runs every 60 seconds, picks up due tasks, executes them via the
  * LLM (non-streaming), and delivers results as notifications.
  *
- * Tasks only have access to READ-ONLY tools (web search, etc.)
- * — they cannot send emails, create calendar events, etc.
+ * Tasks now use the owner's connected integrations (Gmail, Calendar,
+ * Drive, etc.) by resolving their active session from the DB.
  */
 
 const aiTaskStore = require('../stores/aiTaskStore');
 const { resolveModelForTier } = require('./modelResolver');
 const { getProviderForModel } = require('./aiAgent');
 const { getAdapter } = require('./providers');
+const { pool } = require('../db');
 
 const RUNNER_INTERVAL_MS = 60_000; // 60 seconds
 const MAX_CONCURRENT = 5;
-const MAX_TOOL_ITERATIONS = 3;
-
-/**
- * Read-only tools whitelist.
- * Only these tool *prefixes* / exact names are allowed during background execution.
- */
-const READ_ONLY_TOOL_NAMES = new Set([
-    'agent_search',      // Web search (Tavily/Bing)
-]);
+const MAX_TOOL_ITERATIONS = 5;
 
 /**
  * Build a minimal system prompt for task execution.
  */
-function buildTaskSystemPrompt(task) {
+function buildTaskSystemPrompt(task, toolHint) {
     // Compute "Now:" in the task's timezone
     let nowStr;
     try {
@@ -51,72 +44,34 @@ Your job is to complete the task described below concisely and deliver actionabl
 - If the task requires web search, use the search tool proactively.
 - Do NOT ask follow-up questions — this runs unattended.
 - Include sources/links when available.
-- Maximum response length: ~${task.maxResultLength || 2000} characters.
+- Use the user's connected integrations when relevant to the task.
+${toolHint ? '\n' + toolHint : ''}
 
 Now: ${nowStr} (${task.timezone || 'UTC'})`;
 }
 
 /**
- * Build the web search tool definition (the only tool available by default).
+ * Resolve the user's active session from the PostgreSQL session store.
+ * Returns a session-like object with oauthProvider, accessToken, refreshToken.
  */
-function buildReadOnlyTools() {
-    // We only inject agent_search for now
+async function resolveUserSession(userId) {
     try {
-        const { buildAgentSearchTool } = require('../integrations/agentSearchTools');
-        if (typeof buildAgentSearchTool === 'function') {
-            return [buildAgentSearchTool()];
+        const { rows } = await pool.query(
+            `SELECT sess FROM user_sessions 
+             WHERE sess::jsonb -> 'user' ->> 'id' = $1
+             AND expire > NOW()
+             ORDER BY expire DESC LIMIT 1`,
+            [userId]
+        );
+        if (rows.length === 0) {
+            console.log(`[AITaskRunner] No active session found for user ${userId}`);
+            return null;
         }
-    } catch (_) { /* not available */ }
-
-    // Fallback: manual tool definition
-    return [{
-        type: 'function',
-        function: {
-            name: 'agent_search',
-            description: 'Search the web for current information, news, facts, or data.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    query: { type: 'string', description: 'The search query' },
-                    num_results: { type: 'integer', description: 'Number of results (default 5, max 10)' },
-                },
-                required: ['query'],
-            },
-        },
-    }];
-}
-
-/**
- * Execute a tool call during task execution.
- * Only read-only tools are allowed.
- */
-async function executeTaskToolCall(toolName, toolArgs) {
-    if (!READ_ONLY_TOOL_NAMES.has(toolName)) {
-        return { error: `Tool "${toolName}" is not available for AI Tasks (read-only mode)` };
-    }
-
-    try {
-        const configStore = require('../stores/configStore');
-
-        if (toolName === 'agent_search') {
-            // Check if admin configured Bing as the search provider (resilient to transient DB failures)
-            try {
-                const searchProvider = await configStore.getConfig('search_provider');
-                if (searchProvider === 'bing') {
-                    const { executeBingSearchTool } = require('../integrations/bingSearchTools');
-                    return await executeBingSearchTool(toolName, toolArgs);
-                }
-            } catch (cfgErr) {
-                console.warn(`[AITaskRunner] Config lookup failed (search_provider), using default: ${cfgErr.message}`);
-            }
-            const { executeAgentSearchTool } = require('../integrations/agentSearchTools');
-            return await executeAgentSearchTool(toolName, toolArgs);
-        }
-
-        return { error: `No handler for tool: ${toolName}` };
+        const sess = typeof rows[0].sess === 'string' ? JSON.parse(rows[0].sess) : rows[0].sess;
+        return sess;
     } catch (err) {
-        console.error(`[AITaskRunner] Tool execution error (${toolName}):`, err.message);
-        return { error: err.message };
+        console.error(`[AITaskRunner] Session lookup error for user ${userId}:`, err.message);
+        return null;
     }
 }
 
@@ -143,8 +98,33 @@ async function executeTask(task) {
             throw new Error(`Provider adapter does not support non-streaming chat`);
         }
 
-        const systemPrompt = buildTaskSystemPrompt(task);
-        const tools = buildReadOnlyTools();
+        // ── Resolve user session & integrations ─────────────────
+        const session = await resolveUserSession(task.userId);
+        let tools = [];
+        let toolHint = '';
+
+        try {
+            const { getIntegrationTools, buildToolHint } = require('./integrationTools');
+            const result = await getIntegrationTools({
+                userId: task.userId,
+                session: session,
+                isAdmin: false,
+            });
+            tools = result.tools || [];
+            toolHint = await buildToolHint(tools, task.userId);
+            console.log(`[AITaskRunner] Loaded ${tools.length} integration tools for user ${task.userId}`);
+        } catch (err) {
+            console.warn(`[AITaskRunner] Failed to load integration tools: ${err.message}`);
+            // Fallback: try to load at least web search
+            try {
+                const { buildAgentSearchTool } = require('../integrations/agentSearchTools');
+                if (typeof buildAgentSearchTool === 'function') {
+                    tools = [buildAgentSearchTool()];
+                }
+            } catch (_) { /* no search available */ }
+        }
+
+        const systemPrompt = buildTaskSystemPrompt(task, toolHint);
 
         let messages = [
             { role: 'system', content: systemPrompt },
@@ -156,7 +136,7 @@ async function executeTask(task) {
         // Tool-calling loop (max iterations)
         for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
             const response = await adapter.chat(config.apiKey, config.url, modelId, messages, {
-                maxTokens: 4096,
+                maxTokens: 16384,
                 temperature: 0.7,
                 tools: tools.length > 0 ? tools : undefined,
                 toolChoice: tools.length > 0 ? 'auto' : undefined,
@@ -182,7 +162,8 @@ async function executeTask(task) {
                     })),
                 });
 
-                // Execute each tool call
+                // Execute each tool call via the unified dispatcher
+                const { executeTool } = require('./toolDispatcher');
                 for (const tc of response.toolCalls) {
                     const toolName = tc.function.name;
                     let toolArgs;
@@ -195,7 +176,17 @@ async function executeTask(task) {
                     }
 
                     console.log(`[AITaskRunner]   🔧 Tool call: ${toolName}(${JSON.stringify(toolArgs).substring(0, 100)})`);
-                    const result = await executeTaskToolCall(toolName, toolArgs);
+                    
+                    let result;
+                    try {
+                        result = await executeTool(toolName, toolArgs, {
+                            userId: task.userId,
+                            session: session,
+                        });
+                    } catch (toolErr) {
+                        console.error(`[AITaskRunner]   ❌ Tool error (${toolName}):`, toolErr.message);
+                        result = { error: toolErr.message };
+                    }
 
                     messages.push({
                         role: 'tool',
@@ -212,8 +203,8 @@ async function executeTask(task) {
             break;
         }
 
-        // Truncate if needed
-        const maxLen = task.maxResultLength || 10000;
+        // Truncate if needed (safety net — ignore task.maxResultLength since DB defaults to 2000)
+        const maxLen = 50000;
         if (finalResponse.length > maxLen) {
             finalResponse = finalResponse.substring(0, maxLen) + '\n\n… (truncated)';
         }

@@ -30,7 +30,7 @@ async function initDB() {
             is_active BOOLEAN DEFAULT TRUE,
             model_tier TEXT DEFAULT 'fast',
             tools_enabled TEXT DEFAULT '["agent_search"]',
-            max_result_length INTEGER DEFAULT 2000,
+            max_result_length INTEGER DEFAULT 50000,
             run_count INTEGER DEFAULT 0,
             timezone TEXT DEFAULT 'UTC',
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -39,6 +39,12 @@ async function initDB() {
         CREATE INDEX IF NOT EXISTS idx_ai_tasks_user ON ai_tasks(user_id);
         CREATE INDEX IF NOT EXISTS idx_ai_tasks_due ON ai_tasks(next_run_at, is_active);
     `);
+
+    // Migrate existing tasks with old default (2000) to new default (50000)
+    await exec(`
+        ALTER TABLE ai_tasks ALTER COLUMN max_result_length SET DEFAULT 50000;
+        UPDATE ai_tasks SET max_result_length = 50000 WHERE max_result_length <= 2000;
+    `).catch(() => { /* already migrated or column doesn't exist yet */ });
 
     initialized = true;
     console.log('[AITaskStore] PostgreSQL initialized');

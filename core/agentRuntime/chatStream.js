@@ -13,7 +13,7 @@ const path = require('path');
 // Legacy swarm modules removed — isSwarm is always false
 const usageStore = require('../../stores/usageStore');
 const integrationActivityStore = require('../../stores/integrationActivityStore');
-const { resolveIntegration, scanOutputForPii } = require('../integrationToolMap');
+const { resolveIntegration } = require('../integrationToolMap');
 
 const { classifyPromptComplexity } = require('../promptClassifier');
 const configStore = require('../../stores/configStore');
@@ -1315,30 +1315,38 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     try {
                         const integMeta = resolveIntegration(toolName, toolArgs || {});
                         if (integMeta) {
-                            // Scan tool output for PII (lightweight regex, no API calls)
                             const resultText = typeof finalToolResult === 'string' ? finalToolResult : JSON.stringify(finalToolResult || '');
-                            const piiDetected = scanOutputForPii(resultText);
-                            // Fire-and-forget: check shield config + log
+                            // Fire-and-forget: check shield config, scan PII, log
                             const shieldKey = `org_privacy_shield_${agent.organization_id}`;
-                            configStore.getConfig(shieldKey).then(shield => {
-                                if (shield?.monitorIntegrations) {
-                                    integrationActivityStore.logIntegrationActivity({
-                                        organization_id: agent.organization_id || null,
-                                        user_id: userId,
-                                        agent_id: agentId,
-                                        agent_name: agent.name,
-                                        conversation_id: conversation?.id || null,
-                                        tool_name: toolName,
-                                        integration_type: integMeta.integration,
-                                        server_endpoint: integMeta.server,
-                                        data_direction: integMeta.direction,
-                                        data_categories: integMeta.dataCategories,
-                                        pii_categories_detected: piiDetected || null,
-                                        pii_scan_enabled: true,
-                                        source: isSwarm ? 'swarm_orchestrator' : 'agent_stream',
-                                        model: modelToUse,
-                                    }).catch(e => console.error('[IntegrationActivityLog] Error:', e.message));
-                                }
+                            configStore.getConfig(shieldKey).then(async shield => {
+                                if (!shield?.monitorIntegrations) return;
+                                // PII scan: use Azure/CPU model with ALL categories, respect org confidence threshold
+                                let piiDetected = null;
+                                try {
+                                    const { detectPii } = require('../azurePiiDetection');
+                                    const threshold = typeof shield.piiDetectionConfidenceThreshold === 'number'
+                                        ? shield.piiDetectionConfidenceThreshold : 0.7;
+                                    const piiResult = await detectPii(resultText.slice(0, 5000), null, threshold);
+                                    if (piiResult?.hasPii) {
+                                        piiDetected = [...new Set(piiResult.entities.map(e => e.label))].join(', ');
+                                    }
+                                } catch (piiErr) { /* fail-open: log without PII data */ }
+                                integrationActivityStore.logIntegrationActivity({
+                                    organization_id: agent.organization_id || null,
+                                    user_id: userId,
+                                    agent_id: agentId,
+                                    agent_name: agent.name,
+                                    conversation_id: conversation?.id || null,
+                                    tool_name: toolName,
+                                    integration_type: integMeta.integration,
+                                    server_endpoint: integMeta.server,
+                                    data_direction: integMeta.direction,
+                                    data_categories: integMeta.dataCategories,
+                                    pii_categories_detected: piiDetected || null,
+                                    pii_scan_enabled: true,
+                                    source: isSwarm ? 'swarm_orchestrator' : 'agent_stream',
+                                    model: modelToUse,
+                                }).catch(e => console.error('[IntegrationActivityLog] Error:', e.message));
                             }).catch(() => {});
                         }
                     } catch (e) { /* ignore integration logging errors */ }
