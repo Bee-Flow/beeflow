@@ -146,12 +146,18 @@ async function triggerWebhookWorkflow(n8nBaseUrl, webhookPath, method, payload, 
         return await res.text();
     } else {
         // Send as JSON
-        const res = await fetch(url, {
-            method: method || 'POST',
+        const actualMethod = method || 'POST';
+        const fetchOptions = {
+            method: actualMethod,
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload || {}),
             agent: n8nAgent,
-        });
+        };
+        
+        if (actualMethod !== 'GET' && actualMethod !== 'HEAD') {
+            fetchOptions.body = JSON.stringify(payload || {});
+        }
+
+        const res = await fetch(url, fetchOptions);
 
         if (!res.ok) {
             const errText = await res.text();

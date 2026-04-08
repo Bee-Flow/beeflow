@@ -534,7 +534,7 @@ router.post('/:id/ingest/n8n', requireAuth, async (req, res) => {
         if (!kb) return res.status(404).json({ error: 'KB not found' });
         if (kb.tenant_id !== getUserId(req)) return res.status(403).json({ error: 'Access denied' });
 
-        const { workflowId } = req.body;
+        const { workflowId, mode = 'data' } = req.body;
         if (!workflowId) {
             return res.status(400).json({ error: 'workflowId is required' });
         }
@@ -560,32 +560,86 @@ router.post('/:id/ingest/n8n', requireAuth, async (req, res) => {
         }
 
         // Fetch the full workflow definition from n8n
-        const { fetchWorkflowById } = require('../integrations/n8nTools');
+        const { fetchWorkflowById, triggerWebhookWorkflow } = require('../integrations/n8nTools');
         const workflow = await fetchWorkflowById(n8nUrl, n8nApiKey, workflowId);
 
         if (!workflow || !workflow.nodes) {
             return res.status(400).json({ error: 'Invalid workflow data received from n8n' });
         }
 
-        // Convert to Markdown
-        const { convertN8nWorkflowToMarkdown } = require('../core/n8nWorkflowConverter');
-        const markdown = convertN8nWorkflowToMarkdown(workflow);
+        let markdown = '';
+        let title = '';
+        let sourceUri = '';
 
-        if (!markdown || markdown.trim().length < 10) {
-            return res.status(400).json({ error: 'Workflow produced no meaningful content' });
+        if (mode === 'definition') {
+            // Convert Workflow Definition to Markdown
+            const { convertN8nWorkflowToMarkdown } = require('../core/n8nWorkflowConverter');
+            markdown = convertN8nWorkflowToMarkdown(workflow);
+            title = `n8n Workflow Structure: ${workflow.name || 'Untitled'}`;
+            sourceUri = `n8n://workflow/${workflowId}/definition`;
+            
+            if (!markdown || markdown.trim().length < 10) {
+                return res.status(400).json({ error: 'Workflow produced no meaningful content' });
+            }
+        } else {
+            // Execute Webhook and use Data
+            const webhookNode = workflow.nodes.find(n => n.type === 'n8n-nodes-base.webhook');
+            if (!webhookNode || !webhookNode.parameters || !webhookNode.parameters.path) {
+                return res.status(400).json({ error: 'Execution failed: No active webhook trigger node found in this workflow.' });
+            }
+
+            const webhookPath = webhookNode.parameters.path;
+            const httpMethod = webhookNode.parameters.httpMethod || 'GET';
+            
+            console.log(`[KB] Executing n8n workflow webhook for real-time ingestion: ${webhookPath}`);
+            const resultContent = await triggerWebhookWorkflow(n8nUrl, webhookPath, httpMethod, null, []);
+
+            if (typeof resultContent === 'string') {
+                try {
+                    const parsed = JSON.parse(resultContent);
+                    if (Array.isArray(parsed)) {
+                        markdown = parsed.map((item, idx) => {
+                            if (item.markdown) return item.markdown;
+                            if (item.text) return item.text;
+                            return `### Output Chunk ${idx + 1}\n\`\`\`json\n${JSON.stringify(item, null, 2)}\n\`\`\``;
+                        }).join('\n\n---\n\n');
+                    } else if (typeof parsed === 'object') {
+                        markdown = `\`\`\`json\n${JSON.stringify(parsed, null, 2)}\n\`\`\``;
+                    } else {
+                        markdown = resultContent;
+                    }
+                } catch (e) {
+                    // It's pure markdown/text
+                    markdown = resultContent;
+                }
+            } else if (typeof resultContent === 'object') {
+                if (Array.isArray(resultContent)) {
+                    markdown = resultContent.map((item, idx) => {
+                        if (item.markdown) return item.markdown;
+                        if (item.text) return item.text;
+                        return `### Output Chunk ${idx + 1}\n\`\`\`json\n${JSON.stringify(item, null, 2)}\n\`\`\``;
+                    }).join('\n\n---\n\n');
+                } else {
+                    markdown = `\`\`\`json\n${JSON.stringify(resultContent, null, 2)}\n\`\`\``;
+                }
+            }
+
+            if (!markdown || markdown.trim().length === 0) {
+                return res.status(400).json({ error: 'n8n workflow executed successfully, but returned no content for the KB' });
+            }
+
+            title = `n8n Workflow Output: ${workflow.name || 'Untitled'} - ${new Date().toISOString()}`;
+            sourceUri = `n8n://workflow/${workflowId}/run/${Date.now()}`;
         }
 
         // Ingest into KB
-        const title = `n8n Workflow: ${workflow.name || 'Untitled'}`;
-        const sourceUri = `n8n://workflow/${workflowId}`;
-
         const result = await ingestDocument(
             kb.tenant_id, kb.id, markdown,
             title, 'n8n', sourceUri,
             { lang: kb.default_lang }
         );
 
-        console.log(`[KB] n8n workflow "${workflow.name}" ingested: ${result.chunks} chunks`);
+        console.log(`[KB] n8n workflow "${workflow.name}" ingested [mode=${mode}]: ${result.chunks} chunks`);
 
         res.status(201).json({
             success: true,
