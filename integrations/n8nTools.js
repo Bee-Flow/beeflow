@@ -132,6 +132,7 @@ async function triggerWebhookWorkflow(n8nBaseUrl, webhookPath, method, payload, 
             body: form,
             headers: form.getHeaders(),
             agent: n8nAgent,
+            signal: AbortSignal.timeout(300000), // 5 min — n8n workflows with AI nodes can be slow
         });
 
         if (!res.ok) {
@@ -157,7 +158,10 @@ async function triggerWebhookWorkflow(n8nBaseUrl, webhookPath, method, payload, 
             fetchOptions.body = JSON.stringify(payload || {});
         }
 
-        const res = await fetch(url, fetchOptions);
+        const res = await fetch(url, {
+            ...fetchOptions,
+            signal: AbortSignal.timeout(300000), // 5 min — n8n workflows with AI nodes can be slow
+        });
 
         if (!res.ok) {
             const errText = await res.text();

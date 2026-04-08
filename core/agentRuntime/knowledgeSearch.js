@@ -167,7 +167,12 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
             }).join('\n');
 
             const citationInstruction = includeRefs
-                ? 'When relevant, cite the source name or URL (from the "Source N:" headers above) at the end of your response so the user can verify the information.'
+                ? `IMPORTANT — Inline Source Citations:
+You MUST cite your sources inline within your answer text. After each fact, claim, or piece of information that comes from the knowledge base, add an inline citation in parentheses.
+Format: (Bron: <document name>, <section heading or topic>)
+Example: "Medewerkers worden ingedeeld op basis van functioneren. (Bron: PHB Aldenhof, §3.2 Salarisschalen)"
+Use the document names from the "Source N:" headers above. If a section heading is visible in the source content, include it.
+Do NOT group all citations at the end — weave them naturally into your answer after the relevant sentences.`
                 : 'Do NOT include citations (e.g. [Source 1]) or source references in your final response.';
 
             if (isStrictKnowledge) {
