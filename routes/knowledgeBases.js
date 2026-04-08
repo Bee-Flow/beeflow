@@ -567,20 +567,19 @@ router.post('/:id/ingest/n8n', requireAuth, async (req, res) => {
             return res.status(400).json({ error: 'Invalid workflow data received from n8n' });
         }
 
-        let markdown = '';
-        let title = '';
-        let sourceUri = '';
+        let documentsToIngest = [];
 
         if (mode === 'definition') {
             // Convert Workflow Definition to Markdown
             const { convertN8nWorkflowToMarkdown } = require('../core/n8nWorkflowConverter');
-            markdown = convertN8nWorkflowToMarkdown(workflow);
-            title = `n8n Workflow Structure: ${workflow.name || 'Untitled'}`;
-            sourceUri = `n8n://workflow/${workflowId}/definition`;
+            const markdown = convertN8nWorkflowToMarkdown(workflow);
+            const title = `n8n Workflow Structure: ${workflow.name || 'Untitled'}`;
+            const sourceUri = `n8n://workflow/${workflowId}/definition`;
             
             if (!markdown || markdown.trim().length < 10) {
                 return res.status(400).json({ error: 'Workflow produced no meaningful content' });
             }
+            documentsToIngest.push({ title, markdown, sourceUri });
         } else {
             // Execute Webhook and use Data
             const webhookNode = workflow.nodes.find(n => n.type === 'n8n-nodes-base.webhook');
@@ -594,57 +593,74 @@ router.post('/:id/ingest/n8n', requireAuth, async (req, res) => {
             console.log(`[KB] Executing n8n workflow webhook for real-time ingestion: ${webhookPath}`);
             const resultContent = await triggerWebhookWorkflow(n8nUrl, webhookPath, httpMethod, null, []);
 
+            let parsedArray = [];
             if (typeof resultContent === 'string') {
                 try {
                     const parsed = JSON.parse(resultContent);
-                    if (Array.isArray(parsed)) {
-                        markdown = parsed.map((item, idx) => {
-                            if (item.markdown) return item.markdown;
-                            if (item.text) return item.text;
-                            return `### Output Chunk ${idx + 1}\n\`\`\`json\n${JSON.stringify(item, null, 2)}\n\`\`\``;
-                        }).join('\n\n---\n\n');
-                    } else if (typeof parsed === 'object') {
-                        markdown = `\`\`\`json\n${JSON.stringify(parsed, null, 2)}\n\`\`\``;
-                    } else {
-                        markdown = resultContent;
+                    // Check if it's an error bubble from triggerWebhookWorkflow
+                    if (parsed.error && Object.keys(parsed).length === 1) {
+                         return res.status(400).json({ error: parsed.error });
                     }
+                    parsedArray = Array.isArray(parsed) ? parsed : [parsed];
                 } catch (e) {
-                    // It's pure markdown/text
-                    markdown = resultContent;
+                    // Pure markdown or text
+                    parsedArray = [{ text: resultContent }];
                 }
             } else if (typeof resultContent === 'object') {
-                if (Array.isArray(resultContent)) {
-                    markdown = resultContent.map((item, idx) => {
-                        if (item.markdown) return item.markdown;
-                        if (item.text) return item.text;
-                        return `### Output Chunk ${idx + 1}\n\`\`\`json\n${JSON.stringify(item, null, 2)}\n\`\`\``;
-                    }).join('\n\n---\n\n');
-                } else {
-                    markdown = `\`\`\`json\n${JSON.stringify(resultContent, null, 2)}\n\`\`\``;
+                if (resultContent.error && Object.keys(resultContent).length === 1) {
+                     return res.status(400).json({ error: resultContent.error });
                 }
+                parsedArray = Array.isArray(resultContent) ? resultContent : [resultContent];
             }
 
-            if (!markdown || markdown.trim().length === 0) {
-                return res.status(400).json({ error: 'n8n workflow executed successfully, but returned no content for the KB' });
-            }
+            parsedArray.forEach((item, idx) => {
+                let itemMarkdown = item.markdown || item.text || `\`\`\`json\n${JSON.stringify(item, null, 2)}\n\`\`\``;
+                let itemTitle = item.fileName || item.filename || item.title || item.name || `n8n Output: ${workflow.name} (Item ${idx + 1})`;
+                documentsToIngest.push({
+                    title: itemTitle,
+                    markdown: itemMarkdown,
+                    sourceUri: `n8n://workflow/${workflowId}/run/${Date.now()}/${idx}`
+                });
+            });
+        }
 
-            title = `n8n Workflow Output: ${workflow.name || 'Untitled'} - ${new Date().toISOString()}`;
-            sourceUri = `n8n://workflow/${workflowId}/run/${Date.now()}`;
+        if (documentsToIngest.length === 0) {
+            return res.status(400).json({ error: 'n8n workflow executed successfully, but returned no content for the KB' });
         }
 
         // Ingest into KB
-        const result = await ingestDocument(
-            kb.tenant_id, kb.id, markdown,
-            title, 'n8n', sourceUri,
-            { lang: kb.default_lang }
-        );
+        let totalChunks = 0;
+        let lastResult = null;
+        let ingestedDocs = 0;
 
-        console.log(`[KB] n8n workflow "${workflow.name}" ingested [mode=${mode}]: ${result.chunks} chunks`);
+        for (const doc of documentsToIngest) {
+            if (!doc.markdown || doc.markdown.trim().length === 0) continue;
+            
+            try {
+                const result = await ingestDocument(
+                    kb.tenant_id, kb.id, doc.markdown,
+                    doc.title, 'n8n', doc.sourceUri,
+                    { lang: kb.default_lang }
+                );
+                totalChunks += result.chunks;
+                ingestedDocs++;
+                lastResult = result;
+            } catch (err) {
+                console.error(`[KB] Failed to ingest item ${doc.title}:`, err.message);
+                if (documentsToIngest.length === 1) throw err; // Throw if it's the only one
+            }
+        }
+
+        if (totalChunks === 0) {
+            return res.status(400).json({ error: `Execution succeeded, but no chunks were produced. Raw payload extracted from ${documentsToIngest.length} item(s) was not chunkable.` });
+        }
+
+        console.log(`[KB] n8n workflow "${workflow.name}" ingested [mode=${mode}]: ${ingestedDocs} docs, ${totalChunks} chunks`);
 
         res.status(201).json({
             success: true,
-            document: result.document,
-            chunks: result.chunks,
+            document: lastResult ? lastResult.document : null,
+            chunks: totalChunks,
             workflowName: workflow.name,
         });
     } catch (e) {
