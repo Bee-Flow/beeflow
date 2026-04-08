@@ -178,7 +178,7 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
             }
             disableSearchOnUpload = !!shield.disableSearchOnUpload;
             if (disableSearchOnUpload) console.log(`[DirectChat] Org ${userOrgForTiers}: disableSearchOnUpload=true`);
-            if (Array.isArray(shield.webSearchGuardPiiCategories) && shield.webSearchGuardPiiCategories.length > 0) {
+            if (shield.webSearchGuardEnabled && Array.isArray(shield.webSearchGuardPiiCategories) && shield.webSearchGuardPiiCategories.length > 0) {
                 webSearchGuardPiiCategories = shield.webSearchGuardPiiCategories;
                 console.log(`[DirectChat] Org ${userOrgForTiers}: webSearchGuardPiiCategories=${webSearchGuardPiiCategories.length} categories`);
             }
