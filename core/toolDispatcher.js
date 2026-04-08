@@ -210,6 +210,42 @@ async function executeTool(toolName, toolArgs, context = {}) {
         }
     }
 
+    // ─── AI Task Tool ───────────────────────────────────────────
+    if (toolName === 'set_ai_task') {
+        const aiTaskStore = require('../stores/aiTaskStore');
+        if (!userId) return { error: 'Not authenticated' };
+        if (!toolArgs.title) return { error: 'Title is required' };
+        if (!toolArgs.prompt) return { error: 'Prompt is required' };
+        if (!toolArgs.first_run_at) return { error: 'first_run_at is required' };
+        try {
+            // Check task limit
+            const maxTasks = (await configStore.getConfig('ai_tasks_max_per_user')) || 10;
+            const currentCount = await aiTaskStore.getTaskCount(userId);
+            if (currentCount >= maxTasks) {
+                return { error: `Maximum number of AI tasks reached (${maxTasks}). The user needs to delete or deactivate existing tasks first.` };
+            }
+            const task = await aiTaskStore.createTask({
+                userId,
+                title: toolArgs.title,
+                prompt: toolArgs.prompt,
+                repeatInterval: toolArgs.repeat_interval || null,
+                nextRunAt: toolArgs.first_run_at,
+                modelTier: toolArgs.model_tier || 'fast',
+                timezone: context?.timezone || 'UTC',
+            });
+            return {
+                success: true,
+                task_id: task.id,
+                title: task.title,
+                next_run: task.nextRunAt,
+                repeat: task.repeatInterval || 'one-time',
+                model_tier: task.modelTier,
+            };
+        } catch (err) {
+            return { error: `Failed to create AI task: ${err.message}` };
+        }
+    }
+
     // ─── Notebook Tools (formerly Workspace) ──────────────────────
     if (toolName === 'notebook_read' || toolName === 'notebook_write' || toolName === 'notebook_replace' || toolName === 'notebook_insert' ||
         toolName === 'workspace_read' || toolName === 'workspace_write' || toolName === 'workspace_replace') {

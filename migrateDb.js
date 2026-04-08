@@ -45,6 +45,7 @@ const STORE_MODULES = [
     { name: 'notebookStore', file: './stores/notebookStore' },
     { name: 'slidesStore', file: './stores/slidesStore' },
     { name: 'sheetStore', file: './stores/sheetStore' },
+    { name: 'aiTaskStore', file: './stores/aiTaskStore' },
 ];
 
 console.log('');

@@ -284,6 +284,7 @@ const projectFeatureGate = async (req, res, next) => {
 };
 app.use('/api/projects', projectFeatureGate, require('./routes/projects'));
 app.use('/api/reminders', require('./routes/reminders'));
+app.use('/api/ai-tasks', require('./routes/aiTasks'));
 app.use('/api/integrations/gdrive', require('./routes/integrations/googleDrive'));
 app.use('/api/integrations/gmail', require('./routes/integrations/gmail'));
 app.use('/api/integrations/calendar', require('./routes/integrations/calendar'));
@@ -354,6 +355,12 @@ app.listen(PORT, '0.0.0.0', () => {
         );
     } catch (err) {
         console.warn('[Server] MCP manager load failed:', err.message);
+    }
+    // Initialize AI Task background runner (non-blocking)
+    try {
+        require('./core/aiTaskRunner');
+    } catch (err) {
+        console.warn('[Server] AI Task runner load failed:', err.message);
     }
 });
 

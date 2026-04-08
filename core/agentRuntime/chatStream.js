@@ -210,6 +210,28 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         });
     }
 
+    // ── Built-in: set_ai_task tool (always available) ────────────
+    if (!tools.find(t => t.function?.name === 'set_ai_task')) {
+        tools.push({
+            type: 'function',
+            function: {
+                name: 'set_ai_task',
+                description: 'Create a scheduled AI task that runs automatically at specified times. Use this when the user wants recurring AI-generated content like news summaries, reports, digests, or any automated information gathering. The task runs in the background using web search and delivers results as notifications. IMPORTANT: Write a detailed, specific prompt for the AI to execute. Use the timezone from the "Now:" line.',
+                parameters: {
+                    type: 'object',
+                    properties: {
+                        title: { type: 'string', description: 'Short descriptive title (e.g., "Weekly AI News Digest")' },
+                        prompt: { type: 'string', description: 'Detailed instruction for the AI to execute each time. Be specific about what to search, summarize, or analyze.' },
+                        repeat_interval: { type: 'string', enum: ['daily', 'weekly', 'monthly'], description: 'How often to run the task' },
+                        first_run_at: { type: 'string', description: 'ISO 8601 datetime for the first execution. MUST include timezone offset from system prompt.' },
+                        model_tier: { type: 'string', enum: ['fast', 'smart', 'thinking'], description: 'AI model quality tier. Default: fast.' },
+                    },
+                    required: ['title', 'prompt', 'repeat_interval', 'first_run_at'],
+                },
+            },
+        });
+    }
+
     // Load tool configs with fixed params
     const toolConfigs = await agentStore.getAgentToolsWithParams(agentId);
     const toolParamsMap = {};

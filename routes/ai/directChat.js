@@ -114,6 +114,8 @@ Do NOT describe what you *could* do — just do it. When a user requests an acti
 
 **Reminders**: When asked to be reminded about something, call set_reminder. Always use the timezone from the "Now:" line — never default to UTC.
 
+**AI Tasks**: When the user wants recurring AI-generated content (news digests, email summaries, reports, or any scheduled AI action), call set_ai_task. Write a detailed, specific prompt that tells the AI exactly what to do each time the task runs. The task runs in the background and delivers results as notifications.
+
 **Web Search**: When you need current information, facts you're unsure about, or real-time data, use the search tool proactively.
 
 **Email**: When composing emails, always match the user's personal writing style and language if a style profile is available.
@@ -371,6 +373,26 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                         repeat_interval: { type: 'string', enum: ['daily', 'weekly', 'monthly'], description: 'Optional repeat interval. Only set if user asks for recurring reminders.' },
                     },
                     required: ['title', 'remind_at'],
+                },
+            },
+        });
+
+        // ─── Built-in: set_ai_task tool ────────────────────────────
+        directChatTools.push({
+            type: 'function',
+            function: {
+                name: 'set_ai_task',
+                description: 'Create a scheduled AI task that runs automatically at specified times. Use this when the user wants recurring AI-generated content like news summaries, reports, digests, or any automated information gathering. The task runs in the background using web search and delivers results as notifications. IMPORTANT: Write a detailed, specific prompt for the AI to execute. Use the timezone from the "Now:" line.',
+                parameters: {
+                    type: 'object',
+                    properties: {
+                        title: { type: 'string', description: 'Short descriptive title (e.g., "Weekly AI News Digest")' },
+                        prompt: { type: 'string', description: 'Detailed instruction for the AI to execute each time. Be specific about what to search, summarize, or analyze. Example: "Search for the most important AI and machine learning news from the past week. Provide a summary of the top 5 developments with source links."' },
+                        repeat_interval: { type: 'string', enum: ['daily', 'weekly', 'monthly'], description: 'How often to run the task. Use daily for morning digests, weekly for weekly summaries, monthly for monthly reports.' },
+                        first_run_at: { type: 'string', description: 'ISO 8601 datetime for the first execution. MUST include timezone offset from system prompt. For "every Monday at 8 AM" → calculate next Monday at 08:00 in user\'s timezone.' },
+                        model_tier: { type: 'string', enum: ['fast', 'smart', 'thinking'], description: 'AI model quality tier. "fast" for simple lookups, "smart" for analysis, "thinking" for deep research. Default: fast.' },
+                    },
+                    required: ['title', 'prompt', 'repeat_interval', 'first_run_at'],
                 },
             },
         });

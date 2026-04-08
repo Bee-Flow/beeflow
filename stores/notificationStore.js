@@ -57,7 +57,7 @@ initDB().catch(err => console.error('[NotificationStore] Failed to init:', err.m
 async function createNotification({ userId, taskId, category = 'info', title, message = '' }) {
     await initDB();
     const id = crypto.randomUUID();
-    const validCategories = ['info', 'heads_up', 'urgent'];
+    const validCategories = ['info', 'heads_up', 'urgent', 'ai_task'];
     const cat = validCategories.includes(category) ? category : 'info';
 
     await pool.query(
