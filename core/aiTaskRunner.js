@@ -165,6 +165,7 @@ async function executeTask(task) {
             // Handle tool calls if present
             if (response.toolCalls && response.toolCalls.length > 0) {
                 // Add assistant message with tool calls
+                // Preserve _thought_signature — required by Gemini 3.x for multi-turn tool calls
                 messages.push({
                     role: 'assistant',
                     content: response.content || null,
@@ -177,6 +178,7 @@ async function executeTask(task) {
                                 ? tc.function.arguments
                                 : JSON.stringify(tc.function.arguments),
                         },
+                        _thought_signature: tc._thought_signature || undefined,
                     })),
                 });
 
