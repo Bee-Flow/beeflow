@@ -124,24 +124,55 @@ async function resolveServerGeo(serverEndpoint) {
 
         if (!ip) return null;
 
-        // 3. GeoIP lookup
-        if (!geoip) return null;
-        const geo = geoip.lookup(ip);
-        if (!geo) return null;
+        // 3. GeoIP lookup (local database)
+        let countryCode = null;
+        let region = null;
+        let city = null;
+
+        if (geoip) {
+            const geo = geoip.lookup(ip);
+            if (geo && geo.country) {
+                countryCode = geo.country;
+                region = geo.region || null;
+                city = geo.city || null;
+            }
+        }
+
+        // 4. Fallback: HTTP API for Cloudflare/CDN IPs where geoip-lite has no data
+        if (!countryCode) {
+            try {
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 3000);
+                const resp = await fetch(`http://ip-api.com/json/${ip}?fields=countryCode,regionName,city`, { signal: controller.signal });
+                clearTimeout(timeout);
+                if (resp.ok) {
+                    const apiGeo = await resp.json();
+                    if (apiGeo.countryCode) {
+                        countryCode = apiGeo.countryCode;
+                        region = apiGeo.regionName || null;
+                        city = apiGeo.city || null;
+                        console.log(`[GeoResolver] Fallback API: ${ip} → ${countryCode}`);
+                    }
+                }
+            } catch (apiErr) {
+                // Fallback failed — proceed with unknown
+                console.warn(`[GeoResolver] Fallback API failed for ${ip}: ${apiErr.message}`);
+            }
+        }
 
         const result = {
             ip,
             hostname,
-            country_code: geo.country || null,
-            country_name: COUNTRY_NAMES[geo.country] || geo.country || 'Unknown',
-            region: geo.region || null,
-            city: geo.city || null,
-            is_eu: EU_EEA_COUNTRIES.has(geo.country),
-            flag: countryFlag(geo.country),
+            country_code: countryCode || null,
+            country_name: COUNTRY_NAMES[countryCode] || countryCode || 'Unknown',
+            region: region || null,
+            city: city || null,
+            is_eu: EU_EEA_COUNTRIES.has(countryCode),
+            flag: countryFlag(countryCode),
             resolved_at: new Date().toISOString(),
         };
 
-        // 4. Cache in Redis (fire-and-forget)
+        // 5. Cache in Redis (fire-and-forget)
         if (redis) {
             redis.setex(`${CACHE_PREFIX}${hostname}`, CACHE_TTL, JSON.stringify(result)).catch(() => {});
         }
