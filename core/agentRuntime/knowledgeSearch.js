@@ -131,7 +131,7 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
         // Without reranker, scores are RRF fusion values (typically 0.01-0.03) →
         // skip this filter (the MIN_SCORE check above already handles the floor).
         if (hasReranker) {
-            const MIN_SCORE_THRESHOLD = 0.75;
+            const MIN_SCORE_THRESHOLD = 0.72;
             const beforeCount = allKnowledgeResults.length;
             allKnowledgeResults = allKnowledgeResults.filter(r => (r.score || 0) >= MIN_SCORE_THRESHOLD);
             if (beforeCount !== allKnowledgeResults.length) {
@@ -164,25 +164,6 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
             if (deduped.length >= TOP_K_MAX) break;
         }
         const topResults = deduped;
-
-        // ── Score-gap detection ──────────────────────────────────────
-        // If there's a >20% relative drop between consecutive chunks,
-        // cut off — the lower chunks are likely noise.
-        if (topResults.length > 1) {
-            let cutIdx = topResults.length;
-            for (let i = 1; i < topResults.length; i++) {
-                const prev = topResults[i - 1].score || 0;
-                const curr = topResults[i].score || 0;
-                if (prev > 0 && (prev - curr) / prev > 0.20) {
-                    cutIdx = i;
-                    break;
-                }
-            }
-            if (cutIdx < topResults.length) {
-                console.log(`[KnowledgeSearch] Score-gap cut: ${topResults.length} → ${cutIdx}`);
-                topResults.length = cutIdx;
-            }
-        }
 
         console.log(`[KnowledgeSearch] Results: ${allKnowledgeResults.length} after filters → ${topResults.length} after dedup (hasReranker=${hasReranker}, includeRefs=${agent.config?.includeSourceReferences})`);
 

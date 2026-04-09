@@ -40,7 +40,7 @@ QUERY FORMAT:
                     },
                     top_k: {
                         type: 'integer',
-                        description: 'Number of results (1-5, default 3)'
+                        description: 'Number of results (1-10, default 5)'
                     }
                 },
                 required: ['query']
@@ -100,7 +100,7 @@ async function executeKbSearchTool(toolName, args, context = {}) {
         };
     }
 
-    const topK = Math.min(Math.max(parseInt(top_k) || 3, 1), 5);
+    const topK = Math.min(Math.max(parseInt(top_k) || 5, 1), 10);
 
     console.log(`[KBSearch] Searching ${kbIds.length} KBs: "${query}" (top_k=${topK}, agent=${agentId})`);
 
@@ -168,7 +168,7 @@ async function executeKbSearchTool(toolName, args, context = {}) {
         // No threshold when reranker is active — trust the reranker's ranking + topK.
         // Minimal floor (0.01) when RRF-only to avoid completely irrelevant results.
         const scoreThreshold = hasReranker ? 0 : 0.01;
-        const MIN_RELEVANCE = 0.75; // Minimum relevance floor (was 0.72)
+        const MIN_RELEVANCE = 0.72; // Minimum relevance floor
 
         const results = chunks
             .filter(c => (c.score || c.rerank_score || 0) >= scoreThreshold)
@@ -200,25 +200,6 @@ async function executeKbSearchTool(toolName, args, context = {}) {
             if (!dedupSets.some(ex => jaccard(ts, ex) >= 0.85)) {
                 dedupResults.push(r);
                 dedupSets.push(ts);
-            }
-        }
-
-        // ── Score-gap detection ──────────────────────────────────────
-        // If there's a >20% relative drop between consecutive results,
-        // cut off — the lower chunks are likely noise.
-        if (dedupResults.length > 1) {
-            let cutIdx = dedupResults.length;
-            for (let i = 1; i < dedupResults.length; i++) {
-                const prev = dedupResults[i - 1].score || 0;
-                const curr = dedupResults[i].score || 0;
-                if (prev > 0 && (prev - curr) / prev > 0.20) {
-                    cutIdx = i;
-                    break;
-                }
-            }
-            if (cutIdx < dedupResults.length) {
-                console.log(`[KBSearch] Score-gap cut: ${dedupResults.length} → ${cutIdx} (gap at ${dedupResults[cutIdx - 1]?.score} → ${dedupResults[cutIdx]?.score})`);
-                dedupResults.length = cutIdx;
             }
         }
 

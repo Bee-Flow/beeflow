@@ -787,17 +787,14 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
         const ftsQueryStr = ftsOrQuery.length > 0 ? ftsOrQuery : sanitizedQuery;
 
         // ── Run vector search + FTS in parallel ─────────────────────
-        // Both queries INNER JOIN documents to exclude orphaned chunks
-        // whose parent document was deleted but chunks remain in kb_chunks.
         const vectorSearchPromise = (pgvectorAvailable && vectorStr)
             ? client.query(
-                `SELECT c.id, c.title, c.content, c.source_uri, c.document_id, c.chunk_id,
-                        1 - (c.embedding <=> $1::vector) AS vec_score
-                 FROM kb_chunks c
-                 INNER JOIN documents d ON d.id::text = c.document_id
-                 WHERE c.tenant_id = $2
-                   AND c.knowledge_base_id = ANY($3::text[])
-                 ORDER BY c.embedding <=> $1::vector
+                `SELECT id, title, content, source_uri, document_id, chunk_id,
+                        1 - (embedding <=> $1::vector) AS vec_score
+                 FROM kb_chunks
+                 WHERE tenant_id = $2
+                   AND knowledge_base_id = ANY($3::text[])
+                 ORDER BY embedding <=> $1::vector
                  LIMIT $4`,
                 [vectorStr, tenantId, kbIds, topK * 2]
             ).catch(err => { console.warn(`[LocalKBSearch] Vector search failed: ${err.message}`); return { rows: [] }; })
@@ -805,18 +802,17 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
 
         const ftsSearchPromise = (ftsQueryStr.length > 0)
             ? client.query(
-                `SELECT c.id, c.title, c.content, c.source_uri, c.document_id, c.chunk_id, c.chunk_type,
+                `SELECT id, title, content, source_uri, document_id, chunk_id, chunk_type,
                         GREATEST(
-                            ts_rank_cd(c.tsv, websearch_to_tsquery('dutch', $1)) * 1.5,
-                            ts_rank_cd(c.tsv, websearch_to_tsquery('simple', $1))
+                            ts_rank_cd(tsv, websearch_to_tsquery('dutch', $1)) * 1.5,
+                            ts_rank_cd(tsv, websearch_to_tsquery('simple', $1))
                         ) AS fts_score
-                 FROM kb_chunks c
-                 INNER JOIN documents d ON d.id::text = c.document_id
-                 WHERE c.tenant_id = $2
-                   AND c.knowledge_base_id = ANY($3::text[])
+                 FROM kb_chunks
+                 WHERE tenant_id = $2
+                   AND knowledge_base_id = ANY($3::text[])
                    AND (
-                       c.tsv @@ websearch_to_tsquery('dutch', $1)
-                       OR c.tsv @@ websearch_to_tsquery('simple', $1)
+                       tsv @@ websearch_to_tsquery('dutch', $1)
+                       OR tsv @@ websearch_to_tsquery('simple', $1)
                    )
                  ORDER BY fts_score DESC
                  LIMIT 15`,
@@ -826,24 +822,48 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
 
         const [vectorResults, ftsResults] = await Promise.all([vectorSearchPromise, ftsSearchPromise]);
 
+        // ── Orphan filter: exclude chunks whose document was deleted ──
+        // Post-filter approach is safer than INNER JOIN (avoids UUID format mismatches)
+        let validDocIds = null;
+        try {
+            const docRows = await client.query(
+                `SELECT id::text FROM documents WHERE knowledge_base_id = ANY($1::uuid[])`,
+                [kbIds]
+            );
+            validDocIds = new Set(docRows.rows.map(r => r.id.toLowerCase()));
+        } catch (e) {
+            console.warn('[LocalKBSearch] Document validation query failed:', e.message);
+        }
+        const filterOrphans = (rows) => {
+            if (!validDocIds) return rows; // skip filter if query failed
+            return rows.filter(r => !r.document_id || validDocIds.has(String(r.document_id).toLowerCase()));
+        };
+
         // Apply cosine similarity floor — chunks below 0.35 are guaranteed noise
         const MIN_VEC_SCORE = 0.35;
         const filteredVecRows = vectorResults.rows.filter(r => (r.vec_score || 0) >= MIN_VEC_SCORE);
 
         console.log(`[LocalKBSearch] Vector: ${vectorResults.rows.length}→${filteredVecRows.length} (floor=${MIN_VEC_SCORE}), FTS: ${ftsResults.rows.length} (query="${ftsQueryStr.slice(0,60)}") [${Date.now() - _searchStart}ms]`);
 
+        // Apply orphan filter to both result sets
+        const cleanVecRows = filterOrphans(filteredVecRows);
+        const cleanFtsRows = filterOrphans(ftsResults.rows);
+        if (cleanVecRows.length < filteredVecRows.length || cleanFtsRows.length < ftsResults.rows.length) {
+            console.log(`[LocalKBSearch] Orphan filter: vec ${filteredVecRows.length}→${cleanVecRows.length}, fts ${ftsResults.rows.length}→${cleanFtsRows.length}`);
+        }
+
         // C. Reciprocal Rank Fusion
         const scores = new Map();
         const contentMap = new Map();
         const K = 60;
 
-        filteredVecRows.forEach((row, idx) => {
+        cleanVecRows.forEach((row, idx) => {
             const rank = idx + 1;
             scores.set(row.id, (scores.get(row.id) || 0) + 1 / (K + rank));
             contentMap.set(row.id, row);
         });
 
-        ftsResults.rows.forEach((row, idx) => {
+        cleanFtsRows.forEach((row, idx) => {
             const rank = idx + 1;
             scores.set(row.id, (scores.get(row.id) || 0) + 1 / (K + rank));
             if (!contentMap.has(row.id)) contentMap.set(row.id, row);
@@ -893,7 +913,6 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
                 const adjacentRows = await client.query(
                     `SELECT DISTINCT ON (c.id) c.id, c.title, c.content, c.source_uri, c.document_id, c.chunk_id
                      FROM kb_chunks c
-                     INNER JOIN documents d ON d.id::text = c.document_id
                      INNER JOIN (
                          SELECT document_id, chunk_id FROM kb_chunks WHERE id = ANY($1::bigint[])
                      ) h ON c.document_id = h.document_id
@@ -1078,7 +1097,7 @@ async function purgeOrphanedChunks() {
             const result = await client.query(
                 `DELETE FROM kb_chunks c
                  WHERE NOT EXISTS (
-                     SELECT 1 FROM documents d WHERE d.id::text = c.document_id
+                     SELECT 1 FROM documents d WHERE LOWER(d.id::text) = LOWER(c.document_id)
                  )`
             );
             const deleted = result.rowCount || 0;
