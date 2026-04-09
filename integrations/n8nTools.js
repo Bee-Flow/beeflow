@@ -205,6 +205,7 @@ async function buildN8nTools(orgId) {
 
     for (const wf of workflows) {
         if (!wf.enabled) continue;
+        if (wf.allowKbIngestion) continue; // KB-only workflows are not exposed as AI tools
 
         const slug = wf.slug || slugify(wf.name);
         const toolName = `n8n_run_${slug}`;
