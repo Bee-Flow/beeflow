@@ -131,7 +131,7 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
         // Without reranker, scores are RRF fusion values (typically 0.01-0.03) →
         // skip this filter (the MIN_SCORE check above already handles the floor).
         if (hasReranker) {
-            const MIN_SCORE_THRESHOLD = 0.72;
+            const MIN_SCORE_THRESHOLD = 0.75;
             const beforeCount = allKnowledgeResults.length;
             allKnowledgeResults = allKnowledgeResults.filter(r => (r.score || 0) >= MIN_SCORE_THRESHOLD);
             if (beforeCount !== allKnowledgeResults.length) {
@@ -165,11 +165,46 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
         }
         const topResults = deduped;
 
+        // ── Score-gap detection ──────────────────────────────────────
+        // If there's a >20% relative drop between consecutive chunks,
+        // cut off — the lower chunks are likely noise.
+        if (topResults.length > 1) {
+            let cutIdx = topResults.length;
+            for (let i = 1; i < topResults.length; i++) {
+                const prev = topResults[i - 1].score || 0;
+                const curr = topResults[i].score || 0;
+                if (prev > 0 && (prev - curr) / prev > 0.20) {
+                    cutIdx = i;
+                    break;
+                }
+            }
+            if (cutIdx < topResults.length) {
+                console.log(`[KnowledgeSearch] Score-gap cut: ${topResults.length} → ${cutIdx}`);
+                topResults.length = cutIdx;
+            }
+        }
+
         console.log(`[KnowledgeSearch] Results: ${allKnowledgeResults.length} after filters → ${topResults.length} after dedup (hasReranker=${hasReranker}, includeRefs=${agent.config?.includeSourceReferences})`);
 
-        // Per-chunk content cap: keep context manageable for the model.
-        const MAX_CHUNK_CHARS = 4000;
+        // Per-chunk content cap + strip repeated heading breadcrumbs.
+        const MAX_CHUNK_CHARS = 3000;
+        const seenDocHeadings = new Map();
         for (const result of topResults) {
+            // Strip heading lines already seen from the same source document
+            const docKey = result.metadata?.source || 'unknown';
+            const seen = seenDocHeadings.get(docKey);
+            if (seen && result.content) {
+                result.content = result.content.split('\n').filter(line => {
+                    if (/^#{1,6}\s+/.test(line) && seen.has(line.trim())) return false;
+                    return true;
+                }).join('\n').replace(/^\n+/, '');
+            }
+            const headings = (result.content || '').match(/^#{1,6}\s+.+$/gm) || [];
+            if (!seen) {
+                seenDocHeadings.set(docKey, new Set(headings.map(h => h.trim())));
+            } else {
+                headings.forEach(h => seen.add(h.trim()));
+            }
             if (result.content && result.content.length > MAX_CHUNK_CHARS) {
                 result.content = result.content.slice(0, MAX_CHUNK_CHARS) + '…';
             }

@@ -40,7 +40,7 @@ QUERY FORMAT:
                     },
                     top_k: {
                         type: 'integer',
-                        description: 'Number of results (1-10, default 5)'
+                        description: 'Number of results (1-5, default 3)'
                     }
                 },
                 required: ['query']
@@ -100,7 +100,7 @@ async function executeKbSearchTool(toolName, args, context = {}) {
         };
     }
 
-    const topK = Math.min(Math.max(parseInt(top_k) || 5, 1), 10);
+    const topK = Math.min(Math.max(parseInt(top_k) || 3, 1), 5);
 
     console.log(`[KBSearch] Searching ${kbIds.length} KBs: "${query}" (top_k=${topK}, agent=${agentId})`);
 
@@ -168,10 +168,11 @@ async function executeKbSearchTool(toolName, args, context = {}) {
         // No threshold when reranker is active — trust the reranker's ranking + topK.
         // Minimal floor (0.01) when RRF-only to avoid completely irrelevant results.
         const scoreThreshold = hasReranker ? 0 : 0.01;
+        const MIN_RELEVANCE = 0.75; // Minimum relevance floor (was 0.72)
 
         const results = chunks
             .filter(c => (c.score || c.rerank_score || 0) >= scoreThreshold)
-            .filter(c => (c.score || c.rerank_score || 0) >= 0.72) // Minimum 72% relevance floor
+            .filter(c => (c.score || c.rerank_score || 0) >= MIN_RELEVANCE)
             .map((c, i) => ({
                 result_number: i + 1,
                 title: c.title || c.source_uri || 'Knowledge Base',
@@ -199,6 +200,53 @@ async function executeKbSearchTool(toolName, args, context = {}) {
             if (!dedupSets.some(ex => jaccard(ts, ex) >= 0.85)) {
                 dedupResults.push(r);
                 dedupSets.push(ts);
+            }
+        }
+
+        // ── Score-gap detection ──────────────────────────────────────
+        // If there's a >20% relative drop between consecutive results,
+        // cut off — the lower chunks are likely noise.
+        if (dedupResults.length > 1) {
+            let cutIdx = dedupResults.length;
+            for (let i = 1; i < dedupResults.length; i++) {
+                const prev = dedupResults[i - 1].score || 0;
+                const curr = dedupResults[i].score || 0;
+                if (prev > 0 && (prev - curr) / prev > 0.20) {
+                    cutIdx = i;
+                    break;
+                }
+            }
+            if (cutIdx < dedupResults.length) {
+                console.log(`[KBSearch] Score-gap cut: ${dedupResults.length} → ${cutIdx} (gap at ${dedupResults[cutIdx - 1]?.score} → ${dedupResults[cutIdx]?.score})`);
+                dedupResults.length = cutIdx;
+            }
+        }
+
+        // ── Strip repeated heading breadcrumbs ───────────────────────
+        // When multiple chunks come from the same document, parent heading
+        // lines are duplicated. Strip them for subsequent chunks.
+        const MAX_CHUNK_CHARS = 3000;
+        const seenDocHeadings = new Map(); // title → Set of heading lines already sent
+        for (const r of dedupResults) {
+            const docKey = r.title || 'unknown';
+            const seen = seenDocHeadings.get(docKey);
+            if (seen && r.content) {
+                // Strip heading lines that were already in a previous chunk from this doc
+                r.content = r.content.split('\n').filter(line => {
+                    if (/^#{1,6}\s+/.test(line) && seen.has(line.trim())) return false;
+                    return true;
+                }).join('\n').replace(/^\n+/, '');
+            }
+            // Record headings from this chunk
+            const headings = (r.content || '').match(/^#{1,6}\s+.+$/gm) || [];
+            if (!seen) {
+                seenDocHeadings.set(docKey, new Set(headings.map(h => h.trim())));
+            } else {
+                headings.forEach(h => seen.add(h.trim()));
+            }
+            // Cap content length
+            if (r.content && r.content.length > MAX_CHUNK_CHARS) {
+                r.content = r.content.slice(0, MAX_CHUNK_CHARS) + '…';
             }
         }
 
