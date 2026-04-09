@@ -49,6 +49,30 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         }
     }
 
+    // ─── Skills injection ──────────────────────────────────
+    const activeSkillIds = messageMetadata?.activeSkillIds;
+    if (Array.isArray(activeSkillIds) && activeSkillIds.length > 0 && messageMetadata?.orgId) {
+        try {
+            const skillStore = require('../../stores/skillStore');
+            const cappedIds = activeSkillIds.slice(0, 3);
+            const skills = await skillStore.getSkillsByIds(cappedIds, messageMetadata.orgId, userId);
+            if (skills.length > 0) {
+                const skillBlocks = skills.map(s => {
+                    let block = `\n### SKILL — "${s.name}"`;
+                    if (s.instructions) block += `\nInstructions: ${s.instructions}`;
+                    if (s.workflow)     block += `\nWorkflow: ${s.workflow}`;
+                    if (s.rules)        block += `\nRules: ${s.rules}`;
+                    if (s.examples)     block += `\nExamples: ${s.examples}`;
+                    return block;
+                }).join('\n');
+                systemPrompt += `\n\n[ACTIVE SKILLS]\nThe user has activated the following skills. Follow their instructions precisely when the task matches.${skillBlocks}`;
+                console.log(`[contextBuilder] Injected ${skills.length} skill(s): ${skills.map(s => s.name).join(', ')}`);
+            }
+        } catch (skillErr) {
+            console.warn('[contextBuilder] Skills injection failed:', skillErr.message);
+        }
+    }
+
     // For strict knowledge mode, prepend a hard constraint at the TOP of the system prompt
     if (isStrictKnowledge) {
         const strictPreamble = `⚠️ CRITICAL OPERATIONAL CONSTRAINT — READ FIRST ⚠️
