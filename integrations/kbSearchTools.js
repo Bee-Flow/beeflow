@@ -138,6 +138,16 @@ async function executeKbSearchTool(toolName, args, context = {}) {
             chunks = searchData.chunks || searchData.results || [];
         }
 
+        // ── Filter Orphaned Chunks ────────────────────────────────────
+        // Ensure we only return chunks that belong to documents STILL present
+        // in the main Postgres database. This protects against remote search-service
+        // failing to delete chunks when a document was removed from the DB.
+        const { getAll } = require('../db');
+        const dbDocs = await getAll('SELECT id FROM documents WHERE knowledge_base_id = ANY($1::uuid[])', [kbIds]);
+        const validDocIds = new Set(dbDocs.map(d => d.id));
+        
+        chunks = chunks.filter(c => validDocIds.has(c.document_id));
+
         // Format results for the agent.
         // When a reranker is active (Azure Cohere or local GPU) it already picked the best
         // topK results — applying a score threshold on top would drop ranked results 2-5.

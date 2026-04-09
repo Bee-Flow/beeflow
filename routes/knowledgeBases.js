@@ -759,6 +759,24 @@ router.post('/search', requireAuth, async (req, res) => {
             }
 
             results = await searchRes.json();
+            
+            // Format chunks correctly regardless of what key the search-service uses
+            if (!results.chunks && results.results) {
+                results.chunks = results.results;
+            }
+        }
+
+        // ── Filter Orphaned Chunks ────────────────────────────────────
+        // Ensure we only return chunks that belong to active documents in Postgres
+        const { getAll } = require('../db');
+        const dbDocs = await getAll('SELECT id FROM documents WHERE knowledge_base_id = ANY($1::uuid[])', [kb_ids]);
+        const validDocIds = new Set(dbDocs.map(d => d.id));
+        
+        if (results.chunks && Array.isArray(results.chunks)) {
+            results.chunks = results.chunks.filter(c => validDocIds.has(c.document_id));
+        }
+        if (results.results && Array.isArray(results.results)) {
+            results.results = results.results.filter(c => validDocIds.has(c.document_id));
         }
 
         res.json(results);
