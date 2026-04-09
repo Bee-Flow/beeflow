@@ -196,7 +196,7 @@ router.post('/:id/chat/stream', async (req, res) => {
         // No userId (unauthenticated embed guest) + is_published → allow (embed flow)
     }
 
-    const { message, history, messageId, parentId, attachments, conversationId, ephemeral } = req.body;
+    const { message, history, messageId, parentId, attachments, conversationId, ephemeral, modelTier } = req.body;
     if (!message) {
         return res.status(400).json({ error: 'Message is required' });
     }
@@ -231,7 +231,7 @@ router.post('/:id/chat/stream', async (req, res) => {
             // Custom history override for thread context isolation
             history,
             // Message metadata for persistence (id, parentId, attachments, and conversationId)
-            { messageId, parentId, attachments, conversationId, ephemeral, workspaceContent: req.body.workspaceContent, workspaceSelection: req.body.workspaceSelection, signal: abortController.signal, userOrgId: userAuth.userOrgId, timezone: req.body.timezone, projectId: req.body.projectId }
+            { messageId, parentId, attachments, conversationId, ephemeral, workspaceContent: req.body.workspaceContent, workspaceSelection: req.body.workspaceSelection, signal: abortController.signal, userOrgId: userAuth.userOrgId, timezone: req.body.timezone, projectId: req.body.projectId, modelTier }
         );
 
         // Skip all post-stream persistence for ephemeral embed chats

@@ -366,12 +366,12 @@ async function createUser(userData) {
     try {
         const mwDek = userData.masterWrappedDEK ? (typeof userData.masterWrappedDEK === 'string' ? userData.masterWrappedDEK : JSON.stringify(userData.masterWrappedDEK)) : null;
         const wDek = userData.wrappedDEK ? (typeof userData.wrappedDEK === 'string' ? userData.wrappedDEK : JSON.stringify(userData.wrappedDEK)) : null;
-        await run(`INSERT INTO users (id, username, "displayName", "firstName", "lastName", email, phone, avatar, "avatarType", "passwordHash", role, groups, "masterWrappedDEK", "wrappedDEK", "orgRole", "organizationId", "createdAt", status)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+        await run(`INSERT INTO users (id, username, "displayName", "firstName", "lastName", email, phone, avatar, "avatarType", "passwordHash", role, groups, "masterWrappedDEK", "wrappedDEK", "orgRole", "organizationId", "createdAt", status, "azureUserId")
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
             [id, username, displayName || username, firstName || null, lastName || null, email || null, phone || null,
                 avatar || null, avatarType || null, passwordHash, role || 'user',
                 JSON.stringify(groups || []), mwDek, wDek, orgRole || '', organizationId || '',
-                new Date().toISOString().split('T')[0], userData.status || 'active']);
+                new Date().toISOString().split('T')[0], userData.status || 'active', userData.azureUserId || null]);
         return true;
     } catch (e) { console.error(e); return false; }
 }

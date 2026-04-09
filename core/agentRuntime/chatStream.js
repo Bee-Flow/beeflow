@@ -152,7 +152,9 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     const globalConfig = await getAIConfig();
 
     // Get the model to use - supports tier-based selection (tier:auto, tier:fast, etc.)
-    const modelToUse = await resolveAgentModel(agent.model, userMessage, { ...globalConfig, organizationId: agent.organization_id, userOrgId: messageMetadata?.userOrgId });
+    // If client provided a modelTier override (e.g. retry with different model), use it
+    const effectiveAgentModel = messageMetadata?.modelTier ? `tier:${messageMetadata.modelTier}` : agent.model;
+    const modelToUse = await resolveAgentModel(effectiveAgentModel, userMessage, { ...globalConfig, organizationId: agent.organization_id, userOrgId: messageMetadata?.userOrgId });
 
     // Get the correct provider config for this model
     const config = await getProviderForModel(modelToUse);
