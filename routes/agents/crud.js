@@ -99,6 +99,11 @@ router.delete('/:id', async (req, res) => {
             if (!hasPerm) {
                 return res.status(403).json({ error: 'Permission denied' });
             }
+
+            if (!(await canModifyAgent(agent, userId, req))) {
+                return res.status(403).json({ error: 'Agent Editors cannot modify or delete unpublished drafts from others.' });
+            }
+
             deleted = await agentStore.forceDeleteAgent(req.params.id);
         }
 
@@ -166,6 +171,24 @@ router.post('/', requirePermission('manage_agents'), async (req, res) => {
     res.json(agent);
 });
 
+// Helper to enforce Agent Editor restriction
+async function canModifyAgent(agent, userId, req) {
+    if (agent.owner_id === userId) return true;
+    
+    // Super admin bypass
+    if (req.session?.isAdmin || req.session?.user?.role === 'admin') return true;
+    
+    const user = await userStore.getUser(userId);
+    const orgRole = user ? user.orgRole : null;
+    
+    // Agent Editor restriction: cannot modify unpublished drafts from others
+    if (orgRole === 'agent_editor' && !agent.is_published) {
+        return false;
+    }
+    
+    return true;
+}
+
 // Update agent - requires manage_agents permission
 router.put('/:id', requirePermission('manage_agents'), async (req, res) => {
     const userId = getEffectiveUserId(req);
@@ -174,6 +197,10 @@ router.put('/:id', requirePermission('manage_agents'), async (req, res) => {
     const agent = await agentStore.getAgent(req.params.id);
     if (!agent) {
         return res.status(404).json({ error: 'Agent not found' });
+    }
+
+    if (!(await canModifyAgent(agent, userId, req))) {
+        return res.status(403).json({ error: 'Agent Editors cannot modify unpublished drafts from others.' });
     }
 
     // Parse existing starter_prompts if stored as JSON string

@@ -681,7 +681,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             let tierSettings = {};
             if (agent.model && agent.model.startsWith('tier:')) {
                 const tierName = agent.model.substring(5);
-                const { getTierConfig } = require('./modelResolver');
+                const { getTierConfig } = require('../modelResolver');
                 tierSettings = await getTierConfig(tierName, { userOrgId: messageMetadata?.userOrgId || null });
             }
 
