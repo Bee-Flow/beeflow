@@ -22,11 +22,12 @@ const CHUNK_SIZE_FLEX = Math.floor(CHUNK_SIZE * 1.8); // atomic blocks up to thi
 
 /**
  * Simple token counter based on character-length heuristic.
- * Not as precise as tiktoken, but good enough for chunking.
+ * Calibrated for mixed Dutch/English content — Dutch words average
+ * 5-6 chars but tokenize to ~3.5 chars/token with text-embedding-3-small.
  */
 function estimateTokens(text) {
     if (!text) return 0;
-    return Math.ceil(text.length / 4);
+    return Math.ceil(text.length / 3.5);
 }
 
 /**
@@ -562,6 +563,9 @@ async function ensureKBChunksTable(vectorDim = 1536) {
     // Ensure chunk_type column exists (safe migration for existing tables)
     try { await exec("ALTER TABLE kb_chunks ADD COLUMN IF NOT EXISTS chunk_type TEXT DEFAULT 'content'"); } catch (_) {}
 
+    // Issue #11: Ensure documents table has original_content column for reindexing
+    try { await exec("ALTER TABLE documents ADD COLUMN IF NOT EXISTS original_content TEXT"); } catch (_) {}
+
     schemaInitialized = true;
     console.log('[LocalKBIngest] kb_chunks table ensured');
 }
@@ -629,41 +633,51 @@ async function ingestLocally(tenantId, kbId, docId, content, options = {}) {
             [tenantId, kbId, docId]
         );
 
-        // Insert new chunks
-        for (let i = 0; i < chunks.length; i++) {
-            const chunk = chunks[i];
-            
-            if (pgvectorAvailable && embeddings[i]) {
-                const vectorStr = `[${embeddings[i].join(',')}]`;
-                await client.query(
-                    `INSERT INTO kb_chunks (
-                        tenant_id, knowledge_base_id, document_id,
-                        chunk_id, lang, title, content, tsv, embedding, source_uri, chunk_type
-                    ) VALUES (
-                        $1, $2, $3,
-                        $4, $5, $6, $7,
-                        setweight(to_tsvector('dutch', $7), 'A') ||
-                        setweight(to_tsvector('simple', $7), 'B'),
-                        $8::vector,
-                        $9, $10
-                    )`,
-                    [tenantId, kbId, docId, chunk.chunk_id, lang, title, chunk.text, vectorStr, sourceUri, chunk.chunk_type || 'content']
-                );
-            } else {
-                await client.query(
-                    `INSERT INTO kb_chunks (
-                        tenant_id, knowledge_base_id, document_id,
-                        chunk_id, lang, title, content, tsv, source_uri, chunk_type
-                    ) VALUES (
-                        $1, $2, $3,
-                        $4, $5, $6, $7,
-                        setweight(to_tsvector('dutch', $7), 'A') ||
-                        setweight(to_tsvector('simple', $7), 'B'),
-                        $8, $9
-                    )`,
-                    [tenantId, kbId, docId, chunk.chunk_id, lang, title, chunk.text, sourceUri, chunk.chunk_type || 'content']
-                );
+        // Issue #11: Store original content in documents table for faster reindexing
+        // (avoids needing to reconstruct content from chunks)
+        try {
+            await client.query(
+                `UPDATE documents SET original_content = $1 WHERE id = $2::uuid`,
+                [content, docId]
+            );
+        } catch (_) {
+            // Column may not exist yet — ignore, migration handles it
+        }
+
+        // Issue #9: Batch INSERT — 10 chunks per statement to reduce round-trips
+        const BATCH_SIZE = 10;
+        for (let batchStart = 0; batchStart < chunks.length; batchStart += BATCH_SIZE) {
+            const batch = chunks.slice(batchStart, batchStart + BATCH_SIZE);
+            const hasVectors = pgvectorAvailable && embeddings.length > 0;
+
+            const values = [];
+            const params = [];
+            let paramIdx = 1;
+
+            for (let j = 0; j < batch.length; j++) {
+                const i = batchStart + j;
+                const chunk = batch[j];
+                const chunkType = chunk.chunk_type || 'content';
+
+                if (hasVectors && embeddings[i]) {
+                    const vectorStr = `[${embeddings[i].join(',')}]`;
+                    values.push(`($${paramIdx}, $${paramIdx+1}, $${paramIdx+2}, $${paramIdx+3}, $${paramIdx+4}, $${paramIdx+5}, $${paramIdx+6}, setweight(to_tsvector('dutch', $${paramIdx+6}), 'A') || setweight(to_tsvector('simple', $${paramIdx+6}), 'B'), $${paramIdx+7}::vector, $${paramIdx+8}, $${paramIdx+9})`);
+                    params.push(tenantId, kbId, docId, chunk.chunk_id, lang, title, chunk.text, vectorStr, sourceUri, chunkType);
+                    paramIdx += 10;
+                } else {
+                    values.push(`($${paramIdx}, $${paramIdx+1}, $${paramIdx+2}, $${paramIdx+3}, $${paramIdx+4}, $${paramIdx+5}, $${paramIdx+6}, setweight(to_tsvector('dutch', $${paramIdx+6}), 'A') || setweight(to_tsvector('simple', $${paramIdx+6}), 'B'), NULL, $${paramIdx+7}, $${paramIdx+8})`);
+                    params.push(tenantId, kbId, docId, chunk.chunk_id, lang, title, chunk.text, sourceUri, chunkType);
+                    paramIdx += 9;
+                }
             }
+
+            await client.query(
+                `INSERT INTO kb_chunks (
+                    tenant_id, knowledge_base_id, document_id,
+                    chunk_id, lang, title, content, tsv, embedding, source_uri, chunk_type
+                ) VALUES ${values.join(', ')}`,
+                params
+            );
         }
 
         await client.query('COMMIT');
@@ -674,7 +688,7 @@ async function ingestLocally(tenantId, kbId, docId, content, options = {}) {
         client.release();
     }
 
-    console.log(`[LocalKBIngest] Stored ${chunks.length} chunks in PostgreSQL`);
+    console.log(`[LocalKBIngest] Stored ${chunks.length} chunks in PostgreSQL (batched)`);
     return { chunks_created: chunks.length };
 }
 
@@ -704,8 +718,8 @@ async function deleteChunksLocally(tenantId, kbId, docId) {
 
 // ── Query embedding LRU cache ───────────────────────────────────────
 // Avoids repeated Azure API calls (~200-400ms each) for identical queries.
-const EMBEDDING_CACHE_MAX = 100;
-const EMBEDDING_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const EMBEDDING_CACHE_MAX = 500;
+const EMBEDDING_CACHE_TTL = 30 * 60 * 1000; // 30 minutes — query embeddings are stable
 const _embeddingCache = new Map();
 
 function getCachedEmbedding(query) {
@@ -794,6 +808,11 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
 
     const client = await getClient();
     try {
+        // Issue #10: Set ef_search on THIS connection for better HNSW recall
+        if (pgvectorAvailable) {
+            await client.query('SET hnsw.ef_search = 100').catch(() => {});
+        }
+
         // ── Run vector search + FTS in parallel ─────────────────────
         const vectorSearchPromise = (pgvectorAvailable && vectorStr)
             ? client.query(
@@ -892,6 +911,12 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
         const contentMap = new Map();
         const K = 60;
 
+        // Issue #5: Short queries (≤2 words) — boost FTS weight.
+        // Single words like "phishing" are better matched by exact keyword
+        // search than by embedding similarity (embeddings need more context).
+        const queryWordCount = query.trim().split(/\s+/).filter(w => w.length >= 2).length;
+        const ftsBoost = queryWordCount <= 2 ? 2.0 : 1.0;
+
         cleanVecRows.forEach((row, idx) => {
             const rank = idx + 1;
             scores.set(row.id, (scores.get(row.id) || 0) + 1 / (K + rank));
@@ -900,7 +925,7 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
 
         cleanFtsRows.forEach((row, idx) => {
             const rank = idx + 1;
-            scores.set(row.id, (scores.get(row.id) || 0) + 1 / (K + rank));
+            scores.set(row.id, (scores.get(row.id) || 0) + (ftsBoost / (K + rank)));
             if (!contentMap.has(row.id)) contentMap.set(row.id, row);
         });
 
@@ -1094,7 +1119,18 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
     // Mark results as orphan-filtered so callers don't duplicate the work
     results._orphanFiltered = true;
 
-    console.log(`[LocalKBSearch] Found ${results.length} results (vec=${vectorResults.rows.length}, fts=${ftsResults.rows.length}) [${Date.now() - _searchStart}ms]`);
+    // Issue #19: Attach search metrics for observability
+    const totalMs = Date.now() - _searchStart;
+    results._metrics = {
+        latencyMs: totalMs,
+        vecCandidates: vectorResults.rows.length,
+        ftsCandidates: ftsResults.rows.length,
+        ftsMode: ftsResults.rows.length > 0 ? (ftsQueryStr.includes(' AND ') ? 'AND' : 'OR') : 'none',
+        topScore: results[0]?.score || 0,
+        resultCount: results.length,
+    };
+
+    console.log(`[LocalKBSearch] Found ${results.length} results (vec=${vectorResults.rows.length}, fts=${ftsResults.rows.length}, top=${results[0]?.score?.toFixed(3) || 0}) [${totalMs}ms]`);
     return results;
 }
 

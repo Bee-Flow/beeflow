@@ -480,35 +480,16 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                         const kbIds = project.knowledgeBaseIds || [];
                         if (kbIds.length > 0) {
                             try {
-                                const useAzure = !!(await configStore.getConfig('use_azure_doc_processing'));
-                                let chunks = [];
+                                const { quickKBSearch } = require('../../core/agentRuntime/knowledgeSearch');
+                                const kbResults = await quickKBSearch(userId, kbIds, message, { topK: 6 });
 
-                                if (useAzure) {
-                                    const { searchLocally } = require('../../core/localKBIngest');
-                                    const localResults = await searchLocally(userId, kbIds, message, { topK: 8 });
-                                    chunks = localResults.filter(c => (c.score || 0) >= 0.25);
-                                } else {
-                                    const searchUrl = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
-                                    const searchRes = await fetch(`${searchUrl}/tools/kb-search`, {
-                                        method: 'POST',
-                                        headers: getServiceHeaders(),
-                                        body: JSON.stringify({ tenant_id: userId, kb_ids: kbIds, query: message, top_k: 8, rerank: true }),
-                                        signal: AbortSignal.timeout(10000),
-                                    });
-                                    if (searchRes.ok) {
-                                        const searchData = await searchRes.json();
-                                        chunks = (searchData.chunks || searchData.results || []).filter(c => (c.score || c.rerank_score || 0) >= 0.25);
-                                    }
-                                }
-
-                                if (chunks.length > 0) {
-                                    const kbText = chunks.slice(0, 6).map((c, i) => {
+                                if (kbResults.length > 0) {
+                                    const kbText = kbResults.map((c, i) => {
                                         const src = c.source_uri || c.title || 'KB';
-                                        const content = (c.content || '').slice(0, 1200);
-                                        return `### Source ${i + 1}: ${src}\n${content}`;
+                                        return `### Source ${i + 1}: ${src}\n${c.content}`;
                                     }).join('\n\n');
                                     projectContext += `\n\n[PROJECT KNOWLEDGE BASE — "${project.name}"]\nRelevant information from this project's knowledge base:\n${kbText}`;
-                                    console.log(`[DirectChat] Injected ${chunks.length} KB chunks from project "${project.name}"`);
+                                    console.log(`[DirectChat] Injected ${kbResults.length} KB chunks from project "${project.name}"`);
                                 }
                             } catch (kbErr) {
                                 console.warn('[DirectChat] Project KB search failed:', kbErr.message);

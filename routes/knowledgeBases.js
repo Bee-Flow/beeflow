@@ -721,10 +721,10 @@ router.post('/search', requireAuth, async (req, res) => {
             return res.status(400).json({ error: 'query and kb_ids[] are required' });
         }
 
-        // Verify ownership of all KBs
+        // Verify access to all KBs (supports org-shared KBs via canAccessKB)
         for (const kbId of kb_ids) {
             const kb = await kbStore.getKB(kbId);
-            if (!kb || kb.tenant_id !== userId) {
+            if (!kb || !(await canAccessKB(req, kb))) {
                 return res.status(403).json({ error: `Access denied for KB ${kbId}` });
             }
         }
@@ -865,9 +865,21 @@ router.post('/:id/reindex', requireAuth, async (req, res) => {
                     console.log(`[KB] Reindex [${i + 1}/${docs.length}] Using existing content for: ${title}`);
 
                     if (useAzure) {
-                        // Retrieve existing content from local kb_chunks
-                        const { getDocumentContent } = require('../core/localKBIngest');
-                        content = await getDocumentContent(kb.tenant_id, kb.id, doc.id);
+                        // Issue #11: Try stored original_content first (fast path)
+                        try {
+                            const { getOne } = require('../db');
+                            const row = await getOne('SELECT original_content FROM documents WHERE id = $1::uuid', [doc.id]);
+                            if (row?.original_content && row.original_content.trim().length >= 20) {
+                                content = row.original_content;
+                                console.log(`[KB] Reindex [${i + 1}/${docs.length}] Using stored original_content`);
+                            }
+                        } catch (_) {}
+
+                        // Fallback: reconstruct from chunks
+                        if (!content || content.trim().length < 20) {
+                            const { getDocumentContent } = require('../core/localKBIngest');
+                            content = await getDocumentContent(kb.tenant_id, kb.id, doc.id);
+                        }
                     } else {
                         const contentRes = await fetch(
                             `${SEARCH_SERVICE_URL}/kb/${kb.id}/documents/${doc.id}/content?tenant_id=${encodeURIComponent(kb.tenant_id)}`,

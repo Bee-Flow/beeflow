@@ -44,7 +44,7 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
                 // ── Local search path (Azure) ──────────────────────────
                 // Search locally-ingested chunks directly from PostgreSQL
                 const { searchLocally } = require('../localKBIngest');
-                const chunks = await searchLocally(userId, kbIds, searchQuery, { topK: 8 });
+                const chunks = await searchLocally(userId, kbIds, searchQuery, { topK: 5 });
                 allKnowledgeResults.push(...chunks.map(c => {
                     // Prefer title over opaque internal URIs (n8n://, etc.)
                     const srcUri = c.source_uri || '';
@@ -276,4 +276,86 @@ Suggest the user rephrase their question or ask about topics covered in your kno
     return systemPromptExtension;
 }
 
-module.exports = { performKnowledgeSearch };
+/**
+ * Quick KB search for non-agent contexts (direct chat, template chat).
+ * Uses the same quality gates as agent KB search: greeting guard,
+ * score threshold, Jaccard dedup, and content cap.
+ *
+ * @param {string} userId
+ * @param {string[]} kbIds
+ * @param {string} query — the user message
+ * @param {object} [options]
+ * @param {number} [options.topK=6] — max results to return
+ * @param {number} [options.contentCap=3000] — max chars per chunk
+ * @returns {Promise<Array<{title: string, content: string, score: number}>>}
+ */
+async function quickKBSearch(userId, kbIds, query, options = {}) {
+    const { topK = 6, contentCap = 3000 } = options;
+
+    if (!kbIds || kbIds.length === 0 || !query) return [];
+
+    // Greeting guard — don't waste API calls on "hi"
+    const trimmed = (query || '').trim();
+    if (GREETING_RE.test(trimmed)) return [];
+
+    const useAzure = !!(await configStore.getConfig('use_azure_doc_processing'));
+    let chunks = [];
+
+    try {
+        if (useAzure) {
+            const { searchLocally } = require('../localKBIngest');
+            chunks = await searchLocally(userId, kbIds, query, { topK: topK + 2 });
+        } else {
+            const searchUrl = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
+            const searchRes = await fetch(`${searchUrl}/tools/kb-search`, {
+                method: 'POST',
+                headers: getServiceHeaders(),
+                body: JSON.stringify({ tenant_id: userId, kb_ids: kbIds, query, top_k: topK + 2, rerank: true }),
+                signal: AbortSignal.timeout(10000),
+            });
+            if (searchRes.ok) {
+                const searchData = await searchRes.json();
+                chunks = searchData.chunks || searchData.results || [];
+            }
+        }
+    } catch (err) {
+        console.warn('[quickKBSearch] KB search failed:', err.message);
+        return [];
+    }
+
+    // Score threshold — same as agent path (0.72 with reranker)
+    const MIN_RELEVANCE = 0.72;
+    chunks = chunks.filter(c => (c.score || c.rerank_score || 0) >= MIN_RELEVANCE);
+
+    // Jaccard dedup (same as kbSearchTools)
+    function getTokenSet(text) {
+        if (!text) return new Set();
+        const body = text.replace(/^#{1,6}\s+.+$/gm, '').trim();
+        return new Set(body.toLowerCase().split(/\s+/).filter(t => t.length > 2));
+    }
+    function jaccard(a, b) {
+        if (a.size === 0 && b.size === 0) return 1;
+        let inter = 0;
+        for (const t of a) { if (b.has(t)) inter++; }
+        return inter / (a.size + b.size - inter);
+    }
+    const deduped = [];
+    const dedupSets = [];
+    for (const c of chunks) {
+        const ts = getTokenSet(c.content);
+        if (!dedupSets.some(ex => jaccard(ts, ex) >= 0.85)) {
+            deduped.push(c);
+            dedupSets.push(ts);
+        }
+    }
+
+    // Cap and format
+    return deduped.slice(0, topK).map(c => ({
+        title: c.title || c.source_uri || 'KB',
+        content: (c.content || '').slice(0, contentCap),
+        score: c.score || c.rerank_score || 0,
+        source_uri: c.source_uri || '',
+    }));
+}
+
+module.exports = { performKnowledgeSearch, quickKBSearch };
