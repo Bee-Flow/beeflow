@@ -15,32 +15,32 @@ const KB_SEARCH_TOOLS = [
         type: 'function',
         function: {
             name: 'kb_search',
-            description: `Search the internal knowledge base for specific information. Only use this when the user asks a concrete question or you need factual details to compose a response.
+            description: `Search the internal knowledge base. Call this with the core topic as query.
 
-DO NOT USE for:
-- Greetings or small-talk ("hi", "hello", "thanks", "how are you")
-- Vague or conversational messages with no clear information need
-- When you already have enough context to answer
+RULES:
+- ONE search per topic is enough. Do NOT repeat with synonyms or variations of the same topic — the search engine handles fuzzy matching.
+- Multiple calls are fine ONLY for genuinely different topics (e.g., searching "email handtekening" and then "VPN instellen" for two separate questions).
+- Only retry the same topic with a different query if the first search returned 0 results.
+- Do NOT use for greetings, small-talk, or vague messages ("hi", "thanks", "how are you").
+- Do NOT use when you already have enough context to answer.
 
 WHEN TO USE:
-- The user asks a specific question about products, services, policies, or procedures
-- After reading an email/document and you need internal context to compose a reply
-- You need factual details (pricing, procedures, contact info, opening hours, etc.)
+- User asks about specific topics, policies, procedures, or factual details
+- After reading an email/document and you need internal context for a reply
 
-QUERY TIPS:
-- Use short, focused queries (2-5 words) — extract only the core topic
-- Search for the TOPIC, not the instruction (e.g., "openingstijden" instead of "wat zijn de openingstijden van het kantoor")
-- You can call this multiple times with different queries if needed`,
+QUERY FORMAT:
+- Use 2-4 keywords, not full sentences
+- Extract the core topic (e.g., "email handtekening" not "hoe kan ik mijn email handtekening veranderen")`,
             parameters: {
                 type: 'object',
                 properties: {
                     query: {
                         type: 'string',
-                        description: 'The specific topic to look up. Use 2-5 keywords, not full sentences.'
+                        description: 'Core topic keywords (2-4 words). Not a full sentence.'
                     },
                     top_k: {
                         type: 'integer',
-                        description: 'Number of results to return (1-10, default 5)'
+                        description: 'Number of results (1-10, default 5)'
                     }
                 },
                 required: ['query']
