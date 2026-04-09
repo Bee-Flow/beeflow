@@ -133,7 +133,7 @@ function requireAuth(req, res, next) {
 // ─── Streaming Direct Chat ───────────────────────────────────────
 
 router.post('/chat/direct/stream', requireAuth, async (req, res) => {
-    const { message, conversationId, modelTier, history, attachments, imageGenSettings, nanoBananaSettings, disabledMedia, webSearchEnabled = true, workspaceContent, workspaceSelection, projectId, timezone, systemPrompt: requestSystemPrompt } = req.body;
+    const { message, conversationId, modelTier, history, attachments, imageGenSettings, nanoBananaSettings, disabledMedia, webSearchEnabled = true, workspaceContent, workspaceSelection, projectId, timezone, systemPrompt: requestSystemPrompt, activeSkillIds } = req.body;
     const userId = req.session.user.id;
 
     if (!message && (!attachments || attachments.length === 0)) {
@@ -531,6 +531,31 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             }
         }
 
+        // ─── Skills injection ────────────────────────────────────
+        let skillsContext = '';
+        if (Array.isArray(activeSkillIds) && activeSkillIds.length > 0) {
+            try {
+                const skillStore = require('../../stores/skillStore');
+                // Cap at 3 active skills to prevent token overflow
+                const cappedIds = activeSkillIds.slice(0, 3);
+                const skills = await skillStore.getSkillsByIds(cappedIds, userOrgForTiers, userId);
+                if (skills.length > 0) {
+                    const skillBlocks = skills.map(s => {
+                        let block = `\n### SKILL — "${s.name}"`;
+                        if (s.instructions) block += `\nInstructions: ${s.instructions}`;
+                        if (s.workflow) block += `\nWorkflow: ${s.workflow}`;
+                        if (s.rules) block += `\nRules: ${s.rules}`;
+                        if (s.examples) block += `\nExamples: ${s.examples}`;
+                        return block;
+                    }).join('\n');
+                    skillsContext = `\n\n[ACTIVE SKILLS]\nThe user has activated the following skills. Follow their instructions precisely when the task matches.${skillBlocks}`;
+                    console.log(`[DirectChat] Injected ${skills.length} skill(s): ${skills.map(s => s.name).join(', ')}`);
+                }
+            } catch (skillErr) {
+                console.warn('[DirectChat] Skills injection failed:', skillErr.message);
+            }
+        }
+
         // Build Now: with explicit UTC offset so the AI knows the user's local time
         const _tz = timezone || 'Europe/Amsterdam';
         let _nowStr;
@@ -549,7 +574,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
 
         let messages = [
             {
-                role: 'system', content: basePrompt + toolHint + memoryContext + workspaceContext + projectContext + `\nNow: ${_nowStr}`
+                role: 'system', content: basePrompt + toolHint + memoryContext + workspaceContext + projectContext + skillsContext + `\nNow: ${_nowStr}`
             }
         ];
 

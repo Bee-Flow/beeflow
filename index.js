@@ -314,6 +314,7 @@ app.use('/api/notebooks', notebookFeatureGate, require('./routes/notebookExport'
 const { requireBetaFeature } = require('./core/betaFeatures');
 app.use('/api/transcriptions', requireBetaFeature('meeting_notes'), require('./routes/transcriptions'));
 app.use('/api/meet-bot', requireBetaFeature('meeting_notes'), require('./routes/meetBot'));
+app.use('/api/skills', requireBetaFeature('skills'), require('./routes/skills'));
 
 app.use('/', require('./routes/knowledge'));
 app.use('/api/kb', require('./routes/knowledgeBases'));

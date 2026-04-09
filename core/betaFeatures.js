@@ -26,6 +26,7 @@ const BETA_FEATURES = [
     { id: 'advanced_analytics', name: 'Advanced Analytics', description: 'Extended analytics dashboards and reporting' },
     { id: 'ai_code_execution', name: 'AI Code Execution', description: 'Allow the AI agent to execute code in a sandboxed environment' },
     { id: 'custom_themes', name: 'Custom Themes', description: 'Organization-level custom branding and theme support' },
+    { id: 'skills', name: 'Skills', description: 'Reusable instruction packs for consistent AI task execution' },
 ];
 
 // -──────────────────────────────────────────────
