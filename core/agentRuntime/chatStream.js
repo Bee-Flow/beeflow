@@ -491,8 +491,12 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     let _kbSources = [];
 
     // ============ VECTOR KNOWLEDGE BASE ============
-    // Only search KB if guardrails did NOT fire — prevents leaking sensitive KB content
-    if (!moderationViolation && !guardrailViolation) {
+    // When the kb_search TOOL is available, skip auto-injection — let the LLM
+    // decide when and what to search.  This avoids double-searching (once here,
+    // once via the tool) and gives the LLM control over query formulation.
+    const hasKbSearchTool = tools.some(t => t.function?.name === 'kb_search');
+
+    if (!moderationViolation && !guardrailViolation && !hasKbSearchTool) {
         try {
             const kbExtension = await performKnowledgeSearch({ agent, userId, userMessage, isStrictKnowledge, onEvent: (type, data) => {
                 // Intercept kb_sources to accumulate for persistence
@@ -507,6 +511,8 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         } catch (kErr) {
             console.error('[AgentRuntime] Knowledge retrieval failed:', kErr.message);
         }
+    } else if (hasKbSearchTool) {
+        console.log('[AgentRuntime] KB auto-inject skipped — kb_search tool available, LLM will decide');
     }
 
     // ============ WORKSPACE INTEGRATION ============

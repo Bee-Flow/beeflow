@@ -55,6 +55,28 @@ async function executeKbSearchTool(toolName, args, context = {}) {
     const { query, top_k } = args;
     if (!query) return { error: 'query is required' };
 
+    // ── Greeting / small-talk guard ─────────────────────────────────
+    // Skip search for trivial inputs — the LLM sometimes calls this tool
+    // with greetings like "servicedesk assistent welkom hi", which wastes
+    // embedding + reranker API calls.
+    const GREETING_WORDS = /\b(h(i|oi|ey|ello|allo|ee)|dag|goeie(morgen|middag|avond)?|yo|sup|thanks?|thankyou|thank\s*you|dank(je|jewel|u)?|bedankt|doei|bye|tot\s*ziens|how\s*are\s*you|hoe\s*gaat\s*het|welkom|welcome)\b/i;
+    // Strip filler words (agent names, "assistent", etc.) and check if what remains is just a greeting
+    const queryCore = query.trim()
+        .replace(/\b(assistent|assistant|servicedesk|service\s*desk|helpdesk|agent|bot)\b/gi, '')
+        .replace(/\s{2,}/g, ' ')
+        .trim();
+    if (GREETING_WORDS.test(queryCore) && queryCore.split(/\s+/).filter(w => w.length >= 2).length <= 3) {
+        console.log(`[KBSearch] Skipped — greeting/small-talk: "${query}" (core: "${queryCore}")`);
+        return {
+            _action: 'kb_sources',
+            _sources: [],
+            query,
+            resultCount: 0,
+            results: [],
+            instruction: 'No search needed for greetings. Respond naturally.'
+        };
+    }
+
     const { userId, agentId } = context;
 
     // Load agent to get KB IDs
@@ -125,7 +147,7 @@ async function executeKbSearchTool(toolName, args, context = {}) {
 
         const results = chunks
             .filter(c => (c.score || c.rerank_score || 0) >= scoreThreshold)
-            .filter(c => (c.score || c.rerank_score || 0) >= 0.60) // Minimum 60% relevance floor
+            .filter(c => (c.score || c.rerank_score || 0) >= 0.72) // Minimum 72% relevance floor
             .map((c, i) => ({
                 result_number: i + 1,
                 title: c.title || c.source_uri || 'Knowledge Base',
