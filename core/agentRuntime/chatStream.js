@@ -706,13 +706,16 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 ];
 
                 const isThinkingModel = modelToUse.includes('magistral');
-                const defaultMaxTokens = isThinkingModel ? 40960 : 8192;
+                const { TIER_DEFAULTS } = require('../modelResolver');
+                const tierName = (agent.model && agent.model.startsWith('tier:')) ? agent.model.substring(5) : 'fast';
+                const tierDefaults = TIER_DEFAULTS[tierName] || TIER_DEFAULTS['fast'];
+                const defaultMaxTokens = isThinkingModel ? 40960 : tierDefaults.maxTokens;
                 const adapterOptions = {
                     maxTokens: tierSettings.maxTokens || defaultMaxTokens,
-                    temperature: tierSettings.temperature !== undefined ? tierSettings.temperature : 0.7,
+                    temperature: tierSettings.temperature !== undefined ? tierSettings.temperature : tierDefaults.temperature,
                     budgetTokens: tierSettings.budgetTokens || undefined,
-                    reasoningEffort: tierSettings.reasoningEffort || undefined,
-                    reasoningSummary: tierSettings.reasoningSummary || false,
+                    reasoningEffort: tierSettings.reasoningEffort || tierDefaults.reasoningEffort || undefined,
+                    reasoningSummary: tierSettings.reasoningSummary !== undefined ? tierSettings.reasoningSummary : (tierDefaults.reasoningSummary || false),
                     // Azure-specific: needed for Responses API version check
                     apiVersion: config.apiVersion || undefined,
                 };

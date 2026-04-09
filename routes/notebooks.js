@@ -549,8 +549,10 @@ ${allContent.slice(0, 50000)}`;
             { role: 'user', content: `Generate the ${type === 'studyGuide' ? 'study guide' : type} now. Be thorough but concise — prioritize substance over volume. Use compact formatting with minimal whitespace. Where appropriate, include Mermaid diagrams to visualize key concepts, processes, or relationships.` }
         ];
 
+        const { TIER_DEFAULTS } = require('../core/modelResolver');
+        const _tierDefaults = TIER_DEFAULTS[resolvedTier] || TIER_DEFAULTS['fast'];
         const chatOptions = {
-            maxTokens: (tier.maxTokens || 8192),
+            maxTokens: (tier.maxTokens || _tierDefaults.maxTokens),
             temperature: 0.4,
         };
 
@@ -777,7 +779,8 @@ ${sourceContent.slice(0, 60000)}`;
             { role: 'user', content: `Here is the document. Replace ALL {{parameter}} placeholders with values from the sources. Return the complete document:\n\n${documentContent}` },
         ];
 
-        const chatOptions = { maxTokens: tier.maxTokens || 8192, temperature: 0.1 };
+        const _fillDefaults = TIER_DEFAULTS[resolvedTier] || TIER_DEFAULTS['fast'];
+        const chatOptions = { maxTokens: tier.maxTokens || _fillDefaults.maxTokens, temperature: 0.1 };
 
         await adapter.stream(apiKey, apiUrl, modelId, messages, chatOptions, (streamType, data) => {
             if (streamType === 'text') {

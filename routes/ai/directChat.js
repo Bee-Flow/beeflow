@@ -1165,13 +1165,15 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
 
         // ─── Tool calling loop via unified adapter.chat() ──────────
         const tierSettings = tiers[resolvedTier] || {};
+        const { TIER_DEFAULTS } = require('../../core/modelResolver');
+        const tierDefaults = TIER_DEFAULTS[resolvedTier] || TIER_DEFAULTS['fast'];
         const isThinkingModel = modelId.includes('magistral');
-        const defaultMaxTokens = isThinkingModel ? 40960 : 8192;
+        const defaultMaxTokens = isThinkingModel ? 40960 : tierDefaults.maxTokens;
         const chatOptions = {
             maxTokens: tierSettings.maxTokens || defaultMaxTokens,
-            temperature: tierSettings.temperature !== undefined ? tierSettings.temperature : 0.7,
-            reasoningEffort: tierSettings.reasoningEffort || undefined,
-            reasoningSummary: tierSettings.reasoningSummary || false,
+            temperature: tierSettings.temperature !== undefined ? tierSettings.temperature : tierDefaults.temperature,
+            reasoningEffort: tierSettings.reasoningEffort || tierDefaults.reasoningEffort || undefined,
+            reasoningSummary: tierSettings.reasoningSummary !== undefined ? tierSettings.reasoningSummary : (tierDefaults.reasoningSummary || false),
             budgetTokens: tierSettings.budgetTokens || undefined,
             // Azure-specific
             apiVersion: config.apiVersion || undefined,

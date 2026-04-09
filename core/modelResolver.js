@@ -12,6 +12,58 @@
 
 const configStore = require('../stores/configStore');
 
+// ─── Tier Defaults ────────────────────────────────────────────────────────────
+// Centralised token / temperature / reasoning standards per tier.
+// User-configured values (from the admin UI) override these; these are the
+// fallback defaults when a tier setting is not explicitly configured.
+//
+// Rationale:
+//   - fast:          Short, snappy answers. Low token ceiling = faster completion.
+//   - thinking:      Analysis / reasoning. Medium budget + medium reasoning effort.
+//   - writer:        Long-form content (reports, articles). High token ceiling.
+//   - deep_thinking: Complex multi-step tasks. Maximum quality.
+//   - smart:         Legacy alias for thinking tier — same defaults.
+//   - pro:           Legacy alias for writer tier — same defaults.
+const TIER_DEFAULTS = {
+    fast: {
+        maxTokens: 2048,
+        temperature: 0.2,
+        reasoningEffort: undefined, // no reasoning for speed
+        reasoningSummary: false,
+    },
+    thinking: {
+        maxTokens: 16384,
+        temperature: 0.7,
+        reasoningEffort: 'medium',
+        reasoningSummary: true,
+    },
+    writer: {
+        maxTokens: 16384,
+        temperature: 0.7,
+        reasoningEffort: 'low',
+        reasoningSummary: false,
+    },
+    deep_thinking: {
+        maxTokens: 40960,
+        temperature: 0.7,
+        reasoningEffort: 'high',
+        reasoningSummary: true,
+    },
+    // Legacy aliases
+    smart: {
+        maxTokens: 16384,
+        temperature: 0.7,
+        reasoningEffort: 'medium',
+        reasoningSummary: true,
+    },
+    pro: {
+        maxTokens: 16384,
+        temperature: 0.7,
+        reasoningEffort: 'low',
+        reasoningSummary: false,
+    },
+};
+
 /**
  * Check if EU mode is active — either org-level shield OR personal user preference.
  * Org-level takes priority. If org has shield enabled + euModeEnabled, that wins.
@@ -117,11 +169,17 @@ async function resolveModelWithGlobalFallback(rawModel, opts = {}) {
 
 /**
  * Get the full tier config object (for endpoints that need maxTokens, temperature, etc.)
+ *
+ * Merges: TIER_DEFAULTS (baseline) ← user config (admin UI overrides).
+ * User-set values always win; TIER_DEFAULTS fill in anything the user hasn't configured.
  */
 async function getTierConfig(tierName, { userOrgId = null, userId = null } = {}) {
     let tiers = await configStore.getConfig('chat_model_tiers') || {};
     tiers = await applyEUOverrides(tiers, { userOrgId, userId });
-    return tiers[tierName] || tiers['fast'] || {};
+    const userConfig = tiers[tierName] || tiers['fast'] || {};
+    const defaults = TIER_DEFAULTS[tierName] || TIER_DEFAULTS['fast'];
+    // Merge: defaults provide baselines, user config overrides
+    return { ...defaults, ...userConfig };
 }
 
 /**
@@ -155,6 +213,7 @@ async function getEUAwareTiers({ userOrgId = null, userId = null } = {}) {
 }
 
 module.exports = {
+    TIER_DEFAULTS,
     resolveModelForTier,
     resolveModelWithGlobalFallback,
     getTierConfig,

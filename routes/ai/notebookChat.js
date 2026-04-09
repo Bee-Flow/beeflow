@@ -388,9 +388,11 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
 
         // ── Tool calling loop ────────────────────────────────────────
         const tierSettings = tiers[resolvedTier] || {};
+        const { TIER_DEFAULTS } = require('../../core/modelResolver');
+        const tierDefaults = TIER_DEFAULTS[resolvedTier] || TIER_DEFAULTS['fast'];
         const chatOptions = {
-            maxTokens: tierSettings.maxTokens || 8192,
-            temperature: tierSettings.temperature !== undefined ? tierSettings.temperature : 0.7,
+            maxTokens: tierSettings.maxTokens || tierDefaults.maxTokens,
+            temperature: tierSettings.temperature !== undefined ? tierSettings.temperature : tierDefaults.temperature,
         };
 
         // Track mutable document content (updated by tool calls)
