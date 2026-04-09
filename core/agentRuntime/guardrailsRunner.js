@@ -87,7 +87,41 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
             const piiMessages = [
                 ...messages.slice(-3), // last few messages for context
             ];
-            await validateInputForPii(piiMessages, orgPiiEnabled, orgShield);
+            const piiResult = await validateInputForPii(piiMessages, orgPiiEnabled, orgShield);
+
+            if (piiResult && piiResult.tokenizedText) {
+                // Redact/tokenize mode: replace user message with tokenized version
+                const lastMsg = messages[messages.length - 1];
+                if (lastMsg && lastMsg.role === 'user') {
+                    if (typeof lastMsg.content === 'string') {
+                        lastMsg.content = piiResult.tokenizedText;
+                        processedUserMessage = piiResult.tokenizedText;
+                    } else if (Array.isArray(lastMsg.content)) {
+                        const textPart = lastMsg.content.find(p => p.type === 'text');
+                        if (textPart) {
+                            textPart.text = piiResult.tokenizedText;
+                            processedUserMessage = piiResult.tokenizedText;
+                        }
+                    }
+                }
+                console.warn(`[GuardrailsRunner] 🔒 PII redacted (${Object.keys(piiResult.tokenMap).length} tokens)`);
+
+                if (onEvent) {
+                    onEvent('pii_tokenized', {
+                        entities: piiResult.entities.map(e => ({ label: e.label, category: e.category })),
+                        tokenCount: Object.keys(piiResult.tokenMap).length,
+                    });
+                }
+
+                // Log PII redact event (fire-and-forget)
+                guardrailEventStore.logGuardrailEvent({
+                    ...eventCtx,
+                    violation_type: 'pii',
+                    violation_categories: [...new Set(piiResult.entities.map(e => e.label || e.category))].join(', '),
+                    direction: 'input',
+                    action_taken: 'redacted',
+                }).catch(() => {});
+            }
         } catch (piiError) {
             if (piiError.message?.includes('PII Detected')) {
                 console.warn('[GuardrailsRunner] PII detected in user input:', piiError.message);

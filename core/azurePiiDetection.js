@@ -468,7 +468,7 @@ async function validateInputForPii(messages, agentPiiEnabled = false, orgShieldC
         console.warn(`[PiiDetection] 🚫 Entities: ${snippets}`);
         console.warn(`[PiiDetection] Action: ${piiAction} (source: ${orgShieldConfig?.piiDetectionAction ? 'org-shield' : aiConfig.piiDetectionAction ? 'ai-config' : 'default'})`);
 
-        if (piiAction === 'tokenize') {
+        if (piiAction === 'tokenize' || piiAction === 'redact') {
             const { tokenizedText, tokenMap } = tokenizeText(inputText, result.entities);
             console.warn(`[PiiDetection] 🔒 Tokenizing — sending redacted text to AI`);
             return { tokenizedText, tokenMap, entities: result.entities };

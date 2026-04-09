@@ -42,15 +42,27 @@ async function resolveOrgShield(orgId) {
         }
     }
 
-    if (rulesWithNames.length === 0) return null;
-
     return {
         enabled: true,
         rulesWithNames,
         scope: shield.scope || { userInput: true, agentOutput: true },
         action: shield.action || 'delete',
+        // PII detection settings
+        azurePiiEnabled: !!shield.azurePiiEnabled,
+        piiDetectionCategories: shield.piiDetectionCategories || [],
+        piiDetectionConfidenceThreshold: shield.piiDetectionConfidenceThreshold,
+        piiDetectionAction: shield.piiDetectionAction || globalConfig.piiDetectionAction || 'block',
+        // Content Safety
+        azureSeverityThreshold: shield.azureSeverityThreshold,
+        azureEnabledCategories: shield.azureEnabledCategories,
+        // Other features
+        moderationEnabled: !!shield.moderationEnabled,
+        moderationCategories: shield.moderationCategories || [],
+        euModeEnabled: !!shield.euModeEnabled,
         webSearchGuardEnabled: !!shield.webSearchGuardEnabled,
         disableSearchOnUpload: !!shield.disableSearchOnUpload,
+        monitorIntegrations: !!shield.monitorIntegrations,
+        webSearchGuardPiiCategories: shield.webSearchGuardPiiCategories || [],
     };
 }
 
