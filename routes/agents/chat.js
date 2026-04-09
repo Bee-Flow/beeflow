@@ -17,6 +17,70 @@ const { setupSSE, sendSSEError, persistAndTitle, getOrCreateAgentConversation } 
 
 const router = express.Router();
 
+/**
+ * Re-validates that an authenticated user still has group/org access to a
+ * published agent at message-send time — not just when the page loaded.
+ *
+ * Mirrors the filtering logic in agentCrud.getPublishedAgentsForUser so that
+ * revoking group membership or changing org scope takes effect immediately,
+ * even for users who already have the agent open in their browser.
+ *
+ * @param {Object} agent   - Parsed agent record (shared_groups already an array)
+ * @param {string} userId  - Authenticated user ID
+ * @param {Object} req     - Express request (for resolveUserOrgIds)
+ * @returns {Promise<boolean>}
+ */
+async function userCanAccessPublishedAgent(agent, userId, req) {
+    // Agent must be published for anyone other than the owner
+    if (!agent.is_published) return false;
+
+    // Owner always has access to their own agent
+    if (agent.owner_id === userId) return true;
+
+    // Load current group membership and direct org from DB (not from session/cache)
+    let userGroups = [];
+    let userDirectOrgId = null;
+    try {
+        const user = await userStore.getUser(userId);
+        if (user) {
+            userGroups = Array.isArray(user.groups)
+                ? user.groups
+                : (() => { try { return JSON.parse(user.groups || '[]'); } catch (_) { return []; } })();
+            userDirectOrgId = user.organizationId || null;
+        }
+    } catch (_) { /* treat as no groups */ }
+
+    // Resolve the full set of org IDs the user belongs to
+    const resolvedOrgIds = await resolveUserOrgIds(req);
+    let userOrgIds;
+    if (resolvedOrgIds instanceof Set) {
+        userOrgIds = resolvedOrgIds;
+    } else {
+        userOrgIds = new Set();
+        if (userDirectOrgId) userOrgIds.add(userDirectOrgId);
+    }
+    const hasOrgMembership = userOrgIds.size > 0;
+
+    // ── Org isolation (same logic as getPublishedAgentsForUser) ─────────────
+    if (hasOrgMembership) {
+        // Org users can ONLY access agents that belong to one of their orgs
+        if (!agent.organization_id) return false;
+        if (!userOrgIds.has(agent.organization_id)) return false;
+    } else {
+        // Users with no org can only access global (non-org-scoped) agents
+        if (agent.organization_id) return false;
+    }
+
+    // ── Group restriction ────────────────────────────────────────────────────
+    // shared_groups is already parsed as an array by agentCrud.parseConfig
+    const sharedGroups = agent.shared_groups || [];
+    if (sharedGroups.length > 0) {
+        return sharedGroups.some(sg => userGroups.includes(sg));
+    }
+
+    return true;
+}
+
 // ============ Chat ============
 
 // Chat with agent
@@ -32,9 +96,18 @@ router.post('/:id/chat', async (req, res) => {
         return res.status(404).json({ error: 'Agent not found' });
     }
 
-    // Allow access if published or if user is owner
-    if (!agent.is_published && agent.owner_id !== userId) {
-        return res.status(403).json({ error: 'Access denied' });
+    if (!agent.is_published) {
+        // Unpublished agents: only the owner can access
+        if (!req.session?.user?.id || agent.owner_id !== userId) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
+    } else if (userId) {
+        // Published agents: re-validate current group/org permissions on every request
+        const canAccess = await userCanAccessPublishedAgent(agent, userId, req);
+        if (!canAccess) {
+            console.warn(`[AgentChat] User ${userId} attempted to chat with agent ${agent.id} — access denied (permissions revoked)`);
+            return res.status(403).json({ error: 'Access denied' });
+        }
     }
 
     try {
@@ -97,16 +170,30 @@ router.post('/:id/chat/stream', async (req, res) => {
         return res.status(404).json({ error: 'Agent not found' });
     }
 
-    // Swarm agents are always published/available; for regular agents check auth
-    if (agent) {
-        if (!agent.is_published && !req.session?.user?.id) {
-            return res.status(401).json({ error: 'Not authenticated' });
-        }
-
+    // Access control — re-validated on every request so revoked permissions take
+    // effect immediately, even for users who already have the agent open.
+    {
         const userId = getEffectiveUserId(req);
-        if (!agent.is_published && agent.owner_id !== userId) {
-            return res.status(403).json({ error: 'Access denied' });
+
+        if (!agent.is_published) {
+            // Unpublished: require authentication and ownership
+            if (!req.session?.user?.id) {
+                return res.status(401).json({ error: 'Not authenticated' });
+            }
+            if (agent.owner_id !== userId) {
+                return res.status(403).json({ error: 'Access denied' });
+            }
+        } else if (userId) {
+            // Published: re-validate group/org membership from DB on every message.
+            // This prevents a user whose permissions were revoked from continuing to
+            // chat just because they haven't refreshed the page yet.
+            const canAccess = await userCanAccessPublishedAgent(agent, userId, req);
+            if (!canAccess) {
+                console.warn(`[AgentChat] User ${userId} attempted to stream agent ${agent.id} — access denied (permissions revoked)`);
+                return res.status(403).json({ error: 'Access denied' });
+            }
         }
+        // No userId (unauthenticated embed guest) + is_published → allow (embed flow)
     }
 
     const { message, history, messageId, parentId, attachments, conversationId, ephemeral } = req.body;
