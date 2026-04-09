@@ -374,7 +374,7 @@ async function detectPii(text, enabledCategories = null, confidenceThreshold = D
  * @param {Array} messages - Chat messages array
  * @param {boolean} [agentPiiEnabled=false] - Per-agent override
  */
-async function validateInputForPii(messages, agentPiiEnabled = false) {
+async function validateInputForPii(messages, agentPiiEnabled = false, orgShieldConfig = null) {
     const aiConfig = await getAIConfig();
 
     // Check if PII detection is enabled
@@ -416,14 +416,20 @@ async function validateInputForPii(messages, agentPiiEnabled = false) {
     console.log(`[PiiDetection] Scanning input (${inputText.length} chars)...`);
     const start = Date.now();
 
-    // ── Load enabled categories from Org Privacy Shield (single source of truth)
-    // Fall back to global AI config, then to all categories
+    // ── Load enabled categories & confidence threshold
+    // Priority: 1) Passed-in org shield config (callers already resolved the correct org)
+    //           2) Fallback: scan configStore for any org shield (legacy/generic callers)
+    //           3) Global AI config categories
+    //           4) All categories (default)
     let enabledCategories = ALL_PII_CATEGORY_IDS;
     let confidenceThreshold = aiConfig.piiDetectionConfidenceThreshold ?? DEFAULT_PII_CONFIDENCE_THRESHOLD;
     try {
-        const allConfigs = await configStore.getAllConfig() || {};
-        const shieldKey = Object.keys(allConfigs).find(k => k.startsWith('org_privacy_shield_'));
-        const shieldConfig = shieldKey ? allConfigs[shieldKey] : null;
+        const shieldConfig = orgShieldConfig || await (async () => {
+            // Legacy fallback: scan configStore for an org shield (when caller doesn't pass one)
+            const allConfigs = await configStore.getAllConfig() || {};
+            const shieldKey = Object.keys(allConfigs).find(k => k.startsWith('org_privacy_shield_'));
+            return shieldKey ? allConfigs[shieldKey] : null;
+        })();
         if (shieldConfig) {
             if (Array.isArray(shieldConfig.piiDetectionCategories) && shieldConfig.piiDetectionCategories.length > 0) {
                 enabledCategories = shieldConfig.piiDetectionCategories.filter(id => ALL_PII_CATEGORY_IDS.includes(id));

@@ -992,7 +992,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         try {
             const { validateInputForPii } = require('../../core/azurePiiDetection');
             const orgPiiEnabled = !!(orgShield?.enabled && orgShield?.azurePiiEnabled);
-            const piiResult = await validateInputForPii(messages.slice(-3), orgPiiEnabled);
+            const piiResult = await validateInputForPii(messages.slice(-3), orgPiiEnabled, orgShield);
 
             if (piiResult && piiResult.tokenizedText) {
                 // Tokenize mode: replace last user message with tokenized version

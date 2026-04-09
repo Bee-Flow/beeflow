@@ -15,6 +15,7 @@ const { executeWorkerTool } = require('./workerExecution');
 const { processSystemPrompt } = require('../promptUtils');
 const { validateInput } = require('../moderation');
 const { validateInputForPii } = require('../azurePiiDetection');
+const { resolveOrgShield } = require('../orgShield');
 
 async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
     const swarm = null; // Swarm agents removed
@@ -87,7 +88,9 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
     const aiConfigForPii = await getAIConfig();
     if (aiConfigForPii?.piiDetectionEnabled) {
         try {
-            await validateInputForPii(messages.slice(-3), false);
+            const orgShield = await resolveOrgShield(agent.organization_id);
+            const orgPiiEnabled = !!(orgShield?.enabled && orgShield?.azurePiiEnabled);
+            await validateInputForPii(messages.slice(-3), orgPiiEnabled, orgShield);
         } catch (piiError) {
             if (piiError.message?.includes('PII Detected')) {
                 throw piiError; // Propagate to the route handler

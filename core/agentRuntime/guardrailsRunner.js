@@ -87,7 +87,7 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
             const piiMessages = [
                 ...messages.slice(-3), // last few messages for context
             ];
-            await validateInputForPii(piiMessages, orgPiiEnabled);
+            await validateInputForPii(piiMessages, orgPiiEnabled, orgShield);
         } catch (piiError) {
             if (piiError.message?.includes('PII Detected')) {
                 console.warn('[GuardrailsRunner] PII detected in user input:', piiError.message);
