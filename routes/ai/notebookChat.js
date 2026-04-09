@@ -16,6 +16,7 @@ const {
 const configStore = require('../../stores/configStore');
 const { getAdapter } = require('../../core/providers');
 const notebookStore = require('../../stores/notebookStore');
+const guardrailEventStore = require('../../stores/guardrailEventStore');
 
 const { NOTEBOOK_DOC_TOOLS, NOTEBOOK_ADD_SOURCE_TOOL, executeNotebookDocTool } = require('../../integrations/notebookDocTools');
 const { AGENT_SEARCH_TOOLS, executeAgentSearchTool, isAgentSearchTool } = require('../../integrations/agentSearchTools');
@@ -70,9 +71,10 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
 
     // Resolve model from tier config (EU-aware via centralized modelResolver)
     let tiers = await getEUAwareTiers({ userOrgId: userOrgForTiers, userId });
+    let orgShield = null;
     if (userOrgForTiers) {
-        const shield = await configStore.getConfig(`org_privacy_shield_${userOrgForTiers}`);
-        if (shield?.enabled && shield.euModeEnabled) {
+        orgShield = await configStore.getConfig(`org_privacy_shield_${userOrgForTiers}`);
+        if (orgShield?.enabled && orgShield.euModeEnabled) {
             console.log(`[NotebookChat] EU mode active for org ${userOrgForTiers}`);
         }
     }
@@ -371,6 +373,51 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             messages.push({ role: 'user', content: message });
         }
 
+        // ── PII Detection on Input ──────────────────────────────────
+        // Scans user input for PII using org shield settings.
+        // Respects scope.userInput — admin can disable input scanning.
+        let piiTokenMap = null;
+        const inputPiiScope = orgShield?.scope?.userInput !== false;
+        try {
+            const { validateInputForPii } = require('../../core/azurePiiDetection');
+            const orgPiiEnabled = !!(orgShield?.enabled && orgShield?.azurePiiEnabled && inputPiiScope);
+            const piiResult = await validateInputForPii(messages.slice(-3), orgPiiEnabled);
+
+            if (piiResult && piiResult.tokenizedText) {
+                const lastIdx = messages.length - 1;
+                if (messages[lastIdx]?.role === 'user') {
+                    if (typeof messages[lastIdx].content === 'string') {
+                        messages[lastIdx] = { role: 'user', content: piiResult.tokenizedText };
+                    } else if (Array.isArray(messages[lastIdx].content)) {
+                        const textBlock = messages[lastIdx].content.find(b => b.type === 'text');
+                        if (textBlock) textBlock.text = piiResult.tokenizedText;
+                    }
+                }
+                piiTokenMap = piiResult.tokenMap;
+                console.warn(`[NotebookChat] 🔒 PII tokenized (${Object.keys(piiTokenMap).length} tokens)`);
+            }
+        } catch (piiError) {
+            if (piiError.piiEntities) {
+                const categoryList = [...new Set(piiError.piiEntities.map(e => e.label))].join(', ');
+                console.warn(`[NotebookChat] 🚫 PII blocked | ${categoryList}`);
+
+                guardrailEventStore.logGuardrailEvent({
+                    organization_id: userOrgForTiers || null,
+                    user_id: userId,
+                    violation_type: 'pii',
+                    violation_categories: categoryList,
+                    direction: 'input',
+                    action_taken: 'blocked',
+                    source: 'notebook',
+                    model: modelId || null,
+                }).catch(() => {});
+
+                send('error', { error: `Your message contains sensitive personal information (${categoryList}). Please remove PII before sending.` });
+                res.end();
+                return;
+            }
+        }
+
         // ── Build tool list ──────────────────────────────────────────
         const notebookTools = [...NOTEBOOK_DOC_TOOLS, NOTEBOOK_ADD_SOURCE_TOOL];
 
@@ -634,6 +681,63 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             };
 
             await adapter.stream(apiKey, apiUrl, modelId, messages, chatOptions, followUpCallback);
+        }
+
+        // ── Restore PII tokens ─────────────────────────────────────
+        if (piiTokenMap && Object.keys(piiTokenMap).length > 0) {
+            const { restoreTokens } = require('../../core/azurePiiDetection');
+            const restored = restoreTokens(fullContent, piiTokenMap);
+            if (restored !== fullContent) {
+                send('content_replace', { text: restored });
+                fullContent = restored;
+                console.log(`[NotebookChat] 🔓 PII tokens restored in output`);
+            }
+        }
+
+        // ── PII Detection on AI Output ─────────────────────────────
+        const outputPiiScope = orgShield?.scope?.agentOutput !== false;
+        if (fullContent && orgShield?.enabled && orgShield?.azurePiiEnabled && outputPiiScope) {
+            try {
+                const { validateOutputForPii } = require('../../core/azurePiiDetection');
+                await validateOutputForPii(fullContent, {
+                    enabledCategories: orgShield.piiDetectionCategories,
+                    confidenceThreshold: orgShield.piiDetectionConfidenceThreshold,
+                    piiEnabled: true,
+                });
+                console.log('[NotebookChat] ✅ PII output scan passed');
+            } catch (piiOutError) {
+                if (piiOutError.piiEntities) {
+                    const categoryList = [...new Set(piiOutError.piiEntities.map(e => e.label))].join(', ');
+                    console.warn(`[NotebookChat] 🚫 PII in AI output | ${categoryList}`);
+
+                    if (orgShield.action === 'redact') {
+                        let redacted = fullContent;
+                        const sorted = [...piiOutError.piiEntities].sort((a, b) => b.offset - a.offset);
+                        for (const e of sorted) {
+                            if (e.offset >= 0 && e.length > 0) {
+                                redacted = redacted.slice(0, e.offset) + `[REDACTED: ${e.label}]` + redacted.slice(e.offset + e.length);
+                            }
+                        }
+                        send('content_replace', { text: redacted });
+                        fullContent = redacted;
+                    } else {
+                        const msg = `⚠️ This response was blocked because it contained sensitive personal information (${categoryList}).`;
+                        send('content_replace', { text: msg });
+                        fullContent = msg;
+                    }
+
+                    guardrailEventStore.logGuardrailEvent({
+                        organization_id: userOrgForTiers || null,
+                        user_id: userId,
+                        violation_type: 'pii',
+                        violation_categories: categoryList,
+                        direction: 'output',
+                        action_taken: orgShield.action === 'redact' ? 'redacted' : 'blocked',
+                        source: 'notebook',
+                        model: modelId || null,
+                    }).catch(() => {});
+                }
+            }
         }
 
         send('done', {});

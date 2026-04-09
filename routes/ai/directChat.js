@@ -985,13 +985,15 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
 
         // ─── PII Detection (independent of content moderation) ──────
         // Runs whenever piiDetectionEnabled is true, regardless of moderation settings.
+        // Respects scope.userInput — admin can disable input scanning.
         // Action 'block' — throw and reject message.
         // Action 'tokenize' — replace PII spans with tokens, pass clean text to AI,
         //                     restore tokens in the AI response before showing the user.
         let piiTokenMap = null;  // non-null only in tokenize mode when PII found
+        const inputPiiScope = orgShield?.scope?.userInput !== false;
         try {
             const { validateInputForPii } = require('../../core/azurePiiDetection');
-            const orgPiiEnabled = !!(orgShield?.enabled && orgShield?.azurePiiEnabled);
+            const orgPiiEnabled = !!(orgShield?.enabled && orgShield?.azurePiiEnabled && inputPiiScope);
             const piiResult = await validateInputForPii(messages.slice(-3), orgPiiEnabled);
 
             if (piiResult && piiResult.tokenizedText) {
