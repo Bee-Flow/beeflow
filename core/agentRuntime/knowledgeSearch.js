@@ -1,10 +1,25 @@
 const configStore = require('../../stores/configStore');
 const { getServiceHeaders } = require('../serviceAuth');
 
+// Greetings / small-talk patterns that should NEVER trigger a KB lookup.
+// Kept intentionally broad — false negatives are cheap (just an extra search),
+// false positives would hide real queries.
+const GREETING_RE = /^(h(i|ey|ello|oi|allo|oi+)|yo|sup|goedemorgen|goedemiddag|goedenavond|goedendag|dag|bedankt|dankjewel|thanks|thank you|ok(ay)?|yes|no|ja|nee|sure|cool|nice|great|good morning|good afternoon|good evening|how are you|hoe gaat het|alles goed|what'?s up|how'?s it going)[\s!.,?]*$/i;
+
 async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnowledge, onEvent }) {
     let systemPromptExtension = '';
     const kbIds = agent.config?.knowledge_base_ids || [];
     let allKnowledgeResults = [];
+
+    // ── Skip KB search for greetings / small-talk ───────────────────
+    // These never carry search intent and always return low-quality matches.
+    const trimmedInput = (userMessage || '').trim();
+    if (GREETING_RE.test(trimmedInput)) {
+        console.log(`[KnowledgeSearch] Skipping KB search — greeting/small-talk detected: "${trimmedInput}"`);
+        // In strict-knowledge mode, still let the agent respond naturally to greetings
+        // (the "no results" prompt would be confusing for a simple "hi")
+        return systemPromptExtension;
+    }
 
     if (kbIds.length > 0) {
         try {
@@ -116,8 +131,12 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
         // Without reranker, scores are RRF fusion values (typically 0.01-0.03) →
         // skip this filter (the MIN_SCORE check above already handles the floor).
         if (hasReranker) {
-            const MIN_SCORE_THRESHOLD = 0.60;
+            const MIN_SCORE_THRESHOLD = 0.72;
+            const beforeCount = allKnowledgeResults.length;
             allKnowledgeResults = allKnowledgeResults.filter(r => (r.score || 0) >= MIN_SCORE_THRESHOLD);
+            if (beforeCount !== allKnowledgeResults.length) {
+                console.log(`[KnowledgeSearch] Relevance filter: ${beforeCount} → ${allKnowledgeResults.length} chunks (threshold: ${MIN_SCORE_THRESHOLD})`);
+            }
         }
 
         const deduped = [];
