@@ -142,11 +142,21 @@ async function executeKbSearchTool(toolName, args, context = {}) {
         // Ensure we only return chunks that belong to documents STILL present
         // in the main Postgres database. This protects against remote search-service
         // failing to delete chunks when a document was removed from the DB.
-        const { getAll } = require('../db');
-        const dbDocs = await getAll('SELECT id FROM documents WHERE knowledge_base_id = ANY($1::uuid[])', [kbIds]);
-        const validDocIds = new Set(dbDocs.map(d => d.id));
-        
-        chunks = chunks.filter(c => validDocIds.has(c.document_id));
+        // Chunks without a document_id are passed through (search-service format may not include it).
+        if (chunks.length > 0 && chunks.some(c => c.document_id)) {
+            try {
+                const { getAll } = require('../db');
+                const dbDocs = await getAll('SELECT id FROM documents WHERE knowledge_base_id = ANY($1::uuid[])', [kbIds]);
+                const validDocIds = new Set(dbDocs.map(d => String(d.id).toLowerCase()));
+                const before = chunks.length;
+                chunks = chunks.filter(c => !c.document_id || validDocIds.has(String(c.document_id).toLowerCase()));
+                if (chunks.length < before) {
+                    console.log(`[KBSearch] Orphan filter: removed ${before - chunks.length} orphaned chunks`);
+                }
+            } catch (filterErr) {
+                console.warn('[KBSearch] Orphan filter failed, skipping:', filterErr.message);
+            }
+        }
 
         // Format results for the agent.
         // When a reranker is active (Azure Cohere or local GPU) it already picked the best

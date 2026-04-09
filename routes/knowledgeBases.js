@@ -767,16 +767,25 @@ router.post('/search', requireAuth, async (req, res) => {
         }
 
         // ── Filter Orphaned Chunks ────────────────────────────────────
-        // Ensure we only return chunks that belong to active documents in Postgres
-        const { getAll } = require('../db');
-        const dbDocs = await getAll('SELECT id FROM documents WHERE knowledge_base_id = ANY($1::uuid[])', [kb_ids]);
-        const validDocIds = new Set(dbDocs.map(d => d.id));
-        
-        if (results.chunks && Array.isArray(results.chunks)) {
-            results.chunks = results.chunks.filter(c => validDocIds.has(c.document_id));
-        }
-        if (results.results && Array.isArray(results.results)) {
-            results.results = results.results.filter(c => validDocIds.has(c.document_id));
+        // Ensure we only return chunks that belong to active documents in Postgres.
+        // Chunks without a document_id are passed through (search-service may not include it).
+        const allChunks = [...(results.chunks || []), ...(results.results || [])];
+        if (allChunks.length > 0 && allChunks.some(c => c.document_id)) {
+            try {
+                const { getAll } = require('../db');
+                const dbDocs = await getAll('SELECT id FROM documents WHERE knowledge_base_id = ANY($1::uuid[])', [kb_ids]);
+                const validDocIds = new Set(dbDocs.map(d => String(d.id).toLowerCase()));
+                const filterFn = c => !c.document_id || validDocIds.has(String(c.document_id).toLowerCase());
+                
+                if (results.chunks && Array.isArray(results.chunks)) {
+                    results.chunks = results.chunks.filter(filterFn);
+                }
+                if (results.results && Array.isArray(results.results)) {
+                    results.results = results.results.filter(filterFn);
+                }
+            } catch (filterErr) {
+                console.warn('[KB] Orphan filter failed, skipping:', filterErr.message);
+            }
         }
 
         res.json(results);
