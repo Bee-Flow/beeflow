@@ -752,40 +752,48 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
 
     await ensureKBChunksTable(1536);
 
-    const client = await getClient();
-
-    try {
-        // ── Embed query (with LRU cache) ────────────────────────────
-        let vectorStr = null;
-        if (pgvectorAvailable) {
-            const cached = getCachedEmbedding(query);
-            if (cached) {
-                vectorStr = cached;
-                console.log('[LocalKBSearch] Using cached query embedding');
-            } else {
-                try {
-                    const queryEmbedding = await azureEmbed([query], endpoint, apiKey, model);
-                    vectorStr = `[${queryEmbedding[0].join(',')}]`;
-                    setCachedEmbedding(query, vectorStr);
-                } catch (err) {
-                    console.warn(`[LocalKBSearch] Query embedding failed: ${err.message}`);
-                }
+    // ── Embed query (with LRU cache) — done BEFORE acquiring DB connection ──
+    let vectorStr = null;
+    if (pgvectorAvailable) {
+        const cached = getCachedEmbedding(query);
+        if (cached) {
+            vectorStr = cached;
+            console.log('[LocalKBSearch] Using cached query embedding');
+        } else {
+            try {
+                const queryEmbedding = await azureEmbed([query], endpoint, apiKey, model);
+                vectorStr = `[${queryEmbedding[0].join(',')}]`;
+                setCachedEmbedding(query, vectorStr);
+            } catch (err) {
+                console.warn(`[LocalKBSearch] Query embedding failed: ${err.message}`);
             }
         }
+    }
 
-        // ── Build FTS query string ───────────────────────────────────
-        const sanitizedQuery = query
-            .replace(/[\\\"'*^$(){}[\]\\\\]/g, '')
-            .trim();
+    // ── Build FTS query string ───────────────────────────────────
+    const sanitizedQuery = query
+        .replace(/[\\\"'*^$(){}[\]\\\\]/g, '')
+        .trim();
 
-        // Build OR-based FTS string from meaningful words (≥2 chars to catch
-        // short Dutch acronyms like "HR", "IT", "CAO", "ICT")
-        const ftsOrQuery = sanitizedQuery
-            .split(/\s+/)
-            .filter(w => w.length >= 2)
-            .join(' OR ');
-        const ftsQueryStr = ftsOrQuery.length > 0 ? ftsOrQuery : sanitizedQuery;
+    // Build AND-based FTS string first (stronger match — co-occurrence)
+    // Fall back to OR if AND has no results
+    const ftsWords = sanitizedQuery
+        .split(/\s+/)
+        .filter(w => w.length >= 2);
+    const ftsAndQuery = ftsWords.join(' AND ');
+    const ftsOrQuery = ftsWords.join(' OR ');
+    const ftsQueryStr = ftsAndQuery.length > 0 ? ftsAndQuery : sanitizedQuery;
 
+    // ── Phase 1: DB queries — acquire connection, run queries, release ──
+    // Connection is held ONLY for actual database work, not for external API calls.
+    let vectorResults = { rows: [] };
+    let ftsResults = { rows: [] };
+    let validDocIds = null;
+    let adjacentResults = [];
+    let results = [];
+
+    const client = await getClient();
+    try {
         // ── Run vector search + FTS in parallel ─────────────────────
         const vectorSearchPromise = (pgvectorAvailable && vectorStr)
             ? client.query(
@@ -800,6 +808,7 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
             ).catch(err => { console.warn(`[LocalKBSearch] Vector search failed: ${err.message}`); return { rows: [] }; })
             : Promise.resolve({ rows: [] });
 
+        // Try AND-join first; if it returns 0 results, fall back to OR-join
         const ftsSearchPromise = (ftsQueryStr.length > 0)
             ? client.query(
                 `SELECT id, title, content, source_uri, document_id, chunk_id, chunk_type,
@@ -820,23 +829,49 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
             ).catch(e => { console.warn('[LocalKBSearch] FTS query failed:', e.message); return { rows: [] }; })
             : Promise.resolve({ rows: [] });
 
-        const [vectorResults, ftsResults] = await Promise.all([vectorSearchPromise, ftsSearchPromise]);
+        // Also fetch orphan filter data in parallel with searches
+        const orphanPromise = client.query(
+            `SELECT id::text FROM documents WHERE knowledge_base_id = ANY($1::uuid[])`,
+            [kbIds]
+        ).catch(e => { console.warn('[LocalKBSearch] Document validation query failed:', e.message); return { rows: [] }; });
 
-        // ── Orphan filter: exclude chunks whose document was deleted ──
-        // Post-filter approach is safer than INNER JOIN (avoids UUID format mismatches)
-        let validDocIds = null;
-        try {
-            const docRows = await client.query(
-                `SELECT id::text FROM documents WHERE knowledge_base_id = ANY($1::uuid[])`,
-                [kbIds]
-            );
-            validDocIds = new Set(docRows.rows.map(r => r.id.toLowerCase()));
-        } catch (e) {
-            console.warn('[LocalKBSearch] Document validation query failed:', e.message);
+        [vectorResults, ftsResults, { rows: validDocIds }] = await Promise.all([
+            vectorSearchPromise, ftsSearchPromise, orphanPromise
+        ]);
+
+        // FTS AND-join fallback: if AND returned 0 results but OR might find some, retry
+        if (ftsResults.rows.length === 0 && ftsOrQuery !== ftsAndQuery && ftsOrQuery.length > 0) {
+            console.log(`[LocalKBSearch] FTS AND returned 0, falling back to OR`);
+            try {
+                ftsResults = await client.query(
+                    `SELECT id, title, content, source_uri, document_id, chunk_id, chunk_type,
+                            GREATEST(
+                                ts_rank_cd(tsv, websearch_to_tsquery('dutch', $1)) * 1.5,
+                                ts_rank_cd(tsv, websearch_to_tsquery('simple', $1))
+                            ) AS fts_score
+                     FROM kb_chunks
+                     WHERE tenant_id = $2
+                       AND knowledge_base_id = ANY($3::text[])
+                       AND (
+                           tsv @@ websearch_to_tsquery('dutch', $1)
+                           OR tsv @@ websearch_to_tsquery('simple', $1)
+                       )
+                     ORDER BY fts_score DESC
+                     LIMIT 15`,
+                    [ftsOrQuery, tenantId, kbIds]
+                );
+            } catch (e) {
+                console.warn('[LocalKBSearch] FTS OR fallback failed:', e.message);
+            }
         }
+
+        // Build orphan filter set
+        const validDocIdSet = validDocIds.length > 0
+            ? new Set(validDocIds.map(r => r.id.toLowerCase()))
+            : null;
         const filterOrphans = (rows) => {
-            if (!validDocIds) return rows; // skip filter if query failed
-            return rows.filter(r => !r.document_id || validDocIds.has(String(r.document_id).toLowerCase()));
+            if (!validDocIdSet) return rows; // skip filter if query failed
+            return rows.filter(r => !r.document_id || validDocIdSet.has(String(r.document_id).toLowerCase()));
         };
 
         // Apply cosine similarity floor — chunks below 0.35 are guaranteed noise
@@ -871,7 +906,7 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
 
         // D. Sort by fused score, deprioritize ToC chunks, and take top candidates for reranking
         const queryWords = query.toLowerCase().split(/\s+/).filter(w => w.length >= 4);
-        let results = Array.from(scores.entries())
+        results = Array.from(scores.entries())
             .map(([id, score]) => {
                 const row = contentMap.get(id);
                 let adjustedScore = score;
@@ -902,7 +937,7 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
                 };
             })
             .sort((a, b) => b.score - a.score)
-            .slice(0, 20); // Cap candidates for reranking (was topK*3+30 — too many)
+            .slice(0, topK * 2); // Cap candidates for reranking
 
         // D2. Context window expansion: fetch adjacent chunks for table completeness
         //     When a table chunk is found, we also pull its neighbors (chunk_id ± 1)
@@ -923,7 +958,10 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
                     [results.map(r => r.id), tenantId]
                 );
 
-                for (const adj of adjacentRows.rows) {
+                // Issue #6 fix: apply orphan filter to adjacent chunks too
+                const cleanAdjacentRows = filterOrphans(adjacentRows.rows);
+
+                for (const adj of cleanAdjacentRows) {
                     if (!existingIds.has(adj.id)) {
                         existingIds.add(adj.id);
                         results.push({
@@ -938,121 +976,126 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
                     }
                 }
 
-                if (adjacentRows.rows.length > 0) {
-                    console.log(`[LocalKBSearch] Context window: added ${adjacentRows.rows.length} adjacent chunks`);
+                if (cleanAdjacentRows.length > 0) {
+                    console.log(`[LocalKBSearch] Context window: added ${cleanAdjacentRows.length} adjacent chunks`);
                 }
             } catch (adjErr) {
                 console.warn(`[LocalKBSearch] Context window expansion failed: ${adjErr.message}`);
             }
         }
+    } finally {
+        // Issue #16 fix: release DB connection BEFORE reranker API call
+        // The reranker is a pure HTTP call that doesn't need the DB.
+        client.release();
+    }
 
-        // E. Rerank
-        // Priority: Azure Cohere (when configured) > local GPU cross-encoder
-        // If Azure reranker is configured it is used exclusively — no GPU needed.
-        const azureRerankerEndpoint = await configStore.getConfig('azure_reranker_endpoint') || process.env.AZURE_RERANKER_ENDPOINT;
-        const azureRerankerKey = await configStore.getSecret('azure_reranker_key') || process.env.AZURE_RERANKER_KEY;
-        const azureRerankerModel = await configStore.getConfig('azure_reranker_model') || process.env.AZURE_RERANKER_MODEL || 'Cohere-rerank-v4.0-fast';
-        const localRerankerUrl = process.env.RERANKER_URL;
+    // ── Phase 2: Reranking — no DB connection held during these API calls ──
+    // Priority: Azure Cohere (when configured) > local GPU cross-encoder
+    // If Azure reranker is configured it is used exclusively — no GPU needed.
+    const azureRerankerEndpoint = await configStore.getConfig('azure_reranker_endpoint') || process.env.AZURE_RERANKER_ENDPOINT;
+    const azureRerankerKey = await configStore.getSecret('azure_reranker_key') || process.env.AZURE_RERANKER_KEY;
+    const azureRerankerModel = await configStore.getConfig('azure_reranker_model') || process.env.AZURE_RERANKER_MODEL || 'Cohere-rerank-v4.0-fast';
+    const localRerankerUrl = process.env.RERANKER_URL;
 
-        if (azureRerankerEndpoint && azureRerankerKey && results.length > 0) {
-            // ── Azure Cohere rerank (primary — no GPU required) ──
-            try {
-                const endpoint = azureRerankerEndpoint.replace(/\/+$/, '');
-                const requestBody = JSON.stringify({
-                    model: azureRerankerModel,
+    if (azureRerankerEndpoint && azureRerankerKey && results.length > 0) {
+        // ── Azure Cohere rerank (primary — no GPU required) ──
+        try {
+            const rrEndpoint = azureRerankerEndpoint.replace(/\/+$/, '');
+            const requestBody = JSON.stringify({
+                model: azureRerankerModel,
+                query,
+                documents: results.map(r => r.content),
+                top_n: topK,
+            });
+            const headers = {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${azureRerankerKey}`,
+            };
+
+            // Try paths in order of likelihood — cache the working one
+            const RERANK_PATHS = ['/providers/cohere/v2/rerank', '/v1/rerank', '/v2/rerank'];
+            if (!global._azureRerankerPath) global._azureRerankerPath = null;
+
+            const pathsToTry = global._azureRerankerPath
+                ? [global._azureRerankerPath]
+                : RERANK_PATHS;
+
+            let rerankerData = null;
+            for (const path of pathsToTry) {
+                const url = `${rrEndpoint}${path}`;
+                console.log(`[LocalKBSearch] Trying Azure reranker: ${url} (model=${azureRerankerModel}, docs=${results.length})`);
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers,
+                    body: requestBody,
+                    signal: AbortSignal.timeout(15000),
+                });
+                if (res.ok) {
+                    rerankerData = await res.json();
+                    global._azureRerankerPath = path;  // cache for future calls
+                    break;
+                }
+                const errBody = await res.text().catch(() => '');
+                console.warn(`[LocalKBSearch] Azure reranker ${path} → ${res.status}: ${errBody.slice(0, 200)}`);
+                if (res.status === 401 || res.status === 403) break; // auth issue, no point trying other paths
+            }
+
+            if (rerankerData?.results?.length > 0) {
+                results = rerankerData.results.map(rr => ({
+                    content: results[rr.index].content,
+                    title: results[rr.index].title,
+                    source_uri: results[rr.index].source_uri,
+                    score: rr.relevance_score,
+                }));
+                console.log(`[LocalKBSearch] Azure Cohere reranked ${rerankerData.results.length} results (top=${results[0]?.score})`);
+            } else if (!rerankerData) {
+                console.warn(`[LocalKBSearch] All Azure reranker paths failed, falling back to RRF`);
+            }
+        } catch (rerankerErr) {
+            console.warn(`[LocalKBSearch] Azure reranker error (${rerankerErr.message}), falling back to RRF`);
+        }
+    } else if (localRerankerUrl && results.length > 0) {
+        // ── Local GPU cross-encoder sidecar (only when Azure is NOT configured) ──
+        try {
+            const rerankerRes = await fetch(`${localRerankerUrl}/rerank`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
                     query,
                     documents: results.map(r => r.content),
                     top_n: topK,
-                });
-                const headers = {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${azureRerankerKey}`,
-                };
+                }),
+                signal: AbortSignal.timeout(10000),
+            });
 
-                // Try paths in order of likelihood — cache the working one
-                const RERANK_PATHS = ['/providers/cohere/v2/rerank', '/v1/rerank', '/v2/rerank'];
-                if (!global._azureRerankerPath) global._azureRerankerPath = null;
-
-                const pathsToTry = global._azureRerankerPath
-                    ? [global._azureRerankerPath]
-                    : RERANK_PATHS;
-
-                let rerankerData = null;
-                for (const path of pathsToTry) {
-                    const url = `${endpoint}${path}`;
-                    console.log(`[LocalKBSearch] Trying Azure reranker: ${url} (model=${azureRerankerModel}, docs=${results.length})`);
-                    const res = await fetch(url, {
-                        method: 'POST',
-                        headers,
-                        body: requestBody,
-                        signal: AbortSignal.timeout(15000),
-                    });
-                    if (res.ok) {
-                        rerankerData = await res.json();
-                        global._azureRerankerPath = path;  // cache for future calls
-                        break;
-                    }
-                    const errBody = await res.text().catch(() => '');
-                    console.warn(`[LocalKBSearch] Azure reranker ${path} → ${res.status}: ${errBody.slice(0, 200)}`);
-                    if (res.status === 401 || res.status === 403) break; // auth issue, no point trying other paths
-                }
-
-                if (rerankerData?.results?.length > 0) {
+            if (rerankerRes.ok) {
+                const rerankerData = await rerankerRes.json();
+                if (rerankerData.results && rerankerData.results.length > 0) {
                     results = rerankerData.results.map(rr => ({
                         content: results[rr.index].content,
                         title: results[rr.index].title,
                         source_uri: results[rr.index].source_uri,
                         score: rr.relevance_score,
                     }));
-                    console.log(`[LocalKBSearch] Azure Cohere reranked ${rerankerData.results.length} results (top=${results[0]?.score})`);
-                } else if (!rerankerData) {
-                    console.warn(`[LocalKBSearch] All Azure reranker paths failed, falling back to RRF`);
+                    console.log(`[LocalKBSearch] Local GPU reranked ${rerankerData.results.length} results in ${rerankerData.latency_ms || '?'}ms (top=${results[0]?.score})`);
                 }
-            } catch (rerankerErr) {
-                console.warn(`[LocalKBSearch] Azure reranker error (${rerankerErr.message}), falling back to RRF`);
+            } else {
+                console.warn(`[LocalKBSearch] Local GPU reranker responded ${rerankerRes.status}, falling back to RRF`);
             }
-        } else if (localRerankerUrl && results.length > 0) {
-            // ── Local GPU cross-encoder sidecar (only when Azure is NOT configured) ──
-            try {
-                const rerankerRes = await fetch(`${localRerankerUrl}/rerank`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        query,
-                        documents: results.map(r => r.content),
-                        top_n: topK,
-                    }),
-                    signal: AbortSignal.timeout(10000),
-                });
-
-                if (rerankerRes.ok) {
-                    const rerankerData = await rerankerRes.json();
-                    if (rerankerData.results && rerankerData.results.length > 0) {
-                        results = rerankerData.results.map(rr => ({
-                            content: results[rr.index].content,
-                            title: results[rr.index].title,
-                            source_uri: results[rr.index].source_uri,
-                            score: rr.relevance_score,
-                        }));
-                        console.log(`[LocalKBSearch] Local GPU reranked ${rerankerData.results.length} results in ${rerankerData.latency_ms || '?'}ms (top=${results[0]?.score})`);
-                    }
-                } else {
-                    console.warn(`[LocalKBSearch] Local GPU reranker responded ${rerankerRes.status}, falling back to RRF`);
-                }
-            } catch (rerankerErr) {
-                console.warn(`[LocalKBSearch] Local GPU reranker unavailable (${rerankerErr.message}), falling back to RRF`);
-            }
-        } else {
-            console.log('[LocalKBSearch] No reranker configured — using RRF scores');
+        } catch (rerankerErr) {
+            console.warn(`[LocalKBSearch] Local GPU reranker unavailable (${rerankerErr.message}), falling back to RRF`);
         }
-
-        results = results.slice(0, topK);
-
-        console.log(`[LocalKBSearch] Found ${results.length} results (vec=${vectorResults.rows.length}, fts=${ftsResults.rows.length})`);
-        return results;
-    } finally {
-        client.release();
+    } else {
+        console.log('[LocalKBSearch] No reranker configured — using RRF scores');
     }
+
+    results = results.slice(0, topK);
+
+    // Mark results as orphan-filtered so callers don't duplicate the work
+    results._orphanFiltered = true;
+
+    console.log(`[LocalKBSearch] Found ${results.length} results (vec=${vectorResults.rows.length}, fts=${ftsResults.rows.length}) [${Date.now() - _searchStart}ms]`);
+    return results;
 }
 
 /**
@@ -1071,7 +1114,7 @@ async function getDocumentContent(tenantId, kbId, docId) {
         const { rows } = await client.query(
             `SELECT content FROM kb_chunks
              WHERE tenant_id = $1 AND knowledge_base_id = $2 AND document_id = $3
-             ORDER BY chunk_index ASC`,
+             ORDER BY chunk_id ASC`,
             [tenantId, kbId, docId]
         );
         return rows.map(r => r.content).join('\n\n');

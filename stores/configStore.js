@@ -94,6 +94,30 @@ function decryptValue(stored) {
     }
 }
 
+// ── In-memory cache (avoids DB round-trips for hot-path reads) ──────
+// Config values change very rarely (monthly). Caching them for 60s
+// eliminates ~6 DB queries per KB search call.
+const CACHE_TTL_MS = 60_000; // 60 seconds
+const _cache = new Map(); // key → { value, ts }
+
+function _cacheGet(key) {
+    const entry = _cache.get(key);
+    if (!entry) return undefined; // undefined = cache miss
+    if (Date.now() - entry.ts > CACHE_TTL_MS) {
+        _cache.delete(key);
+        return undefined;
+    }
+    return entry.value; // may be null (config key exists but has no value)
+}
+
+function _cacheSet(key, value) {
+    _cache.set(key, { value, ts: Date.now() });
+}
+
+function _cacheInvalidate(key) {
+    _cache.delete(key);
+}
+
 // Schema init
 let initialized = false;
 async function initDB() {
@@ -111,14 +135,24 @@ async function initDB() {
 initDB().catch(err => console.error('[ConfigStore] Init error:', err.message));
 
 async function getConfig(key) {
+    // Check in-memory cache first
+    const cached = _cacheGet(key);
+    if (cached !== undefined) return cached;
+
     await initDB();
     const row = await getOne('SELECT value FROM config WHERE key = $1', [key]);
-    if (!row) return null;
-    try {
-        return JSON.parse(row.value);
-    } catch (e) {
-        return row.value;
+    if (!row) {
+        _cacheSet(key, null);
+        return null;
     }
+    let result;
+    try {
+        result = JSON.parse(row.value);
+    } catch (e) {
+        result = row.value;
+    }
+    _cacheSet(key, result);
+    return result;
 }
 
 async function setConfig(key, value) {
@@ -128,6 +162,7 @@ async function setConfig(key, value) {
         INSERT INTO config (key, value, updated_at) VALUES ($1, $2, NOW())
         ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
     `, [key, stringValue]);
+    _cacheInvalidate(key); // bust cache on write
     return true;
 }
 
@@ -146,6 +181,8 @@ async function setSecret(key, value) {
         INSERT INTO config (key, value, updated_at) VALUES ($1, $2, NOW())
         ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
     `, [key, encrypted]);
+    _cacheInvalidate(key);
+    _cacheInvalidate(`__secret__${key}`); // bust secret cache on write
     return true;
 }
 
@@ -154,31 +191,44 @@ async function setSecret(key, value) {
  * Transparently handles legacy plaintext values (returns as-is).
  */
 async function getSecret(key) {
+    // Check in-memory cache first (decrypted values are cached)
+    const cached = _cacheGet(`__secret__${key}`);
+    if (cached !== undefined) return cached;
+
     await initDB();
     const row = await getOne('SELECT value FROM config WHERE key = $1', [key]);
-    if (!row || !row.value) return null;
+    if (!row || !row.value) {
+        _cacheSet(`__secret__${key}`, null);
+        return null;
+    }
 
     const rawValue = row.value;
+    let result;
 
     // Try to parse as encrypted envelope
     try {
         const parsed = JSON.parse(rawValue);
         if (parsed && typeof parsed === 'object' && parsed._encrypted === 'config-v1') {
-            return decryptValue(parsed);
+            result = decryptValue(parsed);
+        } else if (typeof parsed === 'string') {
+            result = parsed;
+        } else {
+            result = rawValue;
         }
-        // JSON but not encrypted — could be a legacy stored string
-        // For secret keys, we expect strings not objects, so return the raw value
-        if (typeof parsed === 'string') return parsed;
-        return rawValue;
     } catch (_) {
         // Not JSON — plaintext legacy value
-        return rawValue;
+        result = rawValue;
     }
+
+    _cacheSet(`__secret__${key}`, result);
+    return result;
 }
 
 async function deleteConfig(key) {
     await initDB();
     const { rowCount } = await run('DELETE FROM config WHERE key = $1', [key]);
+    _cacheInvalidate(key);
+    _cacheInvalidate(`__secret__${key}`);
     return rowCount > 0;
 }
 

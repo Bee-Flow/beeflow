@@ -139,11 +139,9 @@ async function executeKbSearchTool(toolName, args, context = {}) {
         }
 
         // ── Filter Orphaned Chunks ────────────────────────────────────
-        // Ensure we only return chunks that belong to documents STILL present
-        // in the main Postgres database. This protects against remote search-service
-        // failing to delete chunks when a document was removed from the DB.
-        // Chunks without a document_id are passed through (search-service format may not include it).
-        if (chunks.length > 0 && chunks.some(c => c.document_id)) {
+        // searchLocally() already filters orphans (returns ._orphanFiltered = true).
+        // Only run this for the search-service path which doesn't do its own filtering.
+        if (chunks.length > 0 && !chunks._orphanFiltered && chunks.some(c => c.document_id)) {
             try {
                 const { getAll } = require('../db');
                 const dbDocs = await getAll('SELECT id FROM documents WHERE knowledge_base_id = ANY($1::uuid[])', [kbIds]);

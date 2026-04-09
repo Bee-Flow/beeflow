@@ -767,10 +767,11 @@ router.post('/search', requireAuth, async (req, res) => {
         }
 
         // ── Filter Orphaned Chunks ────────────────────────────────────
-        // Ensure we only return chunks that belong to active documents in Postgres.
-        // Chunks without a document_id are passed through (search-service may not include it).
+        // searchLocally() already filters orphans (._orphanFiltered = true).
+        // Only run this for the search-service path.
         const allChunks = [...(results.chunks || []), ...(results.results || [])];
-        if (allChunks.length > 0 && allChunks.some(c => c.document_id)) {
+        const alreadyFiltered = (results.chunks || results.results || [])?._orphanFiltered;
+        if (!alreadyFiltered && allChunks.length > 0 && allChunks.some(c => c.document_id)) {
             try {
                 const { getAll } = require('../db');
                 const dbDocs = await getAll('SELECT id FROM documents WHERE knowledge_base_id = ANY($1::uuid[])', [kb_ids]);
