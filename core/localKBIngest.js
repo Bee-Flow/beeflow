@@ -16,8 +16,8 @@ const { convertAllHtmlTablesToMarkdown } = require('./markdownCleanup');
 
 // ── Structure-aware text chunking ───────────────────────────────────
 
-const CHUNK_SIZE = 800;    // tokens per chunk
-const CHUNK_OVERLAP = 150; // token overlap (ensures continuity)
+const CHUNK_SIZE = 400;    // tokens per chunk (sweet spot for text-embedding-3-small)
+const CHUNK_OVERLAP = 60;  // token overlap (~15% — preserves boundary context)
 const CHUNK_SIZE_FLEX = Math.floor(CHUNK_SIZE * 1.8); // atomic blocks up to this size stay whole
 
 /**
@@ -434,8 +434,8 @@ function chunkText(text) {
         }
     }
 
-    // Filter out tiny chunks (< 30 tokens)
-    const MIN_TOKENS = 30;
+    // Filter out tiny chunks (< 20 tokens)
+    const MIN_TOKENS = 20;
     const filtered = chunks.filter(c => c.token_count >= MIN_TOKENS);
 
     // Tag chunk types (ToC, content)
@@ -695,6 +695,31 @@ async function deleteChunksLocally(tenantId, kbId, docId) {
     }
 }
 
+// ── Query embedding LRU cache ───────────────────────────────────────
+// Avoids repeated Azure API calls (~200-400ms each) for identical queries.
+const EMBEDDING_CACHE_MAX = 100;
+const EMBEDDING_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const _embeddingCache = new Map();
+
+function getCachedEmbedding(query) {
+    const entry = _embeddingCache.get(query);
+    if (!entry) return null;
+    if (Date.now() - entry.ts > EMBEDDING_CACHE_TTL) {
+        _embeddingCache.delete(query);
+        return null;
+    }
+    return entry.embedding;
+}
+
+function setCachedEmbedding(query, embedding) {
+    // Evict oldest if at capacity
+    if (_embeddingCache.size >= EMBEDDING_CACHE_MAX) {
+        const oldestKey = _embeddingCache.keys().next().value;
+        _embeddingCache.delete(oldestKey);
+    }
+    _embeddingCache.set(query, { embedding, ts: Date.now() });
+}
+
 /**
  * Search locally-ingested KB chunks using hybrid (vector + FTS) search.
  *
@@ -707,6 +732,7 @@ async function deleteChunksLocally(tenantId, kbId, docId) {
  */
 async function searchLocally(tenantId, kbIds, query, options = {}) {
     const { topK = 10 } = options;
+    const _searchStart = Date.now();
     console.log(`[LocalKBSearch] searchLocally — tenantId="${tenantId}" kbIds=${JSON.stringify(kbIds)} query="${query.slice(0,60)}"`);
 
     // Get Azure credentials for embedding the query
@@ -719,79 +745,88 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
 
     await ensureKBChunksTable(1536);
 
-    let vectorResults = { rows: [] };
     const client = await getClient();
 
     try {
-        // A. Vector search
+        // ── Embed query (with LRU cache) ────────────────────────────
+        let vectorStr = null;
         if (pgvectorAvailable) {
-            try {
-                // Embed the query
-                const queryEmbedding = await azureEmbed([query], endpoint, apiKey, model);
-                const vectorStr = `[${queryEmbedding[0].join(',')}]`;
-
-                vectorResults = await client.query(
-                    `SELECT id, title, content, source_uri, document_id, chunk_id,
-                            1 - (embedding <=> $1::vector) AS vec_score
-                     FROM kb_chunks
-                     WHERE tenant_id = $2
-                       AND knowledge_base_id = ANY($3::text[])
-                     ORDER BY embedding <=> $1::vector
-                     LIMIT $4`,
-                    [vectorStr, tenantId, kbIds, topK * 3]
-                );
-            } catch (err) {
-                console.warn(`[LocalKBIngest] Vector search failed: ${err.message}`);
+            const cached = getCachedEmbedding(query);
+            if (cached) {
+                vectorStr = cached;
+                console.log('[LocalKBSearch] Using cached query embedding');
+            } else {
+                try {
+                    const queryEmbedding = await azureEmbed([query], endpoint, apiKey, model);
+                    vectorStr = `[${queryEmbedding[0].join(',')}]`;
+                    setCachedEmbedding(query, vectorStr);
+                } catch (err) {
+                    console.warn(`[LocalKBSearch] Query embedding failed: ${err.message}`);
+                }
             }
         }
 
-        // B. Full-text search
-        // Extract significant words (≥4 chars) and join with OR so that natural-language
-        // questions like "wat kan je vinden over Algemene bepalingen" still find the right
-        // chunks even when question verbs ("vinden") don't appear in the target content.
-        let ftsResults = { rows: [] };
+        // ── Build FTS query string ───────────────────────────────────
         const sanitizedQuery = query
             .replace(/[\\\"'*^$(){}[\]\\\\]/g, '')
             .trim();
 
-        // Build OR-based FTS string from meaningful words (skip short stop words)
+        // Build OR-based FTS string from meaningful words (≥2 chars to catch
+        // short Dutch acronyms like "HR", "IT", "CAO", "ICT")
         const ftsOrQuery = sanitizedQuery
             .split(/\s+/)
-            .filter(w => w.length >= 4)
+            .filter(w => w.length >= 2)
             .join(' OR ');
         const ftsQueryStr = ftsOrQuery.length > 0 ? ftsOrQuery : sanitizedQuery;
 
-        if (ftsQueryStr.length > 0) {
-            try {
-                ftsResults = await client.query(
-                    `SELECT id, title, content, source_uri, document_id, chunk_id, chunk_type,
-                            GREATEST(
-                                ts_rank_cd(tsv, websearch_to_tsquery('dutch', $1)) * 1.5,
-                                ts_rank_cd(tsv, websearch_to_tsquery('simple', $1))
-                            ) AS fts_score
-                     FROM kb_chunks
-                     WHERE tenant_id = $2
-                       AND knowledge_base_id = ANY($3::text[])
-                       AND (
-                           tsv @@ websearch_to_tsquery('dutch', $1)
-                           OR tsv @@ websearch_to_tsquery('simple', $1)
-                       )
-                     ORDER BY fts_score DESC
-                     LIMIT 20`,
-                    [ftsQueryStr, tenantId, kbIds]
-                );
-                console.log(`[LocalKBSearch] FTS query: "${ftsQueryStr}" → ${ftsResults.rows.length} rows`);
-            } catch (e) {
-                console.warn('[LocalKBSearch] FTS query failed:', e.message);
-            }
-        }
+        // ── Run vector search + FTS in parallel ─────────────────────
+        const vectorSearchPromise = (pgvectorAvailable && vectorStr)
+            ? client.query(
+                `SELECT id, title, content, source_uri, document_id, chunk_id,
+                        1 - (embedding <=> $1::vector) AS vec_score
+                 FROM kb_chunks
+                 WHERE tenant_id = $2
+                   AND knowledge_base_id = ANY($3::text[])
+                 ORDER BY embedding <=> $1::vector
+                 LIMIT $4`,
+                [vectorStr, tenantId, kbIds, topK * 2]
+            ).catch(err => { console.warn(`[LocalKBSearch] Vector search failed: ${err.message}`); return { rows: [] }; })
+            : Promise.resolve({ rows: [] });
+
+        const ftsSearchPromise = (ftsQueryStr.length > 0)
+            ? client.query(
+                `SELECT id, title, content, source_uri, document_id, chunk_id, chunk_type,
+                        GREATEST(
+                            ts_rank_cd(tsv, websearch_to_tsquery('dutch', $1)) * 1.5,
+                            ts_rank_cd(tsv, websearch_to_tsquery('simple', $1))
+                        ) AS fts_score
+                 FROM kb_chunks
+                 WHERE tenant_id = $2
+                   AND knowledge_base_id = ANY($3::text[])
+                   AND (
+                       tsv @@ websearch_to_tsquery('dutch', $1)
+                       OR tsv @@ websearch_to_tsquery('simple', $1)
+                   )
+                 ORDER BY fts_score DESC
+                 LIMIT 15`,
+                [ftsQueryStr, tenantId, kbIds]
+            ).catch(e => { console.warn('[LocalKBSearch] FTS query failed:', e.message); return { rows: [] }; })
+            : Promise.resolve({ rows: [] });
+
+        const [vectorResults, ftsResults] = await Promise.all([vectorSearchPromise, ftsSearchPromise]);
+
+        // Apply cosine similarity floor — chunks below 0.35 are guaranteed noise
+        const MIN_VEC_SCORE = 0.35;
+        const filteredVecRows = vectorResults.rows.filter(r => (r.vec_score || 0) >= MIN_VEC_SCORE);
+
+        console.log(`[LocalKBSearch] Vector: ${vectorResults.rows.length}→${filteredVecRows.length} (floor=${MIN_VEC_SCORE}), FTS: ${ftsResults.rows.length} (query="${ftsQueryStr.slice(0,60)}") [${Date.now() - _searchStart}ms]`);
 
         // C. Reciprocal Rank Fusion
         const scores = new Map();
         const contentMap = new Map();
         const K = 60;
 
-        vectorResults.rows.forEach((row, idx) => {
+        filteredVecRows.forEach((row, idx) => {
             const rank = idx + 1;
             scores.set(row.id, (scores.get(row.id) || 0) + 1 / (K + rank));
             contentMap.set(row.id, row);
@@ -836,7 +871,7 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
                 };
             })
             .sort((a, b) => b.score - a.score)
-            .slice(0, Math.max(topK, 20)); // Take extra candidates for reranking
+            .slice(0, 20); // Cap candidates for reranking (was topK*3+30 — too many)
 
         // D2. Context window expansion: fetch adjacent chunks for table completeness
         //     When a table chunk is found, we also pull its neighbors (chunk_id ± 1)
@@ -853,7 +888,7 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
                         AND c.chunk_id BETWEEN h.chunk_id - 1 AND h.chunk_id + 1
                      WHERE c.tenant_id = $2
                        AND c.id != ALL($1::bigint[])
-                     LIMIT 30`,
+                     LIMIT 10`,
                     [results.map(r => r.id), tenantId]
                 );
 

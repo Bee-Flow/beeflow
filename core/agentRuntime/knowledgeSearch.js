@@ -44,7 +44,7 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
                 // ── Local search path (Azure) ──────────────────────────
                 // Search locally-ingested chunks directly from PostgreSQL
                 const { searchLocally } = require('../localKBIngest');
-                const chunks = await searchLocally(userId, kbIds, searchQuery, { topK: 15 });
+                const chunks = await searchLocally(userId, kbIds, searchQuery, { topK: 8 });
                 allKnowledgeResults.push(...chunks.map(c => {
                     // Prefer title over opaque internal URIs (n8n://, etc.)
                     const srcUri = c.source_uri || '';
@@ -67,7 +67,7 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
                         tenant_id: userId,
                         kb_ids: kbIds,
                         query: searchQuery,
-                        top_k: 15,
+                        top_k: 8,
                         rerank: true,
                         use_azure: false,
                     }),
