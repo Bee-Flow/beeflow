@@ -15,24 +15,28 @@ const KB_SEARCH_TOOLS = [
         type: 'function',
         function: {
             name: 'kb_search',
-            description: `Search the agent's knowledge base for relevant information. Use this PROACTIVELY whenever you need to look up internal knowledge — especially after reading emails, documents, or when the user asks about topics that might be in the knowledge base.
+            description: `Search the internal knowledge base for specific information. Only use this when the user asks a concrete question or you need factual details to compose a response.
+
+DO NOT USE for:
+- Greetings or small-talk ("hi", "hello", "thanks", "how are you")
+- Vague or conversational messages with no clear information need
+- When you already have enough context to answer
 
 WHEN TO USE:
-- After reading an email: search for the email's topic/subject to find relevant information for composing a reply
-- When the user asks about products, services, policies, or any topic that could be in internal documentation
-- When you need specific details (pricing, procedures, contact info) that the knowledge base might contain
-- Before composing any customer-facing response that should reference internal information
+- The user asks a specific question about products, services, policies, or procedures
+- After reading an email/document and you need internal context to compose a reply
+- You need factual details (pricing, procedures, contact info, opening hours, etc.)
 
 QUERY TIPS:
-- Use short, focused queries (2-6 words) for best results
-- Search for the TOPIC, not the instruction (e.g., "hybride events techniek" instead of "read email and reply")
-- You can call this tool multiple times with different queries to gather more context`,
+- Use short, focused queries (2-5 words) — extract only the core topic
+- Search for the TOPIC, not the instruction (e.g., "openingstijden" instead of "wat zijn de openingstijden van het kantoor")
+- You can call this multiple times with different queries if needed`,
             parameters: {
                 type: 'object',
                 properties: {
                     query: {
                         type: 'string',
-                        description: 'Search query — use the topic or subject you want to look up, not the user instruction. Keep it short and focused.'
+                        description: 'The specific topic to look up. Use 2-5 keywords, not full sentences.'
                     },
                     top_k: {
                         type: 'integer',
