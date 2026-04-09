@@ -33,6 +33,7 @@ const SYSTEM_PERMISSIONS = [
     { id: 'manage_users', name: 'Manage Users', description: 'Create, edit, and delete users', group: 'actions' },
     { id: 'manage_agents', name: 'Manage Agents', description: 'Create, edit, delete, and publish agents', group: 'actions' },
     { id: 'manage_components', name: 'Manage Components', description: 'Create and edit workflow components', group: 'actions' },
+    { id: 'manage_knowledge', name: 'Manage Knowledge', description: 'Create, edit, delete, and ingest knowledge bases', group: 'actions' },
     { id: 'manage_apps', name: 'Manage Apps', description: 'Create and publish apps', group: 'actions' },
 ];
 

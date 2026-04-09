@@ -9,7 +9,7 @@ const router = express.Router();
 const multer = require('multer');
 const kbStore = require('../stores/knowledgeBases');
 const configStore = require('../stores/configStore');
-const { requireAuth, resolveUserOrgIds } = require('../auth');
+const { requireAuth, resolveUserOrgIds, requirePermission } = require('../auth');
 
 const SEARCH_SERVICE_URL = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
 const { getServiceHeaders } = require('../core/serviceAuth');
@@ -66,7 +66,7 @@ router.get('/', requireAuth, async (req, res) => {
 /**
  * Create a new KB (auto-assigns to user's organization)
  */
-router.post('/', requireAuth, async (req, res) => {
+router.post('/', requireAuth, requirePermission('manage_knowledge'), async (req, res) => {
     try {
         const userId = getUserId(req);
         const { name, description, defaultLang, organizationId } = req.body;
@@ -111,7 +111,7 @@ router.get('/:id', requireAuth, async (req, res) => {
 /**
  * Update KB metadata
  */
-router.patch('/:id', requireAuth, async (req, res) => {
+router.patch('/:id', requireAuth, requirePermission('manage_knowledge'), async (req, res) => {
     try {
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
@@ -128,7 +128,7 @@ router.patch('/:id', requireAuth, async (req, res) => {
 /**
  * Delete a KB (cascades documents, chunks via search-service)
  */
-router.delete('/:id', requireAuth, async (req, res) => {
+router.delete('/:id', requireAuth, requirePermission('manage_knowledge'), async (req, res) => {
     try {
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
@@ -184,7 +184,7 @@ router.get('/:id/documents', requireAuth, async (req, res) => {
 /**
  * Delete a document (and its chunks)
  */
-router.delete('/:id/documents/:docId', requireAuth, async (req, res) => {
+router.delete('/:id/documents/:docId', requireAuth, requirePermission('manage_knowledge'), async (req, res) => {
     try {
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
@@ -208,7 +208,7 @@ router.delete('/:id/documents/:docId', requireAuth, async (req, res) => {
 /**
  * Ingest text content into a KB
  */
-router.post('/:id/ingest/text', requireAuth, async (req, res) => {
+router.post('/:id/ingest/text', requireAuth, requirePermission('manage_knowledge'), async (req, res) => {
     try {
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
@@ -242,7 +242,7 @@ router.post('/:id/ingest/text', requireAuth, async (req, res) => {
 /**
  * Ingest file into a KB
  */
-router.post('/:id/ingest/file', requireAuth, upload.single('file'), async (req, res) => {
+router.post('/:id/ingest/file', requireAuth, requirePermission('manage_knowledge'), upload.single('file'), async (req, res) => {
     try {
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
@@ -283,7 +283,7 @@ router.post('/:id/ingest/file', requireAuth, upload.single('file'), async (req, 
 /**
  * Ingest URL into a KB
  */
-router.post('/:id/ingest/url', requireAuth, async (req, res) => {
+router.post('/:id/ingest/url', requireAuth, requirePermission('manage_knowledge'), async (req, res) => {
     try {
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
@@ -325,7 +325,7 @@ router.post('/:id/ingest/url', requireAuth, async (req, res) => {
 /**
  * Ingest all pages from a website sitemap into a KB
  */
-router.post('/:id/ingest/sitemap', requireAuth, async (req, res) => {
+router.post('/:id/ingest/sitemap', requireAuth, requirePermission('manage_knowledge'), async (req, res) => {
     try {
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
@@ -563,7 +563,7 @@ router.get('/n8n/ingestible', requireAuth, async (req, res) => {
  * Fetches the workflow from the connected n8n instance, converts it
  * to structured Markdown, and ingests it as a KB document.
  */
-router.post('/:id/ingest/n8n', requireAuth, async (req, res) => {
+router.post('/:id/ingest/n8n', requireAuth, requirePermission('manage_knowledge'), async (req, res) => {
     try {
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
@@ -802,7 +802,7 @@ router.post('/search', requireAuth, async (req, res) => {
  * Re-index all documents in a KB (re-fetch URLs, re-embed all chunks)
  * Used after switching embedding models.
  */
-router.post('/:id/reindex', requireAuth, async (req, res) => {
+router.post('/:id/reindex', requireAuth, requirePermission('manage_knowledge'), async (req, res) => {
     try {
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
