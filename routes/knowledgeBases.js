@@ -146,6 +146,14 @@ router.delete('/:id', requireAuth, async (req, res) => {
             console.warn('[KB] Search-service chunk cleanup failed:', e.message);
         }
 
+        // Delete chunks from local vector store
+        try {
+            const { deleteChunksLocally } = require('../core/localKBIngest');
+            await deleteChunksLocally(kb.tenant_id, kb.id);
+        } catch (e) {
+            console.warn('[KB] Local chunk cleanup failed:', e.message);
+        }
+
         await kbStore.deleteKB(kb.id);
         res.json({ success: true });
     } catch (e) {

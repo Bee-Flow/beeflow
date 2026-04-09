@@ -679,17 +679,24 @@ async function ingestLocally(tenantId, kbId, docId, content, options = {}) {
 }
 
 /**
- * Delete chunks for a document locally.
+ * Delete chunks for a document locally (or all chunks for a KB if docId is omitted).
  */
 async function deleteChunksLocally(tenantId, kbId, docId) {
     await ensureKBChunksTable();
 
     const client = await getClient();
     try {
-        await client.query(
-            'DELETE FROM kb_chunks WHERE tenant_id = $1 AND knowledge_base_id = $2 AND document_id = $3',
-            [tenantId, kbId, docId]
-        );
+        if (docId) {
+            await client.query(
+                'DELETE FROM kb_chunks WHERE tenant_id = $1 AND knowledge_base_id = $2 AND document_id = $3',
+                [tenantId, kbId, docId]
+            );
+        } else {
+            await client.query(
+                'DELETE FROM kb_chunks WHERE tenant_id = $1 AND knowledge_base_id = $2',
+                [tenantId, kbId]
+            );
+        }
     } finally {
         client.release();
     }
