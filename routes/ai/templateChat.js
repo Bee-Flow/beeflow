@@ -18,7 +18,6 @@ const { getAdapter } = require('../../core/providers');
 const templateStore = require('../../stores/templateStore');
 const transcriptionStore = require('../../stores/transcriptionStore');
 const { getServiceHeaders } = require('../../core/serviceAuth');
-const guardrailEventStore = require('../../stores/guardrailEventStore');
 
 function requireAuth(req, res, next) {
     if (req.session && req.session.user) return next();
@@ -82,10 +81,9 @@ router.post('/chat/template/stream', requireAuth, async (req, res) => {
         modelId = config.model || 'mistral-small-latest';
     }
 
-    let orgShield = null;
     if (userOrgId) {
-        orgShield = await configStore.getConfig(`org_privacy_shield_${userOrgId}`);
-        if (orgShield?.euModeEnabled) {
+        const shield = await configStore.getConfig(`org_privacy_shield_${userOrgId}`);
+        if (shield?.euModeEnabled) {
             console.log(`[TemplateChat] EU mode active for org ${userOrgId}`);
         }
     }
@@ -326,53 +324,6 @@ ABSOLUTE RULES:
             messages.push({ role: 'user', content: message });
         }
 
-        // ─── PII Detection on Input ──────────────────────────────
-        // Scans user input for PII using org shield settings.
-        // Respects scope.userInput — admin can disable input scanning.
-        let piiTokenMap = null;
-        const inputPiiScope = orgShield?.scope?.userInput !== false;
-        try {
-            const { validateInputForPii } = require('../../core/azurePiiDetection');
-            const orgPiiEnabled = !!(orgShield?.enabled && orgShield?.azurePiiEnabled && inputPiiScope);
-            const piiResult = await validateInputForPii(messages.slice(-3), orgPiiEnabled);
-
-            if (piiResult && piiResult.tokenizedText) {
-                // Tokenize mode: replace last user message with tokenized version
-                const lastIdx = messages.length - 1;
-                if (messages[lastIdx]?.role === 'user') {
-                    if (typeof messages[lastIdx].content === 'string') {
-                        messages[lastIdx] = { role: 'user', content: piiResult.tokenizedText };
-                    } else if (Array.isArray(messages[lastIdx].content)) {
-                        const textBlock = messages[lastIdx].content.find(b => b.type === 'text');
-                        if (textBlock) textBlock.text = piiResult.tokenizedText;
-                    }
-                }
-                piiTokenMap = piiResult.tokenMap;
-                console.warn(`[TemplateChat] 🔒 PII tokenized (${Object.keys(piiTokenMap).length} tokens)`);
-            }
-        } catch (piiError) {
-            if (piiError.piiEntities) {
-                const categoryList = [...new Set(piiError.piiEntities.map(e => e.label))].join(', ');
-                console.warn(`[TemplateChat] 🚫 PII blocked | ${categoryList}`);
-
-                guardrailEventStore.logGuardrailEvent({
-                    organization_id: userOrgId || null,
-                    user_id: userId,
-                    conversation_id: conversationId || null,
-                    violation_type: 'pii',
-                    violation_categories: categoryList,
-                    direction: 'input',
-                    action_taken: 'blocked',
-                    source: 'template',
-                    model: modelId || null,
-                }).catch(() => {});
-
-                send('error', { error: `Your message contains sensitive personal information (${categoryList}). Please remove PII before sending.` });
-                res.end();
-                return;
-            }
-        }
-
         // Stream response
         const tierSettings = tiers[resolvedTier] || {};
         const { TIER_DEFAULTS } = require('../../core/modelResolver');
@@ -396,67 +347,6 @@ ABSOLUTE RULES:
         };
 
         await adapter.stream(apiKey, apiUrl, modelId, messages, chatOptions, streamCallback);
-
-        // ─── Restore PII tokens ─────────────────────────────────
-        if (piiTokenMap && Object.keys(piiTokenMap).length > 0) {
-            const { restoreTokens } = require('../../core/azurePiiDetection');
-            const restored = restoreTokens(fullContent, piiTokenMap);
-            if (restored !== fullContent) {
-                send('content_replace', { text: restored });
-                fullContent = restored;
-                console.log(`[TemplateChat] 🔓 PII tokens restored in output`);
-            }
-        }
-
-        // ─── PII Detection on AI Output ─────────────────────────
-        // Scans the final AI response for PII using org shield settings.
-        // Runs AFTER token restoration so restored real values are also scanned.
-        // Respects scope.agentOutput — admin can disable output scanning.
-        const outputPiiScope = orgShield?.scope?.agentOutput !== false;
-        if (fullContent && orgShield?.enabled && orgShield?.azurePiiEnabled && outputPiiScope) {
-            try {
-                const { validateOutputForPii } = require('../../core/azurePiiDetection');
-                await validateOutputForPii(fullContent, {
-                    enabledCategories: orgShield.piiDetectionCategories,
-                    confidenceThreshold: orgShield.piiDetectionConfidenceThreshold,
-                    piiEnabled: true,
-                });
-                console.log('[TemplateChat] ✅ PII output scan passed');
-            } catch (piiOutError) {
-                if (piiOutError.piiEntities) {
-                    const categoryList = [...new Set(piiOutError.piiEntities.map(e => e.label))].join(', ');
-                    console.warn(`[TemplateChat] 🚫 PII in AI output | ${categoryList}`);
-
-                    if (orgShield.action === 'redact') {
-                        let redacted = fullContent;
-                        const sorted = [...piiOutError.piiEntities].sort((a, b) => b.offset - a.offset);
-                        for (const e of sorted) {
-                            if (e.offset >= 0 && e.length > 0) {
-                                redacted = redacted.slice(0, e.offset) + `[REDACTED: ${e.label}]` + redacted.slice(e.offset + e.length);
-                            }
-                        }
-                        send('content_replace', { text: redacted });
-                        fullContent = redacted;
-                    } else {
-                        const msg = `⚠️ This response was blocked because it contained sensitive personal information (${categoryList}).`;
-                        send('content_replace', { text: msg });
-                        fullContent = msg;
-                    }
-
-                    guardrailEventStore.logGuardrailEvent({
-                        organization_id: userOrgId || null,
-                        user_id: userId,
-                        conversation_id: conversationId || null,
-                        violation_type: 'pii',
-                        violation_categories: categoryList,
-                        direction: 'output',
-                        action_taken: orgShield.action === 'redact' ? 'redacted' : 'blocked',
-                        source: 'template',
-                        model: modelId || null,
-                    }).catch(() => {});
-                }
-            }
-        }
 
         send('done', {});
         res.end();

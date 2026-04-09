@@ -139,8 +139,6 @@ router.put('/:orgId', requireAuth, async (req, res) => {
         if (Array.isArray(azureEnabledCategories)) aiBlob.azureContentSafetyCategories = azureEnabledCategories;
         if (Array.isArray(piiDetectionCategories)) aiBlob.piiDetectionCategories = piiDetectionCategories;
         if (typeof piiDetectionConfidenceThreshold === 'number') aiBlob.piiDetectionConfidenceThreshold = piiDetectionConfidenceThreshold;
-        // Sync PII action: shield 'redact' → PII 'tokenize', shield 'delete' → PII 'block'
-        if (action) aiBlob.piiDetectionAction = action === 'redact' ? 'tokenize' : 'block';
         await configStore.setConfig('ai', aiBlob);
         console.log(`[OrgPrivacyShield] Synced shield settings to global AI config`);
 

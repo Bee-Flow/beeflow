@@ -985,15 +985,13 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
 
         // ─── PII Detection (independent of content moderation) ──────
         // Runs whenever piiDetectionEnabled is true, regardless of moderation settings.
-        // Respects scope.userInput — admin can disable input scanning.
         // Action 'block' — throw and reject message.
         // Action 'tokenize' — replace PII spans with tokens, pass clean text to AI,
         //                     restore tokens in the AI response before showing the user.
         let piiTokenMap = null;  // non-null only in tokenize mode when PII found
-        const inputPiiScope = orgShield?.scope?.userInput !== false;
         try {
             const { validateInputForPii } = require('../../core/azurePiiDetection');
-            const orgPiiEnabled = !!(orgShield?.enabled && orgShield?.azurePiiEnabled && inputPiiScope);
+            const orgPiiEnabled = !!(orgShield?.enabled && orgShield?.azurePiiEnabled);
             const piiResult = await validateInputForPii(messages.slice(-3), orgPiiEnabled);
 
             if (piiResult && piiResult.tokenizedText) {
@@ -1948,59 +1946,6 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                 console.log('[DirectChat] 🔓 PII tokens restored in AI response');
                 send('content_replace', { text: restored });
                 fullContent = restored;
-            }
-        }
-
-        // ─── PII Detection on AI Output ────────────────────────────
-        // Scans the final AI response for PII using org shield settings.
-        // Runs AFTER token restoration so restored real values are also scanned.
-        // Respects scope.agentOutput — admin can disable output scanning.
-        const outputPiiScope = orgShield?.scope?.agentOutput !== false;
-        if (fullContent && orgShield?.enabled && orgShield?.azurePiiEnabled && outputPiiScope) {
-            try {
-                const { validateOutputForPii } = require('../../core/azurePiiDetection');
-                await validateOutputForPii(fullContent, {
-                    enabledCategories: orgShield.piiDetectionCategories,
-                    confidenceThreshold: orgShield.piiDetectionConfidenceThreshold,
-                    piiEnabled: true,
-                });
-                console.log('[DirectChat] ✅ PII output scan passed');
-            } catch (piiOutError) {
-                if (piiOutError.piiEntities) {
-                    const categoryList = [...new Set(piiOutError.piiEntities.map(e => e.label))].join(', ');
-                    console.warn(`[DirectChat] 🚫 PII in AI output | ${categoryList}`);
-
-                    if (orgShield.action === 'redact') {
-                        // Redact PII spans in-place using entity offsets
-                        let redacted = fullContent;
-                        const sorted = [...piiOutError.piiEntities].sort((a, b) => b.offset - a.offset);
-                        for (const e of sorted) {
-                            if (e.offset >= 0 && e.length > 0) {
-                                redacted = redacted.slice(0, e.offset) + `[REDACTED: ${e.label}]` + redacted.slice(e.offset + e.length);
-                            }
-                        }
-                        send('content_replace', { text: redacted });
-                        fullContent = redacted;
-                    } else {
-                        // delete: replace entire response
-                        const msg = `⚠️ This response was blocked because it contained sensitive personal information (${categoryList}).`;
-                        send('content_replace', { text: msg });
-                        fullContent = msg;
-                    }
-
-                    // Log output PII event
-                    guardrailEventStore.logGuardrailEvent({
-                        organization_id: userOrgId || null,
-                        user_id: userId,
-                        conversation_id: convId || null,
-                        violation_type: 'pii',
-                        violation_categories: categoryList,
-                        direction: 'output',
-                        action_taken: orgShield.action === 'redact' ? 'redacted' : 'blocked',
-                        source: 'direct',
-                        model: modelId || null,
-                    }).catch(() => {});
-                }
             }
         }
 

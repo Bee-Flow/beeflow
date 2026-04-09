@@ -361,43 +361,6 @@ async function detectPii(text, enabledCategories = null, confidenceThreshold = D
 }
 
 /**
- * Attempt to decode common encodings (Base64, Hex) from text.
- * Returns an array of decoded strings that look like they might contain real text.
- * Used as defense-in-depth: users may encode PII to bypass the raw-text scanner.
- */
-function extractEncodedSegments(text) {
-    const decoded = [];
-
-    // Base64 pattern: 16+ chars of [A-Za-z0-9+/] with optional = padding
-    const b64Pattern = /(?:[A-Za-z0-9+/]{4}){4,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{4})/g;
-    let match;
-    while ((match = b64Pattern.exec(text)) !== null) {
-        try {
-            const raw = Buffer.from(match[0], 'base64').toString('utf-8');
-            // Only keep if result looks like readable text (>70% printable ASCII)
-            const printable = raw.replace(/[\x20-\x7E]/g, '').length;
-            if (raw.length >= 3 && printable / raw.length < 0.3) {
-                decoded.push(raw);
-            }
-        } catch (_) { /* ignore invalid */ }
-    }
-
-    // Hex pattern: 16+ hex chars (case-insensitive, even length)
-    const hexPattern = /(?:[0-9a-fA-F]{2}){8,}/g;
-    while ((match = hexPattern.exec(text)) !== null) {
-        try {
-            const raw = Buffer.from(match[0], 'hex').toString('utf-8');
-            const printable = raw.replace(/[\x20-\x7E]/g, '').length;
-            if (raw.length >= 3 && printable / raw.length < 0.3) {
-                decoded.push(raw);
-            }
-        } catch (_) { /* ignore invalid */ }
-    }
-
-    return decoded;
-}
-
-/**
  * Validate user input for PII.
  *
  * Behaviour depends on piiDetectionAction config:
@@ -489,39 +452,6 @@ async function validateInputForPii(messages, agentPiiEnabled = false) {
         cacheSet(key, result);
 
         if (!result.hasPii) {
-            // ── Encoded PII fallback: decode Base64/Hex segments and re-scan ──
-            // The raw text was clean, but it may contain encoded PII like
-            // Base64-encoded email addresses that the LLM will decode in output.
-            try {
-                const decodedSegments = extractEncodedSegments(inputText);
-                if (decodedSegments.length > 0) {
-                    const combined = decodedSegments.join(' ');
-                    console.log(`[PiiDetection] 🔍 Scanning ${decodedSegments.length} decoded segments (${combined.length} chars)`);
-                    const decodedResult = await detectPii(combined, enabledCategories, confidenceThreshold);
-                    if (decodedResult?.hasPii) {
-                        const decodedMs = Date.now() - start;
-                        const decodedCategories = [...new Set(decodedResult.entities.map(e => e.label))].join(', ');
-                        console.warn(`[PiiDetection] 🚫 Encoded PII detected | categories: ${decodedCategories} | ${decodedResult.entities.length} entities | ${decodedMs}ms`);
-                        console.warn(`[PiiDetection] 🚫 Encoded entities: ${decodedResult.entities.map(e => `"${e.text.slice(0, 20).trim()}" (${e.label})`).join(' | ')}`);
-
-                        if (piiAction === 'tokenize') {
-                            // In tokenize mode for encoded PII, we can't splice the original text
-                            // at correct offsets (the offsets are in the decoded string).
-                            // Instead, block the encoded content — the user is likely trying to bypass.
-                            console.warn(`[PiiDetection] 🔒 Encoded PII found — blocking (cannot safely tokenize encoded content)`);
-                        }
-                        const err = new Error(`PII Detected: Message contains encoded sensitive personal information (${decodedCategories}). Please remove PII before sending.`);
-                        err.piiEntities = decodedResult.entities;
-                        err.violationCodes = decodedResult.entities.map(e => `PII:${e.category}`);
-                        err.encodedBypass = true;
-                        throw err;
-                    }
-                }
-            } catch (encErr) {
-                if (encErr.piiEntities) throw encErr; // re-throw PII detection errors
-                console.warn('[PiiDetection] Encoded PII scan failed (non-critical):', encErr.message);
-            }
-
             console.log(`[PiiDetection] ✅ Input clean | ${ms}ms`);
             return null;
         }
@@ -553,22 +483,11 @@ async function validateInputForPii(messages, agentPiiEnabled = false) {
 
 /**
  * Validate agent output for PII.
- *
- * Accepts an optional options object to allow callers to pass org-level shield
- * settings instead of relying solely on the global aiConfig.
- *
- * @param {string} content - The AI response text to scan
- * @param {object} [opts] - Optional overrides
- * @param {boolean} [opts.piiEnabled] - Force PII detection on (overrides aiConfig)
- * @param {Array}   [opts.enabledCategories] - Org-level category list
- * @param {number}  [opts.confidenceThreshold] - Org-level confidence threshold
  */
-async function validateOutputForPii(content, opts = {}) {
+async function validateOutputForPii(content) {
     const aiConfig = await getAIConfig();
 
-    // Respect org-level override: if caller says piiEnabled=true, honour it
-    const piiEnabled = opts.piiEnabled || aiConfig.piiDetectionEnabled;
-    if (!piiEnabled) return;
+    if (!aiConfig.piiDetectionEnabled) return;
     if (!content || content.length < 3) return;
 
     const key = cacheKey('assistant_output', content);
@@ -583,14 +502,8 @@ async function validateOutputForPii(content, opts = {}) {
     }
 
     try {
-        // Prefer org-level settings passed by caller, fall back to global aiConfig
-        const enabledCategories = (Array.isArray(opts.enabledCategories) && opts.enabledCategories.length > 0)
-            ? opts.enabledCategories
-            : (aiConfig.piiDetectionCategories || ALL_PII_CATEGORY_IDS);
-        const confidenceThreshold = (typeof opts.confidenceThreshold === 'number')
-            ? opts.confidenceThreshold
-            : (aiConfig.piiDetectionConfidenceThreshold ?? DEFAULT_PII_CONFIDENCE_THRESHOLD);
-
+        const enabledCategories = aiConfig.piiDetectionCategories || ALL_PII_CATEGORY_IDS;
+        const confidenceThreshold = aiConfig.piiDetectionConfidenceThreshold ?? DEFAULT_PII_CONFIDENCE_THRESHOLD;
         const result = await detectPii(content, enabledCategories, confidenceThreshold);
         if (!result) return;
 
@@ -621,7 +534,6 @@ module.exports = {
     detectPii,
     tokenizeText,
     restoreTokens,
-    extractEncodedSegments,
     PII_CATEGORIES,
     ALL_PII_CATEGORY_IDS,
     DEFAULT_PII_CONFIDENCE_THRESHOLD,
