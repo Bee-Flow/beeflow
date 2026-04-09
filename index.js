@@ -361,6 +361,15 @@ app.listen(PORT, '0.0.0.0', () => {
     } catch (err) {
         console.warn('[Server] AI Task runner load failed:', err.message);
     }
+    // Purge orphaned KB chunks (non-blocking, delayed to let DB pool warm up)
+    setTimeout(() => {
+        try {
+            const { purgeOrphanedChunks } = require('./core/localKBIngest');
+            purgeOrphanedChunks()
+                .then(n => { if (n > 0) console.log(`[Server] Startup: purged ${n} orphaned KB chunks`); })
+                .catch(err => console.warn('[Server] Orphan purge error:', err.message));
+        } catch (_) { /* localKBIngest not available — skip */ }
+    }, 5000);
 });
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────

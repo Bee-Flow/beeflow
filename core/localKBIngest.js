@@ -787,14 +787,17 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
         const ftsQueryStr = ftsOrQuery.length > 0 ? ftsOrQuery : sanitizedQuery;
 
         // ── Run vector search + FTS in parallel ─────────────────────
+        // Both queries INNER JOIN documents to exclude orphaned chunks
+        // whose parent document was deleted but chunks remain in kb_chunks.
         const vectorSearchPromise = (pgvectorAvailable && vectorStr)
             ? client.query(
-                `SELECT id, title, content, source_uri, document_id, chunk_id,
-                        1 - (embedding <=> $1::vector) AS vec_score
-                 FROM kb_chunks
-                 WHERE tenant_id = $2
-                   AND knowledge_base_id = ANY($3::text[])
-                 ORDER BY embedding <=> $1::vector
+                `SELECT c.id, c.title, c.content, c.source_uri, c.document_id, c.chunk_id,
+                        1 - (c.embedding <=> $1::vector) AS vec_score
+                 FROM kb_chunks c
+                 INNER JOIN documents d ON d.id::text = c.document_id
+                 WHERE c.tenant_id = $2
+                   AND c.knowledge_base_id = ANY($3::text[])
+                 ORDER BY c.embedding <=> $1::vector
                  LIMIT $4`,
                 [vectorStr, tenantId, kbIds, topK * 2]
             ).catch(err => { console.warn(`[LocalKBSearch] Vector search failed: ${err.message}`); return { rows: [] }; })
@@ -802,17 +805,18 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
 
         const ftsSearchPromise = (ftsQueryStr.length > 0)
             ? client.query(
-                `SELECT id, title, content, source_uri, document_id, chunk_id, chunk_type,
+                `SELECT c.id, c.title, c.content, c.source_uri, c.document_id, c.chunk_id, c.chunk_type,
                         GREATEST(
-                            ts_rank_cd(tsv, websearch_to_tsquery('dutch', $1)) * 1.5,
-                            ts_rank_cd(tsv, websearch_to_tsquery('simple', $1))
+                            ts_rank_cd(c.tsv, websearch_to_tsquery('dutch', $1)) * 1.5,
+                            ts_rank_cd(c.tsv, websearch_to_tsquery('simple', $1))
                         ) AS fts_score
-                 FROM kb_chunks
-                 WHERE tenant_id = $2
-                   AND knowledge_base_id = ANY($3::text[])
+                 FROM kb_chunks c
+                 INNER JOIN documents d ON d.id::text = c.document_id
+                 WHERE c.tenant_id = $2
+                   AND c.knowledge_base_id = ANY($3::text[])
                    AND (
-                       tsv @@ websearch_to_tsquery('dutch', $1)
-                       OR tsv @@ websearch_to_tsquery('simple', $1)
+                       c.tsv @@ websearch_to_tsquery('dutch', $1)
+                       OR c.tsv @@ websearch_to_tsquery('simple', $1)
                    )
                  ORDER BY fts_score DESC
                  LIMIT 15`,
@@ -889,6 +893,7 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
                 const adjacentRows = await client.query(
                     `SELECT DISTINCT ON (c.id) c.id, c.title, c.content, c.source_uri, c.document_id, c.chunk_id
                      FROM kb_chunks c
+                     INNER JOIN documents d ON d.id::text = c.document_id
                      INNER JOIN (
                          SELECT document_id, chunk_id FROM kb_chunks WHERE id = ANY($1::bigint[])
                      ) h ON c.document_id = h.document_id
@@ -1056,4 +1061,38 @@ async function getDocumentContent(tenantId, kbId, docId) {
     }
 }
 
-module.exports = { ingestLocally, deleteChunksLocally, searchLocally, getDocumentContent, chunkText, azureEmbed };
+/**
+ * Purge orphaned chunks — rows in kb_chunks whose document_id
+ * no longer exists in the documents table.
+ *
+ * This handles the case where a document was deleted but its chunks
+ * weren't cleaned up (e.g. due to a partial failure or race condition).
+ *
+ * @returns {Promise<number>} number of orphaned rows deleted
+ */
+async function purgeOrphanedChunks() {
+    try {
+        await ensureKBChunksTable();
+        const client = await getClient();
+        try {
+            const result = await client.query(
+                `DELETE FROM kb_chunks c
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM documents d WHERE d.id::text = c.document_id
+                 )`
+            );
+            const deleted = result.rowCount || 0;
+            if (deleted > 0) {
+                console.log(`[LocalKBIngest] Purged ${deleted} orphaned chunks from kb_chunks`);
+            }
+            return deleted;
+        } finally {
+            client.release();
+        }
+    } catch (err) {
+        console.warn('[LocalKBIngest] Orphan purge failed:', err.message);
+        return 0;
+    }
+}
+
+module.exports = { ingestLocally, deleteChunksLocally, searchLocally, getDocumentContent, chunkText, azureEmbed, purgeOrphanedChunks };
