@@ -166,11 +166,9 @@ async function executeKbSearchTool(toolName, args, context = {}) {
         // No threshold when reranker is active — trust the reranker's ranking + topK.
         // Minimal floor (0.01) when RRF-only to avoid completely irrelevant results.
         const scoreThreshold = hasReranker ? 0 : 0.01;
-        const MIN_RELEVANCE = 0.72; // Minimum relevance floor
 
         const results = chunks
             .filter(c => (c.score || c.rerank_score || 0) >= scoreThreshold)
-            .filter(c => (c.score || c.rerank_score || 0) >= MIN_RELEVANCE)
             .map((c, i) => ({
                 result_number: i + 1,
                 title: c.title || c.source_uri || 'Knowledge Base',
