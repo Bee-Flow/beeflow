@@ -15,6 +15,8 @@
 
 const { getAIConfig } = require('./aiAgent');
 const configStore = require('../stores/configStore');
+const { computePiiDetectionCost } = require('./azureServiceCosts');
+const azureServiceUsageStore = require('../stores/azureServiceUsageStore');
 
 // ── PII service — standalone service running betterdataai/PII_DETECTION_MODEL
 // Set PII_SERVICE_URL in .env to point at the running pii-service instance.
@@ -281,6 +283,17 @@ async function detectPiiViaRestApi(text, endpoint, apiKey, enabledCategories, co
 
     const data = await response.json();
     const doc = data.results?.documents?.[0];
+
+    // ── Track usage cost (fire-and-forget) ──
+    const charCount = text.length;
+    const cost = computePiiDetectionCost(charCount);
+    azureServiceUsageStore.logAzureServiceUsage({
+        service_type: 'pii_detection',
+        input_chars: charCount,
+        estimated_cost: cost,
+        source: 'unknown',
+    }).catch(() => {});
+    if (cost > 0) console.log(`[PiiDetection] 💰 Est. cost: $${cost.toFixed(6)} (${charCount} chars)`);
 
     if (!doc) {
         const errors = data.results?.errors;

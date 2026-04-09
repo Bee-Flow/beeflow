@@ -497,6 +497,22 @@ async function azureEmbed(texts, endpoint, apiKey, model) {
     return allEmbeddings;
 }
 
+// ── Embedding cost tracking (lazy-loaded) ────────────────────────────
+function _trackEmbeddingCost(totalTokensEstimate) {
+    try {
+        const { computeEmbeddingCost } = require('./azureServiceCosts');
+        const azureServiceUsageStore = require('../stores/azureServiceUsageStore');
+        const cost = computeEmbeddingCost(totalTokensEstimate);
+        azureServiceUsageStore.logAzureServiceUsage({
+            service_type: 'embedding',
+            tokens: totalTokensEstimate,
+            estimated_cost: cost,
+            source: 'kb_upload',
+        }).catch(() => {});
+        if (cost > 0) console.log(`[LocalKBIngest] 💰 Embedding cost: $${cost.toFixed(6)} (~${totalTokensEstimate} tokens)`);
+    } catch (_) {}
+}
+
 // ── Database schema bootstrap ───────────────────────────────────────
 
 let schemaInitialized = false;
@@ -615,6 +631,9 @@ async function ingestLocally(tenantId, kbId, docId, content, options = {}) {
         console.log(`[LocalKBIngest] Generating Azure embeddings (${model})...`);
         try {
             embeddings = await azureEmbed(chunkTexts, endpoint, apiKey, model);
+            // Track embedding cost (estimate tokens from chunk text lengths)
+            const totalTokens = chunkTexts.reduce((sum, t) => sum + estimateTokens(t), 0);
+            _trackEmbeddingCost(totalTokens);
         } catch (err) {
             console.warn(`[LocalKBIngest] Azure embedding failed: ${err.message}. Falling back to keyword search only.`);
         }

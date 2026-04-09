@@ -622,7 +622,8 @@ function stopPeriodicSync(orgId) {
 
 /**
  * Initialize periodic syncs for all orgs that have it enabled.
- * Called once at server startup.
+ * Called once at server startup. If a sync is overdue (lastSync + interval
+ * is in the past), it fires immediately before starting the regular timer.
  */
 async function initPeriodicSyncs() {
     try {
@@ -631,6 +632,18 @@ async function initPeriodicSyncs() {
             const settings = await getSyncSettings(org.id);
             if (settings.periodicSync) {
                 startPeriodicSync(org.id, settings.syncIntervalHours);
+
+                // Check if sync is overdue and trigger immediately
+                const status = await getSyncStatus(org.id);
+                if (status.lastSyncAt) {
+                    const nextSyncDue = new Date(status.lastSyncAt).getTime() + settings.syncIntervalHours * 60 * 60 * 1000;
+                    if (Date.now() > nextSyncDue) {
+                        console.log(`[AzureGroupSync] Sync overdue for org "${org.id}" — triggering immediate sync`);
+                        syncAzureGroupsToOrg(org.id).catch(err =>
+                            console.error(`[AzureGroupSync] Overdue sync failed for org "${org.id}":`, err.message)
+                        );
+                    }
+                }
             }
         }
     } catch (err) {

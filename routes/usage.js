@@ -60,7 +60,7 @@ function enrichWithCostSplit(rows) {
     });
 }
 
-// 1. Summary Overview (enriched with input/output cost)
+// 1. Summary Overview (enriched with input/output cost + Azure service costs)
 router.get('/summary', async (req, res) => {
     try {
         const summary = await usageStore.getUsageSummary(req.usageFilters);
@@ -72,10 +72,19 @@ router.get('/summary', async (req, res) => {
             total_input_cost += input_cost;
             total_output_cost += output_cost;
         }
+        // Fetch Azure service costs for the same period
+        let azure_services_total_cost = 0;
+        try {
+            const azSvcStore = require('../stores/azureServiceUsageStore');
+            const azSummary = await azSvcStore.getAzureServiceSummary(req.usageFilters);
+            azure_services_total_cost = azSummary?.total_cost || 0;
+        } catch (_) {}
         res.json({
             ...(summary || { total_calls: 0, total_tokens: 0, total_estimated_cost: 0, total_prompt_tokens: 0, total_completion_tokens: 0 }),
             total_input_cost,
             total_output_cost,
+            azure_services_total_cost,
+            combined_total_cost: (summary?.total_estimated_cost || 0) + azure_services_total_cost,
         });
     } catch (err) {
         console.error('[Usage API] /summary error:', err.message);
@@ -464,4 +473,87 @@ router.get('/integrations/recent', async (req, res) => {
 });
 
 module.exports = router;
+
+// ════════════════════════════════════════════════════════════════════════════
+// AZURE SERVICE COST MONITORING ENDPOINTS
+// ════════════════════════════════════════════════════════════════════════════
+const azureServiceUsageStore = require('../stores/azureServiceUsageStore');
+
+// 28. Azure Service Summary
+router.get('/azure-services/summary', async (req, res) => {
+    try {
+        const summary = await azureServiceUsageStore.getAzureServiceSummary(req.usageFilters);
+        res.json(summary || { total_calls: 0, total_cost: 0, total_pages: 0, total_chars: 0, total_tokens: 0, unique_services: 0, unique_users: 0 });
+    } catch (err) {
+        console.error('[Usage API] /azure-services/summary error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch Azure service summary' });
+    }
+});
+
+// 29. Azure Service by Type
+router.get('/azure-services/by-type', async (req, res) => {
+    try {
+        const data = await azureServiceUsageStore.getAzureServiceByType(req.usageFilters);
+        res.json(data || []);
+    } catch (err) {
+        console.error('[Usage API] /azure-services/by-type error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch Azure service type data' });
+    }
+});
+
+// 30. Azure Service by User
+router.get('/azure-services/by-user', async (req, res) => {
+    try {
+        const data = await azureServiceUsageStore.getAzureServiceByUser(req.usageFilters);
+        const userMap = await getUserMap();
+        const enriched = (data || []).map(row => ({
+            ...row,
+            display_name: userMap.get(row.user_id) || row.user_id || 'Unknown'
+        }));
+        res.json(enriched);
+    } catch (err) {
+        console.error('[Usage API] /azure-services/by-user error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch Azure service user data' });
+    }
+});
+
+// 31. Azure Service Timeline
+router.get('/azure-services/timeline', async (req, res) => {
+    try {
+        const interval = req.query.interval === 'hour' ? 'hour' : 'day';
+        const data = await azureServiceUsageStore.getAzureServiceTimeline(req.usageFilters, interval);
+        res.json(data || []);
+    } catch (err) {
+        console.error('[Usage API] /azure-services/timeline error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch Azure service timeline' });
+    }
+});
+
+// 32. Recent Azure Service Usage
+router.get('/azure-services/recent', async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit, 10) || 50;
+        const data = await azureServiceUsageStore.getRecentAzureServiceUsage(limit, req.usageFilters);
+        const userMap = await getUserMap();
+        const enriched = (data || []).map(row => ({
+            ...row,
+            display_name: userMap.get(row.user_id) || row.user_id || 'Unknown'
+        }));
+        res.json(enriched);
+    } catch (err) {
+        console.error('[Usage API] /azure-services/recent error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch recent Azure service usage' });
+    }
+});
+
+// 33. Azure Service Cost Rates (current pricing config)
+router.get('/azure-services/rates', async (req, res) => {
+    try {
+        const { getAllRates } = require('../core/azureServiceCosts');
+        res.json(getAllRates());
+    } catch (err) {
+        console.error('[Usage API] /azure-services/rates error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch Azure service rates' });
+    }
+});
 

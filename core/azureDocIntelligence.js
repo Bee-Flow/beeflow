@@ -17,6 +17,8 @@
  */
 
 const configStore = require('../stores/configStore');
+const { computeDocIntelligenceCost } = require('./azureServiceCosts');
+const azureServiceUsageStore = require('../stores/azureServiceUsageStore');
 
 // ── Cached client ────────────────────────────────────────────────
 let _client = null;
@@ -127,6 +129,19 @@ async function extractWithAzure(buffer, filename = 'unknown') {
             const content = cleanAzureDocMarkdown(rawContent);
 
             console.log(`[AzureDocIntelligence] Extracted ${rawContent.length} → ${content.length} chars from ${filename} (${pageCount} pages)`);
+
+            // ── Track usage cost (fire-and-forget) ──
+            const cost = computeDocIntelligenceCost(pageCount);
+            azureServiceUsageStore.logAzureServiceUsage({
+                service_type: 'doc_intelligence',
+                pages: pageCount,
+                input_chars: rawContent.length,
+                estimated_cost: cost,
+                source: 'unknown',
+                metadata: { filename, content_length: content.length },
+            }).catch(() => {});
+            if (cost > 0) console.log(`[AzureDocIntelligence] 💰 Est. cost: $${cost.toFixed(4)} (${pageCount} pages)`);
+
             return content;
         }
 

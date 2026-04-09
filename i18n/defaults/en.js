@@ -321,6 +321,11 @@ const GUI_DEFAULTS = {
     'usage.in_cost': 'In Cost',
     'usage.out_cost': 'Out Cost',
     'usage.total_cost': 'Total Cost',
+    'usage.azure_services': 'Azure Services',
+    'usage.azure_doc_intelligence': 'Document Intelligence',
+    'usage.azure_content_safety': 'Content Safety',
+    'usage.azure_pii_detection': 'PII Detection',
+    'usage.azure_embeddings': 'Embeddings',
 
     // ── Organisation ────────────────────────────────────────────
     'org.license_usage': 'License & Usage',
@@ -523,6 +528,9 @@ const GUI_DEFAULTS = {
     'azure.sync_periodic': 'Automatic periodic sync',
     'azure.sync_periodic_desc': 'Automatically sync groups from Azure AD at a regular interval.',
     'azure.sync_interval': 'Sync every',
+    'azure.sync_next': 'Next sync',
+    'azure.sync_overdue': 'Overdue',
+    'azure.sync_next_imminent': 'Any moment',
     'azure.sync_permissions_title': 'Required Azure Permissions',
     'azure.sync_permissions_desc': 'The following Application permissions must be granted in Azure Portal → App registrations → API permissions, with admin consent:',
     'azure.group_source_azure': 'Managed by Azure AD',

@@ -18,6 +18,8 @@
 
 const { getAIConfig } = require('./aiAgent');
 const configStore = require('../stores/configStore');
+const { computeContentSafetyCost } = require('./azureServiceCosts');
+const azureServiceUsageStore = require('../stores/azureServiceUsageStore');
 
 // ── Cache (LRU, 5-min TTL) — shared structure with moderation.js ──────
 const CACHE_MAX = 200;
@@ -111,6 +113,17 @@ async function analyzeText(text, severityThreshold, enabledCategories = null) {
 
     const categories = result.body.categoriesAnalysis || [];
     const threshold = severityThreshold ?? DEFAULT_SEVERITY_THRESHOLD;
+
+    // ── Track usage cost (fire-and-forget) ──
+    const charCount = text.length;
+    const cost = computeContentSafetyCost(charCount);
+    azureServiceUsageStore.logAzureServiceUsage({
+        service_type: 'content_safety',
+        input_chars: charCount,
+        estimated_cost: cost,
+        source: 'unknown',
+    }).catch(() => {});
+    if (cost > 0) console.log(`[AzureContentSafety] 💰 Est. cost: $${cost.toFixed(6)} (${charCount} chars)`);
 
     // Find the highest-severity violation
     let worstViolation = null;
