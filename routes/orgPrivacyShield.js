@@ -75,6 +75,7 @@ router.get('/:orgId', requireAuth, async (req, res) => {
             azureEnabledCategories: ['Hate', 'Violence', 'Sexual', 'SelfHarm'],
             piiDetectionCategories: [],
             piiDetectionConfidenceThreshold: 0.7,
+            piiDetectionAction: 'block',
             webSearchGuardPiiCategories: [],
             monitorIntegrations: false,
         };
@@ -93,6 +94,9 @@ router.get('/:orgId', requireAuth, async (req, res) => {
         if (config.piiDetectionConfidenceThreshold === undefined) {
             config.piiDetectionConfidenceThreshold = aiBlob.piiDetectionConfidenceThreshold ?? 0.7;
         }
+        if (!config.piiDetectionAction) {
+            config.piiDetectionAction = aiBlob.piiDetectionAction || 'block';
+        }
         res.json(config);
     } catch (e) {
         console.error('[OrgPrivacyShield] GET error:', e);
@@ -108,7 +112,7 @@ router.put('/:orgId', requireAuth, async (req, res) => {
             return res.status(403).json({ error: 'Only organization admins can manage the privacy shield' });
         }
 
-        const { enabled, collectionIds, scope, action, moderationEnabled, moderationCategories, euModeEnabled, webSearchGuardEnabled, disableSearchOnUpload, azurePiiEnabled, azureSeverityThreshold, azureEnabledCategories, piiDetectionCategories, piiDetectionConfidenceThreshold, webSearchGuardPiiCategories, monitorIntegrations } = req.body;
+        const { enabled, collectionIds, scope, action, moderationEnabled, moderationCategories, euModeEnabled, webSearchGuardEnabled, disableSearchOnUpload, azurePiiEnabled, azureSeverityThreshold, azureEnabledCategories, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionAction, webSearchGuardPiiCategories, monitorIntegrations } = req.body;
         const config = {
             enabled: !!enabled,
             collectionIds: Array.isArray(collectionIds) ? collectionIds : [],
@@ -124,6 +128,7 @@ router.put('/:orgId', requireAuth, async (req, res) => {
             azureEnabledCategories: Array.isArray(azureEnabledCategories) ? azureEnabledCategories : ['Hate', 'Violence', 'Sexual', 'SelfHarm'],
             piiDetectionCategories: Array.isArray(piiDetectionCategories) ? piiDetectionCategories : [],
             piiDetectionConfidenceThreshold: typeof piiDetectionConfidenceThreshold === 'number' ? piiDetectionConfidenceThreshold : 0.7,
+            piiDetectionAction: ['block', 'tokenize', 'warn'].includes(piiDetectionAction) ? piiDetectionAction : 'block',
             webSearchGuardPiiCategories: Array.isArray(webSearchGuardPiiCategories) ? webSearchGuardPiiCategories : [],
             monitorIntegrations: !!monitorIntegrations,
             updatedAt: new Date().toISOString(),
@@ -139,6 +144,7 @@ router.put('/:orgId', requireAuth, async (req, res) => {
         if (Array.isArray(azureEnabledCategories)) aiBlob.azureContentSafetyCategories = azureEnabledCategories;
         if (Array.isArray(piiDetectionCategories)) aiBlob.piiDetectionCategories = piiDetectionCategories;
         if (typeof piiDetectionConfidenceThreshold === 'number') aiBlob.piiDetectionConfidenceThreshold = piiDetectionConfidenceThreshold;
+        if (piiDetectionAction) aiBlob.piiDetectionAction = piiDetectionAction;
         await configStore.setConfig('ai', aiBlob);
         console.log(`[OrgPrivacyShield] Synced shield settings to global AI config`);
 

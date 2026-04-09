@@ -381,7 +381,7 @@ async function validateInputForPii(messages, agentPiiEnabled = false, orgShieldC
     const piiEnabled = aiConfig.piiDetectionEnabled || agentPiiEnabled;
     if (!piiEnabled) return null;
 
-    const piiAction = aiConfig.piiDetectionAction || 'block';
+    const piiAction = orgShieldConfig?.piiDetectionAction || aiConfig.piiDetectionAction || 'block';
 
     const lastUserMessage = messages.slice().reverse().find(m => m.role === 'user');
     if (!lastUserMessage) return null;
@@ -466,6 +466,7 @@ async function validateInputForPii(messages, agentPiiEnabled = false, orgShieldC
         const snippets = result.entities.map(e => `"${e.text.slice(0, 20).trim()}" (${e.label}, ${Math.round(e.confidence * 100)}%)`).join(' | ');
         console.warn(`[PiiDetection] 🚫 PII detected | categories: ${categoryList} | ${result.entities.length} entities | ${ms}ms`);
         console.warn(`[PiiDetection] 🚫 Entities: ${snippets}`);
+        console.warn(`[PiiDetection] Action: ${piiAction} (source: ${orgShieldConfig?.piiDetectionAction ? 'org-shield' : aiConfig.piiDetectionAction ? 'ai-config' : 'default'})`);
 
         if (piiAction === 'tokenize') {
             const { tokenizedText, tokenMap } = tokenizeText(inputText, result.entities);
