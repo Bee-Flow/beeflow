@@ -766,14 +766,13 @@ router.get('/user-settings', requireAuth, async (req, res) => {
         }
     } catch (e) { /* ignore */ }
 
-    // Check n8n config for org
+    // Check n8n config for org (uses group-based fallback for super-admins)
     let hasN8nConfig = false;
     try {
-        const userStore = require('../../stores/userStore');
-        const currentUser = await userStore.getUser(userId);
-        if (currentUser?.organizationId) {
-            const n8nUrl = await configStore.getConfig(`n8n_url_org_${currentUser.organizationId}`);
-            const n8nKey = await configStore.getSecret(`n8n_api_key_org_${currentUser.organizationId}`);
+        const n8nOrgId = await resolveUserOrgId(userId);
+        if (n8nOrgId) {
+            const n8nUrl = await configStore.getConfig(`n8n_url_org_${n8nOrgId}`);
+            const n8nKey = await configStore.getSecret(`n8n_api_key_org_${n8nOrgId}`);
             hasN8nConfig = !!(n8nUrl && n8nKey);
         }
     } catch (e) { /* ignore */ }
@@ -988,13 +987,30 @@ router.post('/generate-regex', requireAuth, async (req, res) => {
 
 const { listActiveWebhookWorkflows, fetchWorkflowById } = require('../../integrations/n8nTools');
 
-// Helper: get org ID from session
-async function getOrgId(req) {
-    const userId = req.session.user?.id;
+// Helper: resolve org ID from user record or group membership
+async function resolveUserOrgId(userId) {
     if (!userId) return null;
     const userStore = require('../../stores/userStore');
     const user = await userStore.getUser(userId);
-    return user?.organizationId || null;
+    if (user?.organizationId) return user.organizationId;
+    // Fallback: check group membership for org association
+    try {
+        const groups = Array.isArray(user?.groups) ? user.groups : (() => { try { return JSON.parse(user?.groups || '[]'); } catch (_) { return []; } })();
+        if (groups.length > 0) {
+            const allGroups = await userStore.getAllGroups();
+            for (const gid of groups) {
+                const g = allGroups.find(gr => gr.id === gid);
+                if (g?.organizationId) return g.organizationId;
+            }
+        }
+    } catch (_) {}
+    return null;
+}
+
+// Helper: get org ID from session
+async function getOrgId(req) {
+    const userId = req.session.user?.id;
+    return resolveUserOrgId(userId);
 }
 
 // Helper: check if user is org admin
@@ -1005,7 +1021,8 @@ async function requireOrgAdminForN8n(req, res, next) {
     const user = await userStore.getUser(userId);
     // Super admins (global) can always manage n8n config
     if (req.session.isAdmin || req.session.user?.role === 'admin') {
-        req.orgId = user?.organizationId || null;
+        req.orgId = await resolveUserOrgId(userId);
+        if (!req.orgId) return res.status(400).json({ error: 'No organization found. Create or join an organization before configuring n8n.' });
         return next();
     }
     if (!user?.organizationId) return res.status(403).json({ error: 'No organization' });
