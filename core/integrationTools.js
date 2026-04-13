@@ -20,6 +20,7 @@ const { YOUTRACK_TOOLS } = require('../integrations/youtrackTools');
 const { SIGNREQUEST_TOOLS } = require('../integrations/signrequestTools');
 const { GAMMA_TOOLS } = require('../integrations/gammaTools');
 const { buildN8nTools } = require('../integrations/n8nTools');
+const { N8N_WORKFLOW_TOOLS } = require('../integrations/n8nWorkflowTools');
 const { AGENT_SEARCH_TOOLS } = require('../integrations/agentSearchTools');
 const { REGEX_GENERATOR_TOOLS } = require('../integrations/regexGeneratorTools');
 const { IMAGE_GEN_TOOLS } = require('../routes/ai/imageGenTool');
@@ -188,6 +189,7 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
             const n8nUrl = await configStore.getConfig(`n8n_url_org_${n8nOrgId}`);
             const n8nKey = await configStore.getSecret(`n8n_api_key_org_${n8nOrgId}`);
             if (n8nUrl && n8nKey) {
+                // Dynamic webhook-trigger tools
                 const n8nTools = await buildN8nTools(n8nOrgId);
                 for (const n8nTool of n8nTools) {
                     const toolId = n8nTool.function.name;
@@ -198,6 +200,11 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
                     if (!tools.find(t => t.function.name === cleanTool.function.name)) {
                         tools.push(cleanTool);
                     }
+                }
+
+                // Static workflow management tools (list, get, create, update, patch, activate, deactivate)
+                if (isAppOn('n8n')) {
+                    addTools(N8N_WORKFLOW_TOOLS);
                 }
             }
         }
@@ -286,9 +293,12 @@ async function buildToolHint(tools, userId = null) {
     if (tools.some(t => t.function.name.startsWith('signrequest_'))) integrations.push('SignRequest (send documents for e-signature, check signing status, list documents, cancel requests)');
     if (tools.some(t => t.function.name.startsWith('fireflies_'))) integrations.push('Fireflies (meeting transcripts)');
     if (tools.some(t => t.function.name.startsWith('gamma_'))) integrations.push('Gamma (presentation generation)');
-    if (tools.some(t => t.function.name.startsWith('n8n_'))) {
-        const n8nNames = tools.filter(t => t.function.name.startsWith('n8n_')).map(t => t.function.description || t.function.name);
+    if (tools.some(t => t.function.name.startsWith('n8n_run_'))) {
+        const n8nNames = tools.filter(t => t.function.name.startsWith('n8n_run_')).map(t => t.function.description || t.function.name);
         integrations.push(`n8n Workflows (${n8nNames.join(', ')})`);
+    }
+    if (tools.some(t => t.function.name.startsWith('n8n_workflow_'))) {
+        integrations.push('n8n Workflow Management (list, get, create, update, patch, activate, and deactivate workflows on the connected n8n instance — use n8n_workflow_patch for partial edits)');
     }
     if (tools.some(t => t.function.name === 'generate_image')) integrations.push('Image generation');
     if (tools.some(t => t.function.name === 'generate_music')) integrations.push('Music generation (instrumental AI music via Lyria)');

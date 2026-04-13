@@ -24,6 +24,7 @@ const { isYouTrackTool, executeYouTrackTool } = require('../integrations/youtrac
 const { isSignRequestTool, executeSignRequestTool } = require('../integrations/signrequestTools');
 const { isGammaTool, executeGammaTool } = require('../integrations/gammaTools');
 const { isN8nTool, executeN8nTool } = require('../integrations/n8nTools');
+const { isN8nWorkflowTool, executeN8nWorkflowTool } = require('../integrations/n8nWorkflowTools');
 const { isAgentSearchTool, executeAgentSearchTool } = require('../integrations/agentSearchTools');
 const { isRegexGeneratorTool, executeRegexGeneratorTool } = require('../integrations/regexGeneratorTools');
 const { executeWorkspaceTool } = require('../integrations/workspaceTools');
@@ -176,6 +177,9 @@ async function executeTool(toolName, toolArgs, context = {}) {
     }
     if (isGoogleGroupsTool(toolName)) {
         return await executeGoogleGroupsTool(toolName, toolArgs, session);
+    }
+    if (isN8nWorkflowTool(toolName)) {
+        return await executeN8nWorkflowTool(toolName, toolArgs, orgId);
     }
     if (isN8nTool(toolName)) {
         return await executeN8nTool(toolName, toolArgs, orgId, attachments);

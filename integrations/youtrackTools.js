@@ -263,26 +263,31 @@ async function executeYouTrackTool(toolName, args, userId) {
 
         console.log(`[YouTrack] Creating issue in ${projectId}: "${summary}"`);
 
-        const params = new URLSearchParams({
-            fields: 'idReadable,summary',
-        });
+        try {
+            const params = new URLSearchParams({
+                fields: 'idReadable,summary',
+            });
 
-        const issue = await youtrackRequest(baseUrl, token, 'POST', `/issues?${params}`, {
-            summary,
-            description: description || '',
-            project: { id: projectId },
-        });
+            const issue = await youtrackRequest(baseUrl, token, 'POST', `/issues?${params}`, {
+                summary,
+                description: description || '',
+                project: { id: projectId },
+            });
 
-        // If project was provided as shortName, try alternative format
-        if (!issue) {
-            return { error: 'Failed to create issue. Make sure the project ID is correct (use youtrack_list_projects).' };
+            // If project was provided as shortName, try alternative format
+            if (!issue) {
+                return { error: 'Failed to create issue. Make sure the project ID is correct (use youtrack_list_projects).' };
+            }
+
+            return {
+                id: issue.idReadable || issue.id,
+                summary: issue.summary,
+                message: `Issue created: ${issue.idReadable || issue.id} — "${issue.summary}"`,
+            };
+        } catch (err) {
+            console.warn(`[YouTrack] Failed to create issue: ${err.message}`);
+            return { error: `Failed to create issue: ${err.message}` };
         }
-
-        return {
-            id: issue.idReadable || issue.id,
-            summary: issue.summary,
-            message: `Issue created: ${issue.idReadable || issue.id} — "${issue.summary}"`,
-        };
 
     } else if (toolName === 'youtrack_add_comment') {
         const { issueId, text } = args;
@@ -290,9 +295,13 @@ async function executeYouTrackTool(toolName, args, userId) {
         if (!text) return { error: 'text is required' };
 
         console.log(`[YouTrack] Adding comment to ${issueId}`);
-        await youtrackRequest(baseUrl, token, 'POST', `/issues/${issueId}/comments`, { text });
-
-        return { message: `Comment added to ${issueId}.` };
+        try {
+            await youtrackRequest(baseUrl, token, 'POST', `/issues/${issueId}/comments`, { text });
+            return { message: `Comment added to ${issueId}.` };
+        } catch (err) {
+            console.warn(`[YouTrack] Failed to add comment to ${issueId}: ${err.message}`);
+            return { error: `Failed to add comment to ${issueId}: ${err.message}` };
+        }
 
     } else if (toolName === 'youtrack_list_projects') {
         const params = new URLSearchParams({
@@ -331,9 +340,13 @@ async function executeYouTrackTool(toolName, args, userId) {
         };
         if (comment) body.comment = comment;
 
-        await youtrackRequest(baseUrl, token, 'POST', '/commands', body);
-
-        return { message: `Command "${command}" executed on ${issueId}.` };
+        try {
+            await youtrackRequest(baseUrl, token, 'POST', '/commands', body);
+            return { message: `Command "${command}" executed on ${issueId}.` };
+        } catch (err) {
+            console.warn(`[YouTrack] Command failed on ${issueId}: ${err.message}`);
+            return { error: `Failed to execute command "${command}" on ${issueId}: ${err.message}` };
+        }
 
     } else {
         return { error: `Unknown YouTrack tool: ${toolName}` };

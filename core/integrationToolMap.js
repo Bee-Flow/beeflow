@@ -35,6 +35,9 @@ const INTEGRATION_PREFIXES = {
     ms_contacts_:   { integration: 'ms_contacts',     label: 'Microsoft Contacts',  server: 'graph.microsoft.com' },
     onedrive_:      { integration: 'onedrive',        label: 'OneDrive',            server: 'graph.microsoft.com' },
 
+    // n8n Workflow Management
+    n8n_workflow_:  { integration: 'n8n',             label: 'n8n Workflow Management', server: 'n8n-server (configured)' },
+
     // Third-party SaaS
     fireflies_:     { integration: 'fireflies',       label: 'Fireflies',           server: 'api.fireflies.ai' },
     youtrack_:      { integration: 'youtrack',        label: 'YouTrack',            server: process.env.YOUTRACK_URL || 'youtrack.cloud' },

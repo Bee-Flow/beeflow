@@ -71,6 +71,13 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
     const maxIterations = 10;
     let toolCalls = [];
 
+    // ── Unicode Smuggling Defense (must run FIRST) ───────────────────
+    const { sanitizeMessagesUnicode } = require('../../utils/unicodeSanitizer');
+    const unicodeResult = sanitizeMessagesUnicode(messages);
+    if (unicodeResult.smugglingDetected) {
+        console.warn(`[ChatWithAgent] 🚨 Unicode smuggling stripped: ${unicodeResult.totalStripped} hidden chars`);
+    }
+
     if (agent.config?.llamaGuardEnabled || (await getAIConfig()).llamaGuardConfig?.enabled) {
         console.log(`[AgentRuntime] Validating input with active guardrails...`);
         const validationRequest = [

@@ -4,11 +4,42 @@ const { validateInputForPii } = require('../azurePiiDetection');
 const { resolveOrgShield, mergeWithOrgShield } = require('../orgShield');
 const { checkRegexPatterns } = require('../guardrails');
 const guardrailEventStore = require('../../stores/guardrailEventStore');
+const { sanitizeMessagesUnicode } = require('../../utils/unicodeSanitizer');
 
 async function runInputGuardrails({ agent, messages, userMessage, globalConfig, onEvent, userId, conversationId, source, model }) {
     let moderationViolation = null;
     let guardrailViolation = null;
     let processedUserMessage = userMessage;
+
+    // ── Unicode Smuggling Defense (must run FIRST) ───────────────────
+    const unicodeResult = sanitizeMessagesUnicode(messages);
+    if (unicodeResult.smugglingDetected) {
+        console.warn(`[GuardrailsRunner] 🚨 Unicode smuggling stripped: ${unicodeResult.totalStripped} hidden chars`);
+        // Update processedUserMessage if the last user message was sanitized
+        const lastMsg = messages[messages.length - 1];
+        if (lastMsg?.role === 'user' && typeof lastMsg.content === 'string') {
+            processedUserMessage = lastMsg.content;
+        }
+        if (onEvent) {
+            onEvent('unicode_smuggling_detected', {
+                strippedCount: unicodeResult.totalStripped,
+                messageIndices: unicodeResult.detectedIn,
+            });
+        }
+        guardrailEventStore.logGuardrailEvent({
+            organization_id: agent.organization_id || null,
+            user_id: userId || null,
+            agent_id: agent.id || null,
+            agent_name: agent.name || null,
+            conversation_id: conversationId || null,
+            violation_type: 'unicode_smuggling',
+            violation_categories: `${unicodeResult.totalStripped} hidden chars`,
+            direction: 'input',
+            action_taken: 'stripped',
+            source: source || 'unknown',
+            model: model || null,
+        }).catch(() => {});
+    }
 
     // Read org shield config once (was previously read 3 times)
     const orgShield = await (async () => {

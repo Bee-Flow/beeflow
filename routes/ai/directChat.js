@@ -910,10 +910,38 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             }
         }
 
+        // ─── Unicode Smuggling Defense ───────────────────────────────
+        // Must run FIRST — before moderation, PII, and regex guardrails.
+        // Strips hidden payloads encoded via Variation Selectors / Tags block.
+        const { sanitizeMessagesUnicode } = require('../../utils/unicodeSanitizer');
+        const unicodeResult = sanitizeMessagesUnicode(messages);
+        if (unicodeResult.smugglingDetected) {
+            console.warn(`[DirectChat] 🚨 Unicode smuggling stripped: ${unicodeResult.totalStripped} hidden chars`);
+            send('unicode_smuggling_detected', {
+                strippedCount: unicodeResult.totalStripped,
+                messageIndices: unicodeResult.detectedIn,
+            });
+        }
+
         // ─── AI Content Moderation (org shield) ─────────────────────
         const { resolveUserOrgIds } = require('../../auth');
         const userOrgIds = await resolveUserOrgIds(req);
         const userOrgId = userOrgIds && userOrgIds.size > 0 ? Array.from(userOrgIds)[0] : null;
+
+        // Deferred log for unicode smuggling (needed userOrgId)
+        if (unicodeResult.smugglingDetected) {
+            guardrailEventStore.logGuardrailEvent({
+                organization_id: userOrgId || null,
+                user_id: userId,
+                conversation_id: convId || null,
+                violation_type: 'unicode_smuggling',
+                violation_categories: `${unicodeResult.totalStripped} hidden chars`,
+                direction: 'input',
+                action_taken: 'stripped',
+                source: 'direct',
+                model: modelId || null,
+            }).catch(() => {});
+        }
 
         // Check if org shield or global config enables moderation for direct chat
         let moderationViolation = null;

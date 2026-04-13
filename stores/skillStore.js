@@ -8,6 +8,21 @@
 const crypto = require('crypto');
 const { run, getOne, getAll, exec } = require('../db');
 
+// ── GitHub Sync hook (fire-and-forget) ───────────────────────────
+async function _notifySkillSync(orgId, skillId, action = 'pending') {
+    if (!orgId) return;
+    try {
+        const syncStore = require('./githubSyncStore');
+        const config = await syncStore.getOrgSyncConfig(orgId);
+        if (!config) return;
+        if (action === 'deleted') {
+            await syncStore.markDeleted(orgId, 'skill', skillId);
+        } else {
+            await syncStore.markPending(orgId, 'skill', skillId);
+        }
+    } catch (e) { /* non-fatal */ }
+}
+
 let initialized = false;
 
 async function initDB() {
@@ -55,6 +70,7 @@ async function createSkill({ orgId, userId, name, description, instructions, wor
         [id, orgId, userId, name, description || '', instructions || '', workflow || '', rules || '', examples || '', icon || '⚡', isShared === true]
     );
     console.log(`[SkillStore] Created skill "${name}" for org ${orgId}`);
+    _notifySkillSync(orgId, id);
     return {
         id, orgId, userId, name, description: description || '', instructions: instructions || '',
         workflow: workflow || '', rules: rules || '', examples: examples || '',
@@ -133,6 +149,11 @@ async function updateSkill(id, userId, updates) {
         `UPDATE skills SET ${setClauses.join(', ')} WHERE id = $${idx++} AND user_id = $${idx}`,
         params
     );
+    if (rowCount > 0) {
+        // Resolve org_id for sync notification
+        const skill = await getOne('SELECT org_id FROM skills WHERE id = $1', [id]);
+        if (skill?.org_id) _notifySkillSync(skill.org_id, id);
+    }
     return rowCount > 0;
 }
 
@@ -141,12 +162,15 @@ async function updateSkill(id, userId, updates) {
  */
 async function deleteSkill(id, userId, isAdmin = false) {
     await initDB();
+    // Grab org_id before deleting for sync notification
+    const skill = await getOne('SELECT org_id FROM skills WHERE id = $1', [id]);
     let result;
     if (isAdmin) {
         result = await run('DELETE FROM skills WHERE id = $1', [id]);
     } else {
         result = await run('DELETE FROM skills WHERE id = $1 AND user_id = $2', [id, userId]);
     }
+    if (result.rowCount > 0 && skill?.org_id) _notifySkillSync(skill.org_id, id, 'deleted');
     return result.rowCount > 0;
 }
 

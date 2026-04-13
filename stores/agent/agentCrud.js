@@ -7,6 +7,21 @@ const { run, getOne, getAll } = require('../../db');
 const { initDB } = require('./initSchema');
 const { getAgentTools, getAgentToolsWithParams } = require('./agentTools');
 
+// ── GitHub Sync hook (fire-and-forget) ───────────────────────────
+async function _notifySync(orgId, agentId, action = 'pending') {
+    if (!orgId) return;
+    try {
+        const syncStore = require('../githubSyncStore');
+        const config = await syncStore.getOrgSyncConfig(orgId);
+        if (!config) return; // Sync not configured for this org
+        if (action === 'deleted') {
+            await syncStore.markDeleted(orgId, 'agent', agentId);
+        } else {
+            await syncStore.markPending(orgId, 'agent', agentId);
+        }
+    } catch (e) { /* non-fatal — sync tracking failure should never break agent ops */ }
+}
+
 function parseConfig(agent) {
     return {
         ...agent,
@@ -35,7 +50,9 @@ async function createAgent(name, description, systemPrompt, ownerId, model = nul
     await run(`INSERT INTO agents (id, name, description, system_prompt, model, starter_prompts, threads_enabled, copy_enabled, workspace_enabled, config, organization_id, shared_groups, category_id, owner_id, created_at, updated_at)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW(),NOW())`,
         [id, name, description || '', systemPrompt || '', model, JSON.stringify(starterPrompts), !!threadsEnabled, !!copyEnabled, !!workspaceEnabled, JSON.stringify(config || {}), organizationId || null, JSON.stringify(sharedGroups || []), categoryId || null, ownerId]);
-    return { id, name, description, system_prompt: systemPrompt, model, starter_prompts: starterPrompts, threads_enabled: threadsEnabled, copy_enabled: copyEnabled, workspace_enabled: workspaceEnabled, config, organization_id: organizationId, shared_groups: sharedGroups, category_id: categoryId, owner_id: ownerId };
+    const result = { id, name, description, system_prompt: systemPrompt, model, starter_prompts: starterPrompts, threads_enabled: threadsEnabled, copy_enabled: copyEnabled, workspace_enabled: workspaceEnabled, config, organization_id: organizationId, shared_groups: sharedGroups, category_id: categoryId, owner_id: ownerId };
+    _notifySync(organizationId, id);
+    return result;
 }
 
 async function getAgents(ownerId) {
@@ -75,12 +92,16 @@ async function updateAgent(id, name, description, systemPrompt, ownerId, model =
     const { rowCount } = await run(`UPDATE agents SET name=$1, description=$2, system_prompt=$3, model=$4, starter_prompts=$5, avatar=$6, threads_enabled=$7, copy_enabled=$8, workspace_enabled=$9, config=$10, embed_enabled=$11, organization_id=$12, shared_groups=$13, category_id=$14, updated_at=NOW()
         WHERE id=$15 AND owner_id=$16`,
         [name, description || '', systemPrompt || '', model, JSON.stringify(starterPrompts), avatar, !!threadsEnabled, !!copyEnabled, !!workspaceEnabled, JSON.stringify(config || {}), !!embedEnabled, orgId, sharedGroupsJson, catId, id, ownerId]);
+    if (rowCount > 0) _notifySync(orgId, id);
     return rowCount > 0;
 }
 
 async function deleteAgent(id, ownerId) {
     await initDB();
+    // Grab org_id before deleting so we can notify sync
+    const agent = await getOne('SELECT organization_id FROM agents WHERE id = $1', [id]);
     const { rowCount } = await run('DELETE FROM agents WHERE id = $1 AND owner_id = $2', [id, ownerId]);
+    if (rowCount > 0 && agent?.organization_id) _notifySync(agent.organization_id, id, 'deleted');
     return rowCount > 0;
 }
 
