@@ -316,6 +316,7 @@ const { requireBetaFeature } = require('./core/betaFeatures');
 app.use('/api/transcriptions', requireBetaFeature('meeting_notes'), require('./routes/transcriptions'));
 app.use('/api/meet-bot', requireBetaFeature('meeting_notes'), require('./routes/meetBot'));
 app.use('/api/skills', requireBetaFeature('skills'), require('./routes/skills'));
+app.use('/api/email-kb', requireBetaFeature('email_knowledge_base'), require('./routes/emailKB'));
 
 app.use('/', require('./routes/knowledge'));
 app.use('/api/kb', require('./routes/knowledgeBases'));
@@ -362,6 +363,13 @@ app.listen(PORT, '0.0.0.0', () => {
         require('./core/aiTaskRunner');
     } catch (err) {
         console.warn('[Server] AI Task runner load failed:', err.message);
+    }
+    // Email KB sync engine (beta — polling-based background sync)
+    try {
+        const { startEmailKBSync } = require('./services/emailKBSyncEngine');
+        startEmailKBSync();
+    } catch (err) {
+        console.warn('[Server] Email KB sync engine load failed:', err.message);
     }
     // Purge orphaned KB chunks (non-blocking, delayed to let DB pool warm up)
     setTimeout(() => {
