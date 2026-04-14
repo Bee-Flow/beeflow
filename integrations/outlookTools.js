@@ -52,6 +52,31 @@ const OUTLOOK_TOOLS = [
     {
         type: 'function',
         function: {
+            name: 'outlook_list_recent',
+            description: 'List the most recent emails from the user\'s Outlook mailbox, sorted by date (newest first). Use this when the user asks about their latest/newest/most recent emails, or when outlook_search doesn\'t return the very latest messages. Supports filtering by folder.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    maxResults: {
+                        type: 'integer',
+                        description: 'Maximum number of results to return (1-20, default 10)'
+                    },
+                    folder: {
+                        type: 'string',
+                        description: 'Mail folder to list from (default: "inbox"). Common values: inbox, sentitems, drafts, junkemail, deleteditems'
+                    },
+                    unreadOnly: {
+                        type: 'boolean',
+                        description: 'If true, only return unread emails (default: false)'
+                    }
+                },
+                required: []
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
             name: 'outlook_compose',
             description: 'Compose and send a new email or reply to an existing email. The user will see a preview with Send, Save as Draft, and Discard buttons before anything is sent — no email is sent automatically. IMPORTANT: When replying, set replyToMessageId to the original message ID. For replies, prefix subject with "Re: ". For forwarding, prefix with "Fwd: " and include the original email body.',
             parameters: {
@@ -120,7 +145,7 @@ async function executeOutlookTool(toolName, args, session) {
         const top = Math.min(Math.max(parseInt(maxResults) || 10, 1), 20);
 
         const data = await graphFetch(
-            `/me/messages?$search="${encodeURIComponent(query)}"&$top=${top}&$select=id,subject,from,toRecipients,receivedDateTime,bodyPreview,hasAttachments`,
+            `/me/messages?$search="${encodeURIComponent(query)}"&$top=${top}&$select=id,subject,from,toRecipients,receivedDateTime,bodyPreview,hasAttachments,isRead`,
             session
         );
 
@@ -131,6 +156,7 @@ async function executeOutlookTool(toolName, args, session) {
             subject: msg.subject || '(no subject)',
             date: msg.receivedDateTime || '',
             snippet: msg.bodyPreview || '',
+            isRead: msg.isRead ?? true,
             hasAttachments: msg.hasAttachments || false,
         }));
 
@@ -138,6 +164,35 @@ async function executeOutlookTool(toolName, args, session) {
             results: messages,
             total: messages.length,
             query,
+            note: 'Results are sorted by relevance, not date. If you need the latest emails, use outlook_list_recent instead.',
+        };
+
+    } else if (toolName === 'outlook_list_recent') {
+        const { maxResults = 10, folder = 'inbox', unreadOnly = false } = args;
+        const top = Math.min(Math.max(parseInt(maxResults) || 10, 1), 20);
+
+        let path = `/me/mailFolders/${folder}/messages?$top=${top}&$orderby=receivedDateTime desc&$select=id,subject,from,toRecipients,receivedDateTime,bodyPreview,hasAttachments,isRead`;
+        if (unreadOnly) {
+            path += `&$filter=isRead eq false`;
+        }
+
+        const data = await graphFetch(path, session);
+
+        const messages = (data.value || []).map(msg => ({
+            id: msg.id,
+            from: msg.from?.emailAddress ? `${msg.from.emailAddress.name || ''} <${msg.from.emailAddress.address}>` : '',
+            to: (msg.toRecipients || []).map(r => r.emailAddress?.address).filter(Boolean).join(', '),
+            subject: msg.subject || '(no subject)',
+            date: msg.receivedDateTime || '',
+            snippet: msg.bodyPreview || '',
+            isRead: msg.isRead ?? true,
+            hasAttachments: msg.hasAttachments || false,
+        }));
+
+        return {
+            results: messages,
+            total: messages.length,
+            folder,
         };
 
     } else if (toolName === 'outlook_read') {
@@ -330,11 +385,19 @@ async function executeOutlookSaveDraft(draft, session) {
  * Check if a tool name is an Outlook tool.
  */
 function isOutlookTool(toolName) {
-    return ['outlook_search', 'outlook_read', 'outlook_compose'].includes(toolName);
+    return ['outlook_search', 'outlook_list_recent', 'outlook_read', 'outlook_compose'].includes(toolName);
 }
+
+/**
+ * Read-only subset of Outlook tools (search, list_recent, read only — no compose/send).
+ */
+const OUTLOOK_READONLY_TOOLS = OUTLOOK_TOOLS.filter(t =>
+    ['outlook_search', 'outlook_list_recent', 'outlook_read'].includes(t.function.name)
+);
 
 module.exports = {
     OUTLOOK_TOOLS,
+    OUTLOOK_READONLY_TOOLS,
     executeOutlookTool,
     executeOutlookSend,
     executeOutlookSaveDraft,
