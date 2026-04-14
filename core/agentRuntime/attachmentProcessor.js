@@ -82,10 +82,13 @@ async function processAttachments(attachments = [], lastMsg, userId = null) {
                     lastMsg.content.push({ type: 'text', text: appendText });
                 }
             } else {
-                lastMsg.content.push({
-                    type: 'file',
-                    file: { filename: att.name, file_data: att.content }
-                });
+                const fallbackText = `\n\n[PDF: ${att.name} — could not extract text. The document may be scanned or image-based. Try re-uploading a text-selectable version.]\n`;
+                const textBlock = lastMsg.content.find(c => c.type === 'text');
+                if (textBlock) {
+                    textBlock.text += fallbackText;
+                } else {
+                    lastMsg.content.push({ type: 'text', text: fallbackText });
+                }
             }
         } else if (att.type.startsWith('image/')) {
             const sizeKB = Math.round((att.content?.length || 0) / 1024);
