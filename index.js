@@ -364,7 +364,11 @@ app.listen(PORT, '0.0.0.0', () => {
     } catch (err) {
         console.warn('[Server] AI Task runner load failed:', err.message);
     }
+<<<<<<< test2
     // Start Email KB background sync engine
+=======
+    // Email KB sync engine (beta — polling-based background sync)
+>>>>>>> main
     try {
         const { startEmailKBSync } = require('./services/emailKBSyncEngine');
         startEmailKBSync();
