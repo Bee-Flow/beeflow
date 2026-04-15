@@ -1,8 +1,4 @@
 /**
- * Email KB API Routes
- *
- * CRUD for email connections, manual sync trigger, test endpoint.
- * Works for both org-scoped and consumer (no-org) accounts.
  * Email KB Routes — REST API for managing email-to-KB connections
  *
  * All routes gated behind requireBetaFeature('email_knowledge_base')
@@ -11,44 +7,6 @@
 
 const express = require('express');
 const router = express.Router();
-const { requireAuth, resolveUserOrgIds } = require('../auth');
-const emailKBStore = require('../stores/emailKBStore');
-const { triggerManualSync, testConnection } = require('../services/emailKBSyncEngine');
-
-// Helper: resolve user + orgId (null for consumer accounts)
-async function getUserContext(req) {
-    const userId = req.session.user?.id;
-    if (!userId) throw new Error('Not authenticated');
-
-    let orgId = null;
-    try {
-        const orgIds = await resolveUserOrgIds(req);
-        if (orgIds === null) {
-            // Super admin — use session org if available
-            orgId = req.session.user?.organizationId || null;
-        } else if (orgIds.size > 0) {
-            orgId = Array.from(orgIds)[0];
-        }
-    } catch (_) { }
-
-    return { userId, orgId };
-}
-
-// ── List connections ─────────────────────────────────────────────────────────
-router.get('/connections', requireAuth, async (req, res) => {
-    try {
-        const { userId, orgId } = await getUserContext(req);
-        const connections = await emailKBStore.getConnections(userId, orgId);
-        // Parse JSON fields for the frontend
-        const parsed = connections.map(c => ({
-            ...c,
-            folder_filter: safeParse(c.folder_filter, ['INBOX']),
-            sender_blacklist: safeParse(c.sender_blacklist, []),
-            enabled: !!c.enabled,
-            group_threads: !!c.group_threads,
-            process_attachments: !!c.process_attachments,
-        }));
-        res.json({ connections: parsed });
 const emailKBStore = require('../stores/emailKBStore');
 const kbStore = require('../stores/knowledgeBases');
 const { triggerManualSync, testConnection } = require('../services/emailKBSyncEngine');
@@ -197,15 +155,17 @@ router.patch('/connections/:id', async (req, res) => {
     }
 });
 
-// ── Delete connection ────────────────────────────────────────────────────────
-router.delete('/connections/:id', requireAuth, async (req, res) => {
+// ──────────────────────────────────────────────
+// DELETE /connections/:id — Remove a connection
+// ──────────────────────────────────────────────
+router.delete('/connections/:id', async (req, res) => {
     try {
-        const conn = await emailKBStore.getConnection(req.params.id);
-        if (!conn) return res.status(404).json({ error: 'Connection not found' });
+        const connection = await emailKBStore.getConnection(req.params.id);
+        if (!connection) return res.status(404).json({ error: 'Connection not found' });
 
-        const { userId } = await getUserContext(req);
-        if (conn.created_by !== userId && !req.session.isAdmin) {
-            return res.status(403).json({ error: 'Not authorized' });
+        const orgId = getOrgId(req);
+        if (connection.organization_id !== orgId) {
+            return res.status(403).json({ error: 'Access denied' });
         }
 
         await emailKBStore.deleteConnection(req.params.id);
@@ -216,12 +176,6 @@ router.delete('/connections/:id', requireAuth, async (req, res) => {
     }
 });
 
-// ── Trigger manual sync ──────────────────────────────────────────────────────
-router.post('/connections/:id/sync', requireAuth, async (req, res) => {
-    try {
-        const result = await triggerManualSync(req.params.id);
-        res.json(result);
-    } catch (err) {
 // ──────────────────────────────────────────────
 // POST /connections/:id/sync — Trigger manual sync
 // ──────────────────────────────────────────────
@@ -243,22 +197,6 @@ router.post('/connections/:id/sync', async (req, res) => {
     }
 });
 
-// ── Test connection ──────────────────────────────────────────────────────────
-router.post('/connections/:id/test', requireAuth, async (req, res) => {
-    try {
-        const result = await testConnection(req.params.id);
-        res.json(result);
-    } catch (err) {
-        res.status(400).json({ error: err.message });
-    }
-});
-
-// ── Get sync logs ────────────────────────────────────────────────────────────
-router.get('/connections/:id/logs', requireAuth, async (req, res) => {
-    try {
-        const logs = await emailKBStore.getSyncLogs(req.params.id);
-        res.json({ logs });
-    } catch (err) {
 // ──────────────────────────────────────────────
 // POST /connections/:id/test — Test connection (process 1 email)
 // ──────────────────────────────────────────────
@@ -302,10 +240,5 @@ router.get('/connections/:id/logs', async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
-
-function safeParse(val, fallback) {
-    if (Array.isArray(val)) return val;
-    try { return JSON.parse(val || '[]'); } catch { return fallback; }
-}
 
 module.exports = router;
