@@ -16,12 +16,46 @@ const emailKBStore = require('../stores/emailKBStore');
 const { processEmail, processEmailThread } = require('../core/emailKBProcessor');
 const { ingestDocument } = require('../core/kbIngestionHelpers');
 
+const { run } = require('../db');
+
 const MAX_CONCURRENT = 3;
 const TICK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const MAX_EMAILS_PER_SYNC = 50;
+const SYNC_TIMEOUT_MINUTES = 30;
+const MAX_RETRIES = 2;
+const RETRY_DELAY_MS = 5000;
 
 let tickTimer = null;
 let isRunning = false;
+
+// ──────────────────────────────────────────────
+// Retry helper for transient failures
+// ──────────────────────────────────────────────
+
+async function withRetry(fn, label = 'operation') {
+    let lastErr;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        try {
+            return await fn();
+        } catch (err) {
+            lastErr = err;
+            // Don't retry auth failures or permanent errors
+            const status = err.status || err.code;
+            if (status === 401 || status === 403 || err.message?.includes('re-authenticat')) {
+                throw err;
+            }
+            // Rate-limited — throw immediately so caller can handle
+            if (status === 429 || err.message?.includes('429')) {
+                throw err;
+            }
+            if (attempt < MAX_RETRIES) {
+                console.warn(`[EmailKBSync] Retrying ${label} (attempt ${attempt + 2}/${MAX_RETRIES + 1}): ${err.message}`);
+                await new Promise(r => setTimeout(r, RETRY_DELAY_MS * (attempt + 1)));
+            }
+        }
+    }
+    throw lastErr;
+}
 
 // ──────────────────────────────────────────────
 // Gmail Sync
@@ -63,10 +97,11 @@ async function syncGmailConnection(connection) {
 
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
-    // Build search query
+    // Build search query — prefer cursor over last_sync_at for more reliable incremental sync
     const labelFilters = (connection.folder_filter || ['INBOX']);
-    const afterDate = connection.last_sync_at
-        ? new Date(connection.last_sync_at).toISOString().split('T')[0].replace(/-/g, '/')
+    const syncAfter = connection.last_sync_cursor || connection.last_sync_at;
+    const afterDate = syncAfter
+        ? new Date(syncAfter).toISOString().split('T')[0].replace(/-/g, '/')
         : (() => {
             const d = new Date();
             d.setDate(d.getDate() - 30); // Initial sync: last 30 days
@@ -88,33 +123,41 @@ async function syncGmailConnection(connection) {
     const messageIds = response.data.messages || [];
     console.log(`[EmailKBSync] Gmail: ${messageIds.length} messages found`);
 
-    const results = { fetched: messageIds.length, created: 0, skipped: 0, errors: 0, errorDetails: [] };
+    const results = { fetched: messageIds.length, created: 0, skipped: 0, errors: 0, errorDetails: [], newestDate: null };
 
     if (connection.group_threads) {
         // Group by threadId
         const threadMap = new Map();
         for (const msg of messageIds) {
             try {
-                const detail = await gmail.users.messages.get({
+                const detail = await withRetry(() => gmail.users.messages.get({
                     userId: 'me',
                     id: msg.id,
                     format: 'full',
-                });
+                }), `gmail.get(${msg.id})`);
                 const threadId = detail.data.threadId;
+                const msgDate = getGmailHeader(detail.data.payload?.headers, 'Date');
+                if (msgDate && (!results.newestDate || new Date(msgDate) > new Date(results.newestDate))) {
+                    results.newestDate = msgDate;
+                }
                 if (!threadMap.has(threadId)) {
                     threadMap.set(threadId, {
                         threadId,
                         subject: getGmailHeader(detail.data.payload?.headers, 'Subject'),
                         from: getGmailHeader(detail.data.payload?.headers, 'From'),
-                        date: getGmailHeader(detail.data.payload?.headers, 'Date'),
+                        date: msgDate,
                         messages: [],
                     });
                 }
                 threadMap.get(threadId).messages.push({
                     body: extractGmailTextBody(detail.data.payload),
-                    date: getGmailHeader(detail.data.payload?.headers, 'Date'),
+                    date: msgDate,
                 });
             } catch (fetchErr) {
+                if (fetchErr.message?.includes('429') || fetchErr.code === 429) {
+                    results.errorDetails.push('Rate limited by Gmail API — will retry next cycle');
+                    break;
+                }
                 results.errors++;
                 results.errorDetails.push(`Fetch msg ${msg.id}: ${fetchErr.message}`);
             }
@@ -163,13 +206,17 @@ async function syncGmailConnection(connection) {
         // Process individual emails
         for (const msg of messageIds) {
             try {
-                const detail = await gmail.users.messages.get({
+                const detail = await withRetry(() => gmail.users.messages.get({
                     userId: 'me',
                     id: msg.id,
                     format: 'full',
-                });
+                }), `gmail.get(${msg.id})`);
 
                 const headers = detail.data.payload?.headers || [];
+                const msgDate = getGmailHeader(headers, 'Date');
+                if (msgDate && (!results.newestDate || new Date(msgDate) > new Date(results.newestDate))) {
+                    results.newestDate = msgDate;
+                }
                 const body = extractGmailTextBody(detail.data.payload);
 
                 const processed = await processEmail(body, {
@@ -202,6 +249,9 @@ async function syncGmailConnection(connection) {
             } catch (procErr) {
                 if (procErr.code === 'DUPLICATE') {
                     results.skipped++;
+                } else if (procErr.message?.includes('429') || procErr.code === 429) {
+                    results.errorDetails.push('Rate limited by Gmail API — will retry next cycle');
+                    break;
                 } else {
                     results.errors++;
                     results.errorDetails.push(`Msg ${msg.id}: ${procErr.message}`);
@@ -324,9 +374,10 @@ async function syncOutlookConnection(connection) {
         return response.json();
     }
 
-    // Build date filter
-    const afterDate = connection.last_sync_at
-        ? new Date(connection.last_sync_at).toISOString()
+    // Build date filter — prefer cursor over last_sync_at
+    const syncAfter = connection.last_sync_cursor || connection.last_sync_at;
+    const afterDate = syncAfter
+        ? new Date(syncAfter).toISOString()
         : (() => {
             const d = new Date();
             d.setDate(d.getDate() - 30);
@@ -344,7 +395,12 @@ async function syncOutlookConnection(connection) {
     const messages = data.value || [];
     console.log(`[EmailKBSync] Outlook: ${messages.length} messages found`);
 
-    const results = { fetched: messages.length, created: 0, skipped: 0, errors: 0, errorDetails: [] };
+    const results = { fetched: messages.length, created: 0, skipped: 0, errors: 0, errorDetails: [], newestDate: null };
+
+    // Track newest message date for cursor
+    if (messages.length > 0) {
+        results.newestDate = messages[0].receivedDateTime; // Already sorted desc
+    }
 
     if (connection.group_threads) {
         // Group by conversationId
@@ -397,6 +453,9 @@ async function syncOutlookConnection(connection) {
             } catch (procErr) {
                 if (procErr.code === 'DUPLICATE') {
                     results.skipped++;
+                } else if (procErr.message?.includes('429')) {
+                    results.errorDetails.push('Rate limited by Microsoft Graph — will retry next cycle');
+                    break;
                 } else {
                     results.errors++;
                     results.errorDetails.push(`Conv ${convId}: ${procErr.message}`);
@@ -440,6 +499,9 @@ async function syncOutlookConnection(connection) {
             } catch (procErr) {
                 if (procErr.code === 'DUPLICATE') {
                     results.skipped++;
+                } else if (procErr.message?.includes('429')) {
+                    results.errorDetails.push('Rate limited by Microsoft Graph — will retry next cycle');
+                    break;
                 } else {
                     results.errors++;
                     results.errorDetails.push(`Msg ${msg.id}: ${procErr.message}`);
@@ -474,6 +536,7 @@ async function syncConnection(connection) {
             syncStatus: 'idle',
             syncError: null,
             lastSyncAt: new Date().toISOString(),
+            lastSyncCursor: results.newestDate || undefined,
             emailsProcessed: results.fetched,
             articlesCreated: results.created,
         });
@@ -515,6 +578,17 @@ async function tick() {
     isRunning = true;
 
     try {
+        // Recover stuck syncs (timeout protection)
+        try {
+            await run(
+                `UPDATE email_kb_connections
+                 SET sync_status = 'error', sync_error = 'Sync timed out', updated_at = now()
+                 WHERE sync_status = 'syncing' AND updated_at < now() - interval '${SYNC_TIMEOUT_MINUTES} minutes'`
+            );
+        } catch (err) {
+            console.warn('[EmailKBSync] Timeout recovery query failed:', err.message);
+        }
+
         const dueConnections = await emailKBStore.getDueConnections();
         if (dueConnections.length === 0) return;
 

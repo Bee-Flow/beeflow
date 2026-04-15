@@ -1045,6 +1045,11 @@ const GUI_DEFAULTS = {
     'email_kb.enabled': 'Enabled',
     'email_kb.disabled': 'Paused',
     'email_kb.connection_settings': 'Connection Settings',
+    'email_kb.custom_prompt_placeholder': 'Leave empty to use the default prompt',
+    'email_kb.reset_prompt': 'Reset to default',
+    'email_kb.error_details': 'Error details',
+    'email_kb.duration': 'Duration',
+    'email_kb.sync_timed_out': 'Sync timed out',
 };
 
 // Get all namespace categories for the GUI editor filter
