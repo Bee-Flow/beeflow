@@ -178,6 +178,9 @@ async function syncGmailConnection(connection) {
 
                 if (!processed.success) {
                     results.skipped++;
+                    const skipLabel = processed.reason || 'unknown';
+                    console.log(`[EmailKBSync] Skipped: ${skipLabel}`);
+                    results.errorDetails.push(`Skipped: ${skipLabel}`);
                     continue;
                 }
 
@@ -232,6 +235,9 @@ async function syncGmailConnection(connection) {
 
                 if (!processed.success) {
                     results.skipped++;
+                    const skipLabel = processed.reason || 'unknown';
+                    console.log(`[EmailKBSync] Skipped: ${skipLabel}`);
+                    results.errorDetails.push(`Skipped: ${skipLabel}`);
                     continue;
                 }
 
@@ -436,6 +442,9 @@ async function syncOutlookConnection(connection) {
 
                 if (!processed.success) {
                     results.skipped++;
+                    const skipLabel = processed.reason || 'unknown';
+                    console.log(`[EmailKBSync] Skipped: ${skipLabel}`);
+                    results.errorDetails.push(`Skipped: ${skipLabel}`);
                     continue;
                 }
 
@@ -482,6 +491,9 @@ async function syncOutlookConnection(connection) {
 
                 if (!processed.success) {
                     results.skipped++;
+                    const skipLabel = processed.reason || 'unknown';
+                    console.log(`[EmailKBSync] Skipped: ${skipLabel}`);
+                    results.errorDetails.push(`Skipped: ${skipLabel}`);
                     continue;
                 }
 

@@ -308,18 +308,16 @@ async function summarizeToArticle(cleanedText, options = {}) {
     }
 
     try {
-        const configStore = require('../stores/configStore');
-
-        // Resolve AI model — use org default or global default
-        let modelId = 'gpt-4.1-mini'; // sensible default
-        if (orgId) {
-            const orgModel = await configStore.getConfig(`default_model_org_${orgId}`);
-            if (orgModel) modelId = orgModel;
+        // Resolve AI model — use the org's configured tier (same as chat, transcriptions, etc.)
+        const { resolveModelForTierName } = require('./modelResolver');
+        let modelId;
+        try {
+            modelId = await resolveModelForTierName('fast', { userOrgId: orgId, fallback: 'gpt-4.1-mini' });
+        } catch (resolveErr) {
+            console.warn('[EmailKBProcessor] Model resolution failed, using fallback:', resolveErr.message);
+            modelId = 'gpt-4.1-mini';
         }
-        if (!modelId) {
-            const globalModel = await configStore.getConfig('default_model');
-            if (globalModel) modelId = globalModel;
-        }
+        console.log(`[EmailKBProcessor] Using model: ${modelId} (org: ${orgId || 'none'})`);
 
         // Use direct API call via provider adapters
         const { createChatCompletion } = require('../agents/providerAdapters');

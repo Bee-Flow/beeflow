@@ -23,24 +23,31 @@ const llmClient = require('../core/llmClient');
  * @returns {Promise<{choices: [{message: {role: string, content: string}}], usage: object}>}
  */
 async function createChatCompletion({ model, messages, temperature, max_tokens }) {
-    const result = await llmClient.chat(model, messages, {
-        temperature,
-        maxTokens: max_tokens,
-        budgetTokens: 0,
-        reasoningEffort: 'none',
-    });
+    try {
+        console.log(`[providerAdapters] Chat request: model=${model}, messages=${messages.length}, temp=${temperature}`);
 
-    return {
-        choices: [
-            {
-                message: {
-                    role: 'assistant',
-                    content: result.content || '',
+        const result = await llmClient.chat(model, messages, {
+            temperature,
+            maxTokens: max_tokens,
+            budgetTokens: 0,
+            reasoningEffort: 'none',
+        });
+
+        return {
+            choices: [
+                {
+                    message: {
+                        role: 'assistant',
+                        content: result.content || '',
+                    },
                 },
-            },
-        ],
-        usage: result.usage || {},
-    };
+            ],
+            usage: result.usage || {},
+        };
+    } catch (err) {
+        console.error(`[providerAdapters] createChatCompletion failed (model=${model}):`, err.message);
+        throw err;
+    }
 }
 
 module.exports = { createChatCompletion };
