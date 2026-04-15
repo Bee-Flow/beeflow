@@ -65,15 +65,19 @@ app.use(cors({
     origin: (origin, cb) => {
         // Allow requests with no origin
         if (!origin) return cb(null, true);
+        // Allow Chrome extensions (PAT-authenticated, no cookies)
+        if (origin.startsWith('chrome-extension://') || origin.startsWith('moz-extension://')) {
+            return cb(null, true);
+        }
         const normalizedOrigin = origin.endsWith('/') ? origin.slice(0, -1) : origin;
         const isAllowed = ALLOWED_ORIGINS.some(o => (o.endsWith('/') ? o.slice(0, -1) : o) === normalizedOrigin);
         if (isAllowed) {
             return cb(null, true);
         }
-        
+
         console.warn(`[CORS] Rejected origin: ${origin}. Allowed:`, ALLOWED_ORIGINS);
         // Return the origin anyway for dev mode flexibility or just 'true' to reflect:
-        cb(null, origin); 
+        cb(null, origin);
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
@@ -140,6 +144,9 @@ app.use(session({
         ...(process.env.COOKIE_DOMAIN && { domain: process.env.COOKIE_DOMAIN })
     }
 }));
+
+// Personal Access Token auth — runs after session, populates session if Bearer token is valid
+app.use(require('./auth/patAuth'));
 
 
 
@@ -317,6 +324,7 @@ app.use('/api/transcriptions', requireBetaFeature('meeting_notes'), require('./r
 app.use('/api/meet-bot', requireBetaFeature('meeting_notes'), require('./routes/meetBot'));
 app.use('/api/skills', requireBetaFeature('skills'), require('./routes/skills'));
 app.use('/api/email-kb', requireBetaFeature('email_knowledge_base'), require('./routes/emailKB'));
+app.use('/api/pat', require('./routes/personalAccessTokens'));
 
 app.use('/', require('./routes/knowledge'));
 app.use('/api/kb', require('./routes/knowledgeBases'));
