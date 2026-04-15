@@ -39,12 +39,18 @@ async function initDB() {
             encrypted_tokens TEXT,
             process_attachments BOOLEAN DEFAULT true,
             group_threads BOOLEAN DEFAULT true,
+            redact_pii BOOLEAN DEFAULT true,
+            max_emails_per_sync INT DEFAULT 50,
             created_at TIMESTAMPTZ DEFAULT now(),
             updated_at TIMESTAMPTZ DEFAULT now()
         )
     `);
     await exec(`CREATE INDEX IF NOT EXISTS idx_email_kb_conn_org ON email_kb_connections(organization_id)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_email_kb_conn_kb ON email_kb_connections(knowledge_base_id)`);
+
+    // Migrate: add columns for existing tables
+    await exec(`ALTER TABLE email_kb_connections ADD COLUMN IF NOT EXISTS redact_pii BOOLEAN DEFAULT true`);
+    await exec(`ALTER TABLE email_kb_connections ADD COLUMN IF NOT EXISTS max_emails_per_sync INT DEFAULT 50`);
 
     await exec(`
         CREATE TABLE IF NOT EXISTS email_kb_sync_log (
@@ -196,7 +202,8 @@ const EmailKBStore = {
     updateConnection: async (id, updates) => {
         await initDB();
         const allowed = ['display_name', 'folder_filter', 'sender_blacklist', 'sync_interval_minutes',
-                          'ai_system_prompt', 'enabled', 'process_attachments', 'group_threads', 'knowledge_base_id'];
+                          'ai_system_prompt', 'enabled', 'process_attachments', 'group_threads', 'knowledge_base_id',
+                          'redact_pii', 'max_emails_per_sync'];
         const sets = [];
         const vals = [id];
         let idx = 2;

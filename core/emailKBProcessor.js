@@ -227,67 +227,96 @@ function redactPII(text) {
  * Default system prompt for article generation.
  * Adapted from the n8n workflow (originally in Dutch, now auto-detects language).
  */
-const DEFAULT_ARTICLE_PROMPT = `You receive a conversation from an email thread. Convert it into a compact, knowledge-base-suitable article in **Markdown**. Use **only \`##\` headers** and ensure **no contact information** appears in the output.
+const DEFAULT_ARTICLE_PROMPT = `You receive an email conversation (or a single email). Rewrite it into a comprehensive, clear knowledge base article in **Markdown**, without duplicate or overlapping content and without contact information in the output.
 
-> **If a section is not applicable: show nothing** (no header, no "N/A"). Do not invent anything not in the conversation.
+Output rules (hard):
+* Return only the rewritten Markdown.
+* Use only \`##\` headers (no #, ###, bullets as headers).
+* Do not add sections that are not relevant; if something does not apply: omit the entire section.
+* Do not invent facts not present in the source. You may add general, safe clarification (e.g. "Check if the error still occurs") as long as it does not speculate about causes or systems.
+
+Anti-duplication / anti-overlap (hard):
+* Each instruction appears exactly once in the entire document.
+* Place information in exactly one location:
+  * Actions to be performed → under "Steps…"
+  * Result/agreement after resolution → under "Solution"
+  * Background/extra context → under "Notes"
+  * Root cause → under "Root Cause"
+* If the same message would end up in multiple sections: choose the most logical section and remove the other.
+* Do not repeat sentences across sections; rephrase and refer implicitly.
 
 IMPORTANT LANGUAGE RULE (hard):
 * Never use persons or references to persons.
-* Avoid words like: user, employee, person, customer, requester, reporter, colleague.
+* Avoid words like: user, employee, person, customer, requester, reporter, colleague, secretary.
 * Avoid pronouns referring to persons: he, she, him, her, their, someone.
 * Write completely impersonally: describe actions without an actor ("Check…", "Request…", "Adjust…") or name only process entities ("Helpdesk", "IT management") without personal references.
 
 Privacy & security (hard):
 * Never include sensitive data or contact information. This includes at minimum:
-  * Personal data and contact information: names, email addresses, phone numbers, addresses, usernames, customer numbers.
+  * Personal data and contact information: names, email addresses, phone numbers, addresses, usernames, customer/relation numbers.
   * Technical identifiers: IP addresses, MAC addresses, serial numbers, asset tags, tokens, session IDs.
-  * Security information: passwords, PIN codes, MFA/2FA codes, recovery codes, API keys, client secrets, certificates, private keys, access tokens, refresh tokens, login credentials (in any form).
+  * Security information: passwords, PIN codes, MFA/2FA codes, recovery codes, API keys, client secrets, certificates, private keys, access/refresh tokens, login credentials (in any form).
 * If such information appears: generalize or omit.
 
-## {Subject (concise)}
+Writing style:
+* Clear, concrete and task-oriented.
+* Add sub-steps within numbered lists where useful (e.g. 1.1, 1.2) but avoid repetition.
+* Add check/verification steps within existing sections (no new header) if it helps validate the issue is resolved.
+* Use consistent terminology (same name for the same component).
 
-Describe the problem in 1-3 sentences, without personal references and without sensitive data.
+Fixed structure (only include what exists in the input or is logically needed without speculation):
+
+## {Subject (concise, improved)}
+
+## Problem
 
 ## Solution
 
-Briefly describe the solution and the desired end result.
+## Steps for end user
 
-## Steps
-
-Write **specific, actionable steps** that need to be performed, numbered and in order.
+## Steps by IT administration
 
 ## Root Cause
 
-Only include if the root cause is explicitly clear from the conversation.
-
 ## Notes
 
-Only include if relevant for reuse.
+Task:
+* Take the input one-to-one as source.
+* Rewrite more extensively and better structured.
+* Remove duplicates and overlap.
+* Deliver only the final Markdown output.
 
 IMPORTANT: Detect the language of the email conversation and write the article in that SAME language.`;
 
-const DEFAULT_CATEGORY_PROMPT = `The only thing you return is one category (exactly one line), without any other detail.
+const DEFAULT_CATEGORY_PROMPT = `The only thing you return is one ticket category (exactly one line), without any other detail.
 
-Goal: Choose the best-fitting category for the email based on the root cause.
+Goal: Choose the best-fitting category for the ticket based on the root cause.
+
+Method:
+1) Determine the root cause from "Problem" and "Steps by IT administration" (this weighs heavier than "Solution").
+2) Return one short category describing the domain of the root cause.
 
 Rules (hard):
 - Output = exactly one category string. No explanation, no JSON, no quotes.
 - Category is singular: 1 concept, 1-3 words, Title Case.
 - Never composite/comparative categories: no "/", "&", "+", "and", commas, brackets.
-- Do not use full sentences or solutions. Only the domain.
+- Do not use full sentences or solutions ("Rights adjusted…" is wrong). Only the domain.
 
 Preferred labels (soft guideline, pick what fits):
-- Rights/roles/access/permissions → "Access"
+- Rights/roles/access/permissions → "Toegang" or "Autorisatie"
 - Login/MFA/password → "Account"
-- Email/spam/delivery → "Email"
-- Network/VPN/WiFi → "Network"
+- Email/spam/delivery → "E-mail"
+- Network/VPN/WiFi → "Netwerk"
 - Hardware/laptop/monitor → "Hardware"
 - Printer/scanning → "Printer"
-- Phone → "Phone"
-- Teams/Webex/meetings → "Meetings"
-- Performance/bug/error in app without permission issue → "Application"
-- Desktop/Windows/updates → "Desktop"
+- Phone → "Telefonie"
+- Teams/Webex/meetings → "Vergaderen"
+- Performance/bug/error in app without permission issue → "Applicatie"
+- Desktop/Windows/updates → "Werkplek"
 - Other → use a fitting 1-2 word category
+
+Tie-breaker:
+If multiple domains are involved, choose the domain that was actually modified to resolve the issue.
 
 Detect the language from the article and write the category in that same language.`;
 
@@ -376,12 +405,12 @@ async function summarizeToArticle(cleanedText, options = {}) {
  *
  * @param {string} rawContent — raw email HTML or text content
  * @param {object} metadata — { subject, from, date, messageId }
- * @param {object} options — { customPrompt, orgId, senderBlacklist }
+ * @param {object} options — { customPrompt, orgId, senderBlacklist, redactPII }
  * @returns {Promise<{success: boolean, article?: string, category?: string, title?: string, reason?: string}>}
  */
 async function processEmail(rawContent, metadata = {}, options = {}) {
     const { subject, from, date, messageId } = metadata;
-    const { senderBlacklist = [] } = options;
+    const { senderBlacklist = [], redactPII: shouldRedact = true } = options;
 
     // Check sender blacklist
     if (from && senderBlacklist.length > 0) {
@@ -397,23 +426,34 @@ async function processEmail(rawContent, metadata = {}, options = {}) {
         return { success: false, reason: 'No meaningful content after cleanup', skipped: true };
     }
 
-    // Stage 2: Redact PII
-    const redacted = redactPII(cleaned);
+    // Stage 2: Redact PII (pre-AI pass) — optional
+    const redacted = shouldRedact ? redactPII(cleaned) : cleaned;
+
+    // Prepend metadata for AI context (subject + date give the AI much better understanding)
+    let aiInput = redacted;
+    if (subject || date) {
+        const header = [subject && `Subject: ${subject}`, date && `Date: ${date}`].filter(Boolean).join('\n');
+        aiInput = `${header}\n---\n${redacted}`;
+    }
 
     // Stage 3: AI Summarize
-    const { article, category, reason } = await summarizeToArticle(redacted, options);
+    const { article, category, reason } = await summarizeToArticle(aiInput, options);
     if (!article) {
         return { success: false, reason: reason || 'AI summarization failed', skipped: true };
     }
 
+    // Stage 4: Post-AI PII pass (AI can accidentally reproduce sensitive data) — optional
+    const sanitizedArticle = shouldRedact ? redactPII(article) : article;
+
     // Build title from subject or first line
-    const title = subject
-        ? `${category}: ${subject.replace(/^(re|fw|fwd):\s*/gi, '').trim()}`
-        : `${category}: ${article.split('\n')[0].replace(/^#+\s*/, '').substring(0, 80)}`;
+    const cleanSubject = subject ? subject.replace(/^(re|fw|fwd):\s*/gi, '').trim() : '';
+    const title = cleanSubject
+        ? `${category}: ${cleanSubject}`
+        : `${category}: ${sanitizedArticle.split('\n')[0].replace(/^#+\s*/, '').substring(0, 80)}`;
 
     return {
         success: true,
-        article,
+        article: sanitizedArticle,
         category,
         title,
         sourceDate: date,
@@ -426,7 +466,7 @@ async function processEmail(rawContent, metadata = {}, options = {}) {
  */
 async function processEmailThread(messages, metadata = {}, options = {}) {
     const { subject, from, date } = metadata;
-    const { senderBlacklist = [] } = options;
+    const { senderBlacklist = [], redactPII: shouldRedact = true } = options;
 
     // Check sender blacklist on the thread starter
     if (from && senderBlacklist.length > 0) {
@@ -436,13 +476,26 @@ async function processEmailThread(messages, metadata = {}, options = {}) {
         }
     }
 
-    // Clean all messages, filter out system messages and empties
-    const cleanedMessages = messages
+    // System message patterns to filter out (matches n8n "Filter: System Msgs")
+    const SYSTEM_MSG_PATTERNS = [
+        /^status gewijzigd naar/i,
+        /^status changed to/i,
+        /^ticket (gesloten|closed|reopened|heropend)/i,
+        /^automatisch bericht/i,
+        /^auto[- ]?reply/i,
+    ];
+
+    // Clean all messages, filter system messages and empties, sort chronologically
+    const sortedMessages = [...messages].sort((a, b) =>
+        new Date(a.date || 0) - new Date(b.date || 0)
+    );
+
+    const cleanedMessages = sortedMessages
         .map(msg => {
             const text = cleanEmail(msg.body || msg.content || '');
-            // Skip system status changes (from the n8n filter)
-            if (text === 'Status gewijzigd naar Gesloten' || text.length < 10) return null;
-            return redactPII(text);
+            if (!text || text.length < 10) return null;
+            if (SYSTEM_MSG_PATTERNS.some(re => re.test(text.trim()))) return null;
+            return { text: shouldRedact ? redactPII(text) : text, date: msg.date };
         })
         .filter(Boolean);
 
@@ -450,8 +503,16 @@ async function processEmailThread(messages, metadata = {}, options = {}) {
         return { success: false, reason: 'No meaningful messages in thread', skipped: true };
     }
 
-    // Merge into single conversation text
-    const merged = cleanedMessages.join('\n\n---\n\n');
+    // Merge into single conversation text with date headers for context
+    let merged = '';
+    if (subject || date) {
+        const header = [subject && `Subject: ${subject}`, date && `Date: ${date}`].filter(Boolean).join('\n');
+        merged = `${header}\n---\n\n`;
+    }
+    merged += cleanedMessages.map((msg, i) => {
+        const dateLabel = msg.date ? `[${new Date(msg.date).toLocaleString()}]` : `[Message ${i + 1}]`;
+        return `${dateLabel}\n${msg.text}`;
+    }).join('\n\n---\n\n');
 
     // AI Summarize the entire thread
     const { article, category, reason } = await summarizeToArticle(merged, options);
@@ -459,13 +520,17 @@ async function processEmailThread(messages, metadata = {}, options = {}) {
         return { success: false, reason: reason || 'AI summarization failed', skipped: true };
     }
 
-    const title = subject
-        ? `${category}: ${subject.replace(/^(re|fw|fwd):\s*/gi, '').trim()}`
-        : `${category}: ${article.split('\n')[0].replace(/^#+\s*/, '').substring(0, 80)}`;
+    // Post-AI PII pass — optional
+    const sanitizedArticle = shouldRedact ? redactPII(article) : article;
+
+    const cleanSubject = subject ? subject.replace(/^(re|fw|fwd):\s*/gi, '').trim() : '';
+    const title = cleanSubject
+        ? `${category}: ${cleanSubject}`
+        : `${category}: ${sanitizedArticle.split('\n')[0].replace(/^#+\s*/, '').substring(0, 80)}`;
 
     return {
         success: true,
-        article,
+        article: sanitizedArticle,
         category,
         title,
         sourceDate: date,

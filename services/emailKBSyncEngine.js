@@ -117,7 +117,7 @@ async function syncGmailConnection(connection) {
         userId: 'me',
         q: query,
         labelIds: labelFilters.includes('INBOX') ? ['INBOX'] : undefined,
-        maxResults: MAX_EMAILS_PER_SYNC,
+        maxResults: connection.max_emails_per_sync || MAX_EMAILS_PER_SYNC,
     });
 
     const messageIds = response.data.messages || [];
@@ -174,6 +174,7 @@ async function syncGmailConnection(connection) {
                     orgId: connection.organization_id,
                     customPrompt: connection.ai_system_prompt,
                     senderBlacklist: connection.sender_blacklist || [],
+                    redactPII: connection.redact_pii !== false,
                 });
 
                 if (!processed.success) {
@@ -231,6 +232,7 @@ async function syncGmailConnection(connection) {
                     orgId: connection.organization_id,
                     customPrompt: connection.ai_system_prompt,
                     senderBlacklist: connection.sender_blacklist || [],
+                    redactPII: connection.redact_pii !== false,
                 });
 
                 if (!processed.success) {
@@ -395,7 +397,7 @@ async function syncOutlookConnection(connection) {
     console.log(`[EmailKBSync] Outlook filter: "${filter}"`);
 
     const data = await graphCall(
-        `/me/messages?$filter=${encodeURIComponent(filter)}&$top=${MAX_EMAILS_PER_SYNC}&$orderby=receivedDateTime desc&$select=id,subject,from,toRecipients,receivedDateTime,body,conversationId,bodyPreview`
+        `/me/messages?$filter=${encodeURIComponent(filter)}&$top=${connection.max_emails_per_sync || MAX_EMAILS_PER_SYNC}&$orderby=receivedDateTime desc&$select=id,subject,from,toRecipients,receivedDateTime,body,conversationId,bodyPreview`
     );
 
     const messages = data.value || [];
@@ -438,6 +440,7 @@ async function syncOutlookConnection(connection) {
                     orgId: connection.organization_id,
                     customPrompt: connection.ai_system_prompt,
                     senderBlacklist: connection.sender_blacklist || [],
+                    redactPII: connection.redact_pii !== false,
                 });
 
                 if (!processed.success) {
@@ -487,6 +490,7 @@ async function syncOutlookConnection(connection) {
                     orgId: connection.organization_id,
                     customPrompt: connection.ai_system_prompt,
                     senderBlacklist: connection.sender_blacklist || [],
+                    redactPII: connection.redact_pii !== false,
                 });
 
                 if (!processed.success) {
@@ -727,6 +731,7 @@ async function testConnection(connectionId) {
         orgId: connection.organization_id,
         customPrompt: connection.ai_system_prompt,
         senderBlacklist: connection.sender_blacklist || [],
+        redactPII: connection.redact_pii !== false,
     });
 
     return {
