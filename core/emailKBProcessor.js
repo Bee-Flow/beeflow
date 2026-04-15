@@ -538,6 +538,105 @@ async function processEmailThread(messages, metadata = {}, options = {}) {
     };
 }
 
+// ──────────────────────────────────────────────
+// Stage 5: Category Aggregation
+// Adapted from n8n workflow 2.1 "Get Ticket summary Files"
+// ──────────────────────────────────────────────
+
+const DEFAULT_MERGE_PROMPT = `You receive multiple existing knowledge base articles from the same category. Rewrite them into ONE comprehensive, deduplicated knowledge base article in **Markdown**.
+
+Output rules (hard):
+* Return only the rewritten Markdown.
+* Use only \`##\` headers (no #, ###).
+* Do not add sections that are not relevant; if something does not apply: omit the entire section.
+* Do not invent facts that are not in the source articles. You may add general, safe clarification as long as it does not speculate.
+
+Anti-duplication (hard):
+* Each instruction or piece of knowledge appears exactly once in the entire document.
+* If multiple source articles describe the same problem or solution: merge them into one entry, combining the most complete details.
+* Remove redundant or overlapping content — keep the most informative version.
+* Use consistent terminology throughout.
+
+Writing style:
+* Clear, concrete and task-oriented.
+* Write completely impersonally (no person references).
+* Add sub-steps within numbered lists where useful (e.g. 1.1, 1.2).
+* Group related problems/solutions together logically.
+
+Privacy & security (hard):
+* Never include sensitive data or contact information (names, emails, phones, IPs, credentials, tokens, etc.).
+* If such information appears: generalize or omit.
+
+Structure (use only sections that are relevant):
+
+## {Category Name} — Knowledge Base
+
+## Overview
+Brief summary of what this category covers.
+
+## Common Problems & Solutions
+For each distinct problem, use a ### sub-header:
+### Problem description (concise)
+**Problem:** ...
+**Solution:** ...
+**Steps:** ...
+
+## Notes
+Only if relevant.
+
+IMPORTANT: Detect the language of the source articles and write in that SAME language.`;
+
+/**
+ * Merge multiple processed articles by category into comprehensive KB documents.
+ *
+ * @param {Array<{article: string, category: string, title: string}>} articles — processed email articles
+ * @param {object} options — { orgId, redactPII, customPrompt }
+ * @returns {Promise<Array<{category: string, article: string, title: string, sourceCount: number}>>}
+ */
+async function mergeArticlesByCategory(articles, options = {}) {
+    const { redactPII: shouldRedact = true } = options;
+
+    // Group by category
+    const groups = {};
+    for (const a of articles) {
+        const cat = a.category || 'Uncategorized';
+        if (!groups[cat]) groups[cat] = [];
+        groups[cat].push(a.article);
+    }
+
+    console.log(`[EmailKBProcessor] Merging ${articles.length} articles into ${Object.keys(groups).length} categories: ${Object.keys(groups).join(', ')}`);
+
+    const results = [];
+    for (const [category, articleTexts] of Object.entries(groups)) {
+        try {
+            const merged = articleTexts.join('\n\n---\n\n');
+
+            console.log(`[EmailKBProcessor] Merging ${articleTexts.length} articles for category "${category}" (${merged.length} chars)`);
+
+            const { article } = await summarizeToArticle(merged, {
+                ...options,
+                customPrompt: DEFAULT_MERGE_PROMPT,
+            });
+
+            if (article) {
+                const sanitized = shouldRedact ? redactPII(article) : article;
+                results.push({
+                    category,
+                    article: sanitized,
+                    title: category,
+                    sourceCount: articleTexts.length,
+                });
+            } else {
+                console.warn(`[EmailKBProcessor] Merge produced empty result for category "${category}"`);
+            }
+        } catch (err) {
+            console.error(`[EmailKBProcessor] Merge failed for category "${category}":`, err.message);
+        }
+    }
+
+    return results;
+}
+
 module.exports = {
     // Individual stages (for testing)
     cleanEmail,
@@ -546,7 +645,9 @@ module.exports = {
     // Full pipelines
     processEmail,
     processEmailThread,
+    mergeArticlesByCategory,
     // Constants
     DEFAULT_ARTICLE_PROMPT,
     DEFAULT_CATEGORY_PROMPT,
+    DEFAULT_MERGE_PROMPT,
 };

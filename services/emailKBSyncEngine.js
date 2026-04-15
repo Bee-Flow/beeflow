@@ -13,8 +13,8 @@
  */
 
 const emailKBStore = require('../stores/emailKBStore');
-const { processEmail, processEmailThread } = require('../core/emailKBProcessor');
-const { ingestDocument } = require('../core/kbIngestionHelpers');
+const { processEmail, processEmailThread, mergeArticlesByCategory } = require('../core/emailKBProcessor');
+const { ingestDocument, findDocumentBySourceUri, deleteDocumentChunks } = require('../core/kbIngestionHelpers');
 
 const { run } = require('../db');
 
@@ -131,7 +131,7 @@ async function syncGmailConnection(connection) {
     const messageIds = response.data.messages || [];
     console.log(`[EmailKBSync] Gmail: ${messageIds.length} messages found`);
 
-    const results = { fetched: messageIds.length, created: 0, skipped: 0, errors: 0, errorDetails: [], newestDate: null };
+    const results = { fetched: messageIds.length, created: 0, skipped: 0, errors: 0, errorDetails: [], newestDate: null, processedArticles: [] };
 
     if (connection.group_threads) {
         // Group by threadId
@@ -171,7 +171,7 @@ async function syncGmailConnection(connection) {
             }
         }
 
-        // Process each thread
+        // Process each thread → collect articles (don't ingest yet)
         for (const [threadId, thread] of threadMap) {
             try {
                 const processed = await processEmailThread(thread.messages, {
@@ -193,25 +193,11 @@ async function syncGmailConnection(connection) {
                     continue;
                 }
 
-                // Ingest into KB
-                await ingestDocument(
-                    connection.created_by,
-                    connection.knowledge_base_id,
-                    processed.article,
-                    processed.title,
-                    'email',
-                    `gmail://thread/${threadId}`,
-                    { lang: 'auto' }
-                );
-
+                results.processedArticles.push(processed);
                 results.created++;
             } catch (procErr) {
-                if (procErr.code === 'DUPLICATE') {
-                    results.skipped++;
-                } else {
-                    results.errors++;
-                    results.errorDetails.push(`Thread ${threadId}: ${procErr.message}`);
-                }
+                results.errors++;
+                results.errorDetails.push(`Thread ${threadId}: ${procErr.message}`);
             }
         }
     } else {
@@ -251,21 +237,10 @@ async function syncGmailConnection(connection) {
                     continue;
                 }
 
-                await ingestDocument(
-                    connection.created_by,
-                    connection.knowledge_base_id,
-                    processed.article,
-                    processed.title,
-                    'email',
-                    `gmail://message/${msg.id}`,
-                    { lang: 'auto' }
-                );
-
+                results.processedArticles.push(processed);
                 results.created++;
             } catch (procErr) {
-                if (procErr.code === 'DUPLICATE') {
-                    results.skipped++;
-                } else if (procErr.message?.includes('429') || procErr.code === 429) {
+                if (procErr.message?.includes('429') || procErr.code === 429) {
                     results.errorDetails.push('Rate limited by Gmail API — will retry next cycle');
                     break;
                 } else {
@@ -438,7 +413,7 @@ async function syncOutlookConnection(connection) {
 
     console.log(`[EmailKBSync] Outlook: ${messages.length} messages found`);
 
-    const results = { fetched: messages.length, created: 0, skipped: 0, errors: 0, errorDetails: [], newestDate: null };
+    const results = { fetched: messages.length, created: 0, skipped: 0, errors: 0, errorDetails: [], newestDate: null, processedArticles: [] };
 
     // Track newest message date for cursor
     if (messages.length > 0) {
@@ -486,21 +461,10 @@ async function syncOutlookConnection(connection) {
                     continue;
                 }
 
-                await ingestDocument(
-                    connection.created_by,
-                    connection.knowledge_base_id,
-                    processed.article,
-                    processed.title,
-                    'email',
-                    `outlook://conversation/${convId}`,
-                    { lang: 'auto' }
-                );
-
+                results.processedArticles.push(processed);
                 results.created++;
             } catch (procErr) {
-                if (procErr.code === 'DUPLICATE') {
-                    results.skipped++;
-                } else if (procErr.message?.includes('429')) {
+                if (procErr.message?.includes('429')) {
                     results.errorDetails.push('Rate limited by Microsoft Graph — will retry next cycle');
                     break;
                 } else {
@@ -536,21 +500,10 @@ async function syncOutlookConnection(connection) {
                     continue;
                 }
 
-                await ingestDocument(
-                    connection.created_by,
-                    connection.knowledge_base_id,
-                    processed.article,
-                    processed.title,
-                    'email',
-                    `outlook://message/${msg.id}`,
-                    { lang: 'auto' }
-                );
-
+                results.processedArticles.push(processed);
                 results.created++;
             } catch (procErr) {
-                if (procErr.code === 'DUPLICATE') {
-                    results.skipped++;
-                } else if (procErr.message?.includes('429')) {
+                if (procErr.message?.includes('429')) {
                     results.errorDetails.push('Rate limited by Microsoft Graph — will retry next cycle');
                     break;
                 } else {
@@ -575,6 +528,7 @@ async function syncConnection(connection) {
 
     let results;
     try {
+        // Phase 1: Fetch + process individual emails (get article + category per email)
         if (connection.provider === 'gmail') {
             results = await syncGmailConnection(connection);
         } else if (connection.provider === 'outlook') {
@@ -583,24 +537,69 @@ async function syncConnection(connection) {
             throw new Error(`Unknown provider: ${connection.provider}`);
         }
 
+        // Phase 2: Merge articles by category and ingest into KB
+        const processedArticles = results.processedArticles || [];
+        let categoryDocsCreated = 0;
+
+        if (processedArticles.length > 0) {
+            console.log(`[EmailKBSync] Phase 2: Merging ${processedArticles.length} articles by category...`);
+
+            const mergedCategories = await mergeArticlesByCategory(processedArticles, {
+                orgId: connection.organization_id,
+                redactPII: connection.redact_pii !== false,
+            });
+
+            // Upsert: for each category, find existing doc → delete → re-ingest
+            for (const { category, article, sourceCount } of mergedCategories) {
+                try {
+                    const sourceUri = `email-kb://category/${encodeURIComponent(category)}`;
+
+                    // Remove existing category document if present
+                    const existing = await findDocumentBySourceUri(connection.knowledge_base_id, sourceUri);
+                    if (existing) {
+                        console.log(`[EmailKBSync] Replacing existing category doc: "${category}" (${existing.id})`);
+                        await deleteDocumentChunks(connection.knowledge_base_id, existing.id, connection.created_by);
+                    }
+
+                    // Ingest merged category article
+                    await ingestDocument(
+                        connection.created_by,
+                        connection.knowledge_base_id,
+                        article,
+                        category,
+                        'email',
+                        sourceUri,
+                        { skipDedup: true, lang: 'auto' }
+                    );
+
+                    categoryDocsCreated++;
+                    console.log(`[EmailKBSync] ✅ Category "${category}" ingested (${sourceCount} emails merged)`);
+                } catch (ingestErr) {
+                    results.errors++;
+                    results.errorDetails.push(`Ingest category "${category}": ${ingestErr.message}`);
+                    console.error(`[EmailKBSync] ❌ Failed to ingest category "${category}":`, ingestErr.message);
+                }
+            }
+        }
+
         await emailKBStore.updateSyncState(connection.id, {
             syncStatus: 'idle',
             syncError: null,
             lastSyncAt: new Date().toISOString(),
             lastSyncCursor: results.newestDate || undefined,
             emailsProcessed: results.fetched,
-            articlesCreated: results.created,
+            articlesCreated: categoryDocsCreated,
         });
 
         await emailKBStore.completeSyncLog(log.id, {
             emailsFetched: results.fetched,
-            articlesCreated: results.created,
+            articlesCreated: categoryDocsCreated,
             articlesSkipped: results.skipped,
             errors: results.errors,
             errorDetails: results.errorDetails.length > 0 ? results.errorDetails.join('\n') : null,
         });
 
-        console.log(`[EmailKBSync] ✅ ${connection.provider} ${connection.email_address}: ${results.created} articles, ${results.skipped} skipped, ${results.errors} errors`);
+        console.log(`[EmailKBSync] ✅ ${connection.provider} ${connection.email_address}: ${processedArticles.length} emails → ${categoryDocsCreated} category docs, ${results.skipped} skipped, ${results.errors} errors`);
 
     } catch (err) {
         console.error(`[EmailKBSync] ❌ ${connection.provider} ${connection.email_address}:`, err.message);
@@ -613,7 +612,7 @@ async function syncConnection(connection) {
 
         await emailKBStore.completeSyncLog(log.id, {
             emailsFetched: results?.fetched || 0,
-            articlesCreated: results?.created || 0,
+            articlesCreated: 0,
             articlesSkipped: results?.skipped || 0,
             errors: (results?.errors || 0) + 1,
             errorDetails: err.message,
