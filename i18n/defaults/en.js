@@ -324,7 +324,7 @@ const GUI_DEFAULTS = {
     'org.default_language_desc': 'Set the default interface language for new users in your organisation',
     'org.new_user_language': 'New User Language',
     'org.new_user_language_desc': 'When a new user signs in for the first time, the interface will be displayed in this language. Users can change their language at any time in their personal settings.',
-    'org.default_language_info': 'This setting only affects new users who haven\\'t chosen a language yet. Existing users keep their current language preference. To add more languages to BeeFlow, go to the admin dashboard > Languages section.',
+    'org.default_language_info': "This setting only affects new users who haven't chosen a language yet. Existing users keep their current language preference. To add more languages to BeeFlow, go to the admin dashboard > Languages section.",
     'org.description': 'Description',
 
     // ── Agent Store ─────────────────────────────────────────────
