@@ -10,16 +10,27 @@ const router = express.Router();
 const emailKBStore = require('../stores/emailKBStore');
 const kbStore = require('../stores/knowledgeBases');
 const { triggerManualSync, testConnection } = require('../services/emailKBSyncEngine');
+const { resolveUserOrgIds } = require('../auth');
 
 // ──────────────────────────────────────────────
-// Middleware: resolve user's org
+// Helpers: resolve user's org (same pattern as knowledgeBases.js)
 // ──────────────────────────────────────────────
-function getOrgId(req) {
-    return req.session?.user?.organizationId || req.session?.user?.orgId || null;
+async function getOrgId(req) {
+    const orgIds = await resolveUserOrgIds(req);
+    if (orgIds === null) {
+        // Super admin — use session org if available, or first org from user record
+        return req.session?.user?.organizationId || null;
+    }
+    if (orgIds.size > 0) return Array.from(orgIds)[0];
+    return null;
 }
 
 function getUserId(req) {
     return req.session?.user?.id || req.session?.userId || null;
+}
+
+function isSuperAdmin(req) {
+    return req.session?.isAdmin || req.session?.user?.role === 'admin';
 }
 
 // ──────────────────────────────────────────────
@@ -27,7 +38,7 @@ function getUserId(req) {
 // ──────────────────────────────────────────────
 router.get('/connections', async (req, res) => {
     try {
-        const orgId = getOrgId(req);
+        const orgId = await getOrgId(req);
         if (!orgId) return res.status(400).json({ error: 'No organization context' });
 
         const connections = await emailKBStore.listConnections(orgId);
@@ -45,7 +56,7 @@ router.get('/connections', async (req, res) => {
 // ──────────────────────────────────────────────
 router.post('/connections', async (req, res) => {
     try {
-        const orgId = getOrgId(req);
+        const orgId = await getOrgId(req);
         const userId = getUserId(req);
         if (!orgId || !userId) return res.status(400).json({ error: 'No organization or user context' });
 
@@ -120,8 +131,8 @@ router.get('/connections/:id', async (req, res) => {
         if (!connection) return res.status(404).json({ error: 'Connection not found' });
 
         // Verify org access
-        const orgId = getOrgId(req);
-        if (connection.organization_id !== orgId) {
+        const orgId = await getOrgId(req);
+        if (connection.organization_id !== orgId && !isSuperAdmin(req)) {
             return res.status(403).json({ error: 'Access denied' });
         }
 
@@ -142,8 +153,8 @@ router.patch('/connections/:id', async (req, res) => {
         const connection = await emailKBStore.getConnection(req.params.id);
         if (!connection) return res.status(404).json({ error: 'Connection not found' });
 
-        const orgId = getOrgId(req);
-        if (connection.organization_id !== orgId) {
+        const orgId = await getOrgId(req);
+        if (connection.organization_id !== orgId && !isSuperAdmin(req)) {
             return res.status(403).json({ error: 'Access denied' });
         }
 
@@ -163,8 +174,8 @@ router.delete('/connections/:id', async (req, res) => {
         const connection = await emailKBStore.getConnection(req.params.id);
         if (!connection) return res.status(404).json({ error: 'Connection not found' });
 
-        const orgId = getOrgId(req);
-        if (connection.organization_id !== orgId) {
+        const orgId = await getOrgId(req);
+        if (connection.organization_id !== orgId && !isSuperAdmin(req)) {
             return res.status(403).json({ error: 'Access denied' });
         }
 
@@ -184,8 +195,8 @@ router.post('/connections/:id/sync', async (req, res) => {
         const connection = await emailKBStore.getConnection(req.params.id);
         if (!connection) return res.status(404).json({ error: 'Connection not found' });
 
-        const orgId = getOrgId(req);
-        if (connection.organization_id !== orgId) {
+        const orgId = await getOrgId(req);
+        if (connection.organization_id !== orgId && !isSuperAdmin(req)) {
             return res.status(403).json({ error: 'Access denied' });
         }
 
@@ -205,8 +216,8 @@ router.post('/connections/:id/test', async (req, res) => {
         const connection = await emailKBStore.getConnection(req.params.id);
         if (!connection) return res.status(404).json({ error: 'Connection not found' });
 
-        const orgId = getOrgId(req);
-        if (connection.organization_id !== orgId) {
+        const orgId = await getOrgId(req);
+        if (connection.organization_id !== orgId && !isSuperAdmin(req)) {
             return res.status(403).json({ error: 'Access denied' });
         }
 
@@ -226,8 +237,8 @@ router.get('/connections/:id/logs', async (req, res) => {
         const connection = await emailKBStore.getConnection(req.params.id);
         if (!connection) return res.status(404).json({ error: 'Connection not found' });
 
-        const orgId = getOrgId(req);
-        if (connection.organization_id !== orgId) {
+        const orgId = await getOrgId(req);
+        if (connection.organization_id !== orgId && !isSuperAdmin(req)) {
             return res.status(403).json({ error: 'Access denied' });
         }
 
