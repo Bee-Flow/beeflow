@@ -15,11 +15,11 @@ const { triggerManualSync, testConnection } = require('../services/emailKBSyncEn
 // Middleware: resolve user's org
 // ──────────────────────────────────────────────
 function getOrgId(req) {
-    return req.session?.organizationId || req.session?.activeOrganizationId || null;
+    return req.session?.user?.organizationId || req.session?.user?.orgId || null;
 }
 
 function getUserId(req) {
-    return req.session?.userId || req.session?.user?.id || null;
+    return req.session?.user?.id || req.session?.userId || null;
 }
 
 // ──────────────────────────────────────────────
