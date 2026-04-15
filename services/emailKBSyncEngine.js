@@ -28,6 +28,34 @@ const RETRY_DELAY_MS = 5000;
 let tickTimer = null;
 let isRunning = false;
 
+/**
+ * Build per-stage process options from connection's pipeline_config.
+ */
+function buildProcessOptions(connection) {
+    const pc = connection.pipeline_config || {};
+    return {
+        orgId: connection.organization_id,
+        senderBlacklist: connection.sender_blacklist || [],
+        redactPII: connection.redact_pii !== false,
+        language: pc.language || '',
+        articleModelTier: pc.article?.modelTier || 'fast',
+        articlePrompt: pc.article?.systemPrompt || connection.ai_system_prompt || '',
+        categoryModelTier: pc.category?.modelTier || 'fast',
+        categoryPrompt: pc.category?.systemPrompt || '',
+    };
+}
+
+function buildMergeOptions(connection) {
+    const pc = connection.pipeline_config || {};
+    return {
+        orgId: connection.organization_id,
+        redactPII: connection.redact_pii !== false,
+        modelTier: pc.merge?.modelTier || 'fast',
+        customPrompt: pc.merge?.systemPrompt || '',
+        language: pc.language || '',
+    };
+}
+
 // ──────────────────────────────────────────────
 // Retry helper for transient failures
 // ──────────────────────────────────────────────
@@ -179,10 +207,7 @@ async function syncGmailConnection(connection) {
                     from: thread.from,
                     date: thread.date,
                 }, {
-                    orgId: connection.organization_id,
-                    customPrompt: connection.ai_system_prompt,
-                    senderBlacklist: connection.sender_blacklist || [],
-                    redactPII: connection.redact_pii !== false,
+                    ...buildProcessOptions(connection),
                 });
 
                 if (!processed.success) {
@@ -223,10 +248,7 @@ async function syncGmailConnection(connection) {
                     date: getGmailHeader(headers, 'Date'),
                     messageId: msg.id,
                 }, {
-                    orgId: connection.organization_id,
-                    customPrompt: connection.ai_system_prompt,
-                    senderBlacklist: connection.sender_blacklist || [],
-                    redactPII: connection.redact_pii !== false,
+                    ...buildProcessOptions(connection),
                 });
 
                 if (!processed.success) {
@@ -447,10 +469,7 @@ async function syncOutlookConnection(connection) {
                     from: thread.from,
                     date: thread.date,
                 }, {
-                    orgId: connection.organization_id,
-                    customPrompt: connection.ai_system_prompt,
-                    senderBlacklist: connection.sender_blacklist || [],
-                    redactPII: connection.redact_pii !== false,
+                    ...buildProcessOptions(connection),
                 });
 
                 if (!processed.success) {
@@ -486,10 +505,7 @@ async function syncOutlookConnection(connection) {
                     date: msg.receivedDateTime,
                     messageId: msg.id,
                 }, {
-                    orgId: connection.organization_id,
-                    customPrompt: connection.ai_system_prompt,
-                    senderBlacklist: connection.sender_blacklist || [],
-                    redactPII: connection.redact_pii !== false,
+                    ...buildProcessOptions(connection),
                 });
 
                 if (!processed.success) {
@@ -544,10 +560,7 @@ async function syncConnection(connection) {
         if (processedArticles.length > 0) {
             console.log(`[EmailKBSync] Phase 2: Merging ${processedArticles.length} articles by category...`);
 
-            const mergedCategories = await mergeArticlesByCategory(processedArticles, {
-                orgId: connection.organization_id,
-                redactPII: connection.redact_pii !== false,
-            });
+            const mergedCategories = await mergeArticlesByCategory(processedArticles, buildMergeOptions(connection));
 
             // Upsert: for each category, find existing doc → delete → re-ingest
             for (const { category, article, sourceCount } of mergedCategories) {
@@ -787,12 +800,7 @@ async function testConnection(connectionId) {
         subject: testEmail.subject,
         from: testEmail.from,
         date: testEmail.date,
-    }, {
-        orgId: connection.organization_id,
-        customPrompt: connection.ai_system_prompt,
-        senderBlacklist: connection.sender_blacklist || [],
-        redactPII: connection.redact_pii !== false,
-    });
+    }, buildProcessOptions(connection));
 
     return {
         success: true,

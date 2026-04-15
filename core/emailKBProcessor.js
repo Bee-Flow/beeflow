@@ -320,42 +320,53 @@ If multiple domains are involved, choose the domain that was actually modified t
 
 Detect the language from the article and write the category in that same language.`;
 
+// ── Shared: resolve model for a tier ──
+
+async function resolveModel(tierName, orgId) {
+    const { resolveModelForTierName } = require('./modelResolver');
+    try {
+        return await resolveModelForTierName(tierName, { userOrgId: orgId, fallback: 'gpt-4.1-mini' });
+    } catch (resolveErr) {
+        console.warn(`[EmailKBProcessor] Model resolution failed for tier "${tierName}", using fallback:`, resolveErr.message);
+        return 'gpt-4.1-mini';
+    }
+}
+
+function appendLanguageInstruction(prompt, language) {
+    if (!language) return prompt;
+    return `${prompt}\n\nIMPORTANT: Write the output in ${language}. Do NOT auto-detect — use ${language} regardless of the input language.`;
+}
+
 /**
- * Generate a KB article from cleaned email text using the org's AI model.
+ * Generate a KB article from cleaned email text.
  *
  * @param {string} cleanedText — email text after HTML cleanup + PII redaction
  * @param {object} options
  * @param {string} [options.customPrompt] — override system prompt
  * @param {string} [options.orgId] — organization ID for model resolution
- * @returns {Promise<{article: string, category: string}>}
+ * @param {string} [options.modelTier='fast'] — model tier to use
+ * @param {string} [options.language] — force output language ('' = auto-detect)
+ * @returns {Promise<{article: string|null, reason?: string}>}
  */
 async function summarizeToArticle(cleanedText, options = {}) {
-    const { customPrompt, orgId } = options;
+    const { customPrompt, orgId, modelTier = 'fast', language } = options;
 
     if (!cleanedText || cleanedText.trim().length < 20) {
-        return { article: null, category: null, reason: 'Content too short' };
+        return { article: null, reason: 'Content too short' };
     }
 
     try {
-        // Resolve AI model — use the org's configured tier (same as chat, transcriptions, etc.)
-        const { resolveModelForTierName } = require('./modelResolver');
-        let modelId;
-        try {
-            modelId = await resolveModelForTierName('fast', { userOrgId: orgId, fallback: 'gpt-4.1-mini' });
-        } catch (resolveErr) {
-            console.warn('[EmailKBProcessor] Model resolution failed, using fallback:', resolveErr.message);
-            modelId = 'gpt-4.1-mini';
-        }
-        console.log(`[EmailKBProcessor] Using model: ${modelId} (org: ${orgId || 'none'})`);
+        const modelId = await resolveModel(modelTier, orgId);
+        console.log(`[EmailKBProcessor] Article stage: model=${modelId} tier=${modelTier}`);
 
-        // Use direct API call via provider adapters
         const { createChatCompletion } = require('../agents/providerAdapters');
 
-        // Step 1: Generate article
+        const prompt = appendLanguageInstruction(customPrompt || DEFAULT_ARTICLE_PROMPT, language);
+
         const articleResult = await createChatCompletion({
             model: modelId,
             messages: [
-                { role: 'system', content: customPrompt || DEFAULT_ARTICLE_PROMPT },
+                { role: 'system', content: prompt },
                 { role: 'user', content: cleanedText }
             ],
             temperature: 0.3,
@@ -365,35 +376,57 @@ async function summarizeToArticle(cleanedText, options = {}) {
         const article = articleResult?.choices?.[0]?.message?.content || '';
 
         if (!article || article.trim().length < 20) {
-            return { article: null, category: null, reason: 'AI produced empty article' };
+            return { article: null, reason: 'AI produced empty article' };
         }
 
-        // Step 2: Categorize
-        let category = 'Uncategorized';
-        try {
-            const catResult = await createChatCompletion({
-                model: modelId,
-                messages: [
-                    { role: 'system', content: DEFAULT_CATEGORY_PROMPT },
-                    { role: 'user', content: article }
-                ],
-                temperature: 0.1,
-                max_tokens: 50,
-            });
-            const rawCat = (catResult?.choices?.[0]?.message?.content || '').trim();
-            if (rawCat && rawCat.length < 50) {
-                category = rawCat;
-            }
-        } catch (catErr) {
-            console.warn('[EmailKBProcessor] Category classification failed:', catErr.message);
-        }
-
-        return { article: article.trim(), category };
+        return { article: article.trim() };
 
     } catch (err) {
         console.error('[EmailKBProcessor] AI summarization failed:', err.message);
-        return { article: null, category: null, reason: `AI error: ${err.message}` };
+        return { article: null, reason: `AI error: ${err.message}` };
     }
+}
+
+/**
+ * Categorize an article based on its content.
+ *
+ * @param {string} articleText — the generated KB article
+ * @param {object} options
+ * @param {string} [options.customPrompt] — override category prompt
+ * @param {string} [options.orgId] — organization ID for model resolution
+ * @param {string} [options.modelTier='fast'] — model tier to use
+ * @param {string} [options.language] — force output language
+ * @returns {Promise<string>} category name
+ */
+async function categorizeArticle(articleText, options = {}) {
+    const { customPrompt, orgId, modelTier = 'fast', language } = options;
+
+    try {
+        const modelId = await resolveModel(modelTier, orgId);
+        console.log(`[EmailKBProcessor] Category stage: model=${modelId} tier=${modelTier}`);
+
+        const { createChatCompletion } = require('../agents/providerAdapters');
+
+        const prompt = appendLanguageInstruction(customPrompt || DEFAULT_CATEGORY_PROMPT, language);
+
+        const catResult = await createChatCompletion({
+            model: modelId,
+            messages: [
+                { role: 'system', content: prompt },
+                { role: 'user', content: articleText }
+            ],
+            temperature: 0.1,
+            max_tokens: 50,
+        });
+        const rawCat = (catResult?.choices?.[0]?.message?.content || '').trim();
+        if (rawCat && rawCat.length < 50) {
+            return rawCat;
+        }
+    } catch (catErr) {
+        console.warn('[EmailKBProcessor] Category classification failed:', catErr.message);
+    }
+
+    return 'Uncategorized';
 }
 
 // ──────────────────────────────────────────────
@@ -405,12 +438,25 @@ async function summarizeToArticle(cleanedText, options = {}) {
  *
  * @param {string} rawContent — raw email HTML or text content
  * @param {object} metadata — { subject, from, date, messageId }
- * @param {object} options — { customPrompt, orgId, senderBlacklist, redactPII }
+ * @param {object} options
+ * @param {string} [options.orgId] — organization ID
+ * @param {string[]} [options.senderBlacklist] — emails/domains to skip
+ * @param {boolean} [options.redactPII=true] — enable PII redaction
+ * @param {string} [options.language] — force output language
+ * @param {string} [options.articleModelTier='fast'] — tier for article generation
+ * @param {string} [options.articlePrompt] — override article system prompt
+ * @param {string} [options.categoryModelTier='fast'] — tier for categorization
+ * @param {string} [options.categoryPrompt] — override category system prompt
  * @returns {Promise<{success: boolean, article?: string, category?: string, title?: string, reason?: string}>}
  */
 async function processEmail(rawContent, metadata = {}, options = {}) {
     const { subject, from, date, messageId } = metadata;
-    const { senderBlacklist = [], redactPII: shouldRedact = true } = options;
+    const {
+        senderBlacklist = [], redactPII: shouldRedact = true, language,
+        articleModelTier = 'fast', articlePrompt,
+        categoryModelTier = 'fast', categoryPrompt,
+        orgId,
+    } = options;
 
     // Check sender blacklist
     if (from && senderBlacklist.length > 0) {
@@ -429,23 +475,34 @@ async function processEmail(rawContent, metadata = {}, options = {}) {
     // Stage 2: Redact PII (pre-AI pass) — optional
     const redacted = shouldRedact ? redactPII(cleaned) : cleaned;
 
-    // Prepend metadata for AI context (subject + date give the AI much better understanding)
+    // Prepend metadata for AI context
     let aiInput = redacted;
     if (subject || date) {
         const header = [subject && `Subject: ${subject}`, date && `Date: ${date}`].filter(Boolean).join('\n');
         aiInput = `${header}\n---\n${redacted}`;
     }
 
-    // Stage 3: AI Summarize
-    const { article, category, reason } = await summarizeToArticle(aiInput, options);
+    // Stage 3: AI Article generation
+    const { article, reason } = await summarizeToArticle(aiInput, {
+        orgId, language,
+        modelTier: articleModelTier,
+        customPrompt: articlePrompt,
+    });
     if (!article) {
         return { success: false, reason: reason || 'AI summarization failed', skipped: true };
     }
 
-    // Stage 4: Post-AI PII pass (AI can accidentally reproduce sensitive data) — optional
+    // Stage 4: AI Categorization (separate model tier + prompt)
+    const category = await categorizeArticle(article, {
+        orgId, language,
+        modelTier: categoryModelTier,
+        customPrompt: categoryPrompt,
+    });
+
+    // Stage 5: Post-AI PII pass — optional
     const sanitizedArticle = shouldRedact ? redactPII(article) : article;
 
-    // Build title from subject or first line
+    // Build title
     const cleanSubject = subject ? subject.replace(/^(re|fw|fwd):\s*/gi, '').trim() : '';
     const title = cleanSubject
         ? `${category}: ${cleanSubject}`
@@ -466,7 +523,12 @@ async function processEmail(rawContent, metadata = {}, options = {}) {
  */
 async function processEmailThread(messages, metadata = {}, options = {}) {
     const { subject, from, date } = metadata;
-    const { senderBlacklist = [], redactPII: shouldRedact = true } = options;
+    const {
+        senderBlacklist = [], redactPII: shouldRedact = true, language,
+        articleModelTier = 'fast', articlePrompt,
+        categoryModelTier = 'fast', categoryPrompt,
+        orgId,
+    } = options;
 
     // Check sender blacklist on the thread starter
     if (from && senderBlacklist.length > 0) {
@@ -515,10 +577,21 @@ async function processEmailThread(messages, metadata = {}, options = {}) {
     }).join('\n\n---\n\n');
 
     // AI Summarize the entire thread
-    const { article, category, reason } = await summarizeToArticle(merged, options);
+    const { article, reason } = await summarizeToArticle(merged, {
+        orgId, language,
+        modelTier: articleModelTier,
+        customPrompt: articlePrompt,
+    });
     if (!article) {
         return { success: false, reason: reason || 'AI summarization failed', skipped: true };
     }
+
+    // AI Categorization (separate tier + prompt)
+    const category = await categorizeArticle(article, {
+        orgId, language,
+        modelTier: categoryModelTier,
+        customPrompt: categoryPrompt,
+    });
 
     // Post-AI PII pass — optional
     const sanitizedArticle = shouldRedact ? redactPII(article) : article;
@@ -590,11 +663,11 @@ IMPORTANT: Detect the language of the source articles and write in that SAME lan
  * Merge multiple processed articles by category into comprehensive KB documents.
  *
  * @param {Array<{article: string, category: string, title: string}>} articles — processed email articles
- * @param {object} options — { orgId, redactPII, customPrompt }
+ * @param {object} options — { orgId, redactPII, modelTier, customPrompt, language }
  * @returns {Promise<Array<{category: string, article: string, title: string, sourceCount: number}>>}
  */
 async function mergeArticlesByCategory(articles, options = {}) {
-    const { redactPII: shouldRedact = true } = options;
+    const { redactPII: shouldRedact = true, modelTier = 'fast', customPrompt, language, orgId } = options;
 
     // Group by category
     const groups = {};
@@ -614,8 +687,10 @@ async function mergeArticlesByCategory(articles, options = {}) {
             console.log(`[EmailKBProcessor] Merging ${articleTexts.length} articles for category "${category}" (${merged.length} chars)`);
 
             const { article } = await summarizeToArticle(merged, {
-                ...options,
-                customPrompt: DEFAULT_MERGE_PROMPT,
+                orgId,
+                modelTier,
+                language,
+                customPrompt: customPrompt || DEFAULT_MERGE_PROMPT,
             });
 
             if (article) {
@@ -642,6 +717,7 @@ module.exports = {
     cleanEmail,
     redactPII,
     summarizeToArticle,
+    categorizeArticle,
     // Full pipelines
     processEmail,
     processEmailThread,
