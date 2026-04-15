@@ -15,28 +15,35 @@ const KB_SEARCH_TOOLS = [
         type: 'function',
         function: {
             name: 'kb_search',
-            description: `Search the internal knowledge base. Call this with the core topic as query.
-
-RULES:
-- ONE search per topic is enough. Do NOT repeat with synonyms or variations of the same topic — the search engine handles fuzzy matching.
-- Multiple calls are fine ONLY for genuinely different topics (e.g., searching "email handtekening" and then "VPN instellen" for two separate questions).
-- Only retry the same topic with a different query if the first search returned 0 results.
-- Do NOT use for greetings, small-talk, or vague messages ("hi", "thanks", "how are you").
-- Do NOT use when you already have enough context to answer.
+            description: `Search the internal knowledge base for relevant context, procedures, policies, or examples of previous similar interactions. The KB is organised by CATEGORY (e.g. "Facturatie", "Autorisatie", "Account", "E-mail", "Netwerk", "Hardware", "Applicatie", "Werkplek", "Toegang") — search both the specific topic AND the likely category.
 
 WHEN TO USE:
-- User asks about specific topics, policies, procedures, or factual details
-- After reading an email/document and you need internal context for a reply
+- ALWAYS before drafting a reply to an email or message about a real topic — even if it seems obvious, there may be a standard procedure or previous response pattern.
+- When the user asks about specific topics, policies, procedures, or factual details.
+- When you need internal context, examples, or precedent for a reply.
+
+WHEN TO SKIP:
+- Pure greetings/small-talk ("hi", "thanks", "how are you") — answer directly.
+- Trivial confirmations ("ok", "got it") that need no factual lookup.
+
+SEARCH STRATEGY (multi-query approach — DO multiple searches):
+1. **First search**: 2-4 keyword core topic of the user's question (e.g. "factuur niet ontvangen", "outlook werkt niet").
+2. **Second search**: the likely CATEGORY label in 1 word (e.g. "Facturatie", "E-mail", "Toegang"). KB documents are titled by category.
+3. **Third search (if first two return 0 results)**: broader synonyms or related terms (e.g. if "outlook" failed, try "mail client" or "Microsoft 365").
+
+Do at least 2 searches before concluding nothing relevant exists. The search engine does fuzzy matching but does NOT cross domains — searching "factuur" won't find a doc titled "Facturatie" reliably.
 
 QUERY FORMAT:
-- Use 2-4 keywords, not full sentences
-- Extract the core topic (e.g., "email handtekening" not "hoe kan ik mijn email handtekening veranderen")`,
+- 1-4 keywords. NOT full sentences. NOT email fragments.
+- Strip names, dates, and specific identifiers — search the underlying topic.
+- BAD: "Hilverzorg AI update werkt niet meer" → GOOD: "update werkt niet" + "Applicatie"
+- BAD: "Hoi, kun je me helpen met inloggen" → GOOD: "inloggen probleem" + "Account"`,
             parameters: {
                 type: 'object',
                 properties: {
                     query: {
                         type: 'string',
-                        description: 'Core topic keywords (2-4 words). Not a full sentence.'
+                        description: 'Core topic keywords (1-4 words) OR a single category label. Not a full sentence. Examples: "factuur ontbreekt", "Facturatie", "outlook crash", "Account".'
                     },
                     top_k: {
                         type: 'integer',
