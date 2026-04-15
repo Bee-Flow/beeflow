@@ -113,7 +113,10 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
     // Runs independently of Llama Guard / Azure moderation.
     // Uses Azure Text Analytics when configured, falls back to CPU model via guard service.
     const orgPiiEnabled = !!(orgShield?.enabled && orgShield?.azurePiiEnabled);
-    if (globalConfig?.piiDetectionEnabled || orgPiiEnabled) {
+    // If the org shield is active and explicitly disables PII detection, respect that
+    // over the global setting (mirrors the moderation "orgExplicitlyDisabled" pattern).
+    const orgExplicitlyDisabledPii = orgShield?.enabled && orgShield?.azurePiiEnabled === false;
+    if ((globalConfig?.piiDetectionEnabled && !orgExplicitlyDisabledPii) || orgPiiEnabled) {
         try {
             const piiMessages = [
                 ...messages.slice(-3), // last few messages for context
