@@ -112,11 +112,11 @@ async function syncGmailConnection(connection) {
 
     console.log(`[EmailKBSync] Gmail query: "${query}" labels: ${labelFilters.join(', ')}`);
 
-    // Fetch message list
+    // Fetch message list — pass folder_filter as Gmail labelIds
     const response = await gmail.users.messages.list({
         userId: 'me',
         q: query,
-        labelIds: labelFilters.includes('INBOX') ? ['INBOX'] : undefined,
+        labelIds: labelFilters.length > 0 ? labelFilters : undefined,
         maxResults: connection.max_emails_per_sync || MAX_EMAILS_PER_SYNC,
     });
 
@@ -393,14 +393,41 @@ async function syncOutlookConnection(connection) {
         })();
 
     const filter = `receivedDateTime ge ${afterDate}`;
+    const outlookFolders = connection.folder_filter || ['Inbox'];
+    const maxEmails = connection.max_emails_per_sync || MAX_EMAILS_PER_SYNC;
+    const selectFields = 'id,subject,from,toRecipients,receivedDateTime,body,conversationId,bodyPreview';
 
-    console.log(`[EmailKBSync] Outlook filter: "${filter}"`);
+    console.log(`[EmailKBSync] Outlook filter: "${filter}" folders: ${outlookFolders.join(', ')}`);
 
-    const data = await graphCall(
-        `/me/messages?$filter=${encodeURIComponent(filter)}&$top=${connection.max_emails_per_sync || MAX_EMAILS_PER_SYNC}&$orderby=receivedDateTime desc&$select=id,subject,from,toRecipients,receivedDateTime,body,conversationId,bodyPreview`
-    );
+    // Fetch from each folder and merge results
+    let allMessages = [];
+    for (const folder of outlookFolders) {
+        try {
+            const perFolder = Math.ceil(maxEmails / outlookFolders.length);
+            const data = await graphCall(
+                `/me/mailFolders/${encodeURIComponent(folder)}/messages?$filter=${encodeURIComponent(filter)}&$top=${perFolder}&$orderby=receivedDateTime desc&$select=${selectFields}`
+            );
+            allMessages.push(...(data.value || []));
+        } catch (folderErr) {
+            console.warn(`[EmailKBSync] Outlook folder "${folder}" failed: ${folderErr.message}`);
+            // Fallback: try without folder path (searches all mail)
+            if (outlookFolders.length === 1) {
+                const data = await graphCall(
+                    `/me/messages?$filter=${encodeURIComponent(filter)}&$top=${maxEmails}&$orderby=receivedDateTime desc&$select=${selectFields}`
+                );
+                allMessages.push(...(data.value || []));
+            }
+        }
+    }
 
-    const messages = data.value || [];
+    // Deduplicate by message ID (same message could appear in multiple folder views)
+    const seen = new Set();
+    const messages = allMessages.filter(m => {
+        if (seen.has(m.id)) return false;
+        seen.add(m.id);
+        return true;
+    }).slice(0, maxEmails);
+
     console.log(`[EmailKBSync] Outlook: ${messages.length} messages found`);
 
     const results = { fetched: messages.length, created: 0, skipped: 0, errors: 0, errorDetails: [], newestDate: null };

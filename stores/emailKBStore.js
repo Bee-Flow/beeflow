@@ -35,7 +35,7 @@ async function initDB() {
             total_emails_processed INT DEFAULT 0,
             total_articles_created INT DEFAULT 0,
             ai_system_prompt TEXT,
-            enabled BOOLEAN DEFAULT true,
+            enabled BOOLEAN DEFAULT false,
             encrypted_tokens TEXT,
             process_attachments BOOLEAN DEFAULT true,
             group_threads BOOLEAN DEFAULT true,
@@ -141,7 +141,9 @@ const EmailKBStore = {
                     folder_filter, sender_blacklist, sync_interval_minutes,
                     last_sync_at, sync_status, sync_error,
                     total_emails_processed, total_articles_created,
-                    enabled, process_attachments, group_threads, created_at, updated_at
+                    enabled, process_attachments, group_threads,
+                    redact_pii, max_emails_per_sync, ai_system_prompt,
+                    created_at, updated_at
              FROM email_kb_connections
              WHERE organization_id = $1
              ORDER BY created_at DESC`,
@@ -159,7 +161,8 @@ const EmailKBStore = {
                     folder_filter, sender_blacklist, sync_interval_minutes,
                     last_sync_at, last_sync_cursor, sync_status, sync_error,
                     total_emails_processed, total_articles_created,
-                    ai_system_prompt, enabled, process_attachments, group_threads, created_at, updated_at
+                    ai_system_prompt, enabled, process_attachments, group_threads,
+                    redact_pii, max_emails_per_sync, created_at, updated_at
              FROM email_kb_connections
              WHERE id = $1`,
             [id]
@@ -229,7 +232,8 @@ const EmailKBStore = {
              RETURNING id, organization_id, knowledge_base_id, provider, email_address, display_name,
                        folder_filter, sender_blacklist, sync_interval_minutes, sync_status,
                        total_emails_processed, total_articles_created, enabled,
-                       process_attachments, group_threads, updated_at`,
+                       process_attachments, group_threads, redact_pii, max_emails_per_sync,
+                       ai_system_prompt, updated_at`,
             vals
         );
     },
