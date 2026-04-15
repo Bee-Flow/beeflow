@@ -41,6 +41,7 @@ async function initDB() {
             group_threads BOOLEAN DEFAULT true,
             redact_pii BOOLEAN DEFAULT true,
             max_emails_per_sync INT DEFAULT 50,
+            sync_after_date TEXT,
             created_at TIMESTAMPTZ DEFAULT now(),
             updated_at TIMESTAMPTZ DEFAULT now()
         )
@@ -51,6 +52,7 @@ async function initDB() {
     // Migrate: add columns for existing tables
     await exec(`ALTER TABLE email_kb_connections ADD COLUMN IF NOT EXISTS redact_pii BOOLEAN DEFAULT true`);
     await exec(`ALTER TABLE email_kb_connections ADD COLUMN IF NOT EXISTS max_emails_per_sync INT DEFAULT 50`);
+    await exec(`ALTER TABLE email_kb_connections ADD COLUMN IF NOT EXISTS sync_after_date TEXT`);
 
     await exec(`
         CREATE TABLE IF NOT EXISTS email_kb_sync_log (
@@ -142,7 +144,7 @@ const EmailKBStore = {
                     last_sync_at, sync_status, sync_error,
                     total_emails_processed, total_articles_created,
                     enabled, process_attachments, group_threads,
-                    redact_pii, max_emails_per_sync, ai_system_prompt,
+                    redact_pii, max_emails_per_sync, sync_after_date, ai_system_prompt,
                     created_at, updated_at
              FROM email_kb_connections
              WHERE organization_id = $1
@@ -162,7 +164,7 @@ const EmailKBStore = {
                     last_sync_at, last_sync_cursor, sync_status, sync_error,
                     total_emails_processed, total_articles_created,
                     ai_system_prompt, enabled, process_attachments, group_threads,
-                    redact_pii, max_emails_per_sync, created_at, updated_at
+                    redact_pii, max_emails_per_sync, sync_after_date, created_at, updated_at
              FROM email_kb_connections
              WHERE id = $1`,
             [id]
@@ -206,7 +208,7 @@ const EmailKBStore = {
         await initDB();
         const allowed = ['display_name', 'folder_filter', 'sender_blacklist', 'sync_interval_minutes',
                           'ai_system_prompt', 'enabled', 'process_attachments', 'group_threads', 'knowledge_base_id',
-                          'redact_pii', 'max_emails_per_sync'];
+                          'redact_pii', 'max_emails_per_sync', 'sync_after_date'];
         const sets = [];
         const vals = [id];
         let idx = 2;
@@ -233,7 +235,7 @@ const EmailKBStore = {
                        folder_filter, sender_blacklist, sync_interval_minutes, sync_status,
                        total_emails_processed, total_articles_created, enabled,
                        process_attachments, group_threads, redact_pii, max_emails_per_sync,
-                       ai_system_prompt, updated_at`,
+                       sync_after_date, ai_system_prompt, updated_at`,
             vals
         );
     },

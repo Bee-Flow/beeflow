@@ -1054,6 +1054,8 @@ const GUI_DEFAULTS = {
     'email_kb.redact_pii_desc': 'Mask emails, phone numbers, IPs and other personal data',
     'email_kb.max_emails': 'Emails per sync',
     'email_kb.max_emails_desc': 'per sync cycle (1-500)',
+    'email_kb.sync_after_date': 'Sync after date',
+    'email_kb.sync_after_date_desc': 'Only fetch emails after this date (leave empty for last 30 days)',
 };
 
 // Get all namespace categories for the GUI editor filter

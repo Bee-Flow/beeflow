@@ -97,19 +97,27 @@ async function syncGmailConnection(connection) {
 
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
-    // Build search query — prefer cursor over last_sync_at for more reliable incremental sync
-    const labelFilters = (connection.folder_filter || ['INBOX']);
-    const syncAfter = connection.last_sync_cursor || connection.last_sync_at;
+    // Build search query — prefer cursor, then last_sync_at, then sync_after_date, then 30 days back
+    const syncAfter = connection.last_sync_cursor || connection.last_sync_at || connection.sync_after_date;
     const afterDate = syncAfter
         ? new Date(syncAfter).toISOString().split('T')[0].replace(/-/g, '/')
         : (() => {
             const d = new Date();
-            d.setDate(d.getDate() - 30); // Initial sync: last 30 days
+            d.setDate(d.getDate() - 30);
             return d.toISOString().split('T')[0].replace(/-/g, '/');
         })();
 
-    const query = `after:${afterDate}`;
+    // Normalize folder_filter: strip "in:" prefixes, map common names to Gmail label IDs
+    const GMAIL_LABEL_MAP = {
+        'inbox': 'INBOX', 'sent': 'SENT', 'drafts': 'DRAFT', 'draft': 'DRAFT',
+        'starred': 'STARRED', 'important': 'IMPORTANT', 'trash': 'TRASH', 'spam': 'SPAM',
+        'unread': 'UNREAD', 'in:sent': 'SENT', 'in:inbox': 'INBOX', 'in:drafts': 'DRAFT',
+        'in:starred': 'STARRED', 'in:important': 'IMPORTANT', 'in:trash': 'TRASH', 'in:spam': 'SPAM',
+    };
+    const rawFilters = connection.folder_filter || ['INBOX'];
+    const labelFilters = rawFilters.map(f => GMAIL_LABEL_MAP[f.toLowerCase()] || f);
 
+    const query = `after:${afterDate}`;
     console.log(`[EmailKBSync] Gmail query: "${query}" labels: ${labelFilters.join(', ')}`);
 
     // Fetch message list — pass folder_filter as Gmail labelIds
@@ -382,8 +390,8 @@ async function syncOutlookConnection(connection) {
         return response.json();
     }
 
-    // Build date filter — prefer cursor over last_sync_at
-    const syncAfter = connection.last_sync_cursor || connection.last_sync_at;
+    // Build date filter — prefer cursor, then last_sync_at, then sync_after_date
+    const syncAfter = connection.last_sync_cursor || connection.last_sync_at || connection.sync_after_date;
     const afterDate = syncAfter
         ? new Date(syncAfter).toISOString()
         : (() => {
@@ -693,17 +701,11 @@ async function triggerManualSync(connectionId) {
 
 /**
  * Test a connection by processing 1 email without ingesting.
+ * Works regardless of enabled status — uses connection's folder/date settings.
  */
 async function testConnection(connectionId) {
     const connection = await emailKBStore.getConnectionWithTokens(connectionId);
     if (!connection) throw new Error('Connection not found');
-
-    // Temporarily create a session-like object for the tools
-    const fakeSession = {
-        accessToken: connection.tokens.accessToken,
-        refreshToken: connection.tokens.refreshToken,
-        oauthProvider: connection.provider === 'outlook' ? 'microsoft' : 'google',
-    };
 
     let testEmail;
 
@@ -715,13 +717,27 @@ async function testConnection(connectionId) {
 
         const oauth2Client = new google.auth.OAuth2(providerConfig.clientId, providerConfig.clientSecret);
         oauth2Client.setCredentials({
-            access_token: fakeSession.accessToken,
-            refresh_token: fakeSession.refreshToken,
+            access_token: connection.tokens.accessToken,
+            refresh_token: connection.tokens.refreshToken,
         });
 
+        // Use connection's folder filter and date settings
+        const LABEL_MAP = {
+            'inbox': 'INBOX', 'sent': 'SENT', 'drafts': 'DRAFT', 'draft': 'DRAFT',
+            'starred': 'STARRED', 'important': 'IMPORTANT', 'in:sent': 'SENT', 'in:inbox': 'INBOX',
+        };
+        const rawFilters = connection.folder_filter || ['INBOX'];
+        const labelIds = rawFilters.map(f => LABEL_MAP[f.toLowerCase()] || f);
+
+        const listParams = { userId: 'me', maxResults: 1 };
+        if (labelIds.length > 0) listParams.labelIds = labelIds;
+        if (connection.sync_after_date) {
+            listParams.q = `after:${new Date(connection.sync_after_date).toISOString().split('T')[0].replace(/-/g, '/')}`;
+        }
+
         const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-        const list = await gmail.users.messages.list({ userId: 'me', maxResults: 1 });
-        if (!list.data.messages?.length) return { success: true, message: 'Mailbox is empty', preview: null };
+        const list = await gmail.users.messages.list(listParams);
+        if (!list.data.messages?.length) return { success: true, message: 'No emails found matching your filters', preview: null };
 
         const detail = await gmail.users.messages.get({ userId: 'me', id: list.data.messages[0].id, format: 'full' });
         const headers = detail.data.payload?.headers || [];
@@ -733,14 +749,32 @@ async function testConnection(connectionId) {
         };
     } else {
         const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
-        const resp = await fetch(`${GRAPH_BASE}/me/messages?$top=1&$select=subject,from,receivedDateTime,body`, {
-            headers: { 'Authorization': `Bearer ${fakeSession.accessToken}` },
-        });
-        if (!resp.ok) throw new Error(`Outlook test failed: ${resp.status}`);
-        const data = await resp.json();
-        if (!data.value?.length) return { success: true, message: 'Mailbox is empty', preview: null };
+        const outlookFolders = connection.folder_filter || ['Inbox'];
+        let filterQ = '';
+        if (connection.sync_after_date) {
+            filterQ = `$filter=${encodeURIComponent(`receivedDateTime ge ${new Date(connection.sync_after_date).toISOString()}`)}&`;
+        }
 
-        const msg = data.value[0];
+        // Try first folder, fallback to all messages
+        let msg;
+        try {
+            const resp = await fetch(`${GRAPH_BASE}/me/mailFolders/${encodeURIComponent(outlookFolders[0])}/messages?${filterQ}$top=1&$orderby=receivedDateTime desc&$select=subject,from,receivedDateTime,body`, {
+                headers: { 'Authorization': `Bearer ${connection.tokens.accessToken}` },
+            });
+            if (!resp.ok) throw new Error(resp.status);
+            const data = await resp.json();
+            msg = data.value?.[0];
+        } catch {
+            const resp = await fetch(`${GRAPH_BASE}/me/messages?${filterQ}$top=1&$orderby=receivedDateTime desc&$select=subject,from,receivedDateTime,body`, {
+                headers: { 'Authorization': `Bearer ${connection.tokens.accessToken}` },
+            });
+            if (!resp.ok) throw new Error(`Outlook test failed: ${resp.status}`);
+            const data = await resp.json();
+            msg = data.value?.[0];
+        }
+
+        if (!msg) return { success: true, message: 'No emails found matching your filters', preview: null };
+
         testEmail = {
             subject: msg.subject,
             from: msg.from?.emailAddress ? `${msg.from.emailAddress.name} <${msg.from.emailAddress.address}>` : '',
