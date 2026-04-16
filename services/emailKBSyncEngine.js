@@ -73,6 +73,40 @@ function getIngestionMode(connection) {
     return 'category_merge';
 }
 
+/**
+ * Run an async mapper across `items` with a concurrency cap.
+ *
+ * Each slot processes items sequentially; `concurrency` slots run in parallel.
+ * Results preserve input order. Errors are captured per-item (returned as
+ * `{ __error: err, __index: i }`) so one bad email doesn't abort the batch.
+ *
+ * If `shouldAbort()` starts returning true (e.g. persistent 429), in-flight
+ * workers finish their current item but no new items are dispatched — the
+ * remaining items come back as `{ __aborted: true }`.
+ */
+async function parallelMap(items, concurrency, fn, shouldAbort = () => false) {
+    const out = new Array(items.length);
+    let cursor = 0;
+    const worker = async () => {
+        while (true) {
+            if (shouldAbort()) break;
+            const i = cursor++;
+            if (i >= items.length) break;
+            try {
+                out[i] = await fn(items[i], i);
+            } catch (err) {
+                out[i] = { __error: err, __index: i };
+            }
+        }
+    };
+    const n = Math.max(1, Math.min(concurrency, items.length));
+    await Promise.all(Array.from({ length: n }, worker));
+    for (let i = 0; i < items.length; i++) {
+        if (out[i] === undefined) out[i] = { __aborted: true, __index: i };
+    }
+    return out;
+}
+
 // ──────────────────────────────────────────────
 // Retry helper for transient failures
 // ──────────────────────────────────────────────
@@ -248,56 +282,70 @@ async function syncGmailConnection(connection) {
             }
         }
     } else {
-        // Process individual emails
-        for (const msg of messageIds) {
-            try {
-                const detail = await withRetry(() => gmail.users.messages.get({
-                    userId: 'me',
-                    id: msg.id,
-                    format: 'full',
-                }), `gmail.get(${msg.id})`);
+        // Process individual emails in parallel. The bottleneck is either the
+        // Gmail API (per_email mode) or the AI provider (category_merge mode);
+        // both tolerate a handful of concurrent callers. If we hit a hard 429
+        // we set `rateLimited` so remaining workers finish their current item
+        // and stop scheduling new ones — the next sync cycle picks up the rest.
+        const concurrency = Math.max(1, Math.min(10, connection.pipeline_config?.article?.concurrency || 5));
+        let rateLimited = false;
+        const processOpts = buildProcessOptions(connection);
 
-                const headers = detail.data.payload?.headers || [];
-                const msgDate = getGmailHeader(headers, 'Date');
-                if (msgDate && (!results.newestDate || new Date(msgDate) > new Date(results.newestDate))) {
-                    results.newestDate = msgDate;
-                }
-                const body = extractGmailTextBody(detail.data.payload);
+        const perItem = async (msg) => {
+            const detail = await withRetry(() => gmail.users.messages.get({
+                userId: 'me',
+                id: msg.id,
+                format: 'full',
+            }), `gmail.get(${msg.id})`);
 
-                const metadata = {
-                    subject: getGmailHeader(headers, 'Subject'),
-                    from: getGmailHeader(headers, 'From'),
-                    to: getGmailHeader(headers, 'To'),
-                    cc: getGmailHeader(headers, 'Cc'),
-                    date: getGmailHeader(headers, 'Date'),
-                    messageId: msg.id,
-                    threadId: detail.data.threadId,
-                    labels: detail.data.labelIds,
-                };
+            const headers = detail.data.payload?.headers || [];
+            const body = extractGmailTextBody(detail.data.payload);
+            const metadata = {
+                subject: getGmailHeader(headers, 'Subject'),
+                from: getGmailHeader(headers, 'From'),
+                to: getGmailHeader(headers, 'To'),
+                cc: getGmailHeader(headers, 'Cc'),
+                date: getGmailHeader(headers, 'Date'),
+                messageId: msg.id,
+                threadId: detail.data.threadId,
+                labels: detail.data.labelIds,
+            };
 
-                const processed = ingestionMode === 'per_email'
-                    ? buildPerEmailArticle(body, metadata, buildProcessOptions(connection))
-                    : await processEmail(body, metadata, buildProcessOptions(connection));
+            const processed = ingestionMode === 'per_email'
+                ? buildPerEmailArticle(body, metadata, processOpts)
+                : await processEmail(body, metadata, processOpts);
 
-                if (!processed.success) {
-                    results.skipped++;
-                    const skipLabel = processed.reason || 'unknown';
-                    console.log(`[EmailKBSync] Skipped: ${skipLabel}`);
-                    results.errorDetails.push(`Skipped: ${skipLabel}`);
+            return { msgId: msg.id, msgDate: metadata.date, processed };
+        };
+
+        const settled = await parallelMap(messageIds, concurrency, perItem, () => rateLimited);
+
+        for (const r of settled) {
+            if (r?.__aborted) {
+                results.skipped++;
+                continue;
+            }
+            if (r?.__error) {
+                const err = r.__error;
+                if (err.message?.includes('429') || err.code === 429) {
+                    rateLimited = true;
+                    results.errorDetails.push('Rate limited — will retry next cycle');
                     continue;
                 }
-
-                results.processedArticles.push(processed);
-                results.created++;
-            } catch (procErr) {
-                if (procErr.message?.includes('429') || procErr.code === 429) {
-                    results.errorDetails.push('Rate limited by Gmail API — will retry next cycle');
-                    break;
-                } else {
-                    results.errors++;
-                    results.errorDetails.push(`Msg ${msg.id}: ${procErr.message}`);
-                }
+                results.errors++;
+                results.errorDetails.push(`Msg ${messageIds[r.__index]?.id}: ${err.message}`);
+                continue;
             }
+            if (r.msgDate && (!results.newestDate || new Date(r.msgDate) > new Date(results.newestDate))) {
+                results.newestDate = r.msgDate;
+            }
+            if (!r.processed.success) {
+                results.skipped++;
+                results.errorDetails.push(`Skipped: ${r.processed.reason || 'unknown'}`);
+                continue;
+            }
+            results.processedArticles.push(r.processed);
+            results.created++;
         }
     }
 
@@ -524,48 +572,60 @@ async function syncOutlookConnection(connection) {
             }
         }
     } else {
-        for (const msg of messages) {
-            try {
-                const fromStr = msg.from?.emailAddress
-                    ? `${msg.from.emailAddress.name || ''} <${msg.from.emailAddress.address}>`
-                    : '';
+        // Process individual messages in parallel (see syncGmailConnection for rationale).
+        const concurrency = Math.max(1, Math.min(10, connection.pipeline_config?.article?.concurrency || 5));
+        let rateLimited = false;
+        const processOpts = buildProcessOptions(connection);
 
-                const toStr = Array.isArray(msg.toRecipients)
-                    ? msg.toRecipients.map(r => r.emailAddress?.address).filter(Boolean).join(', ')
-                    : '';
+        const perItem = async (msg) => {
+            const fromStr = msg.from?.emailAddress
+                ? `${msg.from.emailAddress.name || ''} <${msg.from.emailAddress.address}>`
+                : '';
+            const toStr = Array.isArray(msg.toRecipients)
+                ? msg.toRecipients.map(r => r.emailAddress?.address).filter(Boolean).join(', ')
+                : '';
 
-                const metadata = {
-                    subject: msg.subject,
-                    from: fromStr,
-                    to: toStr,
-                    date: msg.receivedDateTime,
-                    messageId: msg.id,
-                    threadId: msg.conversationId,
-                };
+            const metadata = {
+                subject: msg.subject,
+                from: fromStr,
+                to: toStr,
+                date: msg.receivedDateTime,
+                messageId: msg.id,
+                threadId: msg.conversationId,
+            };
 
-                const processed = ingestionMode === 'per_email'
-                    ? buildPerEmailArticle(msg.body?.content || '', metadata, buildProcessOptions(connection))
-                    : await processEmail(msg.body?.content || '', metadata, buildProcessOptions(connection));
+            const processed = ingestionMode === 'per_email'
+                ? buildPerEmailArticle(msg.body?.content || '', metadata, processOpts)
+                : await processEmail(msg.body?.content || '', metadata, processOpts);
 
-                if (!processed.success) {
-                    results.skipped++;
-                    const skipLabel = processed.reason || 'unknown';
-                    console.log(`[EmailKBSync] Skipped: ${skipLabel}`);
-                    results.errorDetails.push(`Skipped: ${skipLabel}`);
+            return { msgId: msg.id, processed };
+        };
+
+        const settled = await parallelMap(messages, concurrency, perItem, () => rateLimited);
+
+        for (const r of settled) {
+            if (r?.__aborted) {
+                results.skipped++;
+                continue;
+            }
+            if (r?.__error) {
+                const err = r.__error;
+                if (err.message?.includes('429')) {
+                    rateLimited = true;
+                    results.errorDetails.push('Rate limited by Microsoft Graph — will retry next cycle');
                     continue;
                 }
-
-                results.processedArticles.push(processed);
-                results.created++;
-            } catch (procErr) {
-                if (procErr.message?.includes('429')) {
-                    results.errorDetails.push('Rate limited by Microsoft Graph — will retry next cycle');
-                    break;
-                } else {
-                    results.errors++;
-                    results.errorDetails.push(`Msg ${msg.id}: ${procErr.message}`);
-                }
+                results.errors++;
+                results.errorDetails.push(`Msg ${messages[r.__index]?.id}: ${err.message}`);
+                continue;
             }
+            if (!r.processed.success) {
+                results.skipped++;
+                results.errorDetails.push(`Skipped: ${r.processed.reason || 'unknown'}`);
+                continue;
+            }
+            results.processedArticles.push(r.processed);
+            results.created++;
         }
     }
 
