@@ -1039,11 +1039,16 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                     if (textPart) textPart.text = piiResult.tokenizedText;
                 }
                 piiTokenMap = piiResult.tokenMap;
+                // Register on the shared DLP conversation-token store so the streaming
+                // un-tokeniser restores these values on the way back even when DLP
+                // itself is disabled.
+                try { require('../../core/dlp/dlpRunner').mergeTokenMap(convId, piiResult.tokenMap); } catch (_) { /* non-fatal */ }
                 const tokenList = Object.entries(piiResult.tokenMap).map(([t, v]) => `${t}=“${v.slice(0,15)}”`).join(', ');
                 console.warn(`[DirectChat] 🔒 PII tokenized (${Object.keys(piiResult.tokenMap).length} tokens): ${tokenList}`);
 
-                // Tell the AI about the tokenization so it can reference them properly
-                messages[0].content += `\n\n[PII TOKENIZATION ACTIVE: Some sensitive data in the user's message has been replaced with placeholder tokens like [PII:iban:1]. When referencing this data in your response, use the same token (e.g. [PII:iban:1]) and the system will automatically restore the real value for the user. Never reveal or guess the actual values.`;
+                // Tell the AI about the tokenization so it can reference them properly.
+                // Tokens look like `[email_1]`, `[phone_2]`, `[iban_1]` — see azurePiiDetection.js.
+                messages[0].content += `\n\n[PII TOKENIZATION ACTIVE: Some sensitive data in the user's message has been replaced with placeholder tokens like [email_1] or [phone_2]. When referring to these values in your response, use the SAME tokens — the system restores the real value for the user automatically. Never invent values; never reveal the token map.]`;
 
                 send('pii_tokenized', {
                     entities: piiResult.entities.map(e => ({ label: e.label, category: e.category })),

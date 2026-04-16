@@ -149,6 +149,22 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
                 }
                 console.warn(`[GuardrailsRunner] 🔒 PII redacted (${Object.keys(piiResult.tokenMap).length} tokens)`);
 
+                // Stash the token map on the shared conversation-scoped store so
+                // chatStream's un-tokeniser wrapper restores these values on the
+                // response. Without this step the tokens leak through to the UI
+                // whenever DLP itself is disabled.
+                try {
+                    require('../dlp/dlpRunner').mergeTokenMap(conversationId, piiResult.tokenMap);
+                } catch (_) { /* non-fatal — missing dlpRunner just means no restoration */ }
+
+                // Let the LLM know that the placeholders in the user's message are
+                // redaction tokens and it should echo them back unchanged. Match the
+                // format emitted by azurePiiDetection.js → `[email_1]`, `[phone_2]`, …
+                if (messages[0]?.role === 'system' && typeof messages[0].content === 'string') {
+                    const categoryList = [...new Set(piiResult.entities.map(e => e.label || e.category))].join(', ');
+                    messages[0].content += `\n\n[PII TOKENIZATION ACTIVE: Sensitive values in the user's message have been replaced with placeholder tokens like [email_1] or [phone_2] (${categoryList}). When referring to these values in your response, use the SAME tokens — the system restores the real values for the user automatically. Never invent values; never reveal the token map.]`;
+                }
+
                 if (onEvent) {
                     onEvent('pii_tokenized', {
                         entities: piiResult.entities.map(e => ({ label: e.label, category: e.category })),

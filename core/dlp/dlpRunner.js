@@ -297,9 +297,31 @@ function applyRedactionChoice({ conversationId, text, findings }) {
     return { tokenizedText, tokenMap, summary };
 }
 
+/**
+ * Public helper: merge an externally-built tokenMap into the conversation's
+ * shared store so the streaming un-tokeniser (wrapped around `onEvent` in
+ * chatStream.js) can restore these tokens on the response.
+ *
+ * Used by the legacy PII path in `guardrailsRunner.js` and by direct chat,
+ * both of which produce their own tokenMap but historically dropped it after
+ * rewriting the user message — which meant tokens leaked through to the user
+ * when DLP itself was disabled.
+ */
+function mergeTokenMap(conversationId, tokenMap) {
+    if (!conversationId || !tokenMap) return;
+    if (tokenMap instanceof Map) {
+        const asObject = {};
+        for (const [k, v] of tokenMap) asObject[k] = v;
+        _mergeIntoTokenMap(conversationId, asObject);
+    } else {
+        _mergeIntoTokenMap(conversationId, tokenMap);
+    }
+}
+
 module.exports = {
     scan,
     applyRedactionChoice,
+    mergeTokenMap,
     getConversationTokenMap,
     clearConversationState,
     setConversationPref,

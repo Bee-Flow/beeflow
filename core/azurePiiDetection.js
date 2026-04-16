@@ -212,9 +212,13 @@ function tokenizeText(text, entities) {
 
     let tokenized = text;
     for (const entity of sorted) {
+        // Human-friendly token format — `[email_1]`, `[phone_2]`, … — easier
+        // for the LLM to echo back verbatim than the old `[PII:email:1]`.
+        // The restore path is format-agnostic (see server/core/dlp/untokeniseStream.js),
+        // so this change is backwards-compatible with any tokens still in flight.
         const catKey = (entity.category || 'data').toLowerCase().replace(/[^a-z0-9]/g, '_');
         counters[catKey] = (counters[catKey] || 0) + 1;
-        const token = `[PII:${catKey}:${counters[catKey]}]`;
+        const token = `[${catKey}_${counters[catKey]}]`;
         tokenMap[token] = entity.text;
         // Replace the exact span (using offset if available, else string replace)
         if (entity.offset !== undefined && entity.offset >= 0) {
