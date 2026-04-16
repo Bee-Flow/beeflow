@@ -222,6 +222,53 @@ router.put('/:orgId', requireAuth, async (req, res) => {
 });
 
 
+// GET /:orgId/effective — inspection-only view of the config the runtime
+// actually sees for this org. Useful after a deploy to verify that custom
+// deploys aren't stuck on a legacy config shape, or that PII/DLP is
+// really enabled (not just toggled in the UI). Mirrors what
+// `resolveOrgShield` returns — same fields, same defaults, same warnings.
+router.get('/:orgId/effective', requireAuth, async (req, res) => {
+    try {
+        const { orgId } = req.params;
+        const orgIds = await resolveUserOrgIds(req);
+        const isMember = orgIds === null || (orgIds && orgIds.has(orgId));
+        if (!isMember) return res.status(403).json({ error: 'Not a member of this organization' });
+
+        const raw = await configStore.getConfig(`org_privacy_shield_${orgId}`);
+        const { resolveOrgShield } = require('../core/orgShield');
+        const resolved = await resolveOrgShield(orgId);
+        const summary = resolved ? {
+            shieldEnabled: resolved.enabled,
+            moderationEnabled: resolved.moderationEnabled,
+            moderationProvider: resolved.moderationProvider,
+            piiEnabled: resolved.azurePiiEnabled,
+            dlpEnabled: resolved.dlpEnabled,
+            privacyScanEnabled: resolved.privacyScanEnabled,
+            privacyAction: resolved.privacyAction,
+            privacyScope: resolved.privacyScope,
+            customTermsCount: (resolved.customSensitiveTerms || []).length,
+            stalenessWarnings: resolved.stalenessWarnings || [],
+        } : { shieldEnabled: false };
+
+        const rawShape = raw && typeof raw === 'object' ? {
+            hasPrivacyScanEnabled: 'privacyScanEnabled' in raw,
+            hasAzurePiiEnabled: 'azurePiiEnabled' in raw,
+            hasDlpEnabled: 'dlpEnabled' in raw,
+            hasPiiDetectionAction: 'piiDetectionAction' in raw,
+            hasDlpMode: 'dlpMode' in raw,
+            legacyShape: ('azurePiiEnabled' in raw || 'piiDetectionAction' in raw) && !('privacyScanEnabled' in raw),
+            updatedAt: raw.updatedAt || null,
+            updatedBy: raw.updatedBy || null,
+        } : null;
+
+        res.json({ orgId, summary, rawShape, resolved });
+    } catch (e) {
+        console.error('[OrgPrivacyShield] GET effective error:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+
 // ═══════════════════════════════════════
 //  User-level Privacy Shield (Consumer Accounts)
 // ═══════════════════════════════════════

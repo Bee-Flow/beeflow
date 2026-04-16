@@ -214,18 +214,51 @@ async function selfCheckOrgShields() {
             return;
         }
         let ok = 0, warnings = 0;
-        for (const [key] of entries) {
+        // Running totals across all orgs so operators can see at a glance which
+        // privacy features are actually active in this deployment. This is the
+        // one place to notice "customer deploys without PII enabled" at a glance.
+        const fleet = {
+            total: entries.length,
+            shieldEnabled: 0,
+            moderationEnabled: 0,
+            providerLlama: 0,
+            providerAzure: 0,
+            piiEnabled: 0,
+            dlpEnabled: 0,
+            privacyScanEnabled: 0,
+            euMode: 0,
+            monitorIntegrations: 0,
+            legacyShape: 0,
+        };
+        for (const [key, rawShield] of entries) {
             const orgId = key.replace(/^org_privacy_shield_/, '');
             try {
                 const resolved = await resolveOrgShield(orgId);
                 if (!resolved) continue; // shield disabled
+                fleet.shieldEnabled++;
+                if (resolved.moderationEnabled) fleet.moderationEnabled++;
+                if (resolved.moderationProvider === 'azure') fleet.providerAzure++;
+                else fleet.providerLlama++;
+                if (resolved.azurePiiEnabled) fleet.piiEnabled++;
+                if (resolved.dlpEnabled) fleet.dlpEnabled++;
+                if (resolved.privacyScanEnabled) fleet.privacyScanEnabled++;
+                if (resolved.euModeEnabled) fleet.euMode++;
+                if (resolved.monitorIntegrations) fleet.monitorIntegrations++;
+                // Detect the "legacy shape" — old storage keys without the new
+                // canonical names. An operator seeing a high count here knows
+                // those orgs must be re-saved once through the new UI before
+                // their config cleans up.
+                const isLegacy = rawShield && typeof rawShield === 'object'
+                    && (('azurePiiEnabled' in rawShield || 'piiDetectionAction' in rawShield)
+                        && !('privacyScanEnabled' in rawShield));
+                if (isLegacy) fleet.legacyShape++;
+
                 if (resolved.stalenessWarnings?.length) {
                     warnings += resolved.stalenessWarnings.length;
                     for (const w of resolved.stalenessWarnings) {
                         console.warn(`[OrgShieldSelfCheck] org=${orgId} stale reference:`, w);
                     }
                 }
-                // Validate custom-term regexes so a bad one doesn't surface only at request-time.
                 for (const term of resolved.customSensitiveTerms || []) {
                     if (term.type !== 'regex') continue;
                     try { new RegExp(term.pattern, term.caseSensitive ? '' : 'i'); }
@@ -240,7 +273,17 @@ async function selfCheckOrgShields() {
                 console.warn(`[OrgShieldSelfCheck] org=${orgId} resolve error: ${err.message}`);
             }
         }
-        console.log(`[OrgShieldSelfCheck] Scanned ${entries.length} org shield(s) — ${ok} OK, ${warnings} warning(s).`);
+        console.log(
+            `[OrgShieldSelfCheck] ${entries.length} shield(s) scanned — ${ok} OK, ${warnings} warning(s). ` +
+            `Fleet: shield=${fleet.shieldEnabled}/${fleet.total}, moderation=${fleet.moderationEnabled} ` +
+            `(llama=${fleet.providerLlama}, azure=${fleet.providerAzure}), ` +
+            `pii=${fleet.piiEnabled}, dlp=${fleet.dlpEnabled}, privacyScan=${fleet.privacyScanEnabled}, ` +
+            `euMode=${fleet.euMode}, monitorIntegrations=${fleet.monitorIntegrations}, ` +
+            `legacyShape=${fleet.legacyShape}.`
+        );
+        if (fleet.legacyShape > 0) {
+            console.log(`[OrgShieldSelfCheck] \u26A0\uFE0F ${fleet.legacyShape} org(s) still on legacy shape. They work via read-time mapping; re-save once through the admin UI to normalise.`);
+        }
     } catch (err) {
         console.warn('[OrgShieldSelfCheck] Self-check failed:', err.message);
     }
