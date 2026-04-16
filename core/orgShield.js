@@ -84,6 +84,11 @@ async function resolveOrgShield(orgId) {
         webSearchGuardEnabled: !!shield.webSearchGuardEnabled,
         disableSearchOnUpload: !!shield.disableSearchOnUpload,
         monitorIntegrations: !!shield.monitorIntegrations,
+        // Transparency: when true, the chat stream emits the tokenised outbound
+        // prompt and the raw (pre-un-tokenise) LLM response as SSE events so
+        // the user's "How I got this answer" panel can display exactly what
+        // the AI saw and said. Default off so orgs have to opt in.
+        showRawPayload: !!shield.showRawPayload,
         // The Web-Search Guard PII filter used to maintain its own separate
         // category list, which drifted from the main PII list. The new
         // contract: if Web-Search Guard is enabled and the admin hasn't

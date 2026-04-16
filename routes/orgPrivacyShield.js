@@ -126,7 +126,9 @@ router.put('/:orgId', requireAuth, async (req, res) => {
 
         const { enabled, collectionIds, scope, action, moderationEnabled, moderationProvider, moderationCategories, euModeEnabled, webSearchGuardEnabled, disableSearchOnUpload, azurePiiEnabled, azureSeverityThreshold, azureEnabledCategories, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionAction, webSearchGuardPiiCategories, monitorIntegrations,
             // DLP
-            dlpEnabled, dlpScope, dlpMode, dlpFailureMode, dlpAllowlistedHosts, customSensitiveTerms } = req.body;
+            dlpEnabled, dlpScope, dlpMode, dlpFailureMode, dlpAllowlistedHosts, customSensitiveTerms,
+            // Transparency
+            showRawPayload } = req.body;
 
         // Validate every custom term's regex. Report ALL invalid terms at once
         // so the admin doesn't need to fix-save-fix-save through a dozen regex
@@ -193,6 +195,7 @@ router.put('/:orgId', requireAuth, async (req, res) => {
             dlpFailureMode: dlpFailureMode === 'fail_open' ? 'fail_open' : 'fail_closed',
             dlpAllowlistedHosts: Array.isArray(dlpAllowlistedHosts) ? dlpAllowlistedHosts.slice(0, 50).map(String) : [],
             customSensitiveTerms: sanitizedTerms,
+            showRawPayload: !!showRawPayload,
             updatedAt: new Date().toISOString(),
             updatedBy: req.session.user.id,
         };
@@ -242,6 +245,11 @@ router.get('/:orgId/effective', requireAuth, async (req, res) => {
             moderationEnabled: resolved.moderationEnabled,
             moderationProvider: resolved.moderationProvider,
             piiEnabled: resolved.azurePiiEnabled,
+            piiCategoriesCount: (resolved.piiDetectionCategories || []).length,
+            piiConfidenceThreshold: resolved.piiDetectionConfidenceThreshold,
+            piiConfidenceWarning: resolved.piiDetectionConfidenceThreshold >= 0.85
+                ? 'Threshold is unusually high; Azure may return detections below this value. Lower to 0.70 if PII does not fire.'
+                : null,
             dlpEnabled: resolved.dlpEnabled,
             privacyScanEnabled: resolved.privacyScanEnabled,
             privacyAction: resolved.privacyAction,

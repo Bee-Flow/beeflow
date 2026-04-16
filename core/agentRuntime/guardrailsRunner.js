@@ -162,7 +162,12 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
                 // format emitted by azurePiiDetection.js → `[email_1]`, `[phone_2]`, …
                 if (messages[0]?.role === 'system' && typeof messages[0].content === 'string') {
                     const categoryList = [...new Set(piiResult.entities.map(e => e.label || e.category))].join(', ');
-                    messages[0].content += `\n\n[PII TOKENIZATION ACTIVE: Sensitive values in the user's message have been replaced with placeholder tokens like [email_1] or [phone_2] (${categoryList}). When referring to these values in your response, use the SAME tokens — the system restores the real values for the user automatically. Never invent values; never reveal the token map.]`;
+                    messages[0].content += `\n\n[PRIVACY MODE ACTIVE — strict rules (${categoryList}):
+- Sensitive values in the user's message and retrieved memories have been replaced with placeholders like [email_1], [phone_2] or [iban_1].
+- When referring to these values in your response, write the SAME placeholder verbatim. The system restores the real value for the user automatically.
+- DO NOT infer, guess, describe, or reveal any property of the underlying data — no digits, no check-codes, no institution names, no country codes derived from the placeholder, no example values, no "it starts with…".
+- If the user asks a question whose answer would require those inferred properties (e.g. "which bank is my IBAN from?"), answer based only on what YOU can see: placeholders. Say you cannot determine the answer from the protected data and suggest the user check directly.
+- Never invent values; never reveal the token map.]`;
                 }
 
                 if (onEvent) {
@@ -170,6 +175,19 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
                         entities: piiResult.entities.map(e => ({ label: e.label, category: e.category })),
                         tokenCount: Object.keys(piiResult.tokenMap).length,
                     });
+
+                    // Transparency: when the org enables `showRawPayload`, also
+                    // emit the exact tokenised string that's about to be sent
+                    // to the LLM. The user's "How I got this answer" panel uses
+                    // this to show the real outbound payload. Opt-in per org.
+                    if (orgShield?.showRawPayload && piiResult.tokenizedText) {
+                        onEvent('privacy_payload', {
+                            tokenizedPrompt: piiResult.tokenizedText,
+                            provider: model || null,
+                            source: 'pii',
+                            timestamp: Date.now(),
+                        });
+                    }
                 }
 
                 // Log PII redact event (fire-and-forget)

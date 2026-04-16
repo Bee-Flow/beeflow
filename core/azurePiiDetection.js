@@ -462,7 +462,26 @@ async function validateInputForPii(messages, agentPiiEnabled = false, orgShieldC
         cacheSet(key, result);
 
         if (!result.hasPii) {
-            console.log(`[PiiDetection] ✅ Input clean | ${ms}ms`);
+            console.log(`[PiiDetection] ✅ Input clean | ${ms}ms | threshold ≥ ${confidenceThreshold}`);
+            // A very common misconfiguration: admin slid the confidence threshold
+            // to 0.9+ which filters out almost every detection Azure returns for
+            // short prompts (typical confidence range: 0.70–0.85). Emit a loud
+            // hint when the prompt *looks* like it contains PII but the scan
+            // came back clean with a high threshold, so operators can diagnose
+            // the "PII works on dev but not on customer" class of tickets.
+            if (confidenceThreshold >= 0.85) {
+                const looksLikeEmail = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/.test(inputText);
+                const looksLikePhone = /(?:\+?\d[\s-]?){8,}/.test(inputText);
+                const looksLikeIban  = /\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b/.test(inputText);
+                const looksLikePii   = looksLikeEmail || looksLikePhone || looksLikeIban;
+                if (looksLikePii) {
+                    const hints = [];
+                    if (looksLikeEmail) hints.push('email');
+                    if (looksLikePhone) hints.push('phone');
+                    if (looksLikeIban) hints.push('IBAN');
+                    console.warn(`[PiiDetection] ⚠️  Input contains likely PII (${hints.join(', ')}) but threshold is ${confidenceThreshold}. Azure typically returns 0.70–0.85 confidence for short texts; lower the threshold to 0.70 if you expect detections. (Org Privacy Shield → PII Detection → Confidence Threshold)`);
+                }
+            }
             return null;
         }
 

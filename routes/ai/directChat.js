@@ -1048,12 +1048,28 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
 
                 // Tell the AI about the tokenization so it can reference them properly.
                 // Tokens look like `[email_1]`, `[phone_2]`, `[iban_1]` — see azurePiiDetection.js.
-                messages[0].content += `\n\n[PII TOKENIZATION ACTIVE: Some sensitive data in the user's message has been replaced with placeholder tokens like [email_1] or [phone_2]. When referring to these values in your response, use the SAME tokens — the system restores the real value for the user automatically. Never invent values; never reveal the token map.]`;
+                messages[0].content += `\n\n[PRIVACY MODE ACTIVE — strict rules:
+- Sensitive values in the user's message and retrieved memories have been replaced with placeholders like [email_1], [phone_2], [iban_1] or [internationalbankingaccountnumber_1].
+- When referring to these values in your response, write the SAME placeholder verbatim. The system restores the real value for the user automatically.
+- DO NOT infer, guess, describe, or reveal any property of the underlying data — no digits, no check-codes, no institution names, no country codes derived from the placeholder, no example values, no "it starts with…".
+- If the user asks a question whose answer would require those inferred properties (e.g. "which bank is my IBAN from?"), answer based only on what YOU can see: placeholders. Say you cannot determine the answer from the protected data and suggest the user check directly.
+- Never invent values; never reveal the token map.]`;
 
                 send('pii_tokenized', {
                     entities: piiResult.entities.map(e => ({ label: e.label, category: e.category })),
                     tokenCount: Object.keys(piiResult.tokenMap).length,
                 });
+
+                // Transparency: when enabled per-org, surface the exact tokenised
+                // outbound string so the user can verify what the LLM received.
+                if (orgShield?.showRawPayload) {
+                    send('privacy_payload', {
+                        tokenizedPrompt: piiResult.tokenizedText,
+                        provider: modelId || null,
+                        source: 'pii',
+                        timestamp: Date.now(),
+                    });
+                }
 
                 // Log PII tokenize event (fire-and-forget)
                 guardrailEventStore.logGuardrailEvent({
@@ -1166,6 +1182,14 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                     automatic: true,
                     decisionMs: Date.now() - scanStart,
                 });
+                if (resolvedShield?.showRawPayload && dlpResult.redactedText) {
+                    send('privacy_payload', {
+                        tokenizedPrompt: dlpResult.redactedText,
+                        provider: modelId || null,
+                        source: 'dlp',
+                        timestamp: Date.now(),
+                    });
+                }
                 guardrailEventStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'redacted' }).catch(() => {});
             } else if (dlpResult.action === 'ask') {
                 const { decisionId, promise } = decisionQueue.register({ conversationId: convId, userId });
@@ -1215,6 +1239,14 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                         automatic: false,
                         decisionMs: Date.now() - scanStart,
                     });
+                    if (resolvedShield?.showRawPayload && tokenizedText) {
+                        send('privacy_payload', {
+                            tokenizedPrompt: tokenizedText,
+                            provider: modelId || null,
+                            source: 'dlp',
+                            timestamp: Date.now(),
+                        });
+                    }
                     guardrailEventStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'redacted' }).catch(() => {});
                 } else {
                     // 'allow'
@@ -2105,6 +2137,20 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         if (!fullContent.trim() && toolCallRounds > 0) {
             fullContent = 'Done ✓';
             send('content', { text: fullContent });
+        }
+
+        // Transparency: emit the raw (pre-un-tokenise) response once per turn
+        // when the org has `showRawPayload` on. Capture BEFORE restoreTokens
+        // runs so the user can see the exact string the LLM produced. Capped
+        // at 64 KB with ellipsis truncation. Gated strictly by org opt-in.
+        if (orgShield?.showRawPayload && fullContent) {
+            const RAW_BUFFER_MAX = 64 * 1024;
+            const truncated = fullContent.length > RAW_BUFFER_MAX;
+            send('privacy_response_raw', {
+                rawResponse: truncated ? fullContent.slice(0, RAW_BUFFER_MAX) + '…' : fullContent,
+                truncated,
+                timestamp: Date.now(),
+            });
         }
 
         // ─── PII Token Restoration ──────────────────────────────────

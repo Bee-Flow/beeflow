@@ -599,6 +599,14 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 automatic: true,
                 decisionMs: scanMs,
             });
+            if (dlpShield?.showRawPayload && dlpResult.redactedText) {
+                onEvent?.('privacy_payload', {
+                    tokenizedPrompt: dlpResult.redactedText,
+                    provider: modelToUse,
+                    source: 'dlp',
+                    timestamp: Date.now(),
+                });
+            }
             dlpStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'redacted' }).catch(() => {});
         } else if (dlpResult.action === 'ask') {
             // Surface findings to the user and pause until they choose.
@@ -660,6 +668,14 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     automatic: false,
                     decisionMs: Date.now() - scanStart,
                 });
+                if (dlpShield?.showRawPayload && tokenizedText) {
+                    onEvent?.('privacy_payload', {
+                        tokenizedPrompt: tokenizedText,
+                        provider: modelToUse,
+                        source: 'dlp',
+                        timestamp: Date.now(),
+                    });
+                }
                 dlpStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'redacted' }).catch(() => {});
             } else {
                 // 'allow' — user chose to send raw. Still log (compliance audit).
@@ -683,6 +699,14 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     // If the conversation has any redacted tokens (from this turn or an earlier
     // one), transparently replace them with the real values in every `content`
     // chunk before it hits the client. Any other event is forwarded unchanged.
+    //
+    // When the org enables `showRawPayload`, we also accumulate the *raw*
+    // (pre-un-tokenise) response text so we can emit `privacy_response_raw` at
+    // the end of the turn. That lets the "How I got this answer" panel show the
+    // exact string the LLM produced.
+    let _rawResponseBuffer = '';
+    const _captureRaw = !!dlpShield?.showRawPayload;
+    const RAW_BUFFER_MAX = 64 * 1024; // cap at 64 KB per turn, then truncate.
     {
         const _dlpConvMap = require('../dlp/dlpRunner').getConversationTokenMap(conversation?.id);
         if (_dlpConvMap && Object.keys(_dlpConvMap).length > 0) {
@@ -691,6 +715,12 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             const _rawOnEvent = onEvent;
             onEvent = (type, data) => {
                 if (type === 'content' && data && typeof data.text === 'string') {
+                    if (_captureRaw && _rawResponseBuffer.length < RAW_BUFFER_MAX) {
+                        _rawResponseBuffer += data.text;
+                        if (_rawResponseBuffer.length > RAW_BUFFER_MAX) {
+                            _rawResponseBuffer = _rawResponseBuffer.slice(0, RAW_BUFFER_MAX) + '…';
+                        }
+                    }
                     const safe = _ut.push(data.text);
                     if (safe) _rawOnEvent(type, { ...data, text: safe });
                     return;
@@ -699,6 +729,22 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 // whatever is buffered so we never leave a partial token dangling.
                 const tail = _ut.flush();
                 if (tail) _rawOnEvent('content', { text: tail });
+                _rawOnEvent(type, data);
+            };
+        } else if (_captureRaw) {
+            // No token map (no redaction happened) — we still want to capture the
+            // raw response so the admin / user can inspect "what the AI said"
+            // even when tokenisation didn't fire this turn. Minimal wrapper.
+            const _rawOnEvent = onEvent;
+            onEvent = (type, data) => {
+                if (type === 'content' && data && typeof data.text === 'string') {
+                    if (_rawResponseBuffer.length < RAW_BUFFER_MAX) {
+                        _rawResponseBuffer += data.text;
+                        if (_rawResponseBuffer.length > RAW_BUFFER_MAX) {
+                            _rawResponseBuffer = _rawResponseBuffer.slice(0, RAW_BUFFER_MAX) + '…';
+                        }
+                    }
+                }
                 _rawOnEvent(type, data);
             };
         }
@@ -2020,6 +2066,16 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
 
                 }
             } catch (e) { /* ignore */ }
+        }
+
+        // Transparency: emit the accumulated raw (pre-un-tokenise) LLM
+        // response once per turn, gated by the org's `showRawPayload` toggle.
+        if (_captureRaw && _rawResponseBuffer) {
+            onEvent?.('privacy_response_raw', {
+                rawResponse: _rawResponseBuffer,
+                truncated: _rawResponseBuffer.endsWith('…'),
+                timestamp: Date.now(),
+            });
         }
 
         return {
