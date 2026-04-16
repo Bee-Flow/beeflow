@@ -269,6 +269,7 @@ async function executeTool(toolName, toolArgs, context = {}) {
         return await executeKbSearchTool(toolName, toolArgs, {
             userId,
             agentId,
+            conversationId: context.conversationId,
         });
     }
 

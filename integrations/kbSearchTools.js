@@ -15,32 +15,31 @@ const KB_SEARCH_TOOLS = [
         type: 'function',
         function: {
             name: 'kb_search',
-            description: `Search the internal knowledge base for relevant context, procedures, policies, or examples of previous similar interactions. The KB is organised by CATEGORY (e.g. "Facturatie", "Autorisatie", "Account", "E-mail", "Netwerk", "Hardware", "Applicatie", "Werkplek", "Toegang") — search both the specific topic AND the likely category.
+            description: `Search the internal knowledge base for relevant context, procedures, policies, or previous similar interactions.
 
 WHEN TO USE:
-- ALWAYS before drafting a reply to an email or message about a real topic — even if it seems obvious, there may be a standard procedure or previous response pattern.
-- When the user asks about specific topics, policies, procedures, or factual details.
-- When you need internal context, examples, or precedent for a reply.
+- Before drafting a reply to a question about a real topic, policy, or procedure.
+- When the user asks for specific factual details you don't already have in context.
 
 WHEN TO SKIP:
-- Pure greetings/small-talk ("hi", "thanks", "how are you") — answer directly.
-- Trivial confirmations ("ok", "got it") that need no factual lookup.
+- Greetings / small-talk ("hi", "thanks", "how are you").
+- Trivial confirmations ("ok", "got it").
+- Anything already answered by text in the current message or earlier in this conversation.
 
-SEARCH STRATEGY (multi-query approach — DO multiple searches):
-1. **First search**: 2-4 keyword core topic of the user's question (e.g. "factuur niet ontvangen", "outlook werkt niet").
-2. **Second search**: the likely CATEGORY label in 1 word (e.g. "Facturatie", "E-mail", "Toegang"). KB documents are titled by category.
-3. **Third search (if first two return 0 results)**: broader synonyms or related terms (e.g. if "outlook" failed, try "mail client" or "Microsoft 365").
-
-Do at least 2 searches before concluding nothing relevant exists. The search engine does fuzzy matching but does NOT cross domains — searching "factuur" won't find a doc titled "Facturatie" reliably.
+SEARCH STRATEGY — ONE FOCUSED QUERY BY DEFAULT:
+1. Make a single well-formed keyword query that captures the core topic. If the result is relevant, USE IT and move on — do not run additional searches.
+2. Only run a second search if the first returned zero results. Use broader synonyms or an adjacent category term.
+3. Do NOT run more than 2 searches per user turn. Additional searches waste tokens and delay the user.
 
 QUERY FORMAT:
-- 1-4 keywords. NOT full sentences. NOT email fragments.
+- 2–5 keywords. Not full sentences. Not email fragments.
 - Strip names, dates, and specific identifiers — search the underlying topic.
-- BAD: "Hilverzorg AI update werkt niet meer" → GOOD: "update werkt niet" + "Applicatie"
-- BAD: "Hoi, kun je me helpen met inloggen" → GOOD: "inloggen probleem" + "Account"
+- BAD: "Hilverzorg AI update werkt niet meer" → GOOD: "update werkt niet applicatie"
+- BAD: "Hoi, kun je me helpen met inloggen" → GOOD: "inloggen probleem account"
+- KB docs are often titled by category (e.g. "Facturatie", "Account", "E-mail", "Netwerk", "Hardware", "Applicatie", "Toegang"). Putting a likely category word IN the single query helps — you don't need a separate category-only search.
 
 EMAIL ARCHIVE KBs:
-- If the KB is an email archive (docs titled "{Sender} — {Subject}"), you can also search by sender name/email, subject keywords, or date fragments — the From/To/Date/Subject metadata header is indexed alongside the body.
+- If the KB is an email archive (docs titled "{Sender} — {Subject}"), you can query by sender name/email, subject keywords, or date fragments — the From/To/Date/Subject metadata header is indexed alongside the body.
 - Example queries: "Ewoud fix bevestigd", "invoice mistral maart", "openwebui bug".`,
             parameters: {
                 type: 'object',
@@ -57,12 +56,91 @@ EMAIL ARCHIVE KBs:
                 required: ['query']
             }
         }
-    }
+    },
 ];
+
+// kb_fetch is only exposed to the LLM when KB_PREVIEW_MODE is on. In that
+// mode, kb_search returns only short previews; the agent uses kb_fetch on the
+// 1–3 chunks it wants to quote. Saves ~70 % of tokens on the typical turn.
+const KB_FETCH_TOOL = {
+    type: 'function',
+    function: {
+        name: 'kb_fetch',
+        description: `Fetch the FULL text of up to 3 KB chunks you previewed via kb_search.
+
+WHEN TO USE:
+- After a kb_search, pick at most 3 chunks whose title/section/preview look most relevant to the user's question, and call kb_fetch with their chunk_ids.
+- DO NOT call kb_fetch on every previewed chunk — only the ones you intend to quote / reason over. Each fetched chunk costs ~750 tokens.
+- If the preview already tells you the answer, DO NOT fetch — answer directly.`,
+        parameters: {
+            type: 'object',
+            properties: {
+                chunk_ids: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description: 'chunk_id values from a recent kb_search result. Max 3 per call.',
+                    maxItems: 3
+                }
+            },
+            required: ['chunk_ids']
+        }
+    }
+};
+
+if (process.env.KB_PREVIEW_MODE === 'true') {
+    KB_SEARCH_TOOLS.push(KB_FETCH_TOOL);
+}
 
 // ─── Tool Execution ────────────────────────────────────────────
 
+async function executeKbFetchTool(args, context = {}) {
+    const kbQueryCache = require('../core/agentRuntime/kbQueryCache');
+    const { conversationId } = context;
+    let ids = Array.isArray(args?.chunk_ids) ? args.chunk_ids : [];
+    ids = ids.slice(0, 3); // Hard server-side cap; description also says max 3.
+
+    if (ids.length === 0) return { error: 'kb_fetch requires chunk_ids' };
+
+    const hits = [];
+    const misses = [];
+    for (const id of ids) {
+        const cached = kbQueryCache.getChunk(conversationId, id);
+        if (cached) {
+            hits.push({ chunk_id: id, title: cached.title, section: cached.section, content: cached.content });
+        } else {
+            misses.push(id);
+        }
+    }
+
+    // Fallback: hit the DB directly for IDs not in the cache (e.g. server restart
+    // dropped the cache between kb_search and kb_fetch, or chunk_ids came from
+    // a previous conversation).
+    if (misses.length > 0) {
+        try {
+            const { getAll } = require('../db');
+            const rows = await getAll(
+                'SELECT id::text AS chunk_id, title, content FROM kb_chunks WHERE id::text = ANY($1::text[])',
+                [misses]
+            );
+            for (const r of rows) {
+                hits.push({ chunk_id: r.chunk_id, title: r.title || '', section: '', content: r.content || '' });
+            }
+        } catch (err) {
+            console.warn('[KBFetch] DB fallback failed:', err.message);
+        }
+    }
+
+    if (hits.length === 0) {
+        return { error: 'None of the requested chunk_ids were found. They may belong to a previous conversation — run kb_search again.' };
+    }
+
+    return { chunks: hits };
+}
+
 async function executeKbSearchTool(toolName, args, context = {}) {
+    if (toolName === 'kb_fetch') {
+        return await executeKbFetchTool(args, context);
+    }
     if (toolName !== 'kb_search') {
         return { error: `Unknown KB search tool: ${toolName}` };
     }
@@ -112,6 +190,17 @@ async function executeKbSearchTool(toolName, args, context = {}) {
     }
 
     const topK = Math.min(Math.max(parseInt(top_k) || 5, 1), 10);
+
+    // Per-conversation cache: if the agent re-asks the same question later in
+    // this conversation, skip the whole retrieval stack. Cache key is
+    // (conversationId, normalized query, sorted kb_ids).
+    const kbQueryCache = require('../core/agentRuntime/kbQueryCache');
+    const { conversationId } = context;
+    const cached = kbQueryCache.get(conversationId, `${query}|top_k=${topK}`, kbIds);
+    if (cached) {
+        console.log(`[KBSearch] Cache HIT: conv=${conversationId} "${query}" → ${cached._sources?.length || 0} chunks`);
+        return cached;
+    }
 
     console.log(`[KBSearch] Searching ${kbIds.length} KBs: "${query}" (top_k=${topK}, agent=${agentId})`);
 
@@ -240,32 +329,65 @@ async function executeKbSearchTool(toolName, args, context = {}) {
 
         const topScore = chunks.length > 0 ? Math.max(...chunks.map(c => c.score || c.rerank_score || 0)) : 0;
         console.log(`[KBSearch] Found ${dedupResults.length} results (from ${chunks.length} chunks, deduped from ${results.length}, reranker=${hasReranker}, topScore=${topScore.toFixed(4)})`);
-        return {
+
+        // Build per-chunk section label (deepest heading + short snippet) once and reuse.
+        const annotated = dedupResults.map((r, i) => {
+            const headings = (r.content || '').match(/^#{1,6}\s+(.+)$/gm) || [];
+            const deepest = headings.length > 0 ? headings[headings.length - 1].replace(/^#{1,6}\s+/, '').trim() : null;
+            const body = (r.content || '').replace(/^#{1,6}\s+.+$/gm, '').replace(/^\|.*$/gm, '').trim();
+            const snippet = body.split(/[.!?\n]/).filter(s => s.trim().length > 10)[0]?.trim() || '';
+            const sectionLabel = deepest
+                ? (snippet ? `${deepest} — ${snippet.slice(0, 60)}` : deepest)
+                : (snippet ? snippet.slice(0, 80) : `Chunk ${i + 1}`);
+            return { r, sectionLabel };
+        });
+
+        const previewMode = process.env.KB_PREVIEW_MODE === 'true';
+
+        // Stash every chunk in the per-conversation cache so kb_fetch can
+        // resolve full content by chunk_id on a later tool call.
+        kbQueryCache.setChunks(conversationId, annotated.map(({ r, sectionLabel }) => ({
+            chunk_id: r.chunk_id,
+            title: r.source_url || r.title,
+            section: sectionLabel,
+            content: r.content,
+            source_uri: r.source_uri || r.source_url || '',
+        })));
+
+        const payload = {
+            // UI-only: full-content cards with score/type the side panel renders.
             _action: 'kb_sources',
-            _sources: dedupResults.map((r, i) => {
-                // Extract deepest heading + content preview for distinctive label
-                const headings = (r.content || '').match(/^#{1,6}\s+(.+)$/gm) || [];
-                const deepest = headings.length > 0 ? headings[headings.length - 1].replace(/^#{1,6}\s+/, '').trim() : null;
-                const body = (r.content || '').replace(/^#{1,6}\s+.+$/gm, '').replace(/^\|.*$/gm, '').trim();
-                const snippet = body.split(/[.!?\n]/).filter(s => s.trim().length > 10)[0]?.trim() || '';
-                const sectionLabel = deepest
-                    ? (snippet ? `${deepest} — ${snippet.slice(0, 60)}` : deepest)
-                    : (snippet ? snippet.slice(0, 80) : `Chunk ${i + 1}`);
-                return {
+            _sources: annotated.map(({ r, sectionLabel }) => ({
+                title: r.source_url || r.title,
+                section: sectionLabel,
+                content: r.content,
+                score: r.score,
+                type: 'kb_chunk'
+            })),
+            query,
+            // LLM-facing: trimmed.
+            //   - default: full content, minus score/type (Phase 1)
+            //   - KB_PREVIEW_MODE=true: first ~220 chars only; agent calls kb_fetch
+            //     for the chunks it actually wants to use (Phase 2)
+            results: annotated.map(({ r, sectionLabel }) => {
+                const base = {
+                    chunk_id: r.chunk_id,
                     title: r.source_url || r.title,
                     section: sectionLabel,
-                    content: r.content,
-                    score: r.score,
-                    type: 'kb_chunk'
                 };
+                if (previewMode) {
+                    const preview = (r.content || '').slice(0, 220);
+                    return {
+                        ...base,
+                        preview,
+                        length: (r.content || '').length,
+                    };
+                }
+                return { ...base, content: r.content };
             }),
-            query,
-            resultCount: dedupResults.length,
-            results: dedupResults,
-            instruction: dedupResults.length > 0
-                ? 'Use this knowledge base information to provide accurate and detailed answers. Cite sources when possible.'
-                : 'No relevant results found. You may try a different search query or answer based on general knowledge.'
         };
+        kbQueryCache.set(conversationId, `${query}|top_k=${topK}|preview=${previewMode}`, kbIds, payload);
+        return payload;
 
     } catch (err) {
         console.error(`[KBSearch] Error:`, err.message);
@@ -274,7 +396,7 @@ async function executeKbSearchTool(toolName, args, context = {}) {
 }
 
 function isKbSearchTool(toolName) {
-    return toolName === 'kb_search';
+    return toolName === 'kb_search' || toolName === 'kb_fetch';
 }
 
 module.exports = {

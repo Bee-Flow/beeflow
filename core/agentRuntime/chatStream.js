@@ -34,6 +34,43 @@ const { runInputGuardrails } = require('./guardrailsRunner');
 const guardrailEventStore = require('../../stores/guardrailEventStore');
 const { processAttachments } = require('./attachmentProcessor');
 
+/**
+ * Serialize a tool result for the LLM's tool message.
+ *
+ * The server stores "internal" fields on tool results (prefixed with `_`,
+ * or the `_action` dispatch field) which chatStream intercepts to emit SSE
+ * events or save persistence state. The LLM only needs the *outcome*; sending
+ * the bulky UI-facing payload (e.g. kb_sources' `_sources` duplicates `results`
+ * at full 3000-char content) wastes tokens and distracts the model.
+ *
+ * Rules:
+ *   - Strings pass through verbatim.
+ *   - Special-case workspace_update → tiny confirmation.
+ *   - Otherwise: drop every key starting with `_` (e.g. `_action`, `_sources`)
+ *     and drop known noise fields (`instruction`, `resultCount`) that are
+ *     superseded by the agent's system prompt.
+ */
+function buildLLMToolContent(finalToolResult) {
+    if (typeof finalToolResult === 'string') return finalToolResult;
+    if (finalToolResult == null || typeof finalToolResult !== 'object') {
+        return JSON.stringify(finalToolResult);
+    }
+
+    // Strip bulky notebook content — LLM only needs the confirmation message.
+    if (finalToolResult._action === 'workspace_update' && finalToolResult.message) {
+        return JSON.stringify({ action: 'notebook_updated', message: finalToolResult.message });
+    }
+
+    const NOISE_KEYS = new Set(['instruction', 'resultCount']);
+    const clean = {};
+    for (const [k, v] of Object.entries(finalToolResult)) {
+        if (k.startsWith('_')) continue;     // Internal dispatch / UI-only fields
+        if (NOISE_KEYS.has(k)) continue;     // Redundant with system prompt
+        clean[k] = v;
+    }
+    return JSON.stringify(clean);
+}
+
 // ============ RETRY & ERROR HELPERS ============
 
 /**
@@ -491,6 +528,11 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
 
     // KB source references accumulator (declared early because performKnowledgeSearch emits before the main loop)
     let _kbSources = [];
+    // Chunk identities already sent to the LLM/UI this turn. When the agent
+    // runs multiple kb_search calls with overlapping results, dedup here
+    // prevents the same chunk from being re-serialized into the tool message
+    // (tokens) and re-emitted to the UI (visual noise).
+    const _seenChunkIds = new Set();
 
     // ============ VECTOR KNOWLEDGE BASE ============
     // When the kb_search TOOL is available, skip auto-injection — let the LLM
@@ -1323,10 +1365,34 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         onEvent('workspace_update', { content: finalToolResult.content });
                     }
 
-                    // Emit kb_sources SSE event so frontend shows knowledge base sources
+                    // Emit kb_sources SSE event so frontend shows knowledge base sources.
+                    // Turn-local dedup: if a chunk_id has already been seen in a prior
+                    // kb_search this turn, drop it from every surface (UI, persistence,
+                    // AND the tool response the LLM will see).
                     if (finalToolResult?._action === 'kb_sources' && finalToolResult._sources?.length > 0) {
-                        onEvent('kb_sources', { sources: finalToolResult._sources });
-                        _kbSources.push(...finalToolResult._sources);
+                        const keepIdx = [];
+                        const resultsArr = Array.isArray(finalToolResult.results) ? finalToolResult.results : [];
+                        finalToolResult._sources.forEach((src, i) => {
+                            const id = resultsArr[i]?.chunk_id
+                                || (src.title || '') + '::' + (src.section || '') + '::' + (src.content || '').slice(0, 80);
+                            if (!_seenChunkIds.has(id)) {
+                                _seenChunkIds.add(id);
+                                keepIdx.push(i);
+                            }
+                        });
+                        const filteredSources = keepIdx.map(i => finalToolResult._sources[i]);
+                        const filteredResults = keepIdx.map(i => resultsArr[i]).filter(Boolean);
+                        const dropped = finalToolResult._sources.length - filteredSources.length;
+                        if (dropped > 0) {
+                            console.log(`[KBSearch] Turn-local dedup: dropped ${dropped} already-seen chunk(s) from kb_search result`);
+                        }
+                        // Mutate so downstream LLM serialization (buildLLMToolContent) sees the trimmed set.
+                        finalToolResult._sources = filteredSources;
+                        finalToolResult.results = filteredResults;
+                        if (filteredSources.length > 0) {
+                            onEvent('kb_sources', { sources: filteredSources });
+                            _kbSources.push(...filteredSources);
+                        }
                     }
 
                     // Track audio files for persistence (sent via SSE by the tool)
@@ -1392,12 +1458,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     messages.push({
                         role: 'tool',
                         tool_call_id: toolCall.id,
-                        content: typeof finalToolResult === 'string' ? finalToolResult : JSON.stringify(
-                            // Strip bulky notebook content — LLM only needs the confirmation message
-                            (typeof finalToolResult === 'object' && finalToolResult?._action === 'workspace_update' && finalToolResult?.message)
-                                ? { action: 'notebook_updated', message: finalToolResult.message }
-                                : finalToolResult
-                        )
+                        content: buildLLMToolContent(finalToolResult),
                     });
                 }
 
