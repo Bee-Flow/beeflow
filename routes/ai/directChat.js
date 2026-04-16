@@ -510,6 +510,29 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
             const relevantMemories = await memoryStore.findRelevantMemories(userId, null, message, 800, projectId || null);
             if (relevantMemories.length > 0) {
                 memoryContext = '\n\n' + memoryStore.formatMemoriesForPrompt(relevantMemories);
+
+                // Defence in depth: scrub PII out of the memory context before
+                // it reaches the LLM. Stored memories can contain real values
+                // from earlier turns that would otherwise bypass this turn's
+                // tokeniser. We replace with generic labels (non-reversible)
+                // so the AI can't reconstruct the underlying data.
+                try {
+                    const orgShieldForScrub = userOrgId
+                        ? await configStore.getConfig(`org_privacy_shield_${userOrgId}`)
+                        : null;
+                    const scrubEnabled = !!(orgShieldForScrub?.enabled && orgShieldForScrub?.azurePiiEnabled)
+                        || !!(await getAIConfig())?.piiDetectionEnabled;
+                    if (scrubEnabled) {
+                        const { scrubMemoryContext } = require('../../core/memory/scrubMemoryContext');
+                        const { scrubbed, replacedCategories } = await scrubMemoryContext(memoryContext, orgShieldForScrub);
+                        if (replacedCategories.length > 0) {
+                            console.log(`[DirectChat] 🧹 Scrubbed memory context: ${replacedCategories.join(', ')}`);
+                            memoryContext = scrubbed;
+                        }
+                    }
+                } catch (scrubErr) {
+                    console.warn('[DirectChat] Memory scrub failed (fail-open):', scrubErr.message);
+                }
             }
         } catch (e) {
             console.warn('[DirectChat] Memory retrieval failed:', e.message);

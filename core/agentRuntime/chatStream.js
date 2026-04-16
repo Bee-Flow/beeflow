@@ -484,6 +484,30 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             if (relevantMemories.length > 0) {
                 memoryContext = memoryStore.formatMemoriesForPrompt(relevantMemories);
                 console.log(`[AgentRuntime] Injected ${relevantMemories.length} memories into prompt`);
+
+                // Defence in depth against the "memory leak" class of bug: stored
+                // memories can carry real PII from earlier turns that would bypass
+                // this turn's tokeniser. Replace detected values with generic
+                // labels before they reach the LLM. Non-reversible by design.
+                try {
+                    const configStore = require('../../stores/configStore');
+                    const { getAIConfig } = require('../aiAgent');
+                    const orgShieldForScrub = agent.organization_id
+                        ? await configStore.getConfig(`org_privacy_shield_${agent.organization_id}`)
+                        : null;
+                    const aiCfg = await getAIConfig();
+                    const scrubEnabled = !!(orgShieldForScrub?.enabled && orgShieldForScrub?.azurePiiEnabled) || !!aiCfg?.piiDetectionEnabled;
+                    if (scrubEnabled) {
+                        const { scrubMemoryContext } = require('../memory/scrubMemoryContext');
+                        const { scrubbed, replacedCategories } = await scrubMemoryContext(memoryContext, orgShieldForScrub);
+                        if (replacedCategories.length > 0) {
+                            console.log(`[AgentRuntime] 🧹 Scrubbed memory context: ${replacedCategories.join(', ')}`);
+                            memoryContext = scrubbed;
+                        }
+                    }
+                } catch (scrubErr) {
+                    console.warn('[AgentRuntime] Memory scrub failed (fail-open):', scrubErr.message);
+                }
                 console.log(`[AgentRuntime] Memory context:\n${memoryContext}`);
             } else {
                 console.log('[AgentRuntime] No memories found for this user/agent');
