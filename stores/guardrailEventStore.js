@@ -103,11 +103,30 @@ async function getGuardrailSummary(filters = {}) {
             COUNT(*) FILTER (WHERE violation_type = 'moderation') as moderation_count,
             COUNT(*) FILTER (WHERE violation_type = 'pii') as pii_count,
             COUNT(*) FILTER (WHERE violation_type = 'regex') as regex_count,
+            COUNT(*) FILTER (WHERE violation_type = 'dlp_decision') as dlp_count,
+            COUNT(*) FILTER (WHERE violation_type = 'dlp_decision' AND action_taken = 'allowed') as dlp_allowed,
+            COUNT(*) FILTER (WHERE violation_type = 'dlp_decision' AND action_taken = 'redacted') as dlp_redacted,
+            COUNT(*) FILTER (WHERE violation_type = 'dlp_decision' AND action_taken = 'blocked') as dlp_blocked,
             COUNT(*) FILTER (WHERE direction = 'input') as input_count,
             COUNT(*) FILTER (WHERE direction = 'output') as output_count,
             COUNT(DISTINCT user_id) as unique_users
         FROM guardrail_events ${where}
     `, params);
+}
+
+// ─── DLP-specific logger ───────────────────────────────────────────
+// `violation_type: 'dlp_decision'` events are emitted when a prompt goes
+// through pre-flight DLP scanning. `action_taken` is one of:
+//   'allowed'  — no findings or user explicitly allowed raw text
+//   'redacted' — tokenised before sending to the LLM
+//   'blocked'  — user or policy blocked the prompt
+//   'scan_failed' — PII service error (paired with fail-open/closed policy)
+async function logDlpDecision(event) {
+    return logGuardrailEvent({
+        ...event,
+        violation_type: 'dlp_decision',
+        direction: 'outbound',
+    });
 }
 
 async function getGuardrailTimeline(filters = {}, interval = 'day') {
@@ -216,6 +235,7 @@ async function getGuardrailByAction(filters = {}) {
 
 module.exports = {
     logGuardrailEvent,
+    logDlpDecision,
     getGuardrailSummary,
     getGuardrailTimeline,
     getGuardrailByUser,

@@ -1016,8 +1016,15 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         // Action 'block' — throw and reject message.
         // Action 'tokenize' — replace PII spans with tokens, pass clean text to AI,
         //                     restore tokens in the AI response before showing the user.
+        // When the org has the interactive DLP gate enabled, skip this auto-tokenising
+        // path — the DLP block further down handles scan + user decision + audit.
         let piiTokenMap = null;  // non-null only in tokenize mode when PII found
+        const dlpWillHandleHere = !!(orgShield?.enabled && orgShield?.dlpEnabled);
+        if (dlpWillHandleHere) {
+            console.log('[DirectChat] DLP enabled — deferring PII handling to pre-flight DLP gate');
+        }
         try {
+            if (dlpWillHandleHere) throw { __skip: true };
             const { validateInputForPii } = require('../../core/azurePiiDetection');
             const orgPiiEnabled = !!(orgShield?.enabled && orgShield?.azurePiiEnabled);
             const piiResult = await validateInputForPii(messages.slice(-3), orgPiiEnabled, orgShield);
@@ -1057,7 +1064,9 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                 }).catch(() => {});
             }
         } catch (piiError) {
-            if (piiError.piiEntities) {
+            if (piiError?.__skip) {
+                // DLP gate will handle PII; nothing to do here.
+            } else if (piiError.piiEntities) {
                 // Block mode: reject the message
                 const categoryList = [...new Set(piiError.piiEntities.map(e => e.label))].join(', ');
                 const snippets = piiError.piiEntities.map(e => `"${e.text.slice(0, 20).trim()}" (${e.label})`).join(' | ');
@@ -1089,6 +1098,134 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             }
             // PII service unavailable — fail-open, log and continue
             console.warn('[DirectChat] PII check error (fail-open):', piiError.message);
+        }
+
+        // ─── Pre-flight DLP (interactive outbound scanner) ───────────
+        if (orgShield?.enabled && orgShield?.dlpEnabled) {
+            const dlpRunner = require('../../core/dlp/dlpRunner');
+            const decisionQueue = require('../../core/dlp/decisionQueue');
+            const { resolveOrgShield: _resolveShield } = require('../../core/orgShield');
+            const resolvedShield = await _resolveShield(userOrgId);
+
+            const providerConfig = {
+                providerType: config.providerType,
+                url: config.url,
+                displayName: config.providerName || config.providerType || 'LLM',
+            };
+            const scanStart = Date.now();
+            const dlpResult = await dlpRunner.scan({
+                messages,
+                orgShieldConfig: resolvedShield,
+                orgId: userOrgId,
+                conversationId: convId,
+                providerConfig,
+            });
+
+            const auditBase = {
+                organization_id: userOrgId || null,
+                user_id: userId,
+                conversation_id: convId || null,
+                model: modelId || null,
+                source: 'direct',
+            };
+            const categoryList = Object.keys(dlpResult.summary || {}).join(', ') || null;
+
+            const applyRedactionToMessages = (tokenizedText) => {
+                const lastMsg = messages[messages.length - 1];
+                if (!lastMsg || lastMsg.role !== 'user') return;
+                if (typeof lastMsg.content === 'string') lastMsg.content = tokenizedText;
+                else if (Array.isArray(lastMsg.content)) {
+                    const textPart = lastMsg.content.find(p => p.type === 'text');
+                    if (textPart) textPart.text = tokenizedText;
+                }
+            };
+
+            if (dlpResult.action === 'block') {
+                send('dlp_blocked', {
+                    findings: dlpResult.findings.map(f => ({ label: f.label, category: f.category, source: f.source })),
+                    provider: dlpResult.provider,
+                    reason: dlpResult.reason || 'policy_block',
+                });
+                guardrailEventStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'blocked' }).catch(() => {});
+                send('done', {}); res.end(); return;
+            }
+
+            if (dlpResult.action === 'redact') {
+                applyRedactionToMessages(dlpResult.redactedText);
+                piiTokenMap = dlpResult.tokenMap; // reuse existing un-tokenise path on the response
+                send('dlp_resolved', {
+                    appliedChoice: 'redact',
+                    redactedCount: Object.keys(dlpResult.tokenMap || {}).length,
+                    provider: dlpResult.provider,
+                    categories: Object.keys(dlpResult.summary || {}),
+                    automatic: true,
+                    decisionMs: Date.now() - scanStart,
+                });
+                guardrailEventStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'redacted' }).catch(() => {});
+            } else if (dlpResult.action === 'ask') {
+                const { decisionId, promise } = decisionQueue.register({ conversationId: convId, userId });
+                send('dlp_preview', {
+                    decisionId,
+                    provider: dlpResult.provider,
+                    findings: dlpResult.findings.map(f => ({
+                        label: f.label, category: f.category, source: f.source,
+                        preview: (f.text || '').slice(0, 3) + '…',
+                    })),
+                    summary: dlpResult.summary,
+                    defaultChoice: resolvedShield.dlpMode === 'block' ? 'block' : 'redact',
+                });
+
+                let decision;
+                try { decision = await promise; }
+                catch (err) {
+                    send('dlp_blocked', { reason: err.code === 'DLP_TIMEOUT' ? 'timeout' : 'rejected', findings: [], provider: dlpResult.provider });
+                    guardrailEventStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'blocked' }).catch(() => {});
+                    send('done', {}); res.end(); return;
+                }
+
+                if (decision.rememberForConversation && decision.choice !== 'block') {
+                    dlpRunner.setConversationPref(convId, decision.choice);
+                }
+
+                if (decision.choice === 'block') {
+                    send('dlp_blocked', { reason: 'user_blocked', findings: [], provider: dlpResult.provider });
+                    guardrailEventStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'blocked' }).catch(() => {});
+                    send('done', {}); res.end(); return;
+                }
+                if (decision.choice === 'redact') {
+                    const lastMsg = messages[messages.length - 1];
+                    const rawText = typeof lastMsg.content === 'string'
+                        ? lastMsg.content
+                        : (Array.isArray(lastMsg.content) ? (lastMsg.content.find(p => p.type === 'text')?.text || '') : '');
+                    const { tokenizedText, tokenMap } = dlpRunner.applyRedactionChoice({
+                        conversationId: convId, text: rawText, findings: dlpResult.findings,
+                    });
+                    applyRedactionToMessages(tokenizedText);
+                    piiTokenMap = tokenMap;
+                    send('dlp_resolved', {
+                        appliedChoice: 'redact',
+                        redactedCount: Object.keys(tokenMap).length,
+                        provider: dlpResult.provider,
+                        categories: Object.keys(dlpResult.summary || {}),
+                        automatic: false,
+                        decisionMs: Date.now() - scanStart,
+                    });
+                    guardrailEventStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'redacted' }).catch(() => {});
+                } else {
+                    // 'allow'
+                    send('dlp_resolved', {
+                        appliedChoice: 'allow',
+                        redactedCount: 0,
+                        provider: dlpResult.provider,
+                        categories: Object.keys(dlpResult.summary || {}),
+                        automatic: false,
+                        decisionMs: Date.now() - scanStart,
+                    });
+                    guardrailEventStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'allowed' }).catch(() => {});
+                }
+            } else if (dlpResult.scanStatus === 'failed') {
+                guardrailEventStore.logDlpDecision({ ...auditBase, violation_categories: 'scan_failed', action_taken: 'scan_failed' }).catch(() => {});
+            }
         }
 
         // ─── Regex Guardrails ────────────────────────────────────────

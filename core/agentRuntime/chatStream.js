@@ -526,6 +526,184 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         }
     }
 
+    // ============ PRE-FLIGHT DLP (interactive outbound scanner) ============
+    // Runs only when the org has `dlpEnabled: true`. It scans the last user
+    // message for PII + org-defined custom terms, classifies the provider, and
+    // either proceeds / redacts / blocks / pauses-to-ask based on the org's
+    // `dlpMode`. See server/core/dlp/dlpRunner.js for semantics.
+    const dlpShield = await resolveOrgShield(agent.organization_id);
+    if (dlpShield?.dlpEnabled) {
+        const dlpRunner = require('../dlp/dlpRunner');
+        const decisionQueue = require('../dlp/decisionQueue');
+        const dlpStore = require('../../stores/guardrailEventStore');
+
+        const providerConfig = {
+            providerType: config.providerType,
+            url: config.url,
+            displayName: config.providerName || config.providerType || 'LLM',
+        };
+
+        const scanStart = Date.now();
+        const dlpResult = await dlpRunner.scan({
+            messages,
+            orgShieldConfig: dlpShield,
+            orgId: agent.organization_id,
+            conversationId: conversation?.id,
+            providerConfig,
+        });
+        const scanMs = Date.now() - scanStart;
+
+        const auditBase = {
+            organization_id: agent.organization_id || null,
+            user_id: userId || null,
+            agent_id: agentId || null,
+            agent_name: agent.name || null,
+            conversation_id: conversation?.id || null,
+            model: modelToUse,
+            source: providerConfig.displayName,
+        };
+        const categoryList = Object.keys(dlpResult.summary || {}).join(', ') || null;
+
+        async function applyRedactionToMessages(tokenizedText) {
+            const lastIdx = messages.length - 1;
+            const lastMsg = messages[lastIdx];
+            if (!lastMsg || lastMsg.role !== 'user') return;
+            if (typeof lastMsg.content === 'string') {
+                lastMsg.content = tokenizedText;
+                processedUserMessage = tokenizedText;
+            } else if (Array.isArray(lastMsg.content)) {
+                const textPart = lastMsg.content.find(p => p.type === 'text');
+                if (textPart) { textPart.text = tokenizedText; processedUserMessage = tokenizedText; }
+            }
+        }
+
+        if (dlpResult.action === 'block') {
+            onEvent?.('dlp_blocked', {
+                findings: dlpResult.findings.map(f => ({ label: f.label, category: f.category, source: f.source })),
+                provider: dlpResult.provider,
+                reason: dlpResult.reason || 'policy_block',
+            });
+            dlpStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'blocked' }).catch(() => {});
+            const err = new Error('Prompt blocked by data-loss-prevention policy.');
+            err.code = 'DLP_BLOCKED';
+            throw err;
+        }
+
+        if (dlpResult.action === 'redact') {
+            await applyRedactionToMessages(dlpResult.redactedText);
+            onEvent?.('dlp_resolved', {
+                appliedChoice: 'redact',
+                redactedCount: Object.keys(dlpResult.tokenMap || {}).length,
+                provider: dlpResult.provider,
+                categories: Object.keys(dlpResult.summary || {}),
+                automatic: true,
+                decisionMs: scanMs,
+            });
+            dlpStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'redacted' }).catch(() => {});
+        } else if (dlpResult.action === 'ask') {
+            // Surface findings to the user and pause until they choose.
+            const { decisionId, promise } = decisionQueue.register({ conversationId: conversation?.id, userId });
+            onEvent?.('dlp_preview', {
+                decisionId,
+                provider: dlpResult.provider,
+                findings: dlpResult.findings.map(f => ({
+                    label: f.label,
+                    category: f.category,
+                    source: f.source,
+                    // Safe preview: first 3 chars of the match + ellipsis. We deliberately
+                    // do NOT send the full value back over SSE — the user already typed it,
+                    // and this keeps the event small / harder to log-snoop.
+                    preview: (f.text || '').slice(0, 3) + '…',
+                })),
+                summary: dlpResult.summary,
+                defaultChoice: dlpShield.dlpMode === 'block' ? 'block' : 'redact',
+            });
+
+            let decision;
+            try {
+                decision = await promise;
+            } catch (err) {
+                // Timeout or abort → treat as block under fail-closed semantics.
+                onEvent?.('dlp_blocked', { reason: err.code === 'DLP_TIMEOUT' ? 'timeout' : 'rejected', findings: [], provider: dlpResult.provider });
+                dlpStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'blocked' }).catch(() => {});
+                const blockErr = new Error('Prompt blocked: DLP decision timed out.');
+                blockErr.code = 'DLP_TIMEOUT';
+                throw blockErr;
+            }
+
+            if (decision.rememberForConversation && decision.choice !== 'block') {
+                dlpRunner.setConversationPref(conversation?.id, decision.choice);
+            }
+
+            if (decision.choice === 'block') {
+                onEvent?.('dlp_blocked', { reason: 'user_blocked', findings: [], provider: dlpResult.provider });
+                dlpStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'blocked' }).catch(() => {});
+                const err = new Error('Prompt blocked by the user.');
+                err.code = 'DLP_USER_BLOCKED';
+                throw err;
+            } else if (decision.choice === 'redact') {
+                const { tokenizedText, tokenMap } = dlpRunner.applyRedactionChoice({
+                    conversationId: conversation?.id,
+                    text: (messages[messages.length - 1].content && typeof messages[messages.length - 1].content === 'string')
+                        ? messages[messages.length - 1].content
+                        : (Array.isArray(messages[messages.length - 1].content)
+                            ? (messages[messages.length - 1].content.find(p => p.type === 'text')?.text || '')
+                            : ''),
+                    findings: dlpResult.findings,
+                });
+                await applyRedactionToMessages(tokenizedText);
+                onEvent?.('dlp_resolved', {
+                    appliedChoice: 'redact',
+                    redactedCount: Object.keys(tokenMap).length,
+                    provider: dlpResult.provider,
+                    categories: Object.keys(dlpResult.summary || {}),
+                    automatic: false,
+                    decisionMs: Date.now() - scanStart,
+                });
+                dlpStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'redacted' }).catch(() => {});
+            } else {
+                // 'allow' — user chose to send raw. Still log (compliance audit).
+                onEvent?.('dlp_resolved', {
+                    appliedChoice: 'allow',
+                    redactedCount: 0,
+                    provider: dlpResult.provider,
+                    categories: Object.keys(dlpResult.summary || {}),
+                    automatic: false,
+                    decisionMs: Date.now() - scanStart,
+                });
+                dlpStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'allowed' }).catch(() => {});
+            }
+        } else if (dlpResult.scanStatus === 'failed') {
+            // fail-open took this path — still record for audit.
+            dlpStore.logDlpDecision({ ...auditBase, violation_categories: 'scan_failed', action_taken: 'scan_failed' }).catch(() => {});
+        }
+    }
+
+    // ── DLP un-tokeniser (wraps onEvent for the rest of the turn) ──
+    // If the conversation has any redacted tokens (from this turn or an earlier
+    // one), transparently replace them with the real values in every `content`
+    // chunk before it hits the client. Any other event is forwarded unchanged.
+    {
+        const _dlpConvMap = require('../dlp/dlpRunner').getConversationTokenMap(conversation?.id);
+        if (_dlpConvMap && Object.keys(_dlpConvMap).length > 0) {
+            const { createUntokeniser } = require('../dlp/untokeniseStream');
+            const _ut = createUntokeniser(_dlpConvMap);
+            const _rawOnEvent = onEvent;
+            onEvent = (type, data) => {
+                if (type === 'content' && data && typeof data.text === 'string') {
+                    const safe = _ut.push(data.text);
+                    if (safe) _rawOnEvent(type, { ...data, text: safe });
+                    return;
+                }
+                // On any non-content event (tool-call, thinking, done-ish), flush
+                // whatever is buffered so we never leave a partial token dangling.
+                const tail = _ut.flush();
+                if (tail) _rawOnEvent('content', { text: tail });
+                _rawOnEvent(type, data);
+            };
+        }
+    }
+
     // KB source references accumulator (declared early because performKnowledgeSearch emits before the main loop)
     let _kbSources = [];
     // Chunk identities already sent to the LLM/UI this turn. When the agent

@@ -262,6 +262,7 @@ app.use('/api/usage', require('./routes/usage'));
 app.use('/api/feedback', require('./routes/feedback'));
 app.use('/api/org-privacy-shield', require('./routes/orgPrivacyShield'));
 app.use('/api/org-azure-config', require('./routes/orgAzureConfig'));
+app.use('/api/chat/dlp-decision', require('./routes/dlpDecision'));
 app.get('/api/guard/health', async (req, res) => {
     try {
         const guardUrl = process.env.GUARD_SERVICE_URL || 'http://guard-service:8100';

@@ -112,7 +112,33 @@ router.put('/:orgId', requireAuth, async (req, res) => {
             return res.status(403).json({ error: 'Only organization admins can manage the privacy shield' });
         }
 
-        const { enabled, collectionIds, scope, action, moderationEnabled, moderationCategories, euModeEnabled, webSearchGuardEnabled, disableSearchOnUpload, azurePiiEnabled, azureSeverityThreshold, azureEnabledCategories, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionAction, webSearchGuardPiiCategories, monitorIntegrations } = req.body;
+        const { enabled, collectionIds, scope, action, moderationEnabled, moderationCategories, euModeEnabled, webSearchGuardEnabled, disableSearchOnUpload, azurePiiEnabled, azureSeverityThreshold, azureEnabledCategories, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionAction, webSearchGuardPiiCategories, monitorIntegrations,
+            // DLP
+            dlpEnabled, dlpScope, dlpMode, dlpFailureMode, dlpAllowlistedHosts, customSensitiveTerms } = req.body;
+
+        // Validate every custom term's regex up front — a bad regex here would
+        // crash the scanner at request-time. Report the first invalid term instead.
+        const sanitizedTerms = [];
+        if (Array.isArray(customSensitiveTerms)) {
+            for (const term of customSensitiveTerms) {
+                if (!term || typeof term !== 'object' || !term.pattern || !term.label) continue;
+                const type = term.type === 'literal' ? 'literal' : 'regex';
+                if (type === 'regex') {
+                    try { new RegExp(term.pattern, term.caseSensitive ? '' : 'i'); }
+                    catch (err) { return res.status(400).json({ error: `Invalid regex in custom term "${term.label}": ${err.message}` }); }
+                }
+                sanitizedTerms.push({
+                    id: term.id || `term-${Date.now()}-${sanitizedTerms.length}`,
+                    label: String(term.label).slice(0, 120),
+                    pattern: String(term.pattern).slice(0, 500),
+                    caseSensitive: !!term.caseSensitive,
+                    type,
+                    createdAt: term.createdAt || new Date().toISOString(),
+                    createdBy: term.createdBy || req.session.user.id,
+                });
+            }
+        }
+
         const config = {
             enabled: !!enabled,
             collectionIds: Array.isArray(collectionIds) ? collectionIds : [],
@@ -131,11 +157,21 @@ router.put('/:orgId', requireAuth, async (req, res) => {
             piiDetectionAction: ['block', 'tokenize', 'warn'].includes(piiDetectionAction) ? piiDetectionAction : 'block',
             webSearchGuardPiiCategories: Array.isArray(webSearchGuardPiiCategories) ? webSearchGuardPiiCategories : [],
             monitorIntegrations: !!monitorIntegrations,
+            // DLP fields
+            dlpEnabled: !!dlpEnabled,
+            dlpScope: dlpScope === 'all' ? 'all' : 'external',
+            dlpMode: ['ask', 'auto_redact', 'block'].includes(dlpMode) ? dlpMode : 'ask',
+            dlpFailureMode: dlpFailureMode === 'fail_open' ? 'fail_open' : 'fail_closed',
+            dlpAllowlistedHosts: Array.isArray(dlpAllowlistedHosts) ? dlpAllowlistedHosts.slice(0, 50).map(String) : [],
+            customSensitiveTerms: sanitizedTerms,
             updatedAt: new Date().toISOString(),
             updatedBy: req.session.user.id,
         };
 
         await configStore.setConfig(`org_privacy_shield_${orgId}`, config);
+
+        // Nudge the in-process custom-terms cache so the next request picks up the new regex.
+        try { require('../core/dlp/customTerms').invalidate(orgId); } catch (_) { /* module may not be loaded yet */ }
 
         // Sync shield settings → global AI config so the runtime uses these values
         const aiBlob = await configStore.getConfig('ai') || {};

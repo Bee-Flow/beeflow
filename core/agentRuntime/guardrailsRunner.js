@@ -116,7 +116,12 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
     // If the org shield is active and explicitly disables PII detection, respect that
     // over the global setting (mirrors the moderation "orgExplicitlyDisabled" pattern).
     const orgExplicitlyDisabledPii = orgShield?.enabled && orgShield?.azurePiiEnabled === false;
-    if ((globalConfig?.piiDetectionEnabled && !orgExplicitlyDisabledPii) || orgPiiEnabled) {
+    // When the org has the interactive DLP gate enabled, skip the auto-tokenising
+    // path here — the downstream dlpRunner call in chatStream.js will do the scan
+    // and apply the user's chosen action (ask/redact/block). Running both leads to
+    // double scans and conflicting actions.
+    const dlpWillHandle = !!(orgShield?.enabled && orgShield?.dlpEnabled);
+    if (!dlpWillHandle && ((globalConfig?.piiDetectionEnabled && !orgExplicitlyDisabledPii) || orgPiiEnabled)) {
         try {
             const piiMessages = [
                 ...messages.slice(-3), // last few messages for context

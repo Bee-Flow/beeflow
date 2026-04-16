@@ -256,6 +256,9 @@ async function deleteConversationById(conversationId) {
     await initDB();
     await run('DELETE FROM conversation_messages WHERE conversation_id = $1', [conversationId]).catch(() => {});
     await run('DELETE FROM agent_conversations WHERE id = $1', [conversationId]);
+    // Drop any DLP token map / remembered choice for this conversation so a new
+    // conversation reusing the same ID (unlikely but possible) starts clean.
+    try { require('../../core/dlp/dlpRunner').clearConversationState(conversationId); } catch (_) { /* module not loaded yet */ }
 }
 
 // ── Internal: read messages, preferring new table, lazy-migrating from blob ──

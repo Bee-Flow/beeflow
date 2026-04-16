@@ -63,6 +63,14 @@ async function resolveOrgShield(orgId) {
         disableSearchOnUpload: !!shield.disableSearchOnUpload,
         monitorIntegrations: !!shield.monitorIntegrations,
         webSearchGuardPiiCategories: shield.webSearchGuardPiiCategories || [],
+        // DLP (Data Loss Prevention) — interactive outbound scanner before
+        // prompts reach external LLMs. Default off so existing orgs are unaffected.
+        dlpEnabled: !!shield.dlpEnabled,
+        dlpScope: shield.dlpScope || 'external',            // 'external' | 'all'
+        dlpMode: shield.dlpMode || 'ask',                   // 'ask' | 'auto_redact' | 'block'
+        dlpFailureMode: shield.dlpFailureMode || 'fail_closed', // 'fail_closed' | 'fail_open'
+        dlpAllowlistedHosts: shield.dlpAllowlistedHosts || [],
+        customSensitiveTerms: Array.isArray(shield.customSensitiveTerms) ? shield.customSensitiveTerms : [],
     };
 }
 

@@ -78,6 +78,8 @@ async function deleteDirectConversation(id, userId) {
     await initDB();
     await run('DELETE FROM conversation_messages WHERE conversation_id = $1', [id]).catch(() => {});
     const { rowCount } = await run('DELETE FROM direct_conversations WHERE id = $1 AND user_id = $2', [id, userId]);
+    // Drop any cached DLP state for this conversation.
+    try { require('../../core/dlp/dlpRunner').clearConversationState(id); } catch (_) { /* module not loaded yet */ }
     return rowCount > 0;
 }
 
