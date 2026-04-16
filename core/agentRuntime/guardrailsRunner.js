@@ -77,7 +77,11 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
     
     if (shouldCheckInputModeration) {
         try {
-            await validateInput(messages, agent.config?.llamaGuardEnabled, orgShieldCategories);
+            // Per-org provider override — exactly one of Llama Guard / Azure Content Safety
+            // runs per turn. When the org hasn't explicitly picked one, moderation.js falls
+            // back to the global `ai.moderationProvider` setting.
+            const preferredProvider = orgShield?.enabled ? orgShield.moderationProvider : null;
+            await validateInput(messages, agent.config?.llamaGuardEnabled, orgShieldCategories, preferredProvider);
         } catch (guardError) {
             console.error('[GuardrailsRunner] Guardrails Check Failed:', guardError.message);
             if (guardError.violationCodes) {

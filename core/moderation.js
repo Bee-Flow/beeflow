@@ -302,30 +302,35 @@ const { validateWithAzureContentSafety, validateOutputWithAzureContentSafety } =
 const { validateInputForPii, validateOutputForPii } = require('./azurePiiDetection');
 
 /**
- * Validate user input — routes to the active moderation provider.
- * Also runs PII detection in parallel if enabled.
- * Drop-in replacement that works with both Llama Guard and Azure Content Safety.
+ * Validate user input — routes to exactly ONE moderation provider.
+ *
+ * Provider selection priority:
+ *   1. `preferredProvider` argument (set from the org shield's `moderationProvider`).
+ *   2. Global `ai.moderationProvider` config.
+ *   3. Default to Llama Guard.
+ *
+ * PII detection runs in parallel if enabled. Never more than one content-moderation
+ * call per turn — avoids the old cost/latency footgun where both Llama Guard and
+ * Azure Content Safety could run side-by-side on the same message.
  */
-async function validateInput(messages, agentModerationEnabled = false, allowedCategories = null) {
+async function validateInput(messages, agentModerationEnabled = false, allowedCategories = null, preferredProvider = null) {
     const aiConfig = await getAIConfig();
-    const provider = aiConfig.moderationProvider || 'llamaguard';
+    const provider = preferredProvider || aiConfig.moderationProvider || 'llamaguard';
 
-    // Run content moderation + PII detection in parallel
     const checks = [];
 
-    // Content moderation check
     if (provider === 'azure') {
         checks.push(validateWithAzureContentSafety(messages, agentModerationEnabled, allowedCategories));
     } else {
         checks.push(validateWithGuardService(messages, agentModerationEnabled, allowedCategories));
     }
 
-    // PII detection check (runs alongside content moderation)
+    // PII detection check (runs alongside content moderation, skipped when DLP
+    // is handling it at a later layer — see guardrailsRunner).
     if (aiConfig.piiDetectionEnabled) {
         checks.push(validateInputForPii(messages, false));
     }
 
-    // Wait for all checks — if any throws, the first error is propagated
     const results = await Promise.allSettled(checks);
     for (const result of results) {
         if (result.status === 'rejected') {
@@ -338,9 +343,9 @@ async function validateInput(messages, agentModerationEnabled = false, allowedCa
  * Validate agent output — routes to the active moderation provider.
  * Also runs PII detection in parallel if enabled.
  */
-async function validateOutput(content, allowedCategories = null) {
+async function validateOutput(content, allowedCategories = null, preferredProvider = null) {
     const aiConfig = await getAIConfig();
-    const provider = aiConfig.moderationProvider || 'llamaguard';
+    const provider = preferredProvider || aiConfig.moderationProvider || 'llamaguard';
 
     const checks = [];
 

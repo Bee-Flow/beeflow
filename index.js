@@ -353,6 +353,12 @@ app.listen(PORT, '0.0.0.0', () => {
     const { runBootInit } = require('./boot-init');
     runBootInit().catch(err => console.error('[boot-init] Fatal:', err));
 
+    // Non-invasive self-check of every org Privacy Shield blob. Logs warnings
+    // for legacy shapes, orphaned regex collections, and invalid custom terms
+    // so operators can spot guardrail drift in the startup log.
+    const { selfCheckOrgShields } = require('./core/orgShield');
+    selfCheckOrgShields().catch(err => console.warn('[OrgShieldSelfCheck] Error:', err.message));
+
     // Seed system agents into the database (explicit lifecycle call, not a require() side-effect)
     const { seedSystemAgents } = require('./stores/agent/systemAgents');
     seedSystemAgents()
