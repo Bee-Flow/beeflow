@@ -37,7 +37,11 @@ QUERY FORMAT:
 - 1-4 keywords. NOT full sentences. NOT email fragments.
 - Strip names, dates, and specific identifiers — search the underlying topic.
 - BAD: "Hilverzorg AI update werkt niet meer" → GOOD: "update werkt niet" + "Applicatie"
-- BAD: "Hoi, kun je me helpen met inloggen" → GOOD: "inloggen probleem" + "Account"`,
+- BAD: "Hoi, kun je me helpen met inloggen" → GOOD: "inloggen probleem" + "Account"
+
+EMAIL ARCHIVE KBs:
+- If the KB is an email archive (docs titled "{Sender} — {Subject}"), you can also search by sender name/email, subject keywords, or date fragments — the From/To/Date/Subject metadata header is indexed alongside the body.
+- Example queries: "Ewoud fix bevestigd", "invoice mistral maart", "openwebui bug".`,
             parameters: {
                 type: 'object',
                 properties: {

@@ -123,15 +123,22 @@ const EmailKBStore = {
     createConnection: async ({ organizationId, knowledgeBaseId, createdBy, provider, emailAddress, displayName, tokens }) => {
         await initDB();
         const encTokens = encryptTokens(tokens);
+        // New connections default to the per-email archive mode (one KB doc per
+        // message with rich metadata header). This preserves retrieval signal
+        // far better than the AI-summarised category_merge pipeline; existing
+        // connections keep their behaviour because they already have a
+        // pipeline_config without `ingestion_mode` set (→ treated as
+        // 'category_merge' by getIngestionMode in emailKBSyncEngine.js).
+        const defaultPipelineConfig = { ingestion_mode: 'per_email' };
         return getOne(
             `INSERT INTO email_kb_connections
-             (organization_id, knowledge_base_id, created_by, provider, email_address, display_name, encrypted_tokens)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             (organization_id, knowledge_base_id, created_by, provider, email_address, display_name, encrypted_tokens, pipeline_config)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              RETURNING id, organization_id, knowledge_base_id, provider, email_address, display_name,
                        folder_filter, sender_blacklist, sync_interval_minutes, sync_status,
                        total_emails_processed, total_articles_created, enabled, process_attachments,
-                       group_threads, created_at`,
-            [organizationId, knowledgeBaseId, createdBy, provider, emailAddress, displayName || emailAddress, encTokens]
+                       group_threads, pipeline_config, created_at`,
+            [organizationId, knowledgeBaseId, createdBy, provider, emailAddress, displayName || emailAddress, encTokens, JSON.stringify(defaultPipelineConfig)]
         );
     },
 

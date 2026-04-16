@@ -13,7 +13,7 @@
  */
 
 const emailKBStore = require('../stores/emailKBStore');
-const { processEmail, processEmailThread, mergeArticlesByCategory } = require('../core/emailKBProcessor');
+const { processEmail, processEmailThread, mergeArticlesByCategory, buildPerEmailArticle } = require('../core/emailKBProcessor');
 const { ingestDocument, findDocumentBySourceUri, deleteDocumentChunks } = require('../core/kbIngestionHelpers');
 
 const { run } = require('../db');
@@ -54,6 +54,23 @@ function buildMergeOptions(connection) {
         customPrompt: pc.merge?.systemPrompt || '',
         language: pc.language || '',
     };
+}
+
+/**
+ * Which ingestion mode is this connection using?
+ *   - 'per_email'      → each email becomes its own KB doc, body preserved verbatim,
+ *                        metadata header (From/To/Date/Subject/Message-Id) inside content.
+ *                        Best retrieval signal. Default for connections created after this change.
+ *   - 'category_merge' → emails AI-rewritten + merged into one doc per category.
+ *                        Kept for backwards-compat with existing setups.
+ */
+function getIngestionMode(connection) {
+    const mode = connection.pipeline_config?.ingestion_mode;
+    if (mode === 'per_email' || mode === 'category_merge') return mode;
+    // Older connections without the key fall back to legacy behaviour so we
+    // don't silently rewrite their KB on next sync. New connections should set
+    // pipeline_config.ingestion_mode = 'per_email' via emailKBStore defaults.
+    return 'category_merge';
 }
 
 // ──────────────────────────────────────────────
@@ -161,7 +178,12 @@ async function syncGmailConnection(connection) {
 
     const results = { fetched: messageIds.length, created: 0, skipped: 0, errors: 0, errorDetails: [], newestDate: null, processedArticles: [] };
 
-    if (connection.group_threads) {
+    const ingestionMode = getIngestionMode(connection);
+    // Per-email mode always treats each message individually — thread-merge is
+    // meaningless because each email becomes its own addressable KB doc.
+    const groupThreads = ingestionMode !== 'per_email' && connection.group_threads;
+
+    if (groupThreads) {
         // Group by threadId
         const threadMap = new Map();
         for (const msg of messageIds) {
@@ -242,14 +264,20 @@ async function syncGmailConnection(connection) {
                 }
                 const body = extractGmailTextBody(detail.data.payload);
 
-                const processed = await processEmail(body, {
+                const metadata = {
                     subject: getGmailHeader(headers, 'Subject'),
                     from: getGmailHeader(headers, 'From'),
+                    to: getGmailHeader(headers, 'To'),
+                    cc: getGmailHeader(headers, 'Cc'),
                     date: getGmailHeader(headers, 'Date'),
                     messageId: msg.id,
-                }, {
-                    ...buildProcessOptions(connection),
-                });
+                    threadId: detail.data.threadId,
+                    labels: detail.data.labelIds,
+                };
+
+                const processed = ingestionMode === 'per_email'
+                    ? buildPerEmailArticle(body, metadata, buildProcessOptions(connection))
+                    : await processEmail(body, metadata, buildProcessOptions(connection));
 
                 if (!processed.success) {
                     results.skipped++;
@@ -442,7 +470,10 @@ async function syncOutlookConnection(connection) {
         results.newestDate = messages[0].receivedDateTime; // Already sorted desc
     }
 
-    if (connection.group_threads) {
+    const ingestionMode = getIngestionMode(connection);
+    const groupThreads = ingestionMode !== 'per_email' && connection.group_threads;
+
+    if (groupThreads) {
         // Group by conversationId
         const threadMap = new Map();
         for (const msg of messages) {
@@ -499,14 +530,22 @@ async function syncOutlookConnection(connection) {
                     ? `${msg.from.emailAddress.name || ''} <${msg.from.emailAddress.address}>`
                     : '';
 
-                const processed = await processEmail(msg.body?.content || '', {
+                const toStr = Array.isArray(msg.toRecipients)
+                    ? msg.toRecipients.map(r => r.emailAddress?.address).filter(Boolean).join(', ')
+                    : '';
+
+                const metadata = {
                     subject: msg.subject,
                     from: fromStr,
+                    to: toStr,
                     date: msg.receivedDateTime,
                     messageId: msg.id,
-                }, {
-                    ...buildProcessOptions(connection),
-                });
+                    threadId: msg.conversationId,
+                };
+
+                const processed = ingestionMode === 'per_email'
+                    ? buildPerEmailArticle(msg.body?.content || '', metadata, buildProcessOptions(connection))
+                    : await processEmail(msg.body?.content || '', metadata, buildProcessOptions(connection));
 
                 if (!processed.success) {
                     results.skipped++;
@@ -553,11 +592,52 @@ async function syncConnection(connection) {
             throw new Error(`Unknown provider: ${connection.provider}`);
         }
 
-        // Phase 2: Merge articles by category and ingest into KB
+        // Phase 2: Ingest articles into KB.
+        // Mode decides the grouping: per_email → one doc per message (unique
+        // source_uri, skip-if-exists); category_merge → AI-merge by category,
+        // replace old category doc.
         const processedArticles = results.processedArticles || [];
+        const ingestionMode = getIngestionMode(connection);
         let categoryDocsCreated = 0;
 
-        if (processedArticles.length > 0) {
+        if (processedArticles.length > 0 && ingestionMode === 'per_email') {
+            console.log(`[EmailKBSync] Phase 2: Ingesting ${processedArticles.length} per-email articles (skip-if-exists)...`);
+
+            for (const processed of processedArticles) {
+                try {
+                    const messageId = processed.sourceMessageId;
+                    if (!messageId) {
+                        results.skipped++;
+                        results.errorDetails.push('Skipped: per-email article without messageId');
+                        continue;
+                    }
+                    const sourceUri = `email-kb://message/${encodeURIComponent(messageId)}`;
+
+                    const existing = await findDocumentBySourceUri(connection.knowledge_base_id, sourceUri);
+                    if (existing) {
+                        results.skipped++;
+                        continue; // Already ingested — per-email archive is append-only.
+                    }
+
+                    await ingestDocument(
+                        connection.created_by,
+                        connection.knowledge_base_id,
+                        processed.article,
+                        processed.title,
+                        'email',
+                        sourceUri,
+                        { skipDedup: false, lang: (connection.pipeline_config?.language || 'auto') }
+                    );
+                    categoryDocsCreated++;
+                } catch (ingestErr) {
+                    results.errors++;
+                    results.errorDetails.push(`Ingest message ${processed.sourceMessageId}: ${ingestErr.message}`);
+                    console.error(`[EmailKBSync] ❌ Failed to ingest per-email doc:`, ingestErr.message);
+                }
+            }
+
+            console.log(`[EmailKBSync] Per-email ingest: ${categoryDocsCreated} new docs, ${results.skipped} already present`);
+        } else if (processedArticles.length > 0) {
             console.log(`[EmailKBSync] Phase 2: Merging ${processedArticles.length} articles by category...`);
 
             const mergedCategories = await mergeArticlesByCategory(processedArticles, buildMergeOptions(connection));

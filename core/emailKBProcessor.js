@@ -712,16 +712,103 @@ async function mergeArticlesByCategory(articles, options = {}) {
     return results;
 }
 
+/**
+ * Parse a "From" field into display name and email parts.
+ * Accepts: `"Sven Hogervorst" <sven@example.com>`, `Sven Hogervorst <sven@example.com>`, or bare `sven@example.com`.
+ */
+function parseFromField(from) {
+    if (!from) return { name: '', email: '' };
+    const match = from.match(/^(.*?)\s*<([^>]+)>\s*$/);
+    if (match) {
+        return {
+            name: match[1].replace(/^["']|["']$/g, '').trim(),
+            email: match[2].trim(),
+        };
+    }
+    return { name: '', email: from.trim() };
+}
+
+/**
+ * Per-email KB ingestion — preserves retrieval signal.
+ *
+ * Unlike `processEmail`, this does NOT rewrite the body through an AI model.
+ * Each email becomes its own KB document whose content starts with a rich
+ * metadata block (From/To/Date/Subject/Message-Id/Thread-Id). The metadata
+ * block lives inside `content`, so tsvector FTS matches on sender/subject
+ * and the vector embeddings see the natural body text.
+ *
+ * Returns { success, article, title, sourceMessageId, sourceDate } on success.
+ */
+function buildPerEmailArticle(rawContent, metadata = {}, options = {}) {
+    const { subject, from, to, cc, date, messageId, threadId, labels } = metadata;
+    const {
+        senderBlacklist = [],
+        redactPII: shouldRedact = true,
+        category,    // optional: caller may pre-compute
+    } = options;
+
+    // Blacklist — same check as processEmail
+    if (from && senderBlacklist.length > 0) {
+        const senderEmail = (from.match(/<([^>]+)>/) || [, from])[1].toLowerCase();
+        if (senderBlacklist.some(b => senderEmail.includes(b.toLowerCase()))) {
+            return { success: false, reason: 'Sender blacklisted', skipped: true };
+        }
+    }
+
+    // Stage 1: Clean
+    const cleaned = cleanEmail(rawContent);
+    if (!cleaned || cleaned.trim().length < 20) {
+        return { success: false, reason: 'No meaningful content after cleanup', skipped: true };
+    }
+
+    // Stage 2: PII redaction (optional)
+    const body = shouldRedact ? redactPII(cleaned) : cleaned;
+
+    // Stage 3: Metadata header
+    const { name: fromName, email: fromEmail } = parseFromField(from);
+    const headerLines = [
+        from && `From: ${from}`,
+        to && `To: ${to}`,
+        cc && `Cc: ${cc}`,
+        date && `Date: ${date}`,
+        subject && `Subject: ${subject}`,
+        messageId && `Message-Id: ${messageId}`,
+        threadId && `Thread-Id: ${threadId}`,
+        labels && (Array.isArray(labels) ? labels.join(', ') : labels) && `Labels: ${Array.isArray(labels) ? labels.join(', ') : labels}`,
+        category && `Category: ${category}`,
+    ].filter(Boolean);
+
+    const article = `${headerLines.join('\n')}\n\n---\n\n${body}`;
+
+    // Title — "{sender} — {subject without Re:/Fwd:}"
+    const cleanSubject = subject ? subject.replace(/^(re|fw|fwd):\s*/gi, '').trim() : '';
+    const displayName = fromName || fromEmail || '';
+    const title = displayName && cleanSubject
+        ? `${displayName} — ${cleanSubject}`
+        : (cleanSubject || displayName || 'Email');
+
+    return {
+        success: true,
+        article,
+        title,
+        category: category || null,
+        sourceMessageId: messageId,
+        sourceDate: date,
+    };
+}
+
 module.exports = {
     // Individual stages (for testing)
     cleanEmail,
     redactPII,
     summarizeToArticle,
     categorizeArticle,
+    parseFromField,
     // Full pipelines
     processEmail,
     processEmailThread,
     mergeArticlesByCategory,
+    buildPerEmailArticle,
     // Constants
     DEFAULT_ARTICLE_PROMPT,
     DEFAULT_CATEGORY_PROMPT,
