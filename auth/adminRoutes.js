@@ -12,7 +12,7 @@ const multer = require('multer');
 const router = express.Router();
 
 const userStore = require('../stores/userStore');
-const { loadConfig, saveConfig, requireAuth, requireAdmin, getUserPermissions, SYSTEM_PERMISSIONS, invalidatePermissionCache, resolveUserOrgIds } = require('./permissions');
+const { loadConfig, saveConfig, requireAuth, requireAdmin, getUserPermissions, SYSTEM_PERMISSIONS, invalidatePermissionCache, invalidateAllPermissionCaches, resolveUserOrgIds } = require('./permissions');
 const { rewrapUserDEKCompat, adminResetUser, getOrCreateUserDEKCompat } = require('./encryption');
 const { checkResourceLimits } = require('../core/limits');
 
@@ -258,6 +258,8 @@ router.put('/users/:id', requireOrgAdminForUser, async (req, res) => {
     if (await userStore.updateUser(id, updates)) {
         const changedFields = Object.keys(updates).filter(k => updates[k] !== undefined);
         console.log(`[Audit] ${req.session.user?.id || 'system'} updated user '${id}' — fields: ${changedFields.join(', ')}`);
+        // Role / orgRole / group changes alter the user's effective permissions.
+        await invalidatePermissionCache(id);
         res.json({ success: true });
     } else {
         res.status(404).json({ error: 'User not found' });
@@ -661,6 +663,9 @@ router.put('/groups/:id', requireAuth, async (req, res) => {
 
     if (await userStore.updateGroup(id, updates)) {
         console.log(`[Audit] ${userId || 'system'} updated group '${id}' — fields: ${Object.keys(updates).filter(k => updates[k] !== undefined).join(', ')}`);
+        // Permissions / roles / orgRole on the group change the effective
+        // permission set of every member. Easiest safe bet: clear all.
+        await invalidateAllPermissionCaches();
         res.json({ success: true });
     } else {
         res.status(404).json({ error: 'Group not found' });
@@ -692,6 +697,7 @@ router.delete('/groups/:id', requireAuth, async (req, res) => {
 
     if (await userStore.deleteGroup(id)) {
         console.log(`[Audit] ${userId || 'system'} deleted group '${id}'`);
+        await invalidateAllPermissionCaches();
         res.json({ success: true });
     } else {
         res.status(404).json({ error: 'Group not found' });
@@ -734,6 +740,7 @@ router.put('/roles/:id', requireAdmin, async (req, res) => {
     const { name, description, permissions } = req.body;
 
     if (await userStore.updateRole(id, { name, description, permissions })) {
+        await invalidateAllPermissionCaches();
         res.json({ success: true });
     } else {
         res.status(404).json({ error: 'Role not found' });
@@ -748,6 +755,7 @@ router.delete('/roles/:id', requireAdmin, async (req, res) => {
 
     if (await userStore.deleteRole(id)) {
         console.log(`[Audit] ${req.session.user?.id || 'system'} deleted role '${id}'`);
+        await invalidateAllPermissionCaches();
         res.json({ success: true });
     } else {
         res.status(404).json({ error: 'Role not found' });

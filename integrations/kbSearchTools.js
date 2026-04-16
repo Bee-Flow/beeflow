@@ -328,7 +328,7 @@ async function executeKbSearchTool(toolName, args, context = {}) {
         }
 
         const topScore = chunks.length > 0 ? Math.max(...chunks.map(c => c.score || c.rerank_score || 0)) : 0;
-        console.log(`[KBSearch] Found ${dedupResults.length} results (from ${chunks.length} chunks, deduped from ${results.length}, reranker=${hasReranker}, topScore=${topScore.toFixed(4)})`);
+        console.log(`[KBSearch] Found ${dedupResults.length} results (from ${chunks.length} chunks, deduped from ${results.length}, threshold=${scoreThreshold}, topScore=${topScore.toFixed(4)})`);
 
         // Build per-chunk section label (deepest heading + short snippet) once and reuse.
         const annotated = dedupResults.map((r, i) => {

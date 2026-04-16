@@ -14,6 +14,7 @@ const userStore = require('../../stores/userStore');
 const usageStore = require('../../stores/usageStore');
 const { checkSubscriptionLimits: checkSubLimits, checkResourceLimits } = require('../../core/limits');
 const { setupSSE, sendSSEError, persistAndTitle, getOrCreateAgentConversation } = require('../../core/sseHelpers');
+const { canModifyAgent } = require('./crud');
 
 const router = express.Router();
 
@@ -93,23 +94,22 @@ router.patch('/:id/publish', async (req, res) => {
         return res.status(404).json({ error: 'Agent not found' });
     }
 
-    // Owner can always publish; non-owners need manage_agents permission
-    if (agent.owner_id !== userId) {
+    // Non-owners additionally need manage_agents permission. Ownership, super-admin
+    // bypass, and the agent_editor/unpublished-draft rule are handled by canModifyAgent.
+    if (!(await canModifyAgent(agent, userId, req))) {
+        return res.status(403).json({ error: 'Agent Editors cannot modify unpublished drafts from others.' });
+    }
+    if (agent.owner_id !== userId && !req.session?.isAdmin && req.session?.user?.role !== 'admin') {
         const { hasPermission } = require('../../auth');
         const hasPerm = await hasPermission(userId, 'manage_agents', req.session);
         if (!hasPerm) {
             return res.status(403).json({ error: 'Permission denied' });
         }
-
-        // Agent Editors cannot publish unpublished drafts from others
-        const user = await userStore.getUser(userId);
-        if (user?.orgRole === 'agent_editor' && !agent.is_published) {
-            return res.status(403).json({ error: 'Agent Editors cannot modify unpublished drafts from others.' });
-        }
     }
 
     const { isPublished, sharedGroups } = req.body;
-    // Use agent.owner_id (not userId) so the SQL WHERE owner_id=$4 matches
+    // Use agent.owner_id (not userId) so the SQL WHERE owner_id matches even when
+    // a non-owner (org admin, agent admin) is toggling publish.
     const success = await agentStore.setAgentPublished(req.params.id, isPublished, agent.owner_id, sharedGroups);
 
     if (!success) {

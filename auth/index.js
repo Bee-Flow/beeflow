@@ -17,7 +17,8 @@ const {
     getUserPermissions,
     resolveUserOrgIds,
     requireOrgAdmin,
-    invalidatePermissionCache
+    invalidatePermissionCache,
+    invalidateAllPermissionCaches
 } = require('./permissions');
 
 // Mount sub-routers
@@ -36,5 +37,6 @@ module.exports = {
     getUserPermissions,
     resolveUserOrgIds,
     requireOrgAdmin,
-    invalidatePermissionCache
+    invalidatePermissionCache,
+    invalidateAllPermissionCaches
 };

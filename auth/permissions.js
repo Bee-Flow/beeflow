@@ -318,6 +318,28 @@ async function invalidatePermissionCache(userId) {
     }
 }
 
+/**
+ * Invalidate every user's cached permission set. Used on group/role mutations
+ * where the affected-user set isn't easily enumerable.
+ */
+async function invalidateAllPermissionCaches() {
+    _permCache.clear();
+    const r = getRedis();
+    if (!r) return;
+    try {
+        let cursor = '0';
+        do {
+            const [next, keys] = await r.scan(cursor, 'MATCH', 'bf:perms:*', 'COUNT', 200);
+            cursor = next;
+            if (keys.length) {
+                try { await r.unlink(...keys); } catch (_) { try { await r.del(...keys); } catch (_) { } }
+            }
+        } while (cursor !== '0');
+    } catch (err) {
+        console.warn('[Auth] invalidateAllPermissionCaches scan failed:', err.message);
+    }
+}
+
 // Helper to check if user has a specific permission
 async function hasPermission(userId, permission, session = null) {
     const perms = await getUserPermissions(userId, session);
@@ -463,5 +485,6 @@ module.exports = {
     requirePluginAdmin,
     resolveUserOrgIds,
     requireOrgAdmin,
-    invalidatePermissionCache
+    invalidatePermissionCache,
+    invalidateAllPermissionCaches
 };

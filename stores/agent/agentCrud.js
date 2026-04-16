@@ -127,8 +127,21 @@ async function getPublishedAgents() {
 
 async function setAgentPublished(id, isPublished, ownerId, sharedGroups = undefined) {
     await initDB();
-    const sharedGroupsJson = sharedGroups !== undefined ? JSON.stringify(sharedGroups || []) : '[]';
-    const { rowCount } = await run('UPDATE agents SET is_published = $1, shared_groups = $2, updated_at = NOW() WHERE id = $3 AND owner_id = $4', [!!isPublished, sharedGroupsJson, id, ownerId]);
+    // When sharedGroups is undefined, preserve the existing DB value — do NOT
+    // overwrite with []. Previously a toggle-publish with no sharedGroups in the
+    // request body silently wiped any group restrictions.
+    let rowCount;
+    if (sharedGroups === undefined) {
+        ({ rowCount } = await run(
+            'UPDATE agents SET is_published = $1, updated_at = NOW() WHERE id = $2 AND owner_id = $3',
+            [!!isPublished, id, ownerId]
+        ));
+    } else {
+        ({ rowCount } = await run(
+            'UPDATE agents SET is_published = $1, shared_groups = $2, updated_at = NOW() WHERE id = $3 AND owner_id = $4',
+            [!!isPublished, JSON.stringify(sharedGroups || []), id, ownerId]
+        ));
+    }
     return rowCount > 0;
 }
 

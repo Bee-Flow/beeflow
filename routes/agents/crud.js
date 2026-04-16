@@ -298,3 +298,4 @@ router.put('/:id/tools/:componentId/params', async (req, res) => {
 });
 
 module.exports = router;
+module.exports.canModifyAgent = canModifyAgent;
