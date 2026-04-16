@@ -35,6 +35,7 @@ const SYSTEM_PERMISSIONS = [
     { id: 'manage_components', name: 'Manage Components', description: 'Create and edit workflow components', group: 'actions' },
     { id: 'manage_knowledge', name: 'Manage Knowledge', description: 'Create, edit, delete, and ingest knowledge bases', group: 'actions' },
     { id: 'manage_apps', name: 'Manage Apps', description: 'Create and publish apps', group: 'actions' },
+    { id: 'use_notebooks', name: 'Use Notebooks', description: 'Create, edit, and delete personal notebooks', group: 'actions' },
 ];
 
 // ── Load org role → permissions mapping from config file ──

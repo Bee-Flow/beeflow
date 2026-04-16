@@ -279,7 +279,10 @@ function mapSourceRow(r) {
 
 // ── Version Control ─────────────────────────────────────────────────
 
-const MAX_VERSIONS_PER_NOTEBOOK = 50;
+// Auto-versioning snapshots notebook content on save with the 5-minute debounce
+// below. At 200 versions that's ~16 hours of continuous editing before the oldest
+// snapshot is pruned — plenty of recovery runway for accidental overwrites.
+const MAX_VERSIONS_PER_NOTEBOOK = 200;
 const AUTO_VERSION_DEBOUNCE_MS = 5 * 60 * 1000; // 5 minutes
 
 /**

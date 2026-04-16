@@ -33,6 +33,7 @@ const kbStore = require('../stores/knowledgeBases');
 const { ingestFileSource, ingestUrlSource, ingestTextSource, ingestDriveSource } = require('../agents/notebooks/sourceIngestion');
 const { parseDocument, isSupportedDocument } = require('../core/documentParser');
 const { deleteDocumentChunks, findDocumentBySourceUri } = require('../core/kbIngestionHelpers');
+const { requirePermission } = require('../auth');
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } }); // 50MB
 
@@ -40,6 +41,10 @@ function requireAuth(req, res, next) {
     if (req.session?.user) return next();
     res.status(401).json({ error: 'Unauthorized' });
 }
+
+// Every notebook route requires the `use_notebooks` permission. Ownership
+// isolation is still enforced per-route via the user_id check in notebookStore.
+router.use(requirePermission('use_notebooks'));
 
 // ── Notebook CRUD ──────────────────────────────────────────────────
 
@@ -552,7 +557,7 @@ ${allContent.slice(0, 50000)}`;
         const { TIER_DEFAULTS } = require('../core/modelResolver');
         const _tierDefaults = TIER_DEFAULTS[resolvedTier] || TIER_DEFAULTS['fast'];
         const chatOptions = {
-            maxTokens: (tier.maxTokens || _tierDefaults.maxTokens),
+            maxTokens: _tierDefaults.maxTokens,
             temperature: 0.4,
         };
 
@@ -780,7 +785,7 @@ ${sourceContent.slice(0, 60000)}`;
         ];
 
         const _fillDefaults = TIER_DEFAULTS[resolvedTier] || TIER_DEFAULTS['fast'];
-        const chatOptions = { maxTokens: tier.maxTokens || _fillDefaults.maxTokens, temperature: 0.1 };
+        const chatOptions = { maxTokens: _fillDefaults.maxTokens, temperature: 0.1 };
 
         await adapter.stream(apiKey, apiUrl, modelId, messages, chatOptions, (streamType, data) => {
             if (streamType === 'text') {

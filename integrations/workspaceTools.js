@@ -215,7 +215,7 @@ function buildOutline(content, sections) {
  * Execute a notebook tool call.
  */
 async function executeWorkspaceTool(toolName, args, context) {
-    const { conversationId } = context;
+    const { conversationId, userId: callerUserId } = context;
 
     // Normalize legacy tool names
     const normalizedName = toolName
@@ -230,14 +230,26 @@ async function executeWorkspaceTool(toolName, args, context) {
     // Lazy-load DB helpers to avoid circular deps
     const { getOne, run } = require('../db');
 
-    // Helper: get notebook content from either agent or direct conversations
+    // Helper: get notebook content from either agent or direct conversations.
+    // Returns user_id alongside content so callers can cross-check ownership
+    // against the tool's execution context (defence in depth — the caller-side
+    // context.userId should always match the conversation owner in practice).
     async function getWorkspace(convId) {
         // Try agent_conversations first
-        let row = await getOne('SELECT workspace_content FROM agent_conversations WHERE id = $1', [convId]);
-        if (row) return { content: row.workspace_content || '', source: 'agent' };
+        let row = await getOne('SELECT workspace_content, user_id FROM agent_conversations WHERE id = $1', [convId]);
+        if (row) return { content: row.workspace_content || '', user_id: row.user_id, source: 'agent' };
         // Fallback to direct_conversations
-        row = await getOne('SELECT workspace_content FROM direct_conversations WHERE id = $1', [convId]);
-        if (row) return { content: row.workspace_content || '', source: 'direct' };
+        row = await getOne('SELECT workspace_content, user_id FROM direct_conversations WHERE id = $1', [convId]);
+        if (row) return { content: row.workspace_content || '', user_id: row.user_id, source: 'direct' };
+        return null;
+    }
+
+    function denyIfCrossUser(workspace) {
+        if (!workspace) return null;
+        if (callerUserId && workspace.user_id && workspace.user_id !== callerUserId) {
+            console.warn('[NotebookTool] cross-user access blocked:', { conversationId, caller: callerUserId, owner: workspace.user_id });
+            return { error: 'This notebook belongs to a different user.' };
+        }
         return null;
     }
 
@@ -255,6 +267,8 @@ async function executeWorkspaceTool(toolName, args, context) {
     if (normalizedName === 'notebook_read') {
         try {
             const workspace = await getWorkspace(conversationId);
+            const denied = denyIfCrossUser(workspace);
+            if (denied) return denied;
             const content = workspace?.content || '';
             if (!content.trim()) {
                 return { content: '', message: 'The notebook is currently empty.' };
@@ -372,6 +386,9 @@ async function executeWorkspaceTool(toolName, args, context) {
         const title = args.title || 'Notebook';
 
         try {
+            const existing = await getWorkspace(conversationId);
+            const denied = denyIfCrossUser(existing);
+            if (denied) return denied;
             await setWorkspace(conversationId, content);
             const words = wordCount(content);
             return {
@@ -399,6 +416,8 @@ async function executeWorkspaceTool(toolName, args, context) {
 
         try {
             const workspace = await getWorkspace(conversationId);
+            const denied = denyIfCrossUser(workspace);
+            if (denied) return denied;
             const currentContent = workspace?.content || '';
             let newContent;
 
@@ -467,6 +486,8 @@ async function executeWorkspaceTool(toolName, args, context) {
 
         try {
             const workspace = await getWorkspace(conversationId);
+            const denied = denyIfCrossUser(workspace);
+            if (denied) return denied;
             const currentContent = workspace?.content || '';
 
             let searchContent = currentContent;
