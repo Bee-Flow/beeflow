@@ -13,7 +13,16 @@
  */
 
 const emailKBStore = require('../stores/emailKBStore');
-const { processEmail, processEmailThread, mergeArticlesByCategory, buildPerEmailArticle } = require('../core/emailKBProcessor');
+const {
+    processEmail,
+    processEmailThread,
+    mergeArticlesByCategory,
+    buildPerEmailArticle,
+    prepareEmailForLLM,
+    assembleProcessedEmail,
+    summarizeAndCategorize,
+    summarizeAndCategorizeBatch,
+} = require('../core/emailKBProcessor');
 const { ingestDocument, findDocumentBySourceUri, deleteDocumentChunks } = require('../core/kbIngestionHelpers');
 
 const { run } = require('../db');
@@ -54,6 +63,27 @@ function buildMergeOptions(connection) {
         customPrompt: pc.merge?.systemPrompt || '',
         language: pc.language || '',
     };
+}
+
+/**
+ * Pick sensible concurrency + batch size from pipeline_config.
+ *
+ * Defaults by model tier for the article stage:
+ *   - fast           → concurrency 8  (provider tolerates high fan-out)
+ *   - thinking/writer → concurrency 5
+ *   - deep_thinking  → concurrency 3  (expensive, throttles fast)
+ *
+ * `batch_size` is opt-in (default 1 = one email per LLM call). When > 1,
+ * multiple emails are sent in a single fused prompt — see
+ * summarizeAndCategorizeBatch in emailKBProcessor.js.
+ */
+function resolveParallelism(connection) {
+    const art = connection.pipeline_config?.article || {};
+    const tier = art.modelTier || 'fast';
+    const tierDefault = tier === 'deep_thinking' ? 3 : tier === 'fast' ? 8 : 5;
+    const concurrency = Math.max(1, Math.min(10, art.concurrency || tierDefault));
+    const batchSize = Math.max(1, Math.min(5, art.batch_size || 1));
+    return { concurrency, batchSize };
 }
 
 /**
@@ -287,38 +317,107 @@ async function syncGmailConnection(connection) {
         // both tolerate a handful of concurrent callers. If we hit a hard 429
         // we set `rateLimited` so remaining workers finish their current item
         // and stop scheduling new ones — the next sync cycle picks up the rest.
-        const concurrency = Math.max(1, Math.min(10, connection.pipeline_config?.article?.concurrency || 5));
+        const { concurrency, batchSize } = resolveParallelism(connection);
         let rateLimited = false;
         const processOpts = buildProcessOptions(connection);
+        const articleTier = connection.pipeline_config?.article?.modelTier || 'fast';
+        const categoryTier = connection.pipeline_config?.category?.modelTier || 'fast';
+        const useBatch = ingestionMode === 'category_merge' && batchSize > 1 && articleTier === categoryTier;
 
-        const perItem = async (msg) => {
+        // Fetch a single Gmail message into { body, metadata } form.
+        const fetchOne = async (msg) => {
             const detail = await withRetry(() => gmail.users.messages.get({
                 userId: 'me',
                 id: msg.id,
                 format: 'full',
             }), `gmail.get(${msg.id})`);
-
             const headers = detail.data.payload?.headers || [];
-            const body = extractGmailTextBody(detail.data.payload);
-            const metadata = {
-                subject: getGmailHeader(headers, 'Subject'),
-                from: getGmailHeader(headers, 'From'),
-                to: getGmailHeader(headers, 'To'),
-                cc: getGmailHeader(headers, 'Cc'),
-                date: getGmailHeader(headers, 'Date'),
-                messageId: msg.id,
-                threadId: detail.data.threadId,
-                labels: detail.data.labelIds,
+            return {
+                msgId: msg.id,
+                body: extractGmailTextBody(detail.data.payload),
+                metadata: {
+                    subject: getGmailHeader(headers, 'Subject'),
+                    from: getGmailHeader(headers, 'From'),
+                    to: getGmailHeader(headers, 'To'),
+                    cc: getGmailHeader(headers, 'Cc'),
+                    date: getGmailHeader(headers, 'Date'),
+                    messageId: msg.id,
+                    threadId: detail.data.threadId,
+                    labels: detail.data.labelIds,
+                },
             };
+        };
 
+        const perItem = async (msg) => {
+            const { body, metadata } = await fetchOne(msg);
             const processed = ingestionMode === 'per_email'
                 ? buildPerEmailArticle(body, metadata, processOpts)
                 : await processEmail(body, metadata, processOpts);
-
             return { msgId: msg.id, msgDate: metadata.date, processed };
         };
 
-        const settled = await parallelMap(messageIds, concurrency, perItem, () => rateLimited);
+        // Batch mode (category_merge + batch_size > 1): fetch N emails, then
+        // make ONE fused LLM call for all of them.
+        const perChunk = async (chunk) => {
+            const fetched = [];
+            for (const msg of chunk) {
+                fetched.push(await fetchOne(msg)); // sequential within a chunk; parallelism is across chunks
+            }
+            const prepped = fetched.map(f => prepareEmailForLLM(f.body, f.metadata, processOpts));
+            const validIdx = [];
+            for (let i = 0; i < prepped.length; i++) if (!prepped[i].skip) validIdx.push(i);
+            const aiInputs = validIdx.map(i => prepped[i].aiInput);
+
+            let llmResults = [];
+            if (aiInputs.length > 0) {
+                llmResults = await summarizeAndCategorizeBatch(aiInputs, {
+                    orgId: processOpts.orgId,
+                    language: processOpts.language,
+                    modelTier: articleTier,
+                    articlePrompt: processOpts.articlePrompt,
+                    categoryPrompt: processOpts.categoryPrompt,
+                });
+                // If the whole batch failed (malformed JSON), fall back to individual fused calls.
+                if (llmResults.every(r => !r.article && r.reason)) {
+                    llmResults = await Promise.all(aiInputs.map(ai => summarizeAndCategorize(ai, {
+                        orgId: processOpts.orgId,
+                        language: processOpts.language,
+                        modelTier: articleTier,
+                        articlePrompt: processOpts.articlePrompt,
+                        categoryPrompt: processOpts.categoryPrompt,
+                    })));
+                }
+            }
+
+            return fetched.map((f, i) => {
+                const p = prepped[i];
+                if (p.skip) {
+                    return { msgId: f.msgId, msgDate: f.metadata.date, processed: { success: false, reason: p.reason, skipped: true } };
+                }
+                const llmIdx = validIdx.indexOf(i);
+                const llm = llmResults[llmIdx] || { article: null };
+                const processed = assembleProcessedEmail({
+                    article: llm.article,
+                    category: llm.category,
+                    subject: p.subject,
+                    date: p.date,
+                    messageId: p.messageId,
+                });
+                if (!processed.success && llm.reason) processed.reason = llm.reason;
+                return { msgId: f.msgId, msgDate: f.metadata.date, processed };
+            });
+        };
+
+        let settled;
+        if (useBatch) {
+            console.log(`[EmailKBSync] Gmail batch mode: batch_size=${batchSize}, concurrency=${concurrency}, ${messageIds.length} msgs`);
+            const chunks = [];
+            for (let i = 0; i < messageIds.length; i += batchSize) chunks.push(messageIds.slice(i, i + batchSize));
+            const settledChunks = await parallelMap(chunks, concurrency, perChunk, () => rateLimited);
+            settled = settledChunks.flatMap(c => (Array.isArray(c) ? c : [c]));
+        } else {
+            settled = await parallelMap(messageIds, concurrency, perItem, () => rateLimited);
+        }
 
         for (const r of settled) {
             if (r?.__aborted) {
@@ -573,19 +672,21 @@ async function syncOutlookConnection(connection) {
         }
     } else {
         // Process individual messages in parallel (see syncGmailConnection for rationale).
-        const concurrency = Math.max(1, Math.min(10, connection.pipeline_config?.article?.concurrency || 5));
+        const { concurrency, batchSize } = resolveParallelism(connection);
         let rateLimited = false;
         const processOpts = buildProcessOptions(connection);
+        const articleTier = connection.pipeline_config?.article?.modelTier || 'fast';
+        const categoryTier = connection.pipeline_config?.category?.modelTier || 'fast';
+        const useBatch = ingestionMode === 'category_merge' && batchSize > 1 && articleTier === categoryTier;
 
-        const perItem = async (msg) => {
+        const buildMeta = (msg) => {
             const fromStr = msg.from?.emailAddress
                 ? `${msg.from.emailAddress.name || ''} <${msg.from.emailAddress.address}>`
                 : '';
             const toStr = Array.isArray(msg.toRecipients)
                 ? msg.toRecipients.map(r => r.emailAddress?.address).filter(Boolean).join(', ')
                 : '';
-
-            const metadata = {
+            return {
                 subject: msg.subject,
                 from: fromStr,
                 to: toStr,
@@ -593,15 +694,73 @@ async function syncOutlookConnection(connection) {
                 messageId: msg.id,
                 threadId: msg.conversationId,
             };
+        };
 
+        const perItem = async (msg) => {
+            const metadata = buildMeta(msg);
+            const body = msg.body?.content || '';
             const processed = ingestionMode === 'per_email'
-                ? buildPerEmailArticle(msg.body?.content || '', metadata, processOpts)
-                : await processEmail(msg.body?.content || '', metadata, processOpts);
-
+                ? buildPerEmailArticle(body, metadata, processOpts)
+                : await processEmail(body, metadata, processOpts);
             return { msgId: msg.id, processed };
         };
 
-        const settled = await parallelMap(messages, concurrency, perItem, () => rateLimited);
+        const perChunk = async (chunk) => {
+            const fetched = chunk.map(msg => ({ msgId: msg.id, body: msg.body?.content || '', metadata: buildMeta(msg) }));
+            const prepped = fetched.map(f => prepareEmailForLLM(f.body, f.metadata, processOpts));
+            const validIdx = [];
+            for (let i = 0; i < prepped.length; i++) if (!prepped[i].skip) validIdx.push(i);
+            const aiInputs = validIdx.map(i => prepped[i].aiInput);
+
+            let llmResults = [];
+            if (aiInputs.length > 0) {
+                llmResults = await summarizeAndCategorizeBatch(aiInputs, {
+                    orgId: processOpts.orgId,
+                    language: processOpts.language,
+                    modelTier: articleTier,
+                    articlePrompt: processOpts.articlePrompt,
+                    categoryPrompt: processOpts.categoryPrompt,
+                });
+                if (llmResults.every(r => !r.article && r.reason)) {
+                    llmResults = await Promise.all(aiInputs.map(ai => summarizeAndCategorize(ai, {
+                        orgId: processOpts.orgId,
+                        language: processOpts.language,
+                        modelTier: articleTier,
+                        articlePrompt: processOpts.articlePrompt,
+                        categoryPrompt: processOpts.categoryPrompt,
+                    })));
+                }
+            }
+
+            return fetched.map((f, i) => {
+                const p = prepped[i];
+                if (p.skip) {
+                    return { msgId: f.msgId, processed: { success: false, reason: p.reason, skipped: true } };
+                }
+                const llmIdx = validIdx.indexOf(i);
+                const llm = llmResults[llmIdx] || { article: null };
+                const processed = assembleProcessedEmail({
+                    article: llm.article,
+                    category: llm.category,
+                    subject: p.subject,
+                    date: p.date,
+                    messageId: p.messageId,
+                });
+                if (!processed.success && llm.reason) processed.reason = llm.reason;
+                return { msgId: f.msgId, processed };
+            });
+        };
+
+        let settled;
+        if (useBatch) {
+            console.log(`[EmailKBSync] Outlook batch mode: batch_size=${batchSize}, concurrency=${concurrency}, ${messages.length} msgs`);
+            const chunks = [];
+            for (let i = 0; i < messages.length; i += batchSize) chunks.push(messages.slice(i, i + batchSize));
+            const settledChunks = await parallelMap(chunks, concurrency, perChunk, () => rateLimited);
+            settled = settledChunks.flatMap(c => (Array.isArray(c) ? c : [c]));
+        } else {
+            settled = await parallelMap(messages, concurrency, perItem, () => rateLimited);
+        }
 
         for (const r of settled) {
             if (r?.__aborted) {

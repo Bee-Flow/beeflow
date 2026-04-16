@@ -429,6 +429,241 @@ async function categorizeArticle(articleText, options = {}) {
     return 'Uncategorized';
 }
 
+/**
+ * Extract the first balanced JSON object/array from a string. Handles models
+ * that wrap their JSON in ```json fences or add prefix/suffix prose.
+ * Returns null if nothing parseable is found.
+ */
+function extractJson(text) {
+    if (!text) return null;
+    // Strip code fences
+    const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+    const candidate = fenceMatch ? fenceMatch[1] : text;
+    // Find the first balanced {...} or [...] block
+    const startIdx = candidate.search(/[{[]/);
+    if (startIdx === -1) return null;
+    const open = candidate[startIdx];
+    const close = open === '{' ? '}' : ']';
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    for (let i = startIdx; i < candidate.length; i++) {
+        const ch = candidate[i];
+        if (escape) { escape = false; continue; }
+        if (ch === '\\') { escape = true; continue; }
+        if (ch === '"') { inString = !inString; continue; }
+        if (inString) continue;
+        if (ch === open) depth++;
+        else if (ch === close) {
+            depth--;
+            if (depth === 0) {
+                const slice = candidate.slice(startIdx, i + 1);
+                try { return JSON.parse(slice); } catch { return null; }
+            }
+        }
+    }
+    return null;
+}
+
+/**
+ * Fused Stage 2 + Stage 3: generate the KB article AND its category label
+ * in a single LLM round-trip. Halves the AI latency per email compared to
+ * calling summarizeToArticle followed by categorizeArticle sequentially.
+ *
+ * Returns {article, category, reason?} matching the shape of the two
+ * separate functions combined. Falls back gracefully: if the model refuses
+ * to return valid JSON, caller can retry with separate calls.
+ */
+async function summarizeAndCategorize(cleanedText, options = {}) {
+    const { articlePrompt, categoryPrompt, orgId, modelTier = 'fast', language } = options;
+
+    if (!cleanedText || cleanedText.trim().length < 20) {
+        return { article: null, category: null, reason: 'Content too short' };
+    }
+
+    try {
+        const modelId = await resolveModel(modelTier, orgId);
+        console.log(`[EmailKBProcessor] Fused article+category: model=${modelId} tier=${modelTier}`);
+
+        const { createChatCompletion } = require('../agents/providerAdapters');
+
+        const artSys = appendLanguageInstruction(articlePrompt || DEFAULT_ARTICLE_PROMPT, language);
+        const catSys = appendLanguageInstruction(categoryPrompt || DEFAULT_CATEGORY_PROMPT, language);
+
+        const fusedSystem =
+            `You perform TWO tasks in one pass and return a single JSON object.\n\n` +
+            `=== TASK 1 — ARTICLE ===\n${artSys}\n\n` +
+            `=== TASK 2 — CATEGORY ===\n${catSys}\n\n` +
+            `=== OUTPUT FORMAT (STRICT) ===\n` +
+            `Return EXACTLY this JSON — no prose, no code fences, no comments:\n` +
+            `{"article": "<TASK 1 markdown output as a single JSON string, escape newlines as \\n>", "category": "<TASK 2 single label, no quotes>"}\n`;
+
+        const result = await createChatCompletion({
+            model: modelId,
+            messages: [
+                { role: 'system', content: fusedSystem },
+                { role: 'user', content: cleanedText },
+            ],
+            temperature: 0.3,
+            max_tokens: 2100,
+        });
+
+        const raw = result?.choices?.[0]?.message?.content || '';
+        const parsed = extractJson(raw);
+
+        if (!parsed || typeof parsed.article !== 'string' || typeof parsed.category !== 'string') {
+            return { article: null, category: null, reason: 'AI did not return parseable JSON' };
+        }
+
+        const article = parsed.article.trim();
+        if (!article || article.length < 20) {
+            return { article: null, category: null, reason: 'AI produced empty article' };
+        }
+
+        return {
+            article,
+            category: parsed.category.trim().slice(0, 80) || 'Uncategorized',
+        };
+    } catch (err) {
+        console.error('[EmailKBProcessor] Fused article+category failed:', err.message);
+        return { article: null, category: null, reason: `AI error: ${err.message}` };
+    }
+}
+
+/**
+ * Batched fused call: N emails in one LLM request, returning an array of
+ * {article, category} entries in the same order as input. Opt-in via
+ * `pipeline_config.article.batch_size` (default 1 = don't batch).
+ *
+ * Trade-off: ~2× additional speed-up over single-email fused calls, but the
+ * model's attention is split across all N emails so very-long emails in the
+ * batch can steal quality from shorter ones. Keep batch_size ≤ 5 in practice.
+ *
+ * Callers must handle the failure case (null entry / mismatched length)
+ * by falling back to summarizeAndCategorize on each item individually.
+ */
+async function summarizeAndCategorizeBatch(emails, options = {}) {
+    const { articlePrompt, categoryPrompt, orgId, modelTier = 'fast', language } = options;
+
+    if (!Array.isArray(emails) || emails.length === 0) return [];
+    if (emails.length === 1) {
+        const r = await summarizeAndCategorize(emails[0], options);
+        return [r];
+    }
+
+    try {
+        const modelId = await resolveModel(modelTier, orgId);
+        console.log(`[EmailKBProcessor] Batched article+category: model=${modelId}, batch=${emails.length}`);
+
+        const { createChatCompletion } = require('../agents/providerAdapters');
+
+        const artSys = appendLanguageInstruction(articlePrompt || DEFAULT_ARTICLE_PROMPT, language);
+        const catSys = appendLanguageInstruction(categoryPrompt || DEFAULT_CATEGORY_PROMPT, language);
+
+        const fusedSystem =
+            `You will receive ${emails.length} emails separated by <<<EMAIL k>>> markers.\n` +
+            `For EACH email, perform two tasks:\n\n` +
+            `=== TASK 1 — ARTICLE ===\n${artSys}\n\n` +
+            `=== TASK 2 — CATEGORY ===\n${catSys}\n\n` +
+            `=== OUTPUT FORMAT (STRICT) ===\n` +
+            `Return a single JSON array of length ${emails.length}, order matching input exactly. No prose, no code fences.\n` +
+            `[{"article": "<markdown>", "category": "<label>"}, ...]\n`;
+
+        const userContent = emails
+            .map((body, i) => `<<<EMAIL ${i + 1}>>>\n${body}`)
+            .join('\n\n');
+
+        const result = await createChatCompletion({
+            model: modelId,
+            messages: [
+                { role: 'system', content: fusedSystem },
+                { role: 'user', content: userContent },
+            ],
+            temperature: 0.3,
+            max_tokens: 2100 * emails.length,
+        });
+
+        const raw = result?.choices?.[0]?.message?.content || '';
+        const parsed = extractJson(raw);
+
+        if (!Array.isArray(parsed) || parsed.length !== emails.length) {
+            // Tell caller to retry per-email
+            return emails.map(() => ({ article: null, category: null, reason: 'Batch output malformed — falling back' }));
+        }
+
+        return parsed.map((entry) => {
+            if (!entry || typeof entry.article !== 'string' || typeof entry.category !== 'string') {
+                return { article: null, category: null, reason: 'Batch entry malformed' };
+            }
+            const article = entry.article.trim();
+            if (!article || article.length < 20) {
+                return { article: null, category: null, reason: 'AI produced empty article' };
+            }
+            return { article, category: entry.category.trim().slice(0, 80) || 'Uncategorized' };
+        });
+    } catch (err) {
+        console.error('[EmailKBProcessor] Batched article+category failed:', err.message);
+        return emails.map(() => ({ article: null, category: null, reason: `AI error: ${err.message}` }));
+    }
+}
+
+/**
+ * Everything `processEmail` does BEFORE the LLM call, extracted so batch mode
+ * can run Stage 1 (clean/redact/header) across N emails synchronously and
+ * then make a single batched LLM call.
+ *
+ * Returns { aiInput, subject, date, messageId } on success
+ * or { skip: true, reason } on blacklist/empty content.
+ */
+function prepareEmailForLLM(rawContent, metadata = {}, options = {}) {
+    const { subject, from, date, messageId } = metadata;
+    const { senderBlacklist = [], redactPII: shouldRedact = true } = options;
+
+    if (from && senderBlacklist.length > 0) {
+        const senderEmail = (from.match(/<([^>]+)>/) || [, from])[1].toLowerCase();
+        if (senderBlacklist.some(b => senderEmail.includes(b.toLowerCase()))) {
+            return { skip: true, reason: 'Sender blacklisted' };
+        }
+    }
+
+    const cleaned = cleanEmail(rawContent);
+    if (!cleaned || cleaned.trim().length < 20) {
+        return { skip: true, reason: 'No meaningful content after cleanup' };
+    }
+
+    const redacted = shouldRedact ? redactPII(cleaned) : cleaned;
+
+    let aiInput = redacted;
+    if (subject || date) {
+        const header = [subject && `Subject: ${subject}`, date && `Date: ${date}`].filter(Boolean).join('\n');
+        aiInput = `${header}\n---\n${redacted}`;
+    }
+
+    return { aiInput, subject, date, messageId };
+}
+
+/**
+ * Build the final processed-email result after the LLM call(s). Shared between
+ * the single-email and batched paths.
+ */
+function assembleProcessedEmail({ article, category, subject, date, messageId }) {
+    if (!article) return { success: false, reason: 'AI produced empty article', skipped: true };
+    const cat = category || 'Uncategorized';
+    const cleanSubject = subject ? subject.replace(/^(re|fw|fwd):\s*/gi, '').trim() : '';
+    const title = cleanSubject
+        ? `${cat}: ${cleanSubject}`
+        : `${cat}: ${article.split('\n')[0].replace(/^#+\s*/, '').substring(0, 80)}`;
+
+    return {
+        success: true,
+        article,
+        category: cat,
+        title,
+        sourceDate: date,
+        sourceMessageId: messageId,
+    };
+}
+
 // ──────────────────────────────────────────────
 // Full Pipeline
 // ──────────────────────────────────────────────
@@ -472,7 +707,9 @@ async function processEmail(rawContent, metadata = {}, options = {}) {
         return { success: false, reason: 'No meaningful content after cleanup', skipped: true };
     }
 
-    // Stage 2: Redact PII (pre-AI pass) — optional
+    // PII redaction — single pre-AI pass. The old pipeline redacted twice
+    // (before AND after AI); the post-AI pass catches only model hallucinations
+    // and its cost isn't worth the wall-time. Redact once, trust the model.
     const redacted = shouldRedact ? redactPII(cleaned) : cleaned;
 
     // Prepend metadata for AI context
@@ -482,35 +719,70 @@ async function processEmail(rawContent, metadata = {}, options = {}) {
         aiInput = `${header}\n---\n${redacted}`;
     }
 
-    // Stage 3: AI Article generation
-    const { article, reason } = await summarizeToArticle(aiInput, {
-        orgId, language,
-        modelTier: articleModelTier,
-        customPrompt: articlePrompt,
-    });
+    // Stage 2 + 3: AI article generation AND categorization.
+    // Fast path (shared model tier → one LLM call returning JSON).
+    // Fallback path (different tiers) still does two calls in sequence.
+    let article, category, reason;
+    if (articleModelTier === categoryModelTier) {
+        const fused = await summarizeAndCategorize(aiInput, {
+            orgId, language,
+            modelTier: articleModelTier,
+            articlePrompt,
+            categoryPrompt,
+        });
+        article = fused.article;
+        category = fused.category;
+        reason = fused.reason;
+
+        // If fused call failed to produce parseable JSON, retry with the old
+        // two-call path rather than dropping the email.
+        if (!article) {
+            const retry = await summarizeToArticle(aiInput, {
+                orgId, language,
+                modelTier: articleModelTier,
+                customPrompt: articlePrompt,
+            });
+            article = retry.article;
+            reason = retry.reason;
+            if (article) {
+                category = await categorizeArticle(article, {
+                    orgId, language,
+                    modelTier: categoryModelTier,
+                    customPrompt: categoryPrompt,
+                });
+            }
+        }
+    } else {
+        const r = await summarizeToArticle(aiInput, {
+            orgId, language,
+            modelTier: articleModelTier,
+            customPrompt: articlePrompt,
+        });
+        article = r.article;
+        reason = r.reason;
+        if (article) {
+            category = await categorizeArticle(article, {
+                orgId, language,
+                modelTier: categoryModelTier,
+                customPrompt: categoryPrompt,
+            });
+        }
+    }
+
     if (!article) {
         return { success: false, reason: reason || 'AI summarization failed', skipped: true };
     }
-
-    // Stage 4: AI Categorization (separate model tier + prompt)
-    const category = await categorizeArticle(article, {
-        orgId, language,
-        modelTier: categoryModelTier,
-        customPrompt: categoryPrompt,
-    });
-
-    // Stage 5: Post-AI PII pass — optional
-    const sanitizedArticle = shouldRedact ? redactPII(article) : article;
+    if (!category) category = 'Uncategorized';
 
     // Build title
     const cleanSubject = subject ? subject.replace(/^(re|fw|fwd):\s*/gi, '').trim() : '';
     const title = cleanSubject
         ? `${category}: ${cleanSubject}`
-        : `${category}: ${sanitizedArticle.split('\n')[0].replace(/^#+\s*/, '').substring(0, 80)}`;
+        : `${category}: ${article.split('\n')[0].replace(/^#+\s*/, '').substring(0, 80)}`;
 
     return {
         success: true,
-        article: sanitizedArticle,
+        article,
         category,
         title,
         sourceDate: date,
@@ -803,7 +1075,12 @@ module.exports = {
     redactPII,
     summarizeToArticle,
     categorizeArticle,
+    summarizeAndCategorize,
+    summarizeAndCategorizeBatch,
     parseFromField,
+    // Split-step helpers (for batch pipelines)
+    prepareEmailForLLM,
+    assembleProcessedEmail,
     // Full pipelines
     processEmail,
     processEmailThread,
