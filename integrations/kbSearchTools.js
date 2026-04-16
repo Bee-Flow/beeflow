@@ -257,16 +257,13 @@ async function executeKbSearchTool(toolName, args, context = {}) {
         }
 
         // Format results for the agent.
-        // When a reranker is active (Azure Cohere or local GPU) it already picked the best
-        // topK results — applying a score threshold on top would drop ranked results 2-5.
-        // We only filter out zero-score results (completely irrelevant) when using raw RRF
-        // with no reranker, to avoid returning noise.
-        const azureRerankerConfigured = !!(await configStore.getConfig('azure_reranker_endpoint') || process.env.AZURE_RERANKER_ENDPOINT);
-        const hasReranker = azureRerankerConfigured || (!useAzure && process.env.RERANKER_URL);
-        // No threshold when reranker is active — trust the reranker's ranking + topK.
-        // Minimal floor (0.01) when RRF-only to avoid completely irrelevant results.
-        const scoreThreshold = hasReranker ? 0 : 0.01;
+        // Apply a minimum relevance threshold. Reranker scores below ~0.35 are
+        // usually noise — they clutter the UI, waste tokens in the LLM payload,
+        // and distract the agent. Override via KB_MIN_SCORE env var if needed.
+        const parsedMin = parseFloat(process.env.KB_MIN_SCORE);
+        const scoreThreshold = Number.isFinite(parsedMin) ? parsedMin : 0.35;
 
+        const preFilterCount = chunks.length;
         const results = chunks
             .filter(c => (c.score || c.rerank_score || 0) >= scoreThreshold)
             .map((c, i) => ({
@@ -276,6 +273,9 @@ async function executeKbSearchTool(toolName, args, context = {}) {
                 content: c.content,
                 score: Math.round((c.score || c.rerank_score || 0) * 1000) / 1000
             }));
+        if (preFilterCount > results.length) {
+            console.log(`[KBSearch] Score filter (>= ${scoreThreshold}): kept ${results.length}/${preFilterCount}`);
+        }
 
         // ── Near-duplicate deduplication (Jaccard on word tokens) ────
         function getTokenSet(text) {
