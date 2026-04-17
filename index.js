@@ -325,6 +325,7 @@ app.use('/api/transcriptions', requireBetaFeature('meeting_notes'), require('./r
 app.use('/api/meet-bot', requireBetaFeature('meeting_notes'), require('./routes/meetBot'));
 app.use('/api/skills', requireBetaFeature('skills'), require('./routes/skills'));
 app.use('/api/email-kb', requireBetaFeature('email_knowledge_base'), require('./routes/emailKB'));
+app.use('/api/browser-agent', require('./routes/browserAgent'));
 app.use('/api/pat', require('./routes/personalAccessTokens'));
 
 app.use('/', require('./routes/knowledge'));
