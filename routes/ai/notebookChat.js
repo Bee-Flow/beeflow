@@ -30,7 +30,7 @@ function requireAuth(req, res, next) {
 // ─── Streaming Notebook Chat ─────────────────────────────────────
 
 router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
-    const { message, notebookId, history, modelTier, timezone, attachments, documentContent } = req.body;
+    const { message, notebookId, history, modelTier, timezone, attachments, documentContent, notebookSelection } = req.body;
     const userId = req.session.user.id;
 
     if (!message) return res.status(400).json({ error: 'Message required' });
@@ -226,6 +226,27 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
             documentContext = '\n\n[DOCUMENT EDITOR — EMPTY]\nThe user has an empty rich-text document editor (TipTap) open. Use notebook_doc_write to create content.';
         }
 
+        // Append the user's editor selection (set by the Ask AI / rewrite /
+        // shorten / expand bubble menu actions on the frontend). When present,
+        // the AI should treat "this", "the text", "the selection", etc. as
+        // referring to the exact string below, and — for rewrite-style actions
+        // — pass that same string verbatim as `find_text` to notebook_doc_replace.
+        let selectionContext = '';
+        if (notebookSelection && typeof notebookSelection.text === 'string' && notebookSelection.text.trim()) {
+            const MAX_SEL_CHARS = 8000;
+            const selText = notebookSelection.text.length > MAX_SEL_CHARS
+                ? notebookSelection.text.slice(0, MAX_SEL_CHARS) + '…[truncated]'
+                : notebookSelection.text;
+            const actionHint = notebookSelection.action && ['rewrite', 'shorten', 'expand'].includes(notebookSelection.action)
+                ? `The user explicitly invoked "${notebookSelection.action}" on this selection, so you MUST call notebook_doc_replace with find_text set to the exact selection above and replace_text set to your revised version.`
+                : `If the user asks you to edit, rewrite, or change "this" / "the text" / "the selection", use notebook_doc_replace with find_text set to the EXACT string above. If they ask a question, answer about this text specifically.`;
+            selectionContext =
+                `\n\n[SELECTED TEXT IN DOCUMENT]\n` +
+                `The user has highlighted the following text in the editor:\n` +
+                `<<<SELECTION_BEGIN>>>\n${selText}\n<<<SELECTION_END>>>\n` +
+                actionHint;
+        }
+
         // Build system prompt
         const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 
@@ -362,7 +383,7 @@ ${searchAvailable ? `[WEB SEARCH & SOURCES]
 - You can search the web using agent_search for current information and research
 - You can add search results or any text directly as a notebook source using notebook_add_source
 - When adding web search results as a source, pass the complete results text directly — no need to re-fetch
-` : ''}${kbContext}${documentContext}
+` : ''}${kbContext}${documentContext}${selectionContext}
 Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = new Date(); const _dp = _now.toLocaleString('sv-SE', { timeZone: _tz }); const _lp = new Date(_now.toLocaleString('en-US', { timeZone: _tz })); const _om = Math.round((_lp - _now) / 60000); const _s = _om >= 0 ? '+' : '-'; const _a = Math.abs(_om); return `${_dp} UTC${_s}${String(Math.floor(_a/60)).padStart(2,'0')}:${String(_a%60).padStart(2,'0')} (${_tz})`; } catch(_) { return new Date().toISOString(); } })()}`;
         }
 

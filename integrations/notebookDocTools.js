@@ -180,7 +180,9 @@ function executeNotebookDocTool(toolName, args, documentContent) {
             return { error: 'The document is empty. Use notebook_doc_write to create content first.' };
         }
 
-        // Strip HTML tags for text matching
+        // Strip HTML tags for text matching. Entity decoding covers the common
+        // cases; anything else should compare close enough via the normalized
+        // whitespace pass below.
         const stripHtml = (html) => html.replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
         const normalized = (t) => t.replace(/\s+/g, ' ').trim();
         const findNorm = normalized(findText);
@@ -189,11 +191,12 @@ function executeNotebookDocTool(toolName, args, documentContent) {
         if (plainNorm.includes(findNorm)) {
             let newContent = documentContent;
 
-            // Try exact match within HTML
+            // Try exact match within HTML first — cheapest and safest when the
+            // AI copied the text verbatim from notebook_doc_read.
             if (documentContent.includes(findText)) {
                 newContent = documentContent.replace(findText, replaceText);
             } else {
-                // Build a regex that matches the text with optional HTML tags in between
+                // Build a regex that matches the text with optional HTML tags in between.
                 const escapedParts = findText.split(/\s+/).map(word =>
                     word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
                 );
@@ -205,7 +208,7 @@ function executeNotebookDocTool(toolName, args, documentContent) {
                 if (match) {
                     newContent = documentContent.replace(match[0], replaceText);
                 } else {
-                    // Find the paragraph(s) containing the text
+                    // Last resort: paragraph-level find by normalized text.
                     const paragraphs = documentContent.split(/(<\/?(?:p|h[1-3]|li|blockquote|ul|ol)(?:\s[^>]*)?>)/);
                     let found = false;
                     let startIdx = -1, endIdx = -1;
@@ -230,8 +233,11 @@ function executeNotebookDocTool(toolName, args, documentContent) {
                         const after = paragraphs.slice(endIdx + 1).join('');
                         newContent = before + replaceText + after;
                     } else {
+                        // Shouldn't really reach here — the outer `plainNorm.includes(findNorm)`
+                        // guard already confirmed the text is present somewhere. But if it
+                        // does, give the AI a pointer rather than a dead end.
                         return {
-                            error: `Could not find the specified text in the document. Try using notebook_doc_read first to see the current content, then retry with the exact text.`
+                            error: `Text was detected in the document but could not be replaced at an HTML boundary. Try shortening find_text to a single paragraph worth of text, or call notebook_doc_read then copy the exact text.`,
                         };
                     }
                 }
@@ -244,8 +250,25 @@ function executeNotebookDocTool(toolName, args, documentContent) {
             };
         }
 
+        // Help the AI self-correct: suggest the closest matching phrase from
+        // the document so it can retry notebook_doc_replace with the right
+        // find_text. The naive approach here picks the document chunk whose
+        // leading whitespace-normalized prefix overlaps most with find_text.
+        const words = findNorm.split(' ').filter(Boolean);
+        let suggestion = '';
+        if (words.length >= 2) {
+            const needle = words.slice(0, Math.min(4, words.length)).join(' ').toLowerCase();
+            const plainLc = plainNorm.toLowerCase();
+            const idx = plainLc.indexOf(needle);
+            if (idx >= 0) {
+                suggestion = plainNorm.slice(idx, idx + Math.min(160, findNorm.length + 60));
+            }
+        }
+        const hint = suggestion
+            ? ` The document contains something similar starting with: "${suggestion.slice(0, 160)}…" — use that exact text as find_text.`
+            : ' Call notebook_doc_read first to see the exact current content, then retry.';
         return {
-            error: `Could not find "${findText.substring(0, 100)}..." in the document. Use notebook_doc_read first to see the exact current content.`
+            error: `Could not find "${findText.substring(0, 100)}${findText.length > 100 ? '…' : ''}" in the document.${hint}`,
         };
     }
 
