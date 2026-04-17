@@ -1226,6 +1226,149 @@ router.post('/n8n/test', requireOrgAdminForN8n, async (req, res) => {
 
 const N8N_PERMISSION_IDS = ['use_n8n_tools', 'modify_n8n_workflows'];
 
+// GET /ai/n8n/diagnostics — self-service access check for the current user.
+// Returns the full trace of how n8n tool injection would go: which of the three
+// gates (user-level, org-level, permission) pass or fail, plus the concrete
+// list of tools the LLM will see. Any authenticated user can call this for
+// themselves — it only exposes their own state.
+router.get('/n8n/diagnostics', requireAuth, async (req, res) => {
+    try {
+        const userStore = require('../../stores/userStore');
+        const { getIntegrationTools } = require('../../core/integrationTools');
+        const userId = req.session.user?.id;
+        if (!userId) return res.status(401).json({ error: 'Not authenticated' });
+
+        const user = await userStore.getUser(userId);
+        const organizationId = user?.organizationId || null;
+
+        // 1. n8n configured for the user's org?
+        let n8nConfigured = false;
+        if (organizationId) {
+            const url = await configStore.getConfig(`n8n_url_org_${organizationId}`);
+            const key = await configStore.getSecret(`n8n_api_key_org_${organizationId}`);
+            n8nConfigured = !!(url && key);
+        }
+
+        // 2. Org-level integration gating.
+        let orgEnabledIntegrations = null;
+        let orgGateSource = 'all_enabled';
+        if (organizationId) {
+            const org = await userStore.getOrganization(organizationId);
+            if (org?.enabledIntegrations) {
+                orgEnabledIntegrations = typeof org.enabledIntegrations === 'string'
+                    ? JSON.parse(org.enabledIntegrations) : org.enabledIntegrations;
+                orgGateSource = 'org_override';
+            } else {
+                const globalDefaults = await configStore.getConfig('default_org_integrations');
+                if (globalDefaults) {
+                    orgEnabledIntegrations = typeof globalDefaults === 'string'
+                        ? JSON.parse(globalDefaults) : globalDefaults;
+                    orgGateSource = 'global_default';
+                }
+            }
+        }
+        const orgGatePasses = !orgEnabledIntegrations || orgEnabledIntegrations.includes('n8n');
+
+        // 3. User-level integration gating.
+        const userEnabledApps = await configStore.getConfig(`enabled_apps_user_${userId}`);
+        let userGateReason, userGatePasses;
+        if (!userEnabledApps) {
+            userGateReason = 'no_saved_list'; userGatePasses = true;
+        } else if (userEnabledApps.includes('n8n')) {
+            userGateReason = 'in_saved_list'; userGatePasses = true;
+        } else {
+            // 'n8n' is in AUTO_ENABLED_APPS so this is true for legacy users with
+            // stale lists. Explicitly signal that in the reason.
+            userGateReason = 'auto_enabled'; userGatePasses = true;
+        }
+
+        // 4. Permission state.
+        const { hasPermission } = require('../../auth/permissions');
+        const canModify = await hasPermission(userId, 'modify_n8n_workflows', req.session);
+        const canUseExplicit = await hasPermission(userId, 'use_n8n_tools', req.session);
+
+        // 5. The real list — ask the registration pipeline what it would hand the LLM.
+        let toolsThatWillBeInjected = [];
+        try {
+            const { tools } = await getIntegrationTools({
+                userId, session: req.session, isAdmin: !!req.session.isAdmin, agentConfig: null,
+            });
+            toolsThatWillBeInjected = (tools || [])
+                .map(t => t.function?.name)
+                .filter(n => n && (n.startsWith('n8n_workflow_') || n.startsWith('n8n_execution_') || n.startsWith('n8n_run_')));
+        } catch (_) { /* non-fatal — if integrationTools throws we still return the gate trace */ }
+
+        const blockingReason =
+            !organizationId ? 'no_organization' :
+            !n8nConfigured ? 'n8n_not_configured' :
+            !orgGatePasses ? 'org_disabled' :
+            !userGatePasses ? 'user_disabled' :
+            toolsThatWillBeInjected.length === 0 ? 'unknown' :
+            null;
+
+        res.json({
+            ok: !blockingReason,
+            blockingReason,
+            user: {
+                id: user?.id,
+                orgRole: user?.orgRole || null,
+                organizationId,
+            },
+            org: {
+                id: organizationId,
+                n8nConfigured,
+                enabledIntegrationsIncludesN8n: orgGatePasses,
+                source: orgGateSource,
+            },
+            userLevel: {
+                passes: userGatePasses,
+                reason: userGateReason,
+                savedList: userEnabledApps || null,
+            },
+            permissions: {
+                modify_n8n_workflows: canModify,
+                use_n8n_tools: canUseExplicit, // informational — now implicit
+            },
+            toolsThatWillBeInjected,
+        });
+    } catch (err) {
+        console.error('[n8n] Diagnostics failed:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /ai/n8n/enable-for-org — one-click convenience: ensure 'n8n' is in the
+// organisation's enabledIntegrations list. Idempotent — safe to call repeatedly.
+// Nothing else is needed: use_n8n_tools is now implicit for all members.
+router.post('/n8n/enable-for-org', requireOrgAdminForN8n, async (req, res) => {
+    try {
+        const userStore = require('../../stores/userStore');
+        const orgId = req.orgId;
+        if (!orgId) return res.status(400).json({ error: 'No organisation' });
+
+        const org = await userStore.getOrganization(orgId);
+        let current = org?.enabledIntegrations;
+        if (typeof current === 'string') {
+            try { current = JSON.parse(current); } catch (_) { current = null; }
+        }
+        // If the org has never customised its enabledIntegrations, null means
+        // "all enabled" — n8n is already implicit. Leave it alone to preserve
+        // that semantics.
+        if (!current) {
+            return res.json({ success: true, changed: false, enabledIntegrations: null, note: 'Organisation uses the default integration set; n8n is already enabled.' });
+        }
+        if (current.includes('n8n')) {
+            return res.json({ success: true, changed: false, enabledIntegrations: current });
+        }
+        const next = [...current, 'n8n'];
+        await userStore.updateOrganization(orgId, { enabledIntegrations: next });
+        res.json({ success: true, changed: true, enabledIntegrations: next });
+    } catch (err) {
+        console.error('[n8n] enable-for-org failed:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // Count how many users are actually members of each group right now. `groups.userCount`
 // is a stale denormalised column (never updated when users move between groups), so we
 // recompute it live for anything the admin UI displays.

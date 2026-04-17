@@ -87,7 +87,7 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
 
     // Auto-enable new integrations for users with existing saved lists
     // (these were added after the user saved their enabledApps, so they wouldn't be included)
-    const AUTO_ENABLED_APPS = ['agent-search', 'workspace', 'image-gen', 'music-gen', 'video-gen', 'elevenlabs', 'google-maps', 'linkedin', 'github', 'google-contacts', 'google-keep', 'outlook', 'outlook-readonly', 'ms-calendar', 'onedrive', 'ms-contacts', 'google-groups'];
+    const AUTO_ENABLED_APPS = ['agent-search', 'workspace', 'image-gen', 'music-gen', 'video-gen', 'elevenlabs', 'google-maps', 'linkedin', 'github', 'google-contacts', 'google-keep', 'outlook', 'outlook-readonly', 'ms-calendar', 'onedrive', 'ms-contacts', 'google-groups', 'n8n'];
 
     const isAppOn = (appId) => {
         // Must be enabled at user level
@@ -184,43 +184,37 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
         addTools(SIGNREQUEST_TOOLS);
     }
 
-    // N8N workflows — org-level config, gated by two-tier permissions:
-    //   use_n8n_tools        → run webhooks + read-only workflow/execution tools
-    //   modify_n8n_workflows → write / delete / activate / execute
+    // N8N workflows — org-level config. Read/run tools are implicit for every
+    // member once the org has n8n configured (umbrella 'n8n' toggle, handled by
+    // AUTO_ENABLED_APPS so legacy users with stale enabledApps lists don't lose
+    // access). Only the write-bucket is permission-gated via modify_n8n_workflows.
     try {
         if (userOrgId) {
             n8nOrgId = userOrgId;
             const n8nUrl = await configStore.getConfig(`n8n_url_org_${n8nOrgId}`);
             const n8nKey = await configStore.getSecret(`n8n_api_key_org_${n8nOrgId}`);
-            if (n8nUrl && n8nKey) {
-                // Resolve n8n permissions once. `use_n8n_tools` is the umbrella — a user
-                // without it sees no n8n tools at all. `modify_n8n_workflows` unlocks the
-                // write-bucket on top.
-                const canUse = await hasPermission(userId, 'use_n8n_tools', session);
+            if (n8nUrl && n8nKey && isAppOn('n8n')) {
                 const canModify = await hasPermission(userId, 'modify_n8n_workflows', session);
 
-                if (canUse) {
-                    // Dynamic webhook-trigger tools (run only — covered by use_n8n_tools)
-                    const n8nTools = await buildN8nTools(n8nOrgId);
-                    for (const n8nTool of n8nTools) {
-                        const toolId = n8nTool.function.name;
-                        // Respect user-level toggle for this specific workflow
-                        if (userEnabledApps && !userEnabledApps.includes(toolId)) continue;
-                        const { _n8n, ...cleanTool } = n8nTool;
-                        if (!tools.find(t => t.function.name === cleanTool.function.name)) {
-                            tools.push(cleanTool);
-                        }
+                // Dynamic webhook-trigger tools — umbrella gating.
+                // A user who has 'n8n' enabled (or is covered by AUTO_ENABLED_APPS)
+                // gets every configured workflow, no per-workflow toggle required.
+                const n8nTools = await buildN8nTools(n8nOrgId);
+                for (const n8nTool of n8nTools) {
+                    const { _n8n, ...cleanTool } = n8nTool;
+                    if (!tools.find(t => t.function.name === cleanTool.function.name)) {
+                        tools.push(cleanTool);
                     }
+                }
 
-                    // Workflow-management tools (split by permission bucket)
-                    if (isAppOn('n8n')) {
-                        for (const tool of N8N_WORKFLOW_TOOLS) {
-                            const perm = getN8nToolPermission(tool.function.name);
-                            if (perm === 'modify_n8n_workflows' && !canModify) continue;
-                            if (!tools.find(t => t.function.name === tool.function.name)) {
-                                tools.push(tool);
-                            }
-                        }
+                // Workflow-management tools — split by permission bucket:
+                //   read-only (list/get/nodes_find/execution reads) → always included
+                //   write / execute / delete / activate             → modify_n8n_workflows
+                for (const tool of N8N_WORKFLOW_TOOLS) {
+                    const perm = getN8nToolPermission(tool.function.name);
+                    if (perm === 'modify_n8n_workflows' && !canModify) continue;
+                    if (!tools.find(t => t.function.name === tool.function.name)) {
+                        tools.push(tool);
                     }
                 }
             }
