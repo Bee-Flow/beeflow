@@ -323,6 +323,8 @@ app.use('/api/notebooks', notebookFeatureGate, require('./routes/notebookExport'
 const { requireBetaFeature } = require('./core/betaFeatures');
 app.use('/api/transcriptions', requireBetaFeature('meeting_notes'), require('./routes/transcriptions'));
 app.use('/api/meet-bot', requireBetaFeature('meeting_notes'), require('./routes/meetBot'));
+// ACS Call Automation webhook — called by Azure, not the browser, so no auth/beta gate.
+app.use('/api/teams-sdk-callback', require('./routes/teamsSdkCallback'));
 app.use('/api/skills', requireBetaFeature('skills'), require('./routes/skills'));
 app.use('/api/email-kb', requireBetaFeature('email_knowledge_base'), require('./routes/emailKB'));
 app.use('/api/browser-agent', require('./routes/browserAgent'));

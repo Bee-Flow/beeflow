@@ -1,36 +1,47 @@
 /**
- * Meet Bot Engine — Playwright-based meeting recording bot.
+ * Meet Bot Engine — Playwright + ACS-based meeting recording bot.
  *
- * Dispatches to a platform-specific provider (Google Meet, Microsoft Teams,
- * Zoom) based on the meeting URL. Each provider is a module in
- * ./meetBotProviders/ exposing { platform, label, detect, validateUrl,
- * joinAndRecord, requiresCredentials }.
+ * Dispatches to a platform-specific provider based on the meeting URL.
+ * Providers live in ./meetBotProviders/ and expose:
+ *   { platform, label, detect, validateUrl, joinAndRecord,
+ *     requiresCredentials, isConfigured? }
  *
- * All providers share the same audio-capture plumbing (PulseAudio null-sink
- * + FFmpeg) in ./meetBotProviders/shared.js.
- *
- * Requirements on server:
- *   - playwright + @playwright/browser-chromium
- *   - pulseaudio, pulseaudio-utils (pactl)
- *   - ffmpeg, xvfb
+ * Priority rules when multiple providers claim the same URL:
+ *   - teams-sdk takes precedence over teams when ACS is configured
+ *     (joins via Azure Communication Services Call Automation, no browser).
+ *   - Otherwise the browser-based providers handle everything.
  */
 
+const googleProvider = require('./meetBotProviders/google');
+const teamsProvider = require('./meetBotProviders/teams');
+const teamsSdkProvider = require('./meetBotProviders/teams-sdk');
+const zoomProvider = require('./meetBotProviders/zoom');
+
+// Order matters: earlier providers are considered first. teams-sdk is
+// listed before teams so we prefer the SDK path when both claim Teams URLs.
 const providers = [
-    require('./meetBotProviders/google'),
-    require('./meetBotProviders/teams'),
-    require('./meetBotProviders/zoom'),
+    googleProvider,
+    teamsSdkProvider,
+    teamsProvider,
+    zoomProvider,
 ];
 
-const activeSessions = new Map(); // sessionId → { context, ffmpegProcess, stopped }
+const activeSessions = new Map(); // sessionId → { context, audioCapture, stopped }
 
 /**
- * Detect which provider handles a given meeting URL. Returns null if no
- * provider claims it.
+ * Detect which provider handles a given URL. Honours async `isConfigured()`
+ * so providers that need extra setup (ACS) can opt out when not ready.
  */
-function detectProvider(url) {
+async function detectProvider(url) {
     if (!url) return null;
     for (const p of providers) {
-        if (p.detect(url)) return p;
+        if (!p.detect(url)) continue;
+        if (typeof p.isConfigured === 'function') {
+            try {
+                if (!(await p.isConfigured())) continue;
+            } catch (_) { continue; }
+        }
+        return p;
     }
     return null;
 }
@@ -38,8 +49,8 @@ function detectProvider(url) {
 /**
  * Validate a meeting URL. Returns { valid, platform, label, error }.
  */
-function validateMeetingUrl(url) {
-    const provider = detectProvider(url);
+async function validateMeetingUrl(url) {
+    const provider = await detectProvider(url);
     if (!provider) {
         return {
             valid: false,
@@ -58,21 +69,21 @@ function validateMeetingUrl(url) {
 }
 
 /**
- * Join a meeting and record audio. Dispatches to the right provider based
- * on the URL. Returns { audioPath, durationSeconds, platform }.
+ * Join a meeting and record. Dispatches to the right provider. Returns
+ * { audioPath, durationSeconds, platform }.
  */
 async function joinAndRecord(sessionId, meetLink, options = {}) {
-    const provider = detectProvider(meetLink);
+    const provider = await detectProvider(meetLink);
     if (!provider) {
         throw new Error('No provider matches this meeting URL (expected Google Meet, Teams, or Zoom).');
     }
 
     console.log(`[MeetBot] Session ${sessionId} → provider: ${provider.label}`);
-    activeSessions.set(sessionId, { context: null, ffmpegProcess: null, stopped: false });
+    activeSessions.set(sessionId, { context: null, audioCapture: null, stopped: false });
 
-    const registerSession = ({ context, ffmpegProcess }) => {
+    const registerSession = (fields) => {
         const current = activeSessions.get(sessionId) || {};
-        activeSessions.set(sessionId, { ...current, context, ffmpegProcess });
+        activeSessions.set(sessionId, { ...current, ...fields });
     };
     const isStopped = () => {
         const s = activeSessions.get(sessionId);
@@ -106,15 +117,21 @@ function isSessionActive(sessionId) {
 }
 
 /**
- * List available platforms — used by the frontend to show what's supported
- * without hardcoding the list client-side.
+ * List supported platforms with their configuration status. The frontend
+ * uses this to show what's available without hardcoding the matrix.
  */
-function listPlatforms() {
-    return providers.map(p => ({
-        platform: p.platform,
-        label: p.label,
-        requiresCredentials: !!p.requiresCredentials,
-    }));
+async function listPlatforms() {
+    const out = [];
+    for (const p of providers) {
+        const configured = typeof p.isConfigured === 'function' ? await p.isConfigured() : true;
+        out.push({
+            platform: p.platform,
+            label: p.label,
+            requiresCredentials: !!p.requiresCredentials,
+            configured,
+        });
+    }
+    return out;
 }
 
 module.exports = {

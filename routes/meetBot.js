@@ -258,6 +258,75 @@ router.post('/credentials', async (req, res) => {
     }
 });
 
+// ─── Teams SDK (ACS Call Automation) configuration ────────
+
+function requireAdmin(req, res, next) {
+    const role = req.session?.user?.role;
+    if (role !== 'admin' && role !== 'owner') {
+        return res.status(403).json({ error: 'Admin access required' });
+    }
+    next();
+}
+
+/**
+ * GET /sdk-config — Read Teams SDK / ACS config status. Secrets are never
+ * returned in full; only booleans and the non-secret callback base URL.
+ */
+router.get('/sdk-config', requireAdmin, async (_req, res) => {
+    try {
+        const connStr = await configStore.getSecret('acs_connection_string');
+        const callbackSecret = await configStore.getSecret('teams_bot_callback_secret');
+        const callbackBaseUrl = await configStore.getConfig('teams_bot_callback_base_url');
+        res.json({
+            acsConfigured: !!connStr,
+            callbackSecretConfigured: !!callbackSecret,
+            callbackBaseUrl: callbackBaseUrl || null,
+            callbackBaseUrlFromEnv: process.env.SERVER_BASE_URL || null,
+        });
+    } catch (err) {
+        console.error('[MeetBot] /sdk-config GET error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * POST /sdk-config — Save ACS connection string + callback URL/secret.
+ * Body: { acsConnectionString?, callbackBaseUrl?, callbackSecret?, clearAcsConnectionString? }
+ * Fields are optional; only provided fields are updated.
+ */
+router.post('/sdk-config', requireAdmin, async (req, res) => {
+    try {
+        const { acsConnectionString, callbackBaseUrl, callbackSecret, clearAcsConnectionString } = req.body || {};
+
+        if (clearAcsConnectionString) {
+            await configStore.setSecret('acs_connection_string', '');
+        } else if (typeof acsConnectionString === 'string' && acsConnectionString.trim()) {
+            // Sanity check: ACS connection strings begin with endpoint=https://
+            if (!/^endpoint=https:\/\//i.test(acsConnectionString.trim())) {
+                return res.status(400).json({ error: 'ACS connection string should start with "endpoint=https://"' });
+            }
+            await configStore.setSecret('acs_connection_string', acsConnectionString.trim());
+        }
+
+        if (typeof callbackBaseUrl === 'string') {
+            const trimmed = callbackBaseUrl.trim().replace(/\/+$/, '');
+            if (trimmed && !/^https:\/\//i.test(trimmed)) {
+                return res.status(400).json({ error: 'Callback base URL must start with https://' });
+            }
+            await configStore.setConfig('teams_bot_callback_base_url', trimmed);
+        }
+
+        if (typeof callbackSecret === 'string') {
+            await configStore.setSecret('teams_bot_callback_secret', callbackSecret.trim());
+        }
+
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[MeetBot] /sdk-config POST error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 /**
  * GET /platforms — List supported meeting platforms
  */
@@ -283,7 +352,7 @@ router.post('/join', async (req, res) => {
         if (!meetLink) return res.status(400).json({ error: 'meetLink is required' });
 
         // Validate URL and determine platform
-        const validation = meetBot.validateMeetingUrl(meetLink);
+        const validation = await meetBot.validateMeetingUrl(meetLink);
         if (!validation.valid) {
             return res.status(400).json({ error: validation.error });
         }
@@ -291,7 +360,7 @@ router.post('/join', async (req, res) => {
         const platformLabel = validation.label;
 
         // Google Meet requires a signed-in bot account; Teams/Zoom join as guests.
-        const provider = meetBot.detectProvider(meetLink);
+        const provider = await meetBot.detectProvider(meetLink);
         let credentials = null;
         if (provider.requiresCredentials) {
             const botEmail = await configStore.getSecret('meet_bot_email');
