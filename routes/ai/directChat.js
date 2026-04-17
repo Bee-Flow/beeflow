@@ -133,7 +133,7 @@ function requireAuth(req, res, next) {
 // ─── Streaming Direct Chat ───────────────────────────────────────
 
 router.post('/chat/direct/stream', requireAuth, async (req, res) => {
-    const { message, conversationId, modelTier, history, attachments, imageGenSettings, nanoBananaSettings, disabledMedia, webSearchEnabled = true, workspaceContent, workspaceSelection, projectId, timezone, systemPrompt: requestSystemPrompt, activeSkillIds } = req.body;
+    const { message, conversationId, modelTier, history, attachments, imageGenSettings, nanoBananaSettings, disabledMedia, webSearchEnabled = true, workspaceContent, workspaceSelection, projectId, timezone, systemPrompt: requestSystemPrompt, activeSkillIds, reasoningEffort: requestReasoningEffort } = req.body;
     const userId = req.session.user.id;
 
     if (!message && (!attachments || attachments.length === 0)) {
@@ -1387,7 +1387,9 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         const chatOptions = {
             maxTokens: tierSettings.maxTokens || defaultMaxTokens,
             temperature: tierSettings.temperature !== undefined ? tierSettings.temperature : tierDefaults.temperature,
-            reasoningEffort: tierSettings.reasoningEffort || tierDefaults.reasoningEffort || undefined,
+            // Per-turn user choice from the composer takes priority over the tier default.
+            // Accepts: 'none' (disabled), 'low', 'medium', 'high', 'xhigh', 'max'.
+            reasoningEffort: requestReasoningEffort || tierSettings.reasoningEffort || tierDefaults.reasoningEffort || undefined,
             reasoningSummary: tierSettings.reasoningSummary !== undefined ? tierSettings.reasoningSummary : (tierDefaults.reasoningSummary || false),
             budgetTokens: tierSettings.budgetTokens || undefined,
             // Azure-specific
@@ -1717,9 +1719,21 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         // ─── Stream final response via adapter.stream() ──────────
         let fullContent = '';
         let thinkingContent = '';
+        let thinkingParts = []; // Structured parts with signatures/timing for persistence + UI
         let streamToolCalls = []; // Tool calls received during streaming (Google SDK)
         let streamUsage = null;
         const streamStartTime = Date.now();
+
+        // Shared helpers — both the primary stream and the tool-follow-up stream use them.
+        const _getThinkingPart = (partId) => {
+            if (!partId) return null;
+            let part = thinkingParts.find(p => p.id === partId);
+            if (!part) {
+                part = { id: partId, text: '', startedAt: Date.now(), endedAt: null };
+                thinkingParts.push(part);
+            }
+            return part;
+        };
 
         const streamOptions = {
             ...chatOptions,
@@ -1732,9 +1746,40 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                 fullContent += data.text;
                 // Stream raw text (tokens like [PII:iban:1] will show briefly — restored at end)
                 send('content', { text: data.text });
+            } else if (type === 'thinking_start') {
+                if (data.partId) {
+                    const part = _getThinkingPart(data.partId);
+                    if (data.redacted) part.redacted = true;
+                    send('thinking_start', { partId: data.partId, redacted: data.redacted || undefined });
+                }
             } else if (type === 'thinking') {
                 thinkingContent += data.text;
-                send('thinking', { text: data.text });
+                if (data.partId) {
+                    const part = _getThinkingPart(data.partId);
+                    part.text += data.text;
+                } else {
+                    // No partId — implicit single block (old adapters / raw SSE path)
+                    let part = thinkingParts[thinkingParts.length - 1];
+                    if (!part || part.endedAt) {
+                        part = { id: `auto-${thinkingParts.length}`, text: '', startedAt: Date.now(), endedAt: null };
+                        thinkingParts.push(part);
+                    }
+                    part.text += data.text;
+                }
+                send('thinking', { text: data.text, partId: data.partId });
+            } else if (type === 'thinking_signature') {
+                // Persisted server-side (for Claude replay), never sent to SSE.
+                if (data.partId && data.signature) {
+                    const part = _getThinkingPart(data.partId);
+                    part.signature = data.signature;
+                }
+            } else if (type === 'thinking_stop') {
+                if (data.partId) {
+                    const part = _getThinkingPart(data.partId);
+                    part.endedAt = Date.now();
+                    if (data.redacted) part.redacted = true;
+                    send('thinking_stop', { partId: data.partId, redacted: data.redacted || undefined });
+                }
             } else if (type === 'tool_use') {
                 // SDK adapter returns tool calls directly in the stream
                 streamToolCalls.push({
@@ -1794,6 +1839,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                 streamOptions.previousResponseId = undefined;
                 fullContent = '';
                 thinkingContent = '';
+                thinkingParts = [];
                 streamToolCalls = [];
                 await adapter.stream(apiKey, apiUrl, modelId, messages, streamOptions, streamCallback);
             } else {
@@ -2111,9 +2157,38 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                 if (type === 'text') {
                     fullContent += data.text;
                     send('content', { text: data.text });
+                } else if (type === 'thinking_start') {
+                    if (data.partId) {
+                        const part = _getThinkingPart(data.partId);
+                        if (data.redacted) part.redacted = true;
+                        send('thinking_start', { partId: data.partId, redacted: data.redacted || undefined });
+                    }
                 } else if (type === 'thinking') {
                     thinkingContent += data.text;
-                    send('thinking', { text: data.text });
+                    if (data.partId) {
+                        const part = _getThinkingPart(data.partId);
+                        part.text += data.text;
+                    } else {
+                        let part = thinkingParts[thinkingParts.length - 1];
+                        if (!part || part.endedAt) {
+                            part = { id: `auto-${thinkingParts.length}`, text: '', startedAt: Date.now(), endedAt: null };
+                            thinkingParts.push(part);
+                        }
+                        part.text += data.text;
+                    }
+                    send('thinking', { text: data.text, partId: data.partId });
+                } else if (type === 'thinking_signature') {
+                    if (data.partId && data.signature) {
+                        const part = _getThinkingPart(data.partId);
+                        part.signature = data.signature;
+                    }
+                } else if (type === 'thinking_stop') {
+                    if (data.partId) {
+                        const part = _getThinkingPart(data.partId);
+                        part.endedAt = Date.now();
+                        if (data.redacted) part.redacted = true;
+                        send('thinking_stop', { partId: data.partId, redacted: data.redacted || undefined });
+                    }
                 } else if (type === 'tool_call') {
                     streamToolCalls.push(data);
                 } else if (type === 'tool_use') {
@@ -2268,7 +2343,22 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             if (persistedAttachments.length > 0) userSave.attachments = persistedAttachments;
             savedMessages.push(userSave);
             const assistantSave = { role: 'assistant', content: fullContent, timestamp: new Date().toISOString() };
-            if (thinkingContent) assistantSave.thinking = thinkingContent;
+            // Prefer the structured thinking parts (with signatures + timing) over the flat string.
+            // The flat string is kept as a fallback for providers that only emit `thinking` without
+            // wrapping start/stop events.
+            if (thinkingParts.length > 0) {
+                assistantSave.thinking = thinkingParts.map(p => ({
+                    id: p.id,
+                    text: p.text,
+                    startedAt: p.startedAt,
+                    endedAt: p.endedAt || Date.now(),
+                    redacted: p.redacted || undefined,
+                    signature: p.signature || undefined,
+                    phase: p.phase || undefined,
+                }));
+            } else if (thinkingContent) {
+                assistantSave.thinking = thinkingContent;
+            }
             if (generatedImages.length > 0) {
                 // Strip base64 data from images for DB — keep only url/mimeType/storageKey
                 assistantSave.images = generatedImages.map(img => {

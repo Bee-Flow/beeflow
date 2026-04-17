@@ -147,6 +147,20 @@ class BaseProvider {
     async _parseSseStream(body, onEvent) {
         const decoder = new TextDecoder();
         let buffer = '';
+        let thinkingOpen = false;
+        const thinkingPartId = 'mistral-0';
+        const openThinking = () => {
+            if (!thinkingOpen) {
+                thinkingOpen = true;
+                onEvent('thinking_start', { partId: thinkingPartId });
+            }
+        };
+        const closeThinking = () => {
+            if (thinkingOpen) {
+                thinkingOpen = false;
+                onEvent('thinking_stop', { partId: thinkingPartId });
+            }
+        };
 
         for await (const chunk of body) {
             buffer += decoder.decode(chunk, { stream: true });
@@ -157,6 +171,7 @@ class BaseProvider {
                 if (!line.startsWith('data: ')) continue;
                 const data = line.slice(6).trim();
                 if (data === '[DONE]') {
+                    closeThinking();
                     onEvent('done', {});
                     return;
                 }
@@ -168,6 +183,7 @@ class BaseProvider {
 
                     if (delta.content !== undefined && delta.content !== null) {
                         if (typeof delta.content === 'string') {
+                            closeThinking();
                             onEvent('text', { text: delta.content });
                         } else if (Array.isArray(delta.content)) {
                             // Mistral reasoning model — array of structured chunks
@@ -177,8 +193,12 @@ class BaseProvider {
                                         .filter(t => t.type === 'text' && t.text)
                                         .map(t => t.text)
                                         .join('');
-                                    if (text) onEvent('thinking', { text });
+                                    if (text) {
+                                        openThinking();
+                                        onEvent('thinking', { text, partId: thinkingPartId });
+                                    }
                                 } else if (block.type === 'text' && block.text) {
+                                    closeThinking();
                                     onEvent('text', { text: block.text });
                                 }
                             }
@@ -187,6 +207,7 @@ class BaseProvider {
 
                     // Tool calls in streaming
                     if (delta.tool_calls) {
+                        closeThinking();
                         for (const tc of delta.tool_calls) {
                             onEvent('tool_use', {
                                 id: tc.id,
@@ -201,6 +222,7 @@ class BaseProvider {
             }
         }
 
+        closeThinking();
         onEvent('done', {});
     }
 

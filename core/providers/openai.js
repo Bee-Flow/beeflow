@@ -371,12 +371,33 @@ class OpenAIProvider extends BaseProvider {
         // Track current function call being accumulated
         let currentFnCall = null;
         let streamUsage = null;
+        const openThinkingParts = new Set();
 
         for await (const event of stream) {
             if (event.type === 'response.output_text.delta') {
                 if (event.delta) onEvent('text', { text: event.delta });
+            } else if (event.type === 'response.reasoning_summary_text.added') {
+                const partId = `openai-${event.summary_index ?? 0}`;
+                if (!openThinkingParts.has(partId)) {
+                    openThinkingParts.add(partId);
+                    onEvent('thinking_start', { partId });
+                }
             } else if (event.type === 'response.reasoning_summary_text.delta') {
-                if (event.delta) onEvent('thinking', { text: event.delta });
+                if (event.delta) {
+                    const partId = `openai-${event.summary_index ?? 0}`;
+                    if (!openThinkingParts.has(partId)) {
+                        // Some stream flavours skip the `.added` event — open on first delta.
+                        openThinkingParts.add(partId);
+                        onEvent('thinking_start', { partId });
+                    }
+                    onEvent('thinking', { text: event.delta, partId });
+                }
+            } else if (event.type === 'response.reasoning_summary_text.done') {
+                const partId = `openai-${event.summary_index ?? 0}`;
+                if (openThinkingParts.has(partId)) {
+                    openThinkingParts.delete(partId);
+                    onEvent('thinking_stop', { partId });
+                }
             } else if (event.type === 'response.output_item.added') {
                 // New output item — could be a function call
                 if (event.item?.type === 'function_call') {
@@ -403,6 +424,11 @@ class OpenAIProvider extends BaseProvider {
                     currentFnCall = null;
                 }
             } else if (event.type === 'response.completed') {
+                // Close any thinking parts that didn't receive an explicit `.done` event.
+                for (const partId of openThinkingParts) {
+                    onEvent('thinking_stop', { partId });
+                }
+                openThinkingParts.clear();
                 // Capture usage and response ID from completed response
                 const usage = event.response?.usage;
                 if (usage) {

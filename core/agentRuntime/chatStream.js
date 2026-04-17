@@ -892,8 +892,19 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     let _mapEmbeds = [];
     let _audioFiles = [];
     let _toolHistory = []; // Track tool calls for persistence
-    let _thinking = '';    // Accumulate model reasoning for persistence
+    let _thinking = '';    // Accumulate model reasoning for persistence (legacy string form)
+    let _thinkingParts = []; // Structured thinking parts — carry signature (Claude) + timing for UI
     let _orchestratorThinking = ''; // Accumulate swarm orchestrator thinking
+    // Helper: look up / create a thinking part by provider-supplied partId.
+    const _getThinkingPart = (partId) => {
+        if (!partId) return null;
+        let part = _thinkingParts.find(p => p.id === partId);
+        if (!part) {
+            part = { id: partId, text: '', startedAt: Date.now(), endedAt: null };
+            _thinkingParts.push(part);
+        }
+        return part;
+    };
 
     // Abort signal from the route handler (client disconnect)
     const signal = messageMetadata.signal || null;
@@ -1006,7 +1017,9 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     maxTokens: tierSettings.maxTokens || defaultMaxTokens,
                     temperature: tierSettings.temperature !== undefined ? tierSettings.temperature : tierDefaults.temperature,
                     budgetTokens: tierSettings.budgetTokens || undefined,
-                    reasoningEffort: tierSettings.reasoningEffort || tierDefaults.reasoningEffort || undefined,
+                    // messageMetadata.reasoningEffort is the per-turn user choice from the composer.
+                    // It overrides tier defaults when present.
+                    reasoningEffort: messageMetadata?.reasoningEffort || tierSettings.reasoningEffort || tierDefaults.reasoningEffort || undefined,
                     reasoningSummary: tierSettings.reasoningSummary !== undefined ? tierSettings.reasoningSummary : (tierDefaults.reasoningSummary || false),
                     // Azure-specific: needed for Responses API version check
                     apiVersion: config.apiVersion || undefined,
@@ -1061,13 +1074,46 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                                 onEvent('orchestrator_thinking', { text: textChunk });
                                 _orchestratorThinking += textChunk;
                             }
+                        } else if (type === 'thinking_start') {
+                            if (!isSwarm && data.partId) {
+                                const part = _getThinkingPart(data.partId);
+                                if (data.redacted) part.redacted = true;
+                                onEvent('thinking_start', { partId: data.partId, redacted: data.redacted || undefined });
+                            }
                         } else if (type === 'thinking') {
                             if (isSwarm) {
                                 onEvent('orchestrator_thinking', { text: data.text });
                                 _orchestratorThinking += data.text;
                             } else {
-                                onEvent('thinking', { text: data.text });
+                                // Route into the right thinking part if provider supplied partId;
+                                // otherwise append to the most recent part (or open an implicit one).
+                                if (data.partId) {
+                                    const part = _getThinkingPart(data.partId);
+                                    part.text += data.text;
+                                } else {
+                                    let part = _thinkingParts[_thinkingParts.length - 1];
+                                    if (!part || part.endedAt) {
+                                        part = { id: `auto-${_thinkingParts.length}`, text: '', startedAt: Date.now(), endedAt: null };
+                                        _thinkingParts.push(part);
+                                    }
+                                    part.text += data.text;
+                                }
+                                onEvent('thinking', { text: data.text, partId: data.partId });
                                 _thinking += data.text;
+                            }
+                        } else if (type === 'thinking_signature') {
+                            // Server-side only — persist onto the matching part so Claude multi-turn
+                            // tool flows replay with signature intact. Never forwarded to SSE.
+                            if (!isSwarm && data.partId && data.signature) {
+                                const part = _getThinkingPart(data.partId);
+                                part.signature = data.signature;
+                            }
+                        } else if (type === 'thinking_stop') {
+                            if (!isSwarm && data.partId) {
+                                const part = _getThinkingPart(data.partId);
+                                part.endedAt = Date.now();
+                                if (data.redacted) part.redacted = true;
+                                onEvent('thinking_stop', { partId: data.partId, redacted: data.redacted || undefined });
                             }
                         } else if (type === 'tool_use') {
                             // Accumulate tool calls for post-stream processing
@@ -1945,7 +1991,23 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             if (_audioFiles.length > 0) assistantMsg.audioFiles = _audioFiles;
             if (_toolHistory.length > 0) assistantMsg.toolHistory = _toolHistory;
             if (_kbSources.length > 0) assistantMsg.kbSources = _kbSources;
-            if (_thinking) assistantMsg.thinking = _thinking;
+            // Persistence format: `thinkingParts` is the structured array (with signatures
+            // for Claude replay); `thinking` stays as the flat string for backwards compat
+            // with memory extraction and anything reading the old shape.
+            if (_thinkingParts.length > 0) {
+                assistantMsg.thinking = _thinkingParts.map(p => ({
+                    id: p.id,
+                    text: p.text,
+                    startedAt: p.startedAt,
+                    endedAt: p.endedAt || Date.now(),
+                    redacted: p.redacted || undefined,
+                    signature: p.signature || undefined,
+                    phase: p.phase || undefined,
+                }));
+            } else if (_thinking) {
+                // Legacy path: flat-string thinking without part metadata.
+                assistantMsg.thinking = _thinking;
+            }
             if (_orchestratorThinking) assistantMsg.orchestratorThinking = _orchestratorThinking;
 
             // Emit phase completion for the last phase

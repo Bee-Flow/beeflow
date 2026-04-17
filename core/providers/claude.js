@@ -72,8 +72,17 @@ class ClaudeProvider extends BaseProvider {
                     };
                 }
                 if (m.role === "assistant" && m.tool_calls && m.tool_calls.length > 0) {
-                    // Convert OpenAI assistant tool_calls → Claude tool_use content blocks
+                    // Convert OpenAI assistant tool_calls → Claude tool_use content blocks.
+                    // When the prior turn had extended thinking WITH signatures, Anthropic
+                    // requires the thinking blocks to precede the tool_use blocks on replay
+                    // or conversation integrity breaks. Unsigned thinking is dropped.
                     const contentBlocks = [];
+                    const signedThinking = Array.isArray(m.thinking)
+                        ? m.thinking.filter(t => t && t.signature && !t.redacted && t.text)
+                        : [];
+                    for (const t of signedThinking) {
+                        contentBlocks.push({ type: "thinking", thinking: t.text, signature: t.signature });
+                    }
                     if (m.content) {
                         contentBlocks.push({ type: "text", text: typeof m.content === "string" ? m.content : JSON.stringify(m.content) });
                     }
@@ -302,6 +311,8 @@ class ClaudeProvider extends BaseProvider {
         let thinkingChunks = 0;
         let eventCount = 0;
         let currentToolUse = null; // Track in-progress tool_use block
+        let currentThinking = null; // Track in-progress thinking / redacted_thinking block
+        let thinkingPartCounter = 0;
         let streamUsage = null;
 
         try {
@@ -315,7 +326,20 @@ class ClaudeProvider extends BaseProvider {
                         onEvent('text', { text: event.delta.text });
                     } else if (event.delta?.type === 'thinking_delta' && event.delta?.thinking) {
                         thinkingChunks++;
-                        onEvent('thinking', { text: event.delta.thinking });
+                        onEvent('thinking', {
+                            text: event.delta.thinking,
+                            partId: currentThinking?.partId,
+                        });
+                    } else if (event.delta?.type === 'signature_delta' && event.delta?.signature) {
+                        // Server-side only — signature is persisted onto the thinking block
+                        // and echoed back to Anthropic on multi-turn tool flows. Never shown to UI.
+                        if (currentThinking) {
+                            currentThinking.signature = event.delta.signature;
+                            onEvent('thinking_signature', {
+                                partId: currentThinking.partId,
+                                signature: event.delta.signature,
+                            });
+                        }
                     } else if (event.delta?.type === 'input_json_delta' && event.delta?.partial_json) {
                         // Accumulate tool call JSON arguments
                         if (currentToolUse) {
@@ -323,7 +347,8 @@ class ClaudeProvider extends BaseProvider {
                         }
                     }
                 } else if (event.type === 'content_block_start') {
-                    if (event.content_block?.type === 'tool_use') {
+                    const blockType = event.content_block?.type;
+                    if (blockType === 'tool_use') {
                         // Start accumulating a new tool call
                         currentToolUse = {
                             id: event.content_block.id,
@@ -331,6 +356,20 @@ class ClaudeProvider extends BaseProvider {
                             arguments: '',
                         };
                         console.log('[Claude] Tool use block start:', event.content_block.name);
+                    } else if (blockType === 'thinking') {
+                        currentThinking = {
+                            partId: `claude-${thinkingPartCounter++}`,
+                            redacted: false,
+                            signature: null,
+                        };
+                        onEvent('thinking_start', { partId: currentThinking.partId });
+                    } else if (blockType === 'redacted_thinking') {
+                        currentThinking = {
+                            partId: `claude-${thinkingPartCounter++}`,
+                            redacted: true,
+                            signature: null,
+                        };
+                        onEvent('thinking_start', { partId: currentThinking.partId, redacted: true });
                     }
                 } else if (event.type === 'content_block_stop') {
                     // Emit accumulated tool call when block ends
@@ -344,6 +383,12 @@ class ClaudeProvider extends BaseProvider {
                         });
                         console.log(`[Claude] Stream tool_use: ${currentToolUse.name}`);
                         currentToolUse = null;
+                    } else if (currentThinking) {
+                        onEvent('thinking_stop', {
+                            partId: currentThinking.partId,
+                            redacted: currentThinking.redacted || undefined,
+                        });
+                        currentThinking = null;
                     }
                 } else if (event.type === 'message_start') {
                     // normal start

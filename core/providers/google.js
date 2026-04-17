@@ -548,6 +548,8 @@ class GoogleProvider extends BaseProvider {
         let textChunks = 0;
         let thinkingChunks = 0;
         let streamUsage = null;
+        let thinkingOpen = false;
+        const thinkingPartId = 'gemini-0';
 
         try {
             const response = await ai.models.generateContentStream(params);
@@ -569,8 +571,12 @@ class GoogleProvider extends BaseProvider {
                 if (chunk.candidates?.[0]?.content?.parts) {
                     for (const part of chunk.candidates[0].content.parts) {
                         if (part.thought && part.text) {
+                            if (!thinkingOpen) {
+                                thinkingOpen = true;
+                                onEvent('thinking_start', { partId: thinkingPartId });
+                            }
                             thinkingChunks++;
-                            onEvent('thinking', { text: part.text });
+                            onEvent('thinking', { text: part.text, partId: thinkingPartId });
                         } else if (part.functionCall) {
                             // Tool call in streaming response
                             const sig = part.thoughtSignature || part.thought_signature;
@@ -582,6 +588,13 @@ class GoogleProvider extends BaseProvider {
                             });
                             if (sig) console.log(`[Google] Stream: captured thought_signature for ${part.functionCall.name}`);
                         } else if (part.text) {
+                            // Closing thinking on first text token is correct: Gemini interleaves
+                            // thought parts and answer parts, but once answer tokens start, thinking
+                            // has finished for this turn.
+                            if (thinkingOpen) {
+                                thinkingOpen = false;
+                                onEvent('thinking_stop', { partId: thinkingPartId });
+                            }
                             textChunks++;
                             onEvent('text', { text: part.text });
                         } else if (part.inlineData) {
@@ -600,6 +613,11 @@ class GoogleProvider extends BaseProvider {
             // Log full error details for debugging
             if (err.errorDetails) console.error('[Google] Error details:', JSON.stringify(err.errorDetails));
             onEvent('error', { error: `Google API error: ${err.message}` });
+        }
+
+        // Ensure thinking is closed — covers streams that end while still in thinking phase.
+        if (thinkingOpen) {
+            onEvent('thinking_stop', { partId: thinkingPartId });
         }
 
         console.log(`[Google] Stream complete — ${textChunks} text chunks, ${thinkingChunks} thinking chunks`);
