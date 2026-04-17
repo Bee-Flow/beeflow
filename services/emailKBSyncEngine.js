@@ -25,6 +25,7 @@ const {
     summarizeAndCategorizeBatch,
 } = require('../core/emailKBProcessor');
 const { ingestDocument, findDocumentBySourceUri, deleteDocumentChunks } = require('../core/kbIngestionHelpers');
+const { extractGmailAttachments, extractOutlookAttachments, formatAttachmentsMarkdown } = require('../core/emailKBAttachments');
 
 const { run } = require('../db');
 
@@ -422,9 +423,22 @@ async function syncGmailConnection(connection) {
                 format: 'full',
             }), `gmail.get(${msg.id})`);
             const headers = detail.data.payload?.headers || [];
+
+            let body = extractGmailTextBody(detail.data.payload);
+            let attachments = [];
+            if (connection.process_attachments !== false) {
+                try {
+                    attachments = await extractGmailAttachments(gmail, msg.id, detail.data.payload, connection.pipeline_config);
+                    const attachmentText = formatAttachmentsMarkdown(attachments);
+                    if (attachmentText) body = body + attachmentText;
+                } catch (err) {
+                    console.warn(`[EmailKBSync] Gmail attachment extraction failed for ${msg.id}: ${err.message}`);
+                }
+            }
+
             return {
                 msgId: msg.id,
-                body: extractGmailTextBody(detail.data.payload),
+                body,
                 metadata: {
                     subject: getGmailHeader(headers, 'Subject'),
                     from: getGmailHeader(headers, 'From'),
@@ -434,6 +448,10 @@ async function syncGmailConnection(connection) {
                     messageId: msg.id,
                     threadId: detail.data.threadId,
                     labels: detail.data.labelIds,
+                    hasAttachments: attachments.some(a => a.kind !== 'skipped'),
+                    attachments: attachments.filter(a => a.kind !== 'skipped').map(a => ({
+                        filename: a.filename, bytes: a.bytes, sha256: a.sha256, source: a.source, kind: a.kind,
+                    })),
                 },
             };
         };
@@ -795,9 +813,28 @@ async function syncOutlookConnection(connection) {
             };
         };
 
-        const perItem = async (msg) => {
+        const enrichWithAttachments = async (msg) => {
             const metadata = buildMeta(msg);
-            const body = msg.body?.content || '';
+            let body = msg.body?.content || '';
+            let attachments = [];
+            if (connection.process_attachments !== false) {
+                try {
+                    attachments = await extractOutlookAttachments(tokens.accessToken, msg.id, connection.pipeline_config);
+                    const md = formatAttachmentsMarkdown(attachments);
+                    if (md) body = body + md;
+                } catch (err) {
+                    console.warn(`[EmailKBSync] Outlook attachment extraction failed for ${msg.id}: ${err.message}`);
+                }
+            }
+            metadata.hasAttachments = attachments.some(a => a.kind !== 'skipped');
+            metadata.attachments = attachments.filter(a => a.kind !== 'skipped').map(a => ({
+                filename: a.filename, bytes: a.bytes, sha256: a.sha256, source: a.source, kind: a.kind,
+            }));
+            return { msgId: msg.id, body, metadata };
+        };
+
+        const perItem = async (msg) => {
+            const { body, metadata } = await enrichWithAttachments(msg);
             const processed = ingestionMode === 'per_email'
                 ? buildPerEmailArticle(body, metadata, processOpts)
                 : await processEmail(body, metadata, processOpts);
@@ -805,7 +842,8 @@ async function syncOutlookConnection(connection) {
         };
 
         const perChunk = async (chunk) => {
-            const fetched = chunk.map(msg => ({ msgId: msg.id, body: msg.body?.content || '', metadata: buildMeta(msg) }));
+            const fetched = [];
+            for (const msg of chunk) fetched.push(await enrichWithAttachments(msg));
             const prepped = fetched.map(f => prepareEmailForLLM(f.body, f.metadata, processOpts));
             const validIdx = [];
             for (let i = 0; i < prepped.length; i++) if (!prepped[i].skip) validIdx.push(i);

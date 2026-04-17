@@ -49,6 +49,13 @@ async function initDB() {
     // ── Column migrations ──
     try { await exec(`ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS organization_id TEXT`); } catch (e) { /* column already exists */ }
     try { await exec(`CREATE INDEX IF NOT EXISTS idx_kb_org ON knowledge_bases(organization_id) WHERE organization_id IS NOT NULL`); } catch (e) { /* index already exists */ }
+    // Rich metadata on documents (sender, threadId, attachments, simhash, …)
+    try { await exec(`ALTER TABLE documents ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb`); } catch (e) { /* column already exists */ }
+    // Duplicate tracking for content-hash / simhash dedup
+    try { await exec(`ALTER TABLE documents ADD COLUMN IF NOT EXISTS duplicate_of UUID`); } catch (e) { /* column already exists */ }
+    try { await exec(`ALTER TABLE documents ADD COLUMN IF NOT EXISTS simhash BIGINT`); } catch (e) { /* column already exists */ }
+    // GIN index for metadata lookups (sender/threadId filters)
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_documents_metadata ON documents USING GIN (metadata jsonb_path_ops)`); } catch (e) { /* index already exists */ }
 
     initialized = true;
     console.log('[KnowledgeBases] Tables initialized');
@@ -204,22 +211,133 @@ const KnowledgeBasesStore = {
 
     // ── Document CRUD ───────────────────────────────────────────────────
 
-    createDocument: async (tenantId, kbId, title, sourceType, sourceUri, contentHash, chunkCount = 0) => {
+    createDocument: async (tenantId, kbId, title, sourceType, sourceUri, contentHash, chunkCount = 0, metadata = null, simhash = null) => {
         await initDB();
         const row = await getOne(
-            `INSERT INTO documents (tenant_id, knowledge_base_id, title, source_type, source_uri, content_hash, chunk_count)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+            `INSERT INTO documents (tenant_id, knowledge_base_id, title, source_type, source_uri, content_hash, chunk_count, metadata, simhash)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
              RETURNING *`,
-            [tenantId, kbId, title, sourceType, sourceUri, contentHash, chunkCount]
+            [tenantId, kbId, title, sourceType, sourceUri, contentHash, chunkCount, metadata ? JSON.stringify(metadata) : '{}', simhash]
         );
         return row;
     },
 
-    listDocuments: async (kbId) => {
+    /**
+     * Record a duplicate relationship: `dupId` is an alias for `canonicalId`.
+     * No new chunks are embedded — the row just points to the canonical doc.
+     */
+    recordDuplicate: async (tenantId, kbId, title, sourceType, sourceUri, contentHash, canonicalId, metadata = null) => {
+        await initDB();
+        return getOne(
+            `INSERT INTO documents (tenant_id, knowledge_base_id, title, source_type, source_uri, content_hash, chunk_count, duplicate_of, metadata)
+             VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8::jsonb)
+             RETURNING *`,
+            [tenantId, kbId, title, sourceType, sourceUri, contentHash, canonicalId, metadata ? JSON.stringify(metadata) : '{}']
+        );
+    },
+
+    /**
+     * Find a near-duplicate by simhash within a given Hamming distance.
+     * Returns the first match or null. `distance` defaults to 3.
+     */
+    findNearDuplicateBySimhash: async (kbId, simhash, distance = 3) => {
+        await initDB();
+        if (simhash == null) return null;
+        // Count set bits in the XOR to compute Hamming distance.
+        return getOne(
+            `SELECT id, title, simhash FROM documents
+             WHERE knowledge_base_id = $1
+               AND simhash IS NOT NULL
+               AND length(replace((($2::bigint # simhash)::bit(64))::text, '0', '')) <= $3
+             ORDER BY created_at DESC
+             LIMIT 1`,
+            [kbId, simhash, distance]
+        );
+    },
+
+    listDocuments: async (kbId, opts = {}) => {
+        await initDB();
+        const { limit = 200, offset = 0, filters = {} } = opts;
+        const clauses = [`knowledge_base_id = $1`];
+        const vals = [kbId];
+        let idx = 2;
+        if (filters.sender) {
+            clauses.push(`metadata->>'from' ILIKE $${idx}`);
+            vals.push(`%${filters.sender}%`); idx++;
+        }
+        if (filters.threadId) {
+            clauses.push(`metadata->>'threadId' = $${idx}`);
+            vals.push(filters.threadId); idx++;
+        }
+        if (filters.hasAttachment) {
+            clauses.push(`(metadata->>'hasAttachments')::boolean = true`);
+        }
+        if (filters.dateFrom) {
+            clauses.push(`(metadata->>'date')::timestamptz >= $${idx}`);
+            vals.push(filters.dateFrom); idx++;
+        }
+        if (filters.dateTo) {
+            clauses.push(`(metadata->>'date')::timestamptz <= $${idx}`);
+            vals.push(filters.dateTo); idx++;
+        }
+        if (filters.sourceType) {
+            clauses.push(`source_type = $${idx}`);
+            vals.push(filters.sourceType); idx++;
+        }
+        vals.push(limit); const limitIdx = idx; idx++;
+        vals.push(offset); const offsetIdx = idx;
+        return getAll(
+            `SELECT * FROM documents
+             WHERE ${clauses.join(' AND ')}
+             ORDER BY created_at DESC
+             LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+            vals
+        );
+    },
+
+    countDocuments: async (kbId, filters = {}) => {
+        await initDB();
+        const clauses = [`knowledge_base_id = $1`];
+        const vals = [kbId];
+        let idx = 2;
+        if (filters.sender) { clauses.push(`metadata->>'from' ILIKE $${idx}`); vals.push(`%${filters.sender}%`); idx++; }
+        if (filters.threadId) { clauses.push(`metadata->>'threadId' = $${idx}`); vals.push(filters.threadId); idx++; }
+        if (filters.hasAttachment) clauses.push(`(metadata->>'hasAttachments')::boolean = true`);
+        if (filters.dateFrom) { clauses.push(`(metadata->>'date')::timestamptz >= $${idx}`); vals.push(filters.dateFrom); idx++; }
+        if (filters.dateTo) { clauses.push(`(metadata->>'date')::timestamptz <= $${idx}`); vals.push(filters.dateTo); idx++; }
+        if (filters.sourceType) { clauses.push(`source_type = $${idx}`); vals.push(filters.sourceType); idx++; }
+        const row = await getOne(`SELECT COUNT(*)::int AS n FROM documents WHERE ${clauses.join(' AND ')}`, vals);
+        return row?.n || 0;
+    },
+
+    /**
+     * Return distinct threadIds + sibling counts for a KB — for the thread explorer UI.
+     */
+    listThreads: async (kbId, opts = {}) => {
+        await initDB();
+        const { limit = 100 } = opts;
+        return getAll(
+            `SELECT metadata->>'threadId' AS thread_id,
+                    COUNT(*)::int AS message_count,
+                    MAX(created_at) AS latest
+             FROM documents
+             WHERE knowledge_base_id = $1
+               AND metadata ? 'threadId'
+               AND metadata->>'threadId' IS NOT NULL
+             GROUP BY thread_id
+             ORDER BY latest DESC
+             LIMIT $2`,
+            [kbId, limit]
+        );
+    },
+
+    listDocumentsByThread: async (kbId, threadId) => {
         await initDB();
         return getAll(
-            `SELECT * FROM documents WHERE knowledge_base_id = $1 ORDER BY created_at DESC`,
-            [kbId]
+            `SELECT * FROM documents
+             WHERE knowledge_base_id = $1 AND metadata->>'threadId' = $2
+             ORDER BY (metadata->>'date')::timestamptz NULLS LAST, created_at`,
+            [kbId, threadId]
         );
     },
 
