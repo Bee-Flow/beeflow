@@ -1,18 +1,18 @@
 /**
  * Microsoft Teams provider for the meeting bot.
  *
- * Joins as a guest via the Teams web client. Handles both teams.microsoft.com
- * and teams.live.com meeting URLs. No Microsoft account required for guest
- * join; credentials are optional and used only for meetings that disallow
- * anonymous participants.
+ * Joins as a guest via the Teams web client (teams.microsoft.com or
+ * teams.live.com). No Microsoft account required for meetings that allow
+ * anonymous participants. Falls back to page MediaRecorder when PulseAudio
+ * is unavailable.
  *
- * Teams frequently revises its UI, so the join flow uses multiple fallback
- * selectors (locale-aware) and a generic text search as a last resort.
+ * Teams frequently revises its UI; selectors include locale-aware fallbacks
+ * and a generic text search as last resort. Debug screenshots are saved to
+ * bot-recordings/ so selector drift is diagnosable.
  */
 
 const fs = require('fs');
 const path = require('path');
-
 const shared = require('./shared');
 
 const PROFILE_DIR = path.resolve(__dirname, '../../data/meet-bot-profile-teams');
@@ -44,29 +44,15 @@ const CONTINUE_ON_WEB_SELECTORS = [
 ];
 
 const END_PHRASES = [
-    'you left the meeting',
-    'the meeting has ended',
-    'call ended',
-    'meeting ended',
-    'u hebt de vergadering verlaten',
-    'de vergadering is beëindigd',
-    'besprechung beendet',
+    'you left the meeting', 'the meeting has ended', 'call ended', 'meeting ended',
+    'u hebt de vergadering verlaten', 'de vergadering is beëindigd', 'besprechung beendet',
 ];
 
-function detect(url) {
-    return /teams\.microsoft\.com|teams\.live\.com/i.test(url);
-}
-
-function validateUrl(url) {
-    return /teams\.(microsoft|live)\.com\/.*(meetup-join|meet)/i.test(url);
-}
+function detect(url) { return /teams\.(microsoft|live)\.com/i.test(url); }
+function validateUrl(url) { return /teams\.(microsoft|live)\.com\/.*(meetup-join|meet)/i.test(url); }
 
 async function dismissOverlays(page) {
-    const dismissLabels = [
-        'Accept', 'Accept all', 'Got it', 'OK', 'Allow', 'Later', 'Skip',
-        'Accepteren', 'Alles accepteren', 'Begrepen',
-    ];
-    for (const label of dismissLabels) {
+    for (const label of ['Accept', 'Accept all', 'Got it', 'OK', 'Allow', 'Later', 'Skip', 'Accepteren', 'Alles accepteren', 'Begrepen']) {
         try {
             const btn = page.locator(`button:has-text("${label}")`);
             if (await btn.count() > 0) { await btn.first().click({ timeout: 1000 }); await page.waitForTimeout(300); }
@@ -87,7 +73,7 @@ async function joinAndRecord(sessionId, meetLink, options = {}) {
 
     const audioPath = path.join(shared.recordingsDir, `teams-${sessionId}-${Date.now()}.webm`);
     let context = null;
-    let ffmpegProcess = null;
+    let audioCapture = null;
     let recordingStartTime = null;
 
     try {
@@ -97,17 +83,19 @@ async function joinAndRecord(sessionId, meetLink, options = {}) {
         if (display) process.env.DISPLAY = display;
 
         const sinkName = shared.ensurePulseAudio();
-        if (!sinkName) throw new Error('PulseAudio setup failed — cannot record audio');
+        if (!sinkName) console.log('[MeetBot/Teams] PulseAudio unavailable — will use page recorder');
 
         context = await shared.launchBrowser(PROFILE_DIR, sinkName, display);
-        registerSession?.({ context, ffmpegProcess: null });
+        registerSession?.({ context, audioCapture: null });
 
         const page = context.pages()[0] || await context.newPage();
+
+        // Must inject before page.goto so the RTC hook fires on meeting load.
+        await shared.preparePageAudioHook(page);
 
         console.log(`[MeetBot/Teams] Navigating to ${meetLink}`);
         await page.goto(meetLink, { waitUntil: 'domcontentloaded', timeout: 45000 });
         await page.waitForTimeout(3000);
-
         await dismissOverlays(page);
 
         // "Continue on this browser" / "Join on the web instead"
@@ -122,10 +110,8 @@ async function joinAndRecord(sessionId, meetLink, options = {}) {
                 }
             } catch (_) {}
         }
-
         await dismissOverlays(page);
 
-        // Debug screenshot of prejoin screen
         try { await page.screenshot({ path: path.join(shared.recordingsDir, `teams-prejoin-${sessionId}.png`) }); } catch (_) {}
 
         // Fill name for guest join
@@ -144,7 +130,7 @@ async function joinAndRecord(sessionId, meetLink, options = {}) {
         }
         if (!nameEntered) console.log('[MeetBot/Teams] No name input found — may already be signed in');
 
-        // Mute mic + camera (defensive — guest flow usually defaults to off already)
+        // Mute mic + camera (defensive)
         for (const sel of [
             '[data-tid="toggle-video"][aria-pressed="true"]',
             '[data-tid="toggle-mute"][aria-pressed="true"]',
@@ -159,27 +145,17 @@ async function joinAndRecord(sessionId, meetLink, options = {}) {
 
         // Join now
         let joined = false;
-        for (const selector of JOIN_SELECTORS) {
+        for (const sel of JOIN_SELECTORS) {
             try {
-                const btn = page.locator(selector);
-                if (await btn.count() > 0) {
-                    await btn.first().click();
-                    console.log(`[MeetBot/Teams] Clicked join (${selector})`);
-                    joined = true;
-                    break;
-                }
+                const btn = page.locator(sel);
+                if (await btn.count() > 0) { await btn.first().click(); console.log(`[MeetBot/Teams] Clicked join (${sel})`); joined = true; break; }
             } catch (_) {}
         }
         if (!joined) {
-            // Last-ditch text match
             joined = await page.evaluate(() => {
-                const btns = document.querySelectorAll('button');
-                for (const btn of btns) {
+                for (const btn of document.querySelectorAll('button')) {
                     const t = (btn.textContent || '').toLowerCase();
-                    if (t.includes('join now') || t.includes('nu deelnemen') || t.includes('jetzt teilnehmen')) {
-                        btn.click();
-                        return true;
-                    }
+                    if (t.includes('join now') || t.includes('nu deelnemen') || t.includes('jetzt teilnehmen')) { btn.click(); return true; }
                 }
                 return false;
             });
@@ -193,14 +169,14 @@ async function joinAndRecord(sessionId, meetLink, options = {}) {
         await page.waitForTimeout(15000);
 
         onStatusChange('recording', { meetLink });
-        ffmpegProcess = shared.startFFmpegRecorder(audioPath, sinkName);
-        registerSession?.({ context, ffmpegProcess });
+        audioCapture = await shared.startAudioCapture(page, audioPath, sinkName);
+        registerSession?.({ context, audioCapture });
         recordingStartTime = Date.now();
+        console.log(`[MeetBot/Teams] Recording started (mode: ${audioCapture.mode})`);
 
         await shared.waitForMeetingEnd({
-            maxDurationMs,
-            isStopped,
-            isEnded: async () => page.evaluate((phrases) => {
+            maxDurationMs, isStopped,
+            isEnded: () => page.evaluate((phrases) => {
                 const body = (document.body?.innerText || '').toLowerCase();
                 return phrases.some(p => body.includes(p));
             }, END_PHRASES),
@@ -209,24 +185,15 @@ async function joinAndRecord(sessionId, meetLink, options = {}) {
     } finally {
         const durationSeconds = recordingStartTime ? Math.round((Date.now() - recordingStartTime) / 1000) : 0;
         console.log(`[MeetBot/Teams] Cleaning up ${sessionId} (${durationSeconds}s recorded)`);
-        await shared.stopFFmpeg(ffmpegProcess);
+        if (audioCapture) await audioCapture.stop();
         if (context) { try { await context.close(); } catch (_) {} }
-
         try {
             const stats = fs.statSync(audioPath);
             if (stats.size < 1000) console.warn(`[MeetBot/Teams] Recording too small (${stats.size} bytes)`);
             else console.log(`[MeetBot/Teams] Recording saved: ${audioPath} (${(stats.size / 1024).toFixed(1)} KB)`);
         } catch (e) { console.error('[MeetBot/Teams] Could not verify recording:', e.message); }
-
         return { audioPath, durationSeconds };
     }
 }
 
-module.exports = {
-    platform: 'teams',
-    label: 'Microsoft Teams',
-    detect,
-    validateUrl,
-    joinAndRecord,
-    requiresCredentials: false,
-};
+module.exports = { platform: 'teams', label: 'Microsoft Teams', detect, validateUrl, joinAndRecord, requiresCredentials: false };
