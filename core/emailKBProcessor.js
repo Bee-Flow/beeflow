@@ -194,28 +194,80 @@ function cleanEmail(rawContent) {
 // ──────────────────────────────────────────────
 
 const PII_PATTERNS = [
-    // Email addresses
-    { regex: /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, replacement: '[EMAIL]' },
-    // Phone numbers (international + NL/EU formats)
-    { regex: /(?:\+\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{2,4}/g, replacement: '[PHONE]' },
-    // IP addresses
-    { regex: /\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g, replacement: '[IP]' },
-    // Dutch BSN-like (9 digits)
-    { regex: /\b\d{9}\b/g, replacement: '[ID]' },
-    // Asset tags / serial numbers (common patterns)
-    { regex: /\b[A-Z]{2,4}-\d{6,10}\b/g, replacement: '[ASSET]' },
-    // MAC addresses
-    { regex: /\b([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b/g, replacement: '[MAC]' },
+    { key: 'email', regex: /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, replacement: '[EMAIL]' },
+    { key: 'phone', regex: /(?:\+\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{2,4}/g, replacement: '[PHONE]' },
+    { key: 'ip', regex: /\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g, replacement: '[IP]' },
+    { key: 'asset', regex: /\b[A-Z]{2,4}-\d{6,10}\b/g, replacement: '[ASSET]' },
 ];
 
-function redactPII(text) {
-    let s = String(text || '');
-    for (const { regex, replacement } of PII_PATTERNS) {
-        // Reset lastIndex for global regexes
-        regex.lastIndex = 0;
-        s = s.replace(regex, replacement);
+// Dutch BSN 11-proof (elfproef).
+// BSN is 9 digits; 9*d1 + 8*d2 + ... + 2*d8 - 1*d9 must be divisible by 11
+// and the result must also be non-zero. This catches most false positives
+// (order numbers, tracking codes) that happen to be 9 digits.
+function isValidBsn(digits) {
+    if (!/^\d{9}$/.test(digits)) return false;
+    const weights = [9, 8, 7, 6, 5, 4, 3, 2, -1];
+    let sum = 0;
+    for (let i = 0; i < 9; i++) sum += weights[i] * parseInt(digits[i], 10);
+    return sum !== 0 && sum % 11 === 0;
+}
+
+// MAC match should be preceded (within 40 chars) by a word like MAC/hwaddr/ether
+// — otherwise it's almost certainly an asset ID, which we already redact via [ASSET].
+const MAC_ANCHOR_RE = /(?:mac|hwaddr|ether|bssid)[\s:=]{0,10}$/i;
+const MAC_RE = /\b([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b/g;
+const BSN_CANDIDATE_RE = /\b\d{9}\b/g;
+
+function replaceWithContext(text, regex, replacement, accept) {
+    let s = '';
+    let lastIndex = 0;
+    let count = 0;
+    let m;
+    regex.lastIndex = 0;
+    while ((m = regex.exec(text)) !== null) {
+        const before = text.slice(Math.max(0, m.index - 40), m.index);
+        if (accept(m[0], before)) {
+            s += text.slice(lastIndex, m.index) + replacement;
+            lastIndex = m.index + m[0].length;
+            count++;
+        }
     }
-    return s;
+    s += text.slice(lastIndex);
+    return { text: s, count };
+}
+
+/**
+ * Redact PII and return { text, counts } where counts is keyed by PII class.
+ * The `disable` array can suppress specific classes: e.g. ['mac','bsn'].
+ */
+function redactPIIWithCounts(text, { disable = [] } = {}) {
+    const disabled = new Set((disable || []).map(s => String(s).toLowerCase()));
+    let s = String(text || '');
+    const counts = { email: 0, phone: 0, ip: 0, asset: 0, bsn: 0, mac: 0 };
+
+    for (const { key, regex, replacement } of PII_PATTERNS) {
+        if (disabled.has(key)) continue;
+        regex.lastIndex = 0;
+        s = s.replace(regex, () => { counts[key]++; return replacement; });
+    }
+
+    if (!disabled.has('bsn')) {
+        const r = replaceWithContext(s, BSN_CANDIDATE_RE, '[ID]', (match) => isValidBsn(match));
+        s = r.text;
+        counts.bsn = r.count;
+    }
+
+    if (!disabled.has('mac')) {
+        const r = replaceWithContext(s, MAC_RE, '[MAC]', (_m, before) => MAC_ANCHOR_RE.test(before));
+        s = r.text;
+        counts.mac = r.count;
+    }
+
+    return { text: s, counts };
+}
+
+function redactPII(text, opts) {
+    return redactPIIWithCounts(text, opts).text;
 }
 
 // ──────────────────────────────────────────────
@@ -1073,6 +1125,8 @@ module.exports = {
     // Individual stages (for testing)
     cleanEmail,
     redactPII,
+    redactPIIWithCounts,
+    isValidBsn,
     summarizeToArticle,
     categorizeArticle,
     summarizeAndCategorize,

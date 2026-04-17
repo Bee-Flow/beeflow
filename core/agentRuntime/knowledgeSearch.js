@@ -1,5 +1,11 @@
 const configStore = require('../../stores/configStore');
 const { getServiceHeaders } = require('../serviceAuth');
+const { estimateTokens, fitIntoTokenBudget } = require('../tokenBudget');
+
+// Rough budget for knowledge injection. Exposed as env vars so we can tune
+// per model-family without a code change.
+const PER_CHUNK_TOKEN_CAP = parseInt(process.env.EMAIL_KB_PER_CHUNK_TOKENS || '800', 10);
+const GLOBAL_INJECT_TOKEN_CAP = parseInt(process.env.EMAIL_KB_INJECT_TOKENS || '4000', 10);
 
 // Greetings / small-talk patterns that should NEVER trigger a KB lookup.
 // Kept intentionally broad — false negatives are cheap (just an extra search),
@@ -167,9 +173,9 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
 
         console.log(`[KnowledgeSearch] Results: ${allKnowledgeResults.length} after filters → ${topResults.length} after dedup (hasReranker=${hasReranker}, includeRefs=${agent.config?.includeSourceReferences})`);
 
-        // Per-chunk content cap + strip repeated heading breadcrumbs.
-        const MAX_CHUNK_CHARS = 3000;
+        // Per-chunk content cap (token-aware) + strip repeated heading breadcrumbs.
         const seenDocHeadings = new Map();
+        let anyChunkTruncated = false;
         for (const result of topResults) {
             // Strip heading lines already seen from the same source document
             const docKey = result.metadata?.source || 'unknown';
@@ -186,20 +192,31 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
             } else {
                 headings.forEach(h => seen.add(h.trim()));
             }
-            if (result.content && result.content.length > MAX_CHUNK_CHARS) {
-                result.content = result.content.slice(0, MAX_CHUNK_CHARS) + '…';
+            if (result.content) {
+                const fit = fitIntoTokenBudget(result.content, PER_CHUNK_TOKEN_CAP);
+                result.content = fit.text;
+                if (fit.truncated) anyChunkTruncated = true;
             }
         }
 
 
         if (topResults.length > 0) {
             const includeRefs = agent.config?.includeSourceReferences === true;
-            const knowledgeText = topResults.map((k, i) => {
+            let knowledgeText = topResults.map((k, i) => {
                 const meta = k.metadata || {};
                 let source = meta.source || meta.source_uri || 'Unknown Source';
                 if (meta.type === 'url_import' && meta.source) source = meta.source;
                 return `### Source ${i + 1}: ${source}\n${k.content}\n`;
             }).join('\n');
+
+            // Global cap: protect against the combined knowledge block blowing
+            // the context window even when individual chunks already fit.
+            const fitGlobal = fitIntoTokenBudget(knowledgeText, GLOBAL_INJECT_TOKEN_CAP);
+            knowledgeText = fitGlobal.text;
+            const truncationNote = (fitGlobal.truncated || anyChunkTruncated)
+                ? '\nSome retrieved sources were truncated to fit the context window.'
+                : '';
+            console.log(`[KnowledgeSearch] Inject tokens: ~${estimateTokens(knowledgeText)} (cap ${GLOBAL_INJECT_TOKEN_CAP}, chunkCap ${PER_CHUNK_TOKEN_CAP}, truncated=${fitGlobal.truncated || anyChunkTruncated})`);
 
             const citationInstruction = includeRefs
                 ? 'Do NOT include inline citations or source references (e.g. [Source 1] or "(Bron: ...)") in your response text. Source references are shown separately below your answer.'
@@ -209,15 +226,15 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
                 systemPromptExtension += `\n\n## KNOWLEDGE BASE RESULTS
 The following information was retrieved from your knowledge base. Answer ONLY from this data.
 If the user's question cannot be answered from the information below, you MUST say you don't have that information.
-${citationInstruction}
+${citationInstruction}${truncationNote}
 
 ${knowledgeText}
 `;
             } else {
                 systemPromptExtension += `\n\n## RELEVANT KNOWLEDGE BASE
-The following information from your knowledge base was retrieved based on the user's request. 
+The following information from your knowledge base was retrieved based on the user's request.
 Use this information to answer the question.
-${citationInstruction}
+${citationInstruction}${truncationNote}
 
 ${knowledgeText}
 `;

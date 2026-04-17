@@ -32,8 +32,27 @@ const MAX_CONCURRENT = 3;
 const TICK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const MAX_EMAILS_PER_SYNC = 50;
 const SYNC_TIMEOUT_MINUTES = 30;
-const MAX_RETRIES = 2;
+const MAX_RETRIES = 2;             // generic transient-error retries (linear backoff)
 const RETRY_DELAY_MS = 5000;
+const MAX_429_RETRIES = 5;         // exponential backoff + jitter for rate limits
+const BACKOFF_BASE_MS = 500;
+const BACKOFF_MAX_MS = 60_000;
+
+/**
+ * Extract Retry-After hint from a provider error (Gmail/Graph).
+ * Supports header-style seconds or HTTP-date. Returns ms, or null.
+ */
+function parseRetryAfter(err) {
+    const h = err?.response?.headers?.['retry-after']
+        || err?.response?.headers?.get?.('retry-after')
+        || err?.headers?.['retry-after'];
+    if (!h) return null;
+    const asSeconds = parseInt(String(h), 10);
+    if (!Number.isNaN(asSeconds) && asSeconds >= 0) return Math.min(BACKOFF_MAX_MS, asSeconds * 1000);
+    const asDate = Date.parse(String(h));
+    if (!Number.isNaN(asDate)) return Math.max(0, Math.min(BACKOFF_MAX_MS, asDate - Date.now()));
+    return null;
+}
 
 let tickTimer = null;
 let isRunning = false;
@@ -199,28 +218,37 @@ function recordOutcome(results, bucket, detail = {}) {
 // ──────────────────────────────────────────────
 
 async function withRetry(fn, label = 'operation') {
-    let lastErr;
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    let genericAttempts = 0;
+    let rateAttempts = 0;
+    // Single unified loop; generic and 429 retries have independent budgets.
+    while (true) {
         try {
             return await fn();
         } catch (err) {
-            lastErr = err;
-            // Don't retry auth failures or permanent errors
             const status = err.status || err.code;
+            // Auth / permission failures — never retry; surface immediately.
             if (status === 401 || status === 403 || err.message?.includes('re-authenticat')) {
                 throw err;
             }
-            // Rate-limited — throw immediately so caller can handle
-            if (status === 429 || err.message?.includes('429')) {
-                throw err;
+            const is429 = status === 429 || err.message?.includes('429');
+            if (is429) {
+                if (rateAttempts >= MAX_429_RETRIES) throw err;
+                const hinted = parseRetryAfter(err);
+                const expo = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * Math.pow(2, rateAttempts));
+                const jitter = Math.floor(Math.random() * 250);
+                const delay = (hinted ?? expo) + jitter;
+                console.warn(`[EmailKBSync] 429 on ${label} — backing off ${delay}ms (attempt ${rateAttempts + 1}/${MAX_429_RETRIES})`);
+                await new Promise(r => setTimeout(r, delay));
+                rateAttempts++;
+                continue;
             }
-            if (attempt < MAX_RETRIES) {
-                console.warn(`[EmailKBSync] Retrying ${label} (attempt ${attempt + 2}/${MAX_RETRIES + 1}): ${err.message}`);
-                await new Promise(r => setTimeout(r, RETRY_DELAY_MS * (attempt + 1)));
-            }
+            // Generic transient: keep the original linear backoff and budget.
+            if (genericAttempts >= MAX_RETRIES) throw err;
+            console.warn(`[EmailKBSync] Retrying ${label} (attempt ${genericAttempts + 2}/${MAX_RETRIES + 1}): ${err.message}`);
+            await new Promise(r => setTimeout(r, RETRY_DELAY_MS * (genericAttempts + 1)));
+            genericAttempts++;
         }
     }
-    throw lastErr;
 }
 
 // ──────────────────────────────────────────────

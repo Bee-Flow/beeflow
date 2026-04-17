@@ -239,6 +239,55 @@ router.post('/connections/:id/test', async (req, res) => {
 });
 
 // ──────────────────────────────────────────────
+// GET /connections/:id/sync/stream — SSE stream of sync progress events
+// Event names: sync_started, sync_fetch_complete, email_processed, sync_completed
+// ──────────────────────────────────────────────
+router.get('/connections/:id/sync/stream', async (req, res) => {
+    try {
+        const connection = await emailKBStore.getConnection(req.params.id);
+        if (!connection) return res.status(404).json({ error: 'Connection not found' });
+
+        const orgId = await getOrgId(req);
+        if (connection.organization_id !== orgId && !isSuperAdmin(req)) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
+
+        const { sendEvent, markEnded } = setupSSE(res);
+
+        // Initial hello so the client knows the stream is live (and proxies don't buffer).
+        sendEvent('ready', { connectionId: connection.id, syncStatus: connection.sync_status });
+
+        const unsubscribe = subscribeSyncEvents(connection.id, ({ event, data, at }) => {
+            sendEvent(event, { ...data, at });
+            if (event === 'sync_completed') {
+                // Give the client a beat to receive the final event, then close.
+                setTimeout(() => {
+                    unsubscribe();
+                    markEnded();
+                    if (!res.writableEnded) res.end();
+                }, 250);
+            }
+        });
+
+        // Heartbeat every 25s keeps reverse-proxies (nginx default 60s idle) from
+        // killing the connection during quiet periods.
+        const heartbeat = setInterval(() => {
+            if (res.writableEnded) return clearInterval(heartbeat);
+            res.write(': ping\n\n');
+        }, 25000);
+
+        req.on('close', () => {
+            clearInterval(heartbeat);
+            unsubscribe();
+            markEnded();
+        });
+    } catch (err) {
+        console.error('[EmailKB] Sync stream error:', err.message);
+        if (!res.headersSent) res.status(500).json({ error: err.message });
+    }
+});
+
+// ──────────────────────────────────────────────
 // GET /connections/:id/logs — Get sync history
 // ──────────────────────────────────────────────
 router.get('/connections/:id/logs', async (req, res) => {
