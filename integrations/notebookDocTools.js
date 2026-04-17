@@ -182,10 +182,12 @@ function executeNotebookDocTool(toolName, args, documentContent) {
 
         // Strip HTML tags for text matching. Entity decoding covers the common
         // cases; anything else should compare close enough via the normalized
-        // whitespace pass below.
+        // whitespace pass below. Critically: we strip BOTH sides so the outer
+        // presence-check works whether the AI passes plain text (from the
+        // editor selection) or verbatim HTML (from notebook_doc_read).
         const stripHtml = (html) => html.replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
         const normalized = (t) => t.replace(/\s+/g, ' ').trim();
-        const findNorm = normalized(findText);
+        const findNorm = normalized(stripHtml(findText));
         const plainNorm = normalized(stripHtml(documentContent));
 
         if (plainNorm.includes(findNorm)) {
