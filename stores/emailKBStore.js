@@ -55,6 +55,7 @@ async function initDB() {
     await exec(`ALTER TABLE email_kb_connections ADD COLUMN IF NOT EXISTS max_emails_per_sync INT DEFAULT 50`);
     await exec(`ALTER TABLE email_kb_connections ADD COLUMN IF NOT EXISTS sync_after_date TEXT`);
     await exec(`ALTER TABLE email_kb_connections ADD COLUMN IF NOT EXISTS pipeline_config JSONB DEFAULT '{}'::jsonb`);
+    await exec(`ALTER TABLE email_kb_connections ADD COLUMN IF NOT EXISTS sync_locked_until TIMESTAMPTZ`);
 
     await exec(`
         CREATE TABLE IF NOT EXISTS email_kb_sync_log (
@@ -66,9 +67,11 @@ async function initDB() {
             articles_created INT DEFAULT 0,
             articles_skipped INT DEFAULT 0,
             errors INT DEFAULT 0,
-            error_details TEXT
+            error_details TEXT,
+            outcomes JSONB DEFAULT '{}'::jsonb
         )
     `);
+    await exec(`ALTER TABLE email_kb_sync_log ADD COLUMN IF NOT EXISTS outcomes JSONB DEFAULT '{}'::jsonb`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_email_kb_log_conn ON email_kb_sync_log(connection_id)`);
 
     initialized = true;
@@ -198,6 +201,7 @@ const EmailKBStore = {
 
     /**
      * Get all connections that are due for syncing.
+     * Skips connections with a live sync lock (another worker is in-flight).
      */
     getDueConnections: async () => {
         await initDB();
@@ -205,9 +209,51 @@ const EmailKBStore = {
             `SELECT * FROM email_kb_connections
              WHERE enabled = true
                AND sync_status != 'syncing'
+               AND (sync_locked_until IS NULL OR sync_locked_until <= now())
                AND (last_sync_at IS NULL OR last_sync_at + (sync_interval_minutes || ' minutes')::interval <= now())
              ORDER BY last_sync_at ASC NULLS FIRST
              LIMIT 10`
+        );
+    },
+
+    /**
+     * Atomically acquire a sync lock on a connection.
+     * Returns { acquired:true, lockedUntil } on success, { acquired:false, retryAfterSeconds }
+     * when another worker holds the lock.
+     */
+    acquireSyncLock: async (connectionId, ttlMinutes = 30) => {
+        await initDB();
+        const row = await getOne(
+            `UPDATE email_kb_connections
+             SET sync_locked_until = now() + ($2 || ' minutes')::interval,
+                 updated_at = now()
+             WHERE id = $1
+               AND (sync_locked_until IS NULL OR sync_locked_until <= now())
+             RETURNING sync_locked_until`,
+            [connectionId, String(ttlMinutes)]
+        );
+        if (row) {
+            return { acquired: true, lockedUntil: row.sync_locked_until };
+        }
+        // Lock is held — read current expiry to return retry hint
+        const held = await getOne(
+            `SELECT sync_locked_until FROM email_kb_connections WHERE id = $1`,
+            [connectionId]
+        );
+        const secs = held?.sync_locked_until
+            ? Math.max(1, Math.ceil((new Date(held.sync_locked_until).getTime() - Date.now()) / 1000))
+            : 60;
+        return { acquired: false, retryAfterSeconds: secs };
+    },
+
+    /**
+     * Release a sync lock. Safe to call even if no lock is held.
+     */
+    releaseSyncLock: async (connectionId) => {
+        await initDB();
+        return run(
+            `UPDATE email_kb_connections SET sync_locked_until = NULL, updated_at = now() WHERE id = $1`,
+            [connectionId]
         );
     },
 

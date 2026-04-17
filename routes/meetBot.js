@@ -259,7 +259,20 @@ router.post('/credentials', async (req, res) => {
 });
 
 /**
- * POST /join — Send bot to a Google Meet
+ * GET /platforms — List supported meeting platforms
+ */
+router.get('/platforms', async (_req, res) => {
+    try {
+        res.json({ platforms: meetBot.listPlatforms() });
+    } catch (err) {
+        console.error('[MeetBot] /platforms error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * POST /join — Send bot to a meeting (Google Meet, Teams, or Zoom).
+ * The platform is auto-detected from the meeting URL.
  */
 router.post('/join', async (req, res) => {
     try {
@@ -269,22 +282,32 @@ router.post('/join', async (req, res) => {
         const { meetLink, title, language } = req.body;
         if (!meetLink) return res.status(400).json({ error: 'meetLink is required' });
 
-        // Validate Meet link format
-        const meetRegex = /meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3}/i;
-        if (!meetRegex.test(meetLink) && !meetLink.includes('meet.google.com')) {
-            return res.status(400).json({ error: 'Invalid Google Meet link. Expected format: meet.google.com/abc-defg-hij' });
+        // Validate URL and determine platform
+        const validation = meetBot.validateMeetingUrl(meetLink);
+        if (!validation.valid) {
+            return res.status(400).json({ error: validation.error });
         }
+        const platform = validation.platform;
+        const platformLabel = validation.label;
 
-        // Load bot credentials
-        const botEmail = await configStore.getSecret('meet_bot_email');
-        const botPassword = await configStore.getSecret('meet_bot_password');
-        if (!botEmail || !botPassword) {
-            return res.status(400).json({ error: 'Bot Google account not configured. Set credentials first.' });
+        // Google Meet requires a signed-in bot account; Teams/Zoom join as guests.
+        const provider = meetBot.detectProvider(meetLink);
+        let credentials = null;
+        if (provider.requiresCredentials) {
+            const botEmail = await configStore.getSecret('meet_bot_email');
+            const botPassword = await configStore.getSecret('meet_bot_password');
+            if (!botEmail || !botPassword) {
+                return res.status(400).json({
+                    error: `${platformLabel} requires a bot Google account. Configure credentials first.`,
+                });
+            }
+            credentials = { email: botEmail, password: botPassword };
         }
 
         // Create session record
-        const session = await meetBotStore.createSession(userId, meetLink, title || 'Google Meet Recording');
-        console.log(`[MeetBot] Session ${session.id} created for user ${userId}`);
+        const defaultTitle = `${platformLabel} Recording`;
+        const session = await meetBotStore.createSession(userId, meetLink, title || defaultTitle, platform);
+        console.log(`[MeetBot] Session ${session.id} (${platformLabel}) created for user ${userId}`);
 
         // Start the bot in the background (don't await)
         (async () => {
@@ -293,7 +316,7 @@ router.post('/join', async (req, res) => {
 
                 const result = await meetBot.joinAndRecord(session.id, meetLink, {
                     botName: 'Bee Flow - Meeting Assistant',
-                    credentials: { email: botEmail, password: botPassword },
+                    credentials,
                     onStatusChange: async (status) => {
                         console.log(`[MeetBot] Session ${session.id} status: ${status}`);
                         await meetBotStore.updateSession(session.id, { status });
@@ -301,13 +324,11 @@ router.post('/join', async (req, res) => {
                 });
 
                 if (result.audioPath && fs.existsSync(result.audioPath)) {
-                    // Update session — now processing transcript
                     await meetBotStore.updateSession(session.id, {
                         status: 'processing',
                         audioPath: result.audioPath,
                     });
 
-                    // Check file size before transcribing
                     const stats = fs.statSync(result.audioPath);
                     if (stats.size < 5000) {
                         console.warn(`[MeetBot] Recording too small (${stats.size} bytes), may be empty`);
@@ -321,11 +342,10 @@ router.post('/join', async (req, res) => {
 
                     console.log(`[MeetBot] Transcribing recording (${(stats.size / (1024 * 1024)).toFixed(1)} MB)...`);
 
-                    // Transcribe the recording
                     const transcription = await transcribeBotRecording(
                         result.audioPath,
                         userId,
-                        title || 'Google Meet Recording',
+                        title || defaultTitle,
                         language || 'nl'
                     );
 
@@ -356,11 +376,13 @@ router.post('/join', async (req, res) => {
 
         // Return immediately with session info
         res.json({
-            message: 'Bot is joining the meeting',
+            message: `Bot is joining the ${platformLabel} meeting`,
             session: {
                 id: session.id,
                 meetLink,
-                title: title || 'Google Meet Recording',
+                platform,
+                platformLabel,
+                title: title || defaultTitle,
                 status: 'joining',
             },
         });
