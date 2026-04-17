@@ -311,7 +311,17 @@ async function buildToolHint(tools, userId = null) {
     if (tools.some(t => t.function.name.startsWith('n8n_workflow_') || t.function.name.startsWith('n8n_execution_'))) {
         const hasWrite = tools.some(t => ['n8n_workflow_create','n8n_workflow_update','n8n_workflow_patch','n8n_workflow_delete','n8n_workflow_execute','n8n_workflow_activate','n8n_workflow_deactivate'].includes(t.function.name));
         if (hasWrite) {
-            integrations.push('n8n Workflow Management (list, get, nodes_find, create, patch, activate, execute, debug executions). Rules: (1) prefer n8n_workflow_patch with node_operations over full update; (2) use n8n_workflow_nodes_find for targeted edits instead of pulling the whole workflow; (3) nodes/connections/parameters must be real JSON — never stringified; (4) always confirm before delete or activate; (5) debug failed runs via n8n_execution_get_detail.');
+            integrations.push(
+                'n8n Workflow Management (list, get, nodes_find, create, patch, activate, execute, debug executions). RULES: '
+                + '(1) ALWAYS call n8n_workflow_list first to discover IDs — never guess a workflow_id. '
+                + '(2) For targeted edits use n8n_workflow_patch with node_operations {action,node_name,node_data} — NOT wholesale update. '
+                + '(3) For searching nodes use n8n_workflow_nodes_find instead of pulling the full workflow. '
+                + '(4) nodes/connections/parameters are real JSON arrays/objects, never stringified. '
+                + '(5) Do NOT send `settings` in a patch unless explicitly changing one — the server preserves/sanitises existing settings automatically. '
+                + '(6) To add documentation to the canvas, use sticky notes: type "n8n-nodes-base.stickyNote" with parameters.content — no connections needed. '
+                + '(7) Always confirm with the user before n8n_workflow_delete or n8n_workflow_activate. '
+                + '(8) On failure, debug via n8n_execution_list → n8n_execution_get_detail for per-node errors.'
+            );
         } else {
             integrations.push('n8n Workflow Inspection (list, get, nodes_find, execution_list, execution_get_detail — read-only). To modify workflows you need the "Modify n8n Workflows" permission.');
         }

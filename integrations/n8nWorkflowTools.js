@@ -61,7 +61,7 @@ const N8N_WORKFLOW_TOOLS = [
         type: 'function',
         function: {
             name: 'n8n_workflow_list',
-            description: 'List all workflows on the connected n8n instance. Returns a summary of each workflow (ID, name, active status, node count, node types, tags, timestamps). Use this first to discover IDs before operating.',
+            description: 'List all workflows on the connected n8n instance. Returns summary per workflow (ID, name, active status, node count, tags, timestamps). ALWAYS call this first to discover IDs before any get/patch/update/delete — never guess a workflow ID. If you already called list in this conversation and the user asks to edit "the first one" or "that workflow", reuse the ID from the previous list result.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -77,7 +77,7 @@ const N8N_WORKFLOW_TOOLS = [
         type: 'function',
         function: {
             name: 'n8n_workflow_get',
-            description: 'Get the full definition of a workflow — nodes, connections, settings. Workflows over ~200KB auto-summarise; pass full:true to force the complete shape.',
+            description: 'Get the full definition of a workflow — nodes, connections, settings. The workflow_id MUST come from a prior n8n_workflow_list call — don\'t guess. If you get a 404, the ID is wrong or stale; re-list to find the current ID. Workflows over ~200KB auto-summarise; pass full:true to force the complete shape. For targeted edits prefer n8n_workflow_nodes_find instead — it\'s much cheaper.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -133,7 +133,7 @@ const N8N_WORKFLOW_TOOLS = [
         type: 'function',
         function: {
             name: 'n8n_workflow_update',
-            description: 'Fully REPLACE a workflow. Every field you omit is deleted. PREFER n8n_workflow_patch for edits.',
+            description: 'Fully REPLACE a workflow. Every field you omit is deleted. DO NOT use this for targeted edits — use n8n_workflow_patch (with node_operations) instead. Only call this when the user explicitly wants to wipe-and-rewrite.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -152,7 +152,7 @@ const N8N_WORKFLOW_TOOLS = [
         type: 'function',
         function: {
             name: 'n8n_workflow_patch',
-            description: 'Partially update a workflow. Only fields you provide change; everything else is preserved. PREFER `node_operations` for surgical edits (add/update/remove by node name) — it deep-merges so you only send the fields that change. Removing a node also prunes dangling connections. If you send the top-level `connections` field, it REPLACES all connections — use node_operations instead when possible. Note: deep-merge replaces arrays wholesale (e.g. parameters.assignments.assignments); include every row you want to keep in that array.',
+            description: 'Partially update a workflow. Only the fields you provide change; everything else is preserved. RULES: (1) Strongly prefer `node_operations` over `nodes`/`connections` — surgical edits by node name, with deep-merge on update and automatic connection cleanup on remove. (2) Do NOT send `settings` unless the user explicitly asked to change a setting; the server preserves the current settings automatically and filters them to n8n\'s accepted keys. Sending arbitrary settings causes a 400 from n8n. (3) Never rename a node via update — connections key on node name. To rename: remove + re-add and re-wire. (4) Deep-merge replaces arrays wholesale (e.g. parameters.assignments.assignments, headerParameters.parameters); include every row you want to keep if you touch an array. (5) For adding documentation (sticky notes) to the canvas, use node_operations with action:"add" and type:"n8n-nodes-base.stickyNote" — sticky notes don\'t need connections.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -559,9 +559,40 @@ const READ_ONLY_WORKFLOW_FIELDS = [
     'active', 'id', 'createdAt', 'updatedAt', 'versionId', 'hash', 'meta',
     'shared', 'homeProject', 'tags', 'usedCredentials', 'pinnedData', 'triggerCount',
 ];
+
+// n8n's PUT /workflows/:id validates `settings` with `additionalProperties: false`,
+// so ANY key outside this whitelist makes the whole request 400. The current
+// workflow's settings object (returned from GET) often contains keys n8n itself
+// added that are NOT in the PUT schema (like `executionTimeout`, internal flags,
+// or legacy keys from older versions). If we blindly round-trip settings we get
+// "request/body/settings must NOT have additional properties".
+// Solution: filter settings to only the keys n8n currently accepts on PUT.
+const SETTINGS_WHITELIST = new Set([
+    'executionOrder',
+    'saveManualExecutions',
+    'saveDataErrorExecution',
+    'saveDataSuccessExecution',
+    'saveExecutionProgress',
+    'timezone',
+    'errorWorkflow',
+    'callerPolicy',
+    'executionTimeout',
+    'maxExecutionTimeout',
+]);
+function sanitiseSettings(settings) {
+    if (!settings || typeof settings !== 'object') return {};
+    const out = {};
+    for (const [k, v] of Object.entries(settings)) {
+        if (SETTINGS_WHITELIST.has(k) && v !== null && v !== undefined) out[k] = v;
+    }
+    return out;
+}
+
 function stripReadOnly(wf) {
     const out = { ...wf };
     for (const k of READ_ONLY_WORKFLOW_FIELDS) delete out[k];
+    // Filter settings to n8n's PUT schema — prevents the common 400 error.
+    if ('settings' in out) out.settings = sanitiseSettings(out.settings);
     return out;
 }
 
@@ -935,4 +966,6 @@ module.exports = {
     assertConnectionsIntegrity,
     deepMerge,
     parseJsonParam,
+    sanitiseSettings,
+    SETTINGS_WHITELIST,
 };
