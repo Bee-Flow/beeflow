@@ -693,39 +693,14 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                     contentParts.push({ type: 'text', text: driveText });
                     persistedAttachments.push({ name: att.name, type: 'google-drive', extractedText: driveText });
                 } else if (att.content && att.type && att.type.includes('pdf')) {
-                    // PDF — pdfjs → Azure Document Intelligence (fallback when enabled)
+                    // PDF — unified pipeline (server/core/attachmentExtractor.js):
+                    //   pdfjs → Azure Document Intelligence → Mistral OCR → vision fallback.
+                    // The helper handles the density heuristic and vision-capable fallback.
                     try {
                         const base64Data = att.content.split(',')[1] || att.content;
                         const pdfBuffer = Buffer.from(base64Data, 'base64');
-                        let pdfText = '';
 
-                        // 1. Try pdfjs-dist first (fast, free — works for text-based PDFs)
-                        try {
-                            const { extractTextFromPDF } = require('../../core/pdfExtractor');
-                            pdfText = await extractTextFromPDF(pdfBuffer, att.name);
-                        } catch (parseErr) {
-                            console.warn(`[DirectChat] pdfjs extraction failed for ${att.name}:`, parseErr.message);
-                        }
-
-                        // 2. If pdfjs returned empty (e.g. scanned PDF), try Azure Document Intelligence
-                        if (!pdfText) {
-                            const useAzureDoc = !!(await configStore.getConfig('use_azure_doc_processing'));
-                            if (useAzureDoc) {
-                                try {
-                                    const { extractWithAzure, isAzureDocIntelligenceConfigured } = require('../../core/azureDocIntelligence');
-                                    if (await isAzureDocIntelligenceConfigured()) {
-                                        pdfText = await extractWithAzure(pdfBuffer, att.name);
-                                        if (pdfText) {
-                                            console.log(`[DirectChat] PDF extracted via Azure Document Intelligence: ${att.name} (${pdfText.length} chars)`);
-                                        }
-                                    }
-                                } catch (azureErr) {
-                                    console.warn(`[DirectChat] Azure Document Intelligence failed for PDF ${att.name}:`, azureErr.message);
-                                }
-                            }
-                        }
-
-                        // Upload original PDF to RustFS for persistence
+                        // Upload original PDF to RustFS for persistence (unchanged).
                         let pdfProxyUrl = null;
                         try {
                             if (storageStore.isAvailable()) {
@@ -739,18 +714,27 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                             console.warn(`[DirectChat] Failed to upload PDF to RustFS: ${e.message}`);
                         }
 
-                        if (pdfText) {
-                            const docText = `[PDF Document: ${att.name}]\n---\n${pdfText}\n---`;
+                        const { extractAttachment, formatTextHeader, formatImagesHeader, formatFailureNote } = require('../../core/attachmentExtractor');
+                        const result = await extractAttachment(att, { modelSupportsVision: adapter.supportsVision(modelId) });
+                        console.log(`[DirectChat] PDF ${att.name} extraction → kind=${result.kind}, source=${result.source || 'n/a'}`);
+
+                        if (result.kind === 'text') {
+                            const docText = `${formatTextHeader(att, result)}\n---\n${result.text}\n---`;
                             contentParts.push({ type: 'text', text: docText });
                             persistedAttachments.push({ name: att.name, type: att.type, url: pdfProxyUrl, extractedText: docText });
-                        } else {
-                            // PDF extraction failed — terminal containers have been removed
-                            contentParts.push({
-                                type: 'text',
-                                text: `[PDF: ${att.name} — could not extract text. The document may be scanned or image-based. Try re-uploading a text-selectable version.]`
-                            });
+                        } else if (result.kind === 'images') {
+                            // Vision fallback — inline a header note, then the page images.
+                            contentParts.push({ type: 'text', text: formatImagesHeader(att, result) });
+                            for (const img of result.images) {
+                                contentParts.push({
+                                    type: 'image_url',
+                                    image_url: { url: `data:${img.mimeType};base64,${img.base64}`, detail: 'auto' },
+                                });
+                            }
                             persistedAttachments.push({ name: att.name, type: att.type, url: pdfProxyUrl });
-                            console.log(`[DirectChat] PDF extraction failed for ${att.name}, no container fallback available`);
+                        } else {
+                            contentParts.push({ type: 'text', text: formatFailureNote(att, result) });
+                            persistedAttachments.push({ name: att.name, type: att.type, url: pdfProxyUrl });
                         }
                     } catch (e) {
                         console.error(`[DirectChat] PDF processing failed for ${att.name}:`, e.message);

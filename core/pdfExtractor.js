@@ -62,4 +62,37 @@ async function extractTextFromPDF(pdfBuffer, filename = 'unknown') {
     }
 }
 
-module.exports = { extractTextFromPDF };
+/**
+ * Extended extraction: returns text + numPages + per-page char counts so callers
+ * can make density-based decisions (e.g. "fall back to OCR when avg chars/page
+ * is too low").
+ *
+ * @param {Buffer|Uint8Array} pdfBuffer
+ * @param {string} [filename]
+ * @returns {Promise<{ text: string, numPages: number, pageCharCounts: number[] }>}
+ */
+async function extractTextFromPDFWithStats(pdfBuffer, filename = 'unknown') {
+    try {
+        const getDocument = await loadGetDocument();
+        const data = new Uint8Array(pdfBuffer);
+        const doc = await getDocument({ data, useSystemFonts: true }).promise;
+
+        const pages = [];
+        const pageCharCounts = [];
+        for (let i = 1; i <= doc.numPages; i++) {
+            const page = await doc.getPage(i);
+            const content = await page.getTextContent();
+            const pageText = content.items.map(item => item.str).join(' ').trim();
+            pageCharCounts.push(pageText.length);
+            if (pageText) pages.push(pageText);
+        }
+
+        const text = pages.join('\n\n').trim();
+        return { text, numPages: doc.numPages, pageCharCounts };
+    } catch (err) {
+        console.warn(`[PDFExtractor] Failed to extract text+stats from ${filename}:`, err.message);
+        return { text: '', numPages: 0, pageCharCounts: [] };
+    }
+}
+
+module.exports = { extractTextFromPDF, extractTextFromPDFWithStats };

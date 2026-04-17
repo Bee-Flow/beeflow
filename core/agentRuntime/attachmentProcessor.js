@@ -1,4 +1,5 @@
-const { mistralOCR } = require('../ocr');
+// mistralOCR is still invoked, but via the unified attachmentExtractor helper
+// (see ../attachmentExtractor.js) so PDF handling stays consistent with direct chat.
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 
@@ -45,50 +46,53 @@ async function uploadImageForInference(base64DataUrl, mimeType, userId, filename
     }
 }
 
-async function processAttachments(attachments = [], lastMsg, userId = null) {
+// Decide whether a model ID supports vision for the PDF-vision-fallback
+// decision. Mirrors the supportsVision regexes in the individual provider
+// adapters (see server/core/providers/*.js). Using a regex here keeps us
+// independent of which adapter the agent ultimately selects.
+function modelSupportsVisionById(modelId) {
+    if (!modelId) return false;
+    return /gpt-4o|gpt-4\.1|gpt-5|o4|claude-3|claude-opus-4|claude-sonnet-4|claude-haiku-4|claude-mythos|gemini|pixtral/i.test(modelId);
+}
+
+async function processAttachments(attachments = [], lastMsg, userId = null, opts = {}) {
     if (!attachments || attachments.length === 0) return;
 
     if (typeof lastMsg.content === 'string') {
         lastMsg.content = [{ type: 'text', text: lastMsg.content }];
     }
 
+    const modelSupportsVision = modelSupportsVisionById(opts.modelId);
+
     for (const att of attachments) {
         if (att.type.includes('pdf')) {
-            const base64Data = att.content.split(',')[1];
-            const pdfBuffer = Buffer.from(base64Data, 'base64');
-            let pdfText = '';
+            // Unified extractor — same pipeline as direct chat:
+            //   pdfjs → Azure Document Intelligence → Mistral OCR → vision fallback.
+            // Behaviour change from the old agent path: Azure now fires here too.
+            const { extractAttachment, formatTextHeader, formatImagesHeader, formatFailureNote } = require('../attachmentExtractor');
+            const result = await extractAttachment(att, { modelSupportsVision });
+            console.log(`[AttachmentProcessor] PDF ${att.name} extraction → kind=${result.kind}, source=${result.source || 'n/a'}`);
 
-            try {
-                const { extractTextFromPDF } = require('./pdfExtractor');
-                pdfText = await extractTextFromPDF(pdfBuffer, att.name);
-            } catch (parseErr) {
-                console.warn(`[AttachmentProcessor] pdfjs extraction failed for ${att.name}:`, parseErr.message);
-            }
-
-            if (!pdfText) {
-                try {
-                    pdfText = await mistralOCR(base64Data, att.type, att.name);
-                } catch (ocrErr) {
-                    console.warn(`[AttachmentProcessor] OCR failed:`, ocrErr.message);
-                }
-            }
-
-            if (pdfText) {
-                const textBlock = lastMsg.content.find(c => c.type === 'text');
-                const appendText = `\n\n[PDF Document: ${att.name}]\n---\n${pdfText}\n---\n`;
-                if (textBlock) {
-                    textBlock.text += appendText;
-                } else {
-                    lastMsg.content.push({ type: 'text', text: appendText });
+            const textBlock = lastMsg.content.find(c => c.type === 'text');
+            if (result.kind === 'text') {
+                const appendText = `\n\n${formatTextHeader(att, result)}\n---\n${result.text}\n---\n`;
+                if (textBlock) textBlock.text += appendText;
+                else lastMsg.content.push({ type: 'text', text: appendText });
+            } else if (result.kind === 'images') {
+                // Vision fallback: a header note followed by the page images.
+                const note = `\n\n${formatImagesHeader(att, result)}\n`;
+                if (textBlock) textBlock.text += note;
+                else lastMsg.content.push({ type: 'text', text: note });
+                for (const img of result.images) {
+                    lastMsg.content.push({
+                        type: 'image_url',
+                        image_url: { url: `data:${img.mimeType};base64,${img.base64}`, detail: 'auto' },
+                    });
                 }
             } else {
-                const fallbackText = `\n\n[PDF: ${att.name} — could not extract text. The document may be scanned or image-based. Try re-uploading a text-selectable version.]\n`;
-                const textBlock = lastMsg.content.find(c => c.type === 'text');
-                if (textBlock) {
-                    textBlock.text += fallbackText;
-                } else {
-                    lastMsg.content.push({ type: 'text', text: fallbackText });
-                }
+                const fallbackText = `\n\n${formatFailureNote(att, result)}\n`;
+                if (textBlock) textBlock.text += fallbackText;
+                else lastMsg.content.push({ type: 'text', text: fallbackText });
             }
         } else if (att.type.startsWith('image/')) {
             const sizeKB = Math.round((att.content?.length || 0) / 1024);

@@ -28,6 +28,7 @@
     "@google/genai": "^1.43.0",
     "@mistralai/mistralai": "^1.14.1",
     "@modelcontextprotocol/sdk": "^1.27.1",
+    "@napi-rs/canvas": "^0.1.98",
     "@serenity-kit/opaque": "^1.1.0",
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "argon2": "^0.44.0",
