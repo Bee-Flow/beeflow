@@ -13,13 +13,17 @@
  */
 
 const googleProvider = require('./meetBotProviders/google');
+const googleMeetSdkProvider = require('./meetBotProviders/google-meet-sdk');
 const teamsProvider = require('./meetBotProviders/teams');
 const teamsSdkProvider = require('./meetBotProviders/teams-sdk');
 const zoomProvider = require('./meetBotProviders/zoom');
 
-// Order matters: earlier providers are considered first. teams-sdk is
-// listed before teams so we prefer the SDK path when both claim Teams URLs.
+// Order matters: earlier providers are considered first. SDK-based providers
+// are listed before their browser-based counterparts so we prefer the
+// official media-API path when configured, and fall back to Playwright
+// otherwise.
 const providers = [
+    googleMeetSdkProvider,
     googleProvider,
     teamsSdkProvider,
     teamsProvider,

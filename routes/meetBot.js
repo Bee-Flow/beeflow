@@ -269,19 +269,36 @@ function requireAdmin(req, res, next) {
 }
 
 /**
- * GET /sdk-config — Read Teams SDK / ACS config status. Secrets are never
- * returned in full; only booleans and the non-secret callback base URL.
+ * GET /sdk-config — Read SDK provider config status (Teams ACS + Google
+ * Meet Media API). Secrets are never returned in full; only booleans and
+ * the non-secret callback base URL and impersonation user email.
  */
 router.get('/sdk-config', requireAdmin, async (_req, res) => {
     try {
-        const connStr = await configStore.getSecret('acs_connection_string');
-        const callbackSecret = await configStore.getSecret('teams_bot_callback_secret');
-        const callbackBaseUrl = await configStore.getConfig('teams_bot_callback_base_url');
+        const acsConnStr = await configStore.getSecret('acs_connection_string');
+        const acsCallbackSecret = await configStore.getSecret('teams_bot_callback_secret');
+        const acsCallbackBaseUrl = await configStore.getConfig('teams_bot_callback_base_url');
+
+        const gmKeyRaw = await configStore.getSecret('google_meet_service_account_key');
+        const gmImpersonationUser = await configStore.getConfig('google_meet_impersonation_user');
+        let gmServiceAccountEmail = null;
+        try {
+            const parsed = gmKeyRaw ? JSON.parse(gmKeyRaw) : null;
+            gmServiceAccountEmail = parsed?.client_email || null;
+        } catch (_) {}
+
         res.json({
-            acsConfigured: !!connStr,
-            callbackSecretConfigured: !!callbackSecret,
-            callbackBaseUrl: callbackBaseUrl || null,
-            callbackBaseUrlFromEnv: process.env.SERVER_BASE_URL || null,
+            teams: {
+                acsConfigured: !!acsConnStr,
+                callbackSecretConfigured: !!acsCallbackSecret,
+                callbackBaseUrl: acsCallbackBaseUrl || null,
+                callbackBaseUrlFromEnv: process.env.SERVER_BASE_URL || null,
+            },
+            googleMeet: {
+                serviceAccountConfigured: !!gmKeyRaw,
+                serviceAccountEmail: gmServiceAccountEmail,
+                impersonationUser: gmImpersonationUser || null,
+            },
         });
     } catch (err) {
         console.error('[MeetBot] /sdk-config GET error:', err);
@@ -290,18 +307,24 @@ router.get('/sdk-config', requireAdmin, async (_req, res) => {
 });
 
 /**
- * POST /sdk-config — Save ACS connection string + callback URL/secret.
- * Body: { acsConnectionString?, callbackBaseUrl?, callbackSecret?, clearAcsConnectionString? }
- * Fields are optional; only provided fields are updated.
+ * POST /sdk-config — Save SDK provider config. Fields are optional; only
+ * provided fields are updated.
+ * Body may contain any of:
+ *   - acsConnectionString, callbackBaseUrl, callbackSecret, clearAcsConnectionString  (Teams SDK)
+ *   - googleMeetServiceAccountKey (JSON string), googleMeetImpersonationUser,
+ *     clearGoogleMeetServiceAccountKey  (Google Meet SDK)
  */
 router.post('/sdk-config', requireAdmin, async (req, res) => {
     try {
-        const { acsConnectionString, callbackBaseUrl, callbackSecret, clearAcsConnectionString } = req.body || {};
+        const {
+            acsConnectionString, callbackBaseUrl, callbackSecret, clearAcsConnectionString,
+            googleMeetServiceAccountKey, googleMeetImpersonationUser, clearGoogleMeetServiceAccountKey,
+        } = req.body || {};
 
+        // ── Teams / ACS ─────────────────────────────────────
         if (clearAcsConnectionString) {
             await configStore.setSecret('acs_connection_string', '');
         } else if (typeof acsConnectionString === 'string' && acsConnectionString.trim()) {
-            // Sanity check: ACS connection strings begin with endpoint=https://
             if (!/^endpoint=https:\/\//i.test(acsConnectionString.trim())) {
                 return res.status(400).json({ error: 'ACS connection string should start with "endpoint=https://"' });
             }
@@ -318,6 +341,30 @@ router.post('/sdk-config', requireAdmin, async (req, res) => {
 
         if (typeof callbackSecret === 'string') {
             await configStore.setSecret('teams_bot_callback_secret', callbackSecret.trim());
+        }
+
+        // ── Google Meet SDK ─────────────────────────────────
+        if (clearGoogleMeetServiceAccountKey) {
+            await configStore.setSecret('google_meet_service_account_key', '');
+        } else if (typeof googleMeetServiceAccountKey === 'string' && googleMeetServiceAccountKey.trim()) {
+            let parsed;
+            try { parsed = JSON.parse(googleMeetServiceAccountKey); }
+            catch { return res.status(400).json({ error: 'Service account key must be valid JSON' }); }
+            if (!parsed.client_email || !parsed.private_key) {
+                return res.status(400).json({ error: 'Service account JSON missing client_email or private_key' });
+            }
+            if (parsed.type !== 'service_account') {
+                return res.status(400).json({ error: 'Expected a Google service-account key (type=service_account)' });
+            }
+            await configStore.setSecret('google_meet_service_account_key', googleMeetServiceAccountKey.trim());
+        }
+
+        if (typeof googleMeetImpersonationUser === 'string') {
+            const trimmed = googleMeetImpersonationUser.trim();
+            if (trimmed && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(trimmed)) {
+                return res.status(400).json({ error: 'Impersonation user must be a valid email address' });
+            }
+            await configStore.setConfig('google_meet_impersonation_user', trimmed);
         }
 
         res.json({ success: true });
