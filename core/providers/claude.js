@@ -149,38 +149,35 @@ class ClaudeProvider extends BaseProvider {
     buildThinking(model, options = {}) {
         if (!this.supportsReasoning(model)) return undefined;
 
-        // Direct budget_tokens override from UI (legacy support)
-        if (options.budgetTokens && options.budgetTokens > 0) {
-            return { thinking: { type: "enabled", budget_tokens: options.budgetTokens } };
-        }
-
-        // Map effort label → adaptive effort level
-        // Default to 'medium' when no explicit setting — ensures thinking always activates
         const effortRaw = options.reasoningEffort;
         if (effortRaw === 'none') return undefined; // Explicitly disabled
 
-        // Claude 4.6+ models: use adaptive thinking (recommended by Anthropic)
-        // The `effort` param is TOP-LEVEL in the API, NOT nested inside thinking.
-        // Maps: low → low, minimal → low, medium → medium, high → high, xhigh → max
-        const EFFORT_MAP = {
-            low: 'low',
-            minimal: 'low',
-            medium: 'medium',
-            high: 'high',
-            xhigh: 'max',
-        };
-        const effort = EFFORT_MAP[effortRaw] || 'medium'; // Default to medium
-        // Return both: thinking config + effort as separate top-level param
+        // Opus 4.7 rejects manual budget_tokens — adaptive is the only supported mode.
+        // Older 4.x models still accept budget_tokens but adaptive is recommended.
+        const isOpus47 = /^claude-opus-4-7/.test(model);
+        if (!isOpus47 && options.budgetTokens && options.budgetTokens > 0) {
+            return { thinking: { type: "enabled", budget_tokens: options.budgetTokens } };
+        }
+
+        // Adaptive thinking: effort is passed via output_config (top-level), not nested in thinking.
+        // Opus 4.7 supports: low, medium, high (default), xhigh, max
+        // Opus 4.6 / Sonnet 4.6 support: low, medium, high, max (no xhigh — map it to max)
+        const EFFORT_MAP_OPUS47 = { low: 'low', minimal: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' };
+        const EFFORT_MAP_LEGACY = { low: 'low', minimal: 'low', medium: 'medium', high: 'high', xhigh: 'max', max: 'max' };
+        const map = isOpus47 ? EFFORT_MAP_OPUS47 : EFFORT_MAP_LEGACY;
+        const effort = map[effortRaw] || 'medium';
         return { thinking: { type: "adaptive" }, effort };
     }
 
     supportsReasoning(modelId) {
-        return /^claude-(opus|sonnet|haiku)-4/.test(modelId);
+        // Opus 4.7, Opus 4.6, Sonnet 4.6 support adaptive thinking. Haiku 4.5 does not.
+        if (/^claude-haiku-4-5/.test(modelId)) return false;
+        return /^claude-(opus|sonnet)-4/.test(modelId);
     }
 
     supportsVision(modelId) {
         // Claude 3+ and Claude 4+ series all support image input
-        return /claude-3|claude-3-5|claude-3-7|claude-opus-4|claude-sonnet-4|claude-haiku-4/.test(modelId);
+        return /claude-3|claude-3-5|claude-3-7|claude-opus-4|claude-sonnet-4|claude-haiku-4|claude-mythos/.test(modelId);
     }
 
     // ─── Tool Normalization ──────────────────────────────────────

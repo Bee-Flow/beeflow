@@ -58,6 +58,7 @@ const DISPLAY_NAME_TO_ID = {
     'o3 Mini': 'o3-mini',
     'o4 Mini': 'o4-mini',
     // Claude models
+    'Claude Opus 4.7': 'claude-opus-4-7',
     'Claude Opus 4.6': 'claude-opus-4-6',
     'Claude Sonnet 4.6': 'claude-sonnet-4-6',
     'Claude Haiku 4.5': 'claude-haiku-4-5',
