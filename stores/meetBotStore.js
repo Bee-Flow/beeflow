@@ -22,10 +22,13 @@ async function initDB() {
             audio_path TEXT DEFAULT '',
             transcription_id TEXT DEFAULT '',
             error TEXT DEFAULT '',
+            platform TEXT DEFAULT 'google',
             started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             ended_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
+
+        ALTER TABLE meet_bot_sessions ADD COLUMN IF NOT EXISTS platform TEXT DEFAULT 'google';
 
         CREATE INDEX IF NOT EXISTS idx_meet_bot_user ON meet_bot_sessions(user_id);
         CREATE INDEX IF NOT EXISTS idx_meet_bot_status ON meet_bot_sessions(status);
@@ -35,15 +38,15 @@ async function initDB() {
     initialized = true;
 }
 
-async function createSession(userId, meetLink, title) {
+async function createSession(userId, meetLink, title, platform = 'google') {
     await initDB();
     const id = crypto.randomUUID();
     await run(
-        `INSERT INTO meet_bot_sessions (id, user_id, meet_link, title, status)
-         VALUES ($1, $2, $3, $4, 'pending')`,
-        [id, userId, meetLink, title || 'Untitled Meeting']
+        `INSERT INTO meet_bot_sessions (id, user_id, meet_link, title, platform, status)
+         VALUES ($1, $2, $3, $4, $5, 'pending')`,
+        [id, userId, meetLink, title || 'Untitled Meeting', platform]
     );
-    return { id, userId, meetLink, title: title || 'Untitled Meeting', status: 'pending' };
+    return { id, userId, meetLink, title: title || 'Untitled Meeting', platform, status: 'pending' };
 }
 
 async function updateSession(id, updates) {
@@ -91,6 +94,7 @@ function mapRow(row) {
         meetLink: row.meet_link,
         title: row.title,
         status: row.status,
+        platform: row.platform || 'google',
         audioPath: row.audio_path || '',
         transcriptionId: row.transcription_id || '',
         error: row.error || '',

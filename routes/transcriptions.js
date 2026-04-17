@@ -667,6 +667,8 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
                 segments: whisperResult.segments || [],
                 summary: summaryW, actionItems: actionItemsW,
             });
+
+        } else {
             // ── Voxtral (cloud, default) ─────────────────────
             const apiKey = await configStore.getSecret('mistral_api_key');
             if (!apiKey) {

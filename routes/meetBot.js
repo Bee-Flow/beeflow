@@ -1,7 +1,11 @@
 /**
- * Meet Bot API — REST endpoints for the Google Meet recording bot.
+ * Meet Bot API — REST endpoints for the meeting recording bot.
  *
- * POST   /api/meet-bot/join           — Send bot to a Google Meet
+ * Supports Google Meet, Microsoft Teams, and Zoom. The platform is
+ * auto-detected from the meeting URL.
+ *
+ * GET    /api/meet-bot/platforms      — List supported meeting platforms
+ * POST   /api/meet-bot/join           — Send bot to a meeting (any platform)
  * GET    /api/meet-bot/sessions       — List bot sessions for current user
  * GET    /api/meet-bot/sessions/:id   — Get a specific bot session
  * POST   /api/meet-bot/sessions/:id/stop — Stop an active bot session
