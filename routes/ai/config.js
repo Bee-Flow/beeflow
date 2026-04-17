@@ -1226,26 +1226,62 @@ router.post('/n8n/test', requireOrgAdminForN8n, async (req, res) => {
 
 const N8N_PERMISSION_IDS = ['use_n8n_tools', 'modify_n8n_workflows'];
 
+// Count how many users are actually members of each group right now. `groups.userCount`
+// is a stale denormalised column (never updated when users move between groups), so we
+// recompute it live for anything the admin UI displays.
+async function computeGroupUserCounts(groupIds, orgId) {
+    const userStore = require('../../stores/userStore');
+    const allUsers = await userStore.getAllUsers();
+    // Users: filter to the caller's org so super-admins don't see cross-org counts.
+    // If orgId is null (super-admin without an org), fall back to counting everyone.
+    const scoped = orgId
+        ? allUsers.filter(u => !u.organizationId || u.organizationId === orgId)
+        : allUsers;
+    const counts = Object.fromEntries(groupIds.map(id => [id, 0]));
+    for (const u of scoped) {
+        let ug = u.groups;
+        if (typeof ug === 'string') { try { ug = JSON.parse(ug); } catch (_) { ug = []; } }
+        if (!Array.isArray(ug)) continue;
+        for (const gid of ug) if (gid in counts) counts[gid]++;
+    }
+    return counts;
+}
+
 // GET /ai/n8n/permissions — return which groups hold each n8n permission, plus the list
-// of all org groups so the admin can pick one to add.
+// of all groups the admin can grant TO (org-scoped only; global groups are deliberately
+// excluded from the picker to avoid cross-org leaks).
 router.get('/n8n/permissions', requireOrgAdminForN8n, async (req, res) => {
     try {
         const orgId = req.orgId;
         const userStore = require('../../stores/userStore');
+        const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
         const allGroups = await userStore.getAllGroups();
-        const orgGroups = (allGroups || []).filter(g => !g.organizationId || g.organizationId === orgId);
 
-        const holdingGroups = (permId) => orgGroups
+        // Org-scope rule:
+        //   - Org admins see + manage groups where organizationId === their own org.
+        //   - Super admins additionally see global groups (null organizationId) since
+        //     they're the only ones allowed to touch those.
+        const visibleGroups = (allGroups || []).filter(g =>
+            g.organizationId === orgId || (isSuperAdmin && !g.organizationId)
+        );
+
+        const counts = await computeGroupUserCounts(visibleGroups.map(g => g.id), orgId);
+        const holdingGroups = (permId) => visibleGroups
             .filter(g => Array.isArray(g.permissions) && g.permissions.includes(permId))
-            .map(g => ({ id: g.id, name: g.name, userCount: g.userCount || 0 }));
+            .map(g => ({ id: g.id, name: g.name, userCount: counts[g.id] ?? 0 }));
 
         res.json({
             use_n8n_tools: holdingGroups('use_n8n_tools'),
             modify_n8n_workflows: holdingGroups('modify_n8n_workflows'),
-            // All groups in this org — lets the admin add one directly from the n8n panel.
-            availableGroups: orgGroups.map(g => ({ id: g.id, name: g.name, userCount: g.userCount || 0 })),
-            // Org admins always have both permissions regardless of group membership —
-            // surfaced in the UI so it's clear where baked-in access comes from.
+            availableGroups: visibleGroups.map(g => ({
+                id: g.id,
+                name: g.name,
+                userCount: counts[g.id] ?? 0,
+                isGlobal: !g.organizationId,
+            })),
+            // Org admins always have both permissions regardless of group membership.
+            // Enforced in permissions.js via orgRoles.json → org_admin perms, with
+            // legacy orgRole='admin' normalised to 'org_admin' at resolution time.
             orgAdminAlways: true,
             editUrl: '/settings/organisation/users',
         });
@@ -1270,14 +1306,23 @@ router.put('/n8n/permissions', requireOrgAdminForN8n, async (req, res) => {
 
         const userStore = require('../../stores/userStore');
         const { invalidateAllPermissionCaches } = require('../../auth/permissions');
+        const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
         const allGroups = await userStore.getAllGroups();
         const group = (allGroups || []).find(g => g.id === groupId);
         if (!group) return res.status(404).json({ error: 'Group not found' });
 
-        // Org-scope check — org admins can only mutate groups in their own org
-        // (super admins inherit a sentinel orgId from requireOrgAdminForN8n).
+        // Org-scope guard. A group with no organizationId is GLOBAL — granting a
+        // permission to it would grant that permission to users in OTHER orgs too,
+        // which an org admin must never be able to do. Only super-admins may edit
+        // global groups.
         const orgId = req.orgId;
-        if (group.organizationId && group.organizationId !== orgId) {
+        if (!group.organizationId) {
+            if (!isSuperAdmin) {
+                return res.status(403).json({
+                    error: 'This is a global group shared across organisations. Only a system administrator can change its permissions.',
+                });
+            }
+        } else if (group.organizationId !== orgId) {
             return res.status(403).json({ error: 'Cannot modify groups in another organisation' });
         }
 
@@ -1291,6 +1336,8 @@ router.put('/n8n/permissions', requireOrgAdminForN8n, async (req, res) => {
 
         await userStore.updateGroup(groupId, { permissions: next });
         // Cached permission sets must be invalidated so the new grant takes effect immediately.
+        // Without Redis, this clears the in-process Map; WITH Redis it also wipes keys for
+        // every logged-in user in the fleet.
         await invalidateAllPermissionCaches();
 
         res.json({ success: true, groupId, permission, action, permissions: next });

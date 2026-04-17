@@ -268,9 +268,17 @@ async function getUserPermissions(userId, session = null) {
         // ── Organisation role → permissions mapping (loaded from config) ──
         const ORG_ROLE_PERMISSIONS = getOrgRolePermissions();
 
+        // Legacy compatibility: accounts created before the role rename carry
+        // orgRole === 'admin' instead of 'org_admin'. Many code paths already
+        // accept both (see server/routes/ai/config.js requireOrgAdminForN8n),
+        // but the permissions map only has 'org_admin' — resulting in zero
+        // permissions for legacy admins. Normalise here.
+        const normaliseOrgRole = (r) => (r === 'admin' ? 'org_admin' : r);
+
         // Apply user's direct orgRole
-        if (user.orgRole && ORG_ROLE_PERMISSIONS[user.orgRole]) {
-            for (const p of ORG_ROLE_PERMISSIONS[user.orgRole]) {
+        const userOrgRole = normaliseOrgRole(user.orgRole);
+        if (userOrgRole && ORG_ROLE_PERMISSIONS[userOrgRole]) {
+            for (const p of ORG_ROLE_PERMISSIONS[userOrgRole]) {
                 permSet.add(p);
             }
         }
@@ -278,8 +286,9 @@ async function getUserPermissions(userId, session = null) {
         // Apply group-level orgRoles (a group can grant a role to all its members)
         for (const gid of groupIds) {
             const group = allGroups.find(g => g.id === gid);
-            if (group?.orgRole && ORG_ROLE_PERMISSIONS[group.orgRole]) {
-                for (const p of ORG_ROLE_PERMISSIONS[group.orgRole]) {
+            const groupOrgRole = normaliseOrgRole(group?.orgRole);
+            if (groupOrgRole && ORG_ROLE_PERMISSIONS[groupOrgRole]) {
+                for (const p of ORG_ROLE_PERMISSIONS[groupOrgRole]) {
                     permSet.add(p);
                 }
             }
