@@ -315,13 +315,10 @@ router.get('/sdk-config', requireAdmin, async (_req, res) => {
         const acsCallbackSecret = await configStore.getSecret('teams_bot_callback_secret');
         const acsCallbackBaseUrl = await configStore.getConfig('teams_bot_callback_base_url');
 
-        const gmKeyRaw = await configStore.getSecret('google_meet_service_account_key');
-        const gmImpersonationUser = await configStore.getConfig('google_meet_impersonation_user');
-        let gmServiceAccountEmail = null;
-        try {
-            const parsed = gmKeyRaw ? JSON.parse(gmKeyRaw) : null;
-            gmServiceAccountEmail = parsed?.client_email || null;
-        } catch (_) {}
+        const gmClientId = await configStore.getSecret('google_meet_oauth_client_id');
+        const gmClientSecret = await configStore.getSecret('google_meet_oauth_client_secret');
+        const gmRefreshToken = await configStore.getSecret('google_meet_oauth_refresh_token');
+        const gmAuthorizedEmail = await configStore.getConfig('google_meet_oauth_authorized_email');
 
         res.json({
             teams: {
@@ -331,9 +328,10 @@ router.get('/sdk-config', requireAdmin, async (_req, res) => {
                 callbackBaseUrlFromEnv: process.env.SERVER_BASE_URL || null,
             },
             googleMeet: {
-                serviceAccountConfigured: !!gmKeyRaw,
-                serviceAccountEmail: gmServiceAccountEmail,
-                impersonationUser: gmImpersonationUser || null,
+                clientConfigured: !!(gmClientId && gmClientSecret),
+                clientIdPreview: gmClientId ? `${gmClientId.slice(0, 12)}…` : null,
+                authorized: !!gmRefreshToken,
+                authorizedEmail: gmAuthorizedEmail || null,
             },
         });
     } catch (err) {
@@ -347,14 +345,16 @@ router.get('/sdk-config', requireAdmin, async (_req, res) => {
  * provided fields are updated.
  * Body may contain any of:
  *   - acsConnectionString, callbackBaseUrl, callbackSecret, clearAcsConnectionString  (Teams SDK)
- *   - googleMeetServiceAccountKey (JSON string), googleMeetImpersonationUser,
- *     clearGoogleMeetServiceAccountKey  (Google Meet SDK)
+ *   - googleMeetOAuthClientId, googleMeetOAuthClientSecret,
+ *     clearGoogleMeetOAuthClient (wipes client id + secret + refresh token),
+ *     clearGoogleMeetRefreshToken (revokes authorisation only)  (Google Meet SDK)
  */
 router.post('/sdk-config', requireAdmin, async (req, res) => {
     try {
         const {
             acsConnectionString, callbackBaseUrl, callbackSecret, clearAcsConnectionString,
-            googleMeetServiceAccountKey, googleMeetImpersonationUser, clearGoogleMeetServiceAccountKey,
+            googleMeetOAuthClientId, googleMeetOAuthClientSecret,
+            clearGoogleMeetOAuthClient, clearGoogleMeetRefreshToken,
         } = req.body || {};
 
         // ── Teams / ACS ─────────────────────────────────────
@@ -379,28 +379,33 @@ router.post('/sdk-config', requireAdmin, async (req, res) => {
             await configStore.setSecret('teams_bot_callback_secret', callbackSecret.trim());
         }
 
-        // ── Google Meet SDK ─────────────────────────────────
-        if (clearGoogleMeetServiceAccountKey) {
-            await configStore.setSecret('google_meet_service_account_key', '');
-        } else if (typeof googleMeetServiceAccountKey === 'string' && googleMeetServiceAccountKey.trim()) {
-            let parsed;
-            try { parsed = JSON.parse(googleMeetServiceAccountKey); }
-            catch { return res.status(400).json({ error: 'Service account key must be valid JSON' }); }
-            if (!parsed.client_email || !parsed.private_key) {
-                return res.status(400).json({ error: 'Service account JSON missing client_email or private_key' });
+        // ── Google Meet SDK (OAuth user flow) ───────────────
+        if (clearGoogleMeetOAuthClient) {
+            await configStore.setSecret('google_meet_oauth_client_id', '');
+            await configStore.setSecret('google_meet_oauth_client_secret', '');
+            await configStore.setSecret('google_meet_oauth_refresh_token', '');
+            await configStore.setConfig('google_meet_oauth_authorized_email', '');
+        } else {
+            if (typeof googleMeetOAuthClientId === 'string' && googleMeetOAuthClientId.trim()) {
+                const v = googleMeetOAuthClientId.trim();
+                if (!/\.apps\.googleusercontent\.com$/.test(v)) {
+                    return res.status(400).json({ error: 'OAuth client ID must end with .apps.googleusercontent.com' });
+                }
+                await configStore.setSecret('google_meet_oauth_client_id', v);
+                // Changing the client invalidates any stored refresh token.
+                await configStore.setSecret('google_meet_oauth_refresh_token', '');
+                await configStore.setConfig('google_meet_oauth_authorized_email', '');
             }
-            if (parsed.type !== 'service_account') {
-                return res.status(400).json({ error: 'Expected a Google service-account key (type=service_account)' });
+            if (typeof googleMeetOAuthClientSecret === 'string' && googleMeetOAuthClientSecret.trim()) {
+                await configStore.setSecret('google_meet_oauth_client_secret', googleMeetOAuthClientSecret.trim());
+                await configStore.setSecret('google_meet_oauth_refresh_token', '');
+                await configStore.setConfig('google_meet_oauth_authorized_email', '');
             }
-            await configStore.setSecret('google_meet_service_account_key', googleMeetServiceAccountKey.trim());
         }
 
-        if (typeof googleMeetImpersonationUser === 'string') {
-            const trimmed = googleMeetImpersonationUser.trim();
-            if (trimmed && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(trimmed)) {
-                return res.status(400).json({ error: 'Impersonation user must be a valid email address' });
-            }
-            await configStore.setConfig('google_meet_impersonation_user', trimmed);
+        if (clearGoogleMeetRefreshToken) {
+            await configStore.setSecret('google_meet_oauth_refresh_token', '');
+            await configStore.setConfig('google_meet_oauth_authorized_email', '');
         }
 
         res.json({ success: true });
@@ -409,6 +414,109 @@ router.post('/sdk-config', requireAdmin, async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
+
+/**
+ * GET /google-oauth/start — Kick off the Meet Media OAuth consent flow.
+ *
+ * Must be called by an admin. Builds an authorization URL for the stored
+ * OAuth client (Desktop or Web) and redirects there. The refresh token is
+ * captured on callback and stored server-side.
+ *
+ * The admin signs in as the bot account (e.g. meetingnotes@…) during
+ * consent — this is the identity that will join meetings.
+ */
+router.get('/google-oauth/start', requireAdmin, async (req, res) => {
+    try {
+        const { OAuth2Client } = require('google-auth-library');
+        const googleMeetSdk = require('../core/meetBotProviders/google-meet-sdk');
+
+        const { clientId, clientSecret } = await googleMeetSdk.loadOAuthConfig();
+        if (!clientId || !clientSecret) {
+            return res.status(400).send('Google Meet OAuth client is not configured yet.');
+        }
+
+        const redirectUri = buildOAuthRedirectUri(req);
+        const oauth2 = new OAuth2Client({ clientId, clientSecret, redirectUri });
+
+        // `prompt=consent` forces Google to emit a refresh_token even if the
+        // user has previously authorised the same client.
+        const url = oauth2.generateAuthUrl({
+            access_type: 'offline',
+            prompt: 'consent',
+            include_granted_scopes: false,
+            scope: googleMeetSdk.OAUTH_SCOPES,
+        });
+        res.redirect(url);
+    } catch (err) {
+        console.error('[MeetBot] /google-oauth/start error:', err);
+        res.status(500).send(`OAuth start failed: ${err.message}`);
+    }
+});
+
+/**
+ * GET /google-oauth/callback — Handle the redirect from Google and store
+ * the refresh token. Renders a minimal HTML page so the admin knows it
+ * worked and can close the tab.
+ */
+router.get('/google-oauth/callback', requireAdmin, async (req, res) => {
+    try {
+        const { code, error: oauthError } = req.query;
+        if (oauthError) {
+            return res.status(400).send(`Google denied authorisation: ${oauthError}`);
+        }
+        if (!code || typeof code !== 'string') {
+            return res.status(400).send('Missing authorisation code.');
+        }
+
+        const { OAuth2Client } = require('google-auth-library');
+        const googleMeetSdk = require('../core/meetBotProviders/google-meet-sdk');
+        const { clientId, clientSecret } = await googleMeetSdk.loadOAuthConfig();
+        if (!clientId || !clientSecret) {
+            return res.status(400).send('OAuth client config was cleared mid-flow. Restart from the admin panel.');
+        }
+
+        const redirectUri = buildOAuthRedirectUri(req);
+        const oauth2 = new OAuth2Client({ clientId, clientSecret, redirectUri });
+        const { tokens } = await oauth2.getToken(code);
+
+        if (!tokens.refresh_token) {
+            return res.status(400).send(
+                'Google did not return a refresh_token. This usually means the bot account has previously ' +
+                'consented to this client — revoke access at https://myaccount.google.com/permissions and try again.'
+            );
+        }
+
+        // Pull the authorised user's email from the id_token (for display only).
+        let authorizedEmail = null;
+        try {
+            if (tokens.id_token) {
+                const ticket = await oauth2.verifyIdToken({ idToken: tokens.id_token, audience: clientId });
+                authorizedEmail = ticket.getPayload()?.email || null;
+            }
+        } catch (_) { /* email is cosmetic; ignore */ }
+
+        await configStore.setSecret('google_meet_oauth_refresh_token', tokens.refresh_token);
+        if (authorizedEmail) {
+            await configStore.setConfig('google_meet_oauth_authorized_email', authorizedEmail);
+        }
+
+        res.send(`<!doctype html><meta charset="utf-8"><title>Authorised</title>
+<body style="font-family: system-ui, sans-serif; padding: 2rem; max-width: 40rem; margin: auto;">
+<h1>✅ Google Meet bot authorised</h1>
+<p>Bot identity: <strong>${authorizedEmail || '(email not returned)'}</strong></p>
+<p>You can close this tab and return to the admin panel.</p>
+</body>`);
+    } catch (err) {
+        console.error('[MeetBot] /google-oauth/callback error:', err);
+        res.status(500).send(`OAuth callback failed: ${err.message}`);
+    }
+});
+
+function buildOAuthRedirectUri(req) {
+    const configured = process.env.SERVER_BASE_URL;
+    const base = (configured && configured.trim().replace(/\/+$/, '')) || `${req.protocol}://${req.get('host')}`;
+    return `${base}/api/meet-bot/google-oauth/callback`;
+}
 
 /**
  * GET /platforms — List supported meeting platforms

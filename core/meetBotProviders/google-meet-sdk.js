@@ -3,8 +3,12 @@
  *
  * Officially supported server-side path for receiving media from a Google
  * Meet conference. Uses:
- *   - A service account (with domain-wide delegation) to impersonate a
- *     Workspace user that has permission to join the meeting.
+ *   - OAuth 2.0 user credentials (authorization-code flow with a stored
+ *     refresh token). The Meet Media scope is NOT DWD-compatible — only a
+ *     real Google user identity that has been invited to the meeting can
+ *     connect. The admin authorises a dedicated bot account (e.g.
+ *     meetingnotes@yourdomain.com) once via consent; the refresh token is
+ *     stored and used to mint access tokens on each join.
  *   - The Meet REST API v2 to resolve a meeting code to a space resource.
  *   - The Meet Media API v2beta `:connectActiveConference` endpoint for the
  *     single HTTP step that exchanges an SDP offer for an answer.
@@ -15,10 +19,10 @@
  *
  * Requirements checked at runtime (provider reports unavailable if any are
  * missing so the dispatcher falls back to the Playwright `google` provider):
- *   1. Secret `google_meet_service_account_key` — JSON key of a service
- *      account granted domain-wide delegation for Meet Media + meeting read.
- *   2. Config `google_meet_impersonation_user` — email of a Workspace user
- *      the service account will impersonate (the bot identity).
+ *   1. Secrets `google_meet_oauth_client_id` + `google_meet_oauth_client_secret`
+ *      — OAuth client (Desktop or Web) with the Meet scopes enabled.
+ *   2. Secret `google_meet_oauth_refresh_token` — minted via the consent
+ *      flow at /api/meet-bot/google-oauth/start.
  *   3. `@roamhq/wrtc` native module installed and loadable.
  *   4. Workspace admin has enabled the Media API in Meet safety settings
  *      (not checkable from code — surfaced in docs/admin UI text).
@@ -40,18 +44,11 @@ const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
 const configStore = require('../../stores/configStore');
 const shared = require('./shared');
 
-// Meet docs currently show both `meetings.space.read` and
-// `meetings.space.readonly` in different pages/samples. We try both so token
-// minting works regardless of which one the admin authorized for DWD.
-const MEET_MEDIA_SCOPE_SETS = [
-    [
-        'https://www.googleapis.com/auth/meetings.conference.media.readonly',
-        'https://www.googleapis.com/auth/meetings.space.readonly',
-    ],
-    [
-        'https://www.googleapis.com/auth/meetings.conference.media.readonly',
-        'https://www.googleapis.com/auth/meetings.space.read',
-    ],
+const MEET_OAUTH_SCOPES = [
+    'https://www.googleapis.com/auth/meetings.conference.media.readonly',
+    'https://www.googleapis.com/auth/meetings.space.readonly',
+    'openid',
+    'email',
 ];
 
 // Meet REST API v2 — used to resolve a meeting code (abc-defg-hij) to a
@@ -79,61 +76,49 @@ function extractMeetingCode(url) {
     return m[1].toLowerCase();
 }
 
-async function loadServiceAccount() {
-    const raw = await configStore.getSecret('google_meet_service_account_key');
-    if (!raw) return null;
-    try {
-        return typeof raw === 'string' ? JSON.parse(raw) : raw;
-    } catch (e) {
-        console.error('[MeetBot/GoogleSDK] Service account JSON is malformed:', e.message);
-        return null;
-    }
+async function loadOAuthConfig() {
+    const [clientId, clientSecret, refreshToken] = await Promise.all([
+        configStore.getSecret('google_meet_oauth_client_id'),
+        configStore.getSecret('google_meet_oauth_client_secret'),
+        configStore.getSecret('google_meet_oauth_refresh_token'),
+    ]);
+    return {
+        clientId: clientId || null,
+        clientSecret: clientSecret || null,
+        refreshToken: refreshToken || null,
+    };
 }
 
 async function isConfigured() {
     try {
-        const sa = await loadServiceAccount();
-        if (!sa?.client_email || !sa?.private_key) return false;
-        const subject = await configStore.getConfig('google_meet_impersonation_user');
-        if (!subject) return false;
-        // Require @roamhq/wrtc to be actually loadable. If the native binary
-        // didn't install, we must fall back to the Playwright provider.
+        const { clientId, clientSecret, refreshToken } = await loadOAuthConfig();
+        if (!clientId || !clientSecret || !refreshToken) return false;
         try { require('@roamhq/wrtc'); } catch { return false; }
         return true;
     } catch (_) { return false; }
 }
 
 /**
- * Mint an access token for the impersonation user via JWT + domain-wide
- * delegation. Uses google-auth-library which ships with googleapis.
+ * Build a google-auth-library OAuth2 client seeded with the stored refresh
+ * token. Callers can `client.getAccessToken()` to mint a fresh bearer, and
+ * the library handles refresh automatically.
  */
+async function getOAuth2Client() {
+    const { OAuth2Client } = require('google-auth-library');
+    const { clientId, clientSecret, refreshToken } = await loadOAuthConfig();
+    if (!clientId || !clientSecret) throw new Error('Google Meet OAuth client not configured');
+    if (!refreshToken) throw new Error('Google Meet OAuth refresh token not configured — admin must complete consent flow');
+
+    const client = new OAuth2Client({ clientId, clientSecret });
+    client.setCredentials({ refresh_token: refreshToken });
+    return client;
+}
+
 async function getAccessToken() {
-    const { JWT } = require('google-auth-library');
-    const sa = await loadServiceAccount();
-    if (!sa) throw new Error('Service account key not configured');
-    const subject = await configStore.getConfig('google_meet_impersonation_user');
-    if (!subject) throw new Error('google_meet_impersonation_user not configured');
-
-    let lastError = null;
-    for (const scopes of MEET_MEDIA_SCOPE_SETS) {
-        try {
-            const jwt = new JWT({
-                email: sa.client_email,
-                key: sa.private_key,
-                scopes,
-                subject,
-            });
-            const { access_token } = await jwt.getAccessToken();
-            if (!access_token) {
-                throw new Error('No access_token returned');
-            }
-            return { accessToken: access_token, scopes };
-        } catch (e) {
-            lastError = e;
-        }
-    }
-
-    throw new Error(`Failed to mint Google access token (check DWD setup and scopes): ${lastError?.message || 'unknown error'}`);
+    const client = await getOAuth2Client();
+    const { token } = await client.getAccessToken();
+    if (!token) throw new Error('Failed to mint Google access token (refresh_token may be expired or revoked — re-authorise)');
+    return { accessToken: token, scopes: MEET_OAUTH_SCOPES };
 }
 
 /**
@@ -408,4 +393,7 @@ module.exports = {
     isConfigured,
     joinAndRecord,
     requiresCredentials: false,
+    // Exposed for the OAuth consent-flow routes in server/routes/meetBot.js
+    OAUTH_SCOPES: MEET_OAUTH_SCOPES,
+    loadOAuthConfig,
 };
