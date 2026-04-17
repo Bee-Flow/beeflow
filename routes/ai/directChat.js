@@ -133,7 +133,7 @@ function requireAuth(req, res, next) {
 // ─── Streaming Direct Chat ───────────────────────────────────────
 
 router.post('/chat/direct/stream', requireAuth, async (req, res) => {
-    const { message, conversationId, modelTier, history, attachments, imageGenSettings, nanoBananaSettings, disabledMedia, webSearchEnabled = true, workspaceContent, workspaceSelection, projectId, timezone, systemPrompt: requestSystemPrompt, activeSkillIds, reasoningEffort: requestReasoningEffort } = req.body;
+    const { message, conversationId, modelTier, history, attachments, imageGenSettings, nanoBananaSettings, disabledMedia, webSearchEnabled = true, notebookspaceContent, notebookspaceSelection, projectId, timezone, systemPrompt: requestSystemPrompt, activeSkillIds, reasoningEffort: requestReasoningEffort } = req.body;
     const userId = req.session.user.id;
 
     if (!message && (!attachments || attachments.length === 0)) {
@@ -539,9 +539,12 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         }
 
         // ─── Notebook context injection ─────────────────────────────
-        let workspaceContext = '';
-        if (notebooksEnabled && workspaceContent) {
-            workspaceContext = `\n\n[NOTEBOOK]
+        // Treat `undefined` as "no notebook open" and anything else (including
+        // empty string) as "notebook present, may be blank". The client drops
+        // the field entirely when the drawer is closed.
+        let notebookspaceContext = '';
+        if (notebooksEnabled && notebookspaceContent !== undefined) {
+            notebookspaceContext = `\n\n[NOTEBOOK]
 The user has a Notebook panel open. You have 4 tools:
 - notebook_read: Read content. Modes: "outline" (default—headings+stats), "section" (one section by heading), "search" (find text), "full" (entire doc). Use outline first, then section/search for targeted access.
 - notebook_write: Replace ALL content (for new documents or full rewrites). Write in Markdown.
@@ -549,8 +552,8 @@ The user has a Notebook panel open. You have 4 tools:
 - notebook_insert: Add content at "start", "end", or "after" a heading.
 
 RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="section" to get exact text. 2) Copy find_text EXACTLY from read output. 3) For partial edits always prefer notebook_replace over notebook_write. 4) Use Markdown for rich text (headings, bold, tables, code blocks, lists, etc.).`;
-            if (workspaceSelection && workspaceSelection.trim()) {
-                workspaceContext += `\n\n[SELECTED TEXT IN NOTEBOOK]\nThe user selected this text:\n\`\`\`\n${workspaceSelection}\n\`\`\`\nUse notebook_replace with find_text set to EXACTLY this text. Set replace_text to the new version.`;
+            if (notebookspaceSelection && notebookspaceSelection.trim()) {
+                notebookspaceContext += `\n\n[SELECTED TEXT IN NOTEBOOK]\nThe user selected this text:\n\`\`\`\n${notebookspaceSelection}\n\`\`\`\nUse notebook_replace with find_text set to EXACTLY this text. Set replace_text to the new version.`;
             }
         }
 
@@ -597,7 +600,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
 
         let messages = [
             {
-                role: 'system', content: basePrompt + toolHint + memoryContext + workspaceContext + projectContext + skillsContext + `\nNow: ${_nowStr}`
+                role: 'system', content: basePrompt + toolHint + memoryContext + notebookspaceContext + projectContext + skillsContext + `\nNow: ${_nowStr}`
             }
         ];
 

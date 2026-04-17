@@ -77,7 +77,10 @@ router.get('/:id', requireAuth, async (req, res) => {
         const notebook = await notebookStore.getNotebook(req.params.id, userId);
         if (!notebook) return res.status(404).json({ error: 'Notebook not found' });
 
-        // Include sources
+        // Flip any sources that have been "processing" for > 10 min to errored.
+        // Protects users from yellow rows stuck forever after a worker crash.
+        await notebookStore.timeoutStuckSources(notebook.id).catch(() => {});
+
         const sources = await notebookStore.getSources(notebook.id);
         res.json({ notebook, sources });
     } catch (err) {
@@ -348,11 +351,88 @@ router.get('/:id/sources', requireAuth, async (req, res) => {
         const nb = await notebookStore.getNotebook(req.params.id, userId);
         if (!nb) return res.status(404).json({ error: 'Notebook not found' });
 
+        await notebookStore.timeoutStuckSources(nb.id).catch(() => {});
         const sources = await notebookStore.getSources(nb.id);
         res.json({ sources });
     } catch (err) {
         console.error('[Notebooks] List sources failed:', err);
         res.status(500).json({ error: 'Failed to list sources' });
+    }
+});
+
+// ── Retry Source Ingestion ──────────────────────────────────────
+// Re-runs ingestion for a failed or cancelled source without re-uploading.
+// Only makes sense for source types whose raw content is recoverable:
+//   - file: we fetch the buffer back from storageStore
+//   - url:  we re-fetch from the saved URL
+// text / gdrive / onedrive sources don't retain original content server-side,
+// so retry is refused with a 422 and the UI falls back to re-adding the source.
+
+router.post('/:id/sources/:sid/retry', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const nb = await notebookStore.getNotebook(req.params.id, userId);
+        if (!nb) return res.status(404).json({ error: 'Notebook not found' });
+
+        const source = await notebookStore.getSource(req.params.sid);
+        if (!source || source.notebookId !== nb.id) return res.status(404).json({ error: 'Source not found' });
+
+        // Reset state so the UI immediately shows the spinner.
+        await notebookStore.updateSource(source.id, { status: 'processing', error: null });
+        res.json({ success: true });
+
+        // Dispatch retry in the background so the HTTP request doesn't stall.
+        (async () => {
+            try {
+                if (source.type === 'url') {
+                    const url = source.metadata?.url;
+                    if (!url) throw new Error('Source has no URL to retry');
+                    await ingestUrlSource(nb.id, source.id, userId, url);
+                } else if (source.storageKey) {
+                    // File source — re-fetch bytes from storage, re-ingest.
+                    if (!storageStore.isAvailable()) throw new Error('Storage not configured');
+                    const { stream } = await storageStore.streamFile(source.storageKey);
+                    const chunks = [];
+                    for await (const chunk of stream) chunks.push(chunk);
+                    const buffer = Buffer.concat(chunks);
+                    const mimeType = source.metadata?.mimeType || 'application/octet-stream';
+                    await ingestFileSource(nb.id, source.id, userId, buffer, source.fileName || source.name, mimeType);
+                } else {
+                    throw new Error('This source type cannot be retried — please re-add it.');
+                }
+            } catch (e) {
+                console.error(`[Notebooks] Retry failed for source ${source.id}:`, e.message);
+                await notebookStore.updateSource(source.id, { status: 'error', error: e.message }).catch(() => {});
+            }
+        })();
+    } catch (err) {
+        console.error('[Notebooks] Retry source route failed:', err);
+        res.status(500).json({ error: 'Failed to retry source' });
+    }
+});
+
+// ── Cancel / Dismiss Stuck Source ───────────────────────────────
+// Flips a processing or error source to a terminal state without deleting.
+// Useful when a worker silently died and the row is stuck yellow — the user
+// can dismiss without losing the uploaded bytes (retry remains available).
+
+router.post('/:id/sources/:sid/cancel', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const nb = await notebookStore.getNotebook(req.params.id, userId);
+        if (!nb) return res.status(404).json({ error: 'Notebook not found' });
+
+        const source = await notebookStore.getSource(req.params.sid);
+        if (!source || source.notebookId !== nb.id) return res.status(404).json({ error: 'Source not found' });
+
+        await notebookStore.updateSource(source.id, {
+            status: 'error',
+            error: 'Cancelled by user',
+        });
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[Notebooks] Cancel source failed:', err);
+        res.status(500).json({ error: 'Failed to cancel source' });
     }
 });
 
@@ -401,12 +481,31 @@ router.delete('/:id/sources/:sid', requireAuth, async (req, res) => {
 
 // ── Studio: Generate Content (FAQ / Summary / Study Guide) ──────
 
+// Studio generation types. The study-aid / podcast gimmicks were removed
+// so older clients calling those types fail loud instead of wasting an LLM
+// round-trip for a result nothing renders nicely anymore.
+const VALID_GEN_TYPES = new Set([
+    'summary', 'briefing_doc', 'blog_post', 'faq',
+    'mind_map', 'data_table',
+]);
+const REMOVED_GEN_TYPES = new Set(['studyGuide', 'flashcards', 'quiz', 'audio_overview']);
+
 router.post('/:id/generate/:type', requireAuth, async (req, res) => {
     try {
         const userId = req.session.user.id;
         const notebookId = req.params.id;
-        const type = req.params.type; // faq, summary, studyGuide
+        const type = req.params.type;
         const { modelTier, timezone } = req.body;
+
+        if (REMOVED_GEN_TYPES.has(type)) {
+            return res.status(400).json({
+                error: `Generation type "${type}" was removed. Use Executive Summary, Briefing Doc, FAQ, Mind Map, or Data Table instead.`,
+                code: 'generation_type_removed',
+            });
+        }
+        if (!VALID_GEN_TYPES.has(type)) {
+            return res.status(400).json({ error: `Unknown generation type "${type}"`, code: 'generation_type_unknown' });
+        }
 
         const nb = await notebookStore.getNotebook(notebookId, userId);
         if (!nb) return res.status(404).json({ error: 'Notebook not found' });
@@ -433,29 +532,17 @@ router.post('/:id/generate/:type', requireAuth, async (req, res) => {
             return res.status(400).json({ error: 'Could not retrieve source content from knowledge base' });
         }
 
-        // Type-specific prompts
+        // Type-specific prompts. Only the types in VALID_GEN_TYPES reach here —
+        // the check above rejects everything else.
         const typePrompts = {
-            faq: `Generate a focused FAQ (Frequently Asked Questions) document based on the source material below. 
+            faq: `Generate a focused FAQ (Frequently Asked Questions) document based on the source material below.
 Format as a well-structured markdown document with clear Q&A pairs grouped by topic. Keep answers concise (2-3 sentences each).`,
             summary: `Generate an executive summary based on the source material below. Include Key Findings and Conclusions.`,
             briefing_doc: `Generate a Briefing Document based on the source material below. Include an Executive Summary, Key Analysis, and Recommendations. Write concisely — prioritize substance over volume.`,
             blog_post: `Draft an engaging, well-written Blog Post based on the core themes of the source material. Use a catchy title, headings, and an accessible tone.`,
-            studyGuide: `Generate a study guide based on the source material below. Include Learning Objectives, Key Concepts, Important Terms, and Review Questions. Be concise and direct.`,
-            flashcards: `Generate a set of 10-15 Flashcards for studying the source material. Format them exactly like this:
-**Q:** [Question]
-**A:** [Answer]`,
-            quiz: `Create a multiple-choice Knowledge Quiz based on the source material. Include 5-10 questions.
-List the questions first with A/B/C/D options. Then provide an Answer Key at the very bottom.`,
             mind_map: `Extract the core concepts from the source material and generate a Mermaid.js mind map visualization.
 Wrap your output in \`\`\`mermaid ... \`\`\` tags. Focus on hierarchical relationships between the main topics.`,
             data_table: `Extract the most important quantitative data, comparisons, or structured information from the source material and present it as a Markdown table.`,
-            audio_overview: `You are an AI podcast producer. Write a short, engaging 2-host podcast script discussing the key takeaways from the provided source material.
-The hosts are Host 1 (an enthusiastic learner) and Host 2 (the expert who explains things).
-FORMAT RULE: You MUST format the script EXACTLY as pairs of lines like this:
-Host 1: [Host 1's dialogue]
-Host 2: [Host 2's dialogue]
-
-Keep the total script length to around 300 words. Focus on the most interesting insights.`
         };
 
         const prompt = typePrompts[type] || typePrompts.summary;
@@ -551,7 +638,7 @@ ${allContent.slice(0, 50000)}`;
 
         const messages = [
             { role: 'system', content: systemPrompt },
-            { role: 'user', content: `Generate the ${type === 'studyGuide' ? 'study guide' : type} now. Be thorough but concise — prioritize substance over volume. Use compact formatting with minimal whitespace. Where appropriate, include Mermaid diagrams to visualize key concepts, processes, or relationships.` }
+            { role: 'user', content: `Generate the ${type} now. Be thorough but concise — prioritize substance over volume. Use compact formatting with minimal whitespace. Where appropriate, include Mermaid diagrams to visualize key concepts, processes, or relationships.` }
         ];
 
         const { TIER_DEFAULTS } = require('../core/modelResolver');
@@ -574,52 +661,9 @@ ${allContent.slice(0, 50000)}`;
             }
         });
 
-        // If it's an audio overview, we pipe the generated script through ElevenLabs.
-        if (type === 'audio_overview') {
-            try {
-                send('content', { text: '\n\n*🎙️ Generating audio podcast using ElevenLabs...*\n' });
-                const scriptLines = fullGeneratedText.split('\\n').map(l => l.trim()).filter(l => l.length > 0);
-                
-                // Extract segments based on standard "Host X:" pattern
-                const segments = [];
-                for (const line of scriptLines) {
-                    if (line.startsWith('Host 1:')) segments.push({ host: 1, text: line.replace('Host 1:', '').trim() });
-                    else if (line.startsWith('Host 2:')) segments.push({ host: 2, text: line.replace('Host 2:', '').trim() });
-                }
-
-                if (segments.length > 0) {
-                    const elevenlabsProvider = require('../core/providers/elevenlabs');
-                    const elApiKey = await configStore.getSecret('elevenlabs_api_key');
-                    if (!elApiKey) {
-                        send('content', { text: '\n\n*(Error: ElevenLabs API Key is missing. Audio not generated.)*' });
-                    } else {
-                        // Voice IDs: Host 1 (George), Host 2 (Rachel)
-                        const voice1 = 'JBFqnCBsd6RMkjVDRZzb'; 
-                        const voice2 = '21m00Tcm4TlvDq8ikWAM'; 
-
-                        const audioBuffers = [];
-                        for (const seg of segments) {
-                            const vId = seg.host === 1 ? voice1 : voice2;
-                            const resAudio = await elevenlabsProvider.textToSpeech(elApiKey, seg.text, { voice_id: vId });
-                            if (resAudio.audioBase64) {
-                                audioBuffers.push(Buffer.from(resAudio.audioBase64, 'base64'));
-                            }
-                        }
-
-                        if (audioBuffers.length > 0) {
-                            const finalBuffer = Buffer.concat(audioBuffers);
-                            const b64 = finalBuffer.toString('base64');
-                            // Emit as a proper audio SSE event so the frontend can render it with AudioPlayer
-                            send('audio', { url: `data:audio/mpeg;base64,${b64}`, mimeType: 'audio/mpeg', source: 'elevenlabs_tts' });
-                            send('content', { text: '\n\n*✅ Audio podcast generated successfully! Check the player above.*' });
-                        }
-                    }
-                }
-            } catch (err) {
-                console.error('[Notebooks] Audio Overview generation failed:', err);
-                send('content', { text: `\n\n*(Audio generation failed: ${err.message})*` });
-            }
-        }
+        // (Removed audio_overview ElevenLabs post-processing — the Audio Podcast
+        // generation type was retired. Any cached/legacy callers now hit the
+        // REMOVED_GEN_TYPES 400 at the top of this route.)
 
         send('done', {});
         res.end();

@@ -35,7 +35,9 @@ async function buildSystemPrompt({ agent, tools, userId, messageMetadata, memory
     systemPrompt += `\nNow: ${new Date().toLocaleString('sv-SE', { timeZone: tz, timeZoneName: 'short' })}`;
 
     // ─── Notebook context injection ─────────────────────────────
-    if (messageMetadata?.workspaceContent) {
+    // `undefined` → no notebook open. Empty string is still "notebook present
+    // but blank" so the AI knows the tools are available.
+    if (messageMetadata?.notebookspaceContent !== undefined) {
         systemPrompt += `\n\n[NOTEBOOK]
 The user has a Notebook panel open. You have 4 tools:
 - notebook_read: Read content. Modes: "outline" (default—headings+stats), "section" (one section by heading), "search" (find text), "full" (entire doc). Use outline first, then section/search for targeted access.
@@ -44,8 +46,8 @@ The user has a Notebook panel open. You have 4 tools:
 - notebook_insert: Add content at "start", "end", or "after" a heading.
 
 RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="section" to get exact text. 2) Copy find_text EXACTLY from read output. 3) For partial edits always prefer notebook_replace over notebook_write. 4) Use Markdown for rich text (headings, bold, tables, code blocks, lists, etc.).`;
-        if (messageMetadata.workspaceSelection && messageMetadata.workspaceSelection.trim()) {
-            systemPrompt += `\n\n[SELECTED TEXT IN NOTEBOOK]\nThe user selected this text:\n\`\`\`\n${messageMetadata.workspaceSelection}\n\`\`\`\nUse notebook_replace with find_text set to EXACTLY this text. Set replace_text to the new version.`;
+        if (messageMetadata.notebookspaceSelection && messageMetadata.notebookspaceSelection.trim()) {
+            systemPrompt += `\n\n[SELECTED TEXT IN NOTEBOOK]\nThe user selected this text:\n\`\`\`\n${messageMetadata.notebookspaceSelection}\n\`\`\`\nUse notebook_replace with find_text set to EXACTLY this text. Set replace_text to the new version.`;
         }
     }
 

@@ -231,7 +231,7 @@ router.post('/:id/chat/stream', async (req, res) => {
             // Custom history override for thread context isolation
             history,
             // Message metadata for persistence (id, parentId, attachments, and conversationId)
-            { messageId, parentId, attachments, conversationId, ephemeral, workspaceContent: req.body.workspaceContent, workspaceSelection: req.body.workspaceSelection, signal: abortController.signal, userOrgId: userAuth.userOrgId, timezone: req.body.timezone, projectId: req.body.projectId, modelTier, activeSkillIds, orgId, reasoningEffort }
+            { messageId, parentId, attachments, conversationId, ephemeral, notebookspaceContent: req.body.notebookspaceContent, notebookspaceSelection: req.body.notebookspaceSelection, signal: abortController.signal, userOrgId: userAuth.userOrgId, timezone: req.body.timezone, projectId: req.body.projectId, modelTier, activeSkillIds, orgId, reasoningEffort }
         );
 
         // Skip all post-stream persistence for ephemeral embed chats

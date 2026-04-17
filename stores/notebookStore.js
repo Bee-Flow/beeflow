@@ -235,6 +235,28 @@ async function deleteSource(id) {
     return mapSourceRow(r);
 }
 
+/**
+ * Watchdog: flip any `processing` source older than the given timeout to `error`
+ * with a generic "timed out" message. Called opportunistically on list-sources so
+ * users never see a yellow row stuck forever after an ingestion worker dies.
+ *
+ * Returns the number of rows transitioned so callers can decide whether to log.
+ */
+async function timeoutStuckSources(notebookId, { stuckMinutes = 10 } = {}) {
+    await initDB();
+    const { rowCount } = await run(
+        `UPDATE notebook_sources
+            SET status = 'error',
+                error = 'Ingestion timed out — retry or re-upload.',
+                updated_at = NOW()
+          WHERE notebook_id = $1
+            AND status = 'processing'
+            AND updated_at < NOW() - ($2::int * INTERVAL '1 minute')`,
+        [notebookId, stuckMinutes]
+    );
+    return rowCount || 0;
+}
+
 // ── Row Mappers ─────────────────────────────────────────────────────
 
 function parseJSON(v, fallback) {
@@ -390,6 +412,7 @@ module.exports = {
     getSource,
     updateSource,
     deleteSource,
+    timeoutStuckSources,
     // Versions
     createVersion,
     getVersions,

@@ -180,15 +180,48 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
             send('kb_sources', { sources: citationSources.map(s => ({ title: s.title, preview: s.content, score: s.score })) });
         }
 
+        // If the document was too large to inline in the prompt, tell the UI so
+        // it can show a one-shot banner. The client-side handler decides whether
+        // to suppress repeat banners for the same conversation turn.
+        // Emitted AFTER the systemPrompt build below uses `documentTruncation` —
+        // so the announcement is deferred until we've actually committed to it.
+
         // Build source summary
         const sourceSummary = readySources.length > 0
             ? readySources.map(s => `- ${s.name} (${s.type}, ${(s.wordCount || 0).toLocaleString()} words)`).join('\n')
             : '(No sources added yet)';
 
-        // Build document context
+        // Build document context. We used to hard-truncate at 8000 chars, which
+        // silently dropped content for anything longer than ~4 pages. Now we fit
+        // the document into a token budget (~20k tokens ≈ 80k chars) and tell
+        // BOTH the AI and the user when truncation happened so neither thinks
+        // they've seen the whole thing.
+        const { fitIntoTokenBudget } = require('../../core/tokenBudget');
+        const DOCUMENT_CONTEXT_TOKENS = 20000;
         let documentContext = '';
+        let documentTruncation = null; // { originalTokens, keptTokens, approxPagesCut }
         if (documentContent && documentContent.trim() && documentContent !== '<p></p>') {
-            documentContext = `\n\n[DOCUMENT EDITOR — CURRENT CONTENT]\nThe user has a rich-text document editor (TipTap) open in the center panel. Current content:\n\`\`\`html\n${documentContent.slice(0, 8000)}\n\`\`\`\nYou can read, write, or edit this document using the notebook_doc_* tools.`;
+            const fit = fitIntoTokenBudget(documentContent, DOCUMENT_CONTEXT_TOKENS);
+            if (fit.truncated) {
+                documentTruncation = {
+                    originalTokens: fit.originalTokens,
+                    keptTokens: fit.keptTokens,
+                };
+                documentContext =
+                    `\n\n[DOCUMENT EDITOR — CURRENT CONTENT, TRUNCATED]\n` +
+                    `The user has a large rich-text document editor (TipTap) open in the center panel. ` +
+                    `Roughly ${fit.keptTokens.toLocaleString()} of ${fit.originalTokens.toLocaleString()} tokens shown below. ` +
+                    `If the user asks about something not visible here, use notebook_kb_search to retrieve from the indexed content, ` +
+                    `or ask them to quote / select the section they mean.\n` +
+                    `\`\`\`html\n${fit.text}\n\`\`\`\n` +
+                    `You can read, write, or edit this document using the notebook_doc_* tools.`;
+            } else {
+                documentContext =
+                    `\n\n[DOCUMENT EDITOR — CURRENT CONTENT]\n` +
+                    `The user has a rich-text document editor (TipTap) open in the center panel. Current content:\n` +
+                    `\`\`\`html\n${fit.text}\n\`\`\`\n` +
+                    `You can read, write, or edit this document using the notebook_doc_* tools.`;
+            }
         } else {
             documentContext = '\n\n[DOCUMENT EDITOR — EMPTY]\nThe user has an empty rich-text document editor (TipTap) open. Use notebook_doc_write to create content.';
         }
@@ -331,6 +364,12 @@ ${searchAvailable ? `[WEB SEARCH & SOURCES]
 - When adding web search results as a source, pass the complete results text directly — no need to re-fetch
 ` : ''}${kbContext}${documentContext}
 Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = new Date(); const _dp = _now.toLocaleString('sv-SE', { timeZone: _tz }); const _lp = new Date(_now.toLocaleString('en-US', { timeZone: _tz })); const _om = Math.round((_lp - _now) / 60000); const _s = _om >= 0 ? '+' : '-'; const _a = Math.abs(_om); return `${_dp} UTC${_s}${String(Math.floor(_a/60)).padStart(2,'0')}:${String(_a%60).padStart(2,'0')} (${_tz})`; } catch(_) { return new Date().toISOString(); } })()}`;
+        }
+
+        // Announce document truncation to the client now that we've finalised
+        // the system prompt. One event per turn — the UI debounces banners.
+        if (documentTruncation) {
+            send('document_truncated', documentTruncation);
         }
 
         let messages = [{ role: 'system', content: systemPrompt }];
