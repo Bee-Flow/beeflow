@@ -20,6 +20,42 @@ const meetBotStore = require('../stores/meetBotStore');
 const meetBot = require('../core/meetBot');
 const transcriptionStore = require('../stores/transcriptionStore');
 const configStore = require('../stores/configStore');
+const storageStore = require('../stores/storageStore');
+
+const AUDIO_MIME_BY_EXT = {
+    '.webm': 'audio/webm',
+    '.wav': 'audio/wav',
+    '.mp3': 'audio/mpeg',
+    '.ogg': 'audio/ogg',
+    '.m4a': 'audio/mp4',
+    '.flac': 'audio/flac',
+};
+
+function decodeStorageKeyFromProxyPath(proxyPath) {
+    if (typeof proxyPath !== 'string') return null;
+    const prefix = '/api/storage/file/';
+    if (!proxyPath.startsWith(prefix)) return null;
+    const encoded = proxyPath.slice(prefix.length);
+    if (!encoded) return null;
+    return encoded.split('/').map(part => decodeURIComponent(part)).join('/');
+}
+
+async function uploadBotRecordingToRustFS(localAudioPath, userId, sessionId) {
+    if (!storageStore.isAvailable()) return null;
+    if (!localAudioPath || !fs.existsSync(localAudioPath)) return null;
+
+    const fileBuffer = fs.readFileSync(localAudioPath);
+    const ext = path.extname(localAudioPath).toLowerCase();
+    const contentType = AUDIO_MIME_BY_EXT[ext] || 'application/octet-stream';
+    const safeName = path.basename(localAudioPath).replace(/[^a-zA-Z0-9._-]/g, '_');
+    const key = storageStore.buildKey(userId, 'audio', `meet-bot-${sessionId}-${safeName}`);
+
+    await storageStore.uploadFile(key, fileBuffer, contentType);
+    return {
+        key,
+        proxyUrl: storageStore.buildProxyUrl(key),
+    };
+}
 
 /**
  * Transcribe a bot recording using the existing Voxtral pipeline.
@@ -379,7 +415,8 @@ router.post('/sdk-config', requireAdmin, async (req, res) => {
  */
 router.get('/platforms', async (_req, res) => {
     try {
-        res.json({ platforms: meetBot.listPlatforms() });
+        const platforms = await meetBot.listPlatforms();
+        res.json({ platforms });
     } catch (err) {
         console.error('[MeetBot] /platforms error:', err);
         res.status(500).json({ error: err.message });
@@ -440,9 +477,20 @@ router.post('/join', async (req, res) => {
                 });
 
                 if (result.audioPath && fs.existsSync(result.audioPath)) {
+                    let audioPathForSession = result.audioPath;
+                    try {
+                        const uploaded = await uploadBotRecordingToRustFS(result.audioPath, userId, session.id);
+                        if (uploaded?.proxyUrl) {
+                            audioPathForSession = uploaded.proxyUrl;
+                            console.log(`[MeetBot] Recording uploaded to RustFS: ${uploaded.key}`);
+                        }
+                    } catch (uploadErr) {
+                        console.warn(`[MeetBot] RustFS upload failed, continuing with local file: ${uploadErr.message}`);
+                    }
+
                     await meetBotStore.updateSession(session.id, {
                         status: 'processing',
-                        audioPath: result.audioPath,
+                        audioPath: audioPathForSession,
                     });
 
                     const stats = fs.statSync(result.audioPath);
@@ -601,6 +649,17 @@ router.delete('/sessions/:id', async (req, res) => {
         }
 
         await meetBotStore.deleteSession(req.params.id);
+
+        const storageKey = decodeStorageKeyFromProxyPath(session.audioPath);
+        if (storageKey && storageStore.isAvailable()) {
+            try {
+                await storageStore.deleteFile(storageKey);
+                console.log(`[MeetBot] Deleted RustFS recording: ${storageKey}`);
+            } catch (e) {
+                console.warn(`[MeetBot] Failed to delete RustFS recording ${storageKey}: ${e.message}`);
+            }
+        }
+
         res.json({ deleted: true });
     } catch (err) {
         console.error('[MeetBot] /delete error:', err);

@@ -180,12 +180,16 @@ async function joinAndRecord(sessionId, meetLink, options = {}) {
         console.log(`[MeetBot/Google] Cleaning up ${sessionId} (${durationSeconds}s recorded)`);
         if (audioCapture) await audioCapture.stop();
         if (context) { try { await context.close(); } catch (_) {} }
+        let finalAudioPath = '';
         try {
             const stats = fs.statSync(audioPath);
             if (stats.size < 1000) console.warn(`[MeetBot/Google] Recording too small (${stats.size} bytes)`);
             else console.log(`[MeetBot/Google] Recording saved: ${audioPath} (${(stats.size / 1024).toFixed(1)} KB)`);
-        } catch (e) { console.error('[MeetBot/Google] Could not verify recording:', e.message); }
-        return { audioPath, durationSeconds };
+            finalAudioPath = audioPath;
+        } catch (_) {
+            console.warn('[MeetBot/Google] No recording file was produced');
+        }
+        return { audioPath: finalAudioPath, durationSeconds };
     }
 }
 
