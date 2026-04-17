@@ -351,8 +351,22 @@ const EmailKBStore = {
         );
     },
 
-    completeSyncLog: async (logId, { emailsFetched, articlesCreated, articlesSkipped, errors, errorDetails }) => {
+    completeSyncLog: async (logId, { emailsFetched, articlesCreated, articlesSkipped, errors, errorDetails, outcomes }) => {
         await initDB();
+        if (outcomes !== undefined) {
+            return run(
+                `UPDATE email_kb_sync_log
+                 SET finished_at = now(),
+                     emails_fetched = $2,
+                     articles_created = $3,
+                     articles_skipped = $4,
+                     errors = $5,
+                     error_details = $6,
+                     outcomes = $7::jsonb
+                 WHERE id = $1`,
+                [logId, emailsFetched || 0, articlesCreated || 0, articlesSkipped || 0, errors || 0, errorDetails || null, JSON.stringify(outcomes)]
+            );
+        }
         return run(
             `UPDATE email_kb_sync_log
              SET finished_at = now(),
@@ -363,6 +377,47 @@ const EmailKBStore = {
                  error_details = $6
              WHERE id = $1`,
             [logId, emailsFetched || 0, articlesCreated || 0, articlesSkipped || 0, errors || 0, errorDetails || null]
+        );
+    },
+
+    /**
+     * Append a per-email outcome to the sync log's outcomes JSONB.
+     *
+     * @param {string} logId
+     * @param {'ingested'|'skipped'|'failed'} bucket
+     * @param {object} detail
+     *   - for 'ingested': { messageId?, subject?, category? }
+     *   - for 'skipped' : { reason: 'already_ingested'|'blacklisted'|'content_hash_dup'|'empty_after_redaction'|'rate_limited'|string, messageId?, subject? }
+     *   - for 'failed'  : { messageId?, stage, error, subject? }
+     *
+     * Stored shape:
+     *   {
+     *     ingested: { count: number, samples: [{...}] },            // samples capped at 20
+     *     skipped:  { count: number, byReason: { reason: count }, samples: [] },
+     *     failed:   { count: number, samples: [] }
+     *   }
+     */
+    addOutcome: async (logId, bucket, detail = {}) => {
+        await initDB();
+        if (!logId || !['ingested', 'skipped', 'failed'].includes(bucket)) return null;
+        const SAMPLE_CAP = 20;
+        const row = await getOne(`SELECT outcomes FROM email_kb_sync_log WHERE id = $1`, [logId]);
+        if (!row) return null;
+        const outcomes = row.outcomes || {};
+        const slot = outcomes[bucket] || { count: 0, samples: [] };
+        slot.count = (slot.count || 0) + 1;
+        if (bucket === 'skipped') {
+            const reason = detail.reason || 'unknown';
+            slot.byReason = slot.byReason || {};
+            slot.byReason[reason] = (slot.byReason[reason] || 0) + 1;
+        }
+        if (Array.isArray(slot.samples) && slot.samples.length < SAMPLE_CAP) {
+            slot.samples.push({ at: new Date().toISOString(), ...detail });
+        }
+        outcomes[bucket] = slot;
+        return run(
+            `UPDATE email_kb_sync_log SET outcomes = $2::jsonb WHERE id = $1`,
+            [logId, JSON.stringify(outcomes)]
         );
     },
 

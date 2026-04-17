@@ -12,6 +12,7 @@
  *   - Uses existing KB ingestion pipeline for storage
  */
 
+const EventEmitter = require('events');
 const emailKBStore = require('../stores/emailKBStore');
 const {
     processEmail,
@@ -36,6 +37,27 @@ const RETRY_DELAY_MS = 5000;
 
 let tickTimer = null;
 let isRunning = false;
+
+// ──────────────────────────────────────────────
+// Per-connection event bus (consumed by SSE route /connections/:id/sync/stream)
+// Events emitted per connectionId:
+//   sync_started   { connectionId, startedAt, totalEstimate? }
+//   sync_progress  { processed, total, lastSubject, lastOutcome }
+//   email_processed { bucket, detail }
+//   sync_completed { stats }
+// ──────────────────────────────────────────────
+const syncEvents = new EventEmitter();
+syncEvents.setMaxListeners(0); // many tabs may subscribe to the same connection
+
+function emitSyncEvent(connectionId, event, data) {
+    if (!connectionId) return;
+    syncEvents.emit(connectionId, { event, data, at: new Date().toISOString() });
+}
+
+function subscribeSyncEvents(connectionId, handler) {
+    syncEvents.on(connectionId, handler);
+    return () => syncEvents.off(connectionId, handler);
+}
 
 /**
  * Build per-stage process options from connection's pipeline_config.
@@ -135,6 +157,41 @@ async function parallelMap(items, concurrency, fn, shouldAbort = () => false) {
         if (out[i] === undefined) out[i] = { __aborted: true, __index: i };
     }
     return out;
+}
+
+// ──────────────────────────────────────────────
+// Outcome accumulator (per-email outcomes, persisted to sync log)
+// ──────────────────────────────────────────────
+
+function createOutcomes() {
+    return {
+        ingested: { count: 0, samples: [] },
+        skipped: { count: 0, byReason: {}, samples: [] },
+        failed: { count: 0, samples: [] },
+    };
+}
+
+const OUTCOME_SAMPLE_CAP = 20;
+
+function recordOutcome(results, bucket, detail = {}) {
+    if (!results || !results.outcomes) return;
+    const slot = results.outcomes[bucket];
+    if (!slot) return;
+    slot.count += 1;
+    if (bucket === 'skipped') {
+        const reason = detail.reason || 'unknown';
+        slot.byReason[reason] = (slot.byReason[reason] || 0) + 1;
+    }
+    if (slot.samples.length < OUTCOME_SAMPLE_CAP) {
+        slot.samples.push({ at: new Date().toISOString(), ...detail });
+    }
+    // Broadcast to SSE subscribers (if syncConnection tagged the results with a connectionId).
+    if (results.__connectionId) {
+        const processed = results.outcomes.ingested.count
+            + results.outcomes.skipped.count
+            + results.outcomes.failed.count;
+        emitSyncEvent(results.__connectionId, 'email_processed', { bucket, detail, processed, total: results.fetched || null });
+    }
 }
 
 // ──────────────────────────────────────────────
@@ -240,7 +297,8 @@ async function syncGmailConnection(connection) {
     const messageIds = response.data.messages || [];
     console.log(`[EmailKBSync] Gmail: ${messageIds.length} messages found`);
 
-    const results = { fetched: messageIds.length, created: 0, skipped: 0, errors: 0, errorDetails: [], newestDate: null, processedArticles: [] };
+    const results = { fetched: messageIds.length, created: 0, skipped: 0, errors: 0, errorDetails: [], newestDate: null, processedArticles: [], outcomes: createOutcomes(), __connectionId: connection.id };
+    emitSyncEvent(connection.id, 'sync_fetch_complete', { total: messageIds.length, provider: 'gmail' });
 
     const ingestionMode = getIngestionMode(connection);
     // Per-email mode always treats each message individually — thread-merge is
@@ -278,10 +336,12 @@ async function syncGmailConnection(connection) {
             } catch (fetchErr) {
                 if (fetchErr.message?.includes('429') || fetchErr.code === 429) {
                     results.errorDetails.push('Rate limited by Gmail API — will retry next cycle');
+                    recordOutcome(results, 'skipped', { reason: 'rate_limited', messageId: msg.id, stage: 'fetch' });
                     break;
                 }
                 results.errors++;
                 results.errorDetails.push(`Fetch msg ${msg.id}: ${fetchErr.message}`);
+                recordOutcome(results, 'failed', { messageId: msg.id, stage: 'fetch', error: fetchErr.message });
             }
         }
 
@@ -301,6 +361,7 @@ async function syncGmailConnection(connection) {
                     const skipLabel = processed.reason || 'unknown';
                     console.log(`[EmailKBSync] Skipped: ${skipLabel}`);
                     results.errorDetails.push(`Skipped: ${skipLabel}`);
+                    recordOutcome(results, 'skipped', { reason: skipLabel, threadId, subject: thread.subject });
                     continue;
                 }
 
@@ -309,6 +370,7 @@ async function syncGmailConnection(connection) {
             } catch (procErr) {
                 results.errors++;
                 results.errorDetails.push(`Thread ${threadId}: ${procErr.message}`);
+                recordOutcome(results, 'failed', { threadId, stage: 'process', error: procErr.message });
             }
         }
     } else {
@@ -422,6 +484,7 @@ async function syncGmailConnection(connection) {
         for (const r of settled) {
             if (r?.__aborted) {
                 results.skipped++;
+                recordOutcome(results, 'skipped', { reason: 'aborted_rate_limit', messageId: messageIds[r.__index]?.id });
                 continue;
             }
             if (r?.__error) {
@@ -429,10 +492,12 @@ async function syncGmailConnection(connection) {
                 if (err.message?.includes('429') || err.code === 429) {
                     rateLimited = true;
                     results.errorDetails.push('Rate limited — will retry next cycle');
+                    recordOutcome(results, 'skipped', { reason: 'rate_limited', messageId: messageIds[r.__index]?.id, stage: 'fetch' });
                     continue;
                 }
                 results.errors++;
                 results.errorDetails.push(`Msg ${messageIds[r.__index]?.id}: ${err.message}`);
+                recordOutcome(results, 'failed', { messageId: messageIds[r.__index]?.id, stage: 'fetch', error: err.message });
                 continue;
             }
             if (r.msgDate && (!results.newestDate || new Date(r.msgDate) > new Date(results.newestDate))) {
@@ -440,7 +505,9 @@ async function syncGmailConnection(connection) {
             }
             if (!r.processed.success) {
                 results.skipped++;
-                results.errorDetails.push(`Skipped: ${r.processed.reason || 'unknown'}`);
+                const reason = r.processed.reason || 'unknown';
+                results.errorDetails.push(`Skipped: ${reason}`);
+                recordOutcome(results, 'skipped', { reason, messageId: r.msgId });
                 continue;
             }
             results.processedArticles.push(r.processed);
@@ -610,7 +677,8 @@ async function syncOutlookConnection(connection) {
 
     console.log(`[EmailKBSync] Outlook: ${messages.length} messages found`);
 
-    const results = { fetched: messages.length, created: 0, skipped: 0, errors: 0, errorDetails: [], newestDate: null, processedArticles: [] };
+    const results = { fetched: messages.length, created: 0, skipped: 0, errors: 0, errorDetails: [], newestDate: null, processedArticles: [], outcomes: createOutcomes(), __connectionId: connection.id };
+    emitSyncEvent(connection.id, 'sync_fetch_complete', { total: messages.length, provider: 'outlook' });
 
     // Track newest message date for cursor
     if (messages.length > 0) {
@@ -655,6 +723,7 @@ async function syncOutlookConnection(connection) {
                     const skipLabel = processed.reason || 'unknown';
                     console.log(`[EmailKBSync] Skipped: ${skipLabel}`);
                     results.errorDetails.push(`Skipped: ${skipLabel}`);
+                    recordOutcome(results, 'skipped', { reason: skipLabel, threadId: convId, subject: thread.subject });
                     continue;
                 }
 
@@ -663,10 +732,12 @@ async function syncOutlookConnection(connection) {
             } catch (procErr) {
                 if (procErr.message?.includes('429')) {
                     results.errorDetails.push('Rate limited by Microsoft Graph — will retry next cycle');
+                    recordOutcome(results, 'skipped', { reason: 'rate_limited', threadId: convId, stage: 'process' });
                     break;
                 } else {
                     results.errors++;
                     results.errorDetails.push(`Conv ${convId}: ${procErr.message}`);
+                    recordOutcome(results, 'failed', { threadId: convId, stage: 'process', error: procErr.message });
                 }
             }
         }
@@ -765,6 +836,7 @@ async function syncOutlookConnection(connection) {
         for (const r of settled) {
             if (r?.__aborted) {
                 results.skipped++;
+                recordOutcome(results, 'skipped', { reason: 'aborted_rate_limit', messageId: messages[r.__index]?.id });
                 continue;
             }
             if (r?.__error) {
@@ -772,15 +844,19 @@ async function syncOutlookConnection(connection) {
                 if (err.message?.includes('429')) {
                     rateLimited = true;
                     results.errorDetails.push('Rate limited by Microsoft Graph — will retry next cycle');
+                    recordOutcome(results, 'skipped', { reason: 'rate_limited', messageId: messages[r.__index]?.id, stage: 'fetch' });
                     continue;
                 }
                 results.errors++;
                 results.errorDetails.push(`Msg ${messages[r.__index]?.id}: ${err.message}`);
+                recordOutcome(results, 'failed', { messageId: messages[r.__index]?.id, stage: 'fetch', error: err.message });
                 continue;
             }
             if (!r.processed.success) {
                 results.skipped++;
-                results.errorDetails.push(`Skipped: ${r.processed.reason || 'unknown'}`);
+                const reason = r.processed.reason || 'unknown';
+                results.errorDetails.push(`Skipped: ${reason}`);
+                recordOutcome(results, 'skipped', { reason, messageId: r.msgId });
                 continue;
             }
             results.processedArticles.push(r.processed);
@@ -796,9 +872,24 @@ async function syncOutlookConnection(connection) {
 // ──────────────────────────────────────────────
 
 async function syncConnection(connection) {
+    // Acquire sync lock first — prevents concurrent tick + manual sync from racing
+    // on the same connection. TTL is a safety net in case the process crashes.
+    const lock = await emailKBStore.acquireSyncLock(connection.id, SYNC_TIMEOUT_MINUTES);
+    if (!lock.acquired) {
+        console.log(`[EmailKBSync] Skipping ${connection.email_address} — lock held (retry in ${lock.retryAfterSeconds}s)`);
+        return { skipped: true, reason: 'locked', retryAfterSeconds: lock.retryAfterSeconds };
+    }
+
     const log = await emailKBStore.createSyncLog(connection.id);
 
     await emailKBStore.updateSyncState(connection.id, { syncStatus: 'syncing', syncError: null });
+
+    emitSyncEvent(connection.id, 'sync_started', {
+        connectionId: connection.id,
+        provider: connection.provider,
+        emailAddress: connection.email_address,
+        logId: log?.id,
+    });
 
     let results;
     try {
@@ -828,6 +919,7 @@ async function syncConnection(connection) {
                     if (!messageId) {
                         results.skipped++;
                         results.errorDetails.push('Skipped: per-email article without messageId');
+                        recordOutcome(results, 'skipped', { reason: 'missing_message_id', subject: processed.title });
                         continue;
                     }
                     const sourceUri = `email-kb://message/${encodeURIComponent(messageId)}`;
@@ -835,6 +927,7 @@ async function syncConnection(connection) {
                     const existing = await findDocumentBySourceUri(connection.knowledge_base_id, sourceUri);
                     if (existing) {
                         results.skipped++;
+                        recordOutcome(results, 'skipped', { reason: 'already_ingested', messageId, subject: processed.title });
                         continue; // Already ingested — per-email archive is append-only.
                     }
 
@@ -848,9 +941,11 @@ async function syncConnection(connection) {
                         { skipDedup: false, lang: (connection.pipeline_config?.language || 'auto') }
                     );
                     categoryDocsCreated++;
+                    recordOutcome(results, 'ingested', { messageId, subject: processed.title });
                 } catch (ingestErr) {
                     results.errors++;
                     results.errorDetails.push(`Ingest message ${processed.sourceMessageId}: ${ingestErr.message}`);
+                    recordOutcome(results, 'failed', { messageId: processed.sourceMessageId, subject: processed.title, stage: 'ingest', error: ingestErr.message });
                     console.error(`[EmailKBSync] ❌ Failed to ingest per-email doc:`, ingestErr.message);
                 }
             }
@@ -885,10 +980,12 @@ async function syncConnection(connection) {
                     );
 
                     categoryDocsCreated++;
+                    recordOutcome(results, 'ingested', { category, sourceCount });
                     console.log(`[EmailKBSync] ✅ Category "${category}" ingested (${sourceCount} emails merged)`);
                 } catch (ingestErr) {
                     results.errors++;
                     results.errorDetails.push(`Ingest category "${category}": ${ingestErr.message}`);
+                    recordOutcome(results, 'failed', { category, stage: 'ingest', error: ingestErr.message });
                     console.error(`[EmailKBSync] ❌ Failed to ingest category "${category}":`, ingestErr.message);
                 }
             }
@@ -909,6 +1006,18 @@ async function syncConnection(connection) {
             articlesSkipped: results.skipped,
             errors: results.errors,
             errorDetails: results.errorDetails.length > 0 ? results.errorDetails.join('\n') : null,
+            outcomes: results.outcomes,
+        });
+
+        emitSyncEvent(connection.id, 'sync_completed', {
+            success: true,
+            stats: {
+                emailsFetched: results.fetched,
+                articlesCreated: categoryDocsCreated,
+                articlesSkipped: results.skipped,
+                errors: results.errors,
+            },
+            outcomes: results.outcomes,
         });
 
         console.log(`[EmailKBSync] ✅ ${connection.provider} ${connection.email_address}: ${processedArticles.length} emails → ${categoryDocsCreated} category docs, ${results.skipped} skipped, ${results.errors} errors`);
@@ -922,12 +1031,33 @@ async function syncConnection(connection) {
             lastSyncAt: new Date().toISOString(),
         });
 
+        const fatalOutcomes = results?.outcomes || createOutcomes();
+        recordOutcome({ outcomes: fatalOutcomes }, 'failed', { stage: 'sync', error: err.message });
+
         await emailKBStore.completeSyncLog(log.id, {
             emailsFetched: results?.fetched || 0,
             articlesCreated: 0,
             articlesSkipped: results?.skipped || 0,
             errors: (results?.errors || 0) + 1,
             errorDetails: err.message,
+            outcomes: fatalOutcomes,
+        });
+
+        emitSyncEvent(connection.id, 'sync_completed', {
+            success: false,
+            error: err.message,
+            stats: {
+                emailsFetched: results?.fetched || 0,
+                articlesCreated: 0,
+                articlesSkipped: results?.skipped || 0,
+                errors: (results?.errors || 0) + 1,
+            },
+            outcomes: fatalOutcomes,
+        });
+    } finally {
+        // Release the sync lock so the next tick/manual sync can run.
+        await emailKBStore.releaseSyncLock(connection.id).catch((e) => {
+            console.warn('[EmailKBSync] Failed to release sync lock:', e.message);
         });
     }
 }
@@ -996,12 +1126,32 @@ function stopEmailKBSync() {
 
 /**
  * Manually trigger a sync for a specific connection.
+ *
+ * Returns a { conflict:true, retryAfterSeconds } structure when another sync
+ * is already in-flight — callers (HTTP route) should map that to 409.
  */
 async function triggerManualSync(connectionId) {
     const connection = await emailKBStore.getConnectionWithTokens(connectionId);
-    if (!connection) throw new Error('Connection not found');
-    if (!connection.enabled) throw new Error('Connection is disabled');
-    if (connection.sync_status === 'syncing') throw new Error('Sync already in progress');
+    if (!connection) {
+        const err = new Error('Connection not found');
+        err.status = 404;
+        throw err;
+    }
+    if (!connection.enabled) {
+        const err = new Error('Connection is disabled');
+        err.status = 400;
+        throw err;
+    }
+
+    // Pre-flight lock probe: if locked or actively syncing, return 409-style
+    // payload without attempting the sync. The real lock is still acquired
+    // inside syncConnection — this just gives a clean UX for the common case.
+    if (connection.sync_status === 'syncing' || (connection.sync_locked_until && new Date(connection.sync_locked_until) > new Date())) {
+        const retryAfterSeconds = connection.sync_locked_until
+            ? Math.max(1, Math.ceil((new Date(connection.sync_locked_until).getTime() - Date.now()) / 1000))
+            : 60;
+        return { conflict: true, retryAfterSeconds, message: 'Sync already in progress' };
+    }
 
     // Run sync without waiting
     syncConnection({ ...connection, encrypted_tokens: emailKBStore.encryptTokens(connection.tokens) })
@@ -1114,5 +1264,6 @@ module.exports = {
     stopEmailKBSync,
     triggerManualSync,
     testConnection,
+    subscribeSyncEvents,
     tick, // exported for testing
 };

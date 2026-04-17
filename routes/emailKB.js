@@ -9,7 +9,8 @@ const express = require('express');
 const router = express.Router();
 const emailKBStore = require('../stores/emailKBStore');
 const kbStore = require('../stores/knowledgeBases');
-const { triggerManualSync, testConnection } = require('../services/emailKBSyncEngine');
+const { triggerManualSync, testConnection, subscribeSyncEvents } = require('../services/emailKBSyncEngine');
+const { setupSSE } = require('../core/sseHelpers');
 const { resolveUserOrgIds } = require('../auth');
 
 // ──────────────────────────────────────────────
@@ -201,10 +202,18 @@ router.post('/connections/:id/sync', async (req, res) => {
         }
 
         const result = await triggerManualSync(req.params.id);
+        if (result && result.conflict) {
+            res.set('Retry-After', String(result.retryAfterSeconds));
+            return res.status(409).json({
+                error: result.message || 'Sync already in progress',
+                retryAfterSeconds: result.retryAfterSeconds,
+            });
+        }
         res.json(result);
     } catch (err) {
         console.error('[EmailKB] Sync trigger error:', err.message);
-        res.status(400).json({ error: err.message });
+        const status = err.status || 400;
+        res.status(status).json({ error: err.message });
     }
 });
 
