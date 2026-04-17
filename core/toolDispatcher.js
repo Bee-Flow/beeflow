@@ -24,7 +24,8 @@ const { isYouTrackTool, executeYouTrackTool } = require('../integrations/youtrac
 const { isSignRequestTool, executeSignRequestTool } = require('../integrations/signrequestTools');
 const { isGammaTool, executeGammaTool } = require('../integrations/gammaTools');
 const { isN8nTool, executeN8nTool } = require('../integrations/n8nTools');
-const { isN8nWorkflowTool, executeN8nWorkflowTool } = require('../integrations/n8nWorkflowTools');
+const { isN8nWorkflowTool, executeN8nWorkflowTool, getN8nToolPermission } = require('../integrations/n8nWorkflowTools');
+const { hasPermission } = require('../auth/permissions');
 const { isAgentSearchTool, executeAgentSearchTool } = require('../integrations/agentSearchTools');
 const { isRegexGeneratorTool, executeRegexGeneratorTool } = require('../integrations/regexGeneratorTools');
 const { executeWorkspaceTool } = require('../integrations/workspaceTools');
@@ -179,9 +180,28 @@ async function executeTool(toolName, toolArgs, context = {}) {
         return await executeGoogleGroupsTool(toolName, toolArgs, session);
     }
     if (isN8nWorkflowTool(toolName)) {
+        // Authoritative permission gate (defense-in-depth vs. the registration-time filter).
+        // Non-LLM callers (pipelines, schedules) also flow through here, so we must re-check.
+        if (userId) {
+            const requiredPerm = getN8nToolPermission(toolName);
+            const granted = await hasPermission(userId, requiredPerm, session);
+            if (!granted) {
+                const friendly = requiredPerm === 'modify_n8n_workflows'
+                    ? 'You do not have permission to modify n8n workflows. Ask your organisation admin to grant the "Modify n8n Workflows" permission.'
+                    : 'You do not have permission to use n8n tools. Ask your organisation admin to grant the "Use n8n Tools" permission.';
+                return { error: friendly };
+            }
+        }
         return await executeN8nWorkflowTool(toolName, toolArgs, orgId);
     }
     if (isN8nTool(toolName)) {
+        // Webhook-trigger tools require the base 'use_n8n_tools' permission.
+        if (userId) {
+            const granted = await hasPermission(userId, 'use_n8n_tools', session);
+            if (!granted) {
+                return { error: 'You do not have permission to run n8n workflows. Ask your organisation admin to grant the "Use n8n Tools" permission.' };
+            }
+        }
         return await executeN8nTool(toolName, toolArgs, orgId, attachments);
     }
     if (isAgentSearchTool(toolName)) {

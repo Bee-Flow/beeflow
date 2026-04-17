@@ -20,7 +20,8 @@ const { YOUTRACK_TOOLS } = require('../integrations/youtrackTools');
 const { SIGNREQUEST_TOOLS } = require('../integrations/signrequestTools');
 const { GAMMA_TOOLS } = require('../integrations/gammaTools');
 const { buildN8nTools } = require('../integrations/n8nTools');
-const { N8N_WORKFLOW_TOOLS } = require('../integrations/n8nWorkflowTools');
+const { N8N_WORKFLOW_TOOLS, getN8nToolPermission } = require('../integrations/n8nWorkflowTools');
+const { hasPermission } = require('../auth/permissions');
 const { AGENT_SEARCH_TOOLS } = require('../integrations/agentSearchTools');
 const { REGEX_GENERATOR_TOOLS } = require('../integrations/regexGeneratorTools');
 const { IMAGE_GEN_TOOLS } = require('../routes/ai/imageGenTool');
@@ -183,29 +184,44 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
         addTools(SIGNREQUEST_TOOLS);
     }
 
-    // N8N workflows — org-level config
+    // N8N workflows — org-level config, gated by two-tier permissions:
+    //   use_n8n_tools        → run webhooks + read-only workflow/execution tools
+    //   modify_n8n_workflows → write / delete / activate / execute
     try {
         if (userOrgId) {
             n8nOrgId = userOrgId;
             const n8nUrl = await configStore.getConfig(`n8n_url_org_${n8nOrgId}`);
             const n8nKey = await configStore.getSecret(`n8n_api_key_org_${n8nOrgId}`);
             if (n8nUrl && n8nKey) {
-                // Dynamic webhook-trigger tools
-                const n8nTools = await buildN8nTools(n8nOrgId);
-                for (const n8nTool of n8nTools) {
-                    const toolId = n8nTool.function.name;
-                    // Respect user-level toggle for this specific workflow
-                    if (userEnabledApps && !userEnabledApps.includes(toolId)) continue;
-                    // Strip internal metadata before sending to LLM
-                    const { _n8n, ...cleanTool } = n8nTool;
-                    if (!tools.find(t => t.function.name === cleanTool.function.name)) {
-                        tools.push(cleanTool);
-                    }
-                }
+                // Resolve n8n permissions once. `use_n8n_tools` is the umbrella — a user
+                // without it sees no n8n tools at all. `modify_n8n_workflows` unlocks the
+                // write-bucket on top.
+                const canUse = await hasPermission(userId, 'use_n8n_tools', session);
+                const canModify = await hasPermission(userId, 'modify_n8n_workflows', session);
 
-                // Static workflow management tools (list, get, create, update, patch, activate, deactivate)
-                if (isAppOn('n8n')) {
-                    addTools(N8N_WORKFLOW_TOOLS);
+                if (canUse) {
+                    // Dynamic webhook-trigger tools (run only — covered by use_n8n_tools)
+                    const n8nTools = await buildN8nTools(n8nOrgId);
+                    for (const n8nTool of n8nTools) {
+                        const toolId = n8nTool.function.name;
+                        // Respect user-level toggle for this specific workflow
+                        if (userEnabledApps && !userEnabledApps.includes(toolId)) continue;
+                        const { _n8n, ...cleanTool } = n8nTool;
+                        if (!tools.find(t => t.function.name === cleanTool.function.name)) {
+                            tools.push(cleanTool);
+                        }
+                    }
+
+                    // Workflow-management tools (split by permission bucket)
+                    if (isAppOn('n8n')) {
+                        for (const tool of N8N_WORKFLOW_TOOLS) {
+                            const perm = getN8nToolPermission(tool.function.name);
+                            if (perm === 'modify_n8n_workflows' && !canModify) continue;
+                            if (!tools.find(t => t.function.name === tool.function.name)) {
+                                tools.push(tool);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -298,8 +314,13 @@ async function buildToolHint(tools, userId = null) {
         const n8nNames = tools.filter(t => t.function.name.startsWith('n8n_run_')).map(t => t.function.description || t.function.name);
         integrations.push(`n8n Workflows (${n8nNames.join(', ')})`);
     }
-    if (tools.some(t => t.function.name.startsWith('n8n_workflow_'))) {
-        integrations.push('n8n Workflow Management (list, get, create, update, patch, activate, and deactivate workflows on the connected n8n instance — use n8n_workflow_patch for partial edits)');
+    if (tools.some(t => t.function.name.startsWith('n8n_workflow_') || t.function.name.startsWith('n8n_execution_'))) {
+        const hasWrite = tools.some(t => ['n8n_workflow_create','n8n_workflow_update','n8n_workflow_patch','n8n_workflow_delete','n8n_workflow_execute','n8n_workflow_activate','n8n_workflow_deactivate'].includes(t.function.name));
+        if (hasWrite) {
+            integrations.push('n8n Workflow Management (list, get, nodes_find, create, patch, activate, execute, debug executions). Rules: (1) prefer n8n_workflow_patch with node_operations over full update; (2) use n8n_workflow_nodes_find for targeted edits instead of pulling the whole workflow; (3) nodes/connections/parameters must be real JSON — never stringified; (4) always confirm before delete or activate; (5) debug failed runs via n8n_execution_get_detail.');
+        } else {
+            integrations.push('n8n Workflow Inspection (list, get, nodes_find, execution_list, execution_get_detail — read-only). To modify workflows you need the "Modify n8n Workflows" permission.');
+        }
     }
     if (tools.some(t => t.function.name === 'generate_image')) integrations.push('Image generation');
     if (tools.some(t => t.function.name === 'generate_music')) integrations.push('Music generation (instrumental AI music via Lyria)');

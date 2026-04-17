@@ -1177,6 +1177,78 @@ router.get('/n8n/workflow/:workflowId', requireOrgAdminForN8n, async (req, res) 
     }
 });
 
+// POST /ai/n8n/test — verify that the stored creds can reach n8n and count workflows.
+// Accepts optional { n8nUrl, apiKey } to test unsaved values from the config form.
+router.post('/n8n/test', requireOrgAdminForN8n, async (req, res) => {
+    const fetch = require('node-fetch');
+    const https = require('https');
+    const agent = new https.Agent({ rejectUnauthorized: false });
+    try {
+        const orgId = req.orgId;
+        const n8nUrl = (req.body?.n8nUrl) || (await configStore.getConfig(`n8n_url_org_${orgId}`));
+        const apiKey = (req.body?.apiKey) || (await configStore.getSecret(`n8n_api_key_org_${orgId}`));
+
+        if (!n8nUrl || !apiKey) {
+            return res.status(400).json({ ok: false, error: 'URL and API key required' });
+        }
+        const base = n8nUrl.replace(/\/+$/, '');
+        const apiBase = base.includes('/api/v1') ? base : `${base}/api/v1`;
+
+        const r = await fetch(`${apiBase}/workflows?limit=1`, {
+            headers: { 'X-N8N-API-KEY': apiKey, 'Content-Type': 'application/json' },
+            agent,
+            signal: AbortSignal.timeout(10000),
+        });
+        if (!r.ok) {
+            const text = await r.text().catch(() => '');
+            return res.json({ ok: false, status: r.status, error: text.slice(0, 200) || `HTTP ${r.status}` });
+        }
+        // Optional workflow count (active webhooks) — cheap, same endpoint with active=true
+        let activeWebhookCount = null;
+        try {
+            const r2 = await fetch(`${apiBase}/workflows?active=true&limit=250`, {
+                headers: { 'X-N8N-API-KEY': apiKey, 'Content-Type': 'application/json' },
+                agent,
+                signal: AbortSignal.timeout(10000),
+            });
+            if (r2.ok) {
+                const data = await r2.json();
+                const arr = data.data || data;
+                activeWebhookCount = Array.isArray(arr) ? arr.length : null;
+            }
+        } catch (_) { /* non-fatal */ }
+
+        res.json({ ok: true, activeWebhookCount });
+    } catch (err) {
+        res.json({ ok: false, error: err.message });
+    }
+});
+
+// GET /ai/n8n/permissions — list which groups currently hold n8n permissions.
+// Read-only summary for the Permissions tab; editing happens in Organisation → Users & Groups.
+router.get('/n8n/permissions', requireOrgAdminForN8n, async (req, res) => {
+    try {
+        const orgId = req.orgId;
+        const userStore = require('../../stores/userStore');
+        const groups = await userStore.getAllGroups();
+        const orgGroups = (groups || []).filter(g => !g.organizationId || g.organizationId === orgId);
+
+        const summarise = (permId) => orgGroups
+            .filter(g => Array.isArray(g.permissions) && g.permissions.includes(permId))
+            .map(g => ({ id: g.id, name: g.name, userCount: g.userCount || 0 }));
+
+        res.json({
+            use_n8n_tools: summarise('use_n8n_tools'),
+            modify_n8n_workflows: summarise('modify_n8n_workflows'),
+            // hint for the UI so it can deep-link to the correct settings screen
+            editUrl: '/settings/organisation/users',
+        });
+    } catch (err) {
+        console.error('[n8n] Permissions summary failed:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ─── MCP Server Management ──────────────────────────────────────
 
 const mcpManager = require('../../core/mcpManager');
