@@ -81,13 +81,13 @@ const GMAIL_TOOLS = [
         type: 'function',
         function: {
             name: 'gmail_compose',
-            description: 'Compose and send a new email or reply to an existing email thread. The user will see a preview with Send, Save as Draft, and Discard buttons before anything is sent — no email is sent automatically. Use this whenever the user asks you to write, draft, send, reply to, or forward an email. IMPORTANT: When replying to an email, you MUST set the replyToMessageId field to the message ID of the email being replied to (from gmail_search or gmail_read results). Without this, the reply will be sent as a new email instead of appearing in the same thread. For replies, also prefix the subject with "Re: " followed by the original subject. For forwarding, prefix with "Fwd: " and include the original email body.',
+            description: 'Compose and send a new email or reply to an existing email thread. The user will see a preview with Send, Save as Draft, and Discard buttons before anything is sent — no email is sent automatically. Use this whenever the user asks you to write, draft, send, reply to, or forward an email.\n\nIMPORTANT: When replying, set replyToMessageId to the message ID of the email being replied to (from gmail_search / gmail_read results, or the attached Gmail thread context). The tool will then auto-fill the recipient and subject from the original message — you only need to pass `body` and `replyToMessageId`. If you *do* pass `to` / `subject` on a reply, your values override the auto-derived ones. For forwards, prefix the subject with "Fwd: " and include the original email body.',
             parameters: {
                 type: 'object',
                 properties: {
                     to: {
                         type: 'string',
-                        description: 'Recipient email address(es), comma-separated for multiple'
+                        description: 'Recipient email address(es), comma-separated for multiple. Optional when replyToMessageId is set — the tool derives the recipient from the original message (Reply-To or From header).'
                     },
                     cc: {
                         type: 'string',
@@ -99,7 +99,7 @@ const GMAIL_TOOLS = [
                     },
                     subject: {
                         type: 'string',
-                        description: 'Email subject line. For replies use "Re: <original subject>", for forwards use "Fwd: <original subject>"'
+                        description: 'Email subject line. Optional when replyToMessageId is set — the tool derives it from the original message and prefixes "Re: " automatically. For forwards, pass explicitly with "Fwd: " prefix.'
                     },
                     body: {
                         type: 'string',
@@ -110,7 +110,7 @@ const GMAIL_TOOLS = [
                         description: 'REQUIRED for replies: Gmail message ID of the email being replied to (from gmail_search or gmail_read results). This ensures the reply appears in the same thread. Omit only for new emails and forwards.'
                     }
                 },
-                required: ['to', 'subject', 'body']
+                required: ['body']
             }
         }
     }
@@ -374,10 +374,13 @@ async function executeGmailTool(toolName, args, session) {
         };
 
     } else if (toolName === 'gmail_compose') {
-        const { to, cc, bcc, subject, body, replyToMessageId } = args;
-        if (!to || !subject || !body) throw new Error('to, subject, and body are required');
+        let { to, cc, bcc, subject, body, replyToMessageId } = args;
+        if (!body) throw new Error('body is required');
 
-        // If replying, fetch the original email's headers for threading
+        // When replying, fetch the original email's headers — both for threading
+        // (In-Reply-To / References) and to fill in to/subject if the model
+        // didn't provide them. This is the common case for the Gmail side-panel
+        // extension, where the thread is already attached as context.
         let inReplyTo = null;
         let references = null;
         let threadId = null;
@@ -387,16 +390,25 @@ async function executeGmailTool(toolName, args, session) {
                     userId: 'me',
                     id: replyToMessageId,
                     format: 'metadata',
-                    metadataHeaders: ['Message-ID', 'References'],
+                    metadataHeaders: ['Message-ID', 'References', 'From', 'Reply-To', 'Subject'],
                 });
                 threadId = original.data.threadId;
                 const headers = original.data.payload?.headers || [];
                 inReplyTo = getHeader(headers, 'Message-ID');
                 references = getHeader(headers, 'References');
+
+                if (!to) to = getHeader(headers, 'Reply-To') || getHeader(headers, 'From') || null;
+                if (!subject) {
+                    const origSubject = getHeader(headers, 'Subject') || '';
+                    subject = /^re:/i.test(origSubject) ? origSubject : `Re: ${origSubject}`.trim();
+                }
             } catch (err) {
                 console.log('[Gmail] Could not fetch reply headers:', err.message);
             }
         }
+
+        if (!to) throw new Error('to is required (include replyToMessageId for replies, or pass to explicitly)');
+        if (!subject) throw new Error('subject is required (include replyToMessageId for replies, or pass subject explicitly)');
 
         return {
             _action: 'email_draft',
