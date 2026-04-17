@@ -56,6 +56,8 @@ async function initDB() {
     await exec(`ALTER TABLE email_kb_connections ADD COLUMN IF NOT EXISTS sync_after_date TEXT`);
     await exec(`ALTER TABLE email_kb_connections ADD COLUMN IF NOT EXISTS pipeline_config JSONB DEFAULT '{}'::jsonb`);
     await exec(`ALTER TABLE email_kb_connections ADD COLUMN IF NOT EXISTS sync_locked_until TIMESTAMPTZ`);
+    await exec(`ALTER TABLE email_kb_connections ADD COLUMN IF NOT EXISTS gmail_history_id TEXT`);
+    await exec(`ALTER TABLE email_kb_connections ADD COLUMN IF NOT EXISTS graph_delta_link TEXT`);
 
     await exec(`
         CREATE TABLE IF NOT EXISTS email_kb_sync_log (
@@ -244,6 +246,25 @@ const EmailKBStore = {
             ? Math.max(1, Math.ceil((new Date(held.sync_locked_until).getTime() - Date.now()) / 1000))
             : 60;
         return { acquired: false, retryAfterSeconds: secs };
+    },
+
+    /**
+     * Persist incremental-sync cursors (Gmail historyId, Graph @odata.deltaLink).
+     * Either field may be set to `null` to force a fallback on next sync.
+     */
+    updateIncrementalCursor: async (connectionId, { gmailHistoryId, graphDeltaLink } = {}) => {
+        await initDB();
+        const sets = ['updated_at = now()'];
+        const vals = [connectionId];
+        let idx = 2;
+        if (gmailHistoryId !== undefined) {
+            sets.push(`gmail_history_id = $${idx}`); vals.push(gmailHistoryId); idx++;
+        }
+        if (graphDeltaLink !== undefined) {
+            sets.push(`graph_delta_link = $${idx}`); vals.push(graphDeltaLink); idx++;
+        }
+        if (sets.length === 1) return null;
+        return run(`UPDATE email_kb_connections SET ${sets.join(', ')} WHERE id = $1`, vals);
     },
 
     /**

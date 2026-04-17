@@ -10,11 +10,50 @@
  *   • Chunk cleanup via search-service
  */
 
+const crypto = require('crypto');
 const configStore = require('../stores/configStore');
 const kbStore = require('../stores/knowledgeBases');
 const { getServiceHeaders } = require('./serviceAuth');
 
 const SEARCH_SERVICE_URL = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
+
+/**
+ * SimHash (64-bit) over normalized tokens of `text`.
+ * Used for near-duplicate detection — small hamming distance (≤3) means
+ * two documents are ~99% the same text modulo whitespace / casing.
+ *
+ * Returns a signed BigInt fitting Postgres BIGINT, or null for empty input.
+ */
+function simhash64(text) {
+    if (!text) return null;
+    const normalized = String(text)
+        .toLowerCase()
+        .replace(/https?:\/\/\S+/g, '')
+        .replace(/\d{5,}/g, '')
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    if (!normalized) return null;
+    const tokens = normalized.split(' ').filter(t => t.length > 2);
+    if (tokens.length === 0) return null;
+
+    const v = new Array(64).fill(0);
+    for (const tok of tokens) {
+        const h = crypto.createHash('md5').update(tok).digest();
+        for (let bit = 0; bit < 64; bit++) {
+            const byte = h[bit >> 3];
+            const isSet = (byte >> (bit & 7)) & 1;
+            v[bit] += isSet ? 1 : -1;
+        }
+    }
+    // Convert bit vector to 64-bit two's-complement signed BigInt.
+    let unsigned = 0n;
+    for (let i = 0; i < 64; i++) if (v[i] > 0) unsigned |= (1n << BigInt(i));
+    // Postgres BIGINT is signed; map high bit to negative range.
+    const signed = unsigned >= (1n << 63n) ? unsigned - (1n << 64n) : unsigned;
+    // Node's Postgres driver accepts BigInt for bigint columns.
+    return signed;
+}
 
 /**
  * Read Azure embedding credentials from configStore.
@@ -279,7 +318,7 @@ async function fetchWithPlaywright(url) {
  * @returns {Promise<{document: object, chunks: number}>}
  */
 async function ingestDocument(tenantId, kbId, content, title, sourceType, sourceUri, options = {}) {
-    const { skipDedup = false, lang = 'auto' } = options;
+    const { skipDedup = false, lang = 'auto', metadata = null, simhashDistance = 3 } = options;
 
     if (!content || content.trim().length < 3) {
         throw new Error('Content is too short (min 3 chars)');
@@ -290,15 +329,42 @@ async function ingestDocument(tenantId, kbId, content, title, sourceType, source
     if (!skipDedup) {
         const existing = await kbStore.hasContentHash(kbId, hash);
         if (existing) {
+            // Record the alias (duplicate_of pointer) so UI shows the attempt,
+            // but do NOT re-embed — the canonical doc's chunks cover it.
+            try {
+                if (kbStore.recordDuplicate) {
+                    await kbStore.recordDuplicate(tenantId, kbId, title, sourceType, sourceUri, hash, existing, metadata);
+                }
+            } catch (_) { /* non-fatal */ }
             throw Object.assign(new Error('Duplicate content already exists in this KB'), {
                 code: 'DUPLICATE', documentId: existing
             });
         }
     }
 
-    // Create document record
+    // SimHash near-duplicate probe (e.g. newsletters with tiny variations).
+    // Skip in skipDedup mode (category_merge re-ingests deliberately).
+    const simhash = simhash64(content);
+    if (!skipDedup && simhash != null && kbStore.findNearDuplicateBySimhash) {
+        try {
+            const near = await kbStore.findNearDuplicateBySimhash(kbId, simhash, simhashDistance);
+            if (near) {
+                if (kbStore.recordDuplicate) {
+                    await kbStore.recordDuplicate(tenantId, kbId, title, sourceType, sourceUri, hash, near.id, metadata);
+                }
+                throw Object.assign(new Error('Near-duplicate content already in KB'), {
+                    code: 'NEAR_DUPLICATE', documentId: near.id
+                });
+            }
+        } catch (e) {
+            if (e.code === 'NEAR_DUPLICATE') throw e;
+            // Simhash failure shouldn't block ingestion — fall through.
+        }
+    }
+
+    // Create document record (with rich metadata + simhash)
     const doc = await kbStore.createDocument(
-        tenantId, kbId, title, sourceType, sourceUri, hash
+        tenantId, kbId, title, sourceType, sourceUri, hash, 0, metadata, simhash
     );
 
     // Send for chunking + embedding
@@ -424,4 +490,5 @@ module.exports = {
     ingestDocument,
     deleteDocumentChunks,
     findDocumentBySourceUri,
+    simhash64,
 };

@@ -58,7 +58,7 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
                     const displaySource = (isInternalUri && c.title) ? c.title : (srcUri || c.title || 'KB');
                     return {
                         content: c.content,
-                        metadata: { source: displaySource, type: 'kb_chunk' },
+                        metadata: { source: displaySource, type: 'kb_chunk', source_uri: srcUri, document_id: c.document_id },
                         score: c.score || 0
                     };
                 }));
@@ -89,7 +89,7 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
                         const displaySource = (isInternalUri && c.title) ? c.title : (srcUri || c.title || 'KB');
                         return {
                             content: c.content,
-                            metadata: { source: displaySource, type: 'kb_chunk' },
+                            metadata: { source: displaySource, type: 'kb_chunk', source_uri: srcUri, document_id: c.document_id },
                             score: c.score || c.rerank_score || 0
                         };
                     }));
@@ -101,6 +101,11 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
     }
 
     if (allKnowledgeResults.length > 0) {
+        // Enrich with document-level metadata (sender/threadId/attachments) so
+        // we can apply metadata-aware scoring boosts and thread-aware retrieval.
+        await enrichResultsWithDocMetadata(allKnowledgeResults, kbIds);
+        applyMetadataBoost(allKnowledgeResults, userMessage);
+
         // Score threshold: use config-based detection (same logic as kbSearchTools.js)
         // When Azure reranker is configured, no threshold — trust the reranker.
         // When RRF-only, apply a minimal floor.
@@ -373,6 +378,91 @@ async function quickKBSearch(userId, kbIds, query, options = {}) {
         score: c.score || c.rerank_score || 0,
         source_uri: c.source_uri || '',
     }));
+}
+
+/**
+ * Batch-load document-level metadata for every chunk that has a source_uri.
+ * Mutates the result objects in-place, adding `docMeta`, `threadId`, `from`,
+ * `subject`, `date`, `hasAttachments` for email-KB chunks.
+ */
+async function enrichResultsWithDocMetadata(results, kbIds) {
+    if (!Array.isArray(kbIds) || kbIds.length === 0) return;
+    const uris = Array.from(new Set(results
+        .map(r => r.metadata?.source_uri)
+        .filter(Boolean)));
+    if (uris.length === 0) return;
+    try {
+        const { getAll } = require('../../db');
+        const rows = await getAll(
+            `SELECT source_uri, metadata, source_type FROM documents
+             WHERE knowledge_base_id = ANY($1::uuid[]) AND source_uri = ANY($2::text[])`,
+            [kbIds, uris]
+        );
+        const byUri = new Map();
+        for (const row of rows) byUri.set(row.source_uri, row);
+        for (const r of results) {
+            const uri = r.metadata?.source_uri;
+            const row = uri && byUri.get(uri);
+            if (!row) continue;
+            r.docMeta = row.metadata || {};
+            r.sourceType = row.source_type;
+            if (row.metadata?.threadId) r.metadata.threadId = row.metadata.threadId;
+            if (row.metadata?.from) r.metadata.from = row.metadata.from;
+            if (row.metadata?.subject) r.metadata.subject = row.metadata.subject;
+            if (row.metadata?.date) r.metadata.date = row.metadata.date;
+            if (row.metadata?.hasAttachments) r.metadata.hasAttachments = true;
+        }
+    } catch (err) {
+        console.warn('[KnowledgeSearch] Metadata enrichment failed:', err.message);
+    }
+}
+
+function tokenize(text) {
+    return String(text || '')
+        .toLowerCase()
+        .replace(/[^\p{L}\p{N}\s@._-]+/gu, ' ')
+        .split(/\s+/)
+        .filter(t => t.length > 2);
+}
+
+/**
+ * Apply metadata-aware score boosts. Caps extra at +0.10 to avoid overriding
+ * semantic similarity entirely.
+ *
+ *   +0.03 per subject keyword hit (cap 0.06)
+ *   +0.05 when sender mentioned in the query
+ *   +0.05 for attachment results when the query mentions attachment/file/bijlage
+ */
+function applyMetadataBoost(results, userMessage) {
+    if (!results || !results.length) return;
+    const qTokens = new Set(tokenize(userMessage));
+    if (qTokens.size === 0) return;
+    const wantsAttachment = /\b(attachment|attach|file|bijlage|bijlagen|anhang|pdf|xlsx|spreadsheet|document)\b/i.test(userMessage || '');
+
+    for (const r of results) {
+        const md = r.docMeta;
+        if (!md) continue;
+        let bump = 0;
+
+        if (md.subject) {
+            const subjTokens = new Set(tokenize(md.subject));
+            let hits = 0;
+            for (const t of qTokens) if (subjTokens.has(t)) hits++;
+            if (hits > 0) bump += Math.min(0.06, 0.03 * hits);
+        }
+
+        if (md.from) {
+            const fromTokens = new Set(tokenize(md.from));
+            for (const t of qTokens) { if (fromTokens.has(t)) { bump += 0.05; break; } }
+        }
+
+        if (wantsAttachment && md.hasAttachments) bump += 0.05;
+
+        if (bump > 0) {
+            r.score = (r.score || 0) + Math.min(0.10, bump);
+            r.metadataBoost = Math.min(0.10, bump);
+        }
+    }
 }
 
 module.exports = { performKnowledgeSearch, quickKBSearch };

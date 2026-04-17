@@ -353,6 +353,19 @@ const KnowledgeBasesStore = {
     },
 
     /**
+     * Change a document's source_uri — used by transactional category_merge
+     * swap: ingest new under a temp uri, then rename to the canonical uri
+     * once the embeddings land.
+     */
+    updateDocumentSourceUri: async (id, newSourceUri) => {
+        await initDB();
+        return run(
+            `UPDATE documents SET source_uri = $2 WHERE id = $1`,
+            [id, newSourceUri]
+        );
+    },
+
+    /**
      * Check if content with same hash already exists in this KB (for deduplication).
      */
     hasContentHash: async (kbId, contentHash) => {

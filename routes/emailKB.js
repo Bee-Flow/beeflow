@@ -11,6 +11,7 @@ const emailKBStore = require('../stores/emailKBStore');
 const kbStore = require('../stores/knowledgeBases');
 const { triggerManualSync, testConnection, subscribeSyncEvents } = require('../services/emailKBSyncEngine');
 const { setupSSE } = require('../core/sseHelpers');
+const emailKBMetrics = require('../core/emailKBMetrics');
 const { resolveUserOrgIds } = require('../auth');
 
 // ──────────────────────────────────────────────
@@ -306,6 +307,33 @@ router.get('/connections/:id/logs', async (req, res) => {
         res.json({ logs });
     } catch (err) {
         console.error('[EmailKB] Logs error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ──────────────────────────────────────────────
+// GET /metrics — Prometheus-compatible metrics dump (admin only)
+// ──────────────────────────────────────────────
+router.get('/metrics', async (req, res) => {
+    if (!isSuperAdmin(req)) return res.status(403).json({ error: 'Admin only' });
+    res.set('Content-Type', 'text/plain; charset=utf-8');
+    res.send(emailKBMetrics.renderTextFormat());
+});
+
+// ──────────────────────────────────────────────
+// GET /connections/:id/cost — last-30d cost estimate for a connection
+// ──────────────────────────────────────────────
+router.get('/connections/:id/cost', async (req, res) => {
+    try {
+        const connection = await emailKBStore.getConnection(req.params.id);
+        if (!connection) return res.status(404).json({ error: 'Connection not found' });
+        const orgId = await getOrgId(req);
+        if (connection.organization_id !== orgId && !isSuperAdmin(req)) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
+        res.json({ connectionId: connection.id, cost30dUsd: emailKBMetrics.getCost30d(connection.id) });
+    } catch (err) {
+        console.error('[EmailKB] Cost error:', err.message);
         res.status(500).json({ error: err.message });
     }
 });

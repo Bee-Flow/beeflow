@@ -23,9 +23,12 @@ const {
     assembleProcessedEmail,
     summarizeAndCategorize,
     summarizeAndCategorizeBatch,
+    cleanEmail,
+    redactPIIWithCounts,
 } = require('../core/emailKBProcessor');
 const { ingestDocument, findDocumentBySourceUri, deleteDocumentChunks } = require('../core/kbIngestionHelpers');
 const { extractGmailAttachments, extractOutlookAttachments, formatAttachmentsMarkdown } = require('../core/emailKBAttachments');
+const metrics = require('../core/emailKBMetrics');
 
 const { run } = require('../db');
 
@@ -211,6 +214,13 @@ function recordOutcome(results, bucket, detail = {}) {
             + results.outcomes.skipped.count
             + results.outcomes.failed.count;
         emitSyncEvent(results.__connectionId, 'email_processed', { bucket, detail, processed, total: results.fetched || null });
+
+        // Metrics counters (labels kept low-cardinality on purpose).
+        const provider = results.__provider || 'unknown';
+        const labels = { provider, connectionId: results.__connectionId };
+        if (bucket === 'ingested') metrics.inc('email_kb_emails_ingested_total', labels);
+        else if (bucket === 'skipped') metrics.inc('email_kb_emails_skipped_total', { ...labels, reason: detail.reason || 'unknown' });
+        else if (bucket === 'failed') metrics.inc('email_kb_emails_failed_total', { ...labels, stage: detail.stage || 'unknown' });
     }
 }
 
@@ -315,18 +325,69 @@ async function syncGmailConnection(connection) {
     const query = `after:${afterDate}`;
     console.log(`[EmailKBSync] Gmail query: "${query}" labels: ${labelFilters.join(', ')}`);
 
-    // Fetch message list — pass folder_filter as Gmail labelIds
-    const response = await gmail.users.messages.list({
-        userId: 'me',
-        q: query,
-        labelIds: labelFilters.length > 0 ? labelFilters : undefined,
-        maxResults: connection.max_emails_per_sync || MAX_EMAILS_PER_SYNC,
-    });
+    // P3.1: prefer Gmail History API when we have a stored historyId.
+    // It returns messageAdded events since that point — more reliable than
+    // date-cursor (no timezone drift, catches labelAdded changes).
+    let messageIds = [];
+    let newHistoryId = null;
+    let syncMode = 'fallback_date';
+    if (connection.gmail_history_id) {
+        try {
+            const historyRes = await withRetry(() => gmail.users.history.list({
+                userId: 'me',
+                startHistoryId: connection.gmail_history_id,
+                historyTypes: ['messageAdded', 'labelAdded'],
+                labelId: labelFilters.length === 1 ? labelFilters[0] : undefined,
+                maxResults: connection.max_emails_per_sync || MAX_EMAILS_PER_SYNC,
+            }), 'gmail.history.list');
+            const histories = historyRes.data.history || [];
+            const seen = new Set();
+            for (const h of histories) {
+                for (const ev of (h.messagesAdded || [])) {
+                    const id = ev.message?.id;
+                    if (id && !seen.has(id)) { seen.add(id); messageIds.push({ id }); }
+                }
+            }
+            newHistoryId = historyRes.data.historyId || connection.gmail_history_id;
+            syncMode = 'history';
+            console.log(`[EmailKBSync] Gmail history API: ${messageIds.length} new messages (mode=${syncMode})`);
+        } catch (err) {
+            const status = err.status || err.code || err.response?.status;
+            if (status === 404) {
+                console.warn('[EmailKBSync] Gmail historyId too old, falling back to date cursor');
+            } else {
+                console.warn(`[EmailKBSync] Gmail history API error (${status}): ${err.message}`);
+            }
+            // Fall through to date-cursor path.
+        }
+    }
 
-    const messageIds = response.data.messages || [];
-    console.log(`[EmailKBSync] Gmail: ${messageIds.length} messages found`);
+    if (syncMode !== 'history') {
+        const response = await gmail.users.messages.list({
+            userId: 'me',
+            q: query,
+            labelIds: labelFilters.length > 0 ? labelFilters : undefined,
+            maxResults: connection.max_emails_per_sync || MAX_EMAILS_PER_SYNC,
+        });
+        messageIds = response.data.messages || [];
+        console.log(`[EmailKBSync] Gmail: ${messageIds.length} messages found (mode=${syncMode})`);
 
-    const results = { fetched: messageIds.length, created: 0, skipped: 0, errors: 0, errorDetails: [], newestDate: null, processedArticles: [], outcomes: createOutcomes(), __connectionId: connection.id };
+        // Capture a fresh historyId for the next tick. Prefer /profile — it
+        // returns the current historyId at the mailbox level regardless of
+        // query filters.
+        try {
+            const profile = await gmail.users.getProfile({ userId: 'me' });
+            newHistoryId = profile.data.historyId || null;
+        } catch (err) {
+            console.warn('[EmailKBSync] Gmail getProfile failed:', err.message);
+        }
+    }
+
+    if (newHistoryId && newHistoryId !== connection.gmail_history_id) {
+        await emailKBStore.updateIncrementalCursor(connection.id, { gmailHistoryId: newHistoryId }).catch(() => {});
+    }
+
+    const results = { fetched: messageIds.length, created: 0, skipped: 0, errors: 0, errorDetails: [], newestDate: null, processedArticles: [], outcomes: createOutcomes(), __connectionId: connection.id, __provider: 'gmail' };
     emitSyncEvent(connection.id, 'sync_fetch_complete', { total: messageIds.length, provider: 'gmail' });
 
     const ingestionMode = getIngestionMode(connection);
@@ -461,6 +522,7 @@ async function syncGmailConnection(connection) {
             const processed = ingestionMode === 'per_email'
                 ? buildPerEmailArticle(body, metadata, processOpts)
                 : await processEmail(body, metadata, processOpts);
+            if (processed) processed.emailMetadata = metadata;
             return { msgId: msg.id, msgDate: metadata.date, processed };
         };
 
@@ -692,25 +754,84 @@ async function syncOutlookConnection(connection) {
 
     console.log(`[EmailKBSync] Outlook filter: "${filter}" folders: ${outlookFolders.join(', ')}`);
 
-    // Fetch from each folder and merge results
+    // P3.1: prefer /me/mailFolders('inbox')/messages/delta with stored deltaLink.
+    // Graph returns changes since the link was issued; fall back to $filter on
+    // first sync or when the deltaLink is invalidated.
     let allMessages = [];
-    for (const folder of outlookFolders) {
-        try {
-            const perFolder = Math.ceil(maxEmails / outlookFolders.length);
-            const data = await graphCall(
-                `/me/mailFolders/${encodeURIComponent(folder)}/messages?$filter=${encodeURIComponent(filter)}&$top=${perFolder}&$orderby=receivedDateTime desc&$select=${selectFields}`
-            );
-            allMessages.push(...(data.value || []));
-        } catch (folderErr) {
-            console.warn(`[EmailKBSync] Outlook folder "${folder}" failed: ${folderErr.message}`);
-            // Fallback: try without folder path (searches all mail)
-            if (outlookFolders.length === 1) {
-                const data = await graphCall(
-                    `/me/messages?$filter=${encodeURIComponent(filter)}&$top=${maxEmails}&$orderby=receivedDateTime desc&$select=${selectFields}`
-                );
-                allMessages.push(...(data.value || []));
+    let newDeltaLink = null;
+    let outlookSyncMode = 'fallback_date';
+
+    async function runDelta(url) {
+        let next = url;
+        let collected = [];
+        let finalDelta = null;
+        // Follow @odata.nextLink pagination until we hit a @odata.deltaLink.
+        while (next) {
+            try {
+                const data = await graphCall(next);
+                collected.push(...(data.value || []));
+                if (data['@odata.deltaLink']) { finalDelta = data['@odata.deltaLink']; next = null; break; }
+                if (data['@odata.nextLink']) { next = data['@odata.nextLink']; }
+                else next = null;
+                if (collected.length >= maxEmails) break;
+            } catch (err) {
+                // 410 Gone → deltaLink expired; caller should fall back.
+                if (err.message?.includes('410') || err.code === 410) {
+                    throw Object.assign(new Error('deltaLink expired'), { code: 410 });
+                }
+                throw err;
             }
         }
+        return { messages: collected, deltaLink: finalDelta };
+    }
+
+    if (connection.graph_delta_link) {
+        try {
+            const result = await runDelta(connection.graph_delta_link);
+            allMessages = result.messages;
+            newDeltaLink = result.deltaLink || connection.graph_delta_link;
+            outlookSyncMode = 'delta';
+            console.log(`[EmailKBSync] Outlook delta: ${allMessages.length} changes (mode=${outlookSyncMode})`);
+        } catch (err) {
+            console.warn(`[EmailKBSync] Outlook delta query failed (${err.code || ''}): ${err.message} — falling back to date`);
+        }
+    }
+
+    if (outlookSyncMode !== 'delta') {
+        // Fetch from each folder and merge results
+        for (const folder of outlookFolders) {
+            try {
+                const perFolder = Math.ceil(maxEmails / outlookFolders.length);
+                const data = await graphCall(
+                    `/me/mailFolders/${encodeURIComponent(folder)}/messages?$filter=${encodeURIComponent(filter)}&$top=${perFolder}&$orderby=receivedDateTime desc&$select=${selectFields}`
+                );
+                allMessages.push(...(data.value || []));
+            } catch (folderErr) {
+                console.warn(`[EmailKBSync] Outlook folder "${folder}" failed: ${folderErr.message}`);
+                // Fallback: try without folder path (searches all mail)
+                if (outlookFolders.length === 1) {
+                    const data = await graphCall(
+                        `/me/messages?$filter=${encodeURIComponent(filter)}&$top=${maxEmails}&$orderby=receivedDateTime desc&$select=${selectFields}`
+                    );
+                    allMessages.push(...(data.value || []));
+                }
+            }
+        }
+
+        // Seed a deltaLink for the next tick (on inbox, which is the common case).
+        try {
+            const firstFolder = outlookFolders[0] || 'Inbox';
+            const seedData = await graphCall(
+                `/me/mailFolders/${encodeURIComponent(firstFolder)}/messages/delta?$select=${selectFields}&$top=1`
+            );
+            newDeltaLink = seedData['@odata.deltaLink'] || null;
+        } catch (err) {
+            console.warn('[EmailKBSync] Outlook delta seed failed:', err.message);
+        }
+    }
+
+    if (newDeltaLink && newDeltaLink !== connection.graph_delta_link) {
+        await emailKBStore.updateIncrementalCursor(connection.id, { graphDeltaLink: newDeltaLink }).catch(() => {});
     }
 
     // Deduplicate by message ID (same message could appear in multiple folder views)
@@ -723,7 +844,7 @@ async function syncOutlookConnection(connection) {
 
     console.log(`[EmailKBSync] Outlook: ${messages.length} messages found`);
 
-    const results = { fetched: messages.length, created: 0, skipped: 0, errors: 0, errorDetails: [], newestDate: null, processedArticles: [], outcomes: createOutcomes(), __connectionId: connection.id };
+    const results = { fetched: messages.length, created: 0, skipped: 0, errors: 0, errorDetails: [], newestDate: null, processedArticles: [], outcomes: createOutcomes(), __connectionId: connection.id, __provider: 'outlook' };
     emitSyncEvent(connection.id, 'sync_fetch_complete', { total: messages.length, provider: 'outlook' });
 
     // Track newest message date for cursor
@@ -838,6 +959,7 @@ async function syncOutlookConnection(connection) {
             const processed = ingestionMode === 'per_email'
                 ? buildPerEmailArticle(body, metadata, processOpts)
                 : await processEmail(body, metadata, processOpts);
+            if (processed) processed.emailMetadata = metadata;
             return { msgId: msg.id, processed };
         };
 
@@ -947,6 +1069,7 @@ async function syncConnection(connection) {
     }
 
     const log = await emailKBStore.createSyncLog(connection.id);
+    const syncStartedAt = Date.now();
 
     await emailKBStore.updateSyncState(connection.id, { syncStatus: 'syncing', syncError: null });
 
@@ -997,6 +1120,22 @@ async function syncConnection(connection) {
                         continue; // Already ingested — per-email archive is append-only.
                     }
 
+                    const em = processed.emailMetadata || {};
+                    const docMetadata = {
+                        connectionId: connection.id,
+                        provider: connection.provider,
+                        mailbox: connection.email_address,
+                        from: em.from || null,
+                        to: em.to || null,
+                        subject: em.subject || null,
+                        date: em.date || null,
+                        threadId: em.threadId || null,
+                        messageId: em.messageId || messageId,
+                        labels: em.labels || null,
+                        hasAttachments: !!em.hasAttachments,
+                        attachments: em.attachments || [],
+                        category: processed.category || null,
+                    };
                     await ingestDocument(
                         connection.created_by,
                         connection.knowledge_base_id,
@@ -1004,11 +1143,21 @@ async function syncConnection(connection) {
                         processed.title,
                         'email',
                         sourceUri,
-                        { skipDedup: false, lang: (connection.pipeline_config?.language || 'auto') }
+                        {
+                            skipDedup: false,
+                            lang: (connection.pipeline_config?.language || 'auto'),
+                            metadata: docMetadata,
+                        }
                     );
                     categoryDocsCreated++;
                     recordOutcome(results, 'ingested', { messageId, subject: processed.title });
                 } catch (ingestErr) {
+                    if (ingestErr.code === 'DUPLICATE' || ingestErr.code === 'NEAR_DUPLICATE') {
+                        results.skipped++;
+                        const reason = ingestErr.code === 'DUPLICATE' ? 'content_hash_dup' : 'simhash_near_dup';
+                        recordOutcome(results, 'skipped', { reason, messageId: processed.sourceMessageId, subject: processed.title });
+                        continue;
+                    }
                     results.errors++;
                     results.errorDetails.push(`Ingest message ${processed.sourceMessageId}: ${ingestErr.message}`);
                     recordOutcome(results, 'failed', { messageId: processed.sourceMessageId, subject: processed.title, stage: 'ingest', error: ingestErr.message });
@@ -1022,33 +1171,53 @@ async function syncConnection(connection) {
 
             const mergedCategories = await mergeArticlesByCategory(processedArticles, buildMergeOptions(connection));
 
-            // Upsert: for each category, find existing doc → delete → re-ingest
+            // Transactional swap: ingest new under a temp source_uri, verify
+            // success, then delete the old canonical doc and rename the new
+            // one. On failure, only the temp doc is cleaned up — the prior
+            // category doc remains intact and retrievable.
+            const kbStoreLocal = require('../stores/knowledgeBases');
             for (const { category, article, sourceCount } of mergedCategories) {
+                const canonicalUri = `email-kb://category/${encodeURIComponent(category)}`;
+                const tempUri = `${canonicalUri}#pending-${Date.now()}`;
+                let newDoc = null;
                 try {
-                    const sourceUri = `email-kb://category/${encodeURIComponent(category)}`;
-
-                    // Remove existing category document if present
-                    const existing = await findDocumentBySourceUri(connection.knowledge_base_id, sourceUri);
-                    if (existing) {
-                        console.log(`[EmailKBSync] Replacing existing category doc: "${category}" (${existing.id})`);
-                        await deleteDocumentChunks(connection.knowledge_base_id, existing.id, connection.created_by);
-                    }
-
-                    // Ingest merged category article
-                    await ingestDocument(
+                    const categoryMetadata = {
+                        connectionId: connection.id,
+                        provider: connection.provider,
+                        mailbox: connection.email_address,
+                        category,
+                        sourceCount,
+                        ingestionMode: 'category_merge',
+                    };
+                    const result = await ingestDocument(
                         connection.created_by,
                         connection.knowledge_base_id,
                         article,
                         category,
                         'email',
-                        sourceUri,
-                        { skipDedup: true, lang: 'auto' }
+                        tempUri,
+                        { skipDedup: true, lang: 'auto', metadata: categoryMetadata }
                     );
+                    newDoc = result.document;
+
+                    // New doc landed. Now swap: remove old canonical + rename temp.
+                    const existing = await findDocumentBySourceUri(connection.knowledge_base_id, canonicalUri);
+                    if (existing) {
+                        console.log(`[EmailKBSync] Swapping category doc "${category}" (${existing.id} → ${newDoc.id})`);
+                        await deleteDocumentChunks(connection.knowledge_base_id, existing.id, connection.created_by);
+                    }
+                    await kbStoreLocal.updateDocumentSourceUri(newDoc.id, canonicalUri);
 
                     categoryDocsCreated++;
                     recordOutcome(results, 'ingested', { category, sourceCount });
                     console.log(`[EmailKBSync] ✅ Category "${category}" ingested (${sourceCount} emails merged)`);
                 } catch (ingestErr) {
+                    // Clean up the failed temp doc so it doesn't leave orphans.
+                    if (newDoc) {
+                        try {
+                            await deleteDocumentChunks(connection.knowledge_base_id, newDoc.id, connection.created_by);
+                        } catch (_) { /* best-effort cleanup */ }
+                    }
                     results.errors++;
                     results.errorDetails.push(`Ingest category "${category}": ${ingestErr.message}`);
                     recordOutcome(results, 'failed', { category, stage: 'ingest', error: ingestErr.message });
@@ -1121,6 +1290,7 @@ async function syncConnection(connection) {
             outcomes: fatalOutcomes,
         });
     } finally {
+        metrics.recordSyncDuration(connection.provider || 'unknown', (Date.now() - syncStartedAt) / 1000);
         // Release the sync lock so the next tick/manual sync can run.
         await emailKBStore.releaseSyncLock(connection.id).catch((e) => {
             console.warn('[EmailKBSync] Failed to release sync lock:', e.message);
@@ -1235,6 +1405,10 @@ async function testConnection(connectionId) {
     if (!connection) throw new Error('Connection not found');
 
     let testEmail;
+    let gmailForTest = null;
+    let gmailDetailForTest = null;
+    let gmailMessageIdForTest = null;
+    let outlookMsgIdForTest = null;
 
     if (connection.provider === 'gmail') {
         const { google } = require('googleapis');
@@ -1267,6 +1441,9 @@ async function testConnection(connectionId) {
         if (!list.data.messages?.length) return { success: true, message: 'No emails found matching your filters', preview: null };
 
         const detail = await gmail.users.messages.get({ userId: 'me', id: list.data.messages[0].id, format: 'full' });
+        gmailForTest = gmail;
+        gmailDetailForTest = detail;
+        gmailMessageIdForTest = list.data.messages[0].id;
         const headers = detail.data.payload?.headers || [];
         testEmail = {
             subject: getGmailHeader(headers, 'Subject'),
@@ -1285,14 +1462,14 @@ async function testConnection(connectionId) {
         // Try first folder, fallback to all messages
         let msg;
         try {
-            const resp = await fetch(`${GRAPH_BASE}/me/mailFolders/${encodeURIComponent(outlookFolders[0])}/messages?${filterQ}$top=1&$orderby=receivedDateTime desc&$select=subject,from,receivedDateTime,body`, {
+            const resp = await fetch(`${GRAPH_BASE}/me/mailFolders/${encodeURIComponent(outlookFolders[0])}/messages?${filterQ}$top=1&$orderby=receivedDateTime desc&$select=id,subject,from,receivedDateTime,body`, {
                 headers: { 'Authorization': `Bearer ${connection.tokens.accessToken}` },
             });
             if (!resp.ok) throw new Error(resp.status);
             const data = await resp.json();
             msg = data.value?.[0];
         } catch {
-            const resp = await fetch(`${GRAPH_BASE}/me/messages?${filterQ}$top=1&$orderby=receivedDateTime desc&$select=subject,from,receivedDateTime,body`, {
+            const resp = await fetch(`${GRAPH_BASE}/me/messages?${filterQ}$top=1&$orderby=receivedDateTime desc&$select=id,subject,from,receivedDateTime,body`, {
                 headers: { 'Authorization': `Bearer ${connection.tokens.accessToken}` },
             });
             if (!resp.ok) throw new Error(`Outlook test failed: ${resp.status}`);
@@ -1302,6 +1479,7 @@ async function testConnection(connectionId) {
 
         if (!msg) return { success: true, message: 'No emails found matching your filters', preview: null };
 
+        outlookMsgIdForTest = msg.id;
         testEmail = {
             subject: msg.subject,
             from: msg.from?.emailAddress ? `${msg.from.emailAddress.name} <${msg.from.emailAddress.address}>` : '',
@@ -1311,17 +1489,62 @@ async function testConnection(connectionId) {
     }
 
     // Process through the full pipeline (but don't ingest)
+    const opts = buildProcessOptions(connection);
     const result = await processEmail(testEmail.body, {
         subject: testEmail.subject,
         from: testEmail.from,
         date: testEmail.date,
-    }, buildProcessOptions(connection));
+    }, opts);
+
+    // PII diff (before/after + counts). Runs independently of the article
+    // pipeline so the UI can show what redaction did regardless of success.
+    let pii = null;
+    try {
+        const cleaned = cleanEmail(testEmail.body || '');
+        if (cleaned) {
+            const disable = Array.isArray(connection.pipeline_config?.pii?.disable)
+                ? connection.pipeline_config.pii.disable : [];
+            const { text: redacted, counts } = redactPIIWithCounts(cleaned, { disable });
+            pii = {
+                enabled: opts.redactPII,
+                before: cleaned,
+                after: redacted,
+                counts,
+                disabled: disable,
+            };
+        }
+    } catch (err) {
+        console.warn('[EmailKBSync] PII diff failed for test:', err.message);
+    }
+
+    // Attachment preview (Phase 3.3): list extracted attachment names + first 500 chars.
+    let attachments = null;
+    try {
+        if (connection.process_attachments !== false) {
+            if (connection.provider === 'gmail' && gmailDetailForTest) {
+                attachments = await extractGmailAttachments(gmailForTest, gmailMessageIdForTest, gmailDetailForTest.data.payload, connection.pipeline_config);
+            } else if (connection.provider === 'outlook' && outlookMsgIdForTest) {
+                attachments = await extractOutlookAttachments(connection.tokens.accessToken, outlookMsgIdForTest, connection.pipeline_config);
+            }
+            if (attachments) {
+                attachments = attachments.map(a => ({
+                    filename: a.filename, bytes: a.bytes, kind: a.kind,
+                    reason: a.reason || null, source: a.source || null, truncated: !!a.truncated,
+                    preview: a.text ? a.text.slice(0, 500) : null,
+                }));
+            }
+        }
+    } catch (err) {
+        console.warn('[EmailKBSync] Attachment preview failed:', err.message);
+    }
 
     return {
         success: true,
         originalSubject: testEmail.subject,
         originalFrom: testEmail.from,
         preview: result,
+        pii,
+        attachments,
     };
 }
 

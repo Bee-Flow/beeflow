@@ -12,6 +12,27 @@
 
 const CHARS_PER_TOKEN = 4;
 
+// P3.5: Optional tiktoken upgrade, gated on `OPENAI_PROMPT_COUNTER=true`.
+// Only loads if the flag is set AND the package is installed — otherwise we
+// silently fall back to the 4-char heuristic.
+let _tiktokenEncoder = null;
+let _tiktokenAttempted = false;
+
+function maybeLoadTiktoken() {
+    if (_tiktokenAttempted) return _tiktokenEncoder;
+    _tiktokenAttempted = true;
+    if (process.env.OPENAI_PROMPT_COUNTER !== 'true') return null;
+    try {
+        // eslint-disable-next-line global-require
+        const tiktoken = require('@dqbd/tiktoken');
+        _tiktokenEncoder = tiktoken.get_encoding('cl100k_base');
+        console.log('[tokenBudget] tiktoken cl100k_base loaded');
+    } catch (err) {
+        console.warn(`[tokenBudget] OPENAI_PROMPT_COUNTER=true but @dqbd/tiktoken not installed: ${err.message}`);
+    }
+    return _tiktokenEncoder;
+}
+
 /**
  * Rough token estimate for a string.
  * @param {string} text
@@ -19,6 +40,10 @@ const CHARS_PER_TOKEN = 4;
  */
 function estimateTokens(text) {
     if (!text) return 0;
+    const enc = maybeLoadTiktoken();
+    if (enc) {
+        try { return enc.encode(text).length; } catch (_) { /* fall through */ }
+    }
     return Math.ceil(text.length / CHARS_PER_TOKEN);
 }
 

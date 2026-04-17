@@ -173,10 +173,90 @@ router.get('/:id/documents', requireAuth, async (req, res) => {
         if (!kb) return res.status(404).json({ error: 'KB not found' });
         if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
 
-        const docs = await kbStore.listDocuments(kb.id);
-        res.json(docs);
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 200);
+        const offset = Math.max(parseInt(req.query.offset) || 0, 0);
+        const filters = {
+            sender: req.query.sender || undefined,
+            threadId: req.query.threadId || undefined,
+            hasAttachment: req.query.hasAttachment === 'true',
+            dateFrom: req.query.dateFrom || undefined,
+            dateTo: req.query.dateTo || undefined,
+            sourceType: req.query.sourceType || undefined,
+        };
+
+        const [docs, total] = await Promise.all([
+            kbStore.listDocuments(kb.id, { limit, offset, filters }),
+            kbStore.countDocuments(kb.id, filters),
+        ]);
+        res.json({ documents: docs, total, limit, offset });
     } catch (e) {
         console.error('[KB] List docs error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * Bulk-delete documents (up to 200 per call).
+ */
+router.post('/:id/documents/bulk-delete', requireAuth, requirePermission('manage_knowledge'), async (req, res) => {
+    try {
+        const kb = await kbStore.getKB(req.params.id);
+        if (!kb) return res.status(404).json({ error: 'KB not found' });
+        if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
+
+        const ids = Array.isArray(req.body?.documentIds) ? req.body.documentIds.slice(0, 200) : [];
+        if (ids.length === 0) return res.status(400).json({ error: 'documentIds required' });
+
+        let deleted = 0;
+        const errors = [];
+        for (const docId of ids) {
+            try {
+                const doc = await kbStore.getDocument(docId);
+                if (!doc || doc.knowledge_base_id !== kb.id) continue;
+                await deleteDocumentChunks(kb.id, doc.id, kb.tenant_id);
+                deleted++;
+            } catch (err) {
+                errors.push({ docId, error: err.message });
+            }
+        }
+        res.json({ deleted, errors });
+    } catch (e) {
+        console.error('[KB] Bulk delete error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * List unique thread IDs for the KB (for the thread explorer).
+ */
+router.get('/:id/threads', requireAuth, async (req, res) => {
+    try {
+        const kb = await kbStore.getKB(req.params.id);
+        if (!kb) return res.status(404).json({ error: 'KB not found' });
+        if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
+
+        const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+        const threads = kbStore.listThreads ? await kbStore.listThreads(kb.id, { limit }) : [];
+        res.json({ threads });
+    } catch (e) {
+        console.error('[KB] List threads error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * List documents in a specific thread, sorted by date.
+ */
+router.get('/:id/threads/:threadId/documents', requireAuth, async (req, res) => {
+    try {
+        const kb = await kbStore.getKB(req.params.id);
+        if (!kb) return res.status(404).json({ error: 'KB not found' });
+        if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
+
+        const docs = kbStore.listDocumentsByThread ? await kbStore.listDocumentsByThread(kb.id, req.params.threadId) : [];
+        res.json({ documents: docs });
+    } catch (e) {
+        console.error('[KB] Thread docs error:', e.message);
         res.status(500).json({ error: e.message });
     }
 });
