@@ -16,7 +16,7 @@
  * Requirements checked at runtime (provider reports unavailable if any are
  * missing so the dispatcher falls back to the Playwright `google` provider):
  *   1. Secret `google_meet_service_account_key` — JSON key of a service
- *      account granted domain-wide delegation for the three Meet scopes.
+ *      account granted domain-wide delegation for Meet Media + meeting read.
  *   2. Config `google_meet_impersonation_user` — email of a Workspace user
  *      the service account will impersonate (the bot identity).
  *   3. `@roamhq/wrtc` native module installed and loadable.
@@ -40,10 +40,18 @@ const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
 const configStore = require('../../stores/configStore');
 const shared = require('./shared');
 
-const MEET_MEDIA_SCOPES = [
-    'https://www.googleapis.com/auth/meetings.space.created',
-    'https://www.googleapis.com/auth/meetings.space.readonly',
-    'https://www.googleapis.com/auth/meetings.conference.media.readonly',
+// Meet docs currently show both `meetings.space.read` and
+// `meetings.space.readonly` in different pages/samples. We try both so token
+// minting works regardless of which one the admin authorized for DWD.
+const MEET_MEDIA_SCOPE_SETS = [
+    [
+        'https://www.googleapis.com/auth/meetings.conference.media.readonly',
+        'https://www.googleapis.com/auth/meetings.space.readonly',
+    ],
+    [
+        'https://www.googleapis.com/auth/meetings.conference.media.readonly',
+        'https://www.googleapis.com/auth/meetings.space.read',
+    ],
 ];
 
 // Meet REST API v2 — used to resolve a meeting code (abc-defg-hij) to a
@@ -106,15 +114,26 @@ async function getAccessToken() {
     const subject = await configStore.getConfig('google_meet_impersonation_user');
     if (!subject) throw new Error('google_meet_impersonation_user not configured');
 
-    const jwt = new JWT({
-        email: sa.client_email,
-        key: sa.private_key,
-        scopes: MEET_MEDIA_SCOPES,
-        subject,
-    });
-    const { access_token } = await jwt.getAccessToken();
-    if (!access_token) throw new Error('Failed to mint Google access token (check DWD setup and scopes)');
-    return access_token;
+    let lastError = null;
+    for (const scopes of MEET_MEDIA_SCOPE_SETS) {
+        try {
+            const jwt = new JWT({
+                email: sa.client_email,
+                key: sa.private_key,
+                scopes,
+                subject,
+            });
+            const { access_token } = await jwt.getAccessToken();
+            if (!access_token) {
+                throw new Error('No access_token returned');
+            }
+            return { accessToken: access_token, scopes };
+        } catch (e) {
+            lastError = e;
+        }
+    }
+
+    throw new Error(`Failed to mint Google access token (check DWD setup and scopes): ${lastError?.message || 'unknown error'}`);
 }
 
 /**
@@ -209,10 +228,11 @@ async function joinAndRecord(sessionId, meetLink, options = {}) {
     console.log(`[MeetBot/GoogleSDK] Joining meeting code ${meetingCode} via Media API`);
 
     // 1. OAuth token
-    const token = await getAccessToken();
+    const { accessToken, scopes } = await getAccessToken();
+    console.log(`[MeetBot/GoogleSDK] OAuth token minted (scopes: ${scopes.join(', ')})`);
 
     // 2. Resolve meeting code → space resource
-    const spaceName = await resolveSpaceName(meetingCode, token);
+    const spaceName = await resolveSpaceName(meetingCode, accessToken);
     console.log(`[MeetBot/GoogleSDK] Resolved space: ${spaceName}`);
 
     // 3. Build PC + data channels
@@ -240,7 +260,7 @@ async function joinAndRecord(sessionId, meetLink, options = {}) {
     const connectResp = await fetch(connectUrl, {
         method: 'POST',
         headers: {
-            Authorization: `Bearer ${token}`,
+            Authorization: `Bearer ${accessToken}`,
             'Content-Type': 'application/json',
         },
         body: JSON.stringify({ offer: pc.localDescription.sdp }),
