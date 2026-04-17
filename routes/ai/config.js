@@ -1224,27 +1224,78 @@ router.post('/n8n/test', requireOrgAdminForN8n, async (req, res) => {
     }
 });
 
-// GET /ai/n8n/permissions — list which groups currently hold n8n permissions.
-// Read-only summary for the Permissions tab; editing happens in Organisation → Users & Groups.
+const N8N_PERMISSION_IDS = ['use_n8n_tools', 'modify_n8n_workflows'];
+
+// GET /ai/n8n/permissions — return which groups hold each n8n permission, plus the list
+// of all org groups so the admin can pick one to add.
 router.get('/n8n/permissions', requireOrgAdminForN8n, async (req, res) => {
     try {
         const orgId = req.orgId;
         const userStore = require('../../stores/userStore');
-        const groups = await userStore.getAllGroups();
-        const orgGroups = (groups || []).filter(g => !g.organizationId || g.organizationId === orgId);
+        const allGroups = await userStore.getAllGroups();
+        const orgGroups = (allGroups || []).filter(g => !g.organizationId || g.organizationId === orgId);
 
-        const summarise = (permId) => orgGroups
+        const holdingGroups = (permId) => orgGroups
             .filter(g => Array.isArray(g.permissions) && g.permissions.includes(permId))
             .map(g => ({ id: g.id, name: g.name, userCount: g.userCount || 0 }));
 
         res.json({
-            use_n8n_tools: summarise('use_n8n_tools'),
-            modify_n8n_workflows: summarise('modify_n8n_workflows'),
-            // hint for the UI so it can deep-link to the correct settings screen
+            use_n8n_tools: holdingGroups('use_n8n_tools'),
+            modify_n8n_workflows: holdingGroups('modify_n8n_workflows'),
+            // All groups in this org — lets the admin add one directly from the n8n panel.
+            availableGroups: orgGroups.map(g => ({ id: g.id, name: g.name, userCount: g.userCount || 0 })),
+            // Org admins always have both permissions regardless of group membership —
+            // surfaced in the UI so it's clear where baked-in access comes from.
+            orgAdminAlways: true,
             editUrl: '/settings/organisation/users',
         });
     } catch (err) {
         console.error('[n8n] Permissions summary failed:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// PUT /ai/n8n/permissions — grant or revoke an n8n permission for a specific group.
+// Body: { permission: 'use_n8n_tools' | 'modify_n8n_workflows', groupId, action: 'add' | 'remove' }
+router.put('/n8n/permissions', requireOrgAdminForN8n, async (req, res) => {
+    try {
+        const { permission, groupId, action } = req.body || {};
+        if (!N8N_PERMISSION_IDS.includes(permission)) {
+            return res.status(400).json({ error: `permission must be one of: ${N8N_PERMISSION_IDS.join(', ')}` });
+        }
+        if (!groupId) return res.status(400).json({ error: 'groupId is required' });
+        if (!['add', 'remove'].includes(action)) {
+            return res.status(400).json({ error: "action must be 'add' or 'remove'" });
+        }
+
+        const userStore = require('../../stores/userStore');
+        const { invalidateAllPermissionCaches } = require('../../auth/permissions');
+        const allGroups = await userStore.getAllGroups();
+        const group = (allGroups || []).find(g => g.id === groupId);
+        if (!group) return res.status(404).json({ error: 'Group not found' });
+
+        // Org-scope check — org admins can only mutate groups in their own org
+        // (super admins inherit a sentinel orgId from requireOrgAdminForN8n).
+        const orgId = req.orgId;
+        if (group.organizationId && group.organizationId !== orgId) {
+            return res.status(403).json({ error: 'Cannot modify groups in another organisation' });
+        }
+
+        const current = Array.isArray(group.permissions) ? [...group.permissions] : [];
+        let next;
+        if (action === 'add') {
+            next = current.includes(permission) ? current : [...current, permission];
+        } else {
+            next = current.filter(p => p !== permission);
+        }
+
+        await userStore.updateGroup(groupId, { permissions: next });
+        // Cached permission sets must be invalidated so the new grant takes effect immediately.
+        await invalidateAllPermissionCaches();
+
+        res.json({ success: true, groupId, permission, action, permissions: next });
+    } catch (err) {
+        console.error('[n8n] Permission mutation failed:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
