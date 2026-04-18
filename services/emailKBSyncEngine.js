@@ -105,7 +105,14 @@ function buildMergeOptions(connection) {
         orgId: connection.organization_id,
         redactPII: connection.redact_pii !== false,
         modelTier: pc.merge?.modelTier || 'fast',
+        // `customPrompt` is kept as a back-compat alias for the chunk-write
+        // prompt — older callers that only know the single-pass merge use it.
         customPrompt: pc.merge?.systemPrompt || '',
+        // Chunked-merge overrides (optional; fall back to `modelTier` / `customPrompt`).
+        chunkWriteModelTier: pc.merge?.chunkWriteModelTier,
+        chunkWriteSystemPrompt: pc.merge?.systemPrompt || '',
+        dedupeModelTier: pc.dedupe?.modelTier,
+        dedupeSystemPrompt: pc.dedupe?.systemPrompt || '',
         language: pc.language || '',
     };
 }
@@ -1169,7 +1176,9 @@ async function syncConnection(connection) {
         } else if (processedArticles.length > 0) {
             console.log(`[EmailKBSync] Phase 2: Merging ${processedArticles.length} articles by category...`);
 
-            const mergedCategories = await mergeArticlesByCategory(processedArticles, buildMergeOptions(connection));
+            const mergeOpts = buildMergeOptions(connection);
+            mergeOpts.onProgress = (event, data) => emitSyncEvent(connection.id, event, data);
+            const mergedCategories = await mergeArticlesByCategory(processedArticles, mergeOpts);
 
             // Transactional swap: ingest new under a temp source_uri, verify
             // success, then delete the old canonical doc and rename the new

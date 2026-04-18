@@ -18,6 +18,7 @@ const {
     categorizeArticle,
     summarizeAndCategorize,
     mergeArticlesByCategory,
+    dedupeMergedChunks,
 } = require('./emailKBProcessor');
 
 /**
@@ -286,6 +287,31 @@ async function runStage({ connection, stage, inputText, overrides = {} }) {
                 tookMs: Date.now() - t0,
             };
         }
+        case 'dedupe': {
+            // Dedupe expects 2+ pre-merged chunk outputs separated by `---`.
+            // It runs the cross-chunk dedupe pass directly, bypassing the
+            // chunk-write phase — so the user can iterate on the dedupe prompt
+            // without re-running the (expensive) chunk-write step.
+            const parts = (rawInput || '').split(/\n-{3,}\n/).map(s => s.trim()).filter(Boolean);
+            if (parts.length < 2) {
+                return {
+                    stage, source, input: inputPayload, output: null, config: {},
+                    tookMs: Date.now() - t0,
+                    error: 'Dedupe requires 2 or more pre-merged chunk outputs separated by "---"',
+                };
+            }
+            const customPrompt = overrides.systemPrompt ?? pc.dedupe?.systemPrompt ?? '';
+            const modelTier = overrides.modelTier ?? pc.dedupe?.modelTier ?? pc.merge?.modelTier ?? 'fast';
+            const result = await dedupeMergedChunks(parts, {
+                orgId, modelTier, customPrompt, language,
+            });
+            return {
+                stage, source, input: { ...inputPayload, chunkCount: parts.length },
+                output: { merged: result.article, reason: result.reason },
+                config: { modelTier, systemPrompt: customPrompt || '(default)', language },
+                tookMs: Date.now() - t0,
+            };
+        }
         default:
             throw new Error(`Unknown stage: ${stage}`);
     }
@@ -319,6 +345,7 @@ async function proposePromptImprovement({
         article:   'turns a single cleaned email into a structured Markdown KB article',
         category:  'assigns a short category label (1–3 words) to a KB article',
         merge:     'merges several per-email articles of the same category into one consolidated KB document',
+        dedupe:    'cross-chunk deduplication: merges multiple separately-processed chunks of the same category into one deduplicated KB article',
         usefulness:'classifies whether a conversation contains reusable knowledge (nuttig: true|false)',
     }[stage] || `runs pipeline stage "${stage}"`;
 

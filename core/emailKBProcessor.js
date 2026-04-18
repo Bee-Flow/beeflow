@@ -960,6 +960,40 @@ async function processEmailThread(messages, metadata = {}, options = {}) {
 // Adapted from n8n workflow 2.1 "Get Ticket summary Files"
 // ──────────────────────────────────────────────
 
+// ── Chunked-merge constants (match n8n reference workflow) ────────
+//
+// Large categories must be chunked before being fed to the LLM,
+// otherwise the single-call merge overflows the model's context
+// window silently. Values mirror the n8n "Email-support-V1" workflow.
+const CHUNK_MAX_TOKENS = 40000;   // per-chunk token budget
+const CHARS_PER_TOKEN = 3.5;      // heuristic — no tokeniser dependency
+const CHUNK_PARALLELISM = 3;      // max chunk-write LLM calls in flight
+
+const DEFAULT_DEDUPE_PROMPT = `You receive a merged knowledge-base article assembled from multiple separately-processed chunks about the same subject. There may be duplicates and overlap between the chunks.
+
+Task:
+Combine the parts into ONE coherent knowledge-base article in **Markdown**. Remove duplicates and overlap across chunks.
+
+Source-bound (hard):
+* Use ONLY information that appears in the input. Do not invent steps, causes, solutions or context.
+* Do not add "general clarification" or best practices.
+* If something is missing → leave it out.
+
+Rules (hard):
+* Deduplication: when the same instruction appears in multiple chunks, keep the most complete version and remove the rest.
+* One place per fact. Every instruction appears exactly once.
+* Conflicts: prefer the most specific version. Only combine when the versions are complementary.
+* Self-contained sections: each \`##\` block must be understandable on its own — repeat the subject in the heading and the opening sentence.
+* Descriptive headings: subject + action (e.g. "## Steps to restore VPN connection").
+* Section length: 150–500 words. Combine sections that are too short, split ones that are too long.
+* Keywords in the first two sentences of each section.
+* No references like "see above" or "as mentioned earlier".
+* Privacy: never include names, emails, phones, addresses, customer/order numbers, IPs, serial numbers, tokens, passwords or credentials.
+* Only use \`##\` headers (no \`#\`, no \`###\`).
+* Output ONLY the rewritten Markdown — no explanation, no code fences, no preamble.
+
+IMPORTANT: Detect the language of the input chunks and write the output in the SAME language.`;
+
 const DEFAULT_MERGE_PROMPT = `You receive multiple existing knowledge base articles from the same category. Rewrite them into ONE comprehensive, deduplicated knowledge base article in **Markdown**.
 
 Output rules (hard):
@@ -1004,16 +1038,178 @@ Only if relevant.
 IMPORTANT: Detect the language of the source articles and write in that SAME language.`;
 
 /**
+ * Greedy-pack article strings into token-bounded chunks. A chunk is the
+ * `\n\n---\n\n`-joined text ready to be fed to the LLM. A single article
+ * larger than the budget becomes its own chunk (not split further).
+ *
+ * @param {string[]} articleTexts — raw article bodies, in ingestion order
+ * @returns {string[]} — one chunk text per element
+ */
+function chunkArticlesByTokenBudget(articleTexts) {
+    const SEPARATOR = '\n\n---\n\n';
+    const maxChars = Math.floor(CHUNK_MAX_TOKENS * CHARS_PER_TOKEN);
+    const chunks = [];
+    let current = [];
+    let currentChars = 0;
+
+    for (const text of articleTexts) {
+        const tLen = (text || '').length;
+        if (tLen === 0) continue;
+
+        // Oversized single article → flush current, keep article solo.
+        if (tLen > maxChars) {
+            if (current.length > 0) {
+                chunks.push(current.join(SEPARATOR));
+                current = [];
+                currentChars = 0;
+            }
+            chunks.push(text);
+            continue;
+        }
+
+        const projected = currentChars + (current.length > 0 ? SEPARATOR.length : 0) + tLen;
+        if (projected > maxChars && current.length > 0) {
+            chunks.push(current.join(SEPARATOR));
+            current = [];
+            currentChars = 0;
+        }
+        current.push(text);
+        currentChars += (current.length > 1 ? SEPARATOR.length : 0) + tLen;
+    }
+
+    if (current.length > 0) chunks.push(current.join(SEPARATOR));
+    return chunks;
+}
+
+/**
+ * Run the per-chunk rewrite LLM call. Same prompt semantics as the old
+ * single-pass merge (DEFAULT_MERGE_PROMPT) — the intent is the same:
+ * consolidate N articles about one subject into one coherent Markdown doc.
+ */
+async function rewriteChunk(chunkText, { orgId, modelTier, customPrompt, language } = {}) {
+    return summarizeToArticle(chunkText, {
+        orgId,
+        modelTier,
+        language,
+        customPrompt: customPrompt || DEFAULT_MERGE_PROMPT,
+    });
+}
+
+/**
+ * Cross-chunk dedupe pass. Feeds all per-chunk outputs (separated by `---`)
+ * into one more LLM call with DEFAULT_DEDUPE_PROMPT. Used only when a
+ * category was split into >1 chunks.
+ *
+ * @param {string[]} chunkOutputs — non-null per-chunk rewritten markdown
+ * @returns {Promise<{article: string|null, reason?: string}>}
+ */
+async function dedupeMergedChunks(chunkOutputs, { orgId, modelTier, customPrompt, language } = {}) {
+    const joined = (chunkOutputs || []).filter(Boolean).join('\n\n---\n\n');
+    if (!joined || joined.trim().length < 20) {
+        return { article: null, reason: 'No chunk outputs to dedupe' };
+    }
+    // Use summarizeToArticle but with a bigger ceiling — the final merged doc
+    // is legitimately longer than a per-email article.
+    try {
+        const modelId = await resolveModel(modelTier || 'fast', orgId);
+        const { createChatCompletion } = require('../agents/providerAdapters');
+        const prompt = appendLanguageInstruction(customPrompt || DEFAULT_DEDUPE_PROMPT, language);
+        const resp = await createChatCompletion({
+            model: modelId,
+            messages: [
+                { role: 'system', content: prompt },
+                { role: 'user', content: joined },
+            ],
+            temperature: 0.2,
+            max_tokens: 4000,
+        });
+        const text = resp?.choices?.[0]?.message?.content || '';
+        if (!text || text.trim().length < 20) {
+            return { article: null, reason: 'AI produced empty dedupe output' };
+        }
+        return { article: text.trim() };
+    } catch (err) {
+        console.error('[EmailKBProcessor] Dedupe pass failed:', err.message);
+        return { article: null, reason: `AI error: ${err.message}` };
+    }
+}
+
+/**
+ * Run `fn` over `items` with bounded parallelism. Preserves input order in the
+ * returned array. Errors from `fn` are captured as `{ error: Error }` so one
+ * failure doesn't reject the whole batch.
+ */
+async function mapWithConcurrency(items, concurrency, fn) {
+    const out = new Array(items.length);
+    let i = 0;
+    const worker = async () => {
+        while (true) {
+            const idx = i++;
+            if (idx >= items.length) return;
+            try {
+                out[idx] = await fn(items[idx], idx);
+            } catch (err) {
+                out[idx] = { error: err };
+            }
+        }
+    };
+    const workers = Array.from({ length: Math.max(1, Math.min(concurrency, items.length)) }, () => worker());
+    await Promise.all(workers);
+    return out;
+}
+
+/**
  * Merge multiple processed articles by category into comprehensive KB documents.
  *
- * @param {Array<{article: string, category: string, title: string}>} articles — processed email articles
- * @param {object} options — { orgId, redactPII, modelTier, customPrompt, language }
- * @returns {Promise<Array<{category: string, article: string, title: string, sourceCount: number}>>}
+ * For each category:
+ *   1. Chunk the articles by a fixed token budget (CHUNK_MAX_TOKENS).
+ *   2. Rewrite each chunk in parallel via `rewriteChunk` (model tier =
+ *      chunkWriteModelTier || modelTier; prompt = chunkWriteSystemPrompt ||
+ *      customPrompt || DEFAULT_MERGE_PROMPT).
+ *   3. If only 1 chunk → that's the final article, no dedupe pass.
+ *      If ≥2 chunks → run `dedupeMergedChunks` (model tier =
+ *      dedupeModelTier || modelTier; prompt = dedupeSystemPrompt ||
+ *      DEFAULT_DEDUPE_PROMPT). If dedupe fails, fall back to the
+ *      `---`-joined chunk outputs so the user still gets a doc.
+ *
+ * The optional `onProgress(event, data)` callback is invoked with:
+ *   - 'merge_category_started'   { category, totalArticles, chunkCount }
+ *   - 'merge_category_complete'  { category, chunkCount, finalChars, dedupeRan }
+ *
+ * @param {Array<{article: string, category: string, title?: string, sourceMessageId?: string}>} articles
+ * @param {object} options
+ * @param {string} [options.orgId]
+ * @param {boolean} [options.redactPII=true]
+ * @param {string} [options.modelTier]                — fallback tier for both passes
+ * @param {string} [options.customPrompt]             — legacy alias for chunkWriteSystemPrompt
+ * @param {string} [options.chunkWriteModelTier]      — override tier for per-chunk rewrite
+ * @param {string} [options.chunkWriteSystemPrompt]   — override prompt for per-chunk rewrite
+ * @param {string} [options.dedupeModelTier]          — override tier for the cross-chunk pass
+ * @param {string} [options.dedupeSystemPrompt]       — override prompt for the cross-chunk pass
+ * @param {string} [options.language]
+ * @param {(event: string, data: object) => void} [options.onProgress]
+ * @returns {Promise<Array<{category, article, title, sourceCount, chunkCount, dedupeRan}>>}
  */
 async function mergeArticlesByCategory(articles, options = {}) {
-    const { redactPII: shouldRedact = true, modelTier: modelTierOpt, customPrompt, language, orgId } = options;
+    const {
+        redactPII: shouldRedact = true,
+        modelTier: modelTierOpt,
+        customPrompt,
+        chunkWriteModelTier,
+        chunkWriteSystemPrompt,
+        dedupeModelTier,
+        dedupeSystemPrompt,
+        language,
+        orgId,
+        onProgress,
+    } = options;
+
     const ekbTiers = await getEmailKBTierConfig();
-    const modelTier = modelTierOpt || ekbTiers.merge;
+    const fallbackTier = modelTierOpt || ekbTiers.merge;
+    const writeTier = chunkWriteModelTier || fallbackTier;
+    const dedupeTier = dedupeModelTier || fallbackTier;
+    const writePrompt = chunkWriteSystemPrompt || customPrompt || '';
+    const dedupePrompt = dedupeSystemPrompt || '';
 
     // Group by category
     const groups = {};
@@ -1023,35 +1219,94 @@ async function mergeArticlesByCategory(articles, options = {}) {
         groups[cat].push(a.article);
     }
 
-    console.log(`[EmailKBProcessor] Merging ${articles.length} articles into ${Object.keys(groups).length} categories: ${Object.keys(groups).join(', ')}`);
+    const categoryNames = Object.keys(groups);
+    console.log(`[EmailKBProcessor] Merging ${articles.length} articles into ${categoryNames.length} categories: ${categoryNames.join(', ')}`);
+
+    const notify = (event, data) => {
+        try { onProgress && onProgress(event, data); } catch { /* never break sync */ }
+    };
 
     const results = [];
-    for (const [category, articleTexts] of Object.entries(groups)) {
+    for (const category of categoryNames) {
+        const articleTexts = groups[category];
+        const chunks = chunkArticlesByTokenBudget(articleTexts);
+        console.log(`[EmailKBProcessor] "${category}": ${articleTexts.length} articles → ${chunks.length} chunks`);
+        notify('merge_category_started', {
+            category,
+            totalArticles: articleTexts.length,
+            chunkCount: chunks.length,
+        });
+
         try {
-            const merged = articleTexts.join('\n\n---\n\n');
+            // Pass 1 — rewrite each chunk in parallel (bounded fan-out)
+            const chunkResults = await mapWithConcurrency(chunks, CHUNK_PARALLELISM, (chunkText) =>
+                rewriteChunk(chunkText, {
+                    orgId,
+                    modelTier: writeTier,
+                    customPrompt: writePrompt,
+                    language,
+                })
+            );
+            const chunkOutputs = chunkResults
+                .map((r) => {
+                    if (r?.error) {
+                        console.warn(`[EmailKBProcessor] Chunk rewrite errored in "${category}":`, r.error.message);
+                        return null;
+                    }
+                    if (!r?.article) {
+                        console.warn(`[EmailKBProcessor] Chunk rewrite empty in "${category}": ${r?.reason || 'unknown'}`);
+                        return null;
+                    }
+                    return r.article;
+                })
+                .filter(Boolean);
 
-            console.log(`[EmailKBProcessor] Merging ${articleTexts.length} articles for category "${category}" (${merged.length} chars)`);
-
-            const { article } = await summarizeToArticle(merged, {
-                orgId,
-                modelTier,
-                language,
-                customPrompt: customPrompt || DEFAULT_MERGE_PROMPT,
-            });
-
-            if (article) {
-                const sanitized = shouldRedact ? redactPII(article) : article;
-                results.push({
-                    category,
-                    article: sanitized,
-                    title: category,
-                    sourceCount: articleTexts.length,
-                });
-            } else {
-                console.warn(`[EmailKBProcessor] Merge produced empty result for category "${category}"`);
+            if (chunkOutputs.length === 0) {
+                console.warn(`[EmailKBProcessor] All chunks failed for category "${category}"`);
+                notify('merge_category_complete', { category, chunkCount: chunks.length, finalChars: 0, dedupeRan: false, ok: false });
+                continue;
             }
+
+            // Pass 2 — dedupe only if we had >1 chunks
+            let finalArticle;
+            let dedupeRan = false;
+            if (chunkOutputs.length === 1) {
+                finalArticle = chunkOutputs[0];
+            } else {
+                dedupeRan = true;
+                const dedupe = await dedupeMergedChunks(chunkOutputs, {
+                    orgId,
+                    modelTier: dedupeTier,
+                    customPrompt: dedupePrompt,
+                    language,
+                });
+                if (dedupe.article) {
+                    finalArticle = dedupe.article;
+                } else {
+                    console.warn(`[EmailKBProcessor] Dedupe pass failed for "${category}" (${dedupe.reason}) — falling back to chunk concat`);
+                    finalArticle = chunkOutputs.join('\n\n---\n\n');
+                }
+            }
+
+            const sanitized = shouldRedact ? redactPII(finalArticle) : finalArticle;
+            results.push({
+                category,
+                article: sanitized,
+                title: category,
+                sourceCount: articleTexts.length,
+                chunkCount: chunks.length,
+                dedupeRan,
+            });
+            notify('merge_category_complete', {
+                category,
+                chunkCount: chunks.length,
+                finalChars: sanitized.length,
+                dedupeRan,
+                ok: true,
+            });
         } catch (err) {
             console.error(`[EmailKBProcessor] Merge failed for category "${category}":`, err.message);
+            notify('merge_category_complete', { category, chunkCount: chunks.length, finalChars: 0, dedupeRan: false, ok: false, error: err.message });
         }
     }
 
@@ -1161,6 +1416,7 @@ module.exports = {
     processEmail,
     processEmailThread,
     mergeArticlesByCategory,
+    dedupeMergedChunks,
     buildPerEmailArticle,
     // Tier configuration
     getEmailKBTierConfig,
@@ -1168,4 +1424,5 @@ module.exports = {
     DEFAULT_ARTICLE_PROMPT,
     DEFAULT_CATEGORY_PROMPT,
     DEFAULT_MERGE_PROMPT,
+    DEFAULT_DEDUPE_PROMPT,
 };

@@ -15,8 +15,8 @@ const { setupSSE } = require('../core/sseHelpers');
 const emailKBMetrics = require('../core/emailKBMetrics');
 const { resolveUserOrgIds } = require('../auth');
 
-const ALLOWED_STAGES = new Set(['cleanup', 'pii', 'article', 'category', 'summarize_and_categorize', 'merge']);
-const AI_ASSIST_STAGES = new Set(['article', 'category', 'merge', 'usefulness']);
+const ALLOWED_STAGES = new Set(['cleanup', 'pii', 'article', 'category', 'summarize_and_categorize', 'merge', 'dedupe']);
+const AI_ASSIST_STAGES = new Set(['article', 'category', 'merge', 'dedupe', 'usefulness']);
 const ALLOWED_TIERS = new Set(['fast', 'thinking', 'writer', 'deep_thinking']);
 
 // ──────────────────────────────────────────────
