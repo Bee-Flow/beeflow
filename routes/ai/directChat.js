@@ -723,6 +723,25 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                 console.log(`[DirectChat] Session skills bootstrapped: ${sessionSkills.length}`);
             } catch (bootstrapErr) {
                 console.warn('[DirectChat] Session skill bootstrap failed:', bootstrapErr.message);
+                // Hard fallback so Standard tier always has at least one
+                // chat-local skill even if provider bootstrap fails.
+                sessionSkills = [{
+                    id: `sess_fallback_${Date.now()}`,
+                    name: 'General Assistant Workflow',
+                    description: 'Use a concise, execution-first workflow for this chat.',
+                    instructions: 'Answer directly, structure output clearly, and execute requested tasks without filler.',
+                    workflow: 'Understand intent -> perform actions/tools -> verify -> return concise result.',
+                    rules: 'Prefer actionable outputs, include assumptions when uncertain, keep language aligned with user.',
+                    examples: 'For research requests, gather current facts first, then synthesize in requested format.',
+                    dynamicActivation: true,
+                }];
+                activatedSessionSkillIds = [];
+                bootstrappedSessionSkills = true;
+                send('session_skills_bootstrapped', {
+                    count: sessionSkills.length,
+                    skills: sessionSkills,
+                    activatedSkillIds: activatedSessionSkillIds,
+                });
             }
         }
 
@@ -1691,6 +1710,10 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
 
                         if (toolName === ACTIVATE_SESSION_SKILL_TOOL_NAME && toolResult?.activatedSkillIds) {
                             activatedSessionSkillIds = Array.from(new Set(toolResult.activatedSkillIds));
+                            send('session_skills_updated', {
+                                skills: sessionSkills,
+                                activatedSkillIds: activatedSessionSkillIds,
+                            });
                         }
 
                         send('tool_end', { name: toolName, result: toolResult });
@@ -2126,6 +2149,10 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
 
                 if (toolName === ACTIVATE_SESSION_SKILL_TOOL_NAME && toolResult?.activatedSkillIds) {
                     activatedSessionSkillIds = Array.from(new Set(toolResult.activatedSkillIds));
+                    send('session_skills_updated', {
+                        skills: sessionSkills,
+                        activatedSkillIds: activatedSessionSkillIds,
+                    });
                 }
 
                 send('tool_end', { name: toolName, result: toolResult });
