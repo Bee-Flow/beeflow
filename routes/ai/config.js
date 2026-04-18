@@ -581,6 +581,183 @@ router.post('/config/chat-models-eu', requireAuth, async (req, res) => {
     }
 });
 
+// ─── Custom Chat Model Tiers ─────────────────────────────────────
+
+const VALID_TASK_TYPES = ['direct_chat', 'agent_chat', 'email_kb'];
+const STANDARD_TIER_KEYS = ['fast', 'thinking', 'writer', 'pro'];
+
+function normalizeCustomTier(t) {
+    if (!t || typeof t !== 'object') return null;
+    const id = typeof t.id === 'string' && t.id.startsWith('custom:') ? t.id : null;
+    if (!id) return null;
+    const allowedTaskTypes = Array.isArray(t.allowedTaskTypes)
+        ? t.allowedTaskTypes.filter(tt => VALID_TASK_TYPES.includes(tt))
+        : [];
+    return {
+        id,
+        label: String(t.label || id.replace(/^custom:/, '')),
+        icon: typeof t.icon === 'string' ? t.icon : '✨',
+        description: typeof t.description === 'string' ? t.description : '',
+        modelId: typeof t.modelId === 'string' ? t.modelId : '',
+        maxTokens: Number.isFinite(t.maxTokens) ? t.maxTokens : 16384,
+        temperature: Number.isFinite(t.temperature) ? t.temperature : 0.7,
+        reasoningEffort: typeof t.reasoningEffort === 'string' ? t.reasoningEffort : undefined,
+        reasoningSummary: !!t.reasoningSummary,
+        allowedTaskTypes,
+    };
+}
+
+router.get('/config/custom-chat-models', requireAuth, async (req, res) => {
+    if (!(await isAdminUser(req))) return res.status(403).json({ error: 'Admin access required' });
+    try {
+        const tiers = await configStore.getConfig('custom_chat_model_tiers') || [];
+        res.json({ tiers: Array.isArray(tiers) ? tiers : [] });
+    } catch (e) {
+        console.error('Failed to get custom chat model tiers:', e);
+        res.status(500).json({ error: 'Failed to fetch config' });
+    }
+});
+
+router.post('/config/custom-chat-models', requireAuth, async (req, res) => {
+    if (!(await isAdminUser(req))) return res.status(403).json({ error: 'Admin access required' });
+    try {
+        const { tiers } = req.body;
+        if (!Array.isArray(tiers)) {
+            return res.status(400).json({ error: '`tiers` must be an array' });
+        }
+        const normalized = tiers.map(normalizeCustomTier).filter(Boolean);
+        // Dedupe by id — last occurrence wins
+        const seen = new Map();
+        for (const t of normalized) seen.set(t.id, t);
+        const finalTiers = Array.from(seen.values());
+
+        const warnings = [];
+        const { getProviderForModel } = require('../../core/aiAgent');
+        for (const t of finalTiers) {
+            if (t.modelId) {
+                try { await getProviderForModel(t.modelId); }
+                catch (_) { warnings.push(`Custom tier "${t.id}": model "${t.modelId}" not found in any configured provider`); }
+            }
+        }
+        await configStore.setConfig('custom_chat_model_tiers', finalTiers);
+        if (warnings.length > 0) console.warn('[Config] Custom tier validation warnings:', warnings);
+        res.json({ success: true, warnings, tiers: finalTiers });
+    } catch (e) {
+        console.error('Failed to save custom chat model tiers:', e);
+        res.status(500).json({ error: 'Failed to save config' });
+    }
+});
+
+// Lightweight tier list for org-admin group editor — metadata only (id, label, icon)
+router.get('/config/custom-tiers-list', requireAuth, async (req, res) => {
+    try {
+        const tiers = await configStore.getConfig('custom_chat_model_tiers') || [];
+        const list = (Array.isArray(tiers) ? tiers : []).map(t => ({
+            id: t.id, label: t.label, icon: t.icon, description: t.description,
+            allowedTaskTypes: t.allowedTaskTypes || [],
+        }));
+        res.json({ tiers: list });
+    } catch (e) {
+        res.status(500).json({ error: 'Failed to fetch tiers list' });
+    }
+});
+
+// Returns tiers a given user may use, optionally filtered by taskType.
+// Shape matches the existing /config/chat-models consumer: { fast: {...}, thinking: {...}, ..., 'custom:xyz': {...} }
+router.get('/config/tiers-for-user', requireAuth, async (req, res) => {
+    try {
+        const taskType = typeof req.query.taskType === 'string' ? req.query.taskType : null;
+        const userId = req.session.user?.id;
+        const userOrgId = req.session.user?.organizationId;
+
+        const userStore = require('../../stores/userStore');
+        const { getEUAwareTiers } = require('../../core/modelResolver');
+
+        // Standard tiers (already EU-aware) — always included, unrestricted by the plan's permission model
+        const standardTiers = await getEUAwareTiers({ userOrgId, userId });
+
+        // Custom tiers
+        const customTiers = (await configStore.getConfig('custom_chat_model_tiers')) || [];
+
+        // Resolve user's group ids
+        const user = userId ? await userStore.getUser(userId) : null;
+        const userGroupIds = Array.isArray(user?.groups) ? user.groups : [];
+        const allGroups = await userStore.getAllGroups();
+        const userGroups = allGroups.filter(g => userGroupIds.includes(g.id));
+
+        // A tier is permitted if ANY of the user's groups:
+        //   (a) has allowedTiers empty/unset (no restriction), OR
+        //   (b) lists the tier id in allowedTiers.
+        // If the user has NO groups, treat as unrestricted (matches getUser default behaviour).
+        function tierPermittedByGroups(tierId) {
+            if (userGroups.length === 0) return true;
+            return userGroups.some(g => {
+                const list = Array.isArray(g.allowedTiers) ? g.allowedTiers : [];
+                return list.length === 0 || list.includes(tierId);
+            });
+        }
+
+        const result = {};
+        // Standard
+        for (const key of STANDARD_TIER_KEYS) {
+            if (!tierPermittedByGroups(key)) continue;
+            if (standardTiers && standardTiers[key]) result[key] = standardTiers[key];
+        }
+        // Custom
+        for (const t of (Array.isArray(customTiers) ? customTiers : [])) {
+            if (taskType && !(t.allowedTaskTypes || []).includes(taskType)) continue;
+            if (!tierPermittedByGroups(t.id)) continue;
+            result[t.id] = {
+                modelId: t.modelId,
+                label: t.label,
+                icon: t.icon,
+                description: t.description,
+                maxTokens: t.maxTokens,
+                temperature: t.temperature,
+                reasoningEffort: t.reasoningEffort,
+                reasoningSummary: t.reasoningSummary,
+                custom: true,
+            };
+        }
+        res.json(result);
+    } catch (e) {
+        console.error('Failed to compute tiers-for-user:', e);
+        res.status(500).json({ error: 'Failed to compute tiers' });
+    }
+});
+
+// ─── Email KB Tier Config ────────────────────────────────────────
+
+const EKB_STAGE_KEYS = ['article', 'category', 'merge'];
+
+router.get('/config/email-kb-tiers', requireAuth, async (req, res) => {
+    if (!(await isAdminUser(req))) return res.status(403).json({ error: 'Admin access required' });
+    try {
+        const cfg = (await configStore.getConfig('email_kb_tier_config')) || {};
+        const out = {};
+        for (const k of EKB_STAGE_KEYS) out[k] = typeof cfg[k] === 'string' && cfg[k] ? cfg[k] : 'fast';
+        res.json(out);
+    } catch (e) {
+        res.status(500).json({ error: 'Failed to fetch Email KB tier config' });
+    }
+});
+
+router.post('/config/email-kb-tiers', requireAuth, async (req, res) => {
+    if (!(await isAdminUser(req))) return res.status(403).json({ error: 'Admin access required' });
+    try {
+        const body = req.body || {};
+        const cfg = {};
+        for (const k of EKB_STAGE_KEYS) {
+            if (typeof body[k] === 'string' && body[k]) cfg[k] = body[k];
+        }
+        await configStore.setConfig('email_kb_tier_config', cfg);
+        res.json({ success: true, config: cfg });
+    } catch (e) {
+        console.error('Failed to save Email KB tier config:', e);
+        res.status(500).json({ error: 'Failed to save config' });
+    }
+});
+
 // ─── Direct Chat System Prompt ───────────────────────────────────
 
 router.get('/config/direct-chat', requireAuth, async (req, res) => {

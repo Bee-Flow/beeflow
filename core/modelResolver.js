@@ -129,13 +129,24 @@ async function applyEUOverrides(tiers, { userOrgId = null, userId = null } = {})
  * @param {string}       opts.fallbackTier - Tier to use when rawModel is null (default: 'fast')
  * @returns {Promise<string|null>} Resolved model ID, or null if nothing could be resolved
  */
+async function getCustomTierById(id) {
+    if (!id || !id.startsWith('custom:')) return null;
+    const arr = await configStore.getConfig('custom_chat_model_tiers') || [];
+    if (!Array.isArray(arr)) return null;
+    return arr.find(t => t && t.id === id) || null;
+}
+
 async function resolveModelForTier(rawModel, { userOrgId = null, userId = null, fallbackTier = 'fast' } = {}) {
     let tiers = await configStore.getConfig('chat_model_tiers') || {};
     tiers = await applyEUOverrides(tiers, { userOrgId, userId });
 
-    // Case 1: Explicit tier reference (e.g. 'tier:fast')
+    // Case 1: Explicit tier reference (e.g. 'tier:fast' or 'tier:custom:slug')
     if (rawModel && rawModel.startsWith('tier:')) {
         const tierName = rawModel.substring(5);
+        if (tierName.startsWith('custom:')) {
+            const custom = await getCustomTierById(tierName);
+            return custom?.modelId || tiers[fallbackTier]?.modelId || null;
+        }
         return tiers[tierName]?.modelId || tiers[fallbackTier]?.modelId || null;
     }
 
@@ -174,6 +185,20 @@ async function resolveModelWithGlobalFallback(rawModel, opts = {}) {
  * User-set values always win; TIER_DEFAULTS fill in anything the user hasn't configured.
  */
 async function getTierConfig(tierName, { userOrgId = null, userId = null } = {}) {
+    // Custom tiers carry their own full config — no TIER_DEFAULTS fallback needed.
+    if (tierName && tierName.startsWith('custom:')) {
+        const custom = await getCustomTierById(tierName);
+        if (custom) {
+            return {
+                maxTokens: custom.maxTokens,
+                temperature: custom.temperature,
+                reasoningEffort: custom.reasoningEffort,
+                reasoningSummary: custom.reasoningSummary,
+                modelId: custom.modelId,
+            };
+        }
+        // Fall through to fast defaults if the id is unknown
+    }
     let tiers = await configStore.getConfig('chat_model_tiers') || {};
     tiers = await applyEUOverrides(tiers, { userOrgId, userId });
     const userConfig = tiers[tierName] || tiers['fast'] || {};
@@ -220,4 +245,5 @@ module.exports = {
     resolveModelForTierName,
     getEUAwareTiers,
     isEUModeActive,
+    getCustomTierById,
 };

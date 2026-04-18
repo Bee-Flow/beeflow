@@ -262,8 +262,9 @@ router.post('/:id/sources/meeting', requireAuth, async (req, res) => {
     try {
         const userId = req.session.user.id;
         const notebookId = req.params.id;
-        const { meetingId } = req.body;
+        const { meetingId, mode } = req.body;
         if (!meetingId) return res.status(400).json({ error: 'Meeting ID required' });
+        const ingestMode = mode === 'summary' ? 'summary' : 'full';
 
         const nb = await notebookStore.getNotebook(notebookId, userId);
         if (!nb) return res.status(404).json({ error: 'Notebook not found' });
@@ -271,9 +272,16 @@ router.post('/:id/sources/meeting', requireAuth, async (req, res) => {
         const meeting = await transcriptionStore.getTranscription(meetingId, userId);
         if (!meeting) return res.status(404).json({ error: 'Meeting not found' });
 
-        const sourceName = `Meeting Note: ${meeting.title || 'Untitled Meeting'}`;
-        const sourceText = meeting.transcription || meeting.summary || '';
-        
+        const fullTranscript = meeting.fullText || meeting.transcript || meeting.transcription || '';
+        const summaryText = meeting.summary || '';
+        // Prefer the requested mode; fall back to whichever is populated.
+        const sourceText = ingestMode === 'summary'
+            ? (summaryText.trim() ? summaryText : fullTranscript)
+            : (fullTranscript.trim() ? fullTranscript : summaryText);
+
+        const modeLabel = ingestMode === 'summary' && summaryText.trim() ? ' (summary)' : '';
+        const sourceName = `Meeting Note: ${meeting.title || 'Untitled Meeting'}${modeLabel}`;
+
         if (!sourceText.trim()) return res.status(400).json({ error: 'Meeting has no transcription content' });
 
         const source = await notebookStore.addSource({

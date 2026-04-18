@@ -70,7 +70,8 @@ async function initDB() {
             permissions TEXT DEFAULT '[]',
             roles TEXT DEFAULT '[]',
             "userCount" INTEGER DEFAULT 0,
-            "allowedAgentTypes" TEXT DEFAULT '[]'
+            "allowedAgentTypes" TEXT DEFAULT '[]',
+            "allowedTiers" TEXT DEFAULT '[]'
         );
 
         CREATE TABLE IF NOT EXISTS roles (
@@ -154,6 +155,7 @@ async function initDB() {
     try { await exec(`ALTER TABLE groups ADD COLUMN IF NOT EXISTS "source" TEXT DEFAULT 'manual'`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE groups ADD COLUMN IF NOT EXISTS "lastSyncedAt" TEXT`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE groups ADD COLUMN IF NOT EXISTS "orgRole" TEXT DEFAULT ''`); } catch (e) { /* column already exists */ }
+    try { await exec(`ALTER TABLE groups ADD COLUMN IF NOT EXISTS "allowedTiers" TEXT DEFAULT '[]'`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS "azureUserId" TEXT`); } catch (e) { /* column already exists */ }
 
     // ── Subscription schema migrations ──
@@ -564,7 +566,7 @@ async function deleteOrganization(orgId) {
 async function getAllGroups() {
     await initDB();
     const rows = await getAll('SELECT * FROM groups');
-    return rows.map(g => ({ ...g, permissions: parseJSON(g.permissions, []), roles: parseJSON(g.roles, []), allowedAgentTypes: parseJSON(g.allowedAgentTypes, []) }));
+    return rows.map(g => ({ ...g, permissions: parseJSON(g.permissions, []), roles: parseJSON(g.roles, []), allowedAgentTypes: parseJSON(g.allowedAgentTypes, []), allowedTiers: parseJSON(g.allowedTiers, []) }));
 }
 
 async function createGroup(groupData) {
@@ -590,7 +592,8 @@ async function updateGroup(groupId, updates) {
     if (updates.permissions !== undefined) updateMap.permissions = JSON.stringify(updates.permissions);
     if (updates.roles !== undefined) updateMap.roles = JSON.stringify(updates.roles);
     if (updates.allowedAgentTypes !== undefined) updateMap.allowedAgentTypes = JSON.stringify(updates.allowedAgentTypes);
-    const fullColMap = { ...colMap, organizationId: 'organizationId', permissions: 'permissions', roles: 'roles', allowedAgentTypes: 'allowedAgentTypes' };
+    if (updates.allowedTiers !== undefined) updateMap.allowedTiers = JSON.stringify(updates.allowedTiers);
+    const fullColMap = { ...colMap, organizationId: 'organizationId', permissions: 'permissions', roles: 'roles', allowedAgentTypes: 'allowedAgentTypes', allowedTiers: 'allowedTiers' };
     try {
         const q = dynamicUpdate('groups', groupId, updateMap, fullColMap);
         if (q) await run(q.sql, q.params);

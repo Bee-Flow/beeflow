@@ -168,6 +168,30 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
 
     // Resolve model from tier config (EU-aware via centralized modelResolver)
     let tiers = await getEUAwareTiers({ userOrgId: userOrgForTiers, userId });
+    // Merge custom tiers so 'custom:<slug>' tier IDs resolve through the same
+    // tiers[resolvedTier] lookup below. Auto-classifier still only sees the
+    // standard tiers (see classifyTiers below) so custom tiers can never be
+    // auto-selected — they must be explicitly chosen by the user.
+    try {
+        const customTiers = await configStore.getConfig('custom_chat_model_tiers') || [];
+        if (Array.isArray(customTiers)) {
+            for (const t of customTiers) {
+                if (t?.id && !tiers[t.id]) {
+                    tiers[t.id] = {
+                        modelId: t.modelId,
+                        label: t.label,
+                        icon: t.icon,
+                        description: t.description,
+                        maxTokens: t.maxTokens,
+                        temperature: t.temperature,
+                        reasoningEffort: t.reasoningEffort,
+                        reasoningSummary: t.reasoningSummary,
+                        custom: true,
+                    };
+                }
+            }
+        }
+    } catch (_) { /* fall through without custom tiers */ }
     let disableSearchOnUpload = false;
     let webSearchGuardPiiCategories = null;
     if (userOrgForTiers) {
@@ -190,7 +214,12 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
     if (resolvedTier === 'auto') {
         try {
             const { classifyWithLLM } = require('../../core/promptClassifier');
-            const result = await classifyWithLLM(message, tiers, { userOrgId: userOrgForTiers, userId });
+            // Strip custom tiers from the auto-classifier input — custom tiers must
+            // never win automatic selection; they require explicit user choice.
+            const classifyTiers = Object.fromEntries(
+                Object.entries(tiers).filter(([k]) => !k.startsWith('custom:'))
+            );
+            const result = await classifyWithLLM(message, classifyTiers, { userOrgId: userOrgForTiers, userId });
             resolvedTier = result.tier;
             console.log(`[DirectChat] Auto: tier="${resolvedTier}" (${result.method}: ${result.reason})`);
         } catch (err) {

@@ -384,6 +384,17 @@ async function resolveModel(tierName, orgId) {
     }
 }
 
+// Per-stage default tiers (overridable by explicit caller argument).
+async function getEmailKBTierConfig() {
+    const configStore = require('../stores/configStore');
+    const cfg = (await configStore.getConfig('email_kb_tier_config')) || {};
+    return {
+        article: typeof cfg.article === 'string' && cfg.article ? cfg.article : 'fast',
+        category: typeof cfg.category === 'string' && cfg.category ? cfg.category : 'fast',
+        merge: typeof cfg.merge === 'string' && cfg.merge ? cfg.merge : 'fast',
+    };
+}
+
 function appendLanguageInstruction(prompt, language) {
     if (!language) return prompt;
     return `${prompt}\n\nIMPORTANT: Write the output in ${language}. Do NOT auto-detect — use ${language} regardless of the input language.`;
@@ -740,10 +751,15 @@ async function processEmail(rawContent, metadata = {}, options = {}) {
     const { subject, from, date, messageId } = metadata;
     const {
         senderBlacklist = [], redactPII: shouldRedact = true, language,
-        articleModelTier = 'fast', articlePrompt,
-        categoryModelTier = 'fast', categoryPrompt,
+        articleModelTier: articleModelTierOpt, articlePrompt,
+        categoryModelTier: categoryModelTierOpt, categoryPrompt,
         orgId,
     } = options;
+
+    // Fall back to the configured per-stage tier when the caller didn't override
+    const ekbTiers = await getEmailKBTierConfig();
+    const articleModelTier = articleModelTierOpt || ekbTiers.article;
+    const categoryModelTier = categoryModelTierOpt || ekbTiers.category;
 
     // Check sender blacklist
     if (from && senderBlacklist.length > 0) {
@@ -849,10 +865,14 @@ async function processEmailThread(messages, metadata = {}, options = {}) {
     const { subject, from, date } = metadata;
     const {
         senderBlacklist = [], redactPII: shouldRedact = true, language,
-        articleModelTier = 'fast', articlePrompt,
-        categoryModelTier = 'fast', categoryPrompt,
+        articleModelTier: articleModelTierOpt, articlePrompt,
+        categoryModelTier: categoryModelTierOpt, categoryPrompt,
         orgId,
     } = options;
+
+    const ekbTiers = await getEmailKBTierConfig();
+    const articleModelTier = articleModelTierOpt || ekbTiers.article;
+    const categoryModelTier = categoryModelTierOpt || ekbTiers.category;
 
     // Check sender blacklist on the thread starter
     if (from && senderBlacklist.length > 0) {
@@ -991,7 +1011,9 @@ IMPORTANT: Detect the language of the source articles and write in that SAME lan
  * @returns {Promise<Array<{category: string, article: string, title: string, sourceCount: number}>>}
  */
 async function mergeArticlesByCategory(articles, options = {}) {
-    const { redactPII: shouldRedact = true, modelTier = 'fast', customPrompt, language, orgId } = options;
+    const { redactPII: shouldRedact = true, modelTier: modelTierOpt, customPrompt, language, orgId } = options;
+    const ekbTiers = await getEmailKBTierConfig();
+    const modelTier = modelTierOpt || ekbTiers.merge;
 
     // Group by category
     const groups = {};
@@ -1140,6 +1162,8 @@ module.exports = {
     processEmailThread,
     mergeArticlesByCategory,
     buildPerEmailArticle,
+    // Tier configuration
+    getEmailKBTierConfig,
     // Constants
     DEFAULT_ARTICLE_PROMPT,
     DEFAULT_CATEGORY_PROMPT,

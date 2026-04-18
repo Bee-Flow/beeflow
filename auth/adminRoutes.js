@@ -619,7 +619,7 @@ router.post('/groups', requireAuth, async (req, res) => {
 
 router.put('/groups/:id', requireAuth, async (req, res) => {
     const { id } = req.params;
-    const { description, permissions, roles, organizationId, allowedAgentTypes, orgRole } = req.body;
+    const { description, permissions, roles, organizationId, allowedAgentTypes, allowedTiers, orgRole } = req.body;
 
     // Require org_admin or manage_users permission to edit groups
     const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
