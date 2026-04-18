@@ -78,6 +78,9 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
     }
 
     let resolvedTier = modelTier || 'fast';
+    if (resolvedTier === 'standard') {
+        resolvedTier = 'fast';
+    }
 
     // Auto mode: classify which tier to use (matches direct chat)
     if (resolvedTier === 'auto') {
@@ -90,6 +93,9 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
             console.log(`[NotebookChat] Auto classification failed: ${err.message}, using fast`);
             resolvedTier = 'fast';
         }
+    }
+    if (resolvedTier === 'standard') {
+        resolvedTier = 'fast';
     }
 
     const tier = tiers[resolvedTier] || {};

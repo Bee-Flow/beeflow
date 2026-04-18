@@ -501,11 +501,13 @@ router.get('/config/chat-models', requireAuth, async (req, res) => {
     try {
         const tiers = await configStore.getConfig('chat_model_tiers') || {
             fast: { modelId: '', label: 'Fast' },
+            standard: { modelId: '', label: 'Standard (Direct)' },
             thinking: { modelId: '', label: 'Thinking' },
             writer: { modelId: '', label: 'Writer' },
             pro: { modelId: '', label: 'Pro' }
         };
         if (!tiers.writer) tiers.writer = { modelId: '', label: 'Writer' };
+        if (!tiers.standard) tiers.standard = { modelId: '', label: 'Standard (Direct)' };
         res.json(tiers);
     } catch (e) {
         console.error('Failed to get chat model tiers:', e);
@@ -515,9 +517,10 @@ router.get('/config/chat-models', requireAuth, async (req, res) => {
 
 router.post('/config/chat-models', requireAuth, async (req, res) => {
     try {
-        const { fast, thinking, writer, pro } = req.body;
+        const { fast, standard, thinking, writer, pro } = req.body;
         const tiers = {
             fast: fast || { modelId: '', label: 'Fast' },
+            standard: standard || { modelId: '', label: 'Standard (Direct)' },
             thinking: thinking || { modelId: '', label: 'Thinking' },
             writer: writer || { modelId: '', label: 'Writer' },
             pro: pro || { modelId: '', label: 'Pro' }
@@ -536,10 +539,12 @@ router.get('/config/chat-models-eu', requireAuth, async (req, res) => {
     try {
         const tiers = await configStore.getConfig('chat_model_tiers_eu') || {
             fast: { modelId: '', label: 'Fast' },
+            standard: { modelId: '', label: 'Standard (Direct)' },
             thinking: { modelId: '', label: 'Thinking' },
             writer: { modelId: '', label: 'Writer' },
             pro: { modelId: '', label: 'Pro' }
         };
+        if (!tiers.standard) tiers.standard = { modelId: '', label: 'Standard (Direct)' };
         res.json(tiers);
     } catch (e) {
         console.error('Failed to get EU chat model tiers:', e);
@@ -549,9 +554,10 @@ router.get('/config/chat-models-eu', requireAuth, async (req, res) => {
 
 router.post('/config/chat-models-eu', requireAuth, async (req, res) => {
     try {
-        const { fast, thinking, writer, pro } = req.body;
+        const { fast, standard, thinking, writer, pro } = req.body;
         const tiers = {
             fast: fast || { modelId: '', label: 'Fast' },
+            standard: standard || { modelId: '', label: 'Standard (Direct)' },
             thinking: thinking || { modelId: '', label: 'Thinking' },
             writer: writer || { modelId: '', label: 'Writer' },
             pro: pro || { modelId: '', label: 'Pro' }
@@ -584,7 +590,7 @@ router.post('/config/chat-models-eu', requireAuth, async (req, res) => {
 // ─── Custom Chat Model Tiers ─────────────────────────────────────
 
 const VALID_TASK_TYPES = ['direct_chat', 'agent_chat', 'email_kb'];
-const STANDARD_TIER_KEYS = ['fast', 'thinking', 'writer', 'pro'];
+const STANDARD_TIER_KEYS = ['fast', 'standard', 'thinking', 'writer', 'pro'];
 
 // ── Custom tier helpers ──────────────────────────────────────────
 async function isOrgAdmin(req) {
@@ -832,6 +838,8 @@ router.get('/config/tiers-for-user', requireAuth, async (req, res) => {
         const result = {};
         // Standard
         for (const key of STANDARD_TIER_KEYS) {
+            // Direct-chat-only tier: never expose for non-direct tasks.
+            if (key === 'standard' && taskType !== 'direct_chat') continue;
             if (!tierPermittedByGroups(key)) continue;
             if (standardTiers && standardTiers[key]) result[key] = standardTiers[key];
         }
@@ -1929,4 +1937,3 @@ router.post('/mcp-servers/user-credentials', requireAuth, async (req, res) => {
 });
 
 module.exports = router;
-

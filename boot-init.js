@@ -20,7 +20,7 @@
  *   INIT_SERPER_API_KEY       — Serper.dev API key (for agent-search web search)
  *   INIT_AI_PROVIDER          — Generic AI provider: 'openai' | 'google' | 'mistral' | 'claude'
  *   INIT_GENERIC_API_KEY      — API key for the generic AI provider above
- *   INIT_CHAT_MODEL_TIERS     — JSON: { fast, thinking, writer, pro } each { modelId }
+ *   INIT_CHAT_MODEL_TIERS     — JSON: { fast, standard, thinking, writer, pro } each { modelId }
  *   INIT_OFFICE_APPS_ENABLED  — 'true' | 'false' — enables Office 365 integration
  */
 
@@ -183,13 +183,14 @@ async function runBootInit() {
 
         // ── 7. Model tier configuration ─────────────────────────────
         // Tiers are stored in configStore ('chat_model_tiers') as:
-        // { fast: { modelId }, thinking: { modelId }, writer: { modelId }, pro: { modelId } }
+        // { fast: { modelId }, standard: { modelId }, thinking: { modelId }, writer: { modelId }, pro: { modelId } }
         if (chatModelTiersRaw) {
             await retry(async () => {
                 const incoming = JSON.parse(chatModelTiersRaw);
                 const existing = await configStore.getConfig('chat_model_tiers') || {};
                 const merged = {
                     fast:     { modelId: '', label: 'Fast',          ...(existing.fast     || {}), ...(incoming.fast     || {}) },
+                    standard: { modelId: '', label: 'Standard (Direct)', ...(existing.standard || {}), ...(incoming.standard || {}) },
                     thinking: { modelId: '', label: 'Thinking',      ...(existing.thinking || {}), ...(incoming.thinking || {}) },
                     writer:   { modelId: '', label: 'Writer',        ...(existing.writer   || {}), ...(incoming.writer   || {}) },
                     pro:      { modelId: '', label: 'Deep Thinking',  ...(existing.pro      || {}), ...(incoming.pro      || {}) },

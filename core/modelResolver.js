@@ -19,6 +19,7 @@ const configStore = require('../stores/configStore');
 //
 // Rationale:
 //   - fast:          Short, snappy answers. Low token ceiling = faster completion.
+//   - standard:      Direct-chat baseline with session-skill bootstrap.
 //   - thinking:      Analysis / reasoning. Medium budget + medium reasoning effort.
 //   - writer:        Long-form content (reports, articles). High token ceiling.
 //   - deep_thinking: Complex multi-step tasks. Maximum quality.
@@ -29,6 +30,12 @@ const TIER_DEFAULTS = {
         maxTokens: 2048,
         temperature: 0.2,
         reasoningEffort: undefined, // no reasoning for speed
+        reasoningSummary: false,
+    },
+    standard: {
+        maxTokens: 8192,
+        temperature: 0.5,
+        reasoningEffort: 'low',
         reasoningSummary: false,
     },
     thinking: {

@@ -73,6 +73,9 @@ router.post('/chat/template/stream', requireAuth, async (req, res) => {
 
     // Resolve model from tier config (EU-aware)
     let resolvedTier = modelTier || 'fast';
+    if (resolvedTier === 'standard') {
+        resolvedTier = 'fast';
+    }
     const tierConfig = await getTierConfig(resolvedTier, { userOrgId, userId });
     let modelId = await resolveModelForTier(`tier:${resolvedTier}`, { userOrgId, userId, fallbackTier: 'fast' });
 

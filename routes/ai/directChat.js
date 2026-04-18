@@ -19,6 +19,11 @@ const { classifyPromptComplexity } = require('../../core/promptClassifier');
 const { getAdapter } = require('../../core/providers');
 const agentStore = require('../../stores/agentStore');
 const { executeTool: dispatchTool } = require('../../core/toolDispatcher');
+const {
+    ACTIVATE_SESSION_SKILL_TOOL_NAME,
+    bootstrapSessionSkills,
+    buildSessionSkillInjection,
+} = require('../../core/sessionSkillRuntime');
 const { WORKSPACE_TOOLS } = require('../../integrations/workspaceTools');
 const guardrailEventStore = require('../../stores/guardrailEventStore');
 
@@ -223,7 +228,7 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
             // Strip custom tiers from the auto-classifier input — custom tiers must
             // never win automatic selection; they require explicit user choice.
             const classifyTiers = Object.fromEntries(
-                Object.entries(tiers).filter(([k]) => !k.startsWith('custom:'))
+                Object.entries(tiers).filter(([k]) => !k.startsWith('custom:') && k !== 'standard')
             );
             const result = await classifyWithLLM(message, classifyTiers, { userOrgId: userOrgForTiers, userId });
             resolvedTier = result.tier;
@@ -649,6 +654,10 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         let lastResponseId = null; // OpenAI Responses API chaining
         let conversationSummary = null; // Compaction summary
         let hasDocumentAttachment = false;
+        const isStandardTier = resolvedTier === 'standard';
+        let sessionSkills = [];
+        let activatedSessionSkillIds = [];
+        let bootstrappedSessionSkills = false;
 
         // Load metadata from existing conversation
         if (convId) {
@@ -673,8 +682,57 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                         directChatTools = directChatTools.filter(t => t.function.name !== 'agent_search');
                         console.log('[DirectChat] Web search disabled — files found in conversation history DB (org policy)');
                     }
+                    if (Array.isArray(existingConv.sessionSkills)) {
+                        sessionSkills = existingConv.sessionSkills;
+                    }
+                    if (Array.isArray(existingConv.activatedSessionSkillIds)) {
+                        activatedSessionSkillIds = existingConv.activatedSessionSkillIds;
+                    }
                 }
             } catch (e) { /* ignore */ }
+        }
+
+        // Forced bootstrap for the direct-chat-only standard tier:
+        // each conversation starts by generating its own chat-local skill set.
+        if (isStandardTier && sessionSkills.length === 0) {
+            try {
+                sessionSkills = await bootstrapSessionSkills({
+                    adapter,
+                    apiKey,
+                    apiUrl,
+                    modelId,
+                    message: message || '[No text message provided]',
+                    timezone: timezone || 'UTC',
+                    apiVersion: config.apiVersion || undefined,
+                });
+                activatedSessionSkillIds = [];
+                bootstrappedSessionSkills = true;
+                send('session_skills_bootstrapped', { count: sessionSkills.length });
+                console.log(`[DirectChat] Session skills bootstrapped: ${sessionSkills.length}`);
+            } catch (bootstrapErr) {
+                console.warn('[DirectChat] Session skill bootstrap failed:', bootstrapErr.message);
+            }
+        }
+
+        // Inject chat-local session skills (standard tier) with dynamic activation tools.
+        if (isStandardTier && sessionSkills.length > 0) {
+            const sessionSkillInjection = buildSessionSkillInjection({
+                sessionSkills,
+                activatedSkillIds: activatedSessionSkillIds,
+            });
+            if (sessionSkillInjection.systemPromptAddendum) {
+                messages[0].content += sessionSkillInjection.systemPromptAddendum;
+            }
+            for (const t of sessionSkillInjection.tools) {
+                if (!directChatTools.find(dt => dt.function?.name === t.function?.name)) {
+                    directChatTools.push(t);
+                }
+            }
+        }
+        // The skill-bootstrap pass is intentionally isolated from the response pass.
+        // Do not chain provider response IDs from before/through bootstrap.
+        if (bootstrappedSessionSkills) {
+            lastResponseId = null;
         }
 
         // Add current message (with attachments if any)
@@ -1601,6 +1659,8 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                                 nanoBananaSettings,
                                 req,
                                 attachments,
+                                sessionSkills,
+                                activatedSessionSkillIds,
                                 timezone: timezone || 'Europe/Amsterdam',
                                 onImageGenerated: (data) => generatedImages.push(data),
                                 terminalCtx: {
@@ -1615,6 +1675,10 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                         } catch (err) {
                             console.error(`[DirectChat] Tool execution failed for ${toolName}:`, err);
                             toolResult = { error: err.message };
+                        }
+
+                        if (toolName === ACTIVATE_SESSION_SKILL_TOOL_NAME && toolResult?.activatedSkillIds) {
+                            activatedSessionSkillIds = Array.from(new Set(toolResult.activatedSkillIds));
                         }
 
                         send('tool_end', { name: toolName, result: toolResult });
@@ -2030,6 +2094,8 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                         nanoBananaSettings,
                         req,
                         attachments,
+                        sessionSkills,
+                        activatedSessionSkillIds,
                         timezone: timezone || 'Europe/Amsterdam',
                         onImageGenerated: (data) => generatedImages.push(data),
                         terminalCtx: {
@@ -2044,6 +2110,10 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                 } catch (err) {
                     console.error(`[DirectChat] Streamed tool execution failed for ${toolName}:`, err);
                     toolResult = { error: err.message };
+                }
+
+                if (toolName === ACTIVATE_SESSION_SKILL_TOOL_NAME && toolResult?.activatedSkillIds) {
+                    activatedSessionSkillIds = Array.from(new Set(toolResult.activatedSkillIds));
                 }
 
                 send('tool_end', { name: toolName, result: toolResult });
@@ -2340,7 +2410,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
 
         // ─── Conversation persistence ────────────────────────────
         if (!convId) {
-            const conv = await agentStore.createDirectConversation(userId, modelTier || 'fast');
+            const conv = await agentStore.createDirectConversation(userId, resolvedTier || 'fast');
             convId = conv.id;
             send('conversation_created', { conversationId: convId });
             // Assign to project if provided
@@ -2419,6 +2489,10 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             }
             if (conversationSummary) {
                 updateMeta.conversationSummary = conversationSummary;
+            }
+            if (isStandardTier && sessionSkills.length > 0) {
+                updateMeta.sessionSkills = sessionSkills;
+                updateMeta.activatedSessionSkillIds = activatedSessionSkillIds;
             }
             await agentStore.updateDirectConversation(convId, savedMessages, userId, updateMeta);
 

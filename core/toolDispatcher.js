@@ -109,6 +109,28 @@ async function executeTool(toolName, toolArgs, context = {}) {
     if (toolName === ACTIVATE_SKILL_TOOL_NAME) {
         return await executeActivateSkill({ args: toolArgs, orgId, userId });
     }
+    // ─── Session Skill Runtime (direct-chat local skills) ───────
+    const {
+        ACTIVATE_SESSION_SKILL_TOOL_NAME,
+        PUBLISH_SESSION_SKILL_TOOL_NAME,
+        executeActivateSessionSkill,
+        executePublishSessionSkill,
+    } = require('./sessionSkillRuntime');
+    if (toolName === ACTIVATE_SESSION_SKILL_TOOL_NAME) {
+        return await executeActivateSessionSkill({
+            args: toolArgs,
+            sessionSkills: context.sessionSkills || [],
+            activatedSkillIds: context.activatedSessionSkillIds || [],
+        });
+    }
+    if (toolName === PUBLISH_SESSION_SKILL_TOOL_NAME) {
+        return await executePublishSessionSkill({
+            args: toolArgs,
+            sessionSkills: context.sessionSkills || [],
+            orgId,
+            userId,
+        });
+    }
 
     // ─── Image Generation ───────────────────────────────────────
     if (toolName === 'generate_image') {
