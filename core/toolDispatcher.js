@@ -104,6 +104,12 @@ async function executeTool(toolName, toolArgs, context = {}) {
     // ─── Terminal Tools (removed — module no longer exists) ────
     // Terminal container system has been removed from the platform
 
+    // ─── Skill Activation (dynamic skill loading) ──────────────
+    const { ACTIVATE_SKILL_TOOL_NAME, executeActivateSkill } = require('./skillInjection');
+    if (toolName === ACTIVATE_SKILL_TOOL_NAME) {
+        return await executeActivateSkill({ args: toolArgs, orgId, userId });
+    }
+
     // ─── Image Generation ───────────────────────────────────────
     if (toolName === 'generate_image') {
         // Lazy import to avoid circular deps

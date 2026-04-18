@@ -593,28 +593,25 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         }
 
         // ─── Skills injection ────────────────────────────────────
+        // Static skills inject their full body into skillsContext. Dynamic
+        // skills inject only a manifest line and add an `activate_skill` tool
+        // to directChatTools so the model can pull the full body on demand.
         let skillsContext = '';
-        if (Array.isArray(activeSkillIds) && activeSkillIds.length > 0) {
-            try {
-                const skillStore = require('../../stores/skillStore');
-                // Cap at 5 active skills to prevent token overflow
-                const cappedIds = activeSkillIds.slice(0, 5);
-                const skills = await skillStore.getSkillsByIds(cappedIds, userOrgForTiers, userId);
-                if (skills.length > 0) {
-                    const skillBlocks = skills.map(s => {
-                        let block = `\n### SKILL — "${s.name}"`;
-                        if (s.instructions) block += `\nInstructions: ${s.instructions}`;
-                        if (s.workflow) block += `\nWorkflow: ${s.workflow}`;
-                        if (s.rules) block += `\nRules: ${s.rules}`;
-                        if (s.examples) block += `\nExamples: ${s.examples}`;
-                        return block;
-                    }).join('\n');
-                    skillsContext = `\n\n[ACTIVE SKILLS]\nThe user has activated the following skills. Follow their instructions precisely when the task matches.${skillBlocks}`;
-                    console.log(`[DirectChat] Injected ${skills.length} skill(s): ${skills.map(s => s.name).join(', ')}`);
-                }
-            } catch (skillErr) {
-                console.warn('[DirectChat] Skills injection failed:', skillErr.message);
+        try {
+            const { buildSkillInjection } = require('../../core/skillInjection');
+            const skillInjection = await buildSkillInjection({
+                sessionSkillIds: Array.isArray(activeSkillIds) ? activeSkillIds : [],
+                attachedSkillIds: [], // direct chat has no agent => no attached skills
+                orgId: userOrgForTiers,
+                userId,
+            });
+            if (skillInjection.systemPromptAddendum) {
+                skillsContext = skillInjection.systemPromptAddendum;
+                console.log(`[DirectChat] Skills: ${skillInjection.staticCount} static, ${skillInjection.dynamicSkillIds.length} dynamic`);
             }
+            for (const t of skillInjection.tools) directChatTools.push(t);
+        } catch (skillErr) {
+            console.warn('[DirectChat] Skills injection failed:', skillErr.message);
         }
 
         // Build Now: with explicit UTC offset so the AI knows the user's local time

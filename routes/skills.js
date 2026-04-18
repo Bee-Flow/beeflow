@@ -44,7 +44,7 @@ router.post('/', async (req, res) => {
         const orgId = await getOrgId(req);
         if (!orgId) return res.status(400).json({ error: 'No organization found' });
 
-        const { name, description, instructions, workflow, rules, examples, icon, isShared } = req.body;
+        const { name, description, instructions, workflow, rules, examples, icon, isShared, dynamicActivation } = req.body;
         if (!name || !name.trim()) {
             return res.status(400).json({ error: 'Skill name is required' });
         }
@@ -64,6 +64,7 @@ router.post('/', async (req, res) => {
             examples,
             icon,
             isShared,
+            dynamicActivation,
         });
         res.status(201).json(skill);
     } catch (err) {
@@ -90,13 +91,13 @@ router.get('/:id', async (req, res) => {
 // ── PUT /api/skills/:id — update a skill ─────────────────────
 router.put('/:id', async (req, res) => {
     try {
-        const { name, description, instructions, workflow, rules, examples, icon, isShared } = req.body;
+        const { name, description, instructions, workflow, rules, examples, icon, isShared, dynamicActivation } = req.body;
         if (instructions && instructions.length > 4000) {
             return res.status(400).json({ error: 'Instructions too long (max 4000 characters)' });
         }
 
         const updated = await skillStore.updateSkill(req.params.id, req.session.user.id, {
-            name, description, instructions, workflow, rules, examples, icon, isShared,
+            name, description, instructions, workflow, rules, examples, icon, isShared, dynamicActivation,
         });
         if (!updated) return res.status(404).json({ error: 'Skill not found or not owner' });
         res.json({ success: true });

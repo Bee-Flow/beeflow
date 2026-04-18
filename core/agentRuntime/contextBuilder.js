@@ -1,5 +1,6 @@
 const { processSystemPrompt } = require('../promptUtils');
 const { buildToolHint } = require('../integrationTools');
+const { buildSkillInjection } = require('../skillInjection');
 
 async function buildSystemPrompt({ agent, tools, userId, messageMetadata, memoryContext, isStrictKnowledge }) {
     const defaultPrompt = tools.length > 0
@@ -52,40 +53,28 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
     }
 
     // ─── Skills injection ──────────────────────────────────
-    // Merge agent-attached skills (always on for this agent) with the user's
-    // session-activated skills (messageMetadata.activeSkillIds). Dedupe, cap
-    // at 5 to bound prompt size. Attached skills come first so they survive
-    // the cap even if the user toggled extras.
-    const SKILL_CAP = 5;
+    // Delegates to the shared helper which splits skills into static (full
+    // body injected here) and dynamic (manifest only; AI loads via the
+    // `activate_skill` tool on demand). The helper returns extra tool
+    // definitions that the caller (chat.js) appends to the tools array so
+    // the model can actually invoke activate_skill.
     const sessionSkillIds = Array.isArray(messageMetadata?.activeSkillIds) ? messageMetadata.activeSkillIds : [];
     const attachedSkillIds = Array.isArray(agent?.config?.attachedSkillIds) ? agent.config.attachedSkillIds : [];
-    const mergedSkillIds = [];
-    const seen = new Set();
-    for (const id of [...attachedSkillIds, ...sessionSkillIds]) {
-        if (!id || seen.has(id)) continue;
-        seen.add(id);
-        mergedSkillIds.push(id);
-        if (mergedSkillIds.length >= SKILL_CAP) break;
+    const skillInjection = await buildSkillInjection({
+        sessionSkillIds,
+        attachedSkillIds,
+        orgId: messageMetadata?.orgId,
+        userId,
+    });
+    if (skillInjection.systemPromptAddendum) {
+        systemPrompt += skillInjection.systemPromptAddendum;
+        console.log(`[contextBuilder] Skills: ${skillInjection.staticCount} static, ${skillInjection.dynamicSkillIds.length} dynamic (attached=${attachedSkillIds.length}, session=${sessionSkillIds.length})`);
     }
-    if (mergedSkillIds.length > 0 && messageMetadata?.orgId) {
-        try {
-            const skillStore = require('../../stores/skillStore');
-            const skills = await skillStore.getSkillsByIds(mergedSkillIds, messageMetadata.orgId, userId);
-            if (skills.length > 0) {
-                const skillBlocks = skills.map(s => {
-                    let block = `\n### SKILL — "${s.name}"`;
-                    if (s.instructions) block += `\nInstructions: ${s.instructions}`;
-                    if (s.workflow)     block += `\nWorkflow: ${s.workflow}`;
-                    if (s.rules)        block += `\nRules: ${s.rules}`;
-                    if (s.examples)     block += `\nExamples: ${s.examples}`;
-                    return block;
-                }).join('\n');
-                systemPrompt += `\n\n[ACTIVE SKILLS]\nThe user has activated the following skills. Follow their instructions precisely when the task matches.${skillBlocks}`;
-                console.log(`[contextBuilder] Injected ${skills.length} skill(s): ${skills.map(s => s.name).join(', ')} (attached=${attachedSkillIds.length}, session=${sessionSkillIds.length})`);
-            }
-        } catch (skillErr) {
-            console.warn('[contextBuilder] Skills injection failed:', skillErr.message);
-        }
+    // Mutate the caller's tools array in place so the model sees activate_skill
+    // when any dynamic skills are in play. Safe because chatStream passes the
+    // same reference it later hands to the LLM.
+    if (Array.isArray(tools) && skillInjection.tools.length > 0) {
+        for (const t of skillInjection.tools) tools.push(t);
     }
 
     // For strict knowledge mode, prepend a hard constraint at the TOP of the system prompt

@@ -41,9 +41,12 @@ async function initDB() {
             examples TEXT DEFAULT '',
             icon TEXT DEFAULT '⚡',
             is_shared BOOLEAN DEFAULT false,
+            dynamic_activation BOOLEAN DEFAULT false,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
+
+        ALTER TABLE skills ADD COLUMN IF NOT EXISTS dynamic_activation BOOLEAN DEFAULT false;
 
         CREATE INDEX IF NOT EXISTS idx_skills_org ON skills(org_id);
         CREATE INDEX IF NOT EXISTS idx_skills_user ON skills(user_id);
@@ -61,20 +64,20 @@ initDB().catch(err => console.error('[SkillStore] Init error:', err.message));
 /**
  * Create a new skill.
  */
-async function createSkill({ orgId, userId, name, description, instructions, workflow, rules, examples, icon, isShared }) {
+async function createSkill({ orgId, userId, name, description, instructions, workflow, rules, examples, icon, isShared, dynamicActivation }) {
     await initDB();
     const id = crypto.randomUUID();
     await run(
-        `INSERT INTO skills (id, org_id, user_id, name, description, instructions, workflow, rules, examples, icon, is_shared)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-        [id, orgId, userId, name, description || '', instructions || '', workflow || '', rules || '', examples || '', icon || '⚡', isShared === true]
+        `INSERT INTO skills (id, org_id, user_id, name, description, instructions, workflow, rules, examples, icon, is_shared, dynamic_activation)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+        [id, orgId, userId, name, description || '', instructions || '', workflow || '', rules || '', examples || '', icon || '⚡', isShared === true, dynamicActivation === true]
     );
     console.log(`[SkillStore] Created skill "${name}" for org ${orgId}`);
     _notifySkillSync(orgId, id);
     return {
         id, orgId, userId, name, description: description || '', instructions: instructions || '',
         workflow: workflow || '', rules: rules || '', examples: examples || '',
-        icon: icon || '⚡', isShared: isShared === true,
+        icon: icon || '⚡', isShared: isShared === true, dynamicActivation: dynamicActivation === true,
         createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
     };
 }
@@ -141,6 +144,10 @@ async function updateSkill(id, userId, updates) {
         setClauses.push(`is_shared = $${idx++}`);
         params.push(updates.isShared === true);
     }
+    if (updates.dynamicActivation !== undefined) {
+        setClauses.push(`dynamic_activation = $${idx++}`);
+        params.push(updates.dynamicActivation === true);
+    }
 
     if (setClauses.length === 0) return false;
     setClauses.push('updated_at = NOW()');
@@ -189,6 +196,7 @@ function mapRow(r) {
         examples: r.examples || '',
         icon: r.icon || '⚡',
         isShared: r.is_shared === true,
+        dynamicActivation: r.dynamic_activation === true,
         createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
         updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : null,
     };
