@@ -110,8 +110,20 @@ router.put('/:id', async (req, res) => {
 router.delete('/:id', async (req, res) => {
     try {
         const isAdmin = req.session?.isAdmin || req.session?.user?.role === 'admin';
+        const orgId = await getOrgId(req);
         const deleted = await skillStore.deleteSkill(req.params.id, req.session.user.id, isAdmin);
         if (!deleted) return res.status(404).json({ error: 'Skill not found or not owner' });
+
+        // Scrub the deleted skill id from every agent in this org that had it attached.
+        // Non-fatal: a failure here leaves a dangling id that the runtime simply ignores.
+        try {
+            const agentStore = require('../stores/agentStore');
+            const scrubbed = await agentStore.scrubSkillFromAllAgents(orgId, req.params.id);
+            if (scrubbed > 0) console.log(`[Skills] Scrubbed deleted skill ${req.params.id} from ${scrubbed} agent(s)`);
+        } catch (scrubErr) {
+            console.warn('[Skills] Scrub after delete failed:', scrubErr.message);
+        }
+
         res.json({ success: true });
     } catch (err) {
         console.error('[Skills] DELETE /:id error:', err);

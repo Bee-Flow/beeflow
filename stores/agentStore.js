@@ -113,4 +113,7 @@ module.exports = {
     getAgentCategories: agentCrud.getAgentCategories,
     createAgentCategory: agentCrud.createAgentCategory,
     deleteAgentCategory: agentCrud.deleteAgentCategory,
+
+    // ── Skills cross-reference cleanup ───────────────────────────────────────
+    scrubSkillFromAllAgents: agentCrud.scrubSkillFromAllAgents,
 };

@@ -247,9 +247,33 @@ async function deleteAgentCategory(id) {
     return rowCount > 0;
 }
 
+// Remove a skill id from every agent's config.attachedSkillIds.
+// Called when a skill is deleted so dangling references don't linger in agent configs.
+async function scrubSkillFromAllAgents(orgId, skillId) {
+    await initDB();
+    if (!skillId) return 0;
+    const query = orgId
+        ? "SELECT id, config FROM agents WHERE organization_id = $1 AND config::text LIKE $2"
+        : "SELECT id, config FROM agents WHERE config::text LIKE $1";
+    const params = orgId ? [orgId, `%${skillId}%`] : [`%${skillId}%`];
+    const rows = await getAll(query, params);
+    let scrubbed = 0;
+    for (const row of rows) {
+        let cfg;
+        try { cfg = typeof row.config === 'string' ? JSON.parse(row.config) : (row.config || {}); } catch (_) { cfg = {}; }
+        const ids = Array.isArray(cfg.attachedSkillIds) ? cfg.attachedSkillIds : null;
+        if (!ids || !ids.includes(skillId)) continue;
+        cfg.attachedSkillIds = ids.filter(x => x !== skillId);
+        await run('UPDATE agents SET config = $1, updated_at = NOW() WHERE id = $2', [JSON.stringify(cfg), row.id]);
+        scrubbed++;
+    }
+    return scrubbed;
+}
+
 module.exports = {
     createAgent, getAgents, getAgent, updateAgent, deleteAgent, forceDeleteAgent,
     getPublishedAgents, setAgentPublished, getPublishedAgentsForUser,
     getAllAgents, getSystemAgents, ensurePlaceholderAgent,
     getAgentCategories, createAgentCategory, deleteAgentCategory,
+    scrubSkillFromAllAgents,
 };

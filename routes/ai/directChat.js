@@ -597,8 +597,8 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         if (Array.isArray(activeSkillIds) && activeSkillIds.length > 0) {
             try {
                 const skillStore = require('../../stores/skillStore');
-                // Cap at 3 active skills to prevent token overflow
-                const cappedIds = activeSkillIds.slice(0, 3);
+                // Cap at 5 active skills to prevent token overflow
+                const cappedIds = activeSkillIds.slice(0, 5);
                 const skills = await skillStore.getSkillsByIds(cappedIds, userOrgForTiers, userId);
                 if (skills.length > 0) {
                     const skillBlocks = skills.map(s => {

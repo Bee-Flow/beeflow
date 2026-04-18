@@ -52,12 +52,25 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
     }
 
     // ─── Skills injection ──────────────────────────────────
-    const activeSkillIds = messageMetadata?.activeSkillIds;
-    if (Array.isArray(activeSkillIds) && activeSkillIds.length > 0 && messageMetadata?.orgId) {
+    // Merge agent-attached skills (always on for this agent) with the user's
+    // session-activated skills (messageMetadata.activeSkillIds). Dedupe, cap
+    // at 5 to bound prompt size. Attached skills come first so they survive
+    // the cap even if the user toggled extras.
+    const SKILL_CAP = 5;
+    const sessionSkillIds = Array.isArray(messageMetadata?.activeSkillIds) ? messageMetadata.activeSkillIds : [];
+    const attachedSkillIds = Array.isArray(agent?.config?.attachedSkillIds) ? agent.config.attachedSkillIds : [];
+    const mergedSkillIds = [];
+    const seen = new Set();
+    for (const id of [...attachedSkillIds, ...sessionSkillIds]) {
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        mergedSkillIds.push(id);
+        if (mergedSkillIds.length >= SKILL_CAP) break;
+    }
+    if (mergedSkillIds.length > 0 && messageMetadata?.orgId) {
         try {
             const skillStore = require('../../stores/skillStore');
-            const cappedIds = activeSkillIds.slice(0, 3);
-            const skills = await skillStore.getSkillsByIds(cappedIds, messageMetadata.orgId, userId);
+            const skills = await skillStore.getSkillsByIds(mergedSkillIds, messageMetadata.orgId, userId);
             if (skills.length > 0) {
                 const skillBlocks = skills.map(s => {
                     let block = `\n### SKILL — "${s.name}"`;
@@ -68,7 +81,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                     return block;
                 }).join('\n');
                 systemPrompt += `\n\n[ACTIVE SKILLS]\nThe user has activated the following skills. Follow their instructions precisely when the task matches.${skillBlocks}`;
-                console.log(`[contextBuilder] Injected ${skills.length} skill(s): ${skills.map(s => s.name).join(', ')}`);
+                console.log(`[contextBuilder] Injected ${skills.length} skill(s): ${skills.map(s => s.name).join(', ')} (attached=${attachedSkillIds.length}, session=${sessionSkillIds.length})`);
             }
         } catch (skillErr) {
             console.warn('[contextBuilder] Skills injection failed:', skillErr.message);
