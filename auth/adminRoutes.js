@@ -657,6 +657,9 @@ router.put('/groups/:id', requireAuth, async (req, res) => {
     if (allowedAgentTypes !== undefined) {
         updates.allowedAgentTypes = allowedAgentTypes;
     }
+    if (allowedTiers !== undefined) {
+        updates.allowedTiers = allowedTiers;
+    }
     if (orgRole !== undefined) {
         updates.orgRole = orgRole;
     }
