@@ -586,6 +586,57 @@ router.post('/config/chat-models-eu', requireAuth, async (req, res) => {
 const VALID_TASK_TYPES = ['direct_chat', 'agent_chat', 'email_kb'];
 const STANDARD_TIER_KEYS = ['fast', 'thinking', 'writer', 'pro'];
 
+// ── Custom tier helpers ──────────────────────────────────────────
+async function isOrgAdmin(req) {
+    if (await isAdminUser(req)) return true;
+    const userId = req.session.user?.id;
+    if (!userId) return false;
+    const perms = await require('../../auth/permissions').getUserPermissions(userId, req.session);
+    return perms.includes('all') || perms.includes('org_admin') || perms.includes('manage_users');
+}
+
+async function resolveSessionOrgId(req) {
+    if (req.session.user?.organizationId) return req.session.user.organizationId;
+    try {
+        const userStore = require('../../stores/userStore');
+        const u = await userStore.getUser(req.session.user?.id);
+        if (u?.organizationId) return u.organizationId;
+        // Fallback: first group's org
+        const groups = Array.isArray(u?.groups) ? u.groups : [];
+        if (groups.length > 0) {
+            const allGroups = await userStore.getAllGroups();
+            for (const gid of groups) {
+                const g = allGroups.find(gr => gr.id === gid);
+                if (g?.organizationId) return g.organizationId;
+            }
+        }
+    } catch (_) { /* ignore */ }
+    return null;
+}
+
+async function loadGlobalCustomTiers() {
+    const arr = await configStore.getConfig('custom_chat_model_tiers') || [];
+    return Array.isArray(arr) ? arr : [];
+}
+
+async function loadOrgCustomTiers(orgId) {
+    if (!orgId) return [];
+    const arr = await configStore.getConfig(`custom_chat_model_tiers_org_${orgId}`) || [];
+    return Array.isArray(arr) ? arr : [];
+}
+
+// Merge global + org tiers into a single array with stable ordering.
+// When IDs collide, the org tier wins (org admin has final word in their org).
+// Each tier gets a `_scope` field ('global' | 'org') so the UI can show badges.
+async function loadMergedCustomTiers(orgId) {
+    const globalTiers = await loadGlobalCustomTiers();
+    const orgTiers = orgId ? await loadOrgCustomTiers(orgId) : [];
+    const byId = new Map();
+    for (const t of globalTiers) if (t && t.id) byId.set(t.id, { ...t, _scope: 'global' });
+    for (const t of orgTiers) if (t && t.id) byId.set(t.id, { ...t, _scope: 'org' });
+    return Array.from(byId.values());
+}
+
 function normalizeCustomTier(t) {
     if (!t || typeof t !== 'object') return null;
     const id = typeof t.id === 'string' && t.id.startsWith('custom:') ? t.id : null;
@@ -599,6 +650,9 @@ function normalizeCustomTier(t) {
         icon: typeof t.icon === 'string' ? t.icon : '✨',
         description: typeof t.description === 'string' ? t.description : '',
         modelId: typeof t.modelId === 'string' ? t.modelId : '',
+        // Optional EU-hosted override used when the org's Privacy Shield forces EU mode.
+        // Empty string → no override; falls back to the global modelId.
+        euModelId: typeof t.euModelId === 'string' ? t.euModelId : '',
         maxTokens: Number.isFinite(t.maxTokens) ? t.maxTokens : 16384,
         temperature: Number.isFinite(t.temperature) ? t.temperature : 0.7,
         reasoningEffort: typeof t.reasoningEffort === 'string' ? t.reasoningEffort : undefined,
@@ -648,17 +702,87 @@ router.post('/config/custom-chat-models', requireAuth, async (req, res) => {
     }
 });
 
-// Lightweight tier list for org-admin group editor — metadata only (id, label, icon)
+// Lightweight tier list for org-admin group editor — metadata only (id, label, icon, scope)
+// Returns global + the caller's org tiers merged.
 router.get('/config/custom-tiers-list', requireAuth, async (req, res) => {
     try {
-        const tiers = await configStore.getConfig('custom_chat_model_tiers') || [];
-        const list = (Array.isArray(tiers) ? tiers : []).map(t => ({
+        const orgId = await resolveSessionOrgId(req);
+        const tiers = await loadMergedCustomTiers(orgId);
+        const list = tiers.map(t => ({
             id: t.id, label: t.label, icon: t.icon, description: t.description,
             allowedTaskTypes: t.allowedTaskTypes || [],
+            scope: t._scope || 'global',
         }));
         res.json({ tiers: list });
     } catch (e) {
         res.status(500).json({ error: 'Failed to fetch tiers list' });
+    }
+});
+
+// ─── Org-scoped Custom Tiers (org admin) ─────────────────────────
+// Operates on custom_chat_model_tiers_org_{orgId}. Org admins may create/edit
+// tiers that are scoped to their organization. Super admins may use this on
+// any org by passing ?orgId=xxx; org admins implicitly target their own org.
+router.get('/config/org-custom-chat-models', requireAuth, async (req, res) => {
+    if (!(await isOrgAdmin(req))) return res.status(403).json({ error: 'Org admin access required' });
+    try {
+        let orgId = await isAdminUser(req) && typeof req.query.orgId === 'string' && req.query.orgId
+            ? req.query.orgId
+            : await resolveSessionOrgId(req);
+        if (!orgId) return res.status(400).json({ error: 'No organisation resolved for this user' });
+        const globalTiers = await loadGlobalCustomTiers();
+        const orgTiers = await loadOrgCustomTiers(orgId);
+        res.json({
+            orgId,
+            orgTiers,
+            // Returned for reference (read-only in this editor) so the org admin
+            // can see which tiers are already provided globally.
+            globalTiers: globalTiers.map(t => ({
+                id: t.id, label: t.label, icon: t.icon, description: t.description,
+                allowedTaskTypes: t.allowedTaskTypes || [],
+            })),
+        });
+    } catch (e) {
+        console.error('Failed to get org custom chat model tiers:', e);
+        res.status(500).json({ error: 'Failed to fetch config' });
+    }
+});
+
+router.post('/config/org-custom-chat-models', requireAuth, async (req, res) => {
+    if (!(await isOrgAdmin(req))) return res.status(403).json({ error: 'Org admin access required' });
+    try {
+        let orgId = await isAdminUser(req) && typeof req.body.orgId === 'string' && req.body.orgId
+            ? req.body.orgId
+            : await resolveSessionOrgId(req);
+        if (!orgId) return res.status(400).json({ error: 'No organisation resolved for this user' });
+
+        const { tiers } = req.body;
+        if (!Array.isArray(tiers)) {
+            return res.status(400).json({ error: '`tiers` must be an array' });
+        }
+        const normalized = tiers.map(normalizeCustomTier).filter(Boolean);
+        const seen = new Map();
+        for (const t of normalized) seen.set(t.id, t);
+        const finalTiers = Array.from(seen.values());
+
+        const warnings = [];
+        const { getProviderForModel } = require('../../core/aiAgent');
+        for (const t of finalTiers) {
+            if (t.modelId) {
+                try { await getProviderForModel(t.modelId); }
+                catch (_) { warnings.push(`Custom tier "${t.id}": model "${t.modelId}" not found in any configured provider`); }
+            }
+            if (t.euModelId) {
+                try { await getProviderForModel(t.euModelId); }
+                catch (_) { warnings.push(`Custom tier "${t.id}": EU model "${t.euModelId}" not found in any configured provider`); }
+            }
+        }
+        await configStore.setConfig(`custom_chat_model_tiers_org_${orgId}`, finalTiers);
+        if (warnings.length > 0) console.warn(`[Config] Org ${orgId} custom tier warnings:`, warnings);
+        res.json({ success: true, orgId, warnings, tiers: finalTiers });
+    } catch (e) {
+        console.error('Failed to save org custom chat model tiers:', e);
+        res.status(500).json({ error: 'Failed to save config' });
     }
 });
 
@@ -676,8 +800,16 @@ router.get('/config/tiers-for-user', requireAuth, async (req, res) => {
         // Standard tiers (already EU-aware) — always included, unrestricted by the plan's permission model
         const standardTiers = await getEUAwareTiers({ userOrgId, userId });
 
-        // Custom tiers
-        const customTiers = (await configStore.getConfig('custom_chat_model_tiers')) || [];
+        // Custom tiers (global + org-scoped, with org taking precedence on id collision)
+        const customTiers = await loadMergedCustomTiers(userOrgId);
+        // EU override: when EU mode is active, swap modelId for euModelId (if set).
+        const { isEUModeActive } = require('../../core/modelResolver');
+        const { isEU } = await isEUModeActive({ userOrgId, userId });
+        if (isEU) {
+            for (const t of customTiers) {
+                if (t.euModelId) t.modelId = t.euModelId;
+            }
+        }
 
         // Resolve user's group ids
         const user = userId ? await userStore.getUser(userId) : null;

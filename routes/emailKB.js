@@ -10,9 +10,14 @@ const router = express.Router();
 const emailKBStore = require('../stores/emailKBStore');
 const kbStore = require('../stores/knowledgeBases');
 const { triggerManualSync, testConnection, subscribeSyncEvents } = require('../services/emailKBSyncEngine');
+const { runStage, proposePromptImprovement } = require('../core/emailKBStageRunner');
 const { setupSSE } = require('../core/sseHelpers');
 const emailKBMetrics = require('../core/emailKBMetrics');
 const { resolveUserOrgIds } = require('../auth');
+
+const ALLOWED_STAGES = new Set(['cleanup', 'pii', 'article', 'category', 'summarize_and_categorize', 'merge']);
+const AI_ASSIST_STAGES = new Set(['article', 'category', 'merge', 'usefulness']);
+const ALLOWED_TIERS = new Set(['fast', 'thinking', 'writer', 'deep_thinking']);
 
 // ──────────────────────────────────────────────
 // Helpers: resolve user's org (same pattern as knowledgeBases.js)
@@ -235,6 +240,83 @@ router.post('/connections/:id/test', async (req, res) => {
         res.json(result);
     } catch (err) {
         console.error('[EmailKB] Test error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ──────────────────────────────────────────────
+// POST /connections/:id/pipeline/run-stage
+// Runs a single pipeline stage (cleanup|pii|article|category|
+// summarize_and_categorize|merge) on either provided text or the latest
+// email sample. Does NOT ingest or persist anything. Supports per-call
+// overrides so the admin can tweak a prompt / tier before saving.
+// ──────────────────────────────────────────────
+router.post('/connections/:id/pipeline/run-stage', async (req, res) => {
+    try {
+        const { stage, input, overrides } = req.body || {};
+        if (!ALLOWED_STAGES.has(stage)) {
+            return res.status(400).json({ error: `Invalid stage. Allowed: ${Array.from(ALLOWED_STAGES).join(', ')}` });
+        }
+        if (overrides?.modelTier && !ALLOWED_TIERS.has(overrides.modelTier)) {
+            return res.status(400).json({ error: `Invalid modelTier. Allowed: ${Array.from(ALLOWED_TIERS).join(', ')}` });
+        }
+        const connection = await emailKBStore.getConnectionWithTokens(req.params.id);
+        if (!connection) return res.status(404).json({ error: 'Connection not found' });
+
+        const orgId = await getOrgId(req);
+        if (connection.organization_id !== orgId && !isSuperAdmin(req)) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
+
+        const result = await runStage({
+            connection,
+            stage,
+            inputText: typeof input === 'string' ? input : undefined,
+            overrides: overrides || {},
+        });
+        res.json(result);
+    } catch (err) {
+        console.error('[EmailKB] run-stage error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ──────────────────────────────────────────────
+// POST /connections/:id/pipeline/ai-assist
+// Uses the caller-chosen model tier to propose an improved system prompt
+// for a given stage, based on a sample input/output and user feedback.
+// ──────────────────────────────────────────────
+router.post('/connections/:id/pipeline/ai-assist', async (req, res) => {
+    try {
+        const { stage, currentPrompt, sampleInput, sampleOutput, userFeedback, modelTier } = req.body || {};
+        if (!AI_ASSIST_STAGES.has(stage)) {
+            return res.status(400).json({ error: `AI assist not supported for stage "${stage}"` });
+        }
+        const tier = modelTier && ALLOWED_TIERS.has(modelTier) ? modelTier : 'thinking';
+        if (!userFeedback || typeof userFeedback !== 'string' || userFeedback.trim().length < 3) {
+            return res.status(400).json({ error: 'userFeedback is required' });
+        }
+
+        const connection = await emailKBStore.getConnection(req.params.id);
+        if (!connection) return res.status(404).json({ error: 'Connection not found' });
+
+        const orgId = await getOrgId(req);
+        if (connection.organization_id !== orgId && !isSuperAdmin(req)) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
+
+        const result = await proposePromptImprovement({
+            connection,
+            stage,
+            currentPrompt: currentPrompt || '',
+            sampleInput: sampleInput || '',
+            sampleOutput: sampleOutput || '',
+            userFeedback: userFeedback.trim(),
+            modelTier: tier,
+        });
+        res.json(result);
+    } catch (err) {
+        console.error('[EmailKB] ai-assist error:', err.message);
         res.status(500).json({ error: err.message });
     }
 });

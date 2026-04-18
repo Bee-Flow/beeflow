@@ -169,27 +169,33 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
     // Resolve model from tier config (EU-aware via centralized modelResolver)
     let tiers = await getEUAwareTiers({ userOrgId: userOrgForTiers, userId });
     // Merge custom tiers so 'custom:<slug>' tier IDs resolve through the same
-    // tiers[resolvedTier] lookup below. Auto-classifier still only sees the
-    // standard tiers (see classifyTiers below) so custom tiers can never be
-    // auto-selected — they must be explicitly chosen by the user.
+    // tiers[resolvedTier] lookup below. Pulls both the global table AND the
+    // user's org-scoped table — org overrides win on id collision.
+    // Auto-classifier still only sees the standard tiers (see classifyTiers
+    // below) so custom tiers can never be auto-selected — they must be
+    // explicitly chosen by the user.
     try {
-        const customTiers = await configStore.getConfig('custom_chat_model_tiers') || [];
-        if (Array.isArray(customTiers)) {
-            for (const t of customTiers) {
-                if (t?.id && !tiers[t.id]) {
-                    tiers[t.id] = {
-                        modelId: t.modelId,
-                        label: t.label,
-                        icon: t.icon,
-                        description: t.description,
-                        maxTokens: t.maxTokens,
-                        temperature: t.temperature,
-                        reasoningEffort: t.reasoningEffort,
-                        reasoningSummary: t.reasoningSummary,
-                        custom: true,
-                    };
-                }
-            }
+        const { isEUModeActive } = require('../../core/modelResolver');
+        const { isEU } = await isEUModeActive({ userOrgId: userOrgForTiers, userId });
+        const globalCustom = (await configStore.getConfig('custom_chat_model_tiers')) || [];
+        const orgCustom = userOrgForTiers
+            ? ((await configStore.getConfig(`custom_chat_model_tiers_org_${userOrgForTiers}`)) || [])
+            : [];
+        const byId = new Map();
+        for (const t of (Array.isArray(globalCustom) ? globalCustom : [])) if (t?.id) byId.set(t.id, t);
+        for (const t of (Array.isArray(orgCustom) ? orgCustom : [])) if (t?.id) byId.set(t.id, t);
+        for (const t of byId.values()) {
+            tiers[t.id] = {
+                modelId: isEU && t.euModelId ? t.euModelId : t.modelId,
+                label: t.label,
+                icon: t.icon,
+                description: t.description,
+                maxTokens: t.maxTokens,
+                temperature: t.temperature,
+                reasoningEffort: t.reasoningEffort,
+                reasoningSummary: t.reasoningSummary,
+                custom: true,
+            };
         }
     } catch (_) { /* fall through without custom tiers */ }
     let disableSearchOnUpload = false;

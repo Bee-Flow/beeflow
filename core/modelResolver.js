@@ -129,11 +129,30 @@ async function applyEUOverrides(tiers, { userOrgId = null, userId = null } = {})
  * @param {string}       opts.fallbackTier - Tier to use when rawModel is null (default: 'fast')
  * @returns {Promise<string|null>} Resolved model ID, or null if nothing could be resolved
  */
-async function getCustomTierById(id) {
+async function getCustomTierById(id, { userOrgId = null, userId = null } = {}) {
     if (!id || !id.startsWith('custom:')) return null;
-    const arr = await configStore.getConfig('custom_chat_model_tiers') || [];
-    if (!Array.isArray(arr)) return null;
-    return arr.find(t => t && t.id === id) || null;
+    // Merge global + org-scoped custom tiers. Org-scoped tiers override globals
+    // when IDs collide (org admin has the final word within their org).
+    const globalArr = (await configStore.getConfig('custom_chat_model_tiers')) || [];
+    const orgArr = userOrgId
+        ? ((await configStore.getConfig(`custom_chat_model_tiers_org_${userOrgId}`)) || [])
+        : [];
+    const byId = new Map();
+    for (const t of (Array.isArray(globalArr) ? globalArr : [])) {
+        if (t && t.id) byId.set(t.id, t);
+    }
+    for (const t of (Array.isArray(orgArr) ? orgArr : [])) {
+        if (t && t.id) byId.set(t.id, t);
+    }
+    const tier = byId.get(id) || null;
+    if (!tier) return null;
+
+    // Apply EU override if EU mode is active for this user/org
+    const { isEU } = await isEUModeActive({ userOrgId, userId });
+    if (isEU && tier.euModelId) {
+        return { ...tier, modelId: tier.euModelId };
+    }
+    return tier;
 }
 
 async function resolveModelForTier(rawModel, { userOrgId = null, userId = null, fallbackTier = 'fast' } = {}) {
@@ -144,7 +163,7 @@ async function resolveModelForTier(rawModel, { userOrgId = null, userId = null, 
     if (rawModel && rawModel.startsWith('tier:')) {
         const tierName = rawModel.substring(5);
         if (tierName.startsWith('custom:')) {
-            const custom = await getCustomTierById(tierName);
+            const custom = await getCustomTierById(tierName, { userOrgId, userId });
             return custom?.modelId || tiers[fallbackTier]?.modelId || null;
         }
         return tiers[tierName]?.modelId || tiers[fallbackTier]?.modelId || null;
@@ -187,7 +206,7 @@ async function resolveModelWithGlobalFallback(rawModel, opts = {}) {
 async function getTierConfig(tierName, { userOrgId = null, userId = null } = {}) {
     // Custom tiers carry their own full config — no TIER_DEFAULTS fallback needed.
     if (tierName && tierName.startsWith('custom:')) {
-        const custom = await getCustomTierById(tierName);
+        const custom = await getCustomTierById(tierName, { userOrgId, userId });
         if (custom) {
             return {
                 maxTokens: custom.maxTokens,
