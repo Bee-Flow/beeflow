@@ -31,11 +31,11 @@ router.get('/conversations/all', async (req, res) => {
     }
 });
 
-// Search all conversations
+// Search all conversations (agent + direct)
 router.get('/conversations/search', async (req, res) => {
     try {
         const userId = getEffectiveUserId(req);
-        const { q, agentId, startDate, endDate } = req.query;
+        const { q, agentId, startDate, endDate, source } = req.query;
 
         if (!q || q.length < 2) {
             return res.json([]);
@@ -46,8 +46,22 @@ router.get('/conversations/search', async (req, res) => {
         if (startDate) filters.startDate = startDate;
         if (endDate) filters.endDate = endDate;
 
-        const conversations = await agentStore.searchConversations(userId, q, filters, req.session?.encryptionKey);
-        res.json(conversations);
+        const encryptionKey = req.session?.encryptionKey;
+        const includeAgents = source !== 'direct';
+        const includeDirect = source !== 'agent' && !agentId; // direct chats have no agent
+
+        const [agentResults, directResults] = await Promise.all([
+            includeAgents ? agentStore.searchConversations(userId, q, filters, encryptionKey) : Promise.resolve([]),
+            includeDirect ? agentStore.searchDirectConversations(userId, q, filters, encryptionKey) : Promise.resolve([]),
+        ]);
+
+        const tagged = [
+            ...agentResults.map(r => ({ ...r, kind: 'agent' })),
+            ...directResults,
+        ];
+
+        tagged.sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
+        res.json(tagged.slice(0, 50));
     } catch (error) {
         console.error('Failed to search conversations:', error);
         res.status(500).json({ error: error.message });

@@ -101,6 +101,7 @@ module.exports = {
     deleteDirectConversation: directConversations.deleteDirectConversation,
     updateDirectConversationWorkspace: directConversations.updateDirectConversationWorkspace,
     getDirectConversationWorkspace: directConversations.getDirectConversationWorkspace,
+    searchDirectConversations: directConversations.searchDirectConversations,
 
     // ── Conversation Labels ──────────────────────────────────────────────────
     listLabels: conversationLabels.listLabels,

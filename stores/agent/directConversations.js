@@ -10,6 +10,7 @@ const { v4: uuidv4 } = require('uuid');
 const { run, getOne, getAll } = require('../../db');
 const { initDB } = require('./initSchema');
 const convMessages = require('./conversationMessages');
+const { decryptMessages } = require('./messageEncryption');
 
 async function createDirectConversation(userId, modelTier = 'fast') {
     await initDB();
@@ -30,6 +31,98 @@ async function getDirectConversation(id, userId) {
 async function listDirectConversations(userId) {
     await initDB();
     return getAll('SELECT id, title, model_tier, project_id, pinned, labels_json, created_at, updated_at FROM direct_conversations WHERE user_id = $1 ORDER BY updated_at DESC', [userId]);
+}
+
+async function searchDirectConversations(userId, query, filters = {}, encryptionKey) {
+    await initDB();
+
+    const likeQuery = `%${query}%`;
+    const lowerQuery = query.toLowerCase();
+
+    const filterParams = [userId];
+    let filterClauses = '';
+    let filterIdx = 2;
+    if (filters.startDate) { filterClauses += ` AND c.updated_at >= $${filterIdx++}`; filterParams.push(filters.startDate); }
+    const likeIdx = filterIdx;
+
+    // Strategy A: title OR migrated message content
+    const stratA = await getAll(`
+        SELECT DISTINCT
+            c.id, c.user_id, c.title, c.updated_at, c.model_tier,
+            c.messages_migrated
+        FROM direct_conversations c
+        LEFT JOIN conversation_messages cm
+            ON cm.conversation_id = c.id
+           AND cm.conversation_type = 'direct'
+           AND c.messages_migrated = TRUE
+        WHERE c.user_id = $1
+          AND (c.title ILIKE $${likeIdx} OR cm.content ILIKE $${likeIdx})
+          ${filterClauses}
+        ORDER BY c.updated_at DESC
+        LIMIT 50
+    `, [...filterParams, likeQuery]);
+
+    const results = [...stratA];
+    const matchedIds = new Set(results.map(r => r.id));
+
+    if (results.length < 50) {
+        if (!encryptionKey) {
+            const remaining = 50 - results.length;
+            const stratB = await getAll(`
+                SELECT
+                    c.id, c.user_id, c.title, c.updated_at, c.model_tier,
+                    c.messages_migrated
+                FROM direct_conversations c
+                WHERE c.user_id = $1
+                  AND c.messages_migrated = FALSE
+                  AND c.messages_json ILIKE $${likeIdx}
+                  ${filterClauses}
+                ORDER BY c.updated_at DESC
+                LIMIT ${remaining}
+            `, [...filterParams, likeQuery]);
+            for (const r of stratB) {
+                if (!matchedIds.has(r.id)) { results.push(r); matchedIds.add(r.id); }
+            }
+        } else {
+            const encCandidates = await getAll(`
+                SELECT
+                    c.id, c.user_id, c.title, c.updated_at, c.model_tier,
+                    c.messages_json, c.messages_migrated
+                FROM direct_conversations c
+                WHERE c.user_id = $1
+                  AND c.messages_migrated = FALSE
+                  ${filterClauses}
+                ORDER BY c.updated_at DESC
+                LIMIT 200
+            `, filterParams);
+            for (const conv of encCandidates) {
+                if (matchedIds.has(conv.id) || results.length >= 50) break;
+                try {
+                    const decrypted = decryptMessages(conv.messages_json || '[]', encryptionKey, conv.id, userId);
+                    if (decrypted.toLowerCase().includes(lowerQuery)) {
+                        results.push({ ...conv, messages_json: decrypted });
+                        matchedIds.add(conv.id);
+                    }
+                } catch (e) {
+                    console.error('[DirectConversations] Search decrypt error:', e);
+                }
+            }
+        }
+    }
+
+    return results
+        .sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at))
+        .slice(0, 50)
+        .map(r => ({
+            id: r.id,
+            user_id: r.user_id,
+            title: r.title,
+            updated_at: r.updated_at,
+            model_tier: r.model_tier,
+            kind: 'direct',
+            agent_name: 'Direct Chat',
+            agent_avatar: null,
+        }));
 }
 
 async function pinDirectConversation(id, pinned, userId) {
@@ -126,4 +219,5 @@ module.exports = {
     createDirectConversation, getDirectConversation, listDirectConversations,
     updateDirectConversation, updateDirectConversationTitle, pinDirectConversation, setDirectConversationLabels, deleteDirectConversation,
     updateDirectConversationWorkspace, getDirectConversationWorkspace,
+    searchDirectConversations,
 };
