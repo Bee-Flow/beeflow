@@ -138,7 +138,7 @@ function requireAuth(req, res, next) {
 // ─── Streaming Direct Chat ───────────────────────────────────────
 
 router.post('/chat/direct/stream', requireAuth, async (req, res) => {
-    const { message, conversationId, modelTier, history, attachments, imageGenSettings, nanoBananaSettings, disabledMedia, webSearchEnabled = true, notebookspaceContent, notebookspaceSelection, projectId, timezone, systemPrompt: requestSystemPrompt, activeSkillIds, reasoningEffort: requestReasoningEffort } = req.body;
+    const { message, conversationId, modelTier, history, attachments, imageGenSettings, nanoBananaSettings, disabledMedia, webSearchEnabled = true, notebookspaceContent, notebookspaceSelection, projectId, timezone, systemPrompt: requestSystemPrompt, activeSkillIds, reasoningEffort: requestReasoningEffort, sessionSkills: requestSessionSkills, activatedSessionSkillIds: requestActivatedSessionSkillIds } = req.body;
     const userId = req.session.user.id;
 
     if (!message && (!attachments || attachments.length === 0)) {
@@ -691,6 +691,14 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                 }
             } catch (e) { /* ignore */ }
         }
+        // Client-side fallback: if a direct conversation id is not yet synced
+        // (race between new message and SSE conversation_created), reuse
+        // chat-local session skills from request payload to avoid regenerating.
+        if (isStandardTier && sessionSkills.length === 0 && Array.isArray(requestSessionSkills) && requestSessionSkills.length > 0) {
+            sessionSkills = requestSessionSkills;
+            activatedSessionSkillIds = Array.isArray(requestActivatedSessionSkillIds) ? requestActivatedSessionSkillIds : [];
+            console.log(`[DirectChat] Reused ${sessionSkills.length} session skills from request payload`);
+        }
 
         // Forced bootstrap for the direct-chat-only standard tier:
         // each conversation starts by generating its own chat-local skill set.
@@ -707,7 +715,11 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                 });
                 activatedSessionSkillIds = [];
                 bootstrappedSessionSkills = true;
-                send('session_skills_bootstrapped', { count: sessionSkills.length });
+                send('session_skills_bootstrapped', {
+                    count: sessionSkills.length,
+                    skills: sessionSkills,
+                    activatedSkillIds: activatedSessionSkillIds,
+                });
                 console.log(`[DirectChat] Session skills bootstrapped: ${sessionSkills.length}`);
             } catch (bootstrapErr) {
                 console.warn('[DirectChat] Session skill bootstrap failed:', bootstrapErr.message);
@@ -2642,6 +2654,62 @@ router.get('/direct/conversations/:id', requireAuth, async (req, res) => {
     } catch (e) {
         console.error('Failed to get direct conversation:', e);
         res.status(500).json({ error: 'Failed to get conversation' });
+    }
+});
+
+router.get('/direct/conversations/:id/session-skills', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const conv = await agentStore.getDirectConversation(req.params.id, userId);
+        if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+        const skills = Array.isArray(conv.sessionSkills) ? conv.sessionSkills : [];
+        const activated = Array.isArray(conv.activatedSessionSkillIds) ? conv.activatedSessionSkillIds : [];
+        res.json({
+            skills,
+            activatedSkillIds: activated,
+            modelTier: conv.model_tier || 'fast',
+        });
+    } catch (e) {
+        console.error('Failed to get direct session skills:', e);
+        res.status(500).json({ error: 'Failed to load session skills' });
+    }
+});
+
+router.post('/direct/conversations/:id/session-skills/:skillId/import', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const conv = await agentStore.getDirectConversation(req.params.id, userId);
+        if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+
+        const sessionSkills = Array.isArray(conv.sessionSkills) ? conv.sessionSkills : [];
+        const source = sessionSkills.find(s => s.id === req.params.skillId);
+        if (!source) return res.status(404).json({ error: 'Session skill not found' });
+
+        const userStore = require('../../stores/userStore');
+        const skillStore = require('../../stores/skillStore');
+        const user = await userStore.getUser(userId);
+        const orgId = user?.organizationId || null;
+        if (!orgId) return res.status(400).json({ error: 'No organization found' });
+
+        const body = req.body || {};
+        const created = await skillStore.createSkill({
+            orgId,
+            userId,
+            name: (typeof body.name === 'string' && body.name.trim()) ? body.name.trim().slice(0, 120) : source.name,
+            description: source.description || '',
+            instructions: source.instructions || '',
+            workflow: source.workflow || '',
+            rules: source.rules || '',
+            examples: source.examples || '',
+            icon: '⚡',
+            isShared: body.isShared === true,
+            dynamicActivation: body.dynamicActivation !== false,
+        });
+
+        res.json({ success: true, skill: created });
+    } catch (e) {
+        console.error('Failed to import direct session skill:', e);
+        res.status(500).json({ error: 'Failed to import session skill' });
     }
 });
 
