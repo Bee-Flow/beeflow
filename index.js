@@ -208,7 +208,8 @@ app.get('/api/health', (req, res) => {
     res.json({
         status: 'ok',
         timestamp: new Date().toISOString(),
-        demoEnabled: process.env.DEMO_MODE_ENABLED !== 'false'
+        demoEnabled: process.env.DEMO_MODE_ENABLED !== 'false',
+        appVersion: process.env.APP_BUILD_SHA || '',
     });
 });
 
@@ -260,6 +261,7 @@ app.use('/apps', appsRouter);
 app.use('/versions', require('./routes/versions'));
 app.use('/api/usage', require('./routes/usage'));
 app.use('/api/feedback', require('./routes/feedback'));
+app.use('/api/client-errors', require('./routes/clientErrors'));
 app.use('/api/org-privacy-shield', require('./routes/orgPrivacyShield'));
 app.use('/api/org-azure-config', require('./routes/orgAzureConfig'));
 app.use('/api/chat/dlp-decision', require('./routes/dlpDecision'));
