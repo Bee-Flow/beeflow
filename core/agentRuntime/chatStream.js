@@ -33,6 +33,8 @@ const { performKnowledgeSearch } = require('./knowledgeSearch');
 const { runInputGuardrails } = require('./guardrailsRunner');
 const guardrailEventStore = require('../../stores/guardrailEventStore');
 const { processAttachments } = require('./attachmentProcessor');
+const { hydrateHistoryAttachments } = require('./historyHydrator');
+const { compactMessages } = require('../compaction');
 
 /**
  * Serialize a tool result for the LLM's tool message.
@@ -419,54 +421,39 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         messages.push(userMsg);
     }
 
-    // ============ REFRESH IMAGE URLS IN HISTORY ============
-    // Images from previous turns need special handling:
-    //  - base64 data URIs are stripped (500KB+ each — causes context overflow)
-    //  - temp HTTPS URLs (from RustFS) are regenerated with fresh expiry so the AI
-    //    can still see images from earlier turns when user asks follow-up questions
-    for (let i = 0; i < messages.length - 1; i++) {
-        const msg = messages[i];
-        if (Array.isArray(msg.content)) {
-            const hasImages = msg.content.some(p => p.type === 'image_url');
-            if (hasImages) {
-                messages[i] = {
-                    ...msg,
-                    content: msg.content.map(part => {
-                        if (part.type !== 'image_url') return part;
-                        const url = part.image_url?.url || '';
+    // ============ HYDRATE HISTORY ATTACHMENTS ============
+    // Rebuilds multimodal content from each historical message's persisted
+    // attachments sidecar so images/files from earlier turns stay visible to
+    // the LLM, and refreshes any stale RustFS temp URLs (900 s TTL).
+    // The current (last) user message is skipped — processAttachments() below
+    // handles it with live upload data.
+    await hydrateHistoryAttachments(messages, { userId });
 
-                        // Strip base64 — too large for context window
-                        if (url.startsWith('data:')) {
-                            return { type: 'text', text: '[Previously attached image]' };
-                        }
-
-                        // Regenerate fresh temp URL for RustFS images
-                        if (url.includes('/api/storage/tmp/')) {
-                            try {
-                                const parsedUrl = new URL(url);
-                                const key = parsedUrl.searchParams.get('key');
-                                if (key) {
-                                    const { generateTempDownloadUrl } = require('../../routes/storageProxy');
-                                    const freshUrl = generateTempDownloadUrl(key, 900);
-                                    console.log(`[AgentRuntime] Refreshed temp URL for historical image (key: ${key.substring(0, 40)}...)`);
-                                    return {
-                                        type: 'image_url',
-                                        image_url: { url: freshUrl, detail: 'auto' }
-                                    };
-                                }
-                            } catch (e) {
-                                console.warn(`[AgentRuntime] Failed to refresh image URL: ${e.message}`);
-                            }
-                            // Fallback if URL parsing fails
-                            return { type: 'text', text: '[Previously attached image]' };
-                        }
-
-                        // Unknown URL format — keep as-is (could be external URL)
-                        return part;
-                    })
-                };
-            }
+    // ============ COMPACTION ============
+    // Once the hydrated history exceeds COMPACTION_THRESHOLD messages, collapse
+    // older turns into a summary block to keep the prompt within a sane token
+    // budget. Any image_url blocks in the summarised window are hoisted into
+    // the summary so visual context is preserved (user requested all images
+    // stay visible). The summary is persisted on the conversation's meta_json
+    // and reused on subsequent turns so we don't re-summarise from scratch.
+    try {
+        // Key name (`conversationSummary`) matches the direct-chat convention so
+        // any future shared helper can read both paths the same way.
+        const existingSummary = conversation?.meta?.conversationSummary || null;
+        const { messages: compactedMessages, newSummary } = await compactMessages(messages, {
+            existingSummary,
+            summaryModelId: 'tier:fast',
+            userOrgId: messageMetadata?.userOrgId || agent?.organization_id || null,
+        });
+        messages = compactedMessages;
+        if (newSummary && newSummary !== existingSummary && conversation?.id) {
+            // Fire-and-forget — the next turn picks it up even if this write
+            // races with the message persistence.
+            agentStore.updateConversationMeta(conversation.id, { conversationSummary: newSummary })
+                .catch(err => console.warn('[AgentRuntime] Failed to persist compaction summary:', err.message));
         }
+    } catch (compactErr) {
+        console.warn('[AgentRuntime] Compaction failed (continuing with full history):', compactErr.message);
     }
 
     // ============ MEMORY INTEGRATION ============
@@ -1027,13 +1014,24 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
 
 
                 if (tools.length > 0) {
-                    // Strip internal metadata (_mcp, _n8n etc.) before sending to LLM — providers may reject unknown fields
-                    adapterOptions.tools = tools.map(t => {
-                        const { _mcp, _n8n, ...clean } = t;
-                        return clean;
-                    });
+                    // Strip internal metadata (_mcp, _n8n etc.) before sending to LLM — providers may reject unknown fields.
+                    // Sort by tool name so the JSON prefix is byte-stable across turns — required for
+                    // OpenAI/Azure automatic prefix caching (≥1024-token stable prefix).
+                    adapterOptions.tools = tools
+                        .map(t => {
+                            const { _mcp, _n8n, ...clean } = t;
+                            return clean;
+                        })
+                        .sort((a, b) => {
+                            const an = a.function?.name || a.name || '';
+                            const bn = b.function?.name || b.name || '';
+                            return an.localeCompare(bn);
+                        });
                     adapterOptions.toolChoice = 'auto';
                 }
+                // Stable end-user identifier — OpenAI uses it as a cache-routing hint
+                // and for abuse monitoring. Safe to pass the raw userId (opaque string).
+                if (userId) adapterOptions.userId = userId;
                 const mcpToolCount = tools.filter(t => t._mcp || t.function?.name?.startsWith('mcp_')).length;
                 if (mcpToolCount > 0) {
                     console.log(`[AgentRuntime] 🔌 ${mcpToolCount} MCP tools loaded for LLM`);

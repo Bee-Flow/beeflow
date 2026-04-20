@@ -112,8 +112,9 @@ async function _doInit() {
 
     // Migration: Add workspace_content column to direct_conversations if missing
     try { await exec(`ALTER TABLE direct_conversations ADD COLUMN IF NOT EXISTS workspace_content TEXT DEFAULT ''`); } catch (e) { /* already exists */ }
-    // Migration: Add meta_json column for provider-specific state (e.g. OpenAI lastResponseId)
+    // Migration: Add meta_json column for provider-specific state (e.g. OpenAI lastResponseId, compactionSummary)
     try { await exec(`ALTER TABLE direct_conversations ADD COLUMN IF NOT EXISTS meta_json TEXT DEFAULT '{}'`); } catch (e) { /* already exists */ }
+    try { await exec(`ALTER TABLE agent_conversations ADD COLUMN IF NOT EXISTS meta_json TEXT DEFAULT '{}'`); } catch (e) { /* already exists */ }
 
     // Migration: Add project_id for Projects feature
     try { await exec(`ALTER TABLE direct_conversations ADD COLUMN IF NOT EXISTS project_id TEXT`); } catch (e) { /* already exists */ }

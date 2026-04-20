@@ -53,7 +53,7 @@ const OUTLOOK_TOOLS = [
         type: 'function',
         function: {
             name: 'outlook_list_recent',
-            description: 'List the most recent emails from the user\'s Outlook mailbox, sorted by date (newest first). Use this when the user asks about their latest/newest/most recent emails, or when outlook_search doesn\'t return the very latest messages. Supports filtering by folder.',
+            description: 'List the most recent emails from the user\'s Outlook mailbox, sorted by date (newest first). Use this when the user asks about their latest/newest/most recent emails (including recently sent ones), or when outlook_search doesn\'t return the very latest messages. For "latest sent email" / "most recent email I sent" set folder to "sentitems". Always prefer this over outlook_search for recency-based questions.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -171,7 +171,10 @@ async function executeOutlookTool(toolName, args, session) {
         const { maxResults = 10, folder = 'inbox', unreadOnly = false } = args;
         const top = Math.min(Math.max(parseInt(maxResults) || 10, 1), 20);
 
-        let path = `/me/mailFolders/${folder}/messages?$top=${top}&$orderby=receivedDateTime desc&$select=id,subject,from,toRecipients,receivedDateTime,bodyPreview,hasAttachments,isRead`;
+        const isSentFolder = String(folder).toLowerCase() === 'sentitems';
+        const orderField = isSentFolder ? 'sentDateTime' : 'receivedDateTime';
+
+        let path = `/me/mailFolders/${folder}/messages?$top=${top}&$orderby=${orderField} desc&$select=id,subject,from,toRecipients,receivedDateTime,sentDateTime,bodyPreview,hasAttachments,isRead`;
         if (unreadOnly) {
             path += `&$filter=isRead eq false`;
         }
@@ -183,7 +186,7 @@ async function executeOutlookTool(toolName, args, session) {
             from: msg.from?.emailAddress ? `${msg.from.emailAddress.name || ''} <${msg.from.emailAddress.address}>` : '',
             to: (msg.toRecipients || []).map(r => r.emailAddress?.address).filter(Boolean).join(', '),
             subject: msg.subject || '(no subject)',
-            date: msg.receivedDateTime || '',
+            date: (isSentFolder ? msg.sentDateTime : msg.receivedDateTime) || msg.receivedDateTime || msg.sentDateTime || '',
             snippet: msg.bodyPreview || '',
             isRead: msg.isRead ?? true,
             hasAttachments: msg.hasAttachments || false,

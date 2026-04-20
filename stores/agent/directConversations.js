@@ -25,7 +25,19 @@ async function getDirectConversation(id, userId) {
     if (!row) return null;
     const meta = JSON.parse(row.meta_json || '{}');
     const messages = await _readDirectMessages(row);
-    return { ...row, messages, ...meta };
+    return { ...row, messages, meta, ...meta };
+}
+
+async function updateDirectConversationMeta(id, userId, partial) {
+    if (!partial || typeof partial !== 'object' || Object.keys(partial).length === 0) return false;
+    await initDB();
+    const existing = await getOne('SELECT meta_json FROM direct_conversations WHERE id = $1 AND user_id = $2', [id, userId]);
+    if (!existing) return false;
+    let existingMeta = {};
+    try { existingMeta = JSON.parse(existing.meta_json || '{}'); } catch (_) { /* noop */ }
+    const merged = { ...existingMeta, ...partial };
+    const { rowCount } = await run('UPDATE direct_conversations SET meta_json = $1 WHERE id = $2 AND user_id = $3', [JSON.stringify(merged), id, userId]);
+    return rowCount > 0;
 }
 
 async function listDirectConversations(userId) {
@@ -219,5 +231,5 @@ module.exports = {
     createDirectConversation, getDirectConversation, listDirectConversations,
     updateDirectConversation, updateDirectConversationTitle, pinDirectConversation, setDirectConversationLabels, deleteDirectConversation,
     updateDirectConversationWorkspace, getDirectConversationWorkspace,
-    searchDirectConversations,
+    searchDirectConversations, updateDirectConversationMeta,
 };

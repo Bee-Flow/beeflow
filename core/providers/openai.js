@@ -186,6 +186,9 @@ class OpenAIProvider extends BaseProvider {
         if (effort && effort !== 'none' && this.supportsReasoning(model)) {
             params.reasoning_effort = effort;
         }
+        // Stable end-user hint — OpenAI routes identical prefixes from the same
+        // user to the same cache shard, improving hit rate.
+        if (options.userId) params.user = String(options.userId);
 
         console.log('[OpenAI] SDK chat (completions) for model:', model);
         const response = await client.chat.completions.create(params);
@@ -225,6 +228,8 @@ class OpenAIProvider extends BaseProvider {
         const effort = this.normalizeEffort(model, options.reasoningEffort);
         reasoning.effort = effort || 'medium';
         params.reasoning = reasoning;
+
+        if (options.userId) params.user = String(options.userId);
 
         console.log('[OpenAI] SDK chat (responses) for model:', model);
         const response = await client.responses.create(params);
@@ -266,6 +271,7 @@ class OpenAIProvider extends BaseProvider {
         if (effort && effort !== 'none' && this.supportsReasoning(model)) {
             params.reasoning_effort = effort;
         }
+        if (options.userId) params.user = String(options.userId);
 
         console.log('[OpenAI] SDK streaming (completions) for model:', model);
         const stream = await client.chat.completions.create(params);
@@ -364,6 +370,7 @@ class OpenAIProvider extends BaseProvider {
                 parameters: t.function?.parameters || t.parameters || {},
             }));
         }
+        if (options.userId) params.user = String(options.userId);
 
         console.log('[OpenAI] SDK streaming (responses) for model:', model, 'reasoning:', JSON.stringify(reasoning));
         const stream = await client.responses.create(params);

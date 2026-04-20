@@ -653,12 +653,25 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             }
         ];
 
-        // Add conversation history
+        // Add conversation history — preserve the `attachments` sidecar so the
+        // hydrator below can rebuild multimodal content (images stay visible
+        // across turns). Stripping sidecar fields here is what used to cause
+        // the AI to "lose" uploaded images one turn after the upload.
         if (history && Array.isArray(history)) {
             for (const msg of history) {
                 if (msg.role === 'user' || msg.role === 'assistant') {
-                    messages.push({ role: msg.role, content: msg.content });
+                    const entry = { role: msg.role, content: msg.content };
+                    if (Array.isArray(msg.attachments) && msg.attachments.length > 0) {
+                        entry.attachments = msg.attachments;
+                    }
+                    messages.push(entry);
                 }
+            }
+            try {
+                const { hydrateHistoryAttachments } = require('../../core/agentRuntime/historyHydrator');
+                await hydrateHistoryAttachments(messages, { userId, skipLast: false });
+            } catch (hydrateErr) {
+                console.warn('[DirectChat] History hydration failed:', hydrateErr.message);
             }
         }
 

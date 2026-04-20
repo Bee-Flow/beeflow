@@ -28,10 +28,13 @@ router.get('/messages', requireAuth, async (req, res) => {
         const { search, top = '20', folder = 'inbox' } = req.query;
         const limit = Math.min(Math.max(parseInt(top) || 20, 1), 50);
 
-        let path = `/me/mailFolders/${folder}/messages?$top=${limit}&$orderby=receivedDateTime desc&$select=id,subject,from,toRecipients,receivedDateTime,bodyPreview,isRead,hasAttachments`;
+        const isSentFolder = String(folder).toLowerCase() === 'sentitems';
+        const orderField = isSentFolder ? 'sentDateTime' : 'receivedDateTime';
+
+        let path = `/me/mailFolders/${folder}/messages?$top=${limit}&$orderby=${orderField} desc&$select=id,subject,from,toRecipients,receivedDateTime,sentDateTime,bodyPreview,isRead,hasAttachments`;
 
         if (search) {
-            path = `/me/messages?$search="${encodeURIComponent(search)}"&$top=${limit}&$select=id,subject,from,toRecipients,receivedDateTime,bodyPreview,isRead,hasAttachments`;
+            path = `/me/messages?$search="${encodeURIComponent(search)}"&$top=${limit}&$select=id,subject,from,toRecipients,receivedDateTime,sentDateTime,bodyPreview,isRead,hasAttachments`;
         }
 
         const data = await graphFetch(path, req.session);
@@ -41,7 +44,7 @@ router.get('/messages', requireAuth, async (req, res) => {
             from: msg.from?.emailAddress ? `${msg.from.emailAddress.name || ''} <${msg.from.emailAddress.address}>` : '',
             to: (msg.toRecipients || []).map(r => r.emailAddress?.address).filter(Boolean).join(', '),
             subject: msg.subject || '(no subject)',
-            date: msg.receivedDateTime || '',
+            date: (isSentFolder ? msg.sentDateTime : msg.receivedDateTime) || msg.receivedDateTime || msg.sentDateTime || '',
             snippet: msg.bodyPreview || '',
             isRead: msg.isRead || false,
             hasAttachments: msg.hasAttachments || false,

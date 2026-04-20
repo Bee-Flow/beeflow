@@ -105,37 +105,68 @@ class ClaudeProvider extends BaseProvider {
                 };
             });
 
-        // ─── Prompt caching: mark the last genuine user text message for cache_control
-        // This creates a cache breakpoint so the entire prefix (system + tools +
-        // all history up to this point) can be reused on the next turn.
-        // Only applies when there's enough history to benefit from caching (4+ messages).
-        // Skips tool_result blocks (converted from tool role) — cache_control is only
-        // valid on text-type content blocks.
+        // ─── Prompt caching ──────────────────────────────────────────
+        // Anthropic allows up to 4 cache_control breakpoints per request. The
+        // adapter already places one on the system prompt (extractSystem) and
+        // one on the last tool definition (see buildTools). Here we place up
+        // to two more:
+        //
+        //   (a) Immediately after the compaction summary block, if present.
+        //       This lets Anthropic cache (system + tools + summary) as a
+        //       durable prefix that stays stable across many turns, even as
+        //       the recent-window messages keep changing.
+        //
+        //   (b) On the last genuine user text message. This creates a
+        //       shorter-lived breakpoint so the next turn can still hit the
+        //       cache for "system + tools + summary + full recent history".
+        //
+        // Both are skipped for very short conversations (<4 messages) where
+        // caching overhead isn't worth it. cache_control is only valid on
+        // text-type content blocks, so tool_result messages are skipped.
+        const markLastTextBlock = (msg) => {
+            if (typeof msg.content === 'string' && msg.content.trim()) {
+                msg.content = [{
+                    type: "text",
+                    text: msg.content,
+                    cache_control: { type: "ephemeral" },
+                }];
+                return true;
+            }
+            if (Array.isArray(msg.content) && msg.content.length > 0) {
+                for (let j = msg.content.length - 1; j >= 0; j--) {
+                    if (msg.content[j].type === 'text') {
+                        msg.content[j].cache_control = { type: "ephemeral" };
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+
+        const isSummaryMessage = (msg) => {
+            if (msg.role !== 'user') return false;
+            const text = typeof msg.content === 'string'
+                ? msg.content
+                : Array.isArray(msg.content)
+                    ? (msg.content.find(b => b.type === 'text')?.text || '')
+                    : '';
+            return text.startsWith('[Conversation Summary');
+        };
+
         if (normalized.length >= 4) {
+            // (a) Breakpoint on the summary message, if the compactor inserted one.
+            const summaryIdx = normalized.findIndex(isSummaryMessage);
+            if (summaryIdx >= 0) {
+                markLastTextBlock(normalized[summaryIdx]);
+            }
+
+            // (b) Breakpoint on the last genuine user text message.
             for (let i = normalized.length - 1; i >= 0; i--) {
                 const msg = normalized[i];
                 if (msg.role !== 'user') continue;
-                // Skip tool_result messages (originally role:"tool", converted to role:"user")
-                if (Array.isArray(msg.content) && msg.content.some(b => b.type === 'tool_result')) {
-                    continue;
-                }
-                if (typeof msg.content === 'string' && msg.content.trim()) {
-                    // Convert string content to block format with cache_control
-                    msg.content = [{
-                        type: "text",
-                        text: msg.content,
-                        cache_control: { type: "ephemeral" },
-                    }];
-                } else if (Array.isArray(msg.content) && msg.content.length > 0) {
-                    // Find the last text block and add cache_control to it
-                    for (let j = msg.content.length - 1; j >= 0; j--) {
-                        if (msg.content[j].type === 'text') {
-                            msg.content[j].cache_control = { type: "ephemeral" };
-                            break;
-                        }
-                    }
-                }
-                break; // Only mark one message
+                if (i === summaryIdx) continue; // already marked above
+                if (Array.isArray(msg.content) && msg.content.some(b => b.type === 'tool_result')) continue;
+                if (markLastTextBlock(msg)) break;
             }
         }
 

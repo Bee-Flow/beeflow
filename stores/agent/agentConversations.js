@@ -22,7 +22,28 @@ async function getConversation(agentId, userId, encryptionKey = null) {
     const row = await getOne('SELECT * FROM agent_conversations WHERE agent_id = $1 AND user_id = $2 ORDER BY updated_at DESC LIMIT 1', [agentId, userId]);
     if (!row) return null;
     const messages = await _readMessages(row, encryptionKey);
-    return { ...row, messages };
+    const meta = _parseMeta(row.meta_json);
+    return { ...row, messages, meta };
+}
+
+function _parseMeta(metaJson) {
+    try { return JSON.parse(metaJson || '{}'); } catch (_) { return {}; }
+}
+
+/**
+ * Merge partial fields into the conversation's meta_json. Used to persist
+ * conversation-scoped state (e.g. compactionSummary). Safe against
+ * concurrent writers because the merge uses a single UPDATE ... jsonb
+ * read-modify-write round-trip; collisions overwrite last-writer-wins,
+ * which is acceptable for this data.
+ */
+async function updateConversationMeta(conversationId, partial) {
+    if (!partial || typeof partial !== 'object' || Object.keys(partial).length === 0) return;
+    await initDB();
+    const existing = await getOne('SELECT meta_json FROM agent_conversations WHERE id = $1', [conversationId]);
+    if (!existing) return;
+    const merged = { ..._parseMeta(existing.meta_json), ...partial };
+    await run('UPDATE agent_conversations SET meta_json = $1 WHERE id = $2', [JSON.stringify(merged), conversationId]);
 }
 
 async function getOrCreateConversation(agentId, userId, encryptionKey = null) {
@@ -222,7 +243,7 @@ async function getConversationById(conversationId, encryptionKey = null) {
     const row = await getOne('SELECT * FROM agent_conversations WHERE id = $1', [conversationId]);
     if (!row) return null;
     const messages = await _readMessages(row, encryptionKey);
-    return { ...row, messages, threadTitles: JSON.parse(row.thread_titles_json || '{}') };
+    return { ...row, messages, meta: _parseMeta(row.meta_json), threadTitles: JSON.parse(row.thread_titles_json || '{}') };
 }
 
 async function createConversation(agentId, userId, title = 'New Chat') {
@@ -292,4 +313,5 @@ module.exports = {
     listConversations, listAllConversations, searchConversations,
     getConversationById, createConversation,
     updateConversationTitle, pinConversation, setConversationLabels, updateThreadTitles, deleteConversationById,
+    updateConversationMeta,
 };

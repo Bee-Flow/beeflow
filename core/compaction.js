@@ -36,6 +36,22 @@ async function compactMessages(messages, options = {}) {
     const oldMessages = convMessages.slice(0, convMessages.length - RECENT_WINDOW);
     const recentMessages = convMessages.slice(convMessages.length - RECENT_WINDOW);
 
+    // Hoist any image_url blocks from the summarised window so visual context
+    // isn't lost when their text gets collapsed into a summary. Deduped by URL
+    // so the same image uploaded once isn't repeated N times.
+    const hoistedImages = [];
+    const seenUrls = new Set();
+    for (const msg of oldMessages) {
+        if (!Array.isArray(msg.content)) continue;
+        for (const part of msg.content) {
+            if (part?.type !== 'image_url') continue;
+            const url = part.image_url?.url;
+            if (!url || seenUrls.has(url)) continue;
+            seenUrls.add(url);
+            hoistedImages.push({ type: 'image_url', image_url: { url, detail: part.image_url.detail || 'auto' } });
+        }
+    }
+
     // Generate summary of old messages (incorporates existing summary if present)
     const newSummary = await generateSummary(oldMessages, options.existingSummary, options.summaryModelId, options.userOrgId);
 
@@ -44,11 +60,18 @@ async function compactMessages(messages, options = {}) {
         ...systemMessages,
     ];
 
-    if (newSummary) {
-        compacted.push({
-            role: 'user',
-            content: `[Conversation Summary — earlier messages have been compacted]\n${newSummary}`,
-        });
+    if (newSummary || hoistedImages.length > 0) {
+        const summaryText = newSummary
+            ? `[Conversation Summary — earlier messages have been compacted]\n${newSummary}`
+            : '[Earlier messages have been compacted. Images from those turns are still attached below.]';
+
+        // Attach hoisted images onto the summary user message so the model sees
+        // them as context belonging to the summarised history.
+        const summaryContent = hoistedImages.length > 0
+            ? [{ type: 'text', text: summaryText }, ...hoistedImages]
+            : summaryText;
+
+        compacted.push({ role: 'user', content: summaryContent });
         compacted.push({
             role: 'assistant',
             content: 'Understood, I have the context from our earlier conversation. Let\'s continue.',

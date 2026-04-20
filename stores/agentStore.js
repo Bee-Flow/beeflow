@@ -53,6 +53,7 @@ module.exports = {
     getConversationById: agentConversations.getConversationById,
     createConversation: agentConversations.createConversation,
     updateConversationTitle: agentConversations.updateConversationTitle,
+    updateConversationMeta: agentConversations.updateConversationMeta,
     pinConversation: agentConversations.pinConversation,
     setConversationLabels: agentConversations.setConversationLabels,
     updateThreadTitles: agentConversations.updateThreadTitles,
