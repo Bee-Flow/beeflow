@@ -11,7 +11,7 @@ const agentStore = require('../stores/agentStore');
 // GET /versions/:agentId — List all versions for an agent
 router.get('/:agentId', async (req, res) => {
     try {
-        const versions = versionStore.getVersions(req.params.agentId);
+        const versions = await versionStore.getVersions(req.params.agentId);
         res.json(versions);
     } catch (err) {
         console.error('[Versions] List error:', err);
@@ -22,7 +22,7 @@ router.get('/:agentId', async (req, res) => {
 // GET /versions/:agentId/:versionId — Get full snapshot of a specific version
 router.get('/:agentId/:versionId', async (req, res) => {
     try {
-        const version = versionStore.getVersion(req.params.versionId);
+        const version = await versionStore.getVersion(req.params.versionId);
         if (!version) return res.status(404).json({ error: 'Version not found' });
         if (version.agent_id !== req.params.agentId) return res.status(404).json({ error: 'Version not found for this agent' });
         res.json(version);
@@ -35,7 +35,7 @@ router.get('/:agentId/:versionId', async (req, res) => {
 // POST /versions/:agentId/:versionId/restore — Restore agent to a specific version
 router.post('/:agentId/:versionId/restore', async (req, res) => {
     try {
-        const version = versionStore.getVersion(req.params.versionId);
+        const version = await versionStore.getVersion(req.params.versionId);
         if (!version) return res.status(404).json({ error: 'Version not found' });
         if (version.agent_id !== req.params.agentId) return res.status(404).json({ error: 'Version not found for this agent' });
 
@@ -79,7 +79,7 @@ router.post('/:agentId/:versionId/restore', async (req, res) => {
 // DELETE /versions/:agentId/:versionId — Delete a specific version
 router.delete('/:agentId/:versionId', async (req, res) => {
     try {
-        const deleted = versionStore.deleteVersion(req.params.versionId);
+        const deleted = await versionStore.deleteVersion(req.params.versionId);
         if (!deleted) return res.status(404).json({ error: 'Version not found' });
         res.json({ success: true });
     } catch (err) {

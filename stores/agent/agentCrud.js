@@ -51,6 +51,13 @@ async function createAgent(name, description, systemPrompt, ownerId, model = nul
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW(),NOW())`,
         [id, name, description || '', systemPrompt || '', model, JSON.stringify(starterPrompts), !!threadsEnabled, !!copyEnabled, !!workspaceEnabled, JSON.stringify(config || {}), organizationId || null, JSON.stringify(sharedGroups || []), categoryId || null, ownerId]);
     const result = { id, name, description, system_prompt: systemPrompt, model, starter_prompts: starterPrompts, threads_enabled: threadsEnabled, copy_enabled: copyEnabled, workspace_enabled: workspaceEnabled, config, organization_id: organizationId, shared_groups: sharedGroups, category_id: categoryId, owner_id: ownerId };
+    try {
+        const created = await getOne('SELECT * FROM agents WHERE id = $1', [id]);
+        if (created) {
+            const versionStore = require('../versionStore');
+            await versionStore.createVersion(id, 'agent', created, ownerId, 'Initial version');
+        }
+    } catch (e) { console.error('[AgentCrud] Initial version snapshot failed:', e.message); }
     _notifySync(organizationId, id);
     return result;
 }

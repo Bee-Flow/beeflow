@@ -35,7 +35,9 @@ async function createVersion(agentId, agentType, snapshot, userId = null, change
     const id = uuidv4();
     const last = await getOne('SELECT MAX(version_number) as max_ver FROM agent_versions WHERE agent_id = $1', [agentId]);
     const versionNumber = (last?.max_ver || 0) + 1;
-    if (!changeSummary && snapshot) changeSummary = `Version ${versionNumber}`;
+    if (!changeSummary && snapshot) {
+        changeSummary = await _autoSummary(agentId, snapshot) || `Version ${versionNumber}`;
+    }
 
     await run(`
         INSERT INTO agent_versions (id, agent_id, agent_type, version_number, snapshot, change_summary, created_by)
@@ -83,6 +85,25 @@ async function pruneVersions(agentId, keepCount = 50) {
             ORDER BY version_number DESC LIMIT $3
         )
     `, [agentId, agentId, keepCount]);
+}
+
+async function _autoSummary(agentId, snapshot) {
+    try {
+        const prev = await getOne(
+            'SELECT snapshot FROM agent_versions WHERE agent_id = $1 ORDER BY version_number DESC LIMIT 1',
+            [agentId]
+        );
+        if (!prev) return null;
+        const before = safeParseJSON(prev.snapshot, {});
+        const norm = (v) => (v && typeof v === 'object') ? JSON.stringify(v) : (v ?? '');
+        const changed = [];
+        if (norm(before.system_prompt) !== norm(snapshot.system_prompt)) changed.push('system prompt');
+        if (norm(before.name) !== norm(snapshot.name)) changed.push('name');
+        if (norm(before.model) !== norm(snapshot.model)) changed.push('model');
+        if (norm(before.config) !== norm(snapshot.config)) changed.push('config');
+        if (!changed.length) return null;
+        return `Updated ${changed.join(', ')}`;
+    } catch { return null; }
 }
 
 function safeParseJSON(str, fallback) {
