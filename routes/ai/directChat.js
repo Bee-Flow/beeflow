@@ -221,6 +221,18 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
     }
     let resolvedTier = modelTier || 'fast';
 
+    // Defensive gate: the Standard tier requires the `skills` beta feature
+    // (it bootstraps chat-local session skills). The frontend already hides
+    // the option when ungranted — this just stops a hand-crafted request.
+    if (resolvedTier === 'standard') {
+        const { userHasBetaFeature } = require('../../core/betaFeatures');
+        const allowed = await userHasBetaFeature(userId, 'skills', req.session).catch(() => false);
+        if (!allowed) {
+            console.warn(`[DirectChat] User ${userId} requested standard tier without skills feature — falling back to fast`);
+            resolvedTier = 'fast';
+        }
+    }
+
     // Auto mode: classify which tier to use
     if (resolvedTier === 'auto') {
         try {

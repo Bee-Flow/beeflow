@@ -835,11 +835,21 @@ router.get('/config/tiers-for-user', requireAuth, async (req, res) => {
             });
         }
 
+        // The Standard tier depends on the `skills` beta feature (it bootstraps
+        // chat-local session skills on first send). Hide it when the caller's
+        // org/user doesn't have the feature.
+        const { userHasBetaFeature } = require('../../core/betaFeatures');
+        const hasSkillsFeature = userId
+            ? await userHasBetaFeature(userId, 'skills', req.session).catch(() => false)
+            : false;
+
         const result = {};
         // Standard
         for (const key of STANDARD_TIER_KEYS) {
             // Direct-chat-only tier: never expose for non-direct tasks.
             if (key === 'standard' && taskType !== 'direct_chat') continue;
+            // Standard tier is gated by the skills beta feature.
+            if (key === 'standard' && !hasSkillsFeature) continue;
             if (!tierPermittedByGroups(key)) continue;
             if (standardTiers && standardTiers[key]) result[key] = standardTiers[key];
         }
