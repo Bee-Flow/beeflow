@@ -76,7 +76,7 @@ const OAUTH_PROVIDERS = {
         authUrl: (tenantId) => `https://login.microsoftonline.com/${tenantId || 'common'}/oauth2/v2.0/authorize`,
         tokenUrl: (tenantId) => `https://login.microsoftonline.com/${tenantId || 'common'}/oauth2/v2.0/token`,
         userInfoUrl: 'https://graph.microsoft.com/v1.0/me',
-        scopes: ['openid', 'email', 'profile', 'User.Read', 'Mail.Read', 'Mail.Send', 'Calendars.ReadWrite', 'Files.ReadWrite', 'Contacts.ReadWrite', 'offline_access']
+        scopes: ['openid', 'email', 'profile', 'User.Read', 'Mail.Read', 'Mail.Send', 'Calendars.ReadWrite', 'Files.ReadWrite', 'Contacts.ReadWrite', 'OnlineMeetings.Read', 'OnlineMeetingTranscript.Read.All', 'OnlineMeetingArtifact.Read.All', 'offline_access']
     },
     nextcloud: {
         name: 'Nextcloud',

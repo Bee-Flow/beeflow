@@ -41,7 +41,7 @@ async function refreshAccessToken(session) {
             refresh_token: refreshToken,
             client_id: providerConfig.clientId,
             client_secret: providerConfig.clientSecret,
-            scope: 'openid email profile User.Read Mail.Read Mail.Send Calendars.ReadWrite Files.ReadWrite Contacts.ReadWrite offline_access',
+            scope: 'openid email profile User.Read Mail.Read Mail.Send Calendars.ReadWrite Files.ReadWrite Contacts.ReadWrite OnlineMeetings.Read OnlineMeetingTranscript.Read.All OnlineMeetingArtifact.Read.All offline_access',
         }).toString(),
     });
 

@@ -58,68 +58,73 @@ async function uploadBotRecordingToRustFS(localAudioPath, userId, sessionId) {
 }
 
 /**
- * Transcribe a bot recording using the existing Voxtral pipeline.
- * This reuses the same logic as the manual transcription upload route.
+ * Turn a Teams-Graph provider error into a message the user can act on.
+ * Unknown errors fall through to the original message.
  */
-async function transcribeBotRecording(audioPath, userId, title, language = 'nl') {
-    const apiKey = await configStore.getSecret('mistral_api_key');
-    if (!apiKey) throw new Error('Mistral API key not configured');
-
-    const { Mistral } = require('@mistralai/mistralai');
-    const client = new Mistral({ apiKey });
-
-    const fileContent = fs.readFileSync(audioPath);
-    const fileName = path.basename(audioPath);
-
-    console.log(`[MeetBot] Transcribing ${fileName} (${(fileContent.length / (1024 * 1024)).toFixed(1)} MB)`);
-
-    // Voxtral transcription with diarization
-    const response = await client.audio.transcriptions.complete({
-        model: 'voxtral-mini-2602',
-        file: { fileName, content: fileContent },
-        diarize: true,
-        language,
-        timestampGranularities: ['segment'],
-    });
-
-    // Merge consecutive segments from same speaker
-    const segments = response.segments || [];
-    const merged = [];
-    for (const seg of segments) {
-        const last = merged[merged.length - 1];
-        if (last && seg.speakerId === last.speakerId) {
-            last.end = seg.end;
-            last.text += ' ' + (seg.text || '').trim();
-        } else {
-            merged.push({
-                speaker: seg.speakerId || 'Unknown',
-                start: seg.start,
-                end: seg.end,
-                text: (seg.text || '').trim(),
-            });
-        }
+function mapProviderErrorToUserMessage(err) {
+    const code = err?.code;
+    if (code === 'NOT_CONNECTED') {
+        return 'Connect your Microsoft account in settings to use Teams native ingestion.';
     }
+    if (code === 'MEETING_NOT_FOUND_FOR_USER') {
+        return "We couldn't find this meeting in your Teams calendar. Only the organiser of a scheduled Teams meeting can use native Graph ingestion.";
+    }
+    if (code === 'INSUFFICIENT_SCOPE') {
+        return 'Your Microsoft connection is missing meeting-transcript permissions. Reconnect Microsoft in settings to grant them.';
+    }
+    if (code === 'TRANSCRIPT_NOT_AVAILABLE') {
+        return "Teams produced no recording or transcript within 4 hours. Make sure the host clicked Start recording (and optionally Start transcription) during the meeting.";
+    }
+    if (code === 'STOPPED_BY_USER') {
+        return 'Stopped by user.';
+    }
+    return err?.message || 'Unknown error';
+}
 
+/**
+ * Format a duration in seconds as HH:MM:SS or MM:SS.
+ */
+function formatTime(secs) {
+    if (secs == null) return '00:00';
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = Math.floor(secs % 60);
+    if (h > 0) return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+/**
+ * Finalize speaker-tagged segments and persist a Transcription row.
+ * Shared between the Voxtral (diarized audio) and Graph-native (VTT) paths.
+ *
+ * When `mapSpeakerNames` is true, the segments use opaque diarization IDs
+ * (e.g. "speaker_1") and Claude is asked to map them to real names. When
+ * false, the segments already carry real names (e.g. from Teams' <v>
+ * tags) and we skip the mapping step.
+ */
+async function finalizeAndSaveTranscription({
+    userId,
+    title,
+    language,
+    segments,
+    audioPath,
+    fullText = '',
+    fileName,
+    durationSeconds,
+    mapSpeakerNames = true,
+}) {
     // Speaker stats
     const speakerMap = {};
-    for (const seg of merged) {
+    for (const seg of segments) {
         if (!speakerMap[seg.speaker]) speakerMap[seg.speaker] = { duration: 0, segments: 0 };
         speakerMap[seg.speaker].duration += (seg.end || 0) - (seg.start || 0);
         speakerMap[seg.speaker].segments += 1;
     }
 
-    const totalDuration = segments.length > 0 ? Math.max(...segments.map(s => s.end || 0)) : 0;
+    const computedDuration = durationSeconds
+        ?? (segments.length > 0 ? Math.max(...segments.map(s => s.end || 0)) : 0);
 
-    const formatTime = (secs) => {
-        if (secs == null) return '00:00';
-        const h = Math.floor(secs / 3600);
-        const m = Math.floor((secs % 3600) / 60);
-        const s = Math.floor(secs % 60);
-        if (h > 0) return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-        return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-    };
-
-    let transcript = merged.map(s => `[${s.speaker}] ${formatTime(s.start)} - ${formatTime(s.end)}: ${s.text}`).join('\n');
+    let transcript = segments.map(s => `[${s.speaker}] ${formatTime(s.start)} - ${formatTime(s.end)}: ${s.text}`).join('\n');
     let speakers = Object.entries(speakerMap).map(([id, data]) => ({
         id,
         speakingTime: formatTime(data.duration),
@@ -127,20 +132,21 @@ async function transcribeBotRecording(audioPath, userId, title, language = 'nl')
         segments: data.segments,
     }));
 
-    // Identify speaker names using Claude
-    const speakerIds = Object.keys(speakerMap);
-    let nameMapping = null;
-    try {
-        const { getProviderForModel } = require('../core/aiAgent');
-        const claudeConfig = await getProviderForModel('claude-sonnet-4-6');
-        const Anthropic = require('@anthropic-ai/sdk');
-        const claude = new Anthropic({ apiKey: claudeConfig.apiKey });
+    // Claude speaker-name mapping (Voxtral path only)
+    if (mapSpeakerNames) {
+        const speakerIds = Object.keys(speakerMap);
+        let nameMapping = null;
+        try {
+            const { getProviderForModel } = require('../core/aiAgent');
+            const claudeConfig = await getProviderForModel('claude-sonnet-4-6');
+            const Anthropic = require('@anthropic-ai/sdk');
+            const claude = new Anthropic({ apiKey: claudeConfig.apiKey });
 
-        const nameResp = await claude.messages.create({
-            model: 'claude-sonnet-4-6',
-            max_tokens: 1024,
-            temperature: 0,
-            system: `You are a transcript analyzer. Identify real names of speakers from the conversation.
+            const nameResp = await claude.messages.create({
+                model: 'claude-sonnet-4-6',
+                max_tokens: 1024,
+                temperature: 0,
+                system: `You are a transcript analyzer. Identify real names of speakers from the conversation.
 
 IMPORTANT: Speech diarization often splits one person into multiple speaker IDs. A conversation with 3 real people may show 15+ speaker_IDs. You MUST group them.
 
@@ -151,33 +157,33 @@ Instructions:
 
 Return ONLY a JSON object. Example: {"speaker_1": "Tom", "speaker_2": "Gerard", "speaker_3": "Tom"}
 Return ONLY valid JSON, no other text.`,
-            messages: [
-                { role: 'user', content: `Speakers: ${speakerIds.join(', ')}\nLanguage: ${language}\n\n${transcript.substring(0, 15000)}` }
-            ],
-        });
-        const chatContent = (nameResp.content?.[0]?.text || '').trim();
-        const jsonMatch = chatContent.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-            nameMapping = JSON.parse(jsonMatch[0]);
-            // Filter nulls
-            for (const [key, value] of Object.entries(nameMapping)) {
-                if (!value || value === 'null') delete nameMapping[key];
+                messages: [
+                    { role: 'user', content: `Speakers: ${speakerIds.join(', ')}\nLanguage: ${language}\n\n${transcript.substring(0, 15000)}` }
+                ],
+            });
+            const chatContent = (nameResp.content?.[0]?.text || '').trim();
+            const jsonMatch = chatContent.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+                nameMapping = JSON.parse(jsonMatch[0]);
+                for (const [key, value] of Object.entries(nameMapping)) {
+                    if (!value || value === 'null') delete nameMapping[key];
+                }
+                console.log('[MeetBot] Speaker names:', nameMapping);
             }
-            console.log('[MeetBot] Speaker names:', nameMapping);
+        } catch (e) {
+            console.warn('[MeetBot] Speaker name identification failed:', e.message);
         }
-    } catch (e) {
-        console.warn('[MeetBot] Speaker name identification failed:', e.message);
+
+        if (nameMapping) {
+            for (const seg of segments) {
+                if (nameMapping[seg.speaker]) seg.speaker = nameMapping[seg.speaker];
+            }
+            transcript = segments.map(s => `[${s.speaker}] ${formatTime(s.start)} - ${formatTime(s.end)}: ${s.text}`).join('\n');
+            speakers = speakers.map(s => ({ ...s, id: nameMapping[s.id] || s.id }));
+        }
     }
 
-    if (nameMapping) {
-        for (const seg of merged) {
-            if (nameMapping[seg.speaker]) seg.speaker = nameMapping[seg.speaker];
-        }
-        transcript = merged.map(s => `[${s.speaker}] ${formatTime(s.start)} - ${formatTime(s.end)}: ${s.text}`).join('\n');
-        speakers = speakers.map(s => ({ ...s, id: nameMapping[s.id] || s.id }));
-    }
-
-    // Generate summary using Claude
+    // Summary
     let summary = '';
     try {
         const { getProviderForModel } = require('../core/aiAgent');
@@ -207,7 +213,7 @@ Write in the same language as the transcript (${language}). Be concise and focus
         console.warn('[MeetBot] Summary generation failed:', e.message);
     }
 
-    // Generate AI title from summary using Claude
+    // AI-generated title
     let finalTitle = title || 'Bot Meeting Recording';
     if (summary) {
         try {
@@ -233,24 +239,95 @@ Write in the same language as the transcript (${language}). Be concise and focus
         } catch (e) { console.warn('[MeetBot] Title generation failed:', e.message); }
     }
 
-    // Save transcription to DB
-    const saved = await transcriptionStore.createTranscription({
+    return await transcriptionStore.createTranscription({
         userId,
         title: finalTitle,
         fileName,
         language,
-        durationSeconds: Math.round(totalDuration),
+        durationSeconds: Math.round(computedDuration),
         speakerCount: Object.keys(speakerMap).length,
-        segmentCount: merged.length,
-        fullText: response.text || '',
+        segmentCount: segments.length,
+        fullText,
         transcript,
-        segments: merged,
+        segments,
         speakers,
         summary,
         audioPath,
     });
+}
 
-    return saved;
+/**
+ * Transcribe a bot recording using the Voxtral (Mistral) diarization pipeline.
+ * Used for Zoom, Google Meet, and Teams meetings that only produced a
+ * recording (no native transcript).
+ */
+async function transcribeBotRecording(audioPath, userId, title, language = 'nl') {
+    const apiKey = await configStore.getSecret('mistral_api_key');
+    if (!apiKey) throw new Error('Mistral API key not configured');
+
+    const { Mistral } = require('@mistralai/mistralai');
+    const client = new Mistral({ apiKey });
+
+    const fileContent = fs.readFileSync(audioPath);
+    const fileName = path.basename(audioPath);
+
+    console.log(`[MeetBot] Transcribing ${fileName} (${(fileContent.length / (1024 * 1024)).toFixed(1)} MB)`);
+
+    const response = await client.audio.transcriptions.complete({
+        model: 'voxtral-mini-2602',
+        file: { fileName, content: fileContent },
+        diarize: true,
+        language,
+        timestampGranularities: ['segment'],
+    });
+
+    // Merge consecutive segments from same speaker
+    const rawSegments = response.segments || [];
+    const merged = [];
+    for (const seg of rawSegments) {
+        const last = merged[merged.length - 1];
+        if (last && seg.speakerId === last.speakerId) {
+            last.end = seg.end;
+            last.text += ' ' + (seg.text || '').trim();
+        } else {
+            merged.push({
+                speaker: seg.speakerId || 'Unknown',
+                start: seg.start,
+                end: seg.end,
+                text: (seg.text || '').trim(),
+            });
+        }
+    }
+
+    return await finalizeAndSaveTranscription({
+        userId,
+        title,
+        language,
+        segments: merged,
+        audioPath,
+        fullText: response.text || '',
+        fileName,
+        mapSpeakerNames: true,
+    });
+}
+
+/**
+ * Persist a Graph-native Teams transcript (WebVTT already parsed into the
+ * pipeline's segment shape). Speaker names come from Teams directly, so we
+ * skip the Claude speaker-mapping step and go straight to summary + title.
+ */
+async function saveNativeTranscription({ userId, title, language, segments, audioPath, vttPath, durationSeconds }) {
+    return await finalizeAndSaveTranscription({
+        userId,
+        title,
+        language,
+        segments,
+        audioPath: audioPath || null,
+        fullText: segments.map(s => s.text).join(' '),
+        fileName: vttPath ? path.basename(vttPath) : 'teams-transcript.vtt',
+        durationSeconds,
+        mapSpeakerNames: false,
+    });
 }
 
 
@@ -309,11 +386,29 @@ function requireAdmin(req, res, next) {
  * Meet Media API). Secrets are never returned in full; only booleans and
  * the non-secret callback base URL and impersonation user email.
  */
-router.get('/sdk-config', requireAdmin, async (_req, res) => {
+router.get('/sdk-config', requireAdmin, async (req, res) => {
     try {
-        const acsConnStr = await configStore.getSecret('acs_connection_string');
-        const acsCallbackSecret = await configStore.getSecret('teams_bot_callback_secret');
-        const acsCallbackBaseUrl = await configStore.getConfig('teams_bot_callback_base_url');
+        const { loadConfig } = require('../auth/permissions');
+        const { isMicrosoftConnected } = require('../integrations/msGraphClient');
+
+        const appConfig = await loadConfig();
+        const msProvider = appConfig.providers?.microsoft || {};
+        const tenantId = msProvider.tenantId || 'common';
+        const clientId = msProvider.clientId || null;
+        const msEnabled = !!(msProvider.enabled && clientId && msProvider.clientSecret);
+
+        // Build the admin-consent URL — lets the customer's tenant admin
+        // grant consent for all users in one click. Redirect back to the
+        // Beeflow OAuth callback so the browser flow lands somewhere sensible.
+        const redirectUri = (process.env.SERVER_BASE_URL || '').replace(/\/+$/, '') + '/api/auth/oauth/microsoft/callback';
+        const adminConsentUrl = clientId
+            ? `https://login.microsoftonline.com/${encodeURIComponent(tenantId)}/adminconsent?` + new URLSearchParams({
+                client_id: clientId,
+                redirect_uri: redirectUri,
+            }).toString()
+            : null;
+
+        const sessionConnected = isMicrosoftConnected(req.session);
 
         const gmClientId = await configStore.getSecret('google_meet_oauth_client_id');
         const gmClientSecret = await configStore.getSecret('google_meet_oauth_client_secret');
@@ -322,10 +417,13 @@ router.get('/sdk-config', requireAdmin, async (_req, res) => {
 
         res.json({
             teams: {
-                acsConfigured: !!acsConnStr,
-                callbackSecretConfigured: !!acsCallbackSecret,
-                callbackBaseUrl: acsCallbackBaseUrl || null,
-                callbackBaseUrlFromEnv: process.env.SERVER_BASE_URL || null,
+                mode: 'graph-native',
+                microsoftOAuthEnabled: msEnabled,
+                tenantId,
+                clientId,
+                adminConsentUrl,
+                currentUserConnected: sessionConnected,
+                currentUserEmail: req.session?.user?.email || null,
             },
             googleMeet: {
                 clientConfigured: !!(gmClientId && gmClientSecret),
@@ -342,9 +440,10 @@ router.get('/sdk-config', requireAdmin, async (_req, res) => {
 
 /**
  * POST /sdk-config — Save SDK provider config. Fields are optional; only
- * provided fields are updated.
+ * provided fields are updated. Teams is now Graph-native (no ACS
+ * connection strings or callback URLs to configure here) — the relevant
+ * config lives in the shared Microsoft OAuth provider settings instead.
  * Body may contain any of:
- *   - acsConnectionString, callbackBaseUrl, callbackSecret, clearAcsConnectionString  (Teams SDK)
  *   - googleMeetOAuthClientId, googleMeetOAuthClientSecret,
  *     clearGoogleMeetOAuthClient (wipes client id + secret + refresh token),
  *     clearGoogleMeetRefreshToken (revokes authorisation only)  (Google Meet SDK)
@@ -352,32 +451,9 @@ router.get('/sdk-config', requireAdmin, async (_req, res) => {
 router.post('/sdk-config', requireAdmin, async (req, res) => {
     try {
         const {
-            acsConnectionString, callbackBaseUrl, callbackSecret, clearAcsConnectionString,
             googleMeetOAuthClientId, googleMeetOAuthClientSecret,
             clearGoogleMeetOAuthClient, clearGoogleMeetRefreshToken,
         } = req.body || {};
-
-        // ── Teams / ACS ─────────────────────────────────────
-        if (clearAcsConnectionString) {
-            await configStore.setSecret('acs_connection_string', '');
-        } else if (typeof acsConnectionString === 'string' && acsConnectionString.trim()) {
-            if (!/^endpoint=https:\/\//i.test(acsConnectionString.trim())) {
-                return res.status(400).json({ error: 'ACS connection string should start with "endpoint=https://"' });
-            }
-            await configStore.setSecret('acs_connection_string', acsConnectionString.trim());
-        }
-
-        if (typeof callbackBaseUrl === 'string') {
-            const trimmed = callbackBaseUrl.trim().replace(/\/+$/, '');
-            if (trimmed && !/^https:\/\//i.test(trimmed)) {
-                return res.status(400).json({ error: 'Callback base URL must start with https://' });
-            }
-            await configStore.setConfig('teams_bot_callback_base_url', trimmed);
-        }
-
-        if (typeof callbackSecret === 'string') {
-            await configStore.setSecret('teams_bot_callback_secret', callbackSecret.trim());
-        }
 
         // ── Google Meet SDK (OAuth user flow) ───────────────
         if (clearGoogleMeetOAuthClient) {
@@ -578,12 +654,67 @@ router.post('/join', async (req, res) => {
                 const result = await meetBot.joinAndRecord(session.id, meetLink, {
                     botName: 'Bee Flow - Meeting Assistant',
                     credentials,
+                    session: req.session,
                     onStatusChange: async (status) => {
                         console.log(`[MeetBot] Session ${session.id} status: ${status}`);
                         await meetBotStore.updateSession(session.id, { status });
                     },
                 });
 
+                // Path A: Teams native — VTT transcript already produced by Teams.
+                if (result.nativeTranscript && result.vttPath && fs.existsSync(result.vttPath)) {
+                    const vttParser = require('../core/meetBotProviders/vttParser');
+                    const vttText = fs.readFileSync(result.vttPath, 'utf8');
+                    const segments = vttParser.parseToSegments(vttText);
+
+                    if (segments.length === 0) {
+                        await meetBotStore.updateSession(session.id, {
+                            status: 'failed',
+                            error: 'Teams returned an empty transcript',
+                            endedAt: new Date().toISOString(),
+                        });
+                        return;
+                    }
+
+                    // Optionally upload the accompanying mp4 to RustFS
+                    let audioPathForSession = result.audioPath || null;
+                    if (result.audioPath && fs.existsSync(result.audioPath)) {
+                        try {
+                            const uploaded = await uploadBotRecordingToRustFS(result.audioPath, userId, session.id);
+                            if (uploaded?.proxyUrl) audioPathForSession = uploaded.proxyUrl;
+                        } catch (uploadErr) {
+                            console.warn(`[MeetBot] RustFS upload failed (mp4): ${uploadErr.message}`);
+                        }
+                    }
+
+                    await meetBotStore.updateSession(session.id, {
+                        status: 'processing',
+                        audioPath: audioPathForSession,
+                    });
+
+                    console.log(`[MeetBot] Native Teams transcript: ${segments.length} segments across ${new Set(segments.map(s => s.speaker)).size} speakers`);
+
+                    const transcription = await saveNativeTranscription({
+                        userId,
+                        title: title || defaultTitle,
+                        language: language || 'nl',
+                        segments,
+                        audioPath: audioPathForSession,
+                        vttPath: result.vttPath,
+                        durationSeconds: result.durationSeconds,
+                    });
+
+                    await meetBotStore.updateSession(session.id, {
+                        status: 'completed',
+                        transcriptionId: transcription.id,
+                        endedAt: new Date().toISOString(),
+                    });
+
+                    console.log(`[MeetBot] Session ${session.id} completed (native transcript). Transcription: ${transcription.id}`);
+                    return;
+                }
+
+                // Path B: audio-only — run it through the Voxtral/Whisper pipeline.
                 if (result.audioPath && fs.existsSync(result.audioPath)) {
                     let audioPathForSession = result.audioPath;
                     try {
@@ -638,9 +769,10 @@ router.post('/join', async (req, res) => {
 
             } catch (err) {
                 console.error(`[MeetBot] Session ${session.id} failed:`, err.message);
+                const userMessage = mapProviderErrorToUserMessage(err);
                 await meetBotStore.updateSession(session.id, {
                     status: 'failed',
-                    error: err.message,
+                    error: userMessage,
                     endedAt: new Date().toISOString(),
                 });
             }

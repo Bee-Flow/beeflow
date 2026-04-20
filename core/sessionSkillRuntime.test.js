@@ -28,6 +28,8 @@ const {
     bootstrapSessionSkills, // exercised via parseSkillPayload-style adapter mock
     buildSessionSkillInjection,
     executeActivateSessionSkill,
+    initialActivatedSkillIds,
+    deriveCompletedSkillIds,
 } = require('./sessionSkillRuntime');
 
 // parseSkillPayload + normalizeSessionSkill aren't exported. Test them via
@@ -123,10 +125,12 @@ async function bootstrapWith(adapterContent) {
     }
 
     // ── buildSessionSkillInjection: mixed active + inactive ─────────
+    // `a` is non-terminal (has downstream `b`) and `b` is not active, so `a`
+    // stays "in focus" (active body injected) rather than being marked done.
     {
         const ss = [
-            { id: 'a', name: 'A', description: 'da', instructions: 'inst-a' },
-            { id: 'b', name: 'B', description: 'db' },
+            { id: 'a', name: 'A', description: 'da', instructions: 'inst-a', order: 1, dependsOn: [] },
+            { id: 'b', name: 'B', description: 'db', order: 2, dependsOn: ['a'] },
         ];
         const out = buildSessionSkillInjection({ sessionSkills: ss, activatedSkillIds: ['a'] });
         assert.match(out.systemPromptAddendum, /ACTIVE CHAT-LOCAL SKILLS/);
@@ -229,6 +233,77 @@ async function bootstrapWith(adapterContent) {
         const out = buildSessionSkillInjection({ sessionSkills: ss, activatedSkillIds: [] });
         assert.match(out.systemPromptAddendum, /READY/, 'step 1 shows READY');
         assert.match(out.systemPromptAddendum, /BLOCKED by: A/, 'step 2 shows BLOCKED by A');
+    }
+
+    // ── initialActivatedSkillIds: picks step-1 nodes with no deps ───
+    {
+        const ss = [
+            { id: 'a', name: 'A', order: 1, dependsOn: [] },
+            { id: 'b', name: 'B', order: 1, dependsOn: [] }, // parallel step-1
+            { id: 'c', name: 'C', order: 2, dependsOn: ['a'] },
+        ];
+        const ids = initialActivatedSkillIds(ss);
+        assert.deepStrictEqual(ids.sort(), ['a', 'b'], 'both step-1 skills are auto-activated');
+    }
+
+    // ── deriveCompletedSkillIds: terminal active → done ─────────────
+    {
+        const ss = [
+            { id: 'a', name: 'A', order: 1, dependsOn: [] },
+            { id: 'b', name: 'B', order: 2, dependsOn: ['a'] },
+        ];
+        // Only step 1 active: 'a' has an inactive downstream → not yet completed.
+        let done = deriveCompletedSkillIds(ss, ['a']);
+        assert.deepStrictEqual(done, [], 'step 1 alone is not completed');
+        // Both active: 'a' completed (downstream 'b' active), 'b' terminal so also completed.
+        done = deriveCompletedSkillIds(ss, ['a', 'b']);
+        assert.deepStrictEqual(done.sort(), ['a', 'b'], 'full pipeline all completed');
+    }
+
+    // ── buildSessionSkillInjection: completed skills trailer ────────
+    {
+        const ss = [
+            { id: 'a', name: 'A', order: 1, dependsOn: [], instructions: 'body-a' },
+            { id: 'b', name: 'B', order: 2, dependsOn: ['a'], instructions: 'body-b' },
+        ];
+        const out = buildSessionSkillInjection({ sessionSkills: ss, activatedSkillIds: ['a', 'b'] });
+        assert.match(out.systemPromptAddendum, /COMPLETED STEPS/, 'completed trailer renders');
+        // Bodies of completed skills must NOT be re-injected.
+        assert.ok(!/body-a/.test(out.systemPromptAddendum), 'completed skill body is elided');
+        assert.ok(!/body-b/.test(out.systemPromptAddendum), 'completed skill body is elided');
+    }
+
+    // ── buildSessionSkillInjection: compactMode elides active bodies ─
+    {
+        const ss = [
+            { id: 'a', name: 'A', order: 1, dependsOn: [], instructions: 'body-a' },
+            { id: 'b', name: 'B', order: 2, dependsOn: ['a'], instructions: 'body-b' },
+        ];
+        // With only 'a' active (still in focus), non-compact mode DOES inject body.
+        let out = buildSessionSkillInjection({ sessionSkills: ss, activatedSkillIds: ['a'] });
+        assert.match(out.systemPromptAddendum, /body-a/, 'non-compact inlines active body');
+        // compactMode should elide the body.
+        out = buildSessionSkillInjection({ sessionSkills: ss, activatedSkillIds: ['a'], compactMode: true });
+        assert.ok(!/body-a/.test(out.systemPromptAddendum), 'compactMode elides active body');
+        assert.match(out.systemPromptAddendum, /bodies elided after compaction/);
+    }
+
+    // ── cycle detection: circular deps are broken ───────────────────
+    {
+        // Patch console.warn so the expected warning doesn't muddy test output.
+        const originalWarn = console.warn;
+        console.warn = () => {};
+        const json = JSON.stringify([
+            { name: 'A', order: 1, dependsOn: ['B'] },
+            { name: 'B', order: 2, dependsOn: ['A'] },
+        ]);
+        const skills = await bootstrapWith(json);
+        console.warn = originalWarn;
+        assert.strictEqual(skills.length, 2, 'both skills survive cycle break');
+        // After cycle break, at least one skill must have empty deps so the
+        // pipeline can schedule.
+        const anyRoot = skills.some(s => (s.dependsOn || []).length === 0);
+        assert.ok(anyRoot, 'cycle broken — at least one root remains');
     }
 
     console.log('[sessionSkillRuntime.test] all assertions passed ✓');

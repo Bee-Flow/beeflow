@@ -1,32 +1,31 @@
 /**
- * Meet Bot Engine — Playwright + ACS-based meeting recording bot.
+ * Meet Bot Engine — dispatches to a platform-specific provider based on the
+ * meeting URL.
  *
- * Dispatches to a platform-specific provider based on the meeting URL.
  * Providers live in ./meetBotProviders/ and expose:
  *   { platform, label, detect, validateUrl, joinAndRecord,
  *     requiresCredentials, isConfigured? }
  *
  * Priority rules when multiple providers claim the same URL:
- *   - teams-sdk takes precedence over teams when ACS is configured
- *     (joins via Azure Communication Services Call Automation, no browser).
- *   - Otherwise the browser-based providers handle everything.
+ *   - google-meet-sdk takes precedence over google when OAuth is configured
+ *     (uses the official Meet Media API, no browser).
+ *   - Teams uses a single Graph-native provider (fetches server-side
+ *     transcripts/recordings the organiser's token has access to).
  */
 
 const googleProvider = require('./meetBotProviders/google');
 const googleMeetSdkProvider = require('./meetBotProviders/google-meet-sdk');
-const teamsProvider = require('./meetBotProviders/teams');
-const teamsSdkProvider = require('./meetBotProviders/teams-sdk');
+const teamsGraphProvider = require('./meetBotProviders/teams-graph');
 const zoomProvider = require('./meetBotProviders/zoom');
 
-// Order matters: earlier providers are considered first. SDK-based providers
-// are listed before their browser-based counterparts so we prefer the
-// official media-API path when configured, and fall back to Playwright
-// otherwise.
+// Order matters: earlier providers are considered first. SDK/Graph providers
+// go before browser-based counterparts so we prefer the official media/API
+// path when configured. Teams is Graph-only (own-meetings flow) — no
+// Playwright fallback.
 const providers = [
     googleMeetSdkProvider,
     googleProvider,
-    teamsSdkProvider,
-    teamsProvider,
+    teamsGraphProvider,
     zoomProvider,
 ];
 

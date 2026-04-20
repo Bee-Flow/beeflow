@@ -60,6 +60,24 @@ function normalizeSessionSkill(raw, idx = 0) {
 // skill ids belonging to the same batch. Drops any reference that doesn't
 // match a sibling skill's id or name. Runs after all ids are assigned so
 // cross-references resolve cleanly.
+// Return the ids of every skill at the lowest `order` value — i.e. the
+// entry points of the pipeline (no dependencies, step 1). We auto-activate
+// these on bootstrap so the first-turn system prompt actually carries the
+// full Instructions body. Without this the AI can (and in the wild, does)
+// answer using only the short manifest, making the pipeline decorative.
+function initialActivatedSkillIds(skills) {
+    if (!Array.isArray(skills) || skills.length === 0) return [];
+    const minOrder = skills.reduce((m, s) => {
+        const o = Number.isFinite(s?.order) ? s.order : Infinity;
+        return o < m ? o : m;
+    }, Infinity);
+    if (!Number.isFinite(minOrder)) return [];
+    // Step-1 skills should also have no unmet deps; filter defensively.
+    return skills
+        .filter(s => s && s.order === minOrder && (!Array.isArray(s.dependsOn) || s.dependsOn.length === 0))
+        .map(s => s.id);
+}
+
 function resolveDependencies(skills) {
     if (!Array.isArray(skills) || skills.length === 0) return skills;
     const byKey = new Map();
@@ -67,12 +85,40 @@ function resolveDependencies(skills) {
         if (s.id) byKey.set(s.id, s.id);
         if (s.name) byKey.set(s.name.toLowerCase(), s.id);
     }
-    return skills.map(s => ({
+    const resolved = skills.map(s => ({
         ...s,
         dependsOn: (s.dependsOn || [])
             .map(dep => byKey.get(dep) || byKey.get(typeof dep === 'string' ? dep.toLowerCase() : '') || null)
             .filter(id => id && id !== s.id),   // never self-depend
     }));
+
+    // Topo-sort; any skill that can never be scheduled is part of a cycle.
+    // Break the cycle by emptying its dependsOn and logging — better to run
+    // the skill in the wrong order than to permanently brick the pipeline.
+    const inDegree = new Map(resolved.map(s => [s.id, (s.dependsOn || []).length]));
+    const graph = new Map(resolved.map(s => [s.id, []]));
+    for (const s of resolved) {
+        for (const dep of s.dependsOn || []) {
+            if (graph.has(dep)) graph.get(dep).push(s.id);
+        }
+    }
+    const queue = [];
+    for (const [id, deg] of inDegree) if (deg === 0) queue.push(id);
+    const visited = new Set();
+    while (queue.length) {
+        const id = queue.shift();
+        visited.add(id);
+        for (const next of graph.get(id) || []) {
+            inDegree.set(next, inDegree.get(next) - 1);
+            if (inDegree.get(next) === 0) queue.push(next);
+        }
+    }
+    if (visited.size < resolved.length) {
+        const cyclic = resolved.filter(s => !visited.has(s.id)).map(s => s.name || s.id);
+        console.warn(`[sessionSkillRuntime] Cyclic dependency detected, breaking cycle for: ${cyclic.join(', ')}`);
+        return resolved.map(s => visited.has(s.id) ? s : { ...s, dependsOn: [] });
+    }
+    return resolved;
 }
 
 function parseSkillPayload(rawText) {
@@ -179,18 +225,53 @@ async function bootstrapSessionSkills({
     }];
 }
 
-function buildSessionSkillInjection({ sessionSkills = [], activatedSkillIds = [] }) {
+/**
+ * Given the pipeline + the set of activated skill ids, derive which activated
+ * skills should be considered "completed". A skill counts as completed when:
+ *   - it's activated AND has ≥1 downstream skill that's also activated
+ *     (the pipeline has moved past it), OR
+ *   - it's activated AND is a terminal node (no one depends on it) —
+ *     reaching it means the pipeline's work is done.
+ * Pure function, no storage. Caller decides what to do with the result.
+ */
+function deriveCompletedSkillIds(sessionSkills, activatedSkillIds) {
+    if (!Array.isArray(sessionSkills) || sessionSkills.length === 0) return [];
+    const activated = new Set(Array.isArray(activatedSkillIds) ? activatedSkillIds : []);
+    if (activated.size === 0) return [];
+    // Build reverse-dep map: for each skill id, list ids of skills that depend on it.
+    const downstream = new Map(sessionSkills.map(s => [s.id, []]));
+    for (const s of sessionSkills) {
+        for (const dep of s.dependsOn || []) {
+            if (downstream.has(dep)) downstream.get(dep).push(s.id);
+        }
+    }
+    const terminals = new Set(sessionSkills.filter(s => (downstream.get(s.id) || []).length === 0).map(s => s.id));
+    const completed = [];
+    for (const s of sessionSkills) {
+        if (!activated.has(s.id)) continue;
+        const down = downstream.get(s.id) || [];
+        const hasActiveDownstream = down.some(id => activated.has(id));
+        if (hasActiveDownstream || terminals.has(s.id)) completed.push(s.id);
+    }
+    return completed;
+}
+
+function buildSessionSkillInjection({ sessionSkills = [], activatedSkillIds = [], compactMode = false }) {
     if (!Array.isArray(sessionSkills) || sessionSkills.length === 0) {
         return { systemPromptAddendum: '', tools: [] };
     }
     const activated = new Set(Array.isArray(activatedSkillIds) ? activatedSkillIds : []);
+    const completed = new Set(deriveCompletedSkillIds(sessionSkills, activatedSkillIds));
     // Sort by order so the LLM sees the pipeline in step sequence, not insertion order.
     const ordered = [...sessionSkills].sort((a, b) => (a.order || 0) - (b.order || 0));
-    const active = ordered.filter(s => activated.has(s.id));
+    // Activated skills split into "still-in-focus" (full body) and "completed"
+    // (one-line trailer only — saves tokens once the pipeline moves past them).
+    const activeInFocus = ordered.filter(s => activated.has(s.id) && !completed.has(s.id));
+    const completedList = ordered.filter(s => completed.has(s.id));
     const inactive = ordered.filter(s => !activated.has(s.id));
     const byId = new Map(ordered.map(s => [s.id, s]));
 
-    let addendum = '\n\n[CHAT-LOCAL SKILLS — ORDERED PIPELINE]\nThese skills form a dependency-enforced pipeline for this direct chat. Each skill has a step number. Activate them in order — the runtime REFUSES to activate a skill whose dependencies are not yet active.';
+    let addendum = '\n\n[CHAT-LOCAL SKILLS — ORDERED PIPELINE]\nThese skills form a dependency-enforced pipeline for this direct chat. Each skill has a step number. Activate them in order — the runtime REFUSES to activate a skill whose dependencies are not yet active. Step-1 skills are already activated for you; for any later step whose work you need, YOU MUST call `' + ACTIVATE_SESSION_SKILL_TOOL_NAME + '` BEFORE producing user-facing output that relies on it. Without activation you only have the short description; your answer will be generic.';
 
     if (inactive.length > 0) {
         const manifest = inactive.map(s => {
@@ -202,17 +283,36 @@ function buildSessionSkillInjection({ sessionSkills = [], activatedSkillIds = []
         addendum += `\n\n[AVAILABLE ON DEMAND]\nActivate the next READY skill when its step is relevant. Call \`${ACTIVATE_SESSION_SKILL_TOOL_NAME}\` before replying.\n${manifest}`;
     }
 
-    if (active.length > 0) {
-        const blocks = active.map(s => {
-            let b = `### SESSION SKILL — "${s.name}" (id: ${s.id})`;
-            if (s.description) b += `\n${s.description}`;
-            if (s.instructions) b += `\nInstructions:\n${s.instructions}`;
-            if (s.workflow) b += `\nWorkflow:\n${s.workflow}`;
-            if (s.rules) b += `\nRules:\n${s.rules}`;
-            if (s.examples) b += `\nExamples:\n${s.examples}`;
-            return b;
-        }).join('\n\n---\n\n');
-        addendum += `\n\n[ACTIVE CHAT-LOCAL SKILLS]\n${blocks}`;
+    if (activeInFocus.length > 0) {
+        if (compactMode) {
+            // Conversation was compacted; the active skill bodies have already
+            // shaped the summary. Don't re-pay for them every turn — list as a
+            // one-liner; the model can reload any via the activate tool.
+            const lines = activeInFocus
+                .map(s => `- [step ${s.order}] ${s.name} (active — body elided; call activate_session_skill to reload)`)
+                .join('\n');
+            addendum += `\n\n[ACTIVE CHAT-LOCAL SKILLS — bodies elided after compaction]\n${lines}`;
+        } else {
+            const blocks = activeInFocus.map(s => {
+                let b = `### SESSION SKILL — "${s.name}" (id: ${s.id})`;
+                if (s.description) b += `\n${s.description}`;
+                if (s.instructions) b += `\nInstructions:\n${s.instructions}`;
+                if (s.workflow) b += `\nWorkflow:\n${s.workflow}`;
+                if (s.rules) b += `\nRules:\n${s.rules}`;
+                if (s.examples) b += `\nExamples:\n${s.examples}`;
+                return b;
+            }).join('\n\n---\n\n');
+            addendum += `\n\n[ACTIVE CHAT-LOCAL SKILLS]\n${blocks}`;
+        }
+    }
+
+    // Completed skills — work is done, full body dropped, one-line trailer so
+    // the model still knows the pipeline context without re-paying the tokens.
+    if (completedList.length > 0) {
+        const lines = completedList
+            .map(s => `- [step ${s.order}] ${s.name} ✓`)
+            .join('\n');
+        addendum += `\n\n[COMPLETED STEPS — work already done in this conversation]\n${lines}`;
     }
 
     addendum += `\n\nIf the user asks to save one of these skills permanently, call \`${PUBLISH_SESSION_SKILL_TOOL_NAME}\`.`;
@@ -345,5 +445,7 @@ module.exports = {
     buildSessionSkillInjection,
     executeActivateSessionSkill,
     executePublishSessionSkill,
+    initialActivatedSkillIds,
+    deriveCompletedSkillIds,
 };
 

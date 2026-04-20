@@ -23,6 +23,7 @@ const {
     ACTIVATE_SESSION_SKILL_TOOL_NAME,
     bootstrapSessionSkills,
     buildSessionSkillInjection,
+    initialActivatedSkillIds,
 } = require('../../core/sessionSkillRuntime');
 const { WORKSPACE_TOOLS } = require('../../integrations/workspaceTools');
 const guardrailEventStore = require('../../stores/guardrailEventStore');
@@ -789,14 +790,17 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                     apiVersion: bootstrapApiVersion,
                     userContext,
                 });
-                activatedSessionSkillIds = [];
+                // Auto-activate step-1 skills so their full bodies land in the
+                // first-turn system prompt. Without this the AI tends to answer
+                // from the short manifest and the pipeline has no effect.
+                activatedSessionSkillIds = initialActivatedSkillIds(sessionSkills);
                 bootstrappedSessionSkills = true;
                 send('session_skills_bootstrapped', {
                     count: sessionSkills.length,
                     skills: sessionSkills,
                     activatedSkillIds: activatedSessionSkillIds,
                 });
-                console.log(`[DirectChat] Session skills bootstrapped: ${sessionSkills.length}`);
+                console.log(`[DirectChat] Session skills bootstrapped: ${sessionSkills.length} (step-1 auto-activated: ${activatedSessionSkillIds.length})`);
             } catch (bootstrapErr) {
                 console.warn('[DirectChat] Session skill bootstrap failed:', bootstrapErr.message);
                 // Hard fallback so Standard tier always has at least one
@@ -809,9 +813,11 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                     workflow: 'Understand intent -> perform actions/tools -> verify -> return concise result.',
                     rules: 'Prefer actionable outputs, include assumptions when uncertain, keep language aligned with user.',
                     examples: 'For research requests, gather current facts first, then synthesize in requested format.',
+                    order: 1,
+                    dependsOn: [],
                     dynamicActivation: true,
                 }];
-                activatedSessionSkillIds = [];
+                activatedSessionSkillIds = initialActivatedSkillIds(sessionSkills);
                 bootstrappedSessionSkills = true;
                 send('session_skills_bootstrapped', {
                     count: sessionSkills.length,
@@ -826,6 +832,11 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             const sessionSkillInjection = buildSessionSkillInjection({
                 sessionSkills,
                 activatedSkillIds: activatedSessionSkillIds,
+                // Once the conversation has been compacted, active-skill bodies
+                // are already baked into the summary — re-injecting them every
+                // turn wastes tokens. Compact mode emits a one-liner instead;
+                // the model can reload any via activate_session_skill.
+                compactMode: !!conversationSummary,
             });
             if (sessionSkillInjection.systemPromptAddendum) {
                 messages[0].content += sessionSkillInjection.systemPromptAddendum;
