@@ -703,15 +703,66 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         // Forced bootstrap for the direct-chat-only standard tier:
         // each conversation starts by generating its own chat-local skill set.
         if (isStandardTier && sessionSkills.length === 0) {
+            // Tell the UI we're spending some time before the first reply
+            // token arrives so it can show a "Preparing chat-local skills…"
+            // status instead of looking frozen.
+            send('session_skills_bootstrap_started', {});
+
+            // Use a cheaper/faster model for the bootstrap pass when the admin
+            // configured tier.bootstrapModelId. Falls back to the main tier
+            // model if unset or if the cheap model fails provider resolution.
+            let bootstrapModelId = modelId;
+            let bootstrapAdapter = adapter;
+            let bootstrapApiKey = apiKey;
+            let bootstrapApiUrl = apiUrl;
+            let bootstrapApiVersion = config.apiVersion || undefined;
+            if (tier.bootstrapModelId && tier.bootstrapModelId !== modelId) {
+                try {
+                    const bConfig = await getProviderForModel(tier.bootstrapModelId);
+                    bootstrapAdapter = getAdapter(bConfig.providerType, (bConfig.url || '').replace(/\/+$/, ''));
+                    bootstrapApiKey = bConfig.apiKey;
+                    bootstrapApiUrl = (bConfig.url || '').replace(/\/+$/, '');
+                    bootstrapApiVersion = bConfig.apiVersion || undefined;
+                    bootstrapModelId = tier.bootstrapModelId;
+                    console.log(`[DirectChat] Bootstrap using cheap model: ${bootstrapModelId} (main tier: ${modelId})`);
+                } catch (bErr) {
+                    console.warn(`[DirectChat] Bootstrap model "${tier.bootstrapModelId}" unavailable, falling back to "${modelId}":`, bErr.message);
+                }
+            }
+
+            // Pull lightweight user/org context so the bootstrap can tailor
+            // language and tone. Best-effort — failures are non-fatal.
+            let userContext = null;
+            try {
+                const userStore = require('../../stores/userStore');
+                const u = await userStore.getUser(userId);
+                if (u) {
+                    userContext = {
+                        language: u.language || u.locale || (req.session?.user?.language) || null,
+                        role: u.orgRole || u.role || null,
+                    };
+                    if (u.organizationId) {
+                        const org = await userStore.getOrganization(u.organizationId);
+                        if (org) {
+                            userContext.orgName = org.name || null;
+                            userContext.orgTagline = org.tagline || null;
+                        }
+                    }
+                }
+            } catch (ctxErr) {
+                console.warn('[DirectChat] Bootstrap userContext lookup failed:', ctxErr.message);
+            }
+
             try {
                 sessionSkills = await bootstrapSessionSkills({
-                    adapter,
-                    apiKey,
-                    apiUrl,
-                    modelId,
+                    adapter: bootstrapAdapter,
+                    apiKey: bootstrapApiKey,
+                    apiUrl: bootstrapApiUrl,
+                    modelId: bootstrapModelId,
                     message: message || '[No text message provided]',
                     timezone: timezone || 'UTC',
-                    apiVersion: config.apiVersion || undefined,
+                    apiVersion: bootstrapApiVersion,
+                    userContext,
                 });
                 activatedSessionSkillIds = [];
                 bootstrappedSessionSkills = true;
@@ -2518,6 +2569,19 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             if (collectedCalendarDrafts.length > 0) assistantSave.calendarDrafts = collectedCalendarDrafts;
             if (collectedMapEmbeds.length > 0) assistantSave.mapEmbeds = collectedMapEmbeds;
             if (collectedToolHistory.length > 0) assistantSave.toolHistory = collectedToolHistory;
+            // Record the bootstrap so the UI can render a "Created N chat-local
+            // skills" header above this assistant reply when reloaded.
+            if (bootstrappedSessionSkills && Array.isArray(sessionSkills) && sessionSkills.length > 0) {
+                assistantSave.sessionSkillsBootstrap = {
+                    state: 'done',
+                    skills: sessionSkills.map(s => ({
+                        id: s.id,
+                        name: s.name,
+                        description: s.description || '',
+                        icon: s.icon || '🧩',
+                    })),
+                };
+            }
             savedMessages.push(assistantSave);
 
             // Save with metadata for OpenAI response chaining + compaction
@@ -2699,6 +2763,119 @@ router.get('/direct/conversations/:id/session-skills', requireAuth, async (req, 
     } catch (e) {
         console.error('Failed to get direct session skills:', e);
         res.status(500).json({ error: 'Failed to load session skills' });
+    }
+});
+
+// Regenerate the chat-local session-skill set for a Standard-tier conversation.
+// Body: { message? }   — optional refining prompt. If absent, re-uses the
+//                          first user message from the conversation.
+// Resets `activatedSessionSkillIds` since the new ids won't match the old ones.
+router.post('/direct/conversations/:id/session-skills/regenerate', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const conv = await agentStore.getDirectConversation(req.params.id, userId);
+        if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+
+        // Resolve the tier the conversation uses; we only regenerate for Standard.
+        const userStoreForOrg = require('../../stores/userStore');
+        const callerForOrg = await userStoreForOrg.getUser(userId);
+        const callerOrgId = callerForOrg?.organizationId || null;
+        const { isEUModeActive } = require('../../core/modelResolver');
+        const { isEU } = await isEUModeActive({ userOrgId: callerOrgId, userId }).catch(() => ({ isEU: false }));
+        const tiersKey = isEU ? 'chat_model_tiers_eu' : 'chat_model_tiers';
+        const tiers = (await configStore.getConfig(tiersKey)) || {};
+        const tier = tiers.standard || {};
+        if (!tier.modelId) {
+            return res.status(400).json({ error: 'Standard tier is not configured.' });
+        }
+
+        // Pick the bootstrap model (cheap if configured, otherwise main).
+        let bootstrapModelId = tier.bootstrapModelId || tier.modelId;
+        let bootstrapConfig;
+        try {
+            bootstrapConfig = await getProviderForModel(bootstrapModelId);
+        } catch (_) {
+            // Cheap model unavailable — fall back to the main tier model.
+            bootstrapConfig = await getProviderForModel(tier.modelId);
+            bootstrapModelId = tier.modelId;
+        }
+        const bootstrapAdapter = getAdapter(bootstrapConfig.providerType, (bootstrapConfig.url || '').replace(/\/+$/, ''));
+
+        // Determine the seed message — body override > first user message > placeholder.
+        const overrideMessage = (typeof req.body?.message === 'string' && req.body.message.trim()) ? req.body.message.trim() : null;
+        const firstUserMsg = (Array.isArray(conv.messages) ? conv.messages : []).find(m => m.role === 'user')?.content;
+        const seedMessage = overrideMessage || firstUserMsg || '[No prior user text — derive broadly useful skills.]';
+
+        // Pull user/org context for tone/language tailoring.
+        let userContext = null;
+        try {
+            const userStore = require('../../stores/userStore');
+            const u = await userStore.getUser(userId);
+            if (u) {
+                userContext = {
+                    language: u.language || u.locale || (req.session?.user?.language) || null,
+                    role: u.orgRole || u.role || null,
+                };
+                if (u.organizationId) {
+                    const org = await userStore.getOrganization(u.organizationId);
+                    if (org) {
+                        userContext.orgName = org.name || null;
+                        userContext.orgTagline = org.tagline || null;
+                    }
+                }
+            }
+        } catch (_) { /* non-fatal */ }
+
+        const newSkills = await bootstrapSessionSkills({
+            adapter: bootstrapAdapter,
+            apiKey: bootstrapConfig.apiKey,
+            apiUrl: (bootstrapConfig.url || '').replace(/\/+$/, ''),
+            modelId: bootstrapModelId,
+            message: seedMessage,
+            timezone: req.body?.timezone || 'UTC',
+            apiVersion: bootstrapConfig.apiVersion || undefined,
+            userContext,
+        });
+
+        // Persist new skills + reset activations. Preserve existing messages.
+        const existingMessages = Array.isArray(conv.messages) ? conv.messages : [];
+        await agentStore.updateDirectConversation(req.params.id, existingMessages, userId, {
+            sessionSkills: newSkills,
+            activatedSessionSkillIds: [],
+        });
+
+        res.json({ success: true, skills: newSkills, activatedSkillIds: [] });
+    } catch (e) {
+        console.error('Failed to regenerate session skills:', e);
+        res.status(500).json({ error: e.message || 'Failed to regenerate session skills' });
+    }
+});
+
+// Delete one chat-local session skill from a conversation.
+router.delete('/direct/conversations/:id/session-skills/:skillId', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const conv = await agentStore.getDirectConversation(req.params.id, userId);
+        if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+
+        const sessionSkills = Array.isArray(conv.sessionSkills) ? conv.sessionSkills : [];
+        const skillId = req.params.skillId;
+        const nextSkills = sessionSkills.filter(s => s.id !== skillId);
+        if (nextSkills.length === sessionSkills.length) {
+            return res.status(404).json({ error: 'Session skill not found' });
+        }
+        const nextActivated = (Array.isArray(conv.activatedSessionSkillIds) ? conv.activatedSessionSkillIds : []).filter(id => id !== skillId);
+
+        const existingMessages = Array.isArray(conv.messages) ? conv.messages : [];
+        await agentStore.updateDirectConversation(req.params.id, existingMessages, userId, {
+            sessionSkills: nextSkills,
+            activatedSessionSkillIds: nextActivated,
+        });
+
+        res.json({ success: true, skills: nextSkills, activatedSkillIds: nextActivated });
+    } catch (e) {
+        console.error('Failed to delete session skill:', e);
+        res.status(500).json({ error: 'Failed to delete session skill' });
     }
 });
 

@@ -50,14 +50,34 @@ function normalizeSessionSkill(raw, idx = 0) {
 function parseSkillPayload(rawText) {
     const txt = stripCodeFences(rawText);
     if (!txt) return [];
-    const parsed = JSON.parse(txt);
+    let parsed;
+    try {
+        parsed = JSON.parse(txt);
+    } catch (_) {
+        // Malformed JSON — return [] so the caller can pick up the fallback
+        // path instead of crashing the request.
+        return [];
+    }
     const arr = Array.isArray(parsed)
         ? parsed
-        : (Array.isArray(parsed.skills) ? parsed.skills : []);
+        : (parsed && Array.isArray(parsed.skills) ? parsed.skills : []);
     return arr
         .slice(0, MAX_SESSION_SKILLS)
         .map((s, i) => normalizeSessionSkill(s, i))
         .filter(Boolean);
+}
+
+function formatUserContext(userContext) {
+    if (!userContext || typeof userContext !== 'object') return '';
+    const parts = [];
+    if (userContext.language) parts.push(`User language: ${userContext.language}`);
+    if (userContext.role) parts.push(`User role: ${userContext.role}`);
+    if (userContext.orgName) {
+        parts.push(userContext.orgTagline
+            ? `Organization: ${userContext.orgName} (${userContext.orgTagline})`
+            : `Organization: ${userContext.orgName}`);
+    }
+    return parts.length > 0 ? parts.join(' · ') : '';
 }
 
 async function bootstrapSessionSkills({
@@ -68,10 +88,13 @@ async function bootstrapSessionSkills({
     message,
     timezone = 'UTC',
     apiVersion,
+    userContext = null,
 }) {
     const seed = typeof message === 'string' && message.trim()
         ? message.trim()
         : 'No explicit user text was provided. Derive broadly useful session skills from context.';
+
+    const ctxLine = formatUserContext(userContext);
 
     const bootstrapMessages = [
         {
@@ -83,12 +106,17 @@ async function bootstrapSessionSkills({
                 'name, description, instructions, workflow, rules, examples, dynamicActivation',
                 'Keep each field concise and practical.',
                 'Set dynamicActivation=true unless always-needed instructions are critical.',
+                'Tailor wording, language, and examples to the user/org context if provided.',
                 'Do not mention tools that are not guaranteed to exist.',
             ].join('\n'),
         },
         {
             role: 'user',
-            content: `User request:\n${seed}\n\nUser timezone: ${timezone}`,
+            content: [
+                `User request:\n${seed}`,
+                `User timezone: ${timezone}`,
+                ctxLine ? `Context: ${ctxLine}` : '',
+            ].filter(Boolean).join('\n\n'),
         },
     ];
 
