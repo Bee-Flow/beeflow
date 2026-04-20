@@ -166,6 +166,71 @@ async function bootstrapWith(adapterContent) {
         assert.ok(out.error, 'empty input returns error');
     }
 
+    // ── dependencies: unmet dep rejects activation ──────────────────
+    {
+        const ss = [
+            { id: 'a', name: 'Research', order: 1, dependsOn: [] },
+            { id: 'b', name: 'Write',    order: 2, dependsOn: ['a'] },
+        ];
+        const out = await executeActivateSessionSkill({
+            args: { skill_ids: ['b'] },
+            sessionSkills: ss,
+            activatedSkillIds: [],
+        });
+        assert.ok(out.error, 'activating step 2 without step 1 returns error');
+        assert.match(out.error, /Research/, 'error cites the missing dep name');
+    }
+
+    // ── dependencies: batch activation of valid prefix chain ────────
+    {
+        const ss = [
+            { id: 'a', name: 'A', order: 1, dependsOn: [] },
+            { id: 'b', name: 'B', order: 2, dependsOn: ['a'] },
+        ];
+        const out = await executeActivateSessionSkill({
+            args: { skill_ids: ['a', 'b'] },
+            sessionSkills: ss,
+            activatedSkillIds: [],
+        });
+        assert.strictEqual(out.success, true, 'batch activates prefix chain');
+        assert.deepStrictEqual(out.activatedSkillIds.sort(), ['a', 'b']);
+    }
+
+    // ── dependencies: reactivating already-active skill is a no-op ──
+    {
+        const ss = [{ id: 'a', name: 'A', order: 1, dependsOn: [] }];
+        const out = await executeActivateSessionSkill({
+            args: { skill_ids: ['a'] },
+            sessionSkills: ss,
+            activatedSkillIds: ['a'],
+        });
+        assert.strictEqual(out.success, true, 'already-active is not an error');
+    }
+
+    // ── resolveDependencies (via parseSkillPayload): names -> ids ───
+    {
+        const json = JSON.stringify([
+            { name: 'Research',   order: 1, dependsOn: [] },
+            { name: 'LinkedIn',   order: 2, dependsOn: ['Research'] },
+        ]);
+        const skills = await bootstrapWith(json);
+        assert.strictEqual(skills.length, 2);
+        const research = skills.find(s => s.name === 'Research');
+        const linkedin = skills.find(s => s.name === 'LinkedIn');
+        assert.deepStrictEqual(linkedin.dependsOn, [research.id], 'name resolved to canonical id');
+    }
+
+    // ── manifest shows READY vs BLOCKED ─────────────────────────────
+    {
+        const ss = [
+            { id: 'a', name: 'A', order: 1, dependsOn: [] },
+            { id: 'b', name: 'B', order: 2, dependsOn: ['a'] },
+        ];
+        const out = buildSessionSkillInjection({ sessionSkills: ss, activatedSkillIds: [] });
+        assert.match(out.systemPromptAddendum, /READY/, 'step 1 shows READY');
+        assert.match(out.systemPromptAddendum, /BLOCKED by: A/, 'step 2 shows BLOCKED by A');
+    }
+
     console.log('[sessionSkillRuntime.test] all assertions passed ✓');
 })().catch(err => {
     console.error('[sessionSkillRuntime.test] FAILED:', err);

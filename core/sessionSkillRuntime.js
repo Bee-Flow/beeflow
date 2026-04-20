@@ -35,6 +35,13 @@ function normalizeSessionSkill(raw, idx = 0) {
     const workflow = sanitizeText(raw.workflow, 3000);
     const rules = sanitizeText(raw.rules, 3000);
     const examples = sanitizeText(raw.examples, 3000);
+    // Pipeline sequencing: `order` is a 1-based step number the bootstrap
+    // assigned; `dependsOn` lists skill ids that must be activated first.
+    // Both are enforced server-side in executeActivateSessionSkill.
+    const orderNum = Number.isFinite(raw.order) ? Math.max(1, Math.round(raw.order)) : (idx + 1);
+    const dependsOn = Array.isArray(raw.dependsOn)
+        ? raw.dependsOn.filter(d => typeof d === 'string' && d.length > 0).slice(0, 10)
+        : [];
     return {
         id: raw.id && typeof raw.id === 'string' ? raw.id : `sess_${crypto.randomUUID()}`,
         name,
@@ -43,8 +50,29 @@ function normalizeSessionSkill(raw, idx = 0) {
         workflow,
         rules,
         examples,
+        order: orderNum,
+        dependsOn,
         dynamicActivation: raw.dynamicActivation !== false, // default true for token savings
     };
+}
+
+// Resolve `dependsOn` strings (LLM-supplied — typically names) into canonical
+// skill ids belonging to the same batch. Drops any reference that doesn't
+// match a sibling skill's id or name. Runs after all ids are assigned so
+// cross-references resolve cleanly.
+function resolveDependencies(skills) {
+    if (!Array.isArray(skills) || skills.length === 0) return skills;
+    const byKey = new Map();
+    for (const s of skills) {
+        if (s.id) byKey.set(s.id, s.id);
+        if (s.name) byKey.set(s.name.toLowerCase(), s.id);
+    }
+    return skills.map(s => ({
+        ...s,
+        dependsOn: (s.dependsOn || [])
+            .map(dep => byKey.get(dep) || byKey.get(typeof dep === 'string' ? dep.toLowerCase() : '') || null)
+            .filter(id => id && id !== s.id),   // never self-depend
+    }));
 }
 
 function parseSkillPayload(rawText) {
@@ -61,10 +89,11 @@ function parseSkillPayload(rawText) {
     const arr = Array.isArray(parsed)
         ? parsed
         : (parsed && Array.isArray(parsed.skills) ? parsed.skills : []);
-    return arr
+    const normalized = arr
         .slice(0, MAX_SESSION_SKILLS)
         .map((s, i) => normalizeSessionSkill(s, i))
         .filter(Boolean);
+    return resolveDependencies(normalized);
 }
 
 function formatUserContext(userContext) {
@@ -103,7 +132,15 @@ async function bootstrapSessionSkills({
                 'You create chat-local skills for one direct-chat conversation.',
                 'Return ONLY valid JSON (no prose, no markdown fences).',
                 `Return an array with 2 to ${MAX_SESSION_SKILLS} objects, each with:`,
-                'name, description, instructions, workflow, rules, examples, dynamicActivation',
+                'name, description, instructions, workflow, rules, examples, dynamicActivation, order, dependsOn',
+                '',
+                'IMPORTANT — skills form an ORDERED PIPELINE enforced by the server:',
+                '  "order"     — 1-based step number (1, 2, 3, ...). Lowest order runs first.',
+                '  "dependsOn" — array of PRIOR skill names (exact match) that must finish before',
+                '                this skill becomes activatable. Use [] for the first step.',
+                '  The runtime REFUSES to activate a skill whose dependencies are not yet active.',
+                '  Design the chain so each skill produces what the next one needs.',
+                '',
                 'Keep each field concise and practical.',
                 'Set dynamicActivation=true unless always-needed instructions are critical.',
                 'Tailor wording, language, and examples to the user/org context if provided.',
@@ -147,16 +184,22 @@ function buildSessionSkillInjection({ sessionSkills = [], activatedSkillIds = []
         return { systemPromptAddendum: '', tools: [] };
     }
     const activated = new Set(Array.isArray(activatedSkillIds) ? activatedSkillIds : []);
-    const active = sessionSkills.filter(s => activated.has(s.id));
-    const inactive = sessionSkills.filter(s => !activated.has(s.id));
+    // Sort by order so the LLM sees the pipeline in step sequence, not insertion order.
+    const ordered = [...sessionSkills].sort((a, b) => (a.order || 0) - (b.order || 0));
+    const active = ordered.filter(s => activated.has(s.id));
+    const inactive = ordered.filter(s => !activated.has(s.id));
+    const byId = new Map(ordered.map(s => [s.id, s]));
 
-    let addendum = '\n\n[CHAT-LOCAL SKILLS]\nThese skills are valid only for this direct chat conversation.';
+    let addendum = '\n\n[CHAT-LOCAL SKILLS — ORDERED PIPELINE]\nThese skills form a dependency-enforced pipeline for this direct chat. Each skill has a step number. Activate them in order — the runtime REFUSES to activate a skill whose dependencies are not yet active.';
 
     if (inactive.length > 0) {
-        const manifest = inactive
-            .map(s => `- ${s.id} · ${s.name} — ${s.description || '(no description)'}`)
-            .join('\n');
-        addendum += `\n\n[AVAILABLE ON DEMAND]\nActivate only when relevant to the current user request. Call \`${ACTIVATE_SESSION_SKILL_TOOL_NAME}\` before replying when needed.\n${manifest}`;
+        const manifest = inactive.map(s => {
+            const unmet = (s.dependsOn || []).filter(depId => !activated.has(depId));
+            const depNames = unmet.map(id => byId.get(id)?.name || id);
+            const status = unmet.length === 0 ? 'READY' : `BLOCKED by: ${depNames.join(', ')}`;
+            return `- [step ${s.order}] ${s.id} · ${s.name} — ${s.description || '(no description)'}  (${status})`;
+        }).join('\n');
+        addendum += `\n\n[AVAILABLE ON DEMAND]\nActivate the next READY skill when its step is relevant. Call \`${ACTIVATE_SESSION_SKILL_TOOL_NAME}\` before replying.\n${manifest}`;
     }
 
     if (active.length > 0) {
@@ -220,10 +263,30 @@ async function executeActivateSessionSkill({ args, sessionSkills = [], activated
     if (ids.length === 0) return { error: 'No skill_ids provided.' };
 
     const byId = new Map((sessionSkills || []).map(s => [s.id, s]));
-    const loaded = ids.map(id => byId.get(id)).filter(Boolean);
-    if (loaded.length === 0) return { error: 'No matching session skills found for the requested ids.' };
+    const requested = ids.map(id => byId.get(id)).filter(Boolean);
+    if (requested.length === 0) return { error: 'No matching session skills found for the requested ids.' };
 
-    const mergedActivated = Array.from(new Set([...(activatedSkillIds || []), ...loaded.map(s => s.id)]));
+    // Enforce the ordered pipeline. Process the requested list in step order
+    // and accumulate activations so batch activations of a valid prefix chain
+    // succeed in one call. The first skill whose deps aren't met aborts the
+    // whole call — partial success is confusing for the model.
+    const sortedReq = [...requested].sort((a, b) => (a.order || 0) - (b.order || 0));
+    const runningActivated = new Set(Array.isArray(activatedSkillIds) ? activatedSkillIds : []);
+    const loaded = [];
+    for (const s of sortedReq) {
+        if (runningActivated.has(s.id)) { loaded.push(s); continue; }
+        const unmet = (s.dependsOn || []).filter(dep => !runningActivated.has(dep));
+        if (unmet.length > 0) {
+            const depNames = unmet.map(id => byId.get(id)?.name || id);
+            return {
+                error: `Cannot activate "${s.name}" (step ${s.order}) yet — it depends on: ${depNames.join(', ')}. Activate those first.`,
+            };
+        }
+        runningActivated.add(s.id);
+        loaded.push(s);
+    }
+
+    const mergedActivated = Array.from(runningActivated);
     const blocks = loaded.map(s => {
         let b = `### SESSION SKILL — "${s.name}" (id: ${s.id})`;
         if (s.description) b += `\n${s.description}`;
