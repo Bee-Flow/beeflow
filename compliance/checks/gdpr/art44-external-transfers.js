@@ -1,12 +1,23 @@
 /**
  * GDPR Art. 44-46 — International transfers / external LLMs.
- * Scans agents + global AI config for external provider usage.
- * If any agent uses an external LLM, warn (SCC/DPA may be required).
+ *
+ * Scans the AI provider list and agent models to see whether personal data
+ * could leave EU / self-hosted infrastructure. `ai.providers` is an ARRAY of
+ * `{id, name, type, url, model, apiKey}` rows (see aiAgent.ensureDefaultProvider).
  */
 
 const { getAll } = require('../../../db');
 const configStore = require('../../../stores/configStore');
 const { classifyProvider } = require('../../../core/providers/classification');
+
+// Known external provider prefixes that can appear inside an agent.model string
+// (e.g. "openai/gpt-4o", "azure:gpt-4o"). A kale modelnaam zoals "gpt-4o"
+// wordt NIET geflagd op naam alleen — we vertrouwen op de provider-list.
+const EXTERNAL_PROVIDER_PREFIXES = new Set([
+    'openai', 'claude', 'anthropic', 'google', 'google-vertex',
+    'azure', 'mistral', 'cohere', 'groq', 'together',
+    'fireworks', 'perplexity', 'minimax',
+]);
 
 module.exports = {
     id: 'GDPR-Art44-external-transfers',
@@ -20,42 +31,57 @@ module.exports = {
     remediationLink: 'admin/ai-config',
     async evaluate(orgId) {
         const ai = (await configStore.getConfig('ai')) || {};
-        const providers = ai.providers || {};
+        const providers = Array.isArray(ai.providers) ? ai.providers : [];
         const allowlist = Array.isArray(ai.privateHostAllowlist) ? ai.privateHostAllowlist : [];
 
+        // ── Scan provider list ─────────────────────────────────────
         const externalProviders = [];
-        for (const [type, cfg] of Object.entries(providers)) {
-            if (!cfg || typeof cfg !== 'object') continue;
-            const hasKey = !!(cfg.apiKey || cfg.enabled);
-            if (!hasKey) continue;
-            const result = classifyProvider({ providerType: type, url: cfg.baseUrl || cfg.endpoint || '' }, allowlist);
-            if (result.isExternal) externalProviders.push({ type, reason: result.reason });
+        for (const p of providers) {
+            if (!p || typeof p !== 'object') continue;
+            // Skip providers without an API key — they aren't actively used.
+            if (!p.apiKey && !p.enabled) continue;
+            const result = classifyProvider({
+                providerType: p.type || '',
+                url: p.url || p.baseUrl || p.endpoint || '',
+            }, allowlist);
+            if (result.isExternal) {
+                externalProviders.push({
+                    id: p.id, name: p.name || p.type, type: p.type, reason: result.reason,
+                });
+            }
         }
 
+        // ── Scan agent model strings ───────────────────────────────
         let agents = [];
         try {
             agents = await getAll(`SELECT id, name, model, organization_id FROM agents WHERE is_published = TRUE`);
-        } catch { /* agents table may not exist in fresh install */ }
+        } catch { /* fresh install, no agents table yet */ }
         const externalAgents = [];
         for (const a of agents) {
             if (orgId && a.organization_id && a.organization_id !== orgId) continue;
-            const model = String(a.model || '');
+            const model = String(a.model || '').trim();
             if (!model) continue;
-            const typeGuess = model.split(/[\/:]/)[0].toLowerCase();
-            const cls = classifyProvider({ providerType: typeGuess, url: '' }, allowlist);
-            if (cls.isExternal) externalAgents.push({ id: a.id, name: a.name, model });
+            // Extract provider prefix if present ("openai/gpt-4o" → "openai").
+            const prefix = model.split(/[\/:]/)[0].toLowerCase();
+            if (EXTERNAL_PROVIDER_PREFIXES.has(prefix)) {
+                externalAgents.push({ id: a.id, name: a.name, model });
+            }
         }
 
-        let status;
-        if (externalProviders.length === 0 && externalAgents.length === 0) status = 'pass';
-        else status = 'warn';
-
+        const hasExternal = externalProviders.length > 0 || externalAgents.length > 0;
+        const status = hasExternal ? 'warn' : 'pass';
         return {
             status,
-            evidence: { external_providers: externalProviders, external_agents: externalAgents.slice(0, 20) },
+            evidence: {
+                external_providers: externalProviders,
+                external_agents: externalAgents.slice(0, 20),
+                total_providers_configured: providers.length,
+            },
             details: status === 'pass'
-                ? 'No external LLM providers detected — all inference stays on self-hosted infrastructure.'
-                : `${externalAgents.length} agent(s) and ${externalProviders.length} provider(s) route data outside EU/internal infrastructure. Ensure SCCs/DPAs are in place or switch to internal models.`,
+                ? providers.length === 0
+                    ? 'No LLM providers configured — nothing leaves your infrastructure.'
+                    : `All ${providers.length} configured provider(s) run on self-hosted or EU-internal infrastructure.`
+                : `${externalProviders.length} external provider(s) and ${externalAgents.length} published agent(s) send data to cloud LLMs outside EU/self-hosted boundaries. Confirm SCCs/DPAs are in place or switch those agents to internal models.`,
         };
     },
 };

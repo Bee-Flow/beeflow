@@ -438,6 +438,38 @@ async function executePublishSessionSkill({
     };
 }
 
+/**
+ * Summarise the pipeline's execution state so the directChat tool loop can
+ * decide what tool_choice to feed the LLM on the next round.
+ *
+ * Returns:
+ *   - hasPipeline        — there's at least one session skill
+ *   - allTerminalsDone   — every terminal skill (no downstream dependents)
+ *                          is in activatedSkillIds; the LLM is now allowed
+ *                          to produce user-facing output.
+ *   - readySkillIds      — skills whose dependencies are all activated but
+ *                          which aren't activated themselves (activation
+ *                          candidates, in step order).
+ */
+function describePipelineState(sessionSkills, activatedSkillIds) {
+    const hasPipeline = Array.isArray(sessionSkills) && sessionSkills.length > 0;
+    if (!hasPipeline) return { hasPipeline: false, allTerminalsDone: true, readySkillIds: [] };
+    const activated = new Set(Array.isArray(activatedSkillIds) ? activatedSkillIds : []);
+    const downstream = new Map(sessionSkills.map(s => [s.id, []]));
+    for (const s of sessionSkills) {
+        for (const dep of s.dependsOn || []) {
+            if (downstream.has(dep)) downstream.get(dep).push(s.id);
+        }
+    }
+    const terminals = sessionSkills.filter(s => (downstream.get(s.id) || []).length === 0);
+    const allTerminalsDone = terminals.every(s => activated.has(s.id));
+    const ordered = [...sessionSkills].sort((a, b) => (a.order || 0) - (b.order || 0));
+    const readySkillIds = ordered
+        .filter(s => !activated.has(s.id) && (s.dependsOn || []).every(dep => activated.has(dep)))
+        .map(s => s.id);
+    return { hasPipeline, allTerminalsDone, readySkillIds };
+}
+
 module.exports = {
     ACTIVATE_SESSION_SKILL_TOOL_NAME,
     PUBLISH_SESSION_SKILL_TOOL_NAME,
@@ -447,5 +479,6 @@ module.exports = {
     executePublishSessionSkill,
     initialActivatedSkillIds,
     deriveCompletedSkillIds,
+    describePipelineState,
 };
 

@@ -24,6 +24,7 @@ const {
     bootstrapSessionSkills,
     buildSessionSkillInjection,
     initialActivatedSkillIds,
+    describePipelineState,
 } = require('../../core/sessionSkillRuntime');
 const { WORKSPACE_TOOLS } = require('../../integrations/workspaceTools');
 const guardrailEventStore = require('../../stores/guardrailEventStore');
@@ -1614,6 +1615,41 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         const skipToolPrecheck = adapter.shouldUseResponsesApi?.(modelId, chatOptions) || ['google', 'openai', 'claude', 'mistral'].includes(config.providerType);
         let toolCallRounds = 0;
         const MAX_TOOL_ROUNDS = 5;
+        // Pipeline enforcement: count rounds where the LLM called tools but
+        // didn't advance the session-skill pipeline (no activate_session_skill).
+        // After a threshold we inject a system reminder + force tool_choice
+        // so the LLM can't stall on integration tools while the pipeline sits idle.
+        let consecutiveNonActivationRounds = 0;
+        const STALL_THRESHOLD = 2;
+        // Helper: compute tool_choice + (if stalled) an extra reminder message.
+        // Returns { toolChoice, stallReminder }.
+        function computePipelineGuard() {
+            if (!isStandardTier) return { toolChoice: 'auto', stallReminder: null };
+            const state = describePipelineState(sessionSkills, activatedSessionSkillIds);
+            if (!state.hasPipeline || state.allTerminalsDone) return { toolChoice: 'auto', stallReminder: null };
+            const byId = new Map(sessionSkills.map(s => [s.id, s]));
+            const nextReadyName = state.readySkillIds.length > 0
+                ? (byId.get(state.readySkillIds[0])?.name || state.readySkillIds[0])
+                : null;
+            const nextReadyId = state.readySkillIds[0] || null;
+            // Stalled: the LLM is calling integration tools but not walking the
+            // pipeline. Force the next call to be activate_session_skill via a
+            // strong system-message nudge (tool_choice: 'required' keeps it
+            // from writing final text; the reminder tells it WHICH tool).
+            if (consecutiveNonActivationRounds >= STALL_THRESHOLD && nextReadyId) {
+                return {
+                    toolChoice: 'required',
+                    stallReminder: {
+                        role: 'system',
+                        content: `Pipeline enforcement: you have taken ${consecutiveNonActivationRounds} tool rounds without advancing the session-skill pipeline. Call \`activate_session_skill\` with skill_ids=["${nextReadyId}"] (${nextReadyName}) RIGHT NOW before any other tool. Final user-facing output is blocked until every terminal session skill is activated.`,
+                    },
+                };
+            }
+            // Default when pipeline is unfinished: force SOME tool call. This
+            // prevents the LLM from producing final text before the pipeline
+            // is walked. It can still pick integration tools, but can't exit.
+            return { toolChoice: 'required', stallReminder: null };
+        }
         const generatedImages = []; // Track images for persistence
         const generatedAudio = []; // Track audio for persistence
         const collectedEmailDrafts = [];
@@ -1643,10 +1679,14 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                 // Non-streaming tool check via adapter.chat()
                 let result;
                 try {
+                    const guard = computePipelineGuard();
+                    if (guard.stallReminder) {
+                        messages.push(guard.stallReminder);
+                    }
                     result = await adapter.chat(apiKey, apiUrl, modelId, messages, {
                         ...chatOptions,
                         tools: directChatTools,
-                        toolChoice: 'auto',
+                        toolChoice: guard.toolChoice,
                     });
                 } catch (err) {
                     console.error('[DirectChat] Tool check error:', err.message);
@@ -1656,6 +1696,11 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                 }
 
                 if (result.toolCalls && result.toolCalls.length > 0) {
+                    // Update pipeline-stall counter: a round where at least
+                    // one call was activate_session_skill resets it; otherwise
+                    // we increment so the next guard kicks in harder.
+                    const calledActivation = result.toolCalls.some(tc => (tc.function?.name || tc.name) === ACTIVATE_SESSION_SKILL_TOOL_NAME);
+                    consecutiveNonActivationRounds = calledActivation ? 0 : consecutiveNonActivationRounds + 1;
                     // Add assistant message with tool calls to history
                     messages.push({
                         role: 'assistant',
@@ -1956,10 +2001,19 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             return part;
         };
 
+        // Pipeline guard at the streaming-call boundary: same rule as the
+        // pre-check path — while a session-skill pipeline is mid-run, the
+        // LLM is forced to keep calling tools instead of emitting final text.
+        const streamGuard = computePipelineGuard();
+        if (streamGuard.stallReminder) {
+            messages.push(streamGuard.stallReminder);
+        }
         const streamOptions = {
             ...chatOptions,
             tools: (toolCallRounds > 0) ? undefined : (directChatTools.length > 0 ? directChatTools : undefined),
-            toolChoice: (toolCallRounds > 0) ? undefined : (directChatTools.length > 0 ? 'auto' : undefined),
+            toolChoice: (toolCallRounds > 0)
+                ? undefined
+                : (directChatTools.length > 0 ? streamGuard.toolChoice : undefined),
         };
 
         const streamCallback = (type, data) => {
@@ -2097,6 +2151,12 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         while (streamToolCalls.length > 0 && toolRound < MAX_STREAM_TOOL_ROUNDS) {
             toolRound++;
             console.log(`[DirectChat] Streamed tool round ${toolRound}: ${streamToolCalls.map(t => t.function?.name).join(', ')}`);
+
+            // Pipeline-stall bookkeeping — mirror the pre-check path.
+            {
+                const calledActivation = streamToolCalls.some(tc => tc.function?.name === ACTIVATE_SESSION_SKILL_TOOL_NAME);
+                consecutiveNonActivationRounds = calledActivation ? 0 : consecutiveNonActivationRounds + 1;
+            }
 
             messages.push({
                 role: 'assistant',
@@ -2380,10 +2440,15 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             // Stream the follow-up response after tool execution (with tools for multi-round)
             fullContent = '';
             streamToolCalls = [];
+            const followGuard = computePipelineGuard();
+            if (followGuard.stallReminder) {
+                messages.push(followGuard.stallReminder);
+            }
             await adapter.stream(apiKey, apiUrl, modelId, messages, {
                 ...chatOptions,
                 previousResponseId: undefined, // Don't chain — we need to send tool results in full
                 tools: directChatTools.length > 0 ? directChatTools : undefined,
+                toolChoice: directChatTools.length > 0 ? followGuard.toolChoice : undefined,
             }, (type, data) => {
                 if (type === 'text') {
                     fullContent += data.text;

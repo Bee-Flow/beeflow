@@ -54,15 +54,45 @@ function computeScore(results) {
     return { score, total: results.length, pass, warn, fail, na };
 }
 
+// Track which orgs have had an auto-run kicked off so we don't re-trigger on
+// every overview call. Keyed by orgId, value = timestamp of last auto-run.
+const _autoRunCache = new Map();
+const AUTO_RUN_STALE_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+async function ensureFreshResults(orgId) {
+    const last = _autoRunCache.get(orgId) || 0;
+    if (Date.now() - last < AUTO_RUN_STALE_MS) return;
+    _autoRunCache.set(orgId, Date.now());
+    // Fire-and-forget — don't block the request
+    runner.runAll(orgId, { runType: 'scheduled' }).catch(e =>
+        console.warn(`[Compliance] auto-run for org "${orgId}" failed:`, e.message)
+    );
+}
+
 router.get('/overview', requireAuth, requirePermission('admin_compliance'), async (req, res) => {
     try {
         const orgId = await resolveOrgId(req);
         const settings = await complianceStore.getSettings(orgId);
-        const latest = await complianceStore.getLatestPerCheck(orgId);
+        let latest = await complianceStore.getLatestPerCheck(orgId);
+
+        // If this org has never been scanned OR the newest result is older than
+        // the 6-hour auto-run window, run checks synchronously so the very first
+        // visit shows a populated dashboard instead of "never run".
+        const newest = latest.length ? latest.reduce((m, r) => (r.run_at > m ? r.run_at : m), latest[0].run_at) : null;
+        const staleMs = newest ? (Date.now() - new Date(newest).getTime()) : Infinity;
+        if (latest.length === 0) {
+            // Never run for this org → block briefly so the UI isn't empty.
+            try { await runner.runAll(orgId, { runType: 'scheduled' }); } catch (e) {
+                console.warn('[Compliance] initial run failed:', e.message);
+            }
+            latest = await complianceStore.getLatestPerCheck(orgId);
+            _autoRunCache.set(orgId, Date.now());
+        } else if (staleMs > AUTO_RUN_STALE_MS) {
+            ensureFreshResults(orgId);
+        }
 
         const gdpr = latest.filter(r => r.regulation === 'GDPR');
         const aia = latest.filter(r => r.regulation === 'AIA');
-
         const lastRunAt = latest.length ? latest.reduce((m, r) => (r.run_at > m ? r.run_at : m), latest[0].run_at) : null;
         res.json({
             organization_id: orgId,
