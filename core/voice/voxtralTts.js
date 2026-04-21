@@ -16,10 +16,46 @@ const configStore = require('../../stores/configStore');
 const elevenlabsProvider = require('../providers/elevenlabs');
 
 const MISTRAL_API_BASE = 'https://api.mistral.ai';
-// Voxtral TTS model name — passing `model` is optional per Mistral's docs,
-// so we leave it undefined by default and let the server pick. Set this via
-// opts.model if a specific checkpoint is needed.
-const DEFAULT_TTS_MODEL = null;
+// Hosted Voxtral TTS model — the Mistral cloud requires a concrete `model`
+// string even though the docs list it as optional (returns 422 otherwise).
+const DEFAULT_TTS_MODEL = 'voxtral-mini-tts-2603';
+
+// Voice discovery cache — Mistral's TTS requires a `voice_id` and does NOT
+// ship preset system voices; users must create a voice first via
+// POST /v1/audio/voices. We lazily list voices on the account and cache the
+// first one for the process lifetime. A manifest change (new voice created,
+// voice deleted) only takes effect on restart, which is fine for Beta.
+let _cachedVoiceId = null;
+let _voiceDiscoveryFailed = false;
+
+async function discoverVoiceId(apiKey) {
+    if (_cachedVoiceId) return _cachedVoiceId;
+    if (_voiceDiscoveryFailed) return null;
+    try {
+        const resp = await fetch(`${MISTRAL_API_BASE}/v1/audio/voices?limit=1`, {
+            headers: { Authorization: `Bearer ${apiKey}` },
+        });
+        if (!resp.ok) {
+            console.warn(`[Voxtral TTS] voice list ${resp.status} — skipping`);
+            _voiceDiscoveryFailed = true;
+            return null;
+        }
+        const json = await resp.json();
+        const first = Array.isArray(json?.items) ? json.items[0] : null;
+        if (first?.id) {
+            _cachedVoiceId = first.id;
+            console.log(`[Voxtral TTS] using voice_id=${_cachedVoiceId} (${first.name || 'unnamed'})`);
+            return _cachedVoiceId;
+        }
+        console.warn('[Voxtral TTS] account has no voices — create one via POST /v1/audio/voices or set an ElevenLabs key');
+        _voiceDiscoveryFailed = true;
+        return null;
+    } catch (err) {
+        console.warn('[Voxtral TTS] voice discovery error:', err.message);
+        _voiceDiscoveryFailed = true;
+        return null;
+    }
+}
 
 /**
  * Synthesize speech with Voxtral, fall back to ElevenLabs on error.
@@ -77,12 +113,17 @@ async function synthesize(text, opts = {}) {
 async function voxtralSynthesize(apiKey, text, opts = {}) {
     const started = Date.now();
 
+    const voiceId = opts.voice || await discoverVoiceId(apiKey);
+    if (!voiceId) {
+        throw new Error('no_voice_configured — create a Voxtral voice via POST /v1/audio/voices');
+    }
+
     const body = {
+        model: opts.model || DEFAULT_TTS_MODEL,
         input: text,
+        voice_id: voiceId,
         response_format: 'mp3',
     };
-    if (opts.model || DEFAULT_TTS_MODEL) body.model = opts.model || DEFAULT_TTS_MODEL;
-    if (opts.voice) body.voice_id = opts.voice;
 
     const resp = await fetch(`${MISTRAL_API_BASE}/v1/audio/speech`, {
         method: 'POST',

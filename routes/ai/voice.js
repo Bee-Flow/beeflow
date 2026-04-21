@@ -227,10 +227,19 @@ router.post(
             // TTS picks the right voice model for Dutch/French/etc. replies.
             if (assistantText.trim()) {
                 const ttsStart = Date.now();
-                const tts = await voxtralTts.synthesize(assistantText, {
-                    voice,
-                    language: stt.language || language,
-                });
+                let tts = { audioBase64: null, mimeType: 'audio/mpeg', provider: 'none' };
+                let ttsReason = 'no_provider_configured';
+                try {
+                    tts = await voxtralTts.synthesize(assistantText, {
+                        voice,
+                        language: stt.language || language,
+                    });
+                } catch (err) {
+                    const msg = String(err?.message || err);
+                    if (msg.includes('no_voice_configured')) ttsReason = 'no_voice_configured';
+                    else ttsReason = 'tts_failed';
+                    console.warn('[Voice turn] TTS pipeline error:', msg);
+                }
                 if (tts.audioBase64) {
                     send('tts', {
                         audioBase64: tts.audioBase64,
@@ -239,7 +248,7 @@ router.post(
                         latencyMs: Date.now() - ttsStart,
                     });
                 } else {
-                    send('tts_unavailable', { reason: 'no_provider_configured' });
+                    send('tts_unavailable', { reason: ttsReason });
                 }
             }
 
