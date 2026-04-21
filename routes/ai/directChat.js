@@ -2618,6 +2618,14 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                     })),
                 };
             }
+            // Per-turn pipeline snapshot — lets reloaded conversations replay
+            // the timeline progression on each assistant message instead of
+            // every old turn snapping to the final activation state.
+            if (Array.isArray(sessionSkills) && sessionSkills.length > 0) {
+                assistantSave.sessionSkillsSnapshot = {
+                    activatedSkillIds: Array.isArray(activatedSessionSkillIds) ? [...activatedSessionSkillIds] : [],
+                };
+            }
             savedMessages.push(assistantSave);
 
             // Save with metadata for OpenAI response chaining + compaction
