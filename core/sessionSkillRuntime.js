@@ -296,9 +296,9 @@ function buildSessionSkillInjection({
     const currentActive = activeInFocus[0] || null;
     let currentStepHeader;
     if (currentActive) {
-        currentStepHeader = `\n\n**Current step: "${currentActive.name}" (id: ${currentActive.id})** — you are WORKING on this step. Use integration tools as needed to produce the step's output. When finished, call \`${COMPLETE_SESSION_SKILL_TOOL_NAME}\` with \`{ skill_id: "${currentActive.id}", summary: "<1-3 sentence recap of what this step produced>" }\`. Only after that may the pipeline advance to the next step.`;
+        currentStepHeader = `\n\n**Current step: "${currentActive.name}" (id: ${currentActive.id})** — you are WORKING on this step. Do the step's actual work first: use integration tools (agent_search, notebook_write, ...) or produce the content this step is supposed to output. You MUST do real work before completing — the runtime rejects \`${COMPLETE_SESSION_SKILL_TOOL_NAME}\` if no tool rounds have run for this step. You also MUST NOT call \`${ACTIVATE_SESSION_SKILL_TOOL_NAME}\` for the next step until this one is completed. When this step's work is finished, call \`${COMPLETE_SESSION_SKILL_TOOL_NAME}\` with \`{ skill_id: "${currentActive.id}", summary: "<1-3 sentence recap of what this step actually produced>" }\`. Only after that may the pipeline advance.`;
     } else if (nextReady) {
-        currentStepHeader = `\n\n**Current step: "${nextReady.name}" (id: ${nextReady.id})** — not yet activated. Call \`${ACTIVATE_SESSION_SKILL_TOOL_NAME}\` with \`skill_ids: ["${nextReady.id}"]\` BEFORE any other action (including integration tools like agent_search / notebook_write). Work done without activating first is wasted — you only have the short description until you activate.`;
+        currentStepHeader = `\n\n**Current step: "${nextReady.name}" (id: ${nextReady.id})** — not yet activated. Call \`${ACTIVATE_SESSION_SKILL_TOOL_NAME}\` with \`skill_ids: ["${nextReady.id}"]\` BEFORE any other action (including integration tools like agent_search / notebook_write). Work done without activating first is wasted — you only have the short description until you activate. After activating, actually DO the step's work before completing.`;
     } else {
         currentStepHeader = '\n\nAll pipeline steps have been activated and completed. Produce the final user-facing answer now.';
     }
@@ -377,7 +377,7 @@ function buildSessionSkillInjection({
             type: 'function',
             function: {
                 name: COMPLETE_SESSION_SKILL_TOOL_NAME,
-                description: 'REQUIRED after finishing each pipeline step. Call this with the currently-active step\'s skill id and a 1-3 sentence summary of what the step produced. The runtime records the summary, shows it to the user as a per-step status row, and unlocks activation of the next step. Final user-facing output is blocked until every terminal step is completed.',
+                description: 'REQUIRED after finishing each pipeline step. Call this with the currently-active step\'s skill id and a 1-3 sentence summary of what the step ACTUALLY produced (facts found, draft content written, files created, etc.). The runtime REJECTS this call if no tool-call rounds have run for the step — each step must do real work (integration tools or content generation) between activation and completion; you cannot skip work. The runtime records the summary, shows it to the user as a per-step status row, and unlocks activation of the next step. Final user-facing output is blocked until every terminal step is completed.',
                 parameters: {
                     type: 'object',
                     properties: {

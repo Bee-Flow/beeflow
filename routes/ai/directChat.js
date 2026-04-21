@@ -1951,6 +1951,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                                 sessionSkills,
                                 activatedSessionSkillIds,
                                 completedSessionSkillIds,
+                                roundsInCurrentStep,
                                 timezone: timezone || 'Europe/Amsterdam',
                                 onImageGenerated: (data) => generatedImages.push(data),
                                 terminalCtx: {
@@ -2531,6 +2532,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                         sessionSkills,
                         activatedSessionSkillIds,
                         completedSessionSkillIds,
+                        roundsInCurrentStep,
                         timezone: timezone || 'Europe/Amsterdam',
                         onImageGenerated: (data) => generatedImages.push(data),
                         terminalCtx: {

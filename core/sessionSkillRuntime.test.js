@@ -28,8 +28,10 @@ const {
     bootstrapSessionSkills, // exercised via parseSkillPayload-style adapter mock
     buildSessionSkillInjection,
     executeActivateSessionSkill,
+    executeCompleteSessionSkill,
     initialActivatedSkillIds,
     deriveCompletedSkillIds,
+    describeStepMachineState,
 } = require('./sessionSkillRuntime');
 
 // parseSkillPayload + normalizeSessionSkill aren't exported. Test them via
@@ -294,15 +296,176 @@ async function bootstrapWith(adapterContent) {
             { id: 'a', name: 'Alpha', order: 1, dependsOn: [] },
             { id: 'b', name: 'Beta',  order: 2, dependsOn: ['a'] },
         ];
-        // Nothing activated yet: header should point at Alpha.
+        // Nothing activated yet: header should point at Alpha (not yet activated).
         let out = buildSessionSkillInjection({ sessionSkills: ss, activatedSkillIds: [] });
         assert.match(out.systemPromptAddendum, /Current step: "Alpha"/, 'header points at first ready skill');
-        // Alpha activated: header should move to Beta.
+        // Alpha activated but NOT completed: header stays on Alpha (mid-work).
         out = buildSessionSkillInjection({ sessionSkills: ss, activatedSkillIds: ['a'] });
-        assert.match(out.systemPromptAddendum, /Current step: "Beta"/, 'header advances as pipeline walks');
-        // All done: header says all steps activated.
-        out = buildSessionSkillInjection({ sessionSkills: ss, activatedSkillIds: ['a', 'b'] });
+        assert.match(out.systemPromptAddendum, /Current step: "Alpha"/, 'header stays on Alpha while it is mid-work');
+        assert.match(out.systemPromptAddendum, /complete_session_skill/, 'header mentions complete_session_skill when a step is active');
+        // Alpha activated AND completed: header advances to Beta.
+        out = buildSessionSkillInjection({
+            sessionSkills: ss,
+            activatedSkillIds: ['a'],
+            completedSessionSkillIds: ['a'],
+        });
+        assert.match(out.systemPromptAddendum, /Current step: "Beta"/, 'header advances only after explicit completion');
+        // Fully walked: all activated + all completed → final-answer phase.
+        out = buildSessionSkillInjection({
+            sessionSkills: ss,
+            activatedSkillIds: ['a', 'b'],
+            completedSessionSkillIds: ['a', 'b'],
+        });
         assert.match(out.systemPromptAddendum, /All pipeline steps have been activated/);
+    }
+
+    // ── manifest includes per-step summary trailer from completions ─
+    {
+        const ss = [
+            { id: 'a', name: 'Research', order: 1, dependsOn: [], instructions: 'body-a' },
+            { id: 'b', name: 'Write',    order: 2, dependsOn: ['a'], instructions: 'body-b' },
+        ];
+        const out = buildSessionSkillInjection({
+            sessionSkills: ss,
+            activatedSkillIds: ['a'],
+            completedSessionSkillIds: ['a'],
+            completions: [{ skillId: 'a', summary: 'Found 3 key sources on pricing trends.' }],
+        });
+        assert.match(out.systemPromptAddendum, /Found 3 key sources on pricing trends\./, 'completion summary appears in trailer');
+        assert.ok(!/body-a/.test(out.systemPromptAddendum), 'completed skill body is elided when explicit completion passed');
+    }
+
+    // ── executeCompleteSessionSkill: happy path advances pipeline ───
+    {
+        const ss = [
+            { id: 'a', name: 'Research', order: 1, dependsOn: [] },
+            { id: 'b', name: 'Write',    order: 2, dependsOn: ['a'] },
+        ];
+        const out = await executeCompleteSessionSkill({
+            args: { skill_id: 'a', summary: 'Gathered sources.' },
+            sessionSkills: ss,
+            activatedSessionSkillIds: ['a'],
+            completedSessionSkillIds: [],
+            roundsInCurrentStep: 2,
+        });
+        assert.strictEqual(out.success, true, 'happy path completes');
+        assert.strictEqual(out.skill_id, 'a');
+        assert.strictEqual(out.summary, 'Gathered sources.');
+        assert.deepStrictEqual(out.completedSessionSkillIds, ['a']);
+        assert.strictEqual(out.nextReadyId, 'b', 'returns next ready skill');
+    }
+
+    // ── executeCompleteSessionSkill: rejects if never activated ─────
+    {
+        const ss = [{ id: 'a', name: 'A', order: 1, dependsOn: [] }];
+        const out = await executeCompleteSessionSkill({
+            args: { skill_id: 'a', summary: 'ok' },
+            sessionSkills: ss,
+            activatedSessionSkillIds: [],
+            completedSessionSkillIds: [],
+            roundsInCurrentStep: 3,
+        });
+        assert.ok(out.error, 'rejects completion before activation');
+        assert.match(out.error, /never activated|activate_session_skill/);
+    }
+
+    // ── executeCompleteSessionSkill: rejects if already completed ───
+    {
+        const ss = [{ id: 'a', name: 'A', order: 1, dependsOn: [] }];
+        const out = await executeCompleteSessionSkill({
+            args: { skill_id: 'a', summary: 'ok' },
+            sessionSkills: ss,
+            activatedSessionSkillIds: ['a'],
+            completedSessionSkillIds: ['a'],
+            roundsInCurrentStep: 3,
+        });
+        assert.ok(out.error, 'rejects re-completing a completed skill');
+    }
+
+    // ── executeCompleteSessionSkill: rejects if no work was done ────
+    {
+        const ss = [{ id: 'a', name: 'A', order: 1, dependsOn: [] }];
+        const out = await executeCompleteSessionSkill({
+            args: { skill_id: 'a', summary: 'skipping work' },
+            sessionSkills: ss,
+            activatedSessionSkillIds: ['a'],
+            completedSessionSkillIds: [],
+            roundsInCurrentStep: 0,
+        });
+        assert.ok(out.error, 'rejects completion with zero work rounds');
+        assert.match(out.error, /no work was done|integration tools/);
+    }
+
+    // ── executeCompleteSessionSkill: rejects empty summary ──────────
+    {
+        const ss = [{ id: 'a', name: 'A', order: 1, dependsOn: [] }];
+        const out = await executeCompleteSessionSkill({
+            args: { skill_id: 'a', summary: '' },
+            sessionSkills: ss,
+            activatedSessionSkillIds: ['a'],
+            completedSessionSkillIds: [],
+            roundsInCurrentStep: 2,
+        });
+        assert.ok(out.error, 'rejects empty summary');
+    }
+
+    // ── executeActivateSessionSkill: blocked while prior step mid-work ─
+    {
+        const ss = [
+            { id: 'a', name: 'A', order: 1, dependsOn: [] },
+            { id: 'b', name: 'B', order: 2, dependsOn: ['a'] },
+        ];
+        const out = await executeActivateSessionSkill({
+            args: { skill_ids: ['b'] },
+            sessionSkills: ss,
+            activatedSkillIds: ['a'],           // a active
+            completedSkillIds: [],              // a not yet completed
+        });
+        assert.ok(out.error, 'activating the next step while current is mid-work is rejected');
+        assert.match(out.error, /still in progress|complete_session_skill/i);
+    }
+
+    // ── executeActivateSessionSkill: unblocks after prior step completed ─
+    {
+        const ss = [
+            { id: 'a', name: 'A', order: 1, dependsOn: [] },
+            { id: 'b', name: 'B', order: 2, dependsOn: ['a'] },
+        ];
+        const out = await executeActivateSessionSkill({
+            args: { skill_ids: ['b'] },
+            sessionSkills: ss,
+            activatedSkillIds: ['a'],
+            completedSkillIds: ['a'],            // a is done → b may start
+        });
+        assert.strictEqual(out.success, true, 'activation of next step allowed after completion');
+    }
+
+    // ── describeStepMachineState: walks through the full lifecycle ──
+    {
+        const ss = [
+            { id: 'a', name: 'A', order: 1, dependsOn: [] },
+            { id: 'b', name: 'B', order: 2, dependsOn: ['a'] },
+            { id: 'c', name: 'C', order: 3, dependsOn: ['b'] },
+        ];
+        // Nothing activated: no active, next ready = a, not complete.
+        let s = describeStepMachineState(ss, [], []);
+        assert.strictEqual(s.hasPipeline, true);
+        assert.strictEqual(s.allTerminalsCompleted, false);
+        assert.strictEqual(s.currentActiveId, null);
+        assert.strictEqual(s.nextReadyId, 'a');
+        // a activated, not completed: current = a, no next ready (b depends on a still active; deps met though).
+        s = describeStepMachineState(ss, ['a'], []);
+        assert.strictEqual(s.currentActiveId, 'a');
+        assert.strictEqual(s.nextReadyId, 'b', 'b becomes ready once a is activated (deps = activation only)');
+        // a completed: current = null, next ready = b.
+        s = describeStepMachineState(ss, ['a'], ['a']);
+        assert.strictEqual(s.currentActiveId, null);
+        assert.strictEqual(s.nextReadyId, 'b');
+        // All activated + completed: final phase.
+        s = describeStepMachineState(ss, ['a', 'b', 'c'], ['a', 'b', 'c']);
+        assert.strictEqual(s.allTerminalsCompleted, true);
+        assert.strictEqual(s.currentActiveId, null);
+        assert.strictEqual(s.nextReadyId, null);
     }
 
     // ── cycle detection: circular deps are broken ───────────────────
