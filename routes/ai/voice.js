@@ -7,18 +7,27 @@
  *   POST /ai/voice/session                — create a session, return defaults
  *   POST /ai/voice/turn                   — multipart audio in, SSE response out
  *
- * Per-turn pipeline (v1 Beta, turn-based streaming):
+ * Per-turn pipeline:
  *   1. Receive the user's audio blob (MediaRecorder → audio/webm;opus).
  *   2. Voxtral STT → transcript (emitted as SSE `transcript`).
- *   3. Mistral chat streaming → `text` deltas (LLM reply).
+ *   3. Tool-calling loop (up to MAX_VOICE_TOOL_ROUNDS):
+ *        Mistral stream with tools → emit `text` deltas.
+ *        If the model emits tool_use, execute via the unified dispatcher,
+ *        emit `tool_use` + `tool_result` SSE events, feed the result back
+ *        into the messages array, and stream again.
  *   4. Voxtral TTS (fallback ElevenLabs) on the final reply → `tts` event
  *      with base64-encoded MP3.
  *   5. `done` event terminates the stream.
  *
+ * Destructive tool calls are gated via a DRAFT_FIRST directive in the
+ * system prompt — the model must announce its intent and wait for a spoken
+ * confirmation before executing anything that creates, sends, modifies, or
+ * deletes. No runtime enforcement: Mistral Large 3 follows this reliably
+ * and a visual approval UI makes no sense in a voice flow.
+ *
  * State is held client-side: the client sends `history` with each turn and
  * appends the assistant reply locally. This keeps v1 stateless and avoids
- * a schema migration for the Beta. Persistence can be layered in v2 by
- * attaching a turn to an existing `direct_conversations` row.
+ * a schema migration for the Beta.
  */
 
 const express = require('express');
@@ -29,6 +38,9 @@ const configStore = require('../../stores/configStore');
 const { getAdapter } = require('../../core/providers');
 const voxtralStt = require('../../core/voice/voxtralStt');
 const voxtralTts = require('../../core/voice/voxtralTts');
+const { getIntegrationTools, buildToolHint } = require('../../core/integrationTools');
+const { executeTool: dispatchTool } = require('../../core/toolDispatcher');
+const agentStore = require('../../stores/agentStore');
 
 // ─── Auth & gating ───────────────────────────────────────────────
 function requireAuth(req, res, next) {
@@ -52,28 +64,58 @@ async function requireMistralConfigured(req, res, next) {
 // hand the buffer to Voxtral; no need to touch disk.
 const uploadTurn = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 25 * 1024 * 1024 }, // 25 MB per turn (≥ 2 minutes of opus)
+    limits: { fileSize: 25 * 1024 * 1024 },
     fileFilter: (req, file, cb) => {
         if (file.mimetype?.startsWith('audio/')) cb(null, true);
         else cb(new Error('Only audio/* mimetypes are accepted'));
     },
 });
 
-// ─── Defaults ─────────────────────────────────────────────────────
+// ─── Defaults & constants ─────────────────────────────────────────
 const DEFAULT_LLM_MODEL = 'mistral-large-latest';
-const DEFAULT_SYSTEM_PROMPT =
-    'You are BeeFlow Voice — a concise, warm, spoken assistant. ' +
-    'Keep replies short (2–3 sentences) and natural for speech. ' +
-    'Avoid markdown, code blocks, bullet lists, or long URLs — they do not sound good when read aloud. ' +
-    'If a detailed answer is needed, offer to send it as text in the chat instead. ' +
-    'ALWAYS reply in the same language the user spoke in. ' +
-    'If the user speaks Dutch, reply in Dutch. If the user speaks French, reply in French. ' +
-    'Never switch languages unless the user explicitly asks you to.';
+const MAX_VOICE_TOOL_ROUNDS = 3;
 
-// Map BCP-47 codes returned by Voxtral STT to a human-readable prompt hint
-// so the LLM reliably matches the spoken language. Voxtral supports 13
-// languages for STT; the subset below covers the ones Voxtral TTS also
-// speaks (9 languages), plus common fallbacks.
+const VOICE_FORMATTING_RULES =
+    'This is a VOICE conversation — your reply will be spoken aloud via text-to-speech.\n' +
+    'Keep replies short (1–3 sentences) and natural for speech.\n' +
+    'Avoid markdown, code blocks, bullet lists, headings, emoji, URLs, or anything that does not sound good when read aloud.\n' +
+    'If a detailed answer is really needed, offer to send it as text in the chat instead.\n' +
+    'ALWAYS reply in the same language the user spoke in. If the user speaks Dutch, reply in Dutch. Never switch languages unless the user explicitly asks you to.';
+
+const DRAFT_FIRST_RULES =
+    '\n\nACTION CONFIRMATION RULES:\n' +
+    '- Tools that READ (search, list, get, read, find) — call them directly when helpful.\n' +
+    '- Tools that CREATE, SEND, MODIFY, or DELETE anything (sending email, creating or moving calendar events, setting reminders, updating files, posting messages, etc.) — NEVER call them immediately.\n' +
+    '  FIRST describe in ONE short sentence exactly what you are about to do (who, what, when), then ask for confirmation in the user\'s language ("Zal ik dat doen?" / "Shall I do that?" / equivalent). WAIT for a clear "ja"/"yes"/"go ahead" before calling the tool on the NEXT turn.\n' +
+    '  If the user says no or changes their mind, simply cancel and acknowledge.\n' +
+    '- After executing a tool, summarize the outcome in one short sentence. If a tool fails, explain it in plain language.';
+
+const DEFAULT_SYSTEM_PROMPT =
+    'You are BeeFlow Voice — a concise, warm, spoken assistant.\n\n' +
+    VOICE_FORMATTING_RULES +
+    DRAFT_FIRST_RULES;
+
+// Tools whose output only makes sense visually — filter them out of voice mode.
+const VOICE_TOOL_BLOCKLIST = [
+    /^generate_(image|video|music|song|sfx|tts)$/,
+    /^elevenlabs_(music|sfx|tts)$/,
+    /^gamma_/,
+    /^signrequest_/,
+    /^maps_/,
+    /^workspace_update$/,
+    /^notebook_write$/,
+    /^notebook_create$/,
+];
+
+function filterVoiceTools(tools) {
+    return (tools || []).filter(tool => {
+        const name = tool?.function?.name || '';
+        return !VOICE_TOOL_BLOCKLIST.some(rx => rx.test(name));
+    });
+}
+
+// Map BCP-47 codes → human name for the language directive injected into
+// the system prompt per turn.
 const LANG_NAMES = {
     en: 'English', nl: 'Dutch', fr: 'French', de: 'German', es: 'Spanish',
     it: 'Italian', pt: 'Portuguese', hi: 'Hindi', ar: 'Arabic',
@@ -85,19 +127,52 @@ function languageName(code) {
     return LANG_NAMES[short] || null;
 }
 
+/**
+ * Strip `_`-prefixed UI/dispatch fields and known-noise keys from a tool
+ * result before sending it back to the LLM. Mirrors `buildLLMToolContent`
+ * in agentRuntime/chatStream.js:55 — duplicated intentionally to avoid a
+ * cross-dependency on the agent runtime module.
+ */
+function compactToolResultForLLM(result) {
+    if (typeof result === 'string') return result;
+    if (result == null || typeof result !== 'object') return JSON.stringify(result);
+    if (result._action === 'workspace_update' && result.message) {
+        return JSON.stringify({ action: 'notebook_updated', message: result.message });
+    }
+    const NOISE = new Set(['instruction', 'resultCount']);
+    const clean = {};
+    for (const [k, v] of Object.entries(result)) {
+        if (k.startsWith('_')) continue;
+        if (NOISE.has(k)) continue;
+        clean[k] = v;
+    }
+    return JSON.stringify(clean);
+}
+
+/**
+ * Build a ≤100-char human-readable summary for the UI tool-chip tooltip.
+ * Stays separate from the LLM-facing serialization so the two can diverge.
+ */
+function summarizeToolResult(name, result) {
+    if (result == null) return 'no result';
+    if (typeof result === 'string') return result.slice(0, 100);
+    if (result.error) return `error: ${String(result.error).slice(0, 90)}`;
+    if (result.message) return String(result.message).slice(0, 100);
+    for (const key of ['results', 'events', 'messages', 'items', 'files', 'contacts']) {
+        if (Array.isArray(result[key])) return `${result[key].length} ${key}`;
+    }
+    return 'ok';
+}
+
 // ─── GET /ai/voice/availability ───────────────────────────────────
-// Called by the UI on mount to decide whether to show the voice button.
-// Returns { enabled, reason } without leaking secrets.
 router.get('/availability', requireAuth, async (req, res) => {
     try {
         const hasMistral = !!(await configStore.getSecret('mistral_api_key'));
-        // Beta-feature gating happens at the router mount level (see ai.js).
-        // If the user reached this handler at all, they have the beta flag.
         res.json({
             enabled: hasMistral,
             reason: hasMistral ? 'ok' : 'mistral_not_configured',
             sttProvider: 'voxtral',
-            ttsProvider: (await configStore.getSecret('mistral_api_key')) ? 'voxtral' : 'elevenlabs',
+            ttsProvider: hasMistral ? 'voxtral' : 'elevenlabs',
             defaultModel: DEFAULT_LLM_MODEL,
         });
     } catch (err) {
@@ -107,31 +182,48 @@ router.get('/availability', requireAuth, async (req, res) => {
 });
 
 // ─── POST /ai/voice/session ───────────────────────────────────────
-// Issues a lightweight session id + the turn defaults. Purely a
-// client-side bookkeeping hook for now — no server-side state is stored.
+// Resolves the agent (if any) once so the client has the right system
+// prompt and label up-front. The same `agentId` is echoed back on every
+// turn so the server can apply the matching tool restrictions.
 router.post('/session', requireAuth, requireMistralConfigured, async (req, res) => {
     const crypto = require('crypto');
     const sessionId = crypto.randomBytes(16).toString('hex');
+    const { agentId = null, voice = null, language = null } = req.body || {};
+
+    let systemPrompt = DEFAULT_SYSTEM_PROMPT;
+    let model = DEFAULT_LLM_MODEL;
+    let agentInfo = null;
+
+    if (agentId) {
+        try {
+            const agent = await agentStore.getAgent(agentId);
+            if (agent) {
+                const base = (agent.system_prompt || '').trim();
+                systemPrompt = [base, VOICE_FORMATTING_RULES, DRAFT_FIRST_RULES]
+                    .filter(Boolean)
+                    .join('\n\n');
+                if (agent.model) model = agent.model;
+                agentInfo = { id: agent.id, name: agent.name };
+            }
+        } catch (err) {
+            console.warn('[Voice session] agent load failed:', err.message);
+        }
+    }
+
     res.json({
         sessionId,
-        model: DEFAULT_LLM_MODEL,
-        // Leave voice unset so the Voxtral endpoint picks its default.
-        // Clients can override via the session-create body for voice cloning.
-        voice: req.body?.voice || null,
-        language: req.body?.language || null, // null = auto-detect from audio
-        systemPrompt: DEFAULT_SYSTEM_PROMPT,
+        model,
+        voice,
+        language,
+        systemPrompt,
+        agentId: agentInfo?.id || null,
+        agentName: agentInfo?.name || null,
         maxTurnSeconds: 60,
         sessionTimeoutMs: 15 * 60 * 1000,
     });
 });
 
 // ─── POST /ai/voice/turn (SSE) ────────────────────────────────────
-// Body (multipart/form-data):
-//   audio:    <Blob>               — user's speech (audio/webm;codecs=opus preferred)
-//   history:  <JSON string>        — [{role, content}, …] prior messages
-//   model:    <string>             — override LLM model (optional)
-//   language: <string>             — BCP-47 language hint (optional)
-//   systemPrompt: <string>         — override system prompt (optional)
 router.post(
     '/turn',
     requireAuth,
@@ -158,8 +250,9 @@ router.post(
             const apiKey = req._mistralKey;
             const language = req.body?.language || null;
             const model = req.body?.model || DEFAULT_LLM_MODEL;
-            const systemPrompt = req.body?.systemPrompt || DEFAULT_SYSTEM_PROMPT;
-            const voice = req.body?.voice || 'amber';
+            const sessionSystemPrompt = req.body?.systemPrompt || DEFAULT_SYSTEM_PROMPT;
+            const voice = req.body?.voice || null;
+            const agentId = req.body?.agentId || null;
 
             let history = [];
             if (req.body?.history) {
@@ -182,49 +275,171 @@ router.post(
             });
 
             if (!stt.text) {
-                // Silence / unintelligible — give the UI a chance to recover
                 send('no_speech', {});
                 send('done', { latencyMs: Date.now() - sttStart });
                 return res.end();
             }
 
-            // 2 ─ LLM stream (Mistral SDK, existing provider abstraction)
-            // Append a detected-language directive to the system prompt so the
-            // model reliably matches the user's spoken language.
+            // 2 ─ Resolve tools. If an agent was selected, prefer its tools;
+            // otherwise pull the integration tools available to the user and
+            // apply the voice-output blocklist.
+            let voiceTools = [];
+            let agentConfig = null;
+            if (agentId) {
+                try {
+                    const agent = await agentStore.getAgent(agentId);
+                    if (agent) {
+                        agentConfig = agent.config || null;
+                        if (Array.isArray(agent.tools) && agent.tools.length) {
+                            voiceTools = filterVoiceTools(agent.tools);
+                        }
+                    }
+                } catch (err) {
+                    console.warn('[Voice turn] agent resolve failed:', err.message);
+                }
+            }
+            if (voiceTools.length === 0) {
+                try {
+                    const { tools } = await getIntegrationTools({
+                        userId: req.session.user.id,
+                        session: req.session,
+                        isAdmin: !!req.session.isAdmin,
+                        agentConfig,
+                    });
+                    voiceTools = filterVoiceTools(tools);
+                } catch (err) {
+                    console.warn('[Voice turn] tool discovery failed:', err.message);
+                }
+            }
+
+            // 3 ─ Build the message array with per-turn language directive.
             const detected = languageName(stt.language);
             const langDirective = detected
                 ? `\n\nThe user just spoke in ${detected}. Reply in ${detected}.`
                 : '';
+            const hintBlock = voiceTools.length
+                ? `\n\n${await buildToolHint(voiceTools, req.session.user.id)}`
+                : '';
+            const finalSystemPrompt = sessionSystemPrompt + langDirective + hintBlock;
+
             const messages = [
-                { role: 'system', content: systemPrompt + langDirective },
+                { role: 'system', content: finalSystemPrompt },
                 ...history
-                    .filter(m => m && m.role && typeof m.content === 'string')
-                    .map(m => ({ role: m.role, content: m.content })),
+                    .filter(m => m && m.role)
+                    .map(m => ({ ...m })),
                 { role: 'user', content: stt.text },
             ];
 
+            // 4 ─ Tool-calling loop.
             const adapter = getAdapter('mistral');
             let assistantText = '';
-            const llmStart = Date.now();
-            let firstTokenAt = null;
+            let round = 0;
+            const roundsMetrics = [];
+            const execContext = {
+                userId: req.session.user.id,
+                session: req.session,
+                orgId: req.session.user?.organizationId,
+                agentId,
+                req,
+                send,
+            };
 
-            await adapter.stream(apiKey, null, model, messages, { temperature: 0.7 }, (event, data) => {
-                if (event === 'text' && data?.text) {
-                    if (!firstTokenAt) firstTokenAt = Date.now();
-                    assistantText += data.text;
-                    send('text', { delta: data.text });
-                } else if (event === 'done') {
-                    send('llm_done', {
-                        ttftMs: firstTokenAt ? firstTokenAt - llmStart : null,
-                        totalMs: Date.now() - llmStart,
-                        usage: data || null,
+            while (round < MAX_VOICE_TOOL_ROUNDS) {
+                let roundText = '';
+                const roundToolCalls = [];
+                let firstTokenAt = null;
+                const roundStart = Date.now();
+
+                const streamOpts = { temperature: 0.7 };
+                if (voiceTools.length) {
+                    streamOpts.tools = voiceTools;
+                    streamOpts.toolChoice = 'auto';
+                }
+
+                await adapter.stream(apiKey, null, model, messages, streamOpts, (event, data) => {
+                    if (event === 'text' && data?.text) {
+                        if (!firstTokenAt) firstTokenAt = Date.now();
+                        roundText += data.text;
+                        send('text', { delta: data.text });
+                    } else if (event === 'thinking' && data?.text) {
+                        send('thinking', { delta: data.text });
+                    } else if (event === 'tool_use' && data?.name) {
+                        roundToolCalls.push({
+                            id: data.id || `call_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+                            name: data.name,
+                            input: data.input || {},
+                        });
+                    }
+                });
+
+                roundsMetrics.push({
+                    round,
+                    ttftMs: firstTokenAt ? firstTokenAt - roundStart : null,
+                    totalMs: Date.now() - roundStart,
+                    toolCalls: roundToolCalls.length,
+                });
+
+                if (roundToolCalls.length === 0) {
+                    assistantText = roundText;
+                    break;
+                }
+
+                // Append assistant message with tool_calls into the history
+                // so the next round can see what was requested.
+                messages.push({
+                    role: 'assistant',
+                    content: roundText || '',
+                    tool_calls: roundToolCalls.map(tc => ({
+                        id: tc.id,
+                        type: 'function',
+                        function: {
+                            name: tc.name,
+                            arguments: JSON.stringify(tc.input || {}),
+                        },
+                    })),
+                });
+
+                // Execute the tool calls in parallel and stream status
+                // back to the client via SSE.
+                const toolOutcomes = await Promise.all(roundToolCalls.map(async (tc) => {
+                    send('tool_use', { id: tc.id, name: tc.name, input: tc.input, round });
+                    try {
+                        const result = await dispatchTool(tc.name, tc.input || {}, execContext);
+                        const ok = !(result && typeof result === 'object' && result.error);
+                        send('tool_result', {
+                            id: tc.id,
+                            name: tc.name,
+                            ok,
+                            summary: summarizeToolResult(tc.name, result),
+                        });
+                        return { tc, result, ok };
+                    } catch (err) {
+                        const errResult = { error: err.message || 'tool failed' };
+                        send('tool_result', {
+                            id: tc.id,
+                            name: tc.name,
+                            ok: false,
+                            summary: errResult.error.slice(0, 100),
+                        });
+                        return { tc, result: errResult, ok: false };
+                    }
+                }));
+
+                // Feed the tool results back to the LLM for the next round.
+                for (const { tc, result } of toolOutcomes) {
+                    messages.push({
+                        role: 'tool',
+                        tool_call_id: tc.id,
+                        content: compactToolResultForLLM(result),
                     });
                 }
-            });
 
-            // 3 ─ TTS the full reply (v1: one-shot; v2 can sentence-stream)
-            // Prefer the language Voxtral detected over any client hint so
-            // TTS picks the right voice model for Dutch/French/etc. replies.
+                round++;
+            }
+
+            send('llm_done', { rounds: roundsMetrics });
+
+            // 5 ─ TTS the final reply (only non-tool assistantText).
             if (assistantText.trim()) {
                 const ttsStart = Date.now();
                 let tts = { audioBase64: null, mimeType: 'audio/mpeg', provider: 'none' };
@@ -255,6 +470,7 @@ router.post(
             send('done', {
                 assistantText,
                 transcript: stt.text,
+                toolRounds: round,
             });
             res.end();
         } catch (err) {
