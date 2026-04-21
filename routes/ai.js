@@ -17,6 +17,8 @@ const directChatRoutes = require('./ai/directChat');
 const researchRoutes = require('./ai/research');
 const templateChatRoutes = require('./ai/templateChat');
 const notebookChatRoutes = require('./ai/notebookChat');
+const voiceRoutes = require('./ai/voice');
+const { requireBetaFeature } = require('../core/betaFeatures');
 
 // Mount all sub-routes
 router.use('/', configRoutes);
@@ -41,6 +43,9 @@ const notebookChatGate = async (req, res, next) => {
 router.use(notebookChatGate);
 router.use('/', notebookChatRoutes);
 
-
+// Voice Chat (Beta) — gated on org-level beta feature flag.
+// Further gated on a configured Mistral API key by the voice router itself.
+// Mounted at /voice so the beta gate only affects /ai/voice/* requests.
+router.use('/voice', requireBetaFeature('voice_chat'), voiceRoutes);
 
 module.exports = router;

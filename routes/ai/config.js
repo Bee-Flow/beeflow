@@ -36,6 +36,11 @@ router.get('/config', async (req, res) => {
         apiKey: !!config.apiKey,
         hasApiKey: !!config.apiKey,
         hasMistralKey: !!(await configStore.getSecret('mistral_api_key')),
+        // Voice Chat (Beta) — capability hint for the UI. The actual gate is
+        // the `voice_chat` beta feature; this flag tells the frontend whether
+        // the underlying Mistral dependency is set up so it can render a
+        // helpful "configure Mistral to enable voice" state in admin.
+        voiceChatReady: !!(await configStore.getSecret('mistral_api_key')),
         hasOpenaiKey: !!(await configStore.getSecret('openai_api_key')),
         hasClaudeKey: !!(await configStore.getSecret('claude_api_key')),
         hasGoogleKey: !!(await configStore.getSecret('google_api_key')),

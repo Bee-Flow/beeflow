@@ -28,6 +28,7 @@ const BETA_FEATURES = [
     { id: 'custom_themes', name: 'Custom Themes', description: 'Organization-level custom branding and theme support' },
     { id: 'skills', name: 'Skills', description: 'Reusable instruction packs for consistent AI task execution' },
     { id: 'email_knowledge_base', name: 'Email Knowledge Base', description: 'Connect Gmail or Outlook mailboxes as knowledge base sources with AI-powered article extraction' },
+    { id: 'voice_chat', name: 'Voice Chat (Beta)', description: 'Realtime voice conversation with direct chat or agents, powered by Mistral Voxtral (STT + TTS). Requires a configured Mistral API key.' },
 ];
 
 // -──────────────────────────────────────────────
