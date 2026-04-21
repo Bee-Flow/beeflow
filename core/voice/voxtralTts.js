@@ -16,8 +16,10 @@ const configStore = require('../../stores/configStore');
 const elevenlabsProvider = require('../providers/elevenlabs');
 
 const MISTRAL_API_BASE = 'https://api.mistral.ai';
-const DEFAULT_TTS_MODEL = 'voxtral-tts-2603';
-const DEFAULT_VOXTRAL_VOICE = 'amber'; // reference voice — overridable via voice settings
+// Voxtral TTS model name — passing `model` is optional per Mistral's docs,
+// so we leave it undefined by default and let the server pick. Set this via
+// opts.model if a specific checkpoint is needed.
+const DEFAULT_TTS_MODEL = null;
 
 /**
  * Synthesize speech with Voxtral, fall back to ElevenLabs on error.
@@ -65,22 +67,29 @@ async function synthesize(text, opts = {}) {
 
 /**
  * Call Mistral's Voxtral-TTS endpoint directly.
- * Format is OpenAI-compatible: POST /v1/audio/speech with JSON body.
+ *   POST /v1/audio/speech
+ *   body: { input, model?, voice_id?, ref_audio?, response_format? }
+ *
+ * Handles both possible response shapes the API returns:
+ *   - binary audio bytes with an audio/* Content-Type
+ *   - JSON with a base64-encoded audio field (e.g. { audio, format })
  */
 async function voxtralSynthesize(apiKey, text, opts = {}) {
     const started = Date.now();
-    const model = opts.model || DEFAULT_TTS_MODEL;
-    const voice = opts.voice || DEFAULT_VOXTRAL_VOICE;
 
-    const body = { model, input: text, voice, response_format: 'mp3' };
-    if (opts.language) body.language = opts.language;
+    const body = {
+        input: text,
+        response_format: 'mp3',
+    };
+    if (opts.model || DEFAULT_TTS_MODEL) body.model = opts.model || DEFAULT_TTS_MODEL;
+    if (opts.voice) body.voice_id = opts.voice;
 
     const resp = await fetch(`${MISTRAL_API_BASE}/v1/audio/speech`, {
         method: 'POST',
         headers: {
             Authorization: `Bearer ${apiKey}`,
             'Content-Type': 'application/json',
-            Accept: 'audio/mpeg',
+            Accept: 'audio/mpeg, application/json',
         },
         body: JSON.stringify(body),
     });
@@ -90,15 +99,30 @@ async function voxtralSynthesize(apiKey, text, opts = {}) {
         throw new Error(`Voxtral TTS ${resp.status}: ${errText.slice(0, 300)}`);
     }
 
-    const arrayBuffer = await resp.arrayBuffer();
-    const audioBuffer = Buffer.from(arrayBuffer);
-    console.log(`[Voxtral TTS] ${model} synthesized ${(audioBuffer.length / 1024).toFixed(0)}KB in ${Date.now() - started}ms`);
+    const contentType = resp.headers.get('content-type') || '';
+    let audioBase64 = null;
+    let mimeType = 'audio/mpeg';
 
-    return {
-        audioBase64: audioBuffer.toString('base64'),
-        mimeType: 'audio/mpeg',
-        provider: 'voxtral',
-    };
+    if (contentType.includes('application/json')) {
+        const json = await resp.json();
+        // Try the common field names used by speech APIs.
+        audioBase64 = json.audio || json.audio_base64 || json.data || null;
+        if (json.format) mimeType = `audio/${json.format}`;
+        else if (json.mime_type) mimeType = json.mime_type;
+    } else {
+        const arrayBuffer = await resp.arrayBuffer();
+        audioBase64 = Buffer.from(arrayBuffer).toString('base64');
+        if (contentType.startsWith('audio/')) mimeType = contentType.split(';')[0];
+    }
+
+    if (!audioBase64) {
+        throw new Error('Voxtral TTS returned no audio payload');
+    }
+
+    const bytesLen = Math.round((audioBase64.length * 3) / 4);
+    console.log(`[Voxtral TTS] synthesized ~${(bytesLen / 1024).toFixed(0)}KB in ${Date.now() - started}ms`);
+
+    return { audioBase64, mimeType, provider: 'voxtral' };
 }
 
 module.exports = { synthesize, DEFAULT_TTS_MODEL };

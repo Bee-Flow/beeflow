@@ -65,7 +65,25 @@ const DEFAULT_SYSTEM_PROMPT =
     'You are BeeFlow Voice — a concise, warm, spoken assistant. ' +
     'Keep replies short (2–3 sentences) and natural for speech. ' +
     'Avoid markdown, code blocks, bullet lists, or long URLs — they do not sound good when read aloud. ' +
-    'If a detailed answer is needed, offer to send it as text in the chat instead.';
+    'If a detailed answer is needed, offer to send it as text in the chat instead. ' +
+    'ALWAYS reply in the same language the user spoke in. ' +
+    'If the user speaks Dutch, reply in Dutch. If the user speaks French, reply in French. ' +
+    'Never switch languages unless the user explicitly asks you to.';
+
+// Map BCP-47 codes returned by Voxtral STT to a human-readable prompt hint
+// so the LLM reliably matches the spoken language. Voxtral supports 13
+// languages for STT; the subset below covers the ones Voxtral TTS also
+// speaks (9 languages), plus common fallbacks.
+const LANG_NAMES = {
+    en: 'English', nl: 'Dutch', fr: 'French', de: 'German', es: 'Spanish',
+    it: 'Italian', pt: 'Portuguese', hi: 'Hindi', ar: 'Arabic',
+    pl: 'Polish', ru: 'Russian', tr: 'Turkish', zh: 'Chinese', ja: 'Japanese',
+};
+function languageName(code) {
+    if (!code) return null;
+    const short = String(code).toLowerCase().slice(0, 2);
+    return LANG_NAMES[short] || null;
+}
 
 // ─── GET /ai/voice/availability ───────────────────────────────────
 // Called by the UI on mount to decide whether to show the voice button.
@@ -97,8 +115,10 @@ router.post('/session', requireAuth, requireMistralConfigured, async (req, res) 
     res.json({
         sessionId,
         model: DEFAULT_LLM_MODEL,
-        voice: req.body?.voice || 'amber',
-        language: req.body?.language || null,
+        // Leave voice unset so the Voxtral endpoint picks its default.
+        // Clients can override via the session-create body for voice cloning.
+        voice: req.body?.voice || null,
+        language: req.body?.language || null, // null = auto-detect from audio
         systemPrompt: DEFAULT_SYSTEM_PROMPT,
         maxTurnSeconds: 60,
         sessionTimeoutMs: 15 * 60 * 1000,
@@ -169,8 +189,14 @@ router.post(
             }
 
             // 2 ─ LLM stream (Mistral SDK, existing provider abstraction)
+            // Append a detected-language directive to the system prompt so the
+            // model reliably matches the user's spoken language.
+            const detected = languageName(stt.language);
+            const langDirective = detected
+                ? `\n\nThe user just spoke in ${detected}. Reply in ${detected}.`
+                : '';
             const messages = [
-                { role: 'system', content: systemPrompt },
+                { role: 'system', content: systemPrompt + langDirective },
                 ...history
                     .filter(m => m && m.role && typeof m.content === 'string')
                     .map(m => ({ role: m.role, content: m.content })),
@@ -197,9 +223,14 @@ router.post(
             });
 
             // 3 ─ TTS the full reply (v1: one-shot; v2 can sentence-stream)
+            // Prefer the language Voxtral detected over any client hint so
+            // TTS picks the right voice model for Dutch/French/etc. replies.
             if (assistantText.trim()) {
                 const ttsStart = Date.now();
-                const tts = await voxtralTts.synthesize(assistantText, { voice, language });
+                const tts = await voxtralTts.synthesize(assistantText, {
+                    voice,
+                    language: stt.language || language,
+                });
                 if (tts.audioBase64) {
                     send('tts', {
                         audioBase64: tts.audioBase64,
