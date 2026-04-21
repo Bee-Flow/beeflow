@@ -1615,40 +1615,69 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         const skipToolPrecheck = adapter.shouldUseResponsesApi?.(modelId, chatOptions) || ['google', 'openai', 'claude', 'mistral'].includes(config.providerType);
         let toolCallRounds = 0;
         const MAX_TOOL_ROUNDS = 5;
-        // Pipeline enforcement: count rounds where the LLM called tools but
-        // didn't advance the session-skill pipeline (no activate_session_skill).
-        // After a threshold we inject a system reminder + force tool_choice
-        // so the LLM can't stall on integration tools while the pipeline sits idle.
+        // Pipeline enforcement. Never inject mid-conversation role:'system'
+        // messages — providers (Mistral/OpenAI) reject that after tool
+        // responses with `invalid_request_message_order`. Instead we:
+        //   1. Append a short reminder to the ORIGINAL system prompt when
+        //      needed — messages[0] is always valid to mutate.
+        //   2. Use tool_choice to mechanically force activate_session_skill
+        //      when the LLM stalls on integration tools.
         let consecutiveNonActivationRounds = 0;
-        const STALL_THRESHOLD = 2;
-        // Helper: compute tool_choice + (if stalled) an extra reminder message.
-        // Returns { toolChoice, stallReminder }.
+        const STALL_THRESHOLD = 1;  // After ONE non-activation round, lock the next call to activate_session_skill.
+
+        // Provider-specific tool_choice shape. OpenAI/Mistral expect the
+        // nested form; our Claude adapter consumes a flat {name}; Google's
+        // adapter doesn't support specific-function — fall back to 'required'.
+        function specificToolChoice(toolName) {
+            const pt = (config?.providerType || '').toLowerCase();
+            if (pt === 'claude') return { name: toolName };
+            if (pt === 'google' || pt === 'gemini') return 'required';
+            return { type: 'function', function: { name: toolName } };
+        }
+
         function computePipelineGuard() {
-            if (!isStandardTier) return { toolChoice: 'auto', stallReminder: null };
+            if (!isStandardTier) return { toolChoice: 'auto', systemAppend: null, mode: 'auto' };
             const state = describePipelineState(sessionSkills, activatedSessionSkillIds);
-            if (!state.hasPipeline || state.allTerminalsDone) return { toolChoice: 'auto', stallReminder: null };
+            if (!state.hasPipeline || state.allTerminalsDone) return { toolChoice: 'auto', systemAppend: null, mode: 'auto' };
             const byId = new Map(sessionSkills.map(s => [s.id, s]));
-            const nextReadyName = state.readySkillIds.length > 0
-                ? (byId.get(state.readySkillIds[0])?.name || state.readySkillIds[0])
-                : null;
             const nextReadyId = state.readySkillIds[0] || null;
-            // Stalled: the LLM is calling integration tools but not walking the
-            // pipeline. Force the next call to be activate_session_skill via a
-            // strong system-message nudge (tool_choice: 'required' keeps it
-            // from writing final text; the reminder tells it WHICH tool).
+            const nextReadyName = nextReadyId ? (byId.get(nextReadyId)?.name || nextReadyId) : null;
+            // Stalled: hard-force activate_session_skill via tool_choice.
             if (consecutiveNonActivationRounds >= STALL_THRESHOLD && nextReadyId) {
                 return {
-                    toolChoice: 'required',
-                    stallReminder: {
-                        role: 'system',
-                        content: `Pipeline enforcement: you have taken ${consecutiveNonActivationRounds} tool rounds without advancing the session-skill pipeline. Call \`activate_session_skill\` with skill_ids=["${nextReadyId}"] (${nextReadyName}) RIGHT NOW before any other tool. Final user-facing output is blocked until every terminal session skill is activated.`,
-                    },
+                    toolChoice: specificToolChoice(ACTIVATE_SESSION_SKILL_TOOL_NAME),
+                    systemAppend: `\n\n[PIPELINE GUARD] ${consecutiveNonActivationRounds} non-activation tool round(s). Your NEXT call MUST be \`${ACTIVATE_SESSION_SKILL_TOOL_NAME}\` with skill_ids=["${nextReadyId}"] (${nextReadyName}). Final output is blocked until every terminal session skill is activated.`,
+                    mode: `forced:${nextReadyId}`,
                 };
             }
-            // Default when pipeline is unfinished: force SOME tool call. This
-            // prevents the LLM from producing final text before the pipeline
-            // is walked. It can still pick integration tools, but can't exit.
-            return { toolChoice: 'required', stallReminder: null };
+            // Pipeline not yet walked: force SOME tool; LLM can still pick
+            // integration tools, but can't exit to final text.
+            return { toolChoice: 'required', systemAppend: null, mode: 'required' };
+        }
+
+        // Safe append to the original system message (messages[0]) instead of
+        // pushing a new message. No ordering violation possible.
+        function applySystemAppend(text) {
+            if (!text || !messages[0]) return;
+            if (messages[0].role === 'system' && typeof messages[0].content === 'string') {
+                // Avoid re-appending the same guard on repeat rounds.
+                if (!messages[0].content.endsWith(text)) messages[0].content += text;
+            }
+        }
+
+        // Try the adapter call; if the provider rejects due to
+        // invalid_request_message_order or similar bad-shape 400s, retry once
+        // with toolChoice: 'auto' to unblock the user.
+        async function callAdapterWithFallback(fn, currentToolChoice) {
+            try {
+                return await fn(currentToolChoice);
+            } catch (err) {
+                const msg = String(err?.message || '');
+                const isBadShape = /invalid_request_message_order|Unexpected role|invalid.*tool_choice/i.test(msg);
+                if (!isBadShape) throw err;
+                console.warn(`[DirectChat pipeline] Adapter rejected toolChoice — retrying with 'auto'. Original: ${msg}`);
+                return await fn('auto');
+            }
         }
         const generatedImages = []; // Track images for persistence
         const generatedAudio = []; // Track audio for persistence
@@ -1680,14 +1709,16 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                 let result;
                 try {
                     const guard = computePipelineGuard();
-                    if (guard.stallReminder) {
-                        messages.push(guard.stallReminder);
-                    }
-                    result = await adapter.chat(apiKey, apiUrl, modelId, messages, {
-                        ...chatOptions,
-                        tools: directChatTools,
-                        toolChoice: guard.toolChoice,
-                    });
+                    applySystemAppend(guard.systemAppend);
+                    console.log(`[DirectChat pipeline] pre-check round toolChoice=${guard.mode} stallRounds=${consecutiveNonActivationRounds}`);
+                    result = await callAdapterWithFallback(
+                        (tc) => adapter.chat(apiKey, apiUrl, modelId, messages, {
+                            ...chatOptions,
+                            tools: directChatTools,
+                            toolChoice: tc,
+                        }),
+                        guard.toolChoice,
+                    );
                 } catch (err) {
                     console.error('[DirectChat] Tool check error:', err.message);
                     send('error', { error: `API error: ${err.message}` });
@@ -2005,9 +2036,8 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         // pre-check path — while a session-skill pipeline is mid-run, the
         // LLM is forced to keep calling tools instead of emitting final text.
         const streamGuard = computePipelineGuard();
-        if (streamGuard.stallReminder) {
-            messages.push(streamGuard.stallReminder);
-        }
+        applySystemAppend(streamGuard.systemAppend);
+        console.log(`[DirectChat pipeline] primary stream toolChoice=${streamGuard.mode} stallRounds=${consecutiveNonActivationRounds}`);
         const streamOptions = {
             ...chatOptions,
             tools: (toolCallRounds > 0) ? undefined : (directChatTools.length > 0 ? directChatTools : undefined),
@@ -2106,9 +2136,10 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         try {
             await adapter.stream(apiKey, apiUrl, modelId, messages, streamOptions, streamCallback);
         } catch (streamErr) {
+            const errMsg = String(streamErr?.error?.message || streamErr?.message || '');
             // Retry without previousResponseId if the error is about missing tool output
             // (stale response ID pointing to unresolved tool-call response)
-            if (streamErr?.error?.message?.includes('No tool output found') && streamOptions.previousResponseId) {
+            if (errMsg.includes('No tool output found') && streamOptions.previousResponseId) {
                 console.warn('[DirectChat] Stale previousResponseId detected, retrying without chaining');
                 lastResponseId = null;
                 streamOptions.previousResponseId = undefined;
@@ -2117,6 +2148,15 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                 thinkingParts = [];
                 streamToolCalls = [];
                 await adapter.stream(apiKey, apiUrl, modelId, messages, streamOptions, streamCallback);
+            } else if (/invalid_request_message_order|Unexpected role|invalid.*tool_choice/i.test(errMsg)) {
+                // Pipeline-guard shape rejected by the provider — retry once
+                // with permissive toolChoice so the user's message goes through.
+                console.warn(`[DirectChat pipeline] Stream rejected — retrying with toolChoice='auto'. Original: ${errMsg}`);
+                fullContent = '';
+                thinkingContent = '';
+                thinkingParts = [];
+                streamToolCalls = [];
+                await adapter.stream(apiKey, apiUrl, modelId, messages, { ...streamOptions, toolChoice: 'auto' }, streamCallback);
             } else {
                 throw streamErr;
             }
@@ -2441,15 +2481,9 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             fullContent = '';
             streamToolCalls = [];
             const followGuard = computePipelineGuard();
-            if (followGuard.stallReminder) {
-                messages.push(followGuard.stallReminder);
-            }
-            await adapter.stream(apiKey, apiUrl, modelId, messages, {
-                ...chatOptions,
-                previousResponseId: undefined, // Don't chain — we need to send tool results in full
-                tools: directChatTools.length > 0 ? directChatTools : undefined,
-                toolChoice: directChatTools.length > 0 ? followGuard.toolChoice : undefined,
-            }, (type, data) => {
+            applySystemAppend(followGuard.systemAppend);
+            console.log(`[DirectChat pipeline] follow-up stream toolChoice=${followGuard.mode} stallRounds=${consecutiveNonActivationRounds}`);
+            const followStreamCallback = (type, data) => {
                 if (type === 'text') {
                     fullContent += data.text;
                     send('content', { text: data.text });
@@ -2508,7 +2542,26 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                         console.log('[DirectChat] Updated lastResponseId after tool follow-up:', lastResponseId);
                     }
                 }
-            });
+            };
+            const followStreamOptions = {
+                ...chatOptions,
+                previousResponseId: undefined, // Don't chain — we need to send tool results in full
+                tools: directChatTools.length > 0 ? directChatTools : undefined,
+                toolChoice: directChatTools.length > 0 ? followGuard.toolChoice : undefined,
+            };
+            try {
+                await adapter.stream(apiKey, apiUrl, modelId, messages, followStreamOptions, followStreamCallback);
+            } catch (followErr) {
+                const fMsg = String(followErr?.error?.message || followErr?.message || '');
+                if (/invalid_request_message_order|Unexpected role|invalid.*tool_choice/i.test(fMsg)) {
+                    console.warn(`[DirectChat pipeline] Follow-up stream rejected — retrying with toolChoice='auto'. Original: ${fMsg}`);
+                    fullContent = '';
+                    streamToolCalls = [];
+                    await adapter.stream(apiKey, apiUrl, modelId, messages, { ...followStreamOptions, toolChoice: 'auto' }, followStreamCallback);
+                } else {
+                    throw followErr;
+                }
+            }
         }
 
         // If LLM returned an empty response after tool calls, send a minimal confirmation

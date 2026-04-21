@@ -1,10 +1,12 @@
 /**
- * EU AI Act Art. 13 — Transparency & information to users.
- * Ensures that for every published agent we have: name, description,
- * and a way to identify who the deployer is. Uses existing agents table.
+ * EU AI Act Art. 13 — Transparency / information to users.
+ * Ensures each published agent has a meaningful description so users can
+ * understand the purpose and limitations of the AI system they interact with.
  */
 
 const { getAll } = require('../../../db');
+
+const MIN_DESCRIPTION_CHARS = 30;
 
 module.exports = {
     id: 'AIA-Art13-transparency',
@@ -29,19 +31,38 @@ module.exports = {
         if (agents.length === 0) {
             return { status: 'not_applicable', evidence: {}, details: 'No published agents to assess.' };
         }
+
         const missing = [];
+        let applicable = 0;
         for (const a of agents) {
             if (orgId && a.organization_id && a.organization_id !== orgId) continue;
-            const desc = (a.description || '').trim();
-            if (desc.length < 20) missing.push({ id: a.id, name: a.name });
+            applicable++;
+            const desc = a.description == null ? '' : String(a.description).trim();
+            if (desc.length < MIN_DESCRIPTION_CHARS) {
+                missing.push({ id: a.id, name: a.name, length: desc.length });
+            }
         }
-        const status = missing.length === 0 ? 'pass' : missing.length < agents.length ? 'warn' : 'fail';
+
+        if (applicable === 0) {
+            return { status: 'not_applicable', evidence: {}, details: 'No agents in this organization.' };
+        }
+
+        let status;
+        if (missing.length === 0) status = 'pass';
+        else if (missing.length < applicable) status = 'warn';
+        else status = 'fail';
+
         return {
             status,
-            evidence: { total: agents.length, missing_descriptions: missing.slice(0, 10), missing_count: missing.length },
+            evidence: {
+                total: applicable,
+                missing_count: missing.length,
+                min_chars: MIN_DESCRIPTION_CHARS,
+                missing_descriptions: missing.slice(0, 10),
+            },
             details: status === 'pass'
-                ? `Every published agent (${agents.length}) has a meaningful description.`
-                : `${missing.length} of ${agents.length} agents lack a proper description. Add at least 20 characters explaining what the agent does.`,
+                ? `Every published agent (${applicable}) has a meaningful description of ≥${MIN_DESCRIPTION_CHARS} characters.`
+                : `${missing.length} of ${applicable} agents have no description or fewer than ${MIN_DESCRIPTION_CHARS} characters. Add a short explanation of what the agent does and its limits.`,
         };
     },
 };

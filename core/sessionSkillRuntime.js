@@ -271,7 +271,18 @@ function buildSessionSkillInjection({ sessionSkills = [], activatedSkillIds = []
     const inactive = ordered.filter(s => !activated.has(s.id));
     const byId = new Map(ordered.map(s => [s.id, s]));
 
-    let addendum = '\n\n[CHAT-LOCAL SKILLS — ORDERED PIPELINE]\nThese skills form a dependency-enforced pipeline for this direct chat. Each skill has a step number. Activate them in order — the runtime REFUSES to activate a skill whose dependencies are not yet active. Step-1 skills are already activated for you; for any later step whose work you need, YOU MUST call `' + ACTIVATE_SESSION_SKILL_TOOL_NAME + '` BEFORE producing user-facing output that relies on it. Without activation you only have the short description; your answer will be generic.';
+    // Point explicitly at the NEXT READY skill. "Ready" = all deps activated,
+    // itself not yet activated. Dynamic per turn because readiness shifts as
+    // activations land.
+    const orderedInactive = [...sessionSkills]
+        .sort((a, b) => (a.order || 0) - (b.order || 0))
+        .filter(s => !activated.has(s.id));
+    const nextReady = orderedInactive.find(s => (s.dependsOn || []).every(d => activated.has(d)));
+    const currentStepHeader = nextReady
+        ? `\n\n**Current step: "${nextReady.name}" (id: ${nextReady.id})** — you MUST call \`${ACTIVATE_SESSION_SKILL_TOOL_NAME}\` with \`skill_ids: ["${nextReady.id}"]\` BEFORE any other action (including integration tools like agent_search / notebook_write). Work done without activating first is wasted — you only have the short description until you activate.`
+        : '\n\nAll pipeline steps have been activated.';
+
+    let addendum = '\n\n[CHAT-LOCAL SKILLS — ORDERED PIPELINE]\nThese skills form a dependency-enforced pipeline for this direct chat. Each skill has a step number. Activate them in order — the runtime REFUSES to activate a skill whose dependencies are not yet active.' + currentStepHeader;
 
     if (inactive.length > 0) {
         const manifest = inactive.map(s => {
@@ -322,7 +333,7 @@ function buildSessionSkillInjection({ sessionSkills = [], activatedSkillIds = []
             type: 'function',
             function: {
                 name: ACTIVATE_SESSION_SKILL_TOOL_NAME,
-                description: 'Load full chat-local skill instructions for one or more session skill ids before answering.',
+                description: 'REQUIRED before each pipeline step. Call this with the step\'s skill id BEFORE using any integration tool or writing any text for that step\'s work. Returns the step\'s full instructions / workflow / rules / examples which you must then follow. Calling this is not optional — the runtime blocks final output until every terminal pipeline step has been activated.',
                 parameters: {
                     type: 'object',
                     properties: {

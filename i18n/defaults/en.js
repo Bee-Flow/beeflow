@@ -1207,7 +1207,29 @@ const GUI_DEFAULTS = {
 
     'compliance.checks.aia_art13.title': 'Transparency: agent described',
     'compliance.checks.aia_art13.desc': 'Art. 13 expects users to understand the purpose, limitations and provider of the AI system.',
-    'compliance.checks.aia_art13.fix': 'Fill in a meaningful description (20+ characters) for each agent in Admin → Agents.',
+    'compliance.checks.aia_art13.fix': 'Fill in a meaningful description (30+ characters) for each agent in Admin → Agents.',
+
+    // Severity badges (plain language)
+    'compliance.sev_critical': 'Must fix',
+    'compliance.sev_high': 'Should fix',
+    'compliance.sev_medium': 'Consider',
+    'compliance.sev_low': 'Low priority',
+
+    // Hero + celebration + toasts
+    'compliance.hero_onboard_title': 'Finish the 2-minute setup to see your score',
+    'compliance.hero_onboard_desc': 'We need your DPO contact, legal bases, retention defaults and breach-notification recipients to evaluate GDPR accurately. Skip anything you don\'t know — you can edit it later.',
+    'compliance.hero_onboard_cta': 'Start setup',
+    'compliance.all_clear_title': "You're fully compliant — nice work",
+    'compliance.all_clear_subtitle': 'Every GDPR and AI Act check passed. We will keep monitoring in the background.',
+    'compliance.toast_settings_saved': 'Settings saved — running checks again…',
+    'compliance.toast_settings_failed': 'Could not save settings',
+    'compliance.toast_scan_complete': 'Compliance scan complete',
+    'compliance.toast_scan_failed': 'Scan failed — see server logs',
+    'compliance.toast_check_rerun': 'Check re-run complete',
+    'compliance.toast_check_failed': 'Could not re-run this check',
+    'compliance.toast_wizard_done': 'Setup complete — your first compliance scan is running',
+    'compliance.toast_wizard_failed': 'Could not save setup — try again',
+    'compliance.toast_first_scan': 'First compliance scan complete — review the score and open items below.',
 };
 
 // Get all namespace categories for the GUI editor filter

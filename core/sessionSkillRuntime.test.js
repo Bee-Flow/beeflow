@@ -288,6 +288,23 @@ async function bootstrapWith(adapterContent) {
         assert.match(out.systemPromptAddendum, /bodies elided after compaction/);
     }
 
+    // ── manifest header names the next READY skill, gates on terminal ─
+    {
+        const ss = [
+            { id: 'a', name: 'Alpha', order: 1, dependsOn: [] },
+            { id: 'b', name: 'Beta',  order: 2, dependsOn: ['a'] },
+        ];
+        // Nothing activated yet: header should point at Alpha.
+        let out = buildSessionSkillInjection({ sessionSkills: ss, activatedSkillIds: [] });
+        assert.match(out.systemPromptAddendum, /Current step: "Alpha"/, 'header points at first ready skill');
+        // Alpha activated: header should move to Beta.
+        out = buildSessionSkillInjection({ sessionSkills: ss, activatedSkillIds: ['a'] });
+        assert.match(out.systemPromptAddendum, /Current step: "Beta"/, 'header advances as pipeline walks');
+        // All done: header says all steps activated.
+        out = buildSessionSkillInjection({ sessionSkills: ss, activatedSkillIds: ['a', 'b'] });
+        assert.match(out.systemPromptAddendum, /All pipeline steps have been activated/);
+    }
+
     // ── cycle detection: circular deps are broken ───────────────────
     {
         // Patch console.warn so the expected warning doesn't muddy test output.

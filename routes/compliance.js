@@ -80,9 +80,13 @@ router.get('/overview', requireAuth, requirePermission('admin_compliance'), asyn
         // visit shows a populated dashboard instead of "never run".
         const newest = latest.length ? latest.reduce((m, r) => (r.run_at > m ? r.run_at : m), latest[0].run_at) : null;
         const staleMs = newest ? (Date.now() - new Date(newest).getTime()) : Infinity;
+        let firstScanRan = false;
         if (latest.length === 0) {
             // Never run for this org → block briefly so the UI isn't empty.
-            try { await runner.runAll(orgId, { runType: 'scheduled' }); } catch (e) {
+            try {
+                await runner.runAll(orgId, { runType: 'scheduled' });
+                firstScanRan = true;
+            } catch (e) {
                 console.warn('[Compliance] initial run failed:', e.message);
             }
             latest = await complianceStore.getLatestPerCheck(orgId);
@@ -103,6 +107,7 @@ router.get('/overview', requireAuth, requirePermission('admin_compliance'), asyn
             aia: computeScore(aia),
             last_run_at: lastRunAt,
             total_checks: registry.getAll().length,
+            first_scan_ran: firstScanRan,
         });
     } catch (e) {
         console.error('[Compliance] overview error:', e);
