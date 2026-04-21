@@ -12,6 +12,7 @@ const crypto = require('crypto');
 const skillStore = require('../stores/skillStore');
 
 const ACTIVATE_SESSION_SKILL_TOOL_NAME = 'activate_session_skill';
+const COMPLETE_SESSION_SKILL_TOOL_NAME = 'complete_session_skill';
 const PUBLISH_SESSION_SKILL_TOOL_NAME = 'publish_session_skill_to_library';
 const MAX_SESSION_SKILLS = 5;
 
@@ -256,12 +257,27 @@ function deriveCompletedSkillIds(sessionSkills, activatedSkillIds) {
     return completed;
 }
 
-function buildSessionSkillInjection({ sessionSkills = [], activatedSkillIds = [], compactMode = false }) {
+function buildSessionSkillInjection({
+    sessionSkills = [],
+    activatedSkillIds = [],
+    completedSessionSkillIds = null,   // explicit completion set (new). If null, fall back to derivation.
+    completions = [],                  // [{skillId, summary}] — renders in the completed-steps trailer.
+    compactMode = false,
+}) {
     if (!Array.isArray(sessionSkills) || sessionSkills.length === 0) {
         return { systemPromptAddendum: '', tools: [] };
     }
     const activated = new Set(Array.isArray(activatedSkillIds) ? activatedSkillIds : []);
-    const completed = new Set(deriveCompletedSkillIds(sessionSkills, activatedSkillIds));
+    // If caller didn't supply an explicit completed set, fall back to the
+    // activation-derived heuristic (keeps older callers / tests working).
+    const completed = Array.isArray(completedSessionSkillIds)
+        ? new Set(completedSessionSkillIds)
+        : new Set(deriveCompletedSkillIds(sessionSkills, activatedSkillIds));
+    const summaryBySkillId = new Map(
+        (Array.isArray(completions) ? completions : [])
+            .filter(c => c && typeof c.skillId === 'string' && typeof c.summary === 'string')
+            .map(c => [c.skillId, c.summary])
+    );
     // Sort by order so the LLM sees the pipeline in step sequence, not insertion order.
     const ordered = [...sessionSkills].sort((a, b) => (a.order || 0) - (b.order || 0));
     // Activated skills split into "still-in-focus" (full body) and "completed"
@@ -271,18 +287,23 @@ function buildSessionSkillInjection({ sessionSkills = [], activatedSkillIds = []
     const inactive = ordered.filter(s => !activated.has(s.id));
     const byId = new Map(ordered.map(s => [s.id, s]));
 
-    // Point explicitly at the NEXT READY skill. "Ready" = all deps activated,
-    // itself not yet activated. Dynamic per turn because readiness shifts as
-    // activations land.
-    const orderedInactive = [...sessionSkills]
-        .sort((a, b) => (a.order || 0) - (b.order || 0))
-        .filter(s => !activated.has(s.id));
+    // Point explicitly at either the NEXT READY skill (nothing active, need to
+    // activate next) or the CURRENT ACTIVE-BUT-INCOMPLETE skill (work in
+    // progress; the LLM must call complete_session_skill when finished).
+    const orderedInactive = ordered.filter(s => !activated.has(s.id));
     const nextReady = orderedInactive.find(s => (s.dependsOn || []).every(d => activated.has(d)));
-    const currentStepHeader = nextReady
-        ? `\n\n**Current step: "${nextReady.name}" (id: ${nextReady.id})** — you MUST call \`${ACTIVATE_SESSION_SKILL_TOOL_NAME}\` with \`skill_ids: ["${nextReady.id}"]\` BEFORE any other action (including integration tools like agent_search / notebook_write). Work done without activating first is wasted — you only have the short description until you activate.`
-        : '\n\nAll pipeline steps have been activated.';
+    // "Current step" = the first (lowest-order) activated-but-not-completed skill.
+    const currentActive = activeInFocus[0] || null;
+    let currentStepHeader;
+    if (currentActive) {
+        currentStepHeader = `\n\n**Current step: "${currentActive.name}" (id: ${currentActive.id})** — you are WORKING on this step. Use integration tools as needed to produce the step's output. When finished, call \`${COMPLETE_SESSION_SKILL_TOOL_NAME}\` with \`{ skill_id: "${currentActive.id}", summary: "<1-3 sentence recap of what this step produced>" }\`. Only after that may the pipeline advance to the next step.`;
+    } else if (nextReady) {
+        currentStepHeader = `\n\n**Current step: "${nextReady.name}" (id: ${nextReady.id})** — not yet activated. Call \`${ACTIVATE_SESSION_SKILL_TOOL_NAME}\` with \`skill_ids: ["${nextReady.id}"]\` BEFORE any other action (including integration tools like agent_search / notebook_write). Work done without activating first is wasted — you only have the short description until you activate.`;
+    } else {
+        currentStepHeader = '\n\nAll pipeline steps have been activated and completed. Produce the final user-facing answer now.';
+    }
 
-    let addendum = '\n\n[CHAT-LOCAL SKILLS — ORDERED PIPELINE]\nThese skills form a dependency-enforced pipeline for this direct chat. Each skill has a step number. Activate them in order — the runtime REFUSES to activate a skill whose dependencies are not yet active.' + currentStepHeader;
+    let addendum = '\n\n[CHAT-LOCAL SKILLS — ORDERED PIPELINE]\nThese skills form a dependency-enforced pipeline for this direct chat. Each skill has a step number. Activate them in order — the runtime REFUSES to activate a skill whose dependencies are not yet active. After finishing each step, call `' + COMPLETE_SESSION_SKILL_TOOL_NAME + '` so the pipeline can advance.' + currentStepHeader;
 
     if (inactive.length > 0) {
         const manifest = inactive.map(s => {
@@ -319,10 +340,15 @@ function buildSessionSkillInjection({ sessionSkills = [], activatedSkillIds = []
 
     // Completed skills — work is done, full body dropped, one-line trailer so
     // the model still knows the pipeline context without re-paying the tokens.
+    // If we have a per-step summary from complete_session_skill, include it
+    // so downstream steps can reference what upstream produced.
     if (completedList.length > 0) {
-        const lines = completedList
-            .map(s => `- [step ${s.order}] ${s.name} ✓`)
-            .join('\n');
+        const lines = completedList.map(s => {
+            const summary = summaryBySkillId.get(s.id);
+            return summary
+                ? `- [step ${s.order}] ${s.name} ✓ — ${summary}`
+                : `- [step ${s.order}] ${s.name} ✓`;
+        }).join('\n');
         addendum += `\n\n[COMPLETED STEPS — work already done in this conversation]\n${lines}`;
     }
 
@@ -350,6 +376,27 @@ function buildSessionSkillInjection({ sessionSkills = [], activatedSkillIds = []
         {
             type: 'function',
             function: {
+                name: COMPLETE_SESSION_SKILL_TOOL_NAME,
+                description: 'REQUIRED after finishing each pipeline step. Call this with the currently-active step\'s skill id and a 1-3 sentence summary of what the step produced. The runtime records the summary, shows it to the user as a per-step status row, and unlocks activation of the next step. Final user-facing output is blocked until every terminal step is completed.',
+                parameters: {
+                    type: 'object',
+                    properties: {
+                        skill_id: {
+                            type: 'string',
+                            description: 'Id of the currently-active session skill that is now finished.',
+                        },
+                        summary: {
+                            type: 'string',
+                            description: '1-3 sentence plain-text recap of what this step produced. Shown to the user and passed to the next step as context.',
+                        },
+                    },
+                    required: ['skill_id', 'summary'],
+                },
+            },
+        },
+        {
+            type: 'function',
+            function: {
                 name: PUBLISH_SESSION_SKILL_TOOL_NAME,
                 description: 'Publish one chat-local session skill to the persistent skill library when the user explicitly asks.',
                 parameters: {
@@ -369,13 +416,33 @@ function buildSessionSkillInjection({ sessionSkills = [], activatedSkillIds = []
     return { systemPromptAddendum: addendum, tools };
 }
 
-async function executeActivateSessionSkill({ args, sessionSkills = [], activatedSkillIds = [] }) {
+async function executeActivateSessionSkill({ args, sessionSkills = [], activatedSkillIds = [], completedSkillIds = null }) {
     const ids = Array.isArray(args?.skill_ids) ? args.skill_ids.filter(Boolean) : [];
     if (ids.length === 0) return { error: 'No skill_ids provided.' };
 
     const byId = new Map((sessionSkills || []).map(s => [s.id, s]));
     const requested = ids.map(id => byId.get(id)).filter(Boolean);
     if (requested.length === 0) return { error: 'No matching session skills found for the requested ids.' };
+
+    // Prevent activating a new step while a previous one is still mid-work.
+    // Each step must produce real work and be completed (via complete_session_skill)
+    // before the pipeline advances. Without this the LLM can chain activations
+    // back-to-back, skipping the actual work each step is supposed to do.
+    const completed = Array.isArray(completedSkillIds) ? new Set(completedSkillIds) : null;
+    if (completed) {
+        const stillActive = (sessionSkills || []).find(s =>
+            (Array.isArray(activatedSkillIds) ? activatedSkillIds : []).includes(s.id) && !completed.has(s.id)
+        );
+        if (stillActive) {
+            const requestedIds = new Set(ids);
+            // Re-activating the current step is always allowed (idempotent reload).
+            if (!requestedIds.has(stillActive.id)) {
+                return {
+                    error: `Cannot activate a new step — "${stillActive.name}" (step ${stillActive.order}) is still in progress. Finish its work, then call complete_session_skill with a summary before activating the next step.`,
+                };
+            }
+        }
+    }
 
     // Enforce the ordered pipeline. Process the requested list in step order
     // and accumulate activations so batch activations of a valid prefix chain
@@ -450,6 +517,111 @@ async function executePublishSessionSkill({
 }
 
 /**
+ * Mark a session skill as completed. The caller passes the current activated
+ * set + the current completed set and we return what the new completed set
+ * should be plus the next-ready skill id (if any) so the caller can drive the
+ * step machine's forced tool_choice.
+ *
+ * Validation:
+ *   - skill_id must be activated (you can't complete a step you haven't started)
+ *   - skill_id must not already be completed (idempotent guard)
+ *   - summary is required (short plain-text recap; trimmed + length-capped)
+ */
+async function executeCompleteSessionSkill({
+    args,
+    sessionSkills = [],
+    activatedSessionSkillIds = [],
+    completedSessionSkillIds = [],
+    roundsInCurrentStep = null,   // number of tool-call rounds since the step was activated
+}) {
+    const skillId = typeof args?.skill_id === 'string' ? args.skill_id.trim() : '';
+    const summary = sanitizeText(args?.summary, 600);
+    if (!skillId) return { error: 'skill_id is required.' };
+    if (!summary) return { error: 'summary is required — describe what the step produced in 1-3 sentences.' };
+
+    const byId = new Map((sessionSkills || []).map(s => [s.id, s]));
+    const skill = byId.get(skillId);
+    if (!skill) return { error: `Unknown session skill id: ${skillId}` };
+
+    const activated = new Set(Array.isArray(activatedSessionSkillIds) ? activatedSessionSkillIds : []);
+    const completed = new Set(Array.isArray(completedSessionSkillIds) ? completedSessionSkillIds : []);
+
+    if (!activated.has(skillId)) {
+        return { error: `Cannot complete "${skill.name}" — it was never activated. Call activate_session_skill first.` };
+    }
+    if (completed.has(skillId)) {
+        return { error: `"${skill.name}" is already completed. Activate the next step instead.` };
+    }
+    // Must have produced real work before completing. Without this the LLM can
+    // chain activate → complete → activate → complete without ever running
+    // an integration tool or writing any content for the step.
+    if (typeof roundsInCurrentStep === 'number' && roundsInCurrentStep <= 0) {
+        return {
+            error: `Cannot complete "${skill.name}" yet — no work was done for this step. Use the integration tools (agent_search, notebook_write, etc.) or produce the step's output first, then call complete_session_skill with a real summary of what you produced.`,
+        };
+    }
+
+    completed.add(skillId);
+    const mergedCompleted = Array.from(completed);
+
+    // Next-ready: first inactive skill (by order) whose deps are all activated.
+    const ordered = [...sessionSkills].sort((a, b) => (a.order || 0) - (b.order || 0));
+    const nextReady = ordered.find(s => !activated.has(s.id) && (s.dependsOn || []).every(d => activated.has(d)));
+
+    return {
+        success: true,
+        skill_id: skillId,
+        summary,
+        completedSessionSkillIds: mergedCompleted,
+        nextReadyId: nextReady ? nextReady.id : null,
+        message: `Step "${skill.name}" marked complete. ${nextReady ? `Next step ready: "${nextReady.name}" — call activate_session_skill.` : 'All pipeline steps complete; produce the final answer.'}`,
+    };
+}
+
+/**
+ * State-machine view used by the directChat guard to pick the next tool_choice.
+ * Distinguishes activation (step started) from completion (step finished). A
+ * step that's activated but not completed is "in progress" — integration
+ * tools are allowed, but the LLM cannot advance to the next step until it
+ * calls complete_session_skill.
+ *
+ * Returns:
+ *   - hasPipeline             — at least one session skill exists
+ *   - allTerminalsCompleted   — every terminal skill is in the completed set
+ *                               (final answer phase is unlocked)
+ *   - currentActiveId         — lowest-order activated-but-not-completed skill
+ *   - nextReadyId             — lowest-order inactive skill with all deps met
+ */
+function describeStepMachineState(sessionSkills, activatedSkillIds, completedSkillIds) {
+    const hasPipeline = Array.isArray(sessionSkills) && sessionSkills.length > 0;
+    if (!hasPipeline) {
+        return { hasPipeline: false, allTerminalsCompleted: true, currentActiveId: null, nextReadyId: null };
+    }
+    const activated = new Set(Array.isArray(activatedSkillIds) ? activatedSkillIds : []);
+    const completed = new Set(Array.isArray(completedSkillIds) ? completedSkillIds : []);
+
+    const downstream = new Map(sessionSkills.map(s => [s.id, []]));
+    for (const s of sessionSkills) {
+        for (const dep of s.dependsOn || []) {
+            if (downstream.has(dep)) downstream.get(dep).push(s.id);
+        }
+    }
+    const terminals = sessionSkills.filter(s => (downstream.get(s.id) || []).length === 0);
+    const allTerminalsCompleted = terminals.every(s => completed.has(s.id));
+
+    const ordered = [...sessionSkills].sort((a, b) => (a.order || 0) - (b.order || 0));
+    const currentActive = ordered.find(s => activated.has(s.id) && !completed.has(s.id)) || null;
+    const nextReady = ordered.find(s => !activated.has(s.id) && (s.dependsOn || []).every(d => activated.has(d))) || null;
+
+    return {
+        hasPipeline: true,
+        allTerminalsCompleted,
+        currentActiveId: currentActive ? currentActive.id : null,
+        nextReadyId: nextReady ? nextReady.id : null,
+    };
+}
+
+/**
  * Summarise the pipeline's execution state so the directChat tool loop can
  * decide what tool_choice to feed the LLM on the next round.
  *
@@ -483,13 +655,16 @@ function describePipelineState(sessionSkills, activatedSkillIds) {
 
 module.exports = {
     ACTIVATE_SESSION_SKILL_TOOL_NAME,
+    COMPLETE_SESSION_SKILL_TOOL_NAME,
     PUBLISH_SESSION_SKILL_TOOL_NAME,
     bootstrapSessionSkills,
     buildSessionSkillInjection,
     executeActivateSessionSkill,
+    executeCompleteSessionSkill,
     executePublishSessionSkill,
     initialActivatedSkillIds,
     deriveCompletedSkillIds,
     describePipelineState,
+    describeStepMachineState,
 };
 

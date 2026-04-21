@@ -21,10 +21,12 @@ const agentStore = require('../../stores/agentStore');
 const { executeTool: dispatchTool } = require('../../core/toolDispatcher');
 const {
     ACTIVATE_SESSION_SKILL_TOOL_NAME,
+    COMPLETE_SESSION_SKILL_TOOL_NAME,
     bootstrapSessionSkills,
     buildSessionSkillInjection,
     initialActivatedSkillIds,
     describePipelineState,
+    describeStepMachineState,
 } = require('../../core/sessionSkillRuntime');
 const { WORKSPACE_TOOLS } = require('../../integrations/workspaceTools');
 const guardrailEventStore = require('../../stores/guardrailEventStore');
@@ -684,6 +686,12 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         const isStandardTier = resolvedTier === 'standard';
         let sessionSkills = [];
         let activatedSessionSkillIds = [];
+        // Step-machine state: completion is explicit (not derived from
+        // activation). LLM calls `complete_session_skill` to advance. Without
+        // this distinction, "active" and "done" collapse and the pipeline
+        // can't tell whether a step is still being worked on or finished.
+        let completedSessionSkillIds = [];
+        let sessionSkillsCompletions = [];   // [{ skillId, skillName, summary, order, total, at }]
         let bootstrappedSessionSkills = false;
 
         // Load metadata from existing conversation
@@ -714,6 +722,12 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                     }
                     if (Array.isArray(existingConv.activatedSessionSkillIds)) {
                         activatedSessionSkillIds = existingConv.activatedSessionSkillIds;
+                    }
+                    if (Array.isArray(existingConv.completedSessionSkillIds)) {
+                        completedSessionSkillIds = existingConv.completedSessionSkillIds;
+                    }
+                    if (Array.isArray(existingConv.sessionSkillsCompletions)) {
+                        sessionSkillsCompletions = existingConv.sessionSkillsCompletions;
                     }
                 }
             } catch (e) { /* ignore */ }
@@ -833,6 +847,11 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             const sessionSkillInjection = buildSessionSkillInjection({
                 sessionSkills,
                 activatedSkillIds: activatedSessionSkillIds,
+                // Explicit completion set — completed steps have their full
+                // body replaced with a one-line summary trailer (tokens +
+                // prevents prior-step prose bleeding into the current step).
+                completedSessionSkillIds,
+                completions: sessionSkillsCompletions,
                 // Once the conversation has been compacted, active-skill bodies
                 // are already baked into the summary — re-injecting them every
                 // turn wastes tokens. Compact mode emits a one-liner instead;
@@ -1615,15 +1634,22 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         const skipToolPrecheck = adapter.shouldUseResponsesApi?.(modelId, chatOptions) || ['google', 'openai', 'claude', 'mistral'].includes(config.providerType);
         let toolCallRounds = 0;
         const MAX_TOOL_ROUNDS = 5;
-        // Pipeline enforcement. Never inject mid-conversation role:'system'
-        // messages — providers (Mistral/OpenAI) reject that after tool
-        // responses with `invalid_request_message_order`. Instead we:
-        //   1. Append a short reminder to the ORIGINAL system prompt when
-        //      needed — messages[0] is always valid to mutate.
-        //   2. Use tool_choice to mechanically force activate_session_skill
-        //      when the LLM stalls on integration tools.
-        let consecutiveNonActivationRounds = 0;
-        const STALL_THRESHOLD = 1;  // After ONE non-activation round, lock the next call to activate_session_skill.
+        // Step-machine guard. Completion is explicit — the LLM calls
+        // `complete_session_skill` to advance. Without explicit completion,
+        // the LLM streams its final answer alongside integration-tool calls
+        // in the same turn and the "walk the pipeline" guarantee is lost.
+        //
+        // State table:
+        //   - no pipeline / all terminals completed  →  'auto' (final answer)
+        //   - nothing active, ready step exists      →  force activate(next-ready)
+        //   - step active, not completed             →  'auto' (integration tools)
+        //   - step active, >=N rounds w/o complete   →  force complete(current)
+        //
+        // Muting: text deltas are dropped (tool calls still flow) until
+        // `allTerminalsCompleted` is true. Prevents the LLM from smuggling a
+        // "final answer" out inside a mid-pipeline tool-call response.
+        let roundsInCurrentStep = 0;
+        const SOFT_COMPLETE_CAP = 3;
 
         // Provider-specific tool_choice shape. OpenAI/Mistral expect the
         // nested form; our Claude adapter consumes a flat {name}; Google's
@@ -1635,24 +1661,48 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             return { type: 'function', function: { name: toolName } };
         }
 
-        function computePipelineGuard() {
-            if (!isStandardTier) return { toolChoice: 'auto', systemAppend: null, mode: 'auto' };
-            const state = describePipelineState(sessionSkills, activatedSessionSkillIds);
-            if (!state.hasPipeline || state.allTerminalsDone) return { toolChoice: 'auto', systemAppend: null, mode: 'auto' };
+        function computeStepMachineGuard() {
+            if (!isStandardTier) return { toolChoice: 'auto', systemAppend: null, mode: 'auto', mute: false };
+            const state = describeStepMachineState(sessionSkills, activatedSessionSkillIds, completedSessionSkillIds);
+            if (!state.hasPipeline || state.allTerminalsCompleted) {
+                return { toolChoice: 'auto', systemAppend: null, mode: 'final', mute: false };
+            }
             const byId = new Map(sessionSkills.map(s => [s.id, s]));
-            const nextReadyId = state.readySkillIds[0] || null;
-            const nextReadyName = nextReadyId ? (byId.get(nextReadyId)?.name || nextReadyId) : null;
-            // Stalled: hard-force activate_session_skill via tool_choice.
-            if (consecutiveNonActivationRounds >= STALL_THRESHOLD && nextReadyId) {
+
+            // A step is mid-work — the LLM should be using integration tools
+            // and then calling complete_session_skill. If it keeps firing
+            // tools without completing, force the completion after the cap.
+            if (state.currentActiveId) {
+                const activeName = byId.get(state.currentActiveId)?.name || state.currentActiveId;
+                if (roundsInCurrentStep >= SOFT_COMPLETE_CAP) {
+                    return {
+                        toolChoice: specificToolChoice(COMPLETE_SESSION_SKILL_TOOL_NAME),
+                        systemAppend: `\n\n[PIPELINE GUARD] Step "${activeName}" has run ${roundsInCurrentStep} tool-call rounds without completing. Your NEXT call MUST be \`${COMPLETE_SESSION_SKILL_TOOL_NAME}\` with \`{ skill_id: "${state.currentActiveId}", summary: "<what this step produced>" }\` so the pipeline can advance.`,
+                        mode: `forced-complete:${state.currentActiveId}`,
+                        mute: true,
+                    };
+                }
+                // Auto tool_choice — let the LLM pick integration tools for
+                // this step's work. Text deltas still muted (pipeline not done).
+                return { toolChoice: 'auto', systemAppend: null, mode: `active:${state.currentActiveId}`, mute: true };
+            }
+
+            // Nothing active — force activation of the next ready step.
+            if (state.nextReadyId) {
+                const readyName = byId.get(state.nextReadyId)?.name || state.nextReadyId;
                 return {
                     toolChoice: specificToolChoice(ACTIVATE_SESSION_SKILL_TOOL_NAME),
-                    systemAppend: `\n\n[PIPELINE GUARD] ${consecutiveNonActivationRounds} non-activation tool round(s). Your NEXT call MUST be \`${ACTIVATE_SESSION_SKILL_TOOL_NAME}\` with skill_ids=["${nextReadyId}"] (${nextReadyName}). Final output is blocked until every terminal session skill is activated.`,
-                    mode: `forced:${nextReadyId}`,
+                    systemAppend: `\n\n[PIPELINE GUARD] No step currently active. Your NEXT call MUST be \`${ACTIVATE_SESSION_SKILL_TOOL_NAME}\` with skill_ids=["${state.nextReadyId}"] (${readyName}) before any other tool.`,
+                    mode: `forced-activate:${state.nextReadyId}`,
+                    mute: true,
                 };
             }
-            // Pipeline not yet walked: force SOME tool; LLM can still pick
-            // integration tools, but can't exit to final text.
-            return { toolChoice: 'required', systemAppend: null, mode: 'required' };
+
+            // Pipeline exists but no active + no ready (e.g. all activated,
+            // completion pending for terminal). Force complete on the last
+            // activated-not-completed skill; fall back to 'auto' if we can't
+            // identify one (shouldn't happen in practice).
+            return { toolChoice: 'required', systemAppend: null, mode: 'required', mute: true };
         }
 
         // Safe append to the original system message (messages[0]) instead of
@@ -1663,6 +1713,47 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                 // Avoid re-appending the same guard on repeat rounds.
                 if (!messages[0].content.endsWith(text)) messages[0].content += text;
             }
+        }
+
+        // True while the step machine still has work to do — used by the
+        // streamed-tool while loop to force another round when the LLM
+        // stopped emitting tool calls mid-pipeline (text was muted, so
+        // without this the user would see an empty reply).
+        function pipelineNeedsWrapUp() {
+            if (!isStandardTier) return false;
+            if (!Array.isArray(sessionSkills) || sessionSkills.length === 0) return false;
+            const state = describeStepMachineState(sessionSkills, activatedSessionSkillIds, completedSessionSkillIds);
+            return state.hasPipeline && !state.allTerminalsCompleted;
+        }
+
+        // Shared side-effect handler for when the LLM calls complete_session_skill.
+        // Both the pre-check path and the streamed-tool path invoke this so the
+        // completion set + UI event stay in sync no matter which adapter fired.
+        function handleSessionSkillCompleteResult(toolArgs, toolResult) {
+            if (!toolResult?.success) return;
+            if (Array.isArray(toolResult.completedSessionSkillIds)) {
+                completedSessionSkillIds = Array.from(new Set(toolResult.completedSessionSkillIds));
+            } else if (toolResult.skill_id) {
+                completedSessionSkillIds = Array.from(new Set([...completedSessionSkillIds, toolResult.skill_id]));
+            }
+            const skillId = toolResult.skill_id || toolArgs?.skill_id;
+            const skill = sessionSkills.find(s => s.id === skillId);
+            const entry = {
+                skillId,
+                skillName: skill?.name || skillId,
+                summary: toolResult.summary || toolArgs?.summary || '',
+                order: skill?.order || null,
+                total: sessionSkills.length,
+                at: Date.now(),
+            };
+            sessionSkillsCompletions = [...sessionSkillsCompletions, entry];
+            roundsInCurrentStep = 0;
+            send('session_skill_completed', entry);
+            send('session_skills_updated', {
+                skills: sessionSkills,
+                activatedSkillIds: activatedSessionSkillIds,
+                completedSkillIds: completedSessionSkillIds,
+            });
         }
 
         // Try the adapter call; if the provider rejects due to
@@ -1708,9 +1799,9 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                 // Non-streaming tool check via adapter.chat()
                 let result;
                 try {
-                    const guard = computePipelineGuard();
+                    const guard = computeStepMachineGuard();
                     applySystemAppend(guard.systemAppend);
-                    console.log(`[DirectChat pipeline] pre-check round toolChoice=${guard.mode} stallRounds=${consecutiveNonActivationRounds}`);
+                    console.log(`[DirectChat pipeline] pre-check round=${toolCallRounds} active=${activatedSessionSkillIds.length} completed=${completedSessionSkillIds.length}/${sessionSkills.length} toolChoice=${guard.mode} roundsInStep=${roundsInCurrentStep}`);
                     result = await callAdapterWithFallback(
                         (tc) => adapter.chat(apiKey, apiUrl, modelId, messages, {
                             ...chatOptions,
@@ -1727,11 +1818,15 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                 }
 
                 if (result.toolCalls && result.toolCalls.length > 0) {
-                    // Update pipeline-stall counter: a round where at least
-                    // one call was activate_session_skill resets it; otherwise
-                    // we increment so the next guard kicks in harder.
+                    // Step-machine bookkeeping: activation resets the in-step
+                    // counter (new step started); completion reset happens
+                    // inside handleSessionSkillCompleteResult after dispatch.
+                    // Any other tool-only round advances the counter toward
+                    // the soft cap that force-requires complete_session_skill.
                     const calledActivation = result.toolCalls.some(tc => (tc.function?.name || tc.name) === ACTIVATE_SESSION_SKILL_TOOL_NAME);
-                    consecutiveNonActivationRounds = calledActivation ? 0 : consecutiveNonActivationRounds + 1;
+                    const calledCompletion = result.toolCalls.some(tc => (tc.function?.name || tc.name) === COMPLETE_SESSION_SKILL_TOOL_NAME);
+                    if (calledActivation) roundsInCurrentStep = 0;
+                    else if (!calledCompletion) roundsInCurrentStep += 1;
                     // Add assistant message with tool calls to history
                     messages.push({
                         role: 'assistant',
@@ -1855,6 +1950,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                                 attachments,
                                 sessionSkills,
                                 activatedSessionSkillIds,
+                                completedSessionSkillIds,
                                 timezone: timezone || 'Europe/Amsterdam',
                                 onImageGenerated: (data) => generatedImages.push(data),
                                 terminalCtx: {
@@ -1873,10 +1969,15 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
 
                         if (toolName === ACTIVATE_SESSION_SKILL_TOOL_NAME && toolResult?.activatedSkillIds) {
                             activatedSessionSkillIds = Array.from(new Set(toolResult.activatedSkillIds));
+                            roundsInCurrentStep = 0;
                             send('session_skills_updated', {
                                 skills: sessionSkills,
                                 activatedSkillIds: activatedSessionSkillIds,
+                                completedSkillIds: completedSessionSkillIds,
                             });
+                        }
+                        if (toolName === COMPLETE_SESSION_SKILL_TOOL_NAME) {
+                            handleSessionSkillCompleteResult(toolArgs, toolResult);
                         }
 
                         send('tool_end', { name: toolName, result: toolResult });
@@ -2035,9 +2136,12 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         // Pipeline guard at the streaming-call boundary: same rule as the
         // pre-check path — while a session-skill pipeline is mid-run, the
         // LLM is forced to keep calling tools instead of emitting final text.
-        const streamGuard = computePipelineGuard();
+        const streamGuard = computeStepMachineGuard();
         applySystemAppend(streamGuard.systemAppend);
-        console.log(`[DirectChat pipeline] primary stream toolChoice=${streamGuard.mode} stallRounds=${consecutiveNonActivationRounds}`);
+        console.log(`[DirectChat pipeline] primary stream active=${activatedSessionSkillIds.length} completed=${completedSessionSkillIds.length}/${sessionSkills.length} toolChoice=${streamGuard.mode} mute=${streamGuard.mute} roundsInStep=${roundsInCurrentStep}`);
+        // Tracks the mute state for the current stream round. Updated again
+        // before the follow-up stream so each round gets a fresh read.
+        let muteAssistantText = !!streamGuard.mute;
         const streamOptions = {
             ...chatOptions,
             tools: (toolCallRounds > 0) ? undefined : (directChatTools.length > 0 ? directChatTools : undefined),
@@ -2048,6 +2152,11 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
 
         const streamCallback = (type, data) => {
             if (type === 'text') {
+                // Pipeline mute: drop text deltas while a step-machine round is
+                // still walking the pipeline. Tool calls always pass. This is
+                // the hard guarantee that the "final answer" can't arrive
+                // alongside mid-pipeline integration tool calls.
+                if (muteAssistantText) return;
                 fullContent += data.text;
                 // Stream raw text (tokens like [PII:iban:1] will show briefly — restored at end)
                 send('content', { text: data.text });
@@ -2188,14 +2297,117 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         const MAX_STREAM_TOOL_ROUNDS = 15;
         let toolRound = 0;
 
-        while (streamToolCalls.length > 0 && toolRound < MAX_STREAM_TOOL_ROUNDS) {
+        // Single callback used by both the wrap-up kickstart and the follow-up
+        // stream. Captures outer closures (fullContent, thinkingContent,
+        // streamToolCalls, muteAssistantText, thinkingParts, lastResponseId).
+        const followStreamCallback = (type, data) => {
+            if (type === 'text') {
+                if (muteAssistantText) return;
+                fullContent += data.text;
+                send('content', { text: data.text });
+            } else if (type === 'thinking_start') {
+                if (data.partId) {
+                    const part = _getThinkingPart(data.partId);
+                    if (data.redacted) part.redacted = true;
+                    send('thinking_start', { partId: data.partId, redacted: data.redacted || undefined });
+                }
+            } else if (type === 'thinking') {
+                thinkingContent += data.text;
+                if (data.partId) {
+                    const part = _getThinkingPart(data.partId);
+                    part.text += data.text;
+                } else {
+                    let part = thinkingParts[thinkingParts.length - 1];
+                    if (!part || part.endedAt) {
+                        part = { id: `auto-${thinkingParts.length}`, text: '', startedAt: Date.now(), endedAt: null };
+                        thinkingParts.push(part);
+                    }
+                    part.text += data.text;
+                }
+                send('thinking', { text: data.text, partId: data.partId });
+            } else if (type === 'thinking_signature') {
+                if (data.partId && data.signature) {
+                    const part = _getThinkingPart(data.partId);
+                    part.signature = data.signature;
+                }
+            } else if (type === 'thinking_stop') {
+                if (data.partId) {
+                    const part = _getThinkingPart(data.partId);
+                    part.endedAt = Date.now();
+                    if (data.redacted) part.redacted = true;
+                    send('thinking_stop', { partId: data.partId, redacted: data.redacted || undefined });
+                }
+            } else if (type === 'tool_call') {
+                streamToolCalls.push(data);
+            } else if (type === 'tool_use') {
+                // Claude SDK returns tool calls as tool_use events
+                streamToolCalls.push({
+                    id: data.id || `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                    type: 'function',
+                    function: {
+                        name: data.name,
+                        arguments: JSON.stringify(data.input || {}),
+                    },
+                    _thought_signature: data.thought_signature || undefined,
+                });
+            } else if (type === 'error') {
+                send('error', data);
+            } else if (type === 'done') {
+                if (data?.responseId) {
+                    lastResponseId = data.responseId;
+                    console.log('[DirectChat] Updated lastResponseId after tool follow-up:', lastResponseId);
+                }
+            }
+        };
+
+        while (
+            (streamToolCalls.length > 0 || pipelineNeedsWrapUp()) &&
+            toolRound < MAX_STREAM_TOOL_ROUNDS
+        ) {
+            // Pipeline wrap-up kickstart: the LLM emitted no tool calls but
+            // the pipeline is still mid-walk (text was muted, so the user
+            // would see an empty reply). Force another streaming round with
+            // the step-machine tool_choice to coax it back onto the rails.
+            if (streamToolCalls.length === 0) {
+                const kickGuard = computeStepMachineGuard();
+                applySystemAppend(kickGuard.systemAppend);
+                muteAssistantText = !!kickGuard.mute;
+                console.log(`[DirectChat pipeline] wrap-up kickstart round=${toolRound + 1} toolChoice=${kickGuard.mode} mute=${kickGuard.mute}`);
+                const kickOptions = {
+                    ...chatOptions,
+                    previousResponseId: undefined,
+                    tools: directChatTools.length > 0 ? directChatTools : undefined,
+                    toolChoice: directChatTools.length > 0 ? kickGuard.toolChoice : undefined,
+                };
+                fullContent = '';
+                try {
+                    await adapter.stream(apiKey, apiUrl, modelId, messages, kickOptions, followStreamCallback);
+                } catch (kickErr) {
+                    const kMsg = String(kickErr?.error?.message || kickErr?.message || '');
+                    if (/invalid_request_message_order|Unexpected role|invalid.*tool_choice/i.test(kMsg)) {
+                        console.warn(`[DirectChat pipeline] Wrap-up rejected — retrying with toolChoice='auto'. Original: ${kMsg}`);
+                        await adapter.stream(apiKey, apiUrl, modelId, messages, { ...kickOptions, toolChoice: 'auto' }, followStreamCallback);
+                    } else {
+                        throw kickErr;
+                    }
+                }
+                // LLM still refused to emit tool calls — stop looping so we
+                // don't spin. The final save path handles the empty reply.
+                if (streamToolCalls.length === 0) {
+                    console.warn('[DirectChat pipeline] Wrap-up yielded no tool calls — aborting pipeline walk.');
+                    break;
+                }
+            }
+
             toolRound++;
             console.log(`[DirectChat] Streamed tool round ${toolRound}: ${streamToolCalls.map(t => t.function?.name).join(', ')}`);
 
-            // Pipeline-stall bookkeeping — mirror the pre-check path.
+            // Step-machine bookkeeping — mirror the pre-check path.
             {
                 const calledActivation = streamToolCalls.some(tc => tc.function?.name === ACTIVATE_SESSION_SKILL_TOOL_NAME);
-                consecutiveNonActivationRounds = calledActivation ? 0 : consecutiveNonActivationRounds + 1;
+                const calledCompletion = streamToolCalls.some(tc => tc.function?.name === COMPLETE_SESSION_SKILL_TOOL_NAME);
+                if (calledActivation) roundsInCurrentStep = 0;
+                else if (!calledCompletion) roundsInCurrentStep += 1;
             }
 
             messages.push({
@@ -2318,6 +2530,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                         attachments,
                         sessionSkills,
                         activatedSessionSkillIds,
+                        completedSessionSkillIds,
                         timezone: timezone || 'Europe/Amsterdam',
                         onImageGenerated: (data) => generatedImages.push(data),
                         terminalCtx: {
@@ -2336,10 +2549,15 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
 
                 if (toolName === ACTIVATE_SESSION_SKILL_TOOL_NAME && toolResult?.activatedSkillIds) {
                     activatedSessionSkillIds = Array.from(new Set(toolResult.activatedSkillIds));
+                    roundsInCurrentStep = 0;
                     send('session_skills_updated', {
                         skills: sessionSkills,
                         activatedSkillIds: activatedSessionSkillIds,
+                        completedSkillIds: completedSessionSkillIds,
                     });
+                }
+                if (toolName === COMPLETE_SESSION_SKILL_TOOL_NAME) {
+                    handleSessionSkillCompleteResult(toolArgs, toolResult);
                 }
 
                 send('tool_end', { name: toolName, result: toolResult });
@@ -2480,69 +2698,10 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             // Stream the follow-up response after tool execution (with tools for multi-round)
             fullContent = '';
             streamToolCalls = [];
-            const followGuard = computePipelineGuard();
+            const followGuard = computeStepMachineGuard();
             applySystemAppend(followGuard.systemAppend);
-            console.log(`[DirectChat pipeline] follow-up stream toolChoice=${followGuard.mode} stallRounds=${consecutiveNonActivationRounds}`);
-            const followStreamCallback = (type, data) => {
-                if (type === 'text') {
-                    fullContent += data.text;
-                    send('content', { text: data.text });
-                } else if (type === 'thinking_start') {
-                    if (data.partId) {
-                        const part = _getThinkingPart(data.partId);
-                        if (data.redacted) part.redacted = true;
-                        send('thinking_start', { partId: data.partId, redacted: data.redacted || undefined });
-                    }
-                } else if (type === 'thinking') {
-                    thinkingContent += data.text;
-                    if (data.partId) {
-                        const part = _getThinkingPart(data.partId);
-                        part.text += data.text;
-                    } else {
-                        let part = thinkingParts[thinkingParts.length - 1];
-                        if (!part || part.endedAt) {
-                            part = { id: `auto-${thinkingParts.length}`, text: '', startedAt: Date.now(), endedAt: null };
-                            thinkingParts.push(part);
-                        }
-                        part.text += data.text;
-                    }
-                    send('thinking', { text: data.text, partId: data.partId });
-                } else if (type === 'thinking_signature') {
-                    if (data.partId && data.signature) {
-                        const part = _getThinkingPart(data.partId);
-                        part.signature = data.signature;
-                    }
-                } else if (type === 'thinking_stop') {
-                    if (data.partId) {
-                        const part = _getThinkingPart(data.partId);
-                        part.endedAt = Date.now();
-                        if (data.redacted) part.redacted = true;
-                        send('thinking_stop', { partId: data.partId, redacted: data.redacted || undefined });
-                    }
-                } else if (type === 'tool_call') {
-                    streamToolCalls.push(data);
-                } else if (type === 'tool_use') {
-                    // Claude SDK returns tool calls as tool_use events
-                    streamToolCalls.push({
-                        id: data.id || `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-                        type: 'function',
-                        function: {
-                            name: data.name,
-                            arguments: JSON.stringify(data.input || {}),
-                        },
-                        _thought_signature: data.thought_signature || undefined,
-                    });
-                } else if (type === 'error') {
-                    send('error', data);
-                } else if (type === 'done') {
-                    // Capture the follow-up response ID so chaining uses this
-                    // (not the previous tool-call response)
-                    if (data?.responseId) {
-                        lastResponseId = data.responseId;
-                        console.log('[DirectChat] Updated lastResponseId after tool follow-up:', lastResponseId);
-                    }
-                }
-            };
+            muteAssistantText = !!followGuard.mute;
+            console.log(`[DirectChat pipeline] follow-up stream round=${toolRound} active=${activatedSessionSkillIds.length} completed=${completedSessionSkillIds.length}/${sessionSkills.length} toolChoice=${followGuard.mode} mute=${followGuard.mute} roundsInStep=${roundsInCurrentStep}`);
             const followStreamOptions = {
                 ...chatOptions,
                 previousResponseId: undefined, // Don't chain — we need to send tool results in full
@@ -2738,10 +2897,14 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             }
             // Per-turn pipeline snapshot — lets reloaded conversations replay
             // the timeline progression on each assistant message instead of
-            // every old turn snapping to the final activation state.
+            // every old turn snapping to the final activation state. Includes
+            // the completed set + per-step summaries so the UI can re-render
+            // both the chip states and the green "✓ Step N — summary" rows.
             if (Array.isArray(sessionSkills) && sessionSkills.length > 0) {
                 assistantSave.sessionSkillsSnapshot = {
                     activatedSkillIds: Array.isArray(activatedSessionSkillIds) ? [...activatedSessionSkillIds] : [],
+                    completedSkillIds: Array.isArray(completedSessionSkillIds) ? [...completedSessionSkillIds] : [],
+                    completions: Array.isArray(sessionSkillsCompletions) ? [...sessionSkillsCompletions] : [],
                 };
             }
             savedMessages.push(assistantSave);
@@ -2758,6 +2921,8 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             if (isStandardTier && sessionSkills.length > 0) {
                 updateMeta.sessionSkills = sessionSkills;
                 updateMeta.activatedSessionSkillIds = activatedSessionSkillIds;
+                updateMeta.completedSessionSkillIds = completedSessionSkillIds;
+                updateMeta.sessionSkillsCompletions = sessionSkillsCompletions;
             }
             await agentStore.updateDirectConversation(convId, savedMessages, userId, updateMeta);
 
@@ -2999,14 +3164,16 @@ router.post('/direct/conversations/:id/session-skills/regenerate', requireAuth, 
             userContext,
         });
 
-        // Persist new skills + reset activations. Preserve existing messages.
+        // Persist new skills + reset activations & completions. Preserve existing messages.
         const existingMessages = Array.isArray(conv.messages) ? conv.messages : [];
         await agentStore.updateDirectConversation(req.params.id, existingMessages, userId, {
             sessionSkills: newSkills,
             activatedSessionSkillIds: [],
+            completedSessionSkillIds: [],
+            sessionSkillsCompletions: [],
         });
 
-        res.json({ success: true, skills: newSkills, activatedSkillIds: [] });
+        res.json({ success: true, skills: newSkills, activatedSkillIds: [], completedSkillIds: [] });
     } catch (e) {
         console.error('Failed to regenerate session skills:', e);
         res.status(500).json({ error: e.message || 'Failed to regenerate session skills' });
@@ -3027,14 +3194,18 @@ router.delete('/direct/conversations/:id/session-skills/:skillId', requireAuth, 
             return res.status(404).json({ error: 'Session skill not found' });
         }
         const nextActivated = (Array.isArray(conv.activatedSessionSkillIds) ? conv.activatedSessionSkillIds : []).filter(id => id !== skillId);
+        const nextCompleted = (Array.isArray(conv.completedSessionSkillIds) ? conv.completedSessionSkillIds : []).filter(id => id !== skillId);
+        const nextCompletions = (Array.isArray(conv.sessionSkillsCompletions) ? conv.sessionSkillsCompletions : []).filter(c => c?.skillId !== skillId);
 
         const existingMessages = Array.isArray(conv.messages) ? conv.messages : [];
         await agentStore.updateDirectConversation(req.params.id, existingMessages, userId, {
             sessionSkills: nextSkills,
             activatedSessionSkillIds: nextActivated,
+            completedSessionSkillIds: nextCompleted,
+            sessionSkillsCompletions: nextCompletions,
         });
 
-        res.json({ success: true, skills: nextSkills, activatedSkillIds: nextActivated });
+        res.json({ success: true, skills: nextSkills, activatedSkillIds: nextActivated, completedSkillIds: nextCompleted });
     } catch (e) {
         console.error('Failed to delete session skill:', e);
         res.status(500).json({ error: 'Failed to delete session skill' });

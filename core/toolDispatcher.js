@@ -112,8 +112,10 @@ async function executeTool(toolName, toolArgs, context = {}) {
     // ─── Session Skill Runtime (direct-chat local skills) ───────
     const {
         ACTIVATE_SESSION_SKILL_TOOL_NAME,
+        COMPLETE_SESSION_SKILL_TOOL_NAME,
         PUBLISH_SESSION_SKILL_TOOL_NAME,
         executeActivateSessionSkill,
+        executeCompleteSessionSkill,
         executePublishSessionSkill,
     } = require('./sessionSkillRuntime');
     if (toolName === ACTIVATE_SESSION_SKILL_TOOL_NAME) {
@@ -121,6 +123,16 @@ async function executeTool(toolName, toolArgs, context = {}) {
             args: toolArgs,
             sessionSkills: context.sessionSkills || [],
             activatedSkillIds: context.activatedSessionSkillIds || [],
+            completedSkillIds: context.completedSessionSkillIds || [],
+        });
+    }
+    if (toolName === COMPLETE_SESSION_SKILL_TOOL_NAME) {
+        return await executeCompleteSessionSkill({
+            args: toolArgs,
+            sessionSkills: context.sessionSkills || [],
+            activatedSessionSkillIds: context.activatedSessionSkillIds || [],
+            completedSessionSkillIds: context.completedSessionSkillIds || [],
+            roundsInCurrentStep: typeof context.roundsInCurrentStep === 'number' ? context.roundsInCurrentStep : null,
         });
     }
     if (toolName === PUBLISH_SESSION_SKILL_TOOL_NAME) {
