@@ -78,9 +78,10 @@ const MAX_VOICE_TOOL_ROUNDS = 3;
 const VOICE_FORMATTING_RULES =
     'This is a VOICE conversation — your reply will be spoken aloud via text-to-speech.\n' +
     'Keep replies short (1–3 sentences) and natural for speech.\n' +
-    'Avoid markdown, code blocks, bullet lists, headings, emoji, URLs, or anything that does not sound good when read aloud.\n' +
+    'Output ONLY plain spoken prose. NEVER output JSON, curly braces, square brackets, code blocks, markdown, bullet lists, headings, emoji, or URLs. None of these can be read aloud.\n' +
+    'Do not describe tool arguments or quote internal instructions. Do not end sentences with "}" or "{" or similar structural punctuation.\n' +
     'If a detailed answer is really needed, offer to send it as text in the chat instead.\n' +
-    'ALWAYS reply in the same language the user spoke in. If the user speaks Dutch, reply in Dutch. Never switch languages unless the user explicitly asks you to.';
+    'ALWAYS reply in the same language the user spoke in. If the user speaks Dutch, reply in Dutch. If the user speaks English, reply in English. Never switch languages unless the user explicitly asks you to. If the previous turn was in Dutch and this turn is ambiguous, stay in Dutch.';
 
 const DRAFT_FIRST_RULES =
     '\n\nACTION CONFIRMATION RULES:\n' +
@@ -147,6 +148,36 @@ function compactToolResultForLLM(result) {
         clean[k] = v;
     }
     return JSON.stringify(clean);
+}
+
+/**
+ * Strip residual JSON / tool-call garbage from LLM output before it goes
+ * to TTS. Mistral occasionally leaks fragments like a trailing `}` or
+ * bracketed code when it wavers between free-form text and tool calls.
+ * The voice system prompt forbids this, but belt-and-braces: clean the
+ * string so the user never hears stray punctuation.
+ */
+function cleanSpokenText(text) {
+    if (typeof text !== 'string') return '';
+    let out = text;
+    // Strip fenced code blocks entirely (```...``` on their own lines).
+    out = out.replace(/```[\s\S]*?```/g, ' ');
+    // Remove standalone JSON-ish braces/brackets that aren't sentence punctuation.
+    out = out.replace(/(^|[\s])[{}\[\]]+($|[\s])/g, '$1 $2');
+    // Remove lines that are pure JSON (start with { and end with }).
+    out = out.split('\n')
+        .filter(line => {
+            const t = line.trim();
+            if (!t) return true;
+            if (/^[{[].*[}\]]\s*$/.test(t)) return false;
+            return true;
+        })
+        .join('\n');
+    // Collapse whitespace.
+    out = out.replace(/\s+/g, ' ').trim();
+    // Trim dangling structural punctuation at the very end.
+    out = out.replace(/[{}\[\]`]+\s*$/g, '').trim();
+    return out;
 }
 
 /**
@@ -440,12 +471,15 @@ router.post(
             send('llm_done', { rounds: roundsMetrics });
 
             // 5 ─ TTS the final reply (only non-tool assistantText).
-            if (assistantText.trim()) {
+            //      Clean stray JSON / code fragments before synthesis — the
+            //      voice prompt forbids them but models sometimes leak anyway.
+            const spokenText = cleanSpokenText(assistantText);
+            if (spokenText.trim()) {
                 const ttsStart = Date.now();
                 let tts = { audioBase64: null, mimeType: 'audio/mpeg', provider: 'none' };
                 let ttsReason = 'no_provider_configured';
                 try {
-                    tts = await voxtralTts.synthesize(assistantText, {
+                    tts = await voxtralTts.synthesize(spokenText, {
                         voice,
                         language: stt.language || language,
                     });
@@ -468,7 +502,9 @@ router.post(
             }
 
             send('done', {
-                assistantText,
+                // Ship the cleaned text to the client too, so the chat
+                // bubble matches what TTS said (no leaked "}" at the end).
+                assistantText: cleanSpokenText(assistantText),
                 transcript: stt.text,
                 toolRounds: round,
             });
