@@ -1,18 +1,19 @@
 /**
- * Email KB Routes — REST API for managing email-to-KB connections
+ * Ticket Assistant Routes — REST API for managing ticket-source connections
+ * (gmail, outlook, jira, servicenow, zendesk, freshservice, topdesk).
  *
- * All routes gated behind requireBetaFeature('email_knowledge_base')
+ * All routes gated behind requireBetaFeature('itil_ticket_assistant')
  * (applied at mount in index.js).
  */
 
 const express = require('express');
 const router = express.Router();
-const emailKBStore = require('../stores/emailKBStore');
+const ticketAssistantStore = require('../stores/ticketAssistantStore');
 const kbStore = require('../stores/knowledgeBases');
-const { triggerManualSync, testConnection, subscribeSyncEvents } = require('../services/emailKBSyncEngine');
-const { runStage, proposePromptImprovement } = require('../core/emailKBStageRunner');
+const { triggerManualSync, testConnection, subscribeSyncEvents } = require('../services/ticketAssistantSyncEngine');
+const { runStage, proposePromptImprovement } = require('../core/ticketAssistantStageRunner');
 const { setupSSE } = require('../core/sseHelpers');
-const emailKBMetrics = require('../core/emailKBMetrics');
+const ticketAssistantMetrics = require('../core/ticketAssistantMetrics');
 const { resolveUserOrgIds } = require('../auth');
 
 const ALLOWED_STAGES = new Set(['cleanup', 'pii', 'article', 'category', 'summarize_and_categorize', 'merge', 'dedupe']);
@@ -48,10 +49,10 @@ router.get('/connections', async (req, res) => {
         const orgId = await getOrgId(req);
         if (!orgId) return res.status(400).json({ error: 'No organization context' });
 
-        const connections = await emailKBStore.listConnections(orgId);
+        const connections = await ticketAssistantStore.listConnections(orgId);
         res.json({ connections });
     } catch (err) {
-        console.error('[EmailKB] List error:', err.message);
+        console.error('[TicketAssistant] List error:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -61,56 +62,70 @@ router.get('/connections', async (req, res) => {
 // Body: { knowledgeBaseId, provider ('gmail'|'outlook'), displayName? }
 // Uses current session OAuth tokens
 // ──────────────────────────────────────────────
+const EMAIL_PROVIDERS = ['gmail', 'outlook'];
+const TICKET_PROVIDERS = ['jira', 'servicenow', 'zendesk', 'freshservice', 'topdesk'];
+const ALL_PROVIDERS = [...EMAIL_PROVIDERS, ...TICKET_PROVIDERS];
+
 router.post('/connections', async (req, res) => {
     try {
         const orgId = await getOrgId(req);
         const userId = getUserId(req);
         if (!orgId || !userId) return res.status(400).json({ error: 'No organization or user context' });
 
-        const { knowledgeBaseId, provider, displayName } = req.body;
+        const { knowledgeBaseId, provider, displayName, credentials } = req.body;
 
         if (!knowledgeBaseId || !provider) {
             return res.status(400).json({ error: 'knowledgeBaseId and provider are required' });
         }
 
-        if (!['gmail', 'outlook'].includes(provider)) {
-            return res.status(400).json({ error: 'Provider must be "gmail" or "outlook"' });
+        if (!ALL_PROVIDERS.includes(provider)) {
+            return res.status(400).json({ error: `Provider must be one of: ${ALL_PROVIDERS.join(', ')}` });
         }
 
         // Verify the KB exists
         const kb = await kbStore.getKB(knowledgeBaseId);
         if (!kb) return res.status(404).json({ error: 'Knowledge base not found' });
 
-        // Extract OAuth tokens from session
-        const session = req.session;
-        const tokens = {};
+        let tokens = {};
         let emailAddress = '';
+        let providerConfig = {};
+        let authMethod = 'oauth';
 
-        if (provider === 'gmail') {
-            if (session.oauthProvider !== 'google' || !session.accessToken) {
+        if (provider === 'gmail' || provider === 'outlook') {
+            // Email providers: OAuth token capture from session
+            const session = req.session;
+            const requiredOauth = provider === 'gmail' ? 'google' : 'microsoft';
+            if (session.oauthProvider !== requiredOauth || !session.accessToken) {
                 return res.status(400).json({
-                    error: 'You must be logged in with Google to connect Gmail. Please sign in with your Google account first.'
+                    error: `You must be logged in with ${requiredOauth === 'google' ? 'Google' : 'Microsoft'} to connect ${provider}. Please sign in first.`,
                 });
             }
-            tokens.accessToken = session.accessToken;
-            tokens.refreshToken = session.refreshToken;
+            tokens = { accessToken: session.accessToken, refreshToken: session.refreshToken };
             emailAddress = session.email || session.user?.email || '';
-        } else if (provider === 'outlook') {
-            if (session.oauthProvider !== 'microsoft' || !session.accessToken) {
-                return res.status(400).json({
-                    error: 'You must be logged in with Microsoft to connect Outlook. Please sign in with your Microsoft account first.'
-                });
+        } else {
+            // Ticket providers: API-token / basic-auth credentials in the body
+            const ticketProviders = require('../core/ticketProviders');
+            const impl = ticketProviders.getProvider(provider);
+            if (!impl) return res.status(400).json({ error: `Unknown ticket provider: ${provider}` });
+            if (!credentials || typeof credentials !== 'object') {
+                return res.status(400).json({ error: 'credentials object required for ticket providers' });
             }
-            tokens.accessToken = session.accessToken;
-            tokens.refreshToken = session.refreshToken;
-            emailAddress = session.email || session.user?.email || '';
+            try {
+                const result = await impl.completeAuth(credentials);
+                tokens = result.tokens;
+                emailAddress = result.accountIdentifier;
+                providerConfig = result.providerConfig || {};
+                authMethod = impl.defaultAuthMethod;
+            } catch (authErr) {
+                return res.status(400).json({ error: `Credential validation failed: ${authErr.message}` });
+            }
         }
 
         if (!emailAddress) {
-            return res.status(400).json({ error: 'Could not determine email address from session' });
+            return res.status(400).json({ error: 'Could not determine account identifier' });
         }
 
-        const connection = await emailKBStore.createConnection({
+        const connection = await ticketAssistantStore.createConnection({
             organizationId: orgId,
             knowledgeBaseId,
             createdBy: userId,
@@ -118,13 +133,46 @@ router.post('/connections', async (req, res) => {
             emailAddress,
             displayName: displayName || emailAddress,
             tokens,
+            providerConfig,
+            authMethod,
         });
 
-        console.log(`[EmailKB] Created connection: ${provider} ${emailAddress} → KB ${knowledgeBaseId}`);
+        console.log(`[TicketAssistant] Created connection: ${provider} ${emailAddress} → KB ${knowledgeBaseId}`);
 
         res.status(201).json({ connection });
     } catch (err) {
-        console.error('[EmailKB] Create error:', err.message);
+        console.error('[TicketAssistant] Create error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ──────────────────────────────────────────────
+// POST /connections/test — validate credentials without creating the connection
+// Body: { provider, credentials }
+// ──────────────────────────────────────────────
+router.post('/connections/test', async (req, res) => {
+    try {
+        const { provider, credentials } = req.body || {};
+        if (!provider) return res.status(400).json({ error: 'provider is required' });
+        if (!TICKET_PROVIDERS.includes(provider)) {
+            return res.status(400).json({ error: 'Test endpoint only valid for ticket providers. Email providers validate via OAuth session.' });
+        }
+        const ticketProviders = require('../core/ticketProviders');
+        const impl = ticketProviders.getProvider(provider);
+        if (!impl) return res.status(400).json({ error: `Unknown ticket provider: ${provider}` });
+        try {
+            const r = await impl.completeAuth(credentials || {});
+            res.json({
+                success: true,
+                accountIdentifier: r.accountIdentifier,
+                displayName: r.displayName,
+                providerConfig: r.providerConfig,
+            });
+        } catch (authErr) {
+            res.status(400).json({ success: false, error: authErr.message });
+        }
+    } catch (err) {
+        console.error('[TicketAssistant] Test error:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -134,7 +182,7 @@ router.post('/connections', async (req, res) => {
 // ──────────────────────────────────────────────
 router.get('/connections/:id', async (req, res) => {
     try {
-        const connection = await emailKBStore.getConnection(req.params.id);
+        const connection = await ticketAssistantStore.getConnection(req.params.id);
         if (!connection) return res.status(404).json({ error: 'Connection not found' });
 
         // Verify org access
@@ -143,11 +191,11 @@ router.get('/connections/:id', async (req, res) => {
             return res.status(403).json({ error: 'Access denied' });
         }
 
-        const logs = await emailKBStore.getRecentSyncLogs(connection.id, 10);
+        const logs = await ticketAssistantStore.getRecentSyncLogs(connection.id, 10);
 
         res.json({ connection, syncLogs: logs });
     } catch (err) {
-        console.error('[EmailKB] Get error:', err.message);
+        console.error('[TicketAssistant] Get error:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -157,7 +205,7 @@ router.get('/connections/:id', async (req, res) => {
 // ──────────────────────────────────────────────
 router.patch('/connections/:id', async (req, res) => {
     try {
-        const connection = await emailKBStore.getConnection(req.params.id);
+        const connection = await ticketAssistantStore.getConnection(req.params.id);
         if (!connection) return res.status(404).json({ error: 'Connection not found' });
 
         const orgId = await getOrgId(req);
@@ -165,10 +213,10 @@ router.patch('/connections/:id', async (req, res) => {
             return res.status(403).json({ error: 'Access denied' });
         }
 
-        const updated = await emailKBStore.updateConnection(req.params.id, req.body);
+        const updated = await ticketAssistantStore.updateConnection(req.params.id, req.body);
         res.json({ connection: updated });
     } catch (err) {
-        console.error('[EmailKB] Update error:', err.message);
+        console.error('[TicketAssistant] Update error:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -178,7 +226,7 @@ router.patch('/connections/:id', async (req, res) => {
 // ──────────────────────────────────────────────
 router.delete('/connections/:id', async (req, res) => {
     try {
-        const connection = await emailKBStore.getConnection(req.params.id);
+        const connection = await ticketAssistantStore.getConnection(req.params.id);
         if (!connection) return res.status(404).json({ error: 'Connection not found' });
 
         const orgId = await getOrgId(req);
@@ -186,10 +234,10 @@ router.delete('/connections/:id', async (req, res) => {
             return res.status(403).json({ error: 'Access denied' });
         }
 
-        await emailKBStore.deleteConnection(req.params.id);
+        await ticketAssistantStore.deleteConnection(req.params.id);
         res.json({ success: true });
     } catch (err) {
-        console.error('[EmailKB] Delete error:', err.message);
+        console.error('[TicketAssistant] Delete error:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -199,7 +247,7 @@ router.delete('/connections/:id', async (req, res) => {
 // ──────────────────────────────────────────────
 router.post('/connections/:id/sync', async (req, res) => {
     try {
-        const connection = await emailKBStore.getConnection(req.params.id);
+        const connection = await ticketAssistantStore.getConnection(req.params.id);
         if (!connection) return res.status(404).json({ error: 'Connection not found' });
 
         const orgId = await getOrgId(req);
@@ -217,7 +265,7 @@ router.post('/connections/:id/sync', async (req, res) => {
         }
         res.json(result);
     } catch (err) {
-        console.error('[EmailKB] Sync trigger error:', err.message);
+        console.error('[TicketAssistant] Sync trigger error:', err.message);
         const status = err.status || 400;
         res.status(status).json({ error: err.message });
     }
@@ -228,7 +276,7 @@ router.post('/connections/:id/sync', async (req, res) => {
 // ──────────────────────────────────────────────
 router.post('/connections/:id/test', async (req, res) => {
     try {
-        const connection = await emailKBStore.getConnection(req.params.id);
+        const connection = await ticketAssistantStore.getConnection(req.params.id);
         if (!connection) return res.status(404).json({ error: 'Connection not found' });
 
         const orgId = await getOrgId(req);
@@ -239,7 +287,7 @@ router.post('/connections/:id/test', async (req, res) => {
         const result = await testConnection(req.params.id);
         res.json(result);
     } catch (err) {
-        console.error('[EmailKB] Test error:', err.message);
+        console.error('[TicketAssistant] Test error:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -260,7 +308,7 @@ router.post('/connections/:id/pipeline/run-stage', async (req, res) => {
         if (overrides?.modelTier && !ALLOWED_TIERS.has(overrides.modelTier)) {
             return res.status(400).json({ error: `Invalid modelTier. Allowed: ${Array.from(ALLOWED_TIERS).join(', ')}` });
         }
-        const connection = await emailKBStore.getConnectionWithTokens(req.params.id);
+        const connection = await ticketAssistantStore.getConnectionWithTokens(req.params.id);
         if (!connection) return res.status(404).json({ error: 'Connection not found' });
 
         const orgId = await getOrgId(req);
@@ -276,7 +324,7 @@ router.post('/connections/:id/pipeline/run-stage', async (req, res) => {
         });
         res.json(result);
     } catch (err) {
-        console.error('[EmailKB] run-stage error:', err.message);
+        console.error('[TicketAssistant] run-stage error:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -297,7 +345,7 @@ router.post('/connections/:id/pipeline/ai-assist', async (req, res) => {
             return res.status(400).json({ error: 'userFeedback is required' });
         }
 
-        const connection = await emailKBStore.getConnection(req.params.id);
+        const connection = await ticketAssistantStore.getConnection(req.params.id);
         if (!connection) return res.status(404).json({ error: 'Connection not found' });
 
         const orgId = await getOrgId(req);
@@ -316,7 +364,7 @@ router.post('/connections/:id/pipeline/ai-assist', async (req, res) => {
         });
         res.json(result);
     } catch (err) {
-        console.error('[EmailKB] ai-assist error:', err.message);
+        console.error('[TicketAssistant] ai-assist error:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -327,7 +375,7 @@ router.post('/connections/:id/pipeline/ai-assist', async (req, res) => {
 // ──────────────────────────────────────────────
 router.get('/connections/:id/sync/stream', async (req, res) => {
     try {
-        const connection = await emailKBStore.getConnection(req.params.id);
+        const connection = await ticketAssistantStore.getConnection(req.params.id);
         if (!connection) return res.status(404).json({ error: 'Connection not found' });
 
         const orgId = await getOrgId(req);
@@ -365,7 +413,7 @@ router.get('/connections/:id/sync/stream', async (req, res) => {
             markEnded();
         });
     } catch (err) {
-        console.error('[EmailKB] Sync stream error:', err.message);
+        console.error('[TicketAssistant] Sync stream error:', err.message);
         if (!res.headersSent) res.status(500).json({ error: err.message });
     }
 });
@@ -375,7 +423,7 @@ router.get('/connections/:id/sync/stream', async (req, res) => {
 // ──────────────────────────────────────────────
 router.get('/connections/:id/logs', async (req, res) => {
     try {
-        const connection = await emailKBStore.getConnection(req.params.id);
+        const connection = await ticketAssistantStore.getConnection(req.params.id);
         if (!connection) return res.status(404).json({ error: 'Connection not found' });
 
         const orgId = await getOrgId(req);
@@ -384,11 +432,11 @@ router.get('/connections/:id/logs', async (req, res) => {
         }
 
         const limit = Math.min(parseInt(req.query.limit) || 20, 100);
-        const logs = await emailKBStore.getRecentSyncLogs(connection.id, limit);
+        const logs = await ticketAssistantStore.getRecentSyncLogs(connection.id, limit);
 
         res.json({ logs });
     } catch (err) {
-        console.error('[EmailKB] Logs error:', err.message);
+        console.error('[TicketAssistant] Logs error:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -399,7 +447,7 @@ router.get('/connections/:id/logs', async (req, res) => {
 router.get('/metrics', async (req, res) => {
     if (!isSuperAdmin(req)) return res.status(403).json({ error: 'Admin only' });
     res.set('Content-Type', 'text/plain; charset=utf-8');
-    res.send(emailKBMetrics.renderTextFormat());
+    res.send(ticketAssistantMetrics.renderTextFormat());
 });
 
 // ──────────────────────────────────────────────
@@ -407,15 +455,15 @@ router.get('/metrics', async (req, res) => {
 // ──────────────────────────────────────────────
 router.get('/connections/:id/cost', async (req, res) => {
     try {
-        const connection = await emailKBStore.getConnection(req.params.id);
+        const connection = await ticketAssistantStore.getConnection(req.params.id);
         if (!connection) return res.status(404).json({ error: 'Connection not found' });
         const orgId = await getOrgId(req);
         if (connection.organization_id !== orgId && !isSuperAdmin(req)) {
             return res.status(403).json({ error: 'Access denied' });
         }
-        res.json({ connectionId: connection.id, cost30dUsd: emailKBMetrics.getCost30d(connection.id) });
+        res.json({ connectionId: connection.id, cost30dUsd: ticketAssistantMetrics.getCost30d(connection.id) });
     } catch (err) {
-        console.error('[EmailKB] Cost error:', err.message);
+        console.error('[TicketAssistant] Cost error:', err.message);
         res.status(500).json({ error: err.message });
     }
 });

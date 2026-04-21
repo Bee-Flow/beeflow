@@ -1,10 +1,10 @@
 /**
- * Per-stage pipeline runner for the Email Knowledge Base.
+ * Per-stage pipeline runner for the Ticket Assistant.
  *
  * Supports the interactive "run a single stage" workflow in the admin UI:
- * fetches a sample email from the connection, runs exactly one stage with
- * optional overrides, and returns input + output + config so the user can
- * inspect and iterate.
+ * fetches a sample item (email or ticket) from the connection, runs exactly
+ * one stage with optional overrides, and returns input + output + config so
+ * the user can inspect and iterate.
  *
  * Also exposes a meta-prompting helper that asks a user-selected model
  * (via model tier) to propose an improved system prompt for a stage when
@@ -19,7 +19,7 @@ const {
     summarizeAndCategorize,
     mergeArticlesByCategory,
     dedupeMergedChunks,
-} = require('./emailKBProcessor');
+} = require('./ticketAssistantProcessor');
 
 /**
  * Fetch the single most recent email from the connection's mailbox, honouring

@@ -1,9 +1,13 @@
 /**
- * Email KB Store — Database layer for email-to-knowledge-base connections
+ * Ticket Assistant Store — Database layer for ITIL ticket-source connections
  *
  * Tables:
- *   email_kb_connections  — connected mailboxes + sync state
- *   email_kb_sync_log     — audit trail for each sync run
+ *   ticket_assistant_connections — connected sources (gmail, outlook, jira,
+ *                                  servicenow, zendesk, freshservice, topdesk)
+ *                                  + sync state
+ *   ticket_assistant_sync_log    — audit trail for each sync run
+ *
+ * Historical names: email_kb_connections / email_kb_sync_log — auto-migrated on boot.
  */
 
 const { run, getOne, getAll, exec } = require('../db');
@@ -16,13 +20,28 @@ let initialized = false;
 async function initDB() {
     if (initialized) return;
 
+    // ── Legacy rename (one-shot, idempotent) ────────────────────────────────
+    // Earlier versions of this feature used email_kb_* table names. On boot
+    // with a pre-existing DB, rename them in place. The ALTER ... IF EXISTS
+    // form makes this safe to run on fresh DBs too (no-op when tables don't
+    // exist yet).
+    try {
+        await exec(`ALTER TABLE IF EXISTS email_kb_connections RENAME TO ticket_assistant_connections`);
+        await exec(`ALTER TABLE IF EXISTS email_kb_sync_log   RENAME TO ticket_assistant_sync_log`);
+        await exec(`ALTER INDEX IF EXISTS idx_email_kb_conn_org RENAME TO idx_ta_conn_org`);
+        await exec(`ALTER INDEX IF EXISTS idx_email_kb_conn_kb  RENAME TO idx_ta_conn_kb`);
+        await exec(`ALTER INDEX IF EXISTS idx_email_kb_log_conn RENAME TO idx_ta_log_conn`);
+    } catch (err) {
+        console.warn('[TicketAssistantStore] Legacy rename error (safe to ignore on fresh DB):', err.message);
+    }
+
     await exec(`
-        CREATE TABLE IF NOT EXISTS email_kb_connections (
+        CREATE TABLE IF NOT EXISTS ticket_assistant_connections (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             organization_id TEXT NOT NULL,
             knowledge_base_id UUID NOT NULL,
             created_by TEXT NOT NULL,
-            provider TEXT NOT NULL CHECK (provider IN ('gmail', 'outlook')),
+            provider TEXT NOT NULL CHECK (provider IN ('gmail','outlook','jira','servicenow','zendesk','freshservice','topdesk')),
             email_address TEXT NOT NULL,
             display_name TEXT DEFAULT '',
             folder_filter JSONB DEFAULT '["INBOX"]'::jsonb,
@@ -43,26 +62,42 @@ async function initDB() {
             max_emails_per_sync INT DEFAULT 50,
             sync_after_date TEXT,
             pipeline_config JSONB DEFAULT '{}'::jsonb,
+            provider_config JSONB DEFAULT '{}'::jsonb,
+            auth_method TEXT DEFAULT 'oauth',
+            provider_cursor JSONB DEFAULT '{}'::jsonb,
             created_at TIMESTAMPTZ DEFAULT now(),
             updated_at TIMESTAMPTZ DEFAULT now()
         )
     `);
-    await exec(`CREATE INDEX IF NOT EXISTS idx_email_kb_conn_org ON email_kb_connections(organization_id)`);
-    await exec(`CREATE INDEX IF NOT EXISTS idx_email_kb_conn_kb ON email_kb_connections(knowledge_base_id)`);
+    await exec(`CREATE INDEX IF NOT EXISTS idx_ta_conn_org ON ticket_assistant_connections(organization_id)`);
+    await exec(`CREATE INDEX IF NOT EXISTS idx_ta_conn_kb ON ticket_assistant_connections(knowledge_base_id)`);
 
-    // Migrate: add columns for existing tables
-    await exec(`ALTER TABLE email_kb_connections ADD COLUMN IF NOT EXISTS redact_pii BOOLEAN DEFAULT true`);
-    await exec(`ALTER TABLE email_kb_connections ADD COLUMN IF NOT EXISTS max_emails_per_sync INT DEFAULT 50`);
-    await exec(`ALTER TABLE email_kb_connections ADD COLUMN IF NOT EXISTS sync_after_date TEXT`);
-    await exec(`ALTER TABLE email_kb_connections ADD COLUMN IF NOT EXISTS pipeline_config JSONB DEFAULT '{}'::jsonb`);
-    await exec(`ALTER TABLE email_kb_connections ADD COLUMN IF NOT EXISTS sync_locked_until TIMESTAMPTZ`);
-    await exec(`ALTER TABLE email_kb_connections ADD COLUMN IF NOT EXISTS gmail_history_id TEXT`);
-    await exec(`ALTER TABLE email_kb_connections ADD COLUMN IF NOT EXISTS graph_delta_link TEXT`);
+    // Migrate: add columns for existing tables (historical + new)
+    await exec(`ALTER TABLE ticket_assistant_connections ADD COLUMN IF NOT EXISTS redact_pii BOOLEAN DEFAULT true`);
+    await exec(`ALTER TABLE ticket_assistant_connections ADD COLUMN IF NOT EXISTS max_emails_per_sync INT DEFAULT 50`);
+    await exec(`ALTER TABLE ticket_assistant_connections ADD COLUMN IF NOT EXISTS sync_after_date TEXT`);
+    await exec(`ALTER TABLE ticket_assistant_connections ADD COLUMN IF NOT EXISTS pipeline_config JSONB DEFAULT '{}'::jsonb`);
+    await exec(`ALTER TABLE ticket_assistant_connections ADD COLUMN IF NOT EXISTS sync_locked_until TIMESTAMPTZ`);
+    await exec(`ALTER TABLE ticket_assistant_connections ADD COLUMN IF NOT EXISTS gmail_history_id TEXT`);
+    await exec(`ALTER TABLE ticket_assistant_connections ADD COLUMN IF NOT EXISTS graph_delta_link TEXT`);
+    await exec(`ALTER TABLE ticket_assistant_connections ADD COLUMN IF NOT EXISTS provider_config JSONB DEFAULT '{}'::jsonb`);
+    await exec(`ALTER TABLE ticket_assistant_connections ADD COLUMN IF NOT EXISTS auth_method TEXT DEFAULT 'oauth'`);
+    await exec(`ALTER TABLE ticket_assistant_connections ADD COLUMN IF NOT EXISTS provider_cursor JSONB DEFAULT '{}'::jsonb`);
+
+    // Widen provider enum (existing rows preserved; new providers now valid)
+    try {
+        await exec(`ALTER TABLE ticket_assistant_connections DROP CONSTRAINT IF EXISTS email_kb_connections_provider_check`);
+        await exec(`ALTER TABLE ticket_assistant_connections DROP CONSTRAINT IF EXISTS ticket_assistant_connections_provider_check`);
+        await exec(`ALTER TABLE ticket_assistant_connections ADD CONSTRAINT ticket_assistant_connections_provider_check
+                    CHECK (provider IN ('gmail','outlook','jira','servicenow','zendesk','freshservice','topdesk'))`);
+    } catch (err) {
+        console.warn('[TicketAssistantStore] Provider enum widening error (safe on fresh DB):', err.message);
+    }
 
     await exec(`
-        CREATE TABLE IF NOT EXISTS email_kb_sync_log (
+        CREATE TABLE IF NOT EXISTS ticket_assistant_sync_log (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            connection_id UUID NOT NULL REFERENCES email_kb_connections(id) ON DELETE CASCADE,
+            connection_id UUID NOT NULL REFERENCES ticket_assistant_connections(id) ON DELETE CASCADE,
             started_at TIMESTAMPTZ DEFAULT now(),
             finished_at TIMESTAMPTZ,
             emails_fetched INT DEFAULT 0,
@@ -73,21 +108,34 @@ async function initDB() {
             outcomes JSONB DEFAULT '{}'::jsonb
         )
     `);
-    await exec(`ALTER TABLE email_kb_sync_log ADD COLUMN IF NOT EXISTS outcomes JSONB DEFAULT '{}'::jsonb`);
-    await exec(`CREATE INDEX IF NOT EXISTS idx_email_kb_log_conn ON email_kb_sync_log(connection_id)`);
+    await exec(`ALTER TABLE ticket_assistant_sync_log ADD COLUMN IF NOT EXISTS outcomes JSONB DEFAULT '{}'::jsonb`);
+    await exec(`CREATE INDEX IF NOT EXISTS idx_ta_log_conn ON ticket_assistant_sync_log(connection_id)`);
+
+    // Migrate beta-feature ID on organizations (TEXT column, JSON-serialized)
+    try {
+        await run(
+            `UPDATE organizations
+             SET beta_features = REPLACE(beta_features, '"email_knowledge_base"', '"itil_ticket_assistant"')
+             WHERE beta_features LIKE '%"email_knowledge_base"%'`
+        );
+    } catch (err) {
+        // Organizations table may not exist during first-boot — not fatal.
+    }
 
     initialized = true;
-    console.log('[EmailKBStore] Tables initialized');
+    console.log('[TicketAssistantStore] Tables initialized');
 }
 
 // Auto-init
-initDB().catch(err => console.error('[EmailKBStore] Init error:', err.message));
+initDB().catch(err => console.error('[TicketAssistantStore] Init error:', err.message));
 
 // ──────────────────────────────────────────────
 // Token Encryption
 // ──────────────────────────────────────────────
 
 function deriveKey() {
+    // Salt intentionally preserved as 'email-kb-salt' so that tokens stored
+    // under the legacy feature name remain decryptable after the rename.
     return crypto.scryptSync(ENCRYPTION_KEY_SOURCE, 'email-kb-salt', 32);
 }
 
@@ -111,7 +159,7 @@ function decryptTokens(encryptedStr) {
         decrypted += decipher.final('utf8');
         return JSON.parse(decrypted);
     } catch (err) {
-        console.error('[EmailKBStore] Token decryption failed:', err.message);
+        console.error('[TicketAssistantStore] Token decryption failed:', err.message);
         return null;
     }
 }
@@ -120,30 +168,48 @@ function decryptTokens(encryptedStr) {
 // Connection CRUD
 // ──────────────────────────────────────────────
 
-const EmailKBStore = {
+const TicketAssistantStore = {
 
     /**
-     * Create a new email KB connection.
+     * Create a new ticket-source connection.
+     *
+     * @param {object} params
+     * @param {string} params.organizationId
+     * @param {string} params.knowledgeBaseId
+     * @param {string} params.createdBy
+     * @param {string} params.provider       — gmail|outlook|jira|servicenow|zendesk|freshservice|topdesk
+     * @param {string} params.emailAddress   — account identifier (email for email providers, login/subdomain/instance for ticket providers)
+     * @param {string} [params.displayName]
+     * @param {object} params.tokens         — provider-specific credential blob (encrypted before storage)
+     * @param {object} [params.providerConfig] — provider-specific config: { siteUrl, projectKeys, jql, instance, tables, subdomain, domain, ... }
+     * @param {string} [params.authMethod]  — 'oauth' (default, used by gmail/outlook) | 'api_token' | 'basic'
      */
-    createConnection: async ({ organizationId, knowledgeBaseId, createdBy, provider, emailAddress, displayName, tokens }) => {
+    createConnection: async ({ organizationId, knowledgeBaseId, createdBy, provider, emailAddress, displayName, tokens, providerConfig, authMethod }) => {
         await initDB();
         const encTokens = encryptTokens(tokens);
         // New connections default to the per-email archive mode (one KB doc per
-        // message with rich metadata header). This preserves retrieval signal
-        // far better than the AI-summarised category_merge pipeline; existing
-        // connections keep their behaviour because they already have a
-        // pipeline_config without `ingestion_mode` set (→ treated as
-        // 'category_merge' by getIngestionMode in emailKBSyncEngine.js).
+        // message/ticket with rich metadata header). This preserves retrieval
+        // signal far better than the AI-summarised category_merge pipeline;
+        // existing connections keep their behaviour because they already have
+        // a pipeline_config without `ingestion_mode` set (→ treated as
+        // 'category_merge' by getIngestionMode in ticketAssistantSyncEngine.js).
         const defaultPipelineConfig = { ingestion_mode: 'per_email' };
         return getOne(
-            `INSERT INTO email_kb_connections
-             (organization_id, knowledge_base_id, created_by, provider, email_address, display_name, encrypted_tokens, pipeline_config)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            `INSERT INTO ticket_assistant_connections
+             (organization_id, knowledge_base_id, created_by, provider, email_address, display_name,
+              encrypted_tokens, pipeline_config, provider_config, auth_method)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              RETURNING id, organization_id, knowledge_base_id, provider, email_address, display_name,
                        folder_filter, sender_blacklist, sync_interval_minutes, sync_status,
                        total_emails_processed, total_articles_created, enabled, process_attachments,
-                       group_threads, pipeline_config, created_at`,
-            [organizationId, knowledgeBaseId, createdBy, provider, emailAddress, displayName || emailAddress, encTokens, JSON.stringify(defaultPipelineConfig)]
+                       group_threads, pipeline_config, provider_config, auth_method, created_at`,
+            [
+                organizationId, knowledgeBaseId, createdBy, provider, emailAddress,
+                displayName || emailAddress, encTokens,
+                JSON.stringify(defaultPipelineConfig),
+                JSON.stringify(providerConfig || {}),
+                authMethod || 'oauth',
+            ]
         );
     },
 
@@ -159,8 +225,8 @@ const EmailKBStore = {
                     total_emails_processed, total_articles_created,
                     enabled, process_attachments, group_threads,
                     redact_pii, max_emails_per_sync, sync_after_date, ai_system_prompt,
-                    pipeline_config, created_at, updated_at
-             FROM email_kb_connections
+                    pipeline_config, provider_config, auth_method, created_at, updated_at
+             FROM ticket_assistant_connections
              WHERE organization_id = $1
              ORDER BY created_at DESC`,
             [organizationId]
@@ -179,8 +245,8 @@ const EmailKBStore = {
                     total_emails_processed, total_articles_created,
                     ai_system_prompt, enabled, process_attachments, group_threads,
                     redact_pii, max_emails_per_sync, sync_after_date, pipeline_config,
-                    created_at, updated_at
-             FROM email_kb_connections
+                    provider_config, auth_method, provider_cursor, created_at, updated_at
+             FROM ticket_assistant_connections
              WHERE id = $1`,
             [id]
         );
@@ -192,7 +258,7 @@ const EmailKBStore = {
     getConnectionWithTokens: async (id) => {
         await initDB();
         const row = await getOne(
-            `SELECT * FROM email_kb_connections WHERE id = $1`,
+            `SELECT * FROM ticket_assistant_connections WHERE id = $1`,
             [id]
         );
         if (!row) return null;
@@ -208,7 +274,7 @@ const EmailKBStore = {
     getDueConnections: async () => {
         await initDB();
         return getAll(
-            `SELECT * FROM email_kb_connections
+            `SELECT * FROM ticket_assistant_connections
              WHERE enabled = true
                AND sync_status != 'syncing'
                AND (sync_locked_until IS NULL OR sync_locked_until <= now())
@@ -226,7 +292,7 @@ const EmailKBStore = {
     acquireSyncLock: async (connectionId, ttlMinutes = 30) => {
         await initDB();
         const row = await getOne(
-            `UPDATE email_kb_connections
+            `UPDATE ticket_assistant_connections
              SET sync_locked_until = now() + ($2 || ' minutes')::interval,
                  updated_at = now()
              WHERE id = $1
@@ -239,7 +305,7 @@ const EmailKBStore = {
         }
         // Lock is held — read current expiry to return retry hint
         const held = await getOne(
-            `SELECT sync_locked_until FROM email_kb_connections WHERE id = $1`,
+            `SELECT sync_locked_until FROM ticket_assistant_connections WHERE id = $1`,
             [connectionId]
         );
         const secs = held?.sync_locked_until
@@ -252,7 +318,7 @@ const EmailKBStore = {
      * Persist incremental-sync cursors (Gmail historyId, Graph @odata.deltaLink).
      * Either field may be set to `null` to force a fallback on next sync.
      */
-    updateIncrementalCursor: async (connectionId, { gmailHistoryId, graphDeltaLink } = {}) => {
+    updateIncrementalCursor: async (connectionId, { gmailHistoryId, graphDeltaLink, providerCursor } = {}) => {
         await initDB();
         const sets = ['updated_at = now()'];
         const vals = [connectionId];
@@ -263,8 +329,11 @@ const EmailKBStore = {
         if (graphDeltaLink !== undefined) {
             sets.push(`graph_delta_link = $${idx}`); vals.push(graphDeltaLink); idx++;
         }
+        if (providerCursor !== undefined) {
+            sets.push(`provider_cursor = $${idx}::jsonb`); vals.push(JSON.stringify(providerCursor)); idx++;
+        }
         if (sets.length === 1) return null;
-        return run(`UPDATE email_kb_connections SET ${sets.join(', ')} WHERE id = $1`, vals);
+        return run(`UPDATE ticket_assistant_connections SET ${sets.join(', ')} WHERE id = $1`, vals);
     },
 
     /**
@@ -273,7 +342,7 @@ const EmailKBStore = {
     releaseSyncLock: async (connectionId) => {
         await initDB();
         return run(
-            `UPDATE email_kb_connections SET sync_locked_until = NULL, updated_at = now() WHERE id = $1`,
+            `UPDATE ticket_assistant_connections SET sync_locked_until = NULL, updated_at = now() WHERE id = $1`,
             [connectionId]
         );
     },
@@ -285,14 +354,15 @@ const EmailKBStore = {
         await initDB();
         const allowed = ['display_name', 'folder_filter', 'sender_blacklist', 'sync_interval_minutes',
                           'ai_system_prompt', 'enabled', 'process_attachments', 'group_threads', 'knowledge_base_id',
-                          'redact_pii', 'max_emails_per_sync', 'sync_after_date', 'pipeline_config'];
+                          'redact_pii', 'max_emails_per_sync', 'sync_after_date', 'pipeline_config',
+                          'provider_config', 'auth_method'];
         const sets = [];
         const vals = [id];
         let idx = 2;
 
         for (const key of allowed) {
             if (updates[key] !== undefined) {
-                const isJsonb = key === 'folder_filter' || key === 'sender_blacklist' || key === 'pipeline_config';
+                const isJsonb = key === 'folder_filter' || key === 'sender_blacklist' || key === 'pipeline_config' || key === 'provider_config';
                 const dbKey = isJsonb ? `${key} = $${idx}::jsonb` : `${key} = $${idx}`;
                 sets.push(dbKey);
                 vals.push(isJsonb ? JSON.stringify(updates[key]) : updates[key]);
@@ -304,12 +374,13 @@ const EmailKBStore = {
         sets.push('updated_at = now()');
 
         return getOne(
-            `UPDATE email_kb_connections SET ${sets.join(', ')} WHERE id = $1
+            `UPDATE ticket_assistant_connections SET ${sets.join(', ')} WHERE id = $1
              RETURNING id, organization_id, knowledge_base_id, provider, email_address, display_name,
                        folder_filter, sender_blacklist, sync_interval_minutes, sync_status,
                        total_emails_processed, total_articles_created, enabled,
                        process_attachments, group_threads, redact_pii, max_emails_per_sync,
-                       sync_after_date, ai_system_prompt, pipeline_config, updated_at`,
+                       sync_after_date, ai_system_prompt, pipeline_config,
+                       provider_config, auth_method, updated_at`,
             vals
         );
     },
@@ -321,7 +392,7 @@ const EmailKBStore = {
         await initDB();
         const encTokens = encryptTokens(tokens);
         return run(
-            `UPDATE email_kb_connections SET encrypted_tokens = $2, updated_at = now() WHERE id = $1`,
+            `UPDATE ticket_assistant_connections SET encrypted_tokens = $2, updated_at = now() WHERE id = $1`,
             [id, encTokens]
         );
     },
@@ -348,7 +419,7 @@ const EmailKBStore = {
             vals.push(articlesCreated); idx++;
         }
 
-        return run(`UPDATE email_kb_connections SET ${sets.join(', ')} WHERE id = $1`, vals);
+        return run(`UPDATE ticket_assistant_connections SET ${sets.join(', ')} WHERE id = $1`, vals);
     },
 
     /**
@@ -356,7 +427,7 @@ const EmailKBStore = {
      */
     deleteConnection: async (id) => {
         await initDB();
-        await run('DELETE FROM email_kb_connections WHERE id = $1', [id]);
+        await run('DELETE FROM ticket_assistant_connections WHERE id = $1', [id]);
         return true;
     },
 
@@ -367,7 +438,7 @@ const EmailKBStore = {
     createSyncLog: async (connectionId) => {
         await initDB();
         return getOne(
-            `INSERT INTO email_kb_sync_log (connection_id) VALUES ($1) RETURNING *`,
+            `INSERT INTO ticket_assistant_sync_log (connection_id) VALUES ($1) RETURNING *`,
             [connectionId]
         );
     },
@@ -376,7 +447,7 @@ const EmailKBStore = {
         await initDB();
         if (outcomes !== undefined) {
             return run(
-                `UPDATE email_kb_sync_log
+                `UPDATE ticket_assistant_sync_log
                  SET finished_at = now(),
                      emails_fetched = $2,
                      articles_created = $3,
@@ -389,7 +460,7 @@ const EmailKBStore = {
             );
         }
         return run(
-            `UPDATE email_kb_sync_log
+            `UPDATE ticket_assistant_sync_log
              SET finished_at = now(),
                  emails_fetched = $2,
                  articles_created = $3,
@@ -422,7 +493,7 @@ const EmailKBStore = {
         await initDB();
         if (!logId || !['ingested', 'skipped', 'failed'].includes(bucket)) return null;
         const SAMPLE_CAP = 20;
-        const row = await getOne(`SELECT outcomes FROM email_kb_sync_log WHERE id = $1`, [logId]);
+        const row = await getOne(`SELECT outcomes FROM ticket_assistant_sync_log WHERE id = $1`, [logId]);
         if (!row) return null;
         const outcomes = row.outcomes || {};
         const slot = outcomes[bucket] || { count: 0, samples: [] };
@@ -437,7 +508,7 @@ const EmailKBStore = {
         }
         outcomes[bucket] = slot;
         return run(
-            `UPDATE email_kb_sync_log SET outcomes = $2::jsonb WHERE id = $1`,
+            `UPDATE ticket_assistant_sync_log SET outcomes = $2::jsonb WHERE id = $1`,
             [logId, JSON.stringify(outcomes)]
         );
     },
@@ -445,7 +516,7 @@ const EmailKBStore = {
     getRecentSyncLogs: async (connectionId, limit = 20) => {
         await initDB();
         return getAll(
-            `SELECT * FROM email_kb_sync_log
+            `SELECT * FROM ticket_assistant_sync_log
              WHERE connection_id = $1
              ORDER BY started_at DESC
              LIMIT $2`,
@@ -458,4 +529,4 @@ const EmailKBStore = {
     decryptTokens,
 };
 
-module.exports = EmailKBStore;
+module.exports = TicketAssistantStore;

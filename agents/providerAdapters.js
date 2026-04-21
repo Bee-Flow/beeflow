@@ -1,7 +1,7 @@
 /**
  * Provider Adapters — Thin wrapper providing OpenAI-style createChatCompletion
  *
- * Bridges emailKBProcessor (and anything else that expects the OpenAI response
+ * Bridges ticketAssistantProcessor (and anything else that expects the OpenAI response
  * shape) to BeeFlow's unified provider system (LLMClient → getAdapter → chat).
  *
  * Usage:

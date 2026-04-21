@@ -327,7 +327,13 @@ const { requireBetaFeature } = require('./core/betaFeatures');
 app.use('/api/transcriptions', requireBetaFeature('meeting_notes'), require('./routes/transcriptions'));
 app.use('/api/meet-bot', requireBetaFeature('meeting_notes'), require('./routes/meetBot'));
 app.use('/api/skills', requireBetaFeature('skills'), require('./routes/skills'));
-app.use('/api/email-kb', requireBetaFeature('email_knowledge_base'), require('./routes/emailKB'));
+// ITIL Ticket Assistant (formerly Email Knowledge Base). Both mount paths point
+// to the same router while the `email_knowledge_base` beta-flag alias is live;
+// remove the `/api/email-kb` alias and the alias entry in betaFeatures.js in
+// the release after this one lands.
+const ticketAssistantRouter = require('./routes/ticketAssistant');
+app.use('/api/ticket-assistant', requireBetaFeature('itil_ticket_assistant'), ticketAssistantRouter);
+app.use('/api/email-kb',        requireBetaFeature('itil_ticket_assistant'), ticketAssistantRouter);
 app.use('/api/browser-agent', require('./routes/browserAgent'));
 app.use('/api/pat', require('./routes/personalAccessTokens'));
 
@@ -387,12 +393,12 @@ app.listen(PORT, '0.0.0.0', () => {
     } catch (err) {
         console.warn('[Server] AI Task runner load failed:', err.message);
     }
-    // Email KB sync engine (beta — polling-based background sync)
+    // Ticket Assistant sync engine (beta — polling-based background sync)
     try {
-        const { startEmailKBSync } = require('./services/emailKBSyncEngine');
-        startEmailKBSync();
+        const { startTicketAssistantSync } = require('./services/ticketAssistantSyncEngine');
+        startTicketAssistantSync();
     } catch (err) {
-        console.warn('[Server] Email KB sync engine load failed:', err.message);
+        console.warn('[Server] Ticket Assistant sync engine load failed:', err.message);
     }
     // Purge orphaned KB chunks (non-blocking, delayed to let DB pool warm up)
     setTimeout(() => {

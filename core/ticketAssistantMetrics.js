@@ -1,16 +1,16 @@
 /**
- * Email KB metrics — lightweight in-memory counters and histograms.
+ * Ticket Assistant metrics — lightweight in-memory counters and histograms.
  *
  * No external dependency (prom-client is not installed). If/when it is,
  * swap the internals behind the same public API without changing callers.
  *
  * Metrics exposed:
- *   - email_kb_emails_ingested_total        { provider, connectionId }
- *   - email_kb_emails_skipped_total         { provider, connectionId, reason }
- *   - email_kb_emails_failed_total          { provider, connectionId, stage }
- *   - email_kb_api_retries_total            { provider, code }
- *   - email_kb_sync_duration_seconds_sum    { provider }
- *   - email_kb_sync_duration_seconds_count  { provider }
+ *   - ticket_assistant_items_ingested_total        { provider, connectionId }
+ *   - ticket_assistant_items_skipped_total         { provider, connectionId, reason }
+ *   - ticket_assistant_items_failed_total          { provider, connectionId, stage }
+ *   - ticket_assistant_api_retries_total           { provider, code }
+ *   - ticket_assistant_sync_duration_seconds_sum   { provider }
+ *   - ticket_assistant_sync_duration_seconds_count { provider }
  *
  * Cost attribution is piggybacked via `recordCost(connectionId, usd)` —
  * sums into per-connection rolling 30-day totals so the UI can show
@@ -67,14 +67,14 @@ function renderTextFormat() {
         lines.push(`${name}${labelFmt} ${value}`);
     }
     for (const [provider, sum] of durationSum) {
-        lines.push(`email_kb_sync_duration_seconds_sum{provider="${provider}"} ${sum}`);
+        lines.push(`ticket_assistant_sync_duration_seconds_sum{provider="${provider}"} ${sum}`);
     }
     for (const [provider, count] of durationCount) {
-        lines.push(`email_kb_sync_duration_seconds_count{provider="${provider}"} ${count}`);
+        lines.push(`ticket_assistant_sync_duration_seconds_count{provider="${provider}"} ${count}`);
     }
     for (const [connectionId, arr] of connectionCost) {
         const total = arr.reduce((s, e) => s + e.usd, 0);
-        lines.push(`email_kb_cost_usd_total{connectionId="${connectionId}"} ${total}`);
+        lines.push(`ticket_assistant_cost_usd_total{connectionId="${connectionId}"} ${total}`);
     }
     return lines.join('\n');
 }

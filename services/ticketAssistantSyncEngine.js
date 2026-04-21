@@ -1,19 +1,20 @@
 /**
- * Email KB Sync Engine — Background polling service
+ * Ticket Assistant Sync Engine — Background polling service
  *
- * Periodically syncs connected email mailboxes, processes new emails
- * through the AI pipeline, and ingests them into the knowledge base.
+ * Periodically syncs connected ticket sources (gmail, outlook, jira,
+ * servicenow, zendesk, freshservice, topdesk), processes new items through
+ * the AI pipeline, and ingests them into the knowledge base.
  *
  * Architecture:
  *   - Cron tick every 5 minutes
  *   - Picks connections where sync is due (based on sync_interval_minutes)
  *   - Max 3 concurrent syncs to avoid AI pipeline overload
- *   - Uses existing Gmail/Outlook tooling for email access
+ *   - Uses existing provider tooling (Gmail/Outlook/ticket-provider modules)
  *   - Uses existing KB ingestion pipeline for storage
  */
 
 const EventEmitter = require('events');
-const emailKBStore = require('../stores/emailKBStore');
+const ticketAssistantStore = require('../stores/ticketAssistantStore');
 const {
     processEmail,
     processEmailThread,
@@ -25,10 +26,10 @@ const {
     summarizeAndCategorizeBatch,
     cleanEmail,
     redactPIIWithCounts,
-} = require('../core/emailKBProcessor');
+} = require('../core/ticketAssistantProcessor');
 const { ingestDocument, findDocumentBySourceUri, deleteDocumentChunks } = require('../core/kbIngestionHelpers');
-const { extractGmailAttachments, extractOutlookAttachments, formatAttachmentsMarkdown } = require('../core/emailKBAttachments');
-const metrics = require('../core/emailKBMetrics');
+const { extractGmailAttachments, extractOutlookAttachments, formatAttachmentsMarkdown } = require('../core/ticketAssistantAttachments');
+const metrics = require('../core/ticketAssistantMetrics');
 
 const { run } = require('../db');
 
@@ -127,7 +128,7 @@ function buildMergeOptions(connection) {
  *
  * `batch_size` is opt-in (default 1 = one email per LLM call). When > 1,
  * multiple emails are sent in a single fused prompt — see
- * summarizeAndCategorizeBatch in emailKBProcessor.js.
+ * summarizeAndCategorizeBatch in ticketAssistantProcessor.js.
  */
 function resolveParallelism(connection) {
     const art = connection.pipeline_config?.article || {};
@@ -151,7 +152,7 @@ function getIngestionMode(connection) {
     if (mode === 'per_email' || mode === 'category_merge') return mode;
     // Older connections without the key fall back to legacy behaviour so we
     // don't silently rewrite their KB on next sync. New connections should set
-    // pipeline_config.ingestion_mode = 'per_email' via emailKBStore defaults.
+    // pipeline_config.ingestion_mode = 'per_email' via ticketAssistantStore defaults.
     return 'category_merge';
 }
 
@@ -225,9 +226,9 @@ function recordOutcome(results, bucket, detail = {}) {
         // Metrics counters (labels kept low-cardinality on purpose).
         const provider = results.__provider || 'unknown';
         const labels = { provider, connectionId: results.__connectionId };
-        if (bucket === 'ingested') metrics.inc('email_kb_emails_ingested_total', labels);
-        else if (bucket === 'skipped') metrics.inc('email_kb_emails_skipped_total', { ...labels, reason: detail.reason || 'unknown' });
-        else if (bucket === 'failed') metrics.inc('email_kb_emails_failed_total', { ...labels, stage: detail.stage || 'unknown' });
+        if (bucket === 'ingested') metrics.inc('ticket_assistant_items_ingested_total', labels);
+        else if (bucket === 'skipped') metrics.inc('ticket_assistant_items_skipped_total', { ...labels, reason: detail.reason || 'unknown' });
+        else if (bucket === 'failed') metrics.inc('ticket_assistant_items_failed_total', { ...labels, stage: detail.stage || 'unknown' });
     }
 }
 
@@ -255,14 +256,14 @@ async function withRetry(fn, label = 'operation') {
                 const expo = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * Math.pow(2, rateAttempts));
                 const jitter = Math.floor(Math.random() * 250);
                 const delay = (hinted ?? expo) + jitter;
-                console.warn(`[EmailKBSync] 429 on ${label} — backing off ${delay}ms (attempt ${rateAttempts + 1}/${MAX_429_RETRIES})`);
+                console.warn(`[TicketAssistantSync] 429 on ${label} — backing off ${delay}ms (attempt ${rateAttempts + 1}/${MAX_429_RETRIES})`);
                 await new Promise(r => setTimeout(r, delay));
                 rateAttempts++;
                 continue;
             }
             // Generic transient: keep the original linear backoff and budget.
             if (genericAttempts >= MAX_RETRIES) throw err;
-            console.warn(`[EmailKBSync] Retrying ${label} (attempt ${genericAttempts + 2}/${MAX_RETRIES + 1}): ${err.message}`);
+            console.warn(`[TicketAssistantSync] Retrying ${label} (attempt ${genericAttempts + 2}/${MAX_RETRIES + 1}): ${err.message}`);
             await new Promise(r => setTimeout(r, RETRY_DELAY_MS * (genericAttempts + 1)));
             genericAttempts++;
         }
@@ -284,7 +285,7 @@ async function syncGmailConnection(connection) {
         throw new Error('Google OAuth not configured');
     }
 
-    const tokens = emailKBStore.decryptTokens(connection.encrypted_tokens);
+    const tokens = ticketAssistantStore.decryptTokens(connection.encrypted_tokens);
     if (!tokens || !tokens.accessToken) {
         throw new Error('No valid OAuth tokens — connection needs to be re-authenticated');
     }
@@ -304,7 +305,7 @@ async function syncGmailConnection(connection) {
         const updated = { ...tokens };
         if (newTokens.access_token) updated.accessToken = newTokens.access_token;
         if (newTokens.refresh_token) updated.refreshToken = newTokens.refresh_token;
-        await emailKBStore.updateTokens(connection.id, updated);
+        await ticketAssistantStore.updateTokens(connection.id, updated);
     });
 
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
@@ -330,7 +331,7 @@ async function syncGmailConnection(connection) {
     const labelFilters = rawFilters.map(f => GMAIL_LABEL_MAP[f.toLowerCase()] || f);
 
     const query = `after:${afterDate}`;
-    console.log(`[EmailKBSync] Gmail query: "${query}" labels: ${labelFilters.join(', ')}`);
+    console.log(`[TicketAssistantSync] Gmail query: "${query}" labels: ${labelFilters.join(', ')}`);
 
     // P3.1: prefer Gmail History API when we have a stored historyId.
     // It returns messageAdded events since that point — more reliable than
@@ -357,13 +358,13 @@ async function syncGmailConnection(connection) {
             }
             newHistoryId = historyRes.data.historyId || connection.gmail_history_id;
             syncMode = 'history';
-            console.log(`[EmailKBSync] Gmail history API: ${messageIds.length} new messages (mode=${syncMode})`);
+            console.log(`[TicketAssistantSync] Gmail history API: ${messageIds.length} new messages (mode=${syncMode})`);
         } catch (err) {
             const status = err.status || err.code || err.response?.status;
             if (status === 404) {
-                console.warn('[EmailKBSync] Gmail historyId too old, falling back to date cursor');
+                console.warn('[TicketAssistantSync] Gmail historyId too old, falling back to date cursor');
             } else {
-                console.warn(`[EmailKBSync] Gmail history API error (${status}): ${err.message}`);
+                console.warn(`[TicketAssistantSync] Gmail history API error (${status}): ${err.message}`);
             }
             // Fall through to date-cursor path.
         }
@@ -377,7 +378,7 @@ async function syncGmailConnection(connection) {
             maxResults: connection.max_emails_per_sync || MAX_EMAILS_PER_SYNC,
         });
         messageIds = response.data.messages || [];
-        console.log(`[EmailKBSync] Gmail: ${messageIds.length} messages found (mode=${syncMode})`);
+        console.log(`[TicketAssistantSync] Gmail: ${messageIds.length} messages found (mode=${syncMode})`);
 
         // Capture a fresh historyId for the next tick. Prefer /profile — it
         // returns the current historyId at the mailbox level regardless of
@@ -386,12 +387,12 @@ async function syncGmailConnection(connection) {
             const profile = await gmail.users.getProfile({ userId: 'me' });
             newHistoryId = profile.data.historyId || null;
         } catch (err) {
-            console.warn('[EmailKBSync] Gmail getProfile failed:', err.message);
+            console.warn('[TicketAssistantSync] Gmail getProfile failed:', err.message);
         }
     }
 
     if (newHistoryId && newHistoryId !== connection.gmail_history_id) {
-        await emailKBStore.updateIncrementalCursor(connection.id, { gmailHistoryId: newHistoryId }).catch(() => {});
+        await ticketAssistantStore.updateIncrementalCursor(connection.id, { gmailHistoryId: newHistoryId }).catch(() => {});
     }
 
     const results = { fetched: messageIds.length, created: 0, skipped: 0, errors: 0, errorDetails: [], newestDate: null, processedArticles: [], outcomes: createOutcomes(), __connectionId: connection.id, __provider: 'gmail' };
@@ -456,7 +457,7 @@ async function syncGmailConnection(connection) {
                 if (!processed.success) {
                     results.skipped++;
                     const skipLabel = processed.reason || 'unknown';
-                    console.log(`[EmailKBSync] Skipped: ${skipLabel}`);
+                    console.log(`[TicketAssistantSync] Skipped: ${skipLabel}`);
                     results.errorDetails.push(`Skipped: ${skipLabel}`);
                     recordOutcome(results, 'skipped', { reason: skipLabel, threadId, subject: thread.subject });
                     continue;
@@ -500,7 +501,7 @@ async function syncGmailConnection(connection) {
                     const attachmentText = formatAttachmentsMarkdown(attachments);
                     if (attachmentText) body = body + attachmentText;
                 } catch (err) {
-                    console.warn(`[EmailKBSync] Gmail attachment extraction failed for ${msg.id}: ${err.message}`);
+                    console.warn(`[TicketAssistantSync] Gmail attachment extraction failed for ${msg.id}: ${err.message}`);
                 }
             }
 
@@ -587,7 +588,7 @@ async function syncGmailConnection(connection) {
 
         let settled;
         if (useBatch) {
-            console.log(`[EmailKBSync] Gmail batch mode: batch_size=${batchSize}, concurrency=${concurrency}, ${messageIds.length} msgs`);
+            console.log(`[TicketAssistantSync] Gmail batch mode: batch_size=${batchSize}, concurrency=${concurrency}, ${messageIds.length} msgs`);
             const chunks = [];
             for (let i = 0; i < messageIds.length; i += batchSize) chunks.push(messageIds.slice(i, i + batchSize));
             const settledChunks = await parallelMap(chunks, concurrency, perChunk, () => rateLimited);
@@ -685,7 +686,7 @@ async function syncOutlookConnection(connection) {
         throw new Error('Microsoft OAuth not configured');
     }
 
-    const tokens = emailKBStore.decryptTokens(connection.encrypted_tokens);
+    const tokens = ticketAssistantStore.decryptTokens(connection.encrypted_tokens);
     if (!tokens || !tokens.accessToken) {
         throw new Error('No valid OAuth tokens — connection needs to be re-authenticated');
     }
@@ -728,7 +729,7 @@ async function syncOutlookConnection(connection) {
                 const tokenData = await tokenResp.json();
                 tokens.accessToken = tokenData.access_token;
                 if (tokenData.refresh_token) tokens.refreshToken = tokenData.refresh_token;
-                await emailKBStore.updateTokens(connection.id, tokens);
+                await ticketAssistantStore.updateTokens(connection.id, tokens);
                 response = await doFetch(tokens.accessToken);
             } else {
                 throw new Error('Token refresh failed — connection needs re-authentication');
@@ -759,7 +760,7 @@ async function syncOutlookConnection(connection) {
     const maxEmails = connection.max_emails_per_sync || MAX_EMAILS_PER_SYNC;
     const selectFields = 'id,subject,from,toRecipients,receivedDateTime,body,conversationId,bodyPreview';
 
-    console.log(`[EmailKBSync] Outlook filter: "${filter}" folders: ${outlookFolders.join(', ')}`);
+    console.log(`[TicketAssistantSync] Outlook filter: "${filter}" folders: ${outlookFolders.join(', ')}`);
 
     // P3.1: prefer /me/mailFolders('inbox')/messages/delta with stored deltaLink.
     // Graph returns changes since the link was issued; fall back to $filter on
@@ -798,9 +799,9 @@ async function syncOutlookConnection(connection) {
             allMessages = result.messages;
             newDeltaLink = result.deltaLink || connection.graph_delta_link;
             outlookSyncMode = 'delta';
-            console.log(`[EmailKBSync] Outlook delta: ${allMessages.length} changes (mode=${outlookSyncMode})`);
+            console.log(`[TicketAssistantSync] Outlook delta: ${allMessages.length} changes (mode=${outlookSyncMode})`);
         } catch (err) {
-            console.warn(`[EmailKBSync] Outlook delta query failed (${err.code || ''}): ${err.message} — falling back to date`);
+            console.warn(`[TicketAssistantSync] Outlook delta query failed (${err.code || ''}): ${err.message} — falling back to date`);
         }
     }
 
@@ -814,7 +815,7 @@ async function syncOutlookConnection(connection) {
                 );
                 allMessages.push(...(data.value || []));
             } catch (folderErr) {
-                console.warn(`[EmailKBSync] Outlook folder "${folder}" failed: ${folderErr.message}`);
+                console.warn(`[TicketAssistantSync] Outlook folder "${folder}" failed: ${folderErr.message}`);
                 // Fallback: try without folder path (searches all mail)
                 if (outlookFolders.length === 1) {
                     const data = await graphCall(
@@ -833,12 +834,12 @@ async function syncOutlookConnection(connection) {
             );
             newDeltaLink = seedData['@odata.deltaLink'] || null;
         } catch (err) {
-            console.warn('[EmailKBSync] Outlook delta seed failed:', err.message);
+            console.warn('[TicketAssistantSync] Outlook delta seed failed:', err.message);
         }
     }
 
     if (newDeltaLink && newDeltaLink !== connection.graph_delta_link) {
-        await emailKBStore.updateIncrementalCursor(connection.id, { graphDeltaLink: newDeltaLink }).catch(() => {});
+        await ticketAssistantStore.updateIncrementalCursor(connection.id, { graphDeltaLink: newDeltaLink }).catch(() => {});
     }
 
     // Deduplicate by message ID (same message could appear in multiple folder views)
@@ -849,7 +850,7 @@ async function syncOutlookConnection(connection) {
         return true;
     }).slice(0, maxEmails);
 
-    console.log(`[EmailKBSync] Outlook: ${messages.length} messages found`);
+    console.log(`[TicketAssistantSync] Outlook: ${messages.length} messages found`);
 
     const results = { fetched: messages.length, created: 0, skipped: 0, errors: 0, errorDetails: [], newestDate: null, processedArticles: [], outcomes: createOutcomes(), __connectionId: connection.id, __provider: 'outlook' };
     emitSyncEvent(connection.id, 'sync_fetch_complete', { total: messages.length, provider: 'outlook' });
@@ -895,7 +896,7 @@ async function syncOutlookConnection(connection) {
                 if (!processed.success) {
                     results.skipped++;
                     const skipLabel = processed.reason || 'unknown';
-                    console.log(`[EmailKBSync] Skipped: ${skipLabel}`);
+                    console.log(`[TicketAssistantSync] Skipped: ${skipLabel}`);
                     results.errorDetails.push(`Skipped: ${skipLabel}`);
                     recordOutcome(results, 'skipped', { reason: skipLabel, threadId: convId, subject: thread.subject });
                     continue;
@@ -951,7 +952,7 @@ async function syncOutlookConnection(connection) {
                     const md = formatAttachmentsMarkdown(attachments);
                     if (md) body = body + md;
                 } catch (err) {
-                    console.warn(`[EmailKBSync] Outlook attachment extraction failed for ${msg.id}: ${err.message}`);
+                    console.warn(`[TicketAssistantSync] Outlook attachment extraction failed for ${msg.id}: ${err.message}`);
                 }
             }
             metadata.hasAttachments = attachments.some(a => a.kind !== 'skipped');
@@ -1019,7 +1020,7 @@ async function syncOutlookConnection(connection) {
 
         let settled;
         if (useBatch) {
-            console.log(`[EmailKBSync] Outlook batch mode: batch_size=${batchSize}, concurrency=${concurrency}, ${messages.length} msgs`);
+            console.log(`[TicketAssistantSync] Outlook batch mode: batch_size=${batchSize}, concurrency=${concurrency}, ${messages.length} msgs`);
             const chunks = [];
             for (let i = 0; i < messages.length; i += batchSize) chunks.push(messages.slice(i, i + batchSize));
             const settledChunks = await parallelMap(chunks, concurrency, perChunk, () => rateLimited);
@@ -1063,22 +1064,198 @@ async function syncOutlookConnection(connection) {
 }
 
 // ──────────────────────────────────────────────
+// Ticket-provider Sync (jira, freshservice, topdesk, zendesk, servicenow)
+//
+// These providers all live behind the TicketSourceProvider interface in
+// server/core/ticketProviders/. This function drives the shared contract and
+// hands normalized tickets to the same AI pipeline + KB ingestion code path
+// used by email providers.
+// ──────────────────────────────────────────────
+
+function assembleTicketMarkdown(normalized) {
+    const lines = [];
+    if (normalized.subject) lines.push(`# ${normalized.subject}`, '');
+    if (normalized.body_markdown) lines.push('## Description', normalized.body_markdown, '');
+    if (Array.isArray(normalized.comments) && normalized.comments.length) {
+        lines.push('## Comments');
+        for (const c of normalized.comments) {
+            const who = c.author_role || 'user';
+            const when = c.at || '';
+            lines.push(`### ${when} — ${who}`);
+            lines.push(c.body_markdown || '');
+            lines.push('');
+        }
+    }
+    if (normalized.resolution?.body_markdown) {
+        lines.push('## Resolution', normalized.resolution.body_markdown, '');
+    }
+    return lines.join('\n').trim();
+}
+
+async function syncTicketProviderConnection(connection, provider) {
+    const { processEmail } = require('../core/ticketAssistantProcessor');
+    const results = {
+        fetched: 0,
+        created: 0,
+        skipped: 0,
+        errors: 0,
+        errorDetails: [],
+        newestDate: null,
+        processedArticles: [],
+        outcomes: createOutcomes(),
+        __connectionId: connection.id,
+        __provider: connection.provider,
+    };
+
+    // Credential health-check (no-op for API token / basic providers)
+    const fresh = await provider.ensureFreshTokens(connection);
+    if (!fresh || !fresh.ok) {
+        const msg = fresh?.needsReauth ? 'Credentials rejected — please update' : 'Provider auth failed';
+        results.errors += 1;
+        results.errorDetails.push(msg);
+        return results;
+    }
+
+    // Iterate items from the provider's paginated list
+    const maxItems = Math.min(500, connection.max_emails_per_sync || 50);
+    const sinceIso = connection.sync_after_date
+        ? new Date(connection.sync_after_date).toISOString()
+        : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    let latestUpdate = null;
+    let zendeskAfterCursor;
+    let zendeskEndOfStream;
+
+    try {
+        for await (const raw of provider.listTickets(connection, { since: sinceIso, max: maxItems })) {
+            results.fetched += 1;
+            let comments = [];
+            let attachments = [];
+            try {
+                // Jira + Freshservice often embed comments in the list payload — the
+                // providers still expose fetchComments, but calling it is cheap when
+                // the embedded list is truncated and skipped when it isn't. For v1
+                // we always call it to keep the code simple.
+                comments = await provider.fetchComments(connection, raw.id || raw.key || raw.sys_id || raw.number);
+            } catch (err) {
+                results.errorDetails.push(`Comments fetch failed: ${err.message}`);
+            }
+            try {
+                if (connection.process_attachments !== false) {
+                    attachments = await provider.fetchAttachments(connection, raw.id || raw.key || raw.sys_id || raw.number);
+                }
+            } catch (err) {
+                results.errorDetails.push(`Attachments fetch failed: ${err.message}`);
+            }
+
+            const normalized = provider.normalize(raw, comments, attachments);
+            if (normalized.updated_at && (!latestUpdate || normalized.updated_at > latestUpdate)) {
+                latestUpdate = normalized.updated_at;
+            }
+            // Zendesk-specific: capture cursor for next tick
+            if (connection.provider === 'zendesk' && raw.generated_timestamp) {
+                zendeskAfterCursor = raw.generated_timestamp;
+            }
+
+            const rawContent = assembleTicketMarkdown(normalized);
+            if (!rawContent || rawContent.length < 20) {
+                results.skipped += 1;
+                recordOutcome(results, 'skipped', { reason: 'empty_after_assembly', subject: normalized.subject });
+                continue;
+            }
+
+            try {
+                const processed = await processEmail(rawContent, {
+                    subject: normalized.subject,
+                    date: normalized.updated_at,
+                    messageId: `${connection.provider}:${normalized.source_id}`,
+                    from: normalized.raw_meta?.requester_id || normalized.raw_meta?.opened_by || '',
+                }, buildProcessOptions(connection));
+
+                if (!processed.success) {
+                    results.skipped += 1;
+                    recordOutcome(results, 'skipped', { reason: processed.reason || 'unknown', subject: normalized.subject });
+                    continue;
+                }
+
+                // Attach ticket-aware metadata so the KB document carries full provenance.
+                processed.sourceMessageId = `${connection.provider}:${normalized.source_id}`;
+                processed.emailMetadata = {
+                    ...(processed.emailMetadata || {}),
+                    source_type: 'ticket',
+                    source_system: normalized.source_system,
+                    source_id: normalized.source_id,
+                    source_uri: normalized.source_uri,
+                    project_key: normalized.project_key,
+                    itil_type: normalized.itil_type,
+                    priority: normalized.priority,
+                    status: normalized.status,
+                    status_bucket: normalized.status_bucket,
+                    category: normalized.category || processed.category,
+                    tags: normalized.tags || [],
+                    resolved_at: normalized.resolved_at,
+                    created_at: normalized.created_at,
+                    updated_at: normalized.updated_at,
+                };
+                results.processedArticles.push(processed);
+                results.created += 1;
+            } catch (procErr) {
+                results.errors += 1;
+                results.errorDetails.push(`Ticket ${normalized.source_id}: ${procErr.message}`);
+                recordOutcome(results, 'failed', { stage: 'process', error: procErr.message, subject: normalized.subject });
+            }
+        }
+    } catch (err) {
+        // Fatal — likely auth or base-URL misconfig. Mark connection as errored via
+        // the existing error path by throwing back up to the orchestrator.
+        results.errors += 1;
+        results.errorDetails.push(`List/fetch failed: ${err.message}`);
+        if (err.needsReauth) throw err;
+    }
+
+    // Update provider_cursor for next tick
+    try {
+        const newCursor = {};
+        if (connection.provider === 'zendesk') {
+            if (zendeskAfterCursor) newCursor.afterCursor = null; // after_cursor read from response; tracked in engine if needed
+            if (latestUpdate) newCursor.startTime = Math.floor(new Date(latestUpdate).getTime() / 1000) + 1;
+        } else if (connection.provider === 'jira' && latestUpdate) {
+            newCursor.updatedFrom = latestUpdate;
+        } else if (connection.provider === 'freshservice' && latestUpdate) {
+            newCursor.updatedSince = latestUpdate;
+        } else if (connection.provider === 'topdesk' && latestUpdate) {
+            newCursor.modificationDateStart = latestUpdate;
+        } else if (connection.provider === 'servicenow' && latestUpdate) {
+            // SNow uses "YYYY-MM-DD HH:mm:ss" not ISO
+            newCursor.sysUpdatedOn = latestUpdate.replace('T', ' ').replace(/\..*$/, '').replace('Z', '');
+        }
+        if (Object.keys(newCursor).length > 0) {
+            await ticketAssistantStore.updateIncrementalCursor(connection.id, { providerCursor: newCursor });
+        }
+    } catch (e) {
+        console.warn('[TicketAssistantSync] Provider cursor update failed:', e.message);
+    }
+
+    return results;
+}
+
+// ──────────────────────────────────────────────
 // Sync Orchestrator
 // ──────────────────────────────────────────────
 
 async function syncConnection(connection) {
     // Acquire sync lock first — prevents concurrent tick + manual sync from racing
     // on the same connection. TTL is a safety net in case the process crashes.
-    const lock = await emailKBStore.acquireSyncLock(connection.id, SYNC_TIMEOUT_MINUTES);
+    const lock = await ticketAssistantStore.acquireSyncLock(connection.id, SYNC_TIMEOUT_MINUTES);
     if (!lock.acquired) {
-        console.log(`[EmailKBSync] Skipping ${connection.email_address} — lock held (retry in ${lock.retryAfterSeconds}s)`);
+        console.log(`[TicketAssistantSync] Skipping ${connection.email_address} — lock held (retry in ${lock.retryAfterSeconds}s)`);
         return { skipped: true, reason: 'locked', retryAfterSeconds: lock.retryAfterSeconds };
     }
 
-    const log = await emailKBStore.createSyncLog(connection.id);
+    const log = await ticketAssistantStore.createSyncLog(connection.id);
     const syncStartedAt = Date.now();
 
-    await emailKBStore.updateSyncState(connection.id, { syncStatus: 'syncing', syncError: null });
+    await ticketAssistantStore.updateSyncState(connection.id, { syncStatus: 'syncing', syncError: null });
 
     emitSyncEvent(connection.id, 'sync_started', {
         connectionId: connection.id,
@@ -1089,11 +1266,17 @@ async function syncConnection(connection) {
 
     let results;
     try {
-        // Phase 1: Fetch + process individual emails (get article + category per email)
+        // Phase 1: Fetch + process individual items (get article + category per item).
+        // Email providers take the legacy specialised path; ticket providers
+        // (jira, freshservice, topdesk, zendesk, servicenow) go through the
+        // shared provider abstraction in ticketProviders/ + processNormalizedTickets.
+        const ticketProviders = require('../core/ticketProviders');
         if (connection.provider === 'gmail') {
             results = await syncGmailConnection(connection);
         } else if (connection.provider === 'outlook') {
             results = await syncOutlookConnection(connection);
+        } else if (ticketProviders.isTicketProvider(connection.provider)) {
+            results = await syncTicketProviderConnection(connection, ticketProviders.getProvider(connection.provider));
         } else {
             throw new Error(`Unknown provider: ${connection.provider}`);
         }
@@ -1107,7 +1290,7 @@ async function syncConnection(connection) {
         let categoryDocsCreated = 0;
 
         if (processedArticles.length > 0 && ingestionMode === 'per_email') {
-            console.log(`[EmailKBSync] Phase 2: Ingesting ${processedArticles.length} per-email articles (skip-if-exists)...`);
+            console.log(`[TicketAssistantSync] Phase 2: Ingesting ${processedArticles.length} per-email articles (skip-if-exists)...`);
 
             for (const processed of processedArticles) {
                 try {
@@ -1118,17 +1301,47 @@ async function syncConnection(connection) {
                         recordOutcome(results, 'skipped', { reason: 'missing_message_id', subject: processed.title });
                         continue;
                     }
-                    const sourceUri = `email-kb://message/${encodeURIComponent(messageId)}`;
+                    const em = processed.emailMetadata || {};
+                    // Ticket-sourced docs: prefer the canonical provider browse URL as
+                    // source_uri so dedup works across mailboxes and an updated ticket
+                    // re-ingests (deletes + re-creates) instead of duplicating.
+                    // Email-sourced docs keep the synthetic email-kb:// URI so existing
+                    // ingested rows continue to dedupe correctly.
+                    const isTicket = em.source_type === 'ticket';
+                    const sourceUri = isTicket && em.source_uri
+                        ? em.source_uri
+                        : `email-kb://message/${encodeURIComponent(messageId)}`;
 
                     const existing = await findDocumentBySourceUri(connection.knowledge_base_id, sourceUri);
                     if (existing) {
-                        results.skipped++;
-                        recordOutcome(results, 'skipped', { reason: 'already_ingested', messageId, subject: processed.title });
-                        continue; // Already ingested — per-email archive is append-only.
+                        if (isTicket) {
+                            // Tickets evolve (new comments, resolution) — refresh the doc.
+                            await deleteDocumentChunks(existing.id).catch(() => {});
+                        } else {
+                            results.skipped++;
+                            recordOutcome(results, 'skipped', { reason: 'already_ingested', messageId, subject: processed.title });
+                            continue; // Per-email archive is append-only.
+                        }
                     }
 
-                    const em = processed.emailMetadata || {};
-                    const docMetadata = {
+                    const docMetadata = isTicket ? {
+                        connectionId: connection.id,
+                        provider: connection.provider,
+                        source_type: em.source_type,
+                        source_system: em.source_system,
+                        source_id: em.source_id,
+                        source_uri: em.source_uri,
+                        project_key: em.project_key || null,
+                        itil_type: em.itil_type || null,
+                        priority: em.priority || null,
+                        status: em.status || null,
+                        status_bucket: em.status_bucket || null,
+                        category: em.category || processed.category || null,
+                        tags: em.tags || [],
+                        resolved_at: em.resolved_at || null,
+                        created_at: em.created_at || null,
+                        updated_at: em.updated_at || null,
+                    } : {
                         connectionId: connection.id,
                         provider: connection.provider,
                         mailbox: connection.email_address,
@@ -1148,7 +1361,7 @@ async function syncConnection(connection) {
                         connection.knowledge_base_id,
                         processed.article,
                         processed.title,
-                        'email',
+                        isTicket ? 'ticket' : 'email',
                         sourceUri,
                         {
                             skipDedup: false,
@@ -1168,13 +1381,13 @@ async function syncConnection(connection) {
                     results.errors++;
                     results.errorDetails.push(`Ingest message ${processed.sourceMessageId}: ${ingestErr.message}`);
                     recordOutcome(results, 'failed', { messageId: processed.sourceMessageId, subject: processed.title, stage: 'ingest', error: ingestErr.message });
-                    console.error(`[EmailKBSync] ❌ Failed to ingest per-email doc:`, ingestErr.message);
+                    console.error(`[TicketAssistantSync] ❌ Failed to ingest per-email doc:`, ingestErr.message);
                 }
             }
 
-            console.log(`[EmailKBSync] Per-email ingest: ${categoryDocsCreated} new docs, ${results.skipped} already present`);
+            console.log(`[TicketAssistantSync] Per-email ingest: ${categoryDocsCreated} new docs, ${results.skipped} already present`);
         } else if (processedArticles.length > 0) {
-            console.log(`[EmailKBSync] Phase 2: Merging ${processedArticles.length} articles by category...`);
+            console.log(`[TicketAssistantSync] Phase 2: Merging ${processedArticles.length} articles by category...`);
 
             const mergeOpts = buildMergeOptions(connection);
             mergeOpts.onProgress = (event, data) => emitSyncEvent(connection.id, event, data);
@@ -1212,14 +1425,14 @@ async function syncConnection(connection) {
                     // New doc landed. Now swap: remove old canonical + rename temp.
                     const existing = await findDocumentBySourceUri(connection.knowledge_base_id, canonicalUri);
                     if (existing) {
-                        console.log(`[EmailKBSync] Swapping category doc "${category}" (${existing.id} → ${newDoc.id})`);
+                        console.log(`[TicketAssistantSync] Swapping category doc "${category}" (${existing.id} → ${newDoc.id})`);
                         await deleteDocumentChunks(connection.knowledge_base_id, existing.id, connection.created_by);
                     }
                     await kbStoreLocal.updateDocumentSourceUri(newDoc.id, canonicalUri);
 
                     categoryDocsCreated++;
                     recordOutcome(results, 'ingested', { category, sourceCount });
-                    console.log(`[EmailKBSync] ✅ Category "${category}" ingested (${sourceCount} emails merged)`);
+                    console.log(`[TicketAssistantSync] ✅ Category "${category}" ingested (${sourceCount} emails merged)`);
                 } catch (ingestErr) {
                     // Clean up the failed temp doc so it doesn't leave orphans.
                     if (newDoc) {
@@ -1230,12 +1443,12 @@ async function syncConnection(connection) {
                     results.errors++;
                     results.errorDetails.push(`Ingest category "${category}": ${ingestErr.message}`);
                     recordOutcome(results, 'failed', { category, stage: 'ingest', error: ingestErr.message });
-                    console.error(`[EmailKBSync] ❌ Failed to ingest category "${category}":`, ingestErr.message);
+                    console.error(`[TicketAssistantSync] ❌ Failed to ingest category "${category}":`, ingestErr.message);
                 }
             }
         }
 
-        await emailKBStore.updateSyncState(connection.id, {
+        await ticketAssistantStore.updateSyncState(connection.id, {
             syncStatus: 'idle',
             syncError: null,
             lastSyncAt: new Date().toISOString(),
@@ -1244,7 +1457,7 @@ async function syncConnection(connection) {
             articlesCreated: categoryDocsCreated,
         });
 
-        await emailKBStore.completeSyncLog(log.id, {
+        await ticketAssistantStore.completeSyncLog(log.id, {
             emailsFetched: results.fetched,
             articlesCreated: categoryDocsCreated,
             articlesSkipped: results.skipped,
@@ -1264,12 +1477,12 @@ async function syncConnection(connection) {
             outcomes: results.outcomes,
         });
 
-        console.log(`[EmailKBSync] ✅ ${connection.provider} ${connection.email_address}: ${processedArticles.length} emails → ${categoryDocsCreated} category docs, ${results.skipped} skipped, ${results.errors} errors`);
+        console.log(`[TicketAssistantSync] ✅ ${connection.provider} ${connection.email_address}: ${processedArticles.length} emails → ${categoryDocsCreated} category docs, ${results.skipped} skipped, ${results.errors} errors`);
 
     } catch (err) {
-        console.error(`[EmailKBSync] ❌ ${connection.provider} ${connection.email_address}:`, err.message);
+        console.error(`[TicketAssistantSync] ❌ ${connection.provider} ${connection.email_address}:`, err.message);
 
-        await emailKBStore.updateSyncState(connection.id, {
+        await ticketAssistantStore.updateSyncState(connection.id, {
             syncStatus: 'error',
             syncError: err.message,
             lastSyncAt: new Date().toISOString(),
@@ -1278,7 +1491,7 @@ async function syncConnection(connection) {
         const fatalOutcomes = results?.outcomes || createOutcomes();
         recordOutcome({ outcomes: fatalOutcomes }, 'failed', { stage: 'sync', error: err.message });
 
-        await emailKBStore.completeSyncLog(log.id, {
+        await ticketAssistantStore.completeSyncLog(log.id, {
             emailsFetched: results?.fetched || 0,
             articlesCreated: 0,
             articlesSkipped: results?.skipped || 0,
@@ -1301,8 +1514,8 @@ async function syncConnection(connection) {
     } finally {
         metrics.recordSyncDuration(connection.provider || 'unknown', (Date.now() - syncStartedAt) / 1000);
         // Release the sync lock so the next tick/manual sync can run.
-        await emailKBStore.releaseSyncLock(connection.id).catch((e) => {
-            console.warn('[EmailKBSync] Failed to release sync lock:', e.message);
+        await ticketAssistantStore.releaseSyncLock(connection.id).catch((e) => {
+            console.warn('[TicketAssistantSync] Failed to release sync lock:', e.message);
         });
     }
 }
@@ -1318,18 +1531,18 @@ async function tick() {
         // Recover stuck syncs (timeout protection)
         try {
             await run(
-                `UPDATE email_kb_connections
+                `UPDATE ticket_assistant_connections
                  SET sync_status = 'error', sync_error = 'Sync timed out', updated_at = now()
                  WHERE sync_status = 'syncing' AND updated_at < now() - interval '${SYNC_TIMEOUT_MINUTES} minutes'`
             );
         } catch (err) {
-            console.warn('[EmailKBSync] Timeout recovery query failed:', err.message);
+            console.warn('[TicketAssistantSync] Timeout recovery query failed:', err.message);
         }
 
-        const dueConnections = await emailKBStore.getDueConnections();
+        const dueConnections = await ticketAssistantStore.getDueConnections();
         if (dueConnections.length === 0) return;
 
-        console.log(`[EmailKBSync] ${dueConnections.length} connection(s) due for sync`);
+        console.log(`[TicketAssistantSync] ${dueConnections.length} connection(s) due for sync`);
 
         // Process in batches of MAX_CONCURRENT
         for (let i = 0; i < dueConnections.length; i += MAX_CONCURRENT) {
@@ -1337,7 +1550,7 @@ async function tick() {
             await Promise.allSettled(batch.map(conn => syncConnection(conn)));
         }
     } catch (err) {
-        console.error('[EmailKBSync] Tick error:', err.message);
+        console.error('[TicketAssistantSync] Tick error:', err.message);
     } finally {
         isRunning = false;
     }
@@ -1346,10 +1559,10 @@ async function tick() {
 /**
  * Start the background sync engine.
  */
-function startEmailKBSync() {
+function startTicketAssistantSync() {
     if (tickTimer) return;
 
-    console.log(`[EmailKBSync] Starting sync engine (interval: ${TICK_INTERVAL_MS / 1000}s)`);
+    console.log(`[TicketAssistantSync] Starting sync engine (interval: ${TICK_INTERVAL_MS / 1000}s)`);
 
     // Delay initial tick to let the server finish booting
     setTimeout(() => {
@@ -1361,11 +1574,11 @@ function startEmailKBSync() {
 /**
  * Stop the background sync engine.
  */
-function stopEmailKBSync() {
+function stopTicketAssistantSync() {
     if (tickTimer) {
         clearInterval(tickTimer);
         tickTimer = null;
-        console.log('[EmailKBSync] Sync engine stopped');
+        console.log('[TicketAssistantSync] Sync engine stopped');
     }
 }
 
@@ -1376,7 +1589,7 @@ function stopEmailKBSync() {
  * is already in-flight — callers (HTTP route) should map that to 409.
  */
 async function triggerManualSync(connectionId) {
-    const connection = await emailKBStore.getConnectionWithTokens(connectionId);
+    const connection = await ticketAssistantStore.getConnectionWithTokens(connectionId);
     if (!connection) {
         const err = new Error('Connection not found');
         err.status = 404;
@@ -1399,8 +1612,8 @@ async function triggerManualSync(connectionId) {
     }
 
     // Run sync without waiting
-    syncConnection({ ...connection, encrypted_tokens: emailKBStore.encryptTokens(connection.tokens) })
-        .catch(err => console.error(`[EmailKBSync] Manual sync error:`, err.message));
+    syncConnection({ ...connection, encrypted_tokens: ticketAssistantStore.encryptTokens(connection.tokens) })
+        .catch(err => console.error(`[TicketAssistantSync] Manual sync error:`, err.message));
 
     return { message: 'Sync started' };
 }
@@ -1410,7 +1623,7 @@ async function triggerManualSync(connectionId) {
  * Works regardless of enabled status — uses connection's folder/date settings.
  */
 async function testConnection(connectionId) {
-    const connection = await emailKBStore.getConnectionWithTokens(connectionId);
+    const connection = await ticketAssistantStore.getConnectionWithTokens(connectionId);
     if (!connection) throw new Error('Connection not found');
 
     let testEmail;
@@ -1523,7 +1736,7 @@ async function testConnection(connectionId) {
             };
         }
     } catch (err) {
-        console.warn('[EmailKBSync] PII diff failed for test:', err.message);
+        console.warn('[TicketAssistantSync] PII diff failed for test:', err.message);
     }
 
     // Attachment preview (Phase 3.3): list extracted attachment names + first 500 chars.
@@ -1544,7 +1757,7 @@ async function testConnection(connectionId) {
             }
         }
     } catch (err) {
-        console.warn('[EmailKBSync] Attachment preview failed:', err.message);
+        console.warn('[TicketAssistantSync] Attachment preview failed:', err.message);
     }
 
     return {
@@ -1558,8 +1771,11 @@ async function testConnection(connectionId) {
 }
 
 module.exports = {
-    startEmailKBSync,
-    stopEmailKBSync,
+    startTicketAssistantSync,
+    stopTicketAssistantSync,
+    // Legacy aliases — retained for 1 release so external callers don't break.
+    startEmailKBSync: startTicketAssistantSync,
+    stopEmailKBSync: stopTicketAssistantSync,
     triggerManualSync,
     testConnection,
     subscribeSyncEvents,

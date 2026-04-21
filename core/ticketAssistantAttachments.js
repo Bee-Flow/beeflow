@@ -1,7 +1,8 @@
 /**
- * Email KB attachment extractor — walks Gmail / Microsoft Graph message
- * payloads, pulls attachment bytes, and delegates to the shared
- * attachmentExtractor to turn PDF/DOCX/XLSX bytes into text.
+ * Ticket Assistant attachment extractor — walks Gmail / Microsoft Graph
+ * message payloads (plus ticket-provider attachment payloads), pulls
+ * attachment bytes, and delegates to the shared attachmentExtractor to turn
+ * PDF/DOCX/XLSX bytes into text.
  *
  * Filters applied (from pipeline_config.attachments):
  *   - enabled (default true)

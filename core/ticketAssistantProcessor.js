@@ -1,12 +1,12 @@
 /**
- * Email KB Processor — Three-stage email-to-KB-article pipeline
+ * Ticket Assistant Processor — Multi-stage ticket/email-to-KB-article pipeline
  *
  * Ported from n8n workflows:
  *   1.3 "Get Ticket Message"  → Stage 1 (HTML cleanup) + Stage 2 (PII redaction)
  *   1.1 "Ticketlist to Summary" → Stage 3 (AI summarization + categorization)
  *
  * Pipeline:
- *   Raw email HTML/text → cleanEmail() → redactPII() → summarizeToArticle()
+ *   Raw source text (email or ticket) → cleanEmail() → redactPII() → summarizeToArticle()
  */
 
 // ──────────────────────────────────────────────
@@ -279,7 +279,11 @@ function redactPII(text, opts) {
  * Default system prompt for article generation.
  * Adapted from the n8n workflow (originally in Dutch, now auto-detects language).
  */
-const DEFAULT_ARTICLE_PROMPT = `You receive an email conversation (or a single email). Rewrite it into a comprehensive, clear knowledge base article in **Markdown**, without duplicate or overlapping content and without contact information in the output.
+const DEFAULT_ARTICLE_PROMPT = `You receive a support conversation — an email thread OR an ITSM ticket (with Description, Comments, and optionally a Resolution section). Rewrite it into a comprehensive, clear knowledge base article in **Markdown**, without duplicate or overlapping content and without contact information in the output.
+
+ITIL handling (hard):
+* If the input contains a "## Resolution" section (ticket with a known fix), the output MUST include an explicit "## Resolution" section with the actionable fix the helpdesk applied, AND a "## Root Cause" section if the cause is inferable from the source.
+* If no Resolution section is present, omit Resolution; include Root Cause only when clearly inferable — never speculate.
 
 Output rules (hard):
 * Return only the rewritten Markdown.
@@ -330,6 +334,8 @@ Fixed structure (only include what exists in the input or is logically needed wi
 
 ## Root Cause
 
+## Resolution
+
 ## Notes
 
 Task:
@@ -338,7 +344,7 @@ Task:
 * Remove duplicates and overlap.
 * Deliver only the final Markdown output.
 
-IMPORTANT: Detect the language of the email conversation and write the article in that SAME language.`;
+IMPORTANT: Detect the language of the conversation/ticket and write the article in that SAME language.`;
 
 const DEFAULT_CATEGORY_PROMPT = `The only thing you return is one ticket category (exactly one line), without any other detail.
 
@@ -379,21 +385,34 @@ async function resolveModel(tierName, orgId) {
     try {
         return await resolveModelForTierName(tierName, { userOrgId: orgId, fallback: 'gpt-4.1-mini' });
     } catch (resolveErr) {
-        console.warn(`[EmailKBProcessor] Model resolution failed for tier "${tierName}", using fallback:`, resolveErr.message);
+        console.warn(`[TicketAssistantProcessor] Model resolution failed for tier "${tierName}", using fallback:`, resolveErr.message);
         return 'gpt-4.1-mini';
     }
 }
 
 // Per-stage default tiers (overridable by explicit caller argument).
-async function getEmailKBTierConfig() {
+// Config key migrated from 'email_kb_tier_config' → 'ticket_assistant_tier_config';
+// first read migrates the legacy key in-place if present.
+async function getTicketAssistantTierConfig() {
     const configStore = require('../stores/configStore');
-    const cfg = (await configStore.getConfig('email_kb_tier_config')) || {};
+    let cfg = await configStore.getConfig('ticket_assistant_tier_config');
+    if (!cfg) {
+        const legacy = await configStore.getConfig('email_kb_tier_config');
+        if (legacy) {
+            await configStore.setConfig('ticket_assistant_tier_config', legacy);
+            try { await configStore.deleteConfig?.('email_kb_tier_config'); } catch (_) { /* ignore */ }
+            cfg = legacy;
+        }
+    }
+    cfg = cfg || {};
     return {
         article: typeof cfg.article === 'string' && cfg.article ? cfg.article : 'fast',
         category: typeof cfg.category === 'string' && cfg.category ? cfg.category : 'fast',
         merge: typeof cfg.merge === 'string' && cfg.merge ? cfg.merge : 'fast',
     };
 }
+// Legacy alias — retained for one release so older call sites keep working.
+const getEmailKBTierConfig = getTicketAssistantTierConfig;
 
 function appendLanguageInstruction(prompt, language) {
     if (!language) return prompt;
@@ -420,7 +439,7 @@ async function summarizeToArticle(cleanedText, options = {}) {
 
     try {
         const modelId = await resolveModel(modelTier, orgId);
-        console.log(`[EmailKBProcessor] Article stage: model=${modelId} tier=${modelTier}`);
+        console.log(`[TicketAssistantProcessor] Article stage: model=${modelId} tier=${modelTier}`);
 
         const { createChatCompletion } = require('../agents/providerAdapters');
 
@@ -445,7 +464,7 @@ async function summarizeToArticle(cleanedText, options = {}) {
         return { article: article.trim() };
 
     } catch (err) {
-        console.error('[EmailKBProcessor] AI summarization failed:', err.message);
+        console.error('[TicketAssistantProcessor] AI summarization failed:', err.message);
         return { article: null, reason: `AI error: ${err.message}` };
     }
 }
@@ -466,7 +485,7 @@ async function categorizeArticle(articleText, options = {}) {
 
     try {
         const modelId = await resolveModel(modelTier, orgId);
-        console.log(`[EmailKBProcessor] Category stage: model=${modelId} tier=${modelTier}`);
+        console.log(`[TicketAssistantProcessor] Category stage: model=${modelId} tier=${modelTier}`);
 
         const { createChatCompletion } = require('../agents/providerAdapters');
 
@@ -486,7 +505,7 @@ async function categorizeArticle(articleText, options = {}) {
             return rawCat;
         }
     } catch (catErr) {
-        console.warn('[EmailKBProcessor] Category classification failed:', catErr.message);
+        console.warn('[TicketAssistantProcessor] Category classification failed:', catErr.message);
     }
 
     return 'Uncategorized';
@@ -546,7 +565,7 @@ async function summarizeAndCategorize(cleanedText, options = {}) {
 
     try {
         const modelId = await resolveModel(modelTier, orgId);
-        console.log(`[EmailKBProcessor] Fused article+category: model=${modelId} tier=${modelTier}`);
+        console.log(`[TicketAssistantProcessor] Fused article+category: model=${modelId} tier=${modelTier}`);
 
         const { createChatCompletion } = require('../agents/providerAdapters');
 
@@ -588,7 +607,7 @@ async function summarizeAndCategorize(cleanedText, options = {}) {
             category: parsed.category.trim().slice(0, 80) || 'Uncategorized',
         };
     } catch (err) {
-        console.error('[EmailKBProcessor] Fused article+category failed:', err.message);
+        console.error('[TicketAssistantProcessor] Fused article+category failed:', err.message);
         return { article: null, category: null, reason: `AI error: ${err.message}` };
     }
 }
@@ -616,7 +635,7 @@ async function summarizeAndCategorizeBatch(emails, options = {}) {
 
     try {
         const modelId = await resolveModel(modelTier, orgId);
-        console.log(`[EmailKBProcessor] Batched article+category: model=${modelId}, batch=${emails.length}`);
+        console.log(`[TicketAssistantProcessor] Batched article+category: model=${modelId}, batch=${emails.length}`);
 
         const { createChatCompletion } = require('../agents/providerAdapters');
 
@@ -665,7 +684,7 @@ async function summarizeAndCategorizeBatch(emails, options = {}) {
             return { article, category: entry.category.trim().slice(0, 80) || 'Uncategorized' };
         });
     } catch (err) {
-        console.error('[EmailKBProcessor] Batched article+category failed:', err.message);
+        console.error('[TicketAssistantProcessor] Batched article+category failed:', err.message);
         return emails.map(() => ({ article: null, category: null, reason: `AI error: ${err.message}` }));
     }
 }
@@ -1129,7 +1148,7 @@ async function dedupeMergedChunks(chunkOutputs, { orgId, modelTier, customPrompt
         }
         return { article: text.trim() };
     } catch (err) {
-        console.error('[EmailKBProcessor] Dedupe pass failed:', err.message);
+        console.error('[TicketAssistantProcessor] Dedupe pass failed:', err.message);
         return { article: null, reason: `AI error: ${err.message}` };
     }
 }
@@ -1220,7 +1239,7 @@ async function mergeArticlesByCategory(articles, options = {}) {
     }
 
     const categoryNames = Object.keys(groups);
-    console.log(`[EmailKBProcessor] Merging ${articles.length} articles into ${categoryNames.length} categories: ${categoryNames.join(', ')}`);
+    console.log(`[TicketAssistantProcessor] Merging ${articles.length} articles into ${categoryNames.length} categories: ${categoryNames.join(', ')}`);
 
     const notify = (event, data) => {
         try { onProgress && onProgress(event, data); } catch { /* never break sync */ }
@@ -1230,7 +1249,7 @@ async function mergeArticlesByCategory(articles, options = {}) {
     for (const category of categoryNames) {
         const articleTexts = groups[category];
         const chunks = chunkArticlesByTokenBudget(articleTexts);
-        console.log(`[EmailKBProcessor] "${category}": ${articleTexts.length} articles → ${chunks.length} chunks`);
+        console.log(`[TicketAssistantProcessor] "${category}": ${articleTexts.length} articles → ${chunks.length} chunks`);
         notify('merge_category_started', {
             category,
             totalArticles: articleTexts.length,
@@ -1250,11 +1269,11 @@ async function mergeArticlesByCategory(articles, options = {}) {
             const chunkOutputs = chunkResults
                 .map((r) => {
                     if (r?.error) {
-                        console.warn(`[EmailKBProcessor] Chunk rewrite errored in "${category}":`, r.error.message);
+                        console.warn(`[TicketAssistantProcessor] Chunk rewrite errored in "${category}":`, r.error.message);
                         return null;
                     }
                     if (!r?.article) {
-                        console.warn(`[EmailKBProcessor] Chunk rewrite empty in "${category}": ${r?.reason || 'unknown'}`);
+                        console.warn(`[TicketAssistantProcessor] Chunk rewrite empty in "${category}": ${r?.reason || 'unknown'}`);
                         return null;
                     }
                     return r.article;
@@ -1262,7 +1281,7 @@ async function mergeArticlesByCategory(articles, options = {}) {
                 .filter(Boolean);
 
             if (chunkOutputs.length === 0) {
-                console.warn(`[EmailKBProcessor] All chunks failed for category "${category}"`);
+                console.warn(`[TicketAssistantProcessor] All chunks failed for category "${category}"`);
                 notify('merge_category_complete', { category, chunkCount: chunks.length, finalChars: 0, dedupeRan: false, ok: false });
                 continue;
             }
@@ -1283,7 +1302,7 @@ async function mergeArticlesByCategory(articles, options = {}) {
                 if (dedupe.article) {
                     finalArticle = dedupe.article;
                 } else {
-                    console.warn(`[EmailKBProcessor] Dedupe pass failed for "${category}" (${dedupe.reason}) — falling back to chunk concat`);
+                    console.warn(`[TicketAssistantProcessor] Dedupe pass failed for "${category}" (${dedupe.reason}) — falling back to chunk concat`);
                     finalArticle = chunkOutputs.join('\n\n---\n\n');
                 }
             }
@@ -1305,7 +1324,7 @@ async function mergeArticlesByCategory(articles, options = {}) {
                 ok: true,
             });
         } catch (err) {
-            console.error(`[EmailKBProcessor] Merge failed for category "${category}":`, err.message);
+            console.error(`[TicketAssistantProcessor] Merge failed for category "${category}":`, err.message);
             notify('merge_category_complete', { category, chunkCount: chunks.length, finalChars: 0, dedupeRan: false, ok: false, error: err.message });
         }
     }
@@ -1419,7 +1438,8 @@ module.exports = {
     dedupeMergedChunks,
     buildPerEmailArticle,
     // Tier configuration
-    getEmailKBTierConfig,
+    getTicketAssistantTierConfig,
+    getEmailKBTierConfig, // legacy alias
     // Constants
     DEFAULT_ARTICLE_PROMPT,
     DEFAULT_CATEGORY_PROMPT,

@@ -27,7 +27,12 @@ const BETA_FEATURES = [
     { id: 'ai_code_execution', name: 'AI Code Execution', description: 'Allow the AI agent to execute code in a sandboxed environment' },
     { id: 'custom_themes', name: 'Custom Themes', description: 'Organization-level custom branding and theme support' },
     { id: 'skills', name: 'Skills', description: 'Reusable instruction packs for consistent AI task execution' },
-    { id: 'email_knowledge_base', name: 'Email Knowledge Base', description: 'Connect Gmail or Outlook mailboxes as knowledge base sources with AI-powered article extraction' },
+    { id: 'itil_ticket_assistant', name: 'ITIL Ticket Assistant', description: 'Connect ITSM platforms (Jira, ServiceNow, Zendesk, Freshservice, TopDesk) and email mailboxes as knowledge base sources. Tickets + emails are turned into structured solution articles (Root Cause / Resolution) for agent self-service.' },
+    // Legacy alias — retained for one release. The initDB() migration in
+    // ticketAssistantStore.js rewrites stored org beta_features from
+    // 'email_knowledge_base' to 'itil_ticket_assistant' on boot; this entry
+    // keeps membership lookups working during the transition window.
+    { id: 'email_knowledge_base', name: 'Email Knowledge Base (deprecated)', description: 'Renamed to "ITIL Ticket Assistant". Existing enablements are auto-migrated.', aliasOf: 'itil_ticket_assistant', deprecated: true },
     { id: 'voice_chat', name: 'Voice Chat (Beta)', description: 'Realtime voice conversation with direct chat or agents, powered by Mistral Voxtral (STT + TTS). Requires a configured Mistral API key.' },
 ];
 
@@ -135,10 +140,28 @@ async function getUserBetaFeatures(userId, session = null) {
 }
 
 /**
+ * Given a feature ID, return the set of IDs that count as "the same feature"
+ * for access-check purposes — the canonical target plus any deprecated
+ * aliases pointing to it (and the reverse direction).
+ */
+function resolveFeatureAliases(featureId) {
+    const ids = new Set([featureId]);
+    for (const entry of BETA_FEATURES) {
+        if (entry.id === featureId && entry.aliasOf) ids.add(entry.aliasOf);
+        if (entry.aliasOf === featureId) ids.add(entry.id);
+    }
+    return ids;
+}
+
+/**
  * Check if a specific user has access to a beta feature.
+ * Aliased feature IDs (e.g. legacy 'email_knowledge_base' →
+ * 'itil_ticket_assistant') are treated as equivalent.
  */
 async function userHasBetaFeature(userId, featureId, session = null) {
-    return (await getUserBetaFeatures(userId, session)).includes(featureId);
+    const aliases = resolveFeatureAliases(featureId);
+    const userFeatures = await getUserBetaFeatures(userId, session);
+    return userFeatures.some(id => aliases.has(id));
 }
 
 /**

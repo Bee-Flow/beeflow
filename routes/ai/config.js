@@ -594,6 +594,9 @@ router.post('/config/chat-models-eu', requireAuth, async (req, res) => {
 
 // ─── Custom Chat Model Tiers ─────────────────────────────────────
 
+// 'email_kb' task type is preserved as the canonical name for the ticket-assistant
+// custom-tier slot so existing org overrides continue to resolve correctly.
+// The feature itself has been rebranded to "ITIL Ticket Assistant".
 const VALID_TASK_TYPES = ['direct_chat', 'agent_chat', 'email_kb'];
 const STANDARD_TIER_KEYS = ['fast', 'standard', 'thinking', 'writer', 'pro'];
 
@@ -881,37 +884,59 @@ router.get('/config/tiers-for-user', requireAuth, async (req, res) => {
     }
 });
 
-// ─── Email KB Tier Config ────────────────────────────────────────
+// ─── Ticket Assistant Tier Config ─────────────────────────────────
+// Formerly "Email KB Tier Config". Config key migrated from
+// 'email_kb_tier_config' → 'ticket_assistant_tier_config' on first read.
+// Old /config/email-kb-tiers route kept as an alias for one release.
 
-const EKB_STAGE_KEYS = ['article', 'category', 'merge'];
+const TA_STAGE_KEYS = ['article', 'category', 'merge'];
 
-router.get('/config/email-kb-tiers', requireAuth, async (req, res) => {
+async function readTicketAssistantTierConfig() {
+    let cfg = await configStore.getConfig('ticket_assistant_tier_config');
+    if (!cfg) {
+        const legacy = await configStore.getConfig('email_kb_tier_config');
+        if (legacy) {
+            await configStore.setConfig('ticket_assistant_tier_config', legacy);
+            try { await configStore.deleteConfig?.('email_kb_tier_config'); } catch (_) { /* ignore */ }
+            cfg = legacy;
+        }
+    }
+    return cfg || {};
+}
+
+async function handleGetTiers(req, res) {
     if (!(await isAdminUser(req))) return res.status(403).json({ error: 'Admin access required' });
     try {
-        const cfg = (await configStore.getConfig('email_kb_tier_config')) || {};
+        const cfg = await readTicketAssistantTierConfig();
         const out = {};
-        for (const k of EKB_STAGE_KEYS) out[k] = typeof cfg[k] === 'string' && cfg[k] ? cfg[k] : 'fast';
+        for (const k of TA_STAGE_KEYS) out[k] = typeof cfg[k] === 'string' && cfg[k] ? cfg[k] : 'fast';
         res.json(out);
     } catch (e) {
-        res.status(500).json({ error: 'Failed to fetch Email KB tier config' });
+        res.status(500).json({ error: 'Failed to fetch Ticket Assistant tier config' });
     }
-});
+}
 
-router.post('/config/email-kb-tiers', requireAuth, async (req, res) => {
+async function handlePostTiers(req, res) {
     if (!(await isAdminUser(req))) return res.status(403).json({ error: 'Admin access required' });
     try {
         const body = req.body || {};
         const cfg = {};
-        for (const k of EKB_STAGE_KEYS) {
+        for (const k of TA_STAGE_KEYS) {
             if (typeof body[k] === 'string' && body[k]) cfg[k] = body[k];
         }
-        await configStore.setConfig('email_kb_tier_config', cfg);
+        await configStore.setConfig('ticket_assistant_tier_config', cfg);
         res.json({ success: true, config: cfg });
     } catch (e) {
-        console.error('Failed to save Email KB tier config:', e);
+        console.error('Failed to save Ticket Assistant tier config:', e);
         res.status(500).json({ error: 'Failed to save config' });
     }
-});
+}
+
+router.get('/config/ticket-assistant-tiers', requireAuth, handleGetTiers);
+router.post('/config/ticket-assistant-tiers', requireAuth, handlePostTiers);
+// Legacy aliases — remove after one release.
+router.get('/config/email-kb-tiers', requireAuth, handleGetTiers);
+router.post('/config/email-kb-tiers', requireAuth, handlePostTiers);
 
 // ─── Direct Chat System Prompt ───────────────────────────────────
 
