@@ -264,6 +264,7 @@ app.use('/api/feedback', require('./routes/feedback'));
 app.use('/api/client-errors', require('./routes/clientErrors'));
 app.use('/api/org-privacy-shield', require('./routes/orgPrivacyShield'));
 app.use('/api/org-azure-config', require('./routes/orgAzureConfig'));
+app.use('/api/compliance', require('./routes/compliance'));
 app.use('/api/chat/dlp-decision', require('./routes/dlpDecision'));
 app.get('/api/guard/health', async (req, res) => {
     try {
@@ -361,6 +362,10 @@ app.listen(PORT, '0.0.0.0', () => {
     // so operators can spot guardrail drift in the startup log.
     const { selfCheckOrgShields } = require('./core/orgShield');
     selfCheckOrgShields().catch(err => console.warn('[OrgShieldSelfCheck] Error:', err.message));
+
+    // Register and schedule AI Act + GDPR compliance checks (6-hour interval).
+    require('./compliance/checks');
+    require('./compliance/scheduler').start();
 
     // Seed system agents into the database (explicit lifecycle call, not a require() side-effect)
     const { seedSystemAgents } = require('./stores/agent/systemAgents');
