@@ -16,6 +16,11 @@ const { loadConfig, saveConfig, requireAdmin, OAUTH_PROVIDERS } = require('./per
 const { getOrCreateSSOUserDEKCompat, setupSSOUserDEK, unlockSSOUserDEK } = require('./encryption');
 const userStore = require('../stores/userStore');
 const { syncUserGroupsOnLogin } = require('../integrations/azureGroupSync');
+const {
+    deriveLocalUserId,
+    resolveExistingSSOUser,
+    resolveOrgByEmailDomain,
+} = require('./ssoUserResolver');
 
 /**
  * Check if encryption is enabled for a user based on their org's subscription plan.
@@ -475,13 +480,16 @@ router.get('/callback/:provider', async (req, res) => {
             if (userResponse.ok) {
                 const userData = await userResponse.json();
                 console.log(`[OAuth/Microsoft] User info received — id: ${userData.id}, displayName: ${userData.displayName}, mail: ${userData.mail}, upn: ${userData.userPrincipalName}`);
+                // Keep the Azure object id separate from the local id. The
+                // local id is resolved/minted in the provisioning block below
+                // so we do not collide with users already synced from Azure AD.
                 user = {
-                    id: userData.id || userData.userPrincipalName,
+                    azureUserId: userData.id || null,
                     displayName: userData.displayName || userData.userPrincipalName,
                     email: userData.mail || userData.userPrincipalName,
                     provider: 'microsoft'
                 };
-                console.log(`[OAuth/Microsoft] Mapped user — id: ${user.id}, displayName: ${user.displayName}, email: ${user.email}`);
+                console.log(`[OAuth/Microsoft] Mapped user — azureUserId: ${user.azureUserId}, displayName: ${user.displayName}, email: ${user.email}`);
 
                 // Attempt to fetch profile picture
                 console.log(`[OAuth/Microsoft] Attempting to fetch user photo...`);
@@ -496,7 +504,7 @@ router.get('/callback/:provider', async (req, res) => {
                         if (!fs.existsSync(uploadDir)) {
                             fs.mkdirSync(uploadDir, { recursive: true });
                         }
-                        const safeId = user.id.replace(/[^a-zA-Z0-9]/g, '');
+                        const safeId = String(user.azureUserId || user.email || 'ms').replace(/[^a-zA-Z0-9]/g, '');
                         const filename = `user-avatar-azure-${safeId}-${Date.now()}.jpg`;
                         const filepath = path.join(uploadDir, filename);
                         fs.writeFileSync(filepath, buffer);
@@ -562,12 +570,47 @@ router.get('/callback/:provider', async (req, res) => {
         }
         console.log(`[OAuth/${provider}] === USER PROVISIONING ===`);
 
-        // Create or update user in the store with full profile data
-        const existingUser = await userStore.getUser(user.id);
-        if (!existingUser) {
+        // Non-Microsoft providers (Nextcloud, legacy) historically used the
+        // provider-issued id as the local id. Preserve that as the provisional
+        // localId so the resolver's legacy-id fallback can still find them.
+        // For Microsoft, the Azure OID lives on user.azureUserId — the local
+        // id is derived/resolved below.
+        const provisionalLocalId = user.id || deriveLocalUserId(user.email, user.azureUserId);
+
+        const { user: existingUser, branch } = await resolveExistingSSOUser(
+            { azureUserId: user.azureUserId || null, email: user.email, localId: provisionalLocalId },
+            userStore,
+        );
+
+        if (existingUser) {
+            // Canonical id comes from the stored record. Do NOT overwrite
+            // role, orgRole, organizationId, groups, or status here — those
+            // are managed by the directory sync and admin flows.
+            user.id = existingUser.id;
+            await userStore.updateUser(existingUser.id, {
+                displayName: user.displayName,
+                firstName: user.firstName || existingUser.firstName,
+                lastName: user.lastName || existingUser.lastName,
+                email: user.email || existingUser.email,
+                avatar: user.picture || existingUser.avatar,
+                avatarType: user.picture ? 'url' : existingUser.avatarType,
+            });
+            console.log(`[OAuth/${provider}] Matched existing user via branch=${branch} → ${existingUser.id} (azureUserId=${existingUser.azureUserId || 'none'}, org=${existingUser.organizationId || 'none'})`);
+        } else {
+            // Truly new user — derive a stable local id and pre-resolve the
+            // organization by email domain so the record isn't orphaned.
+            const localId = deriveLocalUserId(user.email, user.azureUserId);
+            user.id = localId;
+
+            let preResolvedOrg = null;
+            if (user.email && user.email.includes('@')) {
+                const allOrgs = await userStore.getAllOrganizations();
+                preResolvedOrg = resolveOrgByEmailDomain(user.email, allOrgs);
+            }
+
             await userStore.createUser({
-                id: user.id,
-                username: user.email || user.id,
+                id: localId,
+                username: user.email || localId,
                 displayName: user.displayName,
                 firstName: user.firstName || '',
                 lastName: user.lastName || '',
@@ -576,19 +619,10 @@ router.get('/callback/:provider', async (req, res) => {
                 avatarType: user.picture ? 'url' : null,
                 role: 'user',
                 groups: [],
+                azureUserId: user.azureUserId || null,
+                organizationId: preResolvedOrg?.id || '',
             });
-            console.log(`[OAuth] Created new user in store: ${user.id} (${user.displayName})`);
-        } else {
-            // Update profile data on each login (name/email/picture may change)
-            await userStore.updateUser(user.id, {
-                displayName: user.displayName,
-                firstName: user.firstName || existingUser.firstName,
-                lastName: user.lastName || existingUser.lastName,
-                email: user.email || existingUser.email,
-                avatar: user.picture || existingUser.avatar,
-                avatarType: user.picture ? 'url' : existingUser.avatarType,
-            });
-            console.log(`[OAuth] Updated user in store: ${user.id} (${user.displayName})`);
+            console.log(`[OAuth/${provider}] Created new user via branch=create → ${localId} (azureUserId=${user.azureUserId || 'none'}, preResolvedOrg=${preResolvedOrg?.id || 'none'})`);
         }
 
         // Handle pending signup — create organization or consumer account
@@ -715,19 +749,8 @@ router.get('/callback/:provider', async (req, res) => {
         // If user has no org, try domain-matching
         let pendingApproval = false;
         if (!userHasOrg && !req.session.pendingSignup && user.email && user.email.includes('@')) {
-            const userDomain = user.email.split('@')[1].toLowerCase();
             const allOrgs = await userStore.getAllOrganizations();
-
-            // Find org whose allowed domains (or email domain) matches the user's email domain
-            const matchingOrg = allOrgs.find(org => {
-                // Check allowedDomains array first (multi-domain support)
-                if (Array.isArray(org.allowedDomains) && org.allowedDomains.length > 0) {
-                    return org.allowedDomains.includes(userDomain);
-                }
-                // Fallback: match on org email domain
-                if (!org.email || !org.email.includes('@')) return false;
-                return org.email.split('@')[1].toLowerCase() === userDomain;
-            });
+            const matchingOrg = resolveOrgByEmailDomain(user.email, allOrgs);
 
             if (matchingOrg) {
                 if (matchingOrg.autoApproveSSO) {
