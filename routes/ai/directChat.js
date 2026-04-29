@@ -921,6 +921,67 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             lastResponseId = null;
         }
 
+        // Per-stage tier override (Flow tier). When the planner declared a
+        // `tier` for a stage, swap modelId/adapter/apiKey/apiUrl to that tier
+        // for the duration of that stage's LLM rounds. Inheriting stages
+        // (no tier) stay on whatever model is currently loaded. Called after
+        // each `activate_session_skill` so the very first round of the new
+        // stage already runs on its requested model.
+        let activeStageModelStageId = null;
+        const swapModelForActiveStage = async () => {
+            if (!isStandardTier || !Array.isArray(sessionSkills) || sessionSkills.length === 0) return;
+            const state = describeStepMachineState(sessionSkills, activatedSessionSkillIds, completedSessionSkillIds);
+            const stageId = state.currentActiveId;
+            if (!stageId || stageId === activeStageModelStageId) return;
+            activeStageModelStageId = stageId;
+            const stage = sessionSkills.find(s => s.id === stageId);
+            const stageTier = stage?.tier;
+            if (!stageTier) return;   // inherit current model
+            // Auto: classify based on what this stage actually demands. We
+            // already have the planner's plain-language description/instructions
+            // — feed that to the same classifier auto uses for the conversation.
+            let targetTier = stageTier;
+            if (stageTier === 'auto') {
+                try {
+                    const { classifyWithLLM } = require('../../core/promptClassifier');
+                    const classifyTiers = Object.fromEntries(
+                        Object.entries(tiers).filter(([k]) => !k.startsWith('custom:') && k !== 'standard')
+                    );
+                    const seed = [stage.name, stage.description, stage.instructions].filter(Boolean).join('\n\n');
+                    const result = await classifyWithLLM(seed, classifyTiers, { userOrgId: userOrgForTiers, userId });
+                    targetTier = result?.tier || resolvedTier;
+                } catch (e) {
+                    targetTier = resolvedTier;
+                }
+            }
+            let stageModelId;
+            try {
+                stageModelId = await resolveModelForTier(`tier:${targetTier}`, {
+                    userOrgId: userOrgForTiers, userId, fallbackTier: resolvedTier,
+                });
+            } catch (e) {
+                console.warn(`[DirectChat] Stage tier "${stageTier}" resolution failed for "${stage.name}": ${e.message}`);
+                return;
+            }
+            if (!stageModelId || stageModelId === modelId) return;
+            try {
+                const newConfig = await getProviderForModel(stageModelId);
+                const newAdapter = getAdapter(newConfig.providerType, (newConfig.url || '').replace(/\/+$/, ''));
+                modelId = stageModelId;
+                config = newConfig;
+                adapter = newAdapter;
+                apiKey = newConfig.apiKey;
+                apiUrl = (newConfig.url || '').replace(/\/+$/, '');
+                console.log(`[DirectChat] Stage "${stage.name}" → ${stageTier}${stageTier !== targetTier ? `→${targetTier}` : ''} tier (${modelId})`);
+                send('stage_model_swapped', { stageId, stageName: stage.name, tier: targetTier, modelId });
+            } catch (e) {
+                console.warn(`[DirectChat] Stage model swap to "${stageModelId}" failed: ${e.message}`);
+            }
+        };
+        // Run once at the start so a step-1 stage with a tier override picks
+        // its model before the first LLM round.
+        await swapModelForActiveStage();
+
         // Add current message (with attachments if any)
         const persistedAttachments = []; // Track attachments for conversation persistence
         if (attachments && attachments.length > 0) {
@@ -2024,6 +2085,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                                 activatedSkillIds: activatedSessionSkillIds,
                                 completedSkillIds: completedSessionSkillIds,
                             });
+                            await swapModelForActiveStage();
                         }
                         if (toolName === COMPLETE_SESSION_SKILL_TOOL_NAME) {
                             handleSessionSkillCompleteResult(toolArgs, toolResult);
@@ -2605,6 +2667,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                         activatedSkillIds: activatedSessionSkillIds,
                         completedSkillIds: completedSessionSkillIds,
                     });
+                    await swapModelForActiveStage();
                 }
                 if (toolName === COMPLETE_SESSION_SKILL_TOOL_NAME) {
                     handleSessionSkillCompleteResult(toolArgs, toolResult);

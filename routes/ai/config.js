@@ -506,13 +506,13 @@ router.get('/config/chat-models', requireAuth, async (req, res) => {
     try {
         const tiers = await configStore.getConfig('chat_model_tiers') || {
             fast: { modelId: '', label: 'Fast' },
-            standard: { modelId: '', label: 'Standard (Direct)' },
+            standard: { modelId: '', label: 'Flow (Direct)' },
             thinking: { modelId: '', label: 'Thinking' },
             writer: { modelId: '', label: 'Writer' },
             pro: { modelId: '', label: 'Pro' }
         };
         if (!tiers.writer) tiers.writer = { modelId: '', label: 'Writer' };
-        if (!tiers.standard) tiers.standard = { modelId: '', label: 'Standard (Direct)' };
+        if (!tiers.standard) tiers.standard = { modelId: '', label: 'Flow (Direct)' };
         res.json(tiers);
     } catch (e) {
         console.error('Failed to get chat model tiers:', e);
@@ -525,7 +525,7 @@ router.post('/config/chat-models', requireAuth, async (req, res) => {
         const { fast, standard, thinking, writer, pro } = req.body;
         const tiers = {
             fast: fast || { modelId: '', label: 'Fast' },
-            standard: standard || { modelId: '', label: 'Standard (Direct)' },
+            standard: standard || { modelId: '', label: 'Flow (Direct)' },
             thinking: thinking || { modelId: '', label: 'Thinking' },
             writer: writer || { modelId: '', label: 'Writer' },
             pro: pro || { modelId: '', label: 'Pro' }
@@ -587,12 +587,12 @@ router.get('/config/chat-models-eu', requireAuth, async (req, res) => {
     try {
         const tiers = await configStore.getConfig('chat_model_tiers_eu') || {
             fast: { modelId: '', label: 'Fast' },
-            standard: { modelId: '', label: 'Standard (Direct)' },
+            standard: { modelId: '', label: 'Flow (Direct)' },
             thinking: { modelId: '', label: 'Thinking' },
             writer: { modelId: '', label: 'Writer' },
             pro: { modelId: '', label: 'Pro' }
         };
-        if (!tiers.standard) tiers.standard = { modelId: '', label: 'Standard (Direct)' };
+        if (!tiers.standard) tiers.standard = { modelId: '', label: 'Flow (Direct)' };
         res.json(tiers);
     } catch (e) {
         console.error('Failed to get EU chat model tiers:', e);
@@ -605,7 +605,7 @@ router.post('/config/chat-models-eu', requireAuth, async (req, res) => {
         const { fast, standard, thinking, writer, pro } = req.body;
         const tiers = {
             fast: fast || { modelId: '', label: 'Fast' },
-            standard: standard || { modelId: '', label: 'Standard (Direct)' },
+            standard: standard || { modelId: '', label: 'Flow (Direct)' },
             thinking: thinking || { modelId: '', label: 'Thinking' },
             writer: writer || { modelId: '', label: 'Writer' },
             pro: pro || { modelId: '', label: 'Pro' }
