@@ -18,6 +18,7 @@ const researchRoutes = require('./ai/research');
 const templateChatRoutes = require('./ai/templateChat');
 const notebookChatRoutes = require('./ai/notebookChat');
 const voiceRoutes = require('./ai/voice');
+const swarmsRoutes = require('./ai/swarms');
 const { requireBetaFeature } = require('../core/betaFeatures');
 
 // Mount all sub-routes
@@ -47,5 +48,10 @@ router.use('/', notebookChatRoutes);
 // Further gated on a configured Mistral API key by the voice router itself.
 // Mounted at /voice so the beta gate only affects /ai/voice/* requests.
 router.use('/voice', requireBetaFeature('voice_chat'), voiceRoutes);
+
+// Swarm Agents (Beta) — gated on org-level beta feature flag. The discovery
+// endpoint also returns [] when the gate is disabled, so the sidebar simply
+// hides the "Swarms" section for non-eligible users.
+router.use('/swarms', requireBetaFeature('swarm'), swarmsRoutes);
 
 module.exports = router;

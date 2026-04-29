@@ -96,6 +96,7 @@ module.exports = {
     getDirectConversation: directConversations.getDirectConversation,
     listDirectConversations: directConversations.listDirectConversations,
     updateDirectConversation: directConversations.updateDirectConversation,
+    updateDirectConversationMeta: directConversations.updateDirectConversationMeta,
     updateDirectConversationTitle: directConversations.updateDirectConversationTitle,
     pinDirectConversation: directConversations.pinDirectConversation,
     setDirectConversationLabels: directConversations.setDirectConversationLabels,

@@ -507,12 +507,14 @@ router.get('/config/chat-models', requireAuth, async (req, res) => {
         const tiers = await configStore.getConfig('chat_model_tiers') || {
             fast: { modelId: '', label: 'Fast' },
             standard: { modelId: '', label: 'Flow (Direct)' },
+            swarm: { modelId: '', label: 'Swarm (Direct)' },
             thinking: { modelId: '', label: 'Thinking' },
             writer: { modelId: '', label: 'Writer' },
             pro: { modelId: '', label: 'Pro' }
         };
         if (!tiers.writer) tiers.writer = { modelId: '', label: 'Writer' };
         if (!tiers.standard) tiers.standard = { modelId: '', label: 'Flow (Direct)' };
+        if (!tiers.swarm) tiers.swarm = { modelId: '', label: 'Swarm (Direct)' };
         res.json(tiers);
     } catch (e) {
         console.error('Failed to get chat model tiers:', e);
@@ -522,10 +524,11 @@ router.get('/config/chat-models', requireAuth, async (req, res) => {
 
 router.post('/config/chat-models', requireAuth, async (req, res) => {
     try {
-        const { fast, standard, thinking, writer, pro } = req.body;
+        const { fast, standard, swarm, thinking, writer, pro } = req.body;
         const tiers = {
             fast: fast || { modelId: '', label: 'Fast' },
             standard: standard || { modelId: '', label: 'Flow (Direct)' },
+            swarm: swarm || { modelId: '', label: 'Swarm (Direct)' },
             thinking: thinking || { modelId: '', label: 'Thinking' },
             writer: writer || { modelId: '', label: 'Writer' },
             pro: pro || { modelId: '', label: 'Pro' }
@@ -588,11 +591,13 @@ router.get('/config/chat-models-eu', requireAuth, async (req, res) => {
         const tiers = await configStore.getConfig('chat_model_tiers_eu') || {
             fast: { modelId: '', label: 'Fast' },
             standard: { modelId: '', label: 'Flow (Direct)' },
+            swarm: { modelId: '', label: 'Swarm (Direct)' },
             thinking: { modelId: '', label: 'Thinking' },
             writer: { modelId: '', label: 'Writer' },
             pro: { modelId: '', label: 'Pro' }
         };
         if (!tiers.standard) tiers.standard = { modelId: '', label: 'Flow (Direct)' };
+        if (!tiers.swarm) tiers.swarm = { modelId: '', label: 'Swarm (Direct)' };
         res.json(tiers);
     } catch (e) {
         console.error('Failed to get EU chat model tiers:', e);
@@ -602,10 +607,11 @@ router.get('/config/chat-models-eu', requireAuth, async (req, res) => {
 
 router.post('/config/chat-models-eu', requireAuth, async (req, res) => {
     try {
-        const { fast, standard, thinking, writer, pro } = req.body;
+        const { fast, standard, swarm, thinking, writer, pro } = req.body;
         const tiers = {
             fast: fast || { modelId: '', label: 'Fast' },
             standard: standard || { modelId: '', label: 'Flow (Direct)' },
+            swarm: swarm || { modelId: '', label: 'Swarm (Direct)' },
             thinking: thinking || { modelId: '', label: 'Thinking' },
             writer: writer || { modelId: '', label: 'Writer' },
             pro: pro || { modelId: '', label: 'Pro' }
@@ -642,7 +648,7 @@ router.post('/config/chat-models-eu', requireAuth, async (req, res) => {
 // custom-tier slot so existing org overrides continue to resolve correctly.
 // The feature itself has been rebranded to "ITIL Ticket Assistant".
 const VALID_TASK_TYPES = ['direct_chat', 'agent_chat', 'email_kb'];
-const STANDARD_TIER_KEYS = ['fast', 'standard', 'thinking', 'writer', 'pro'];
+const STANDARD_TIER_KEYS = ['fast', 'standard', 'swarm', 'thinking', 'writer', 'pro'];
 
 // ── Custom tier helpers ──────────────────────────────────────────
 async function isOrgAdmin(req) {
@@ -887,12 +893,16 @@ router.get('/config/tiers-for-user', requireAuth, async (req, res) => {
             });
         }
 
-        // The Standard tier depends on the `skills` beta feature (it bootstraps
-        // chat-local session skills on first send). Hide it when the caller's
-        // org/user doesn't have the feature.
+        // The Flow tier (key 'standard') depends on the `skills` beta; the
+        // Swarm tier depends on the `swarm` beta. Hide either tier when the
+        // caller's org/user doesn't have the matching feature so they never
+        // appear in the dropdown.
         const { userHasBetaFeature } = require('../../core/betaFeatures');
         const hasSkillsFeature = userId
             ? await userHasBetaFeature(userId, 'skills', req.session).catch(() => false)
+            : false;
+        const hasSwarmFeature = userId
+            ? await userHasBetaFeature(userId, 'swarm', req.session).catch(() => false)
             : false;
 
         const result = {};
@@ -904,10 +914,11 @@ router.get('/config/tiers-for-user', requireAuth, async (req, res) => {
         }
         // Standard
         for (const key of STANDARD_TIER_KEYS) {
-            // Direct-chat-only tier: never expose for non-direct tasks.
-            if (key === 'standard' && taskType !== 'direct_chat') continue;
-            // Standard tier is gated by the skills beta feature.
+            // Direct-chat-only tiers: never expose for non-direct tasks.
+            if ((key === 'standard' || key === 'swarm') && taskType !== 'direct_chat') continue;
+            // Beta gates: Flow uses `skills`, Swarm uses `swarm`.
             if (key === 'standard' && !hasSkillsFeature) continue;
+            if (key === 'swarm' && !hasSwarmFeature) continue;
             if (!tierPermittedByGroups(key)) continue;
             if (standardTiers && standardTiers[key]) result[key] = standardTiers[key];
         }

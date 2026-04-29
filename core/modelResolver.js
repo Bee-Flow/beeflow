@@ -38,6 +38,15 @@ const TIER_DEFAULTS = {
         reasoningEffort: 'low',
         reasoningSummary: false,
     },
+    swarm: {
+        // Swarm tier delegates per-message to a multi-agent runtime; the
+        // tier's model is used as the synthesiser default and as the
+        // fallback for any worker that doesn't declare its own tier.
+        maxTokens: 8192,
+        temperature: 0.5,
+        reasoningEffort: 'low',
+        reasoningSummary: false,
+    },
     thinking: {
         maxTokens: 16384,
         temperature: 0.7,

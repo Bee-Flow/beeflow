@@ -143,12 +143,127 @@ function requireAuth(req, res, next) {
 // ─── Streaming Direct Chat ───────────────────────────────────────
 
 router.post('/chat/direct/stream', requireAuth, async (req, res) => {
-    const { message, conversationId, modelTier, history, attachments, imageGenSettings, nanoBananaSettings, disabledMedia, webSearchEnabled = true, notebookspaceContent, notebookspaceSelection, projectId, timezone, systemPrompt: requestSystemPrompt, activeSkillIds, reasoningEffort: requestReasoningEffort, sessionSkills: requestSessionSkills, activatedSessionSkillIds: requestActivatedSessionSkillIds, knowledgeBaseIds: requestedKbIds } = req.body;
+    const { message, conversationId, modelTier, history, attachments, imageGenSettings, nanoBananaSettings, disabledMedia, webSearchEnabled = true, notebookspaceContent, notebookspaceSelection, projectId, timezone, systemPrompt: requestSystemPrompt, activeSkillIds, reasoningEffort: requestReasoningEffort, sessionSkills: requestSessionSkills, activatedSessionSkillIds: requestActivatedSessionSkillIds, knowledgeBaseIds: requestedKbIds, swarmOptions: requestedSwarmOptions } = req.body;
     const userId = req.session.user.id;
 
     if (!message && (!attachments || attachments.length === 0)) {
         return res.status(400).json({ error: 'Message or attachments required' });
     }
+
+    // ─── Swarm tier branch ─────────────────────────────────────────
+    // When the user picked the "Swarm" tier in the model dropdown, the entire
+    // turn runs through the swarm runtime. Phase progress + Hive Mind + final
+    // answer all stream over the same SSE channel; the rest of the directChat
+    // route (tier resolution, Flow stages, tool-call loop, …) is bypassed.
+    // v1 always runs the Deep Research built-in; per-conversation swarm choice
+    // ('which swarm?') becomes a sub-picker in v2.
+    if (modelTier === 'swarm') {
+        const { runSwarmTurn, loadSwarmById } = require('../../core/swarms/swarmRuntime');
+        const { userHasBetaFeature } = require('../../core/betaFeatures');
+
+        // Beta gate (defensive — `tiers-for-user` already hides the Swarm
+        // tier from the dropdown when this feature is off, but never trust
+        // the client).
+        const allowed = await userHasBetaFeature(userId, 'swarm', req.session).catch(() => false);
+        if (!allowed) {
+            return res.status(403).json({ error: 'Swarm Agents beta is not enabled for your organisation.' });
+        }
+        // v1: Deep Research is the only built-in. v2 adds Component Pipeline
+        // and exposes a sub-picker on the swarm tier so the user chooses.
+        const swarmId = 'builtin:deep_research';
+        const swarmEntry = loadSwarmById(swarmId);
+        if (!swarmEntry) {
+            return res.status(500).json({ error: `Swarm runtime is misconfigured: ${swarmId} not registered.` });
+        }
+
+        // SSE handshake (mirror of the block further down for the regular
+        // direct-chat path — kept inline so the swarm branch is self-contained).
+        res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no',
+        });
+        const send = (event, data) => {
+            try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch (_) {}
+        };
+
+        // Load (or create) conversation + restore prior Hive Mind state.
+        let convId = conversationId;
+        let hiveMind = null;
+        if (convId) {
+            try {
+                const existingConv = await agentStore.getDirectConversation(convId, userId);
+                if (existingConv && existingConv.hiveMind && typeof existingConv.hiveMind === 'object') {
+                    hiveMind = existingConv.hiveMind;
+                }
+            } catch (_) { /* ignore — proceed with fresh state */ }
+        }
+
+        try {
+            const result = await runSwarmTurn({
+                swarmId,
+                message,
+                options: requestedSwarmOptions || {},
+                hiveMind,
+                send,
+                userId,
+                userOrgId: null,        // swarm doesn't need EU-tier resolution in v1
+                modelOverride: null,
+            });
+
+            // Persist updated state on the conversation (best-effort; failure
+            // here mustn't abort the response — the user already saw the answer).
+            try {
+                if (!convId) {
+                    // model_tier is recorded on the conversation row; for a
+                    // swarm conversation we tag it 'swarm' so the sidebar
+                    // list renderer can label it appropriately.
+                    const created = await agentStore.createDirectConversation(userId, 'swarm');
+                    convId = created?.id || null;
+                    if (convId) send('conversation_created', { conversationId: convId });
+                }
+                if (convId) {
+                    // Read existing messages so we can append the user message
+                    // and the assistant's final answer in one write.
+                    const existingConv = await agentStore.getDirectConversation(convId, userId);
+                    const messages = Array.isArray(existingConv?.messages) ? [...existingConv.messages] : [];
+                    if (!result.paused && typeof result.finalText === 'string' && result.finalText.length > 0) {
+                        messages.push({
+                            role: 'user',
+                            content: message,
+                            attachments: attachments || [],
+                            timestamp: new Date().toISOString(),
+                        });
+                        messages.push({
+                            role: 'assistant',
+                            content: result.finalText,
+                            metadata: {
+                                swarmId,
+                                sourceCount: (result.sources || []).length,
+                                topic: result.metadata?.topic || null,
+                            },
+                            timestamp: new Date().toISOString(),
+                        });
+                    }
+                    await agentStore.updateDirectConversation(convId, messages, userId, {
+                        swarmId,
+                        hiveMind: result.hiveMind,
+                    });
+                }
+            } catch (persistErr) {
+                console.warn('[DirectChat/Swarm] persist failed:', persistErr.message);
+            }
+
+            send('done', {});
+            return res.end();
+        } catch (err) {
+            console.error('[DirectChat/Swarm] run failed:', err);
+            send('error', { error: err.message || 'Swarm execution failed' });
+            return res.end();
+        }
+    }
+    // ───────────────────────────────────────────────────────────────
 
     // EU mode + org privacy shield: resolve user's org early
     const { resolveUserOrgIds: resolveOrgIdsForTiers } = require('../../auth');
@@ -243,10 +358,12 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         try {
             const { classifyWithLLM } = require('../../core/promptClassifier');
             // Strip custom tiers — they require explicit user choice and must never
-            // win automatic selection. Flow (standard) IS eligible for auto, but the
-            // classifier is instructed to reserve it for clear multi-stage tasks.
+            // win automatic selection. Swarm is also excluded (auto must never
+            // spend the cost of a multi-agent swarm without the user asking).
+            // Flow (standard) IS eligible for auto, but the classifier is
+            // instructed to reserve it for clear multi-stage tasks.
             const classifyTiers = Object.fromEntries(
-                Object.entries(tiers).filter(([k]) => !k.startsWith('custom:'))
+                Object.entries(tiers).filter(([k]) => !k.startsWith('custom:') && k !== 'swarm')
             );
             const result = await classifyWithLLM(message, classifyTiers, { userOrgId: userOrgForTiers, userId });
             resolvedTier = result.tier;
@@ -975,7 +1092,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                 try {
                     const { classifyWithLLM } = require('../../core/promptClassifier');
                     const classifyTiers = Object.fromEntries(
-                        Object.entries(tiers).filter(([k]) => !k.startsWith('custom:') && k !== 'standard')
+                        Object.entries(tiers).filter(([k]) => !k.startsWith('custom:') && k !== 'standard' && k !== 'swarm')
                     );
                     const seed = [stage.name, stage.description, stage.instructions].filter(Boolean).join('\n\n');
                     const result = await classifyWithLLM(seed, classifyTiers, { userOrgId: userOrgForTiers, userId });
