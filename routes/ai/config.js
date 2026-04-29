@@ -852,6 +852,12 @@ router.get('/config/tiers-for-user', requireAuth, async (req, res) => {
             : false;
 
         const result = {};
+        // Auto is a meta/routing tier (no concrete modelId) — always include it
+        // when permitted by groups so the client's persisted 'auto' selection
+        // survives the post-fetch reconciliation in AgentHub.
+        if (tierPermittedByGroups('auto')) {
+            result.auto = { auto: true };
+        }
         // Standard
         for (const key of STANDARD_TIER_KEYS) {
             // Direct-chat-only tier: never expose for non-direct tasks.
