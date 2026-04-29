@@ -166,6 +166,9 @@ function classifyPromptComplexity(message) {
 
     // ── High-confidence shortcuts ──
     // Very long messages, heavy URLs, or large code blocks → deep_thinking.
+    // (Note: "Flow" / standard tier is never picked by the heuristic — its
+    //  trigger is multi-phase intent, which is a semantic signal the LLM
+    //  decides on. Heuristic only handles obvious extremes.)
     const codeFenceLines = (msg.match(/```[\s\S]*?```/g) || [])
         .reduce((acc, block) => acc + block.split('\n').length, 0);
     if (len > 1500 || urls >= 3 || codeFenceLines > 40) {
@@ -177,19 +180,19 @@ function classifyPromptComplexity(message) {
         };
     }
 
-    // Tiny structural input (≤ 80 chars, no code/math/url) → fast.
-    if (len <= 80 && score === 0) {
-        return { tier: 'fast', score: 0, reason: 'short structural', confident: true };
-    }
-
     // ── Score-based tier (medium confidence) ──
     let tier;
     if (score >= 6) tier = 'deep_thinking';
     else if (score >= 3) tier = 'thinking';
     else tier = 'fast';
 
-    // 80 < len ≤ 1500 and no strong signals → ambiguous: defer to LLM.
-    const confident = score >= 6 || (score === 0 && len <= 80);
+    // The only confident heuristic verdicts are:
+    //   - very short input (handled at the top, len ≤ 12 → fast)
+    //   - very heavy input (handled above → deep_thinking)
+    //   - score ≥ 6 (clearly heavy signals → deep_thinking)
+    // Everything else is ambiguous and should defer to the LLM, which knows
+    // the user's language and can distinguish thinking vs flow vs writer.
+    const confident = score >= 6;
 
     return { tier, score, reason: reasons.join(', ') || 'standard query', confident };
 }
@@ -197,37 +200,79 @@ function classifyPromptComplexity(message) {
 // ─── LLM Classifier ───────────────────────────────────────────────
 
 function buildClassifierPrompt(availableTiers) {
+    // Each tier description names a single, non-overlapping trigger. The
+    // tiers are ordered from cheapest/simplest to heaviest so the model
+    // reads them as an escalation ladder.
     const tierDescriptions = {
-        fast: 'fast — Greetings, simple questions, quick lookups, casual chat, short answers',
-        thinking: 'thinking — Code writing/debugging, analysis, multi-step problems, explanations, comparisons, moderate research',
-        writer: 'writer — Long-form content: essays, articles, blog posts, stories, poems, emails, reports, copywriting',
-        deep_thinking: 'deep_thinking — Deep research, complex multi-domain reasoning, architecture design, advanced math/proofs, thorough investigation',
+        fast:
+            'fast — One-shot, low-effort answers. Greetings, acks, quick factual lookups, ' +
+            'short translations, casual chat, single-sentence questions. Default for anything trivial.',
+        thinking:
+            'thinking — Single-pass reasoning on a focused problem. Code writing/debugging, ' +
+            'one-topic explanations, comparisons, "how does X work", analysis of a single artefact. ' +
+            'No multi-stage planning required.',
+        standard:
+            'standard — A multi-stage workflow tier (called "Flow") that runs a planner + tools + ' +
+            'verifier pipeline. Use ONLY when the request clearly benefits from breaking the work ' +
+            'into distinct phases the assistant must execute itself: e.g. "plan and then build X", ' +
+            '"research topic Y, then write a structured report with sources", "design X, then ' +
+            'implement it, then test it", or any task where the user expects the assistant to ' +
+            'orchestrate several tools/skills end-to-end. Do NOT pick standard for ordinary ' +
+            'questions, single-pass code help, or simple long-form writing.',
+        writer:
+            'writer — Pure long-form content production where the deliverable is the prose itself. ' +
+            'Essays, articles, blog posts, stories, poems, emails, marketing copy, ghostwriting, ' +
+            'rewrites/translations of long text. Pick writer over standard when the user just ' +
+            'wants the text, not a multi-stage process.',
+        deep_thinking:
+            'deep_thinking — One careful, heavy single-pass answer. Deep research synthesis, ' +
+            'complex multi-domain reasoning, advanced math/proofs, architecture trade-off ' +
+            'analysis, "think carefully about X". Pick deep_thinking over standard when the ' +
+            'user wants a single thorough answer, not an orchestrated workflow.',
     };
 
-    const descriptions = availableTiers
-        .filter(t => tierDescriptions[t])
+    const order = ['fast', 'thinking', 'standard', 'writer', 'deep_thinking'];
+    const descriptions = order
+        .filter(t => availableTiers.includes(t) && tierDescriptions[t])
         .map(t => `• ${tierDescriptions[t]}`)
         .join('\n');
 
+    const longFormTier = availableTiers.includes('writer')
+        ? 'writer'
+        : (availableTiers.includes('deep_thinking') ? 'deep_thinking' : 'thinking');
+    const flowExample = availableTiers.includes('standard')
+        ? '\n"plan a 3-phase migration from MySQL to Postgres, then write the runbook" → standard'
+        + '\n"research current EU AI Act articles, summarise findings, and produce a compliance checklist" → standard'
+        : '';
+
     return `You are a multilingual query classifier. The user message may be in ANY language (English, Dutch, German, Spanish, French, Italian, Portuguese, Polish, Turkish, Arabic, Chinese, Japanese, etc.). Classify by intent, NOT by language. Respond with ONLY the tier name — one word, nothing else.
 
-Available tiers:
+Available tiers (escalation ladder, cheapest first):
 ${descriptions}
+
+Decision order — try each tier in turn and stop at the first match:
+1. Trivial / one-line / greeting → fast
+2. Single-pass technical or analytical question → thinking
+3. Pure long-form writing deliverable → ${longFormTier}
+4. Multi-stage orchestrated workflow (plan + execute + verify, multiple distinct phases) → ${availableTiers.includes('standard') ? 'standard' : longFormTier}
+5. Heavy single-pass reasoning / deep research / architecture / proofs → ${availableTiers.includes('deep_thinking') ? 'deep_thinking' : 'thinking'}
 
 Examples:
 "hoi" → fast
-"schrijf een uitgebreid rapport over klimaatverandering" → ${availableTiers.includes('writer') ? 'writer' : 'deep_thinking'}
+"what is the capital of France?" → fast
 "erkläre mir, wie ein neuronales Netz funktioniert" → thinking
-"compara las arquitecturas de microservicios y monolitos" → thinking
-"investiga a fondo el impacto regulatorio del AI Act" → deep_thinking
 "fix this null pointer in my Java code" → thinking
+"compara las arquitecturas de microservicios y monolitos" → thinking
+"schrijf een uitgebreid rapport over klimaatverandering" → ${longFormTier}${flowExample}
+"investiga a fondo el impacto regulatorio del AI Act y dame un análisis" → ${availableTiers.includes('deep_thinking') ? 'deep_thinking' : 'thinking'}
+"prove that the halting problem is undecidable" → ${availableTiers.includes('deep_thinking') ? 'deep_thinking' : 'thinking'}
 
-Rules:
-- Default to "fast" for anything simple or ambiguous
-- Use "thinking" for technical/analytical tasks that need reasoning
-- Use "deep_thinking" only for complex multi-step problems, deep research, or requests asking to think carefully/deeply
-- When in doubt between thinking and deep_thinking, choose thinking
-- Respond with ONLY the tier name, no punctuation, no explanation`;
+Hard rules:
+- Default to "fast" for anything ambiguous or short.
+- "standard" is the WORKFLOW tier — only pick it when the user clearly asks the assistant to run multiple distinct phases (plan → do → verify, or research → write → check). When in doubt between standard and any other tier, do NOT pick standard.
+- "deep_thinking" is for ONE big careful answer, not for multi-phase work.
+- "writer" is for prose deliverables, not for analysis or planning.
+- Respond with ONLY the tier name, no punctuation, no explanation.`;
 }
 
 // Map legacy tier keys to current ones if the modern key is configured.

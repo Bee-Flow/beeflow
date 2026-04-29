@@ -242,10 +242,11 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
     if (resolvedTier === 'auto') {
         try {
             const { classifyWithLLM } = require('../../core/promptClassifier');
-            // Strip custom tiers from the auto-classifier input — custom tiers must
-            // never win automatic selection; they require explicit user choice.
+            // Strip custom tiers — they require explicit user choice and must never
+            // win automatic selection. Flow (standard) IS eligible for auto, but the
+            // classifier is instructed to reserve it for clear multi-stage tasks.
             const classifyTiers = Object.fromEntries(
-                Object.entries(tiers).filter(([k]) => !k.startsWith('custom:') && k !== 'standard')
+                Object.entries(tiers).filter(([k]) => !k.startsWith('custom:'))
             );
             const result = await classifyWithLLM(message, classifyTiers, { userOrgId: userOrgForTiers, userId });
             resolvedTier = result.tier;
