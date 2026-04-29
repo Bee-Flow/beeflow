@@ -16,6 +16,17 @@ const COMPLETE_SESSION_SKILL_TOOL_NAME = 'complete_session_skill';
 const PUBLISH_SESSION_SKILL_TOOL_NAME = 'publish_session_skill_to_library';
 const MAX_SESSION_SKILLS = 5;
 
+// Tier values a Flow stage may declare for its own LLM execution. The runtime
+// re-resolves the model per stage when a value here is set; anything else
+// falls back to the conversation's tier.
+const ALLOWED_STAGE_TIERS = new Set(['auto', 'fast', 'thinking', 'writer', 'pro']);
+
+function normalizeStageTier(raw) {
+    if (typeof raw !== 'string') return undefined;
+    const t = raw.trim().toLowerCase();
+    return ALLOWED_STAGE_TIERS.has(t) ? t : undefined;
+}
+
 function stripCodeFences(text) {
     if (typeof text !== 'string') return '';
     const t = text.trim();
@@ -43,6 +54,10 @@ function normalizeSessionSkill(raw, idx = 0) {
     const dependsOn = Array.isArray(raw.dependsOn)
         ? raw.dependsOn.filter(d => typeof d === 'string' && d.length > 0).slice(0, 10)
         : [];
+    // Per-stage execution tier (optional). When set, the directChat runtime
+    // swaps the active model+adapter for this stage's LLM rounds. Falsy means
+    // "inherit the conversation's tier".
+    const tier = normalizeStageTier(raw.tier);
     return {
         id: raw.id && typeof raw.id === 'string' ? raw.id : `sess_${crypto.randomUUID()}`,
         name,
@@ -54,6 +69,7 @@ function normalizeSessionSkill(raw, idx = 0) {
         order: orderNum,
         dependsOn,
         dynamicActivation: raw.dynamicActivation !== false, // default true for token savings
+        ...(tier ? { tier } : {}),
     };
 }
 
@@ -176,17 +192,26 @@ async function bootstrapSessionSkills({
         {
             role: 'system',
             content: [
-                'You create chat-local skills for one direct-chat conversation.',
+                'You design the Flow stages for one direct-chat conversation.',
                 'Return ONLY valid JSON (no prose, no markdown fences).',
                 `Return an array with 2 to ${MAX_SESSION_SKILLS} objects, each with:`,
-                'name, description, instructions, workflow, rules, examples, dynamicActivation, order, dependsOn',
+                'name, description, instructions, workflow, rules, examples, dynamicActivation, order, dependsOn, tier',
                 '',
-                'IMPORTANT — skills form an ORDERED PIPELINE enforced by the server:',
+                'IMPORTANT — stages form an ORDERED PIPELINE enforced by the server:',
                 '  "order"     — 1-based step number (1, 2, 3, ...). Lowest order runs first.',
-                '  "dependsOn" — array of PRIOR skill names (exact match) that must finish before',
-                '                this skill becomes activatable. Use [] for the first step.',
-                '  The runtime REFUSES to activate a skill whose dependencies are not yet active.',
-                '  Design the chain so each skill produces what the next one needs.',
+                '  "dependsOn" — array of PRIOR stage names (exact match) that must finish before',
+                '                this stage becomes activatable. Use [] for the first step.',
+                '  The runtime REFUSES to activate a stage whose dependencies are not yet active.',
+                '  Design the chain so each stage produces what the next one needs.',
+                '',
+                'Per-stage execution tier — pick the cheapest tier that fits the stage\'s work:',
+                '  "tier": "auto"     — let the auto-classifier choose (good default for most stages).',
+                '  "tier": "fast"     — quick lookups, simple transforms, short answers.',
+                '  "tier": "thinking" — analysis, planning, multi-step reasoning, comparisons.',
+                '  "tier": "writer"   — long-form drafting (articles, reports, emails, summaries).',
+                '  "tier": "pro"      — only when deep reasoning is essential and other tiers will fail.',
+                '  Omit "tier" or set "auto" to inherit the conversation default. Mix tiers across',
+                '  stages so research stages can think while writing stages use the writer model.',
                 '',
                 'Keep each field concise and practical.',
                 'Set dynamicActivation=true unless always-needed instructions are critical.',

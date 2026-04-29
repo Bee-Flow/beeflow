@@ -28,6 +28,7 @@ const {
     describePipelineState,
     describeStepMachineState,
 } = require('../../core/sessionSkillRuntime');
+const { resolveModelForTier } = require('../../core/modelResolver');
 const { WORKSPACE_TOOLS } = require('../../integrations/workspaceTools');
 const guardrailEventStore = require('../../stores/guardrailEventStore');
 
@@ -284,8 +285,8 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         console.error(`[DirectChat] Provider resolution failed for model "${modelId}":`, providerErr.message);
         return res.status(400).json({ error: providerErr.message });
     }
-    const apiKey = config.apiKey;
-    const apiUrl = (config.url || '').replace(/\/+$/, '');
+    let apiKey = config.apiKey;
+    let apiUrl = (config.url || '').replace(/\/+$/, '');
 
     console.log(`[DirectChat] Provider: ${config.providerName || 'default'} (${adapter.name})`);
     console.log(`[DirectChat] Using model: ${modelId} (tier: ${resolvedTier}${modelTier === 'auto' ? ', auto-selected' : ''})`);
