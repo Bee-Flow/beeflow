@@ -2,8 +2,9 @@
  * Project Store — PostgreSQL-backed projects for organizing chats.
  *
  * Tables:
- *   - projects:        core project data (name, instructions, owner)
- *   - project_shares:  sharing records (user / group)
+ *   - projects:          core project data (name, instructions, owner)
+ *   - project_shares:    sharing records (user / group), permission ∈ {viewer, editor}
+ *   - project_activity:  audit feed (member changes, edits, kb/conversation moves)
  */
 
 const crypto = require('crypto');
@@ -54,6 +55,38 @@ async function initDB() {
         CREATE INDEX IF NOT EXISTS idx_projects_org ON projects(organization_id);
         CREATE INDEX IF NOT EXISTS idx_project_shares_project ON project_shares(project_id);
         CREATE INDEX IF NOT EXISTS idx_project_shares_shared ON project_shares(shared_with_type, shared_with_id);
+
+        -- Migrate legacy permission vocabulary: 'view' → 'viewer', 'edit' → 'editor'
+        DO $$ BEGIN
+            UPDATE project_shares SET permission = 'viewer' WHERE permission = 'view';
+            UPDATE project_shares SET permission = 'editor' WHERE permission = 'edit';
+        EXCEPTION WHEN OTHERS THEN NULL;
+        END $$;
+
+        DO $$ BEGIN
+            ALTER TABLE project_shares ADD COLUMN IF NOT EXISTS invited_by TEXT;
+        EXCEPTION WHEN OTHERS THEN NULL;
+        END $$;
+
+        DO $$ BEGIN
+            ALTER TABLE project_shares
+                ADD CONSTRAINT project_shares_permission_chk
+                CHECK (permission IN ('viewer', 'editor'));
+        EXCEPTION WHEN OTHERS THEN NULL;
+        END $$;
+
+        CREATE TABLE IF NOT EXISTS project_activity (
+            id          TEXT PRIMARY KEY,
+            project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            actor_id    TEXT NOT NULL,
+            action      TEXT NOT NULL,
+            target_type TEXT,
+            target_id   TEXT,
+            details     JSONB DEFAULT '{}'::jsonb,
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_project_activity_project_created
+            ON project_activity(project_id, created_at DESC);
     `);
 
     initialized = true;
@@ -121,14 +154,16 @@ async function listUserProjects(userId, groupIds = []) {
     }
 
     const rows = await getAll(`
-        SELECT DISTINCT p.*, 
+        SELECT DISTINCT p.*,
             CASE WHEN p.owner_id = $1 THEN 'owner' ELSE COALESCE(
-                (SELECT ps2.permission FROM project_shares ps2 
+                (SELECT ps2.permission FROM project_shares ps2
                  WHERE ps2.project_id = p.id AND (
                      (ps2.shared_with_type = 'user' AND ps2.shared_with_id = $1)
                      ${groupPlaceholders.replace(/ps\./g, 'ps2.')}
-                 ) LIMIT 1),
-                'view'
+                 )
+                 ORDER BY CASE ps2.permission WHEN 'editor' THEN 0 ELSE 1 END
+                 LIMIT 1),
+                'viewer'
             ) END as user_permission
         FROM projects p
         LEFT JOIN project_shares ps ON ps.project_id = p.id
@@ -204,26 +239,59 @@ async function deleteProject(id) {
 
 // ── Sharing ──────────────────────────────────────────────
 
-async function shareProject(projectId, sharedWithType, sharedWithId, permission = 'view') {
+// Translate legacy permission vocabulary so external callers don't break.
+function normalizePermission(permission) {
+    if (permission === 'view') return 'viewer';
+    if (permission === 'edit') return 'editor';
+    if (permission === 'viewer' || permission === 'editor') return permission;
+    return 'viewer';
+}
+
+async function shareProject(projectId, sharedWithType, sharedWithId, permission = 'viewer', invitedBy = null) {
     await initDB();
+    const perm = normalizePermission(permission);
     // Check for existing share
     const existing = await getOne(
         'SELECT id FROM project_shares WHERE project_id = $1 AND shared_with_type = $2 AND shared_with_id = $3',
         [projectId, sharedWithType, sharedWithId]
     );
     if (existing) {
-        // Update permission
-        await run('UPDATE project_shares SET permission = $1 WHERE id = $2', [permission, existing.id]);
+        await run('UPDATE project_shares SET permission = $1 WHERE id = $2', [perm, existing.id]);
         return existing.id;
     }
 
     const id = crypto.randomUUID();
     await run(
-        `INSERT INTO project_shares (id, project_id, shared_with_type, shared_with_id, permission)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [id, projectId, sharedWithType, sharedWithId, permission]
+        `INSERT INTO project_shares (id, project_id, shared_with_type, shared_with_id, permission, invited_by)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [id, projectId, sharedWithType, sharedWithId, perm, invitedBy]
     );
     return id;
+}
+
+async function getShareById(shareId) {
+    await initDB();
+    const r = await getOne('SELECT * FROM project_shares WHERE id = $1', [shareId]);
+    if (!r) return null;
+    return {
+        id: r.id,
+        projectId: r.project_id,
+        sharedWithType: r.shared_with_type,
+        sharedWithId: r.shared_with_id,
+        permission: r.permission,
+        invitedBy: r.invited_by,
+        createdAt: r.created_at,
+    };
+}
+
+async function updateMemberRole(shareId, role) {
+    await initDB();
+    const perm = normalizePermission(role);
+    const { rowCount } = await run(
+        'UPDATE project_shares SET permission = $1 WHERE id = $2',
+        [perm, shareId]
+    );
+    return rowCount > 0;
 }
 
 async function unshareProject(shareId) {
@@ -270,34 +338,81 @@ async function unassignConversation(conversationId, tableName = 'direct_conversa
 // ── Access check ─────────────────────────────────────────
 
 /**
- * Check if a user has access to a project (owner OR shared).
+ * Returns the user's effective role on a project: 'owner' | 'editor' | 'viewer' | null.
+ * Owner trumps any share. For non-owners, returns the highest matching share permission
+ * across direct user shares and group shares.
+ *
  * @param {string} userId
  * @param {string} projectId
- * @param {string[]} groupIds - optional group IDs the user belongs to
- * @returns {Promise<boolean>}
+ * @param {string[]} groupIds - groups the user belongs to
+ */
+async function getProjectRole(userId, projectId, groupIds = []) {
+    await initDB();
+    if (!userId || !projectId) return null;
+    const project = await getOne('SELECT owner_id FROM projects WHERE id = $1', [projectId]);
+    if (!project) return null;
+    if (project.owner_id === userId) return 'owner';
+
+    const groupArr = (groupIds && groupIds.length > 0) ? groupIds : [''];
+    const row = await getOne(`
+        SELECT permission FROM project_shares
+        WHERE project_id = $1
+          AND ((shared_with_type = 'user'  AND shared_with_id = $2)
+            OR (shared_with_type = 'group' AND shared_with_id = ANY($3::text[])))
+        ORDER BY CASE permission WHEN 'editor' THEN 0 ELSE 1 END
+        LIMIT 1
+    `, [projectId, userId, groupArr]);
+    return row?.permission || null;
+}
+
+/**
+ * Backwards-compatible boolean wrapper. New code should call getProjectRole.
  */
 async function userHasAccess(userId, projectId, groupIds = []) {
+    const role = await getProjectRole(userId, projectId, groupIds);
+    return role !== null;
+}
+
+// ── Activity feed ────────────────────────────────────────
+
+async function logActivity(projectId, actorId, action, details = {}) {
     await initDB();
-    // Check ownership
-    const project = await getOne('SELECT owner_id FROM projects WHERE id = $1', [projectId]);
-    if (!project) return false;
-    if (project.owner_id === userId) return true;
-    // Check direct user share
-    const userShare = await getOne(
-        `SELECT id FROM project_shares WHERE project_id = $1 AND shared_with_type = 'user' AND shared_with_id = $2`,
-        [projectId, userId]
-    );
-    if (userShare) return true;
-    // Check group shares
-    if (groupIds.length > 0) {
-        const placeholders = groupIds.map((_, i) => `$${i + 3}`).join(', ');
-        const groupShare = await getOne(
-            `SELECT id FROM project_shares WHERE project_id = $1 AND shared_with_type = 'group' AND shared_with_id IN (${placeholders})`,
-            [projectId, ...groupIds]
+    if (!projectId || !actorId || !action) return null;
+    const id = crypto.randomUUID();
+    const targetType = details.targetType || null;
+    const targetId = details.targetId || null;
+    try {
+        await run(
+            `INSERT INTO project_activity (id, project_id, actor_id, action, target_type, target_id, details)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [id, projectId, actorId, action, targetType, targetId, JSON.stringify(details)]
         );
-        if (groupShare) return true;
+    } catch (err) {
+        console.warn('[ProjectStore] logActivity failed:', err.message);
+        return null;
     }
-    return false;
+    return id;
+}
+
+async function listActivity(projectId, limit = 50, offset = 0) {
+    await initDB();
+    const rows = await getAll(
+        `SELECT * FROM project_activity
+         WHERE project_id = $1
+         ORDER BY created_at DESC
+         LIMIT $2 OFFSET $3`,
+        [projectId, limit, offset]
+    );
+    return rows.map(r => ({
+        id: r.id,
+        projectId: r.project_id,
+        actorId: r.actor_id,
+        action: r.action,
+        targetType: r.target_type,
+        targetId: r.target_id,
+        details: r.details || {},
+        createdAt: r.created_at,
+    }));
 }
 
 module.exports = {
@@ -309,7 +424,13 @@ module.exports = {
     shareProject,
     unshareProject,
     getProjectShares,
+    getShareById,
+    updateMemberRole,
     assignConversation,
     unassignConversation,
+    getProjectRole,
     userHasAccess,
+    logActivity,
+    listActivity,
+    normalizePermission,
 };
