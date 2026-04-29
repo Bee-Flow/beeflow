@@ -106,19 +106,23 @@ class ClaudeProvider extends BaseProvider {
             });
 
         // ─── Prompt caching ──────────────────────────────────────────
-        // Anthropic allows up to 4 cache_control breakpoints per request. The
-        // adapter already places one on the system prompt (extractSystem) and
-        // one on the last tool definition (see buildTools). Here we place up
-        // to two more:
+        // Anthropic allows up to 4 cache_control breakpoints per request and
+        // requires longer TTLs to appear earlier in the wire order. The
+        // adapter already places one 1h breakpoint on the first system block
+        // (extractSystem) which caches "tools + stable system" together.
+        // Here we add up to two 5-min breakpoints further down the request:
         //
         //   (a) Immediately after the compaction summary block, if present.
-        //       This lets Anthropic cache (system + tools + summary) as a
+        //       This lets Anthropic cache (tools + system + summary) as a
         //       durable prefix that stays stable across many turns, even as
         //       the recent-window messages keep changing.
         //
         //   (b) On the last genuine user text message. This creates a
         //       shorter-lived breakpoint so the next turn can still hit the
         //       cache for "system + tools + summary + full recent history".
+        //
+        // Total breakpoints used: 1 (system, 1h) + up to 2 (5-min) = 3 max,
+        // safely under the 4-breakpoint cap.
         //
         // Both are skipped for very short conversations (<4 messages) where
         // caching overhead isn't worth it. cache_control is only valid on
@@ -176,12 +180,26 @@ class ClaudeProvider extends BaseProvider {
     extractSystem(messages) {
         const systemMessages = messages.filter((m) => m?.role === "system");
         if (!systemMessages.length) return undefined;
-        const text = systemMessages
-            .map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content)))
-            .join("\n\n");
-        // Return as array of content blocks with cache_control on the last block
-        // This enables Anthropic prompt caching — 90% cost reduction on cached prefix
-        return [{ type: "text", text, cache_control: { type: "ephemeral" } }];
+
+        // Per-message blocks let the caller layer caching by stability:
+        //   - First system message = stable identity + tooling + project
+        //     context. Gets a 1-hour ephemeral breakpoint so an active user
+        //     hitting the same agent for an afternoon reads from cache for
+        //     hours at -90%, paying the +100% write only once. Min prefix
+        //     length per Opus 4.x is 4096 tokens; shorter prefixes silently
+        //     bypass caching.
+        //   - Subsequent system messages (e.g. the volatile timestamp emitted
+        //     by directChat) get NO cache_control so they don't churn writes.
+        //     Anthropic still serves cached prefix from the first breakpoint.
+        const blocks = systemMessages.map((m, i) => {
+            const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+            const block = { type: "text", text };
+            if (i === 0) {
+                block.cache_control = { type: "ephemeral", ttl: "1h" };
+            }
+            return block;
+        });
+        return blocks;
     }
 
     // ─── Thinking/Reasoning ──────────────────────────────────────
@@ -249,10 +267,12 @@ class ClaudeProvider extends BaseProvider {
 
         if (options.tools && options.tools.length > 0) {
             const normalizedTools = this.normalizeTools(options.tools);
-            // Add cache_control on the last tool for prompt caching
-            if (normalizedTools.length > 0) {
-                normalizedTools[normalizedTools.length - 1].cache_control = { type: "ephemeral" };
-            }
+            // Tools come before system in Anthropic's wire format. Per the
+            // mixed-TTL rule ("longer TTL must appear first"), placing a
+            // 5-min breakpoint on tools while system has a 1-hour breakpoint
+            // would violate ordering. The system block-1 1h breakpoint
+            // already caches "tools + system" as a single prefix, so the
+            // standalone tools breakpoint is redundant — drop it.
             params.tools = normalizedTools;
             if (options.toolChoice === "auto") params.tool_choice = { type: "auto" };
             if (options.toolChoice === "any" || options.toolChoice === "required") {

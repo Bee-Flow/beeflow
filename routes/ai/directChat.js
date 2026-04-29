@@ -700,18 +700,47 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             _nowStr = new Date().toISOString();
         }
 
+        // System prompt is split into two messages so per-provider caching
+        // can place a long-lived breakpoint on the stable portion. The
+        // timestamp is genuinely volatile (changes every second) and would
+        // poison any cache that includes it.
+        //   1. stable: identity / tool hint / memory / project / notebook / skills
+        //   2. volatile: the current timestamp
+        // Providers that join system messages (Gemini, OpenAI Responses) still
+        // see the same effective prompt; Claude's extractSystem emits per-
+        // message blocks with the right cache_control on the stable one.
         let messages = [
-            {
-                role: 'system', content: basePrompt + toolHint + memoryContext + notebookspaceContext + projectContext + skillsContext + `\nNow: ${_nowStr}`
-            }
+            { role: 'system', content: basePrompt + toolHint + memoryContext + notebookspaceContext + projectContext + skillsContext },
+            { role: 'system', content: `Now: ${_nowStr}` },
         ];
 
         // Add conversation history — preserve the `attachments` sidecar so the
         // hydrator below can rebuild multimodal content (images stay visible
         // across turns). Stripping sidecar fields here is what used to cause
         // the AI to "lose" uploaded images one turn after the upload.
-        if (history && Array.isArray(history)) {
-            for (const msg of history) {
+        //
+        // Source-of-truth rule:
+        //   - If the client sent `history` in the body, use it. This covers
+        //     brand-new conversations (no DB row yet) and edit/retry flows
+        //     where the client has truncated history before the edit point.
+        //   - If `history` is missing/empty AND we have a conversationId,
+        //     fall back to the persisted message rows. This eliminates the
+        //     class of bugs where the client's in-memory history drifts from
+        //     the durable record (e.g. tool messages stripped, page reload).
+        let resolvedHistory = Array.isArray(history) ? history : null;
+        if ((!resolvedHistory || resolvedHistory.length === 0) && conversationId) {
+            try {
+                const persisted = await agentStore.getDirectConversation(conversationId, userId);
+                if (persisted && Array.isArray(persisted.messages) && persisted.messages.length > 0) {
+                    resolvedHistory = persisted.messages;
+                    console.log(`[DirectChat] No client history — loaded ${resolvedHistory.length} persisted messages from DB`);
+                }
+            } catch (loadErr) {
+                console.warn('[DirectChat] Failed to load persisted history:', loadErr.message);
+            }
+        }
+        if (resolvedHistory && resolvedHistory.length > 0) {
+            for (const msg of resolvedHistory) {
                 if (msg.role === 'user' || msg.role === 'assistant') {
                     const entry = { role: msg.role, content: msg.content };
                     if (Array.isArray(msg.attachments) && msg.attachments.length > 0) {
@@ -990,6 +1019,24 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             if (message) contentParts.push({ type: 'text', text: message });
             const storageStore = require('../../stores/storageStore');
             const crypto = require('crypto');
+            const { persistExtractedText } = require('../../core/extractedTextStore');
+
+            // Sidecar carries the persistent representation of an attachment.
+            // Big extractions are tiered to RustFS via persistExtractedText so
+            // meta_json doesn't grow unbounded, while the head+tail snippet
+            // stays inline for replay.
+            const pushAttachment = async (base, fullText) => {
+                if (!fullText) {
+                    persistedAttachments.push(base);
+                    return;
+                }
+                const tiered = await persistExtractedText(fullText, userId, base.name);
+                persistedAttachments.push({
+                    ...base,
+                    extractedText: tiered.extractedText,
+                    ...(tiered.extractionKey ? { extractionKey: tiered.extractionKey } : {}),
+                });
+            };
 
             for (const att of attachments) {
                 if (att.type && att.type.startsWith('image/') && att.content) {
@@ -1032,7 +1079,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                     // Google Drive file — already exported as plain text, inject directly
                     const driveText = `--- Google Drive: ${att.name} ---\n${att.content}\n--- End of ${att.name} ---`;
                     contentParts.push({ type: 'text', text: driveText });
-                    persistedAttachments.push({ name: att.name, type: 'google-drive', extractedText: driveText });
+                    await pushAttachment({ name: att.name, type: 'google-drive' }, driveText);
                 } else if (att.content && att.type && att.type.includes('pdf')) {
                     // PDF — unified pipeline (server/core/attachmentExtractor.js):
                     //   pdfjs → Azure Document Intelligence → Mistral OCR → vision fallback.
@@ -1061,21 +1108,45 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
 
                         if (result.kind === 'text') {
                             const docText = `${formatTextHeader(att, result)}\n---\n${result.text}\n---`;
-                            contentParts.push({ type: 'text', text: docText });
-                            persistedAttachments.push({ name: att.name, type: att.type, url: pdfProxyUrl, extractedText: docText });
+                            const isClaude = (config.providerType || '').toLowerCase() === 'claude' || (config.providerType || '').toLowerCase() === 'anthropic';
+                            if (isClaude) {
+                                // Claude has native PDF support — send the binary
+                                // as a document block so the model can do its own
+                                // visual + text understanding (charts, diagrams,
+                                // tables). No explicit cache_control here; the
+                                // last-user-text breakpoint placed by Claude's
+                                // normalizeMessages already covers this prefix.
+                                // Persist the extracted text to the sidecar so
+                                // replays (and provider switches) still have
+                                // something to show.
+                                const mediaType = att.type && att.type.includes('pdf') ? att.type : 'application/pdf';
+                                contentParts.push({
+                                    type: 'document',
+                                    source: { type: 'base64', media_type: mediaType, data: base64Data },
+                                });
+                            } else {
+                                contentParts.push({ type: 'text', text: docText });
+                            }
+                            await pushAttachment({ name: att.name, type: att.type, url: pdfProxyUrl }, docText);
                         } else if (result.kind === 'images') {
                             // Vision fallback — inline a header note, then the page images.
-                            contentParts.push({ type: 'text', text: formatImagesHeader(att, result) });
+                            const visionHeader = formatImagesHeader(att, result);
+                            contentParts.push({ type: 'text', text: visionHeader });
                             for (const img of result.images) {
                                 contentParts.push({
                                     type: 'image_url',
                                     image_url: { url: `data:${img.mimeType};base64,${img.base64}`, detail: 'auto' },
                                 });
                             }
-                            persistedAttachments.push({ name: att.name, type: att.type, url: pdfProxyUrl });
+                            // Persist the header so replays at least know which
+                            // file was visually analysed; the rendered pages
+                            // themselves aren't re-uploaded (would be expensive
+                            // and is mostly recoverable via the original PDF URL).
+                            await pushAttachment({ name: att.name, type: att.type, url: pdfProxyUrl }, visionHeader);
                         } else {
-                            contentParts.push({ type: 'text', text: formatFailureNote(att, result) });
-                            persistedAttachments.push({ name: att.name, type: att.type, url: pdfProxyUrl });
+                            const failureNote = formatFailureNote(att, result);
+                            contentParts.push({ type: 'text', text: failureNote });
+                            await pushAttachment({ name: att.name, type: att.type, url: pdfProxyUrl }, failureNote);
                         }
                     } catch (e) {
                         console.error(`[DirectChat] PDF processing failed for ${att.name}:`, e.message);
@@ -1130,12 +1201,13 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                         if (docxText && !docxText.startsWith('[Document:')) {
                             const docText = `[Word Document: ${att.name}]\n---\n${docxText}\n---`;
                             contentParts.push({ type: 'text', text: docText });
-                            persistedAttachments.push({ name: att.name, type: att.type, url: docxProxyUrl, extractedText: docText });
+                            await pushAttachment({ name: att.name, type: att.type, url: docxProxyUrl }, docText);
                             console.log(`[DirectChat] Extracted ${docxText.length} chars from DOCX: ${att.name}`);
                         } else {
                             // mammoth extraction returned empty/error — fall back to container
-                            contentParts.push({ type: 'text', text: `[Word Document: ${att.name} — no extractable text, may contain only images]` });
-                            persistedAttachments.push({ name: att.name, type: att.type, url: docxProxyUrl });
+                            const note = `[Word Document: ${att.name} — no extractable text, may contain only images]`;
+                            contentParts.push({ type: 'text', text: note });
+                            await pushAttachment({ name: att.name, type: att.type, url: docxProxyUrl }, note);
                         }
                     } catch (e) {
                         console.error(`[DirectChat] DOCX processing failed for ${att.name}:`, e.message);
@@ -1195,11 +1267,12 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                         if (sheetText && !sheetText.startsWith('[Spreadsheet:')) {
                             const docText = `[Spreadsheet: ${att.name}]\n---\n${sheetText}\n---`;
                             contentParts.push({ type: 'text', text: docText });
-                            persistedAttachments.push({ name: att.name, type: att.type, url: sheetProxyUrl, extractedText: docText });
+                            await pushAttachment({ name: att.name, type: att.type, url: sheetProxyUrl }, docText);
                             console.log(`[DirectChat] Extracted ${sheetText.length} chars from spreadsheet: ${att.name}`);
                         } else {
-                            contentParts.push({ type: 'text', text: sheetText || `[Spreadsheet: ${att.name} — no data found]` });
-                            persistedAttachments.push({ name: att.name, type: att.type, url: sheetProxyUrl });
+                            const note = sheetText || `[Spreadsheet: ${att.name} — no data found]`;
+                            contentParts.push({ type: 'text', text: note });
+                            await pushAttachment({ name: att.name, type: att.type, url: sheetProxyUrl }, note);
                         }
                     } catch (e) {
                         console.error(`[DirectChat] Spreadsheet processing failed for ${att.name}:`, e.message);
@@ -1227,11 +1300,9 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                         console.warn(`[DirectChat] Failed to upload file to RustFS: ${storErr.message}`);
                     }
 
-                    contentParts.push({
-                        type: 'text',
-                        text: `[Attached file: ${filename}] This file has been uploaded${fileProxyUrl ? ' and stored' : ''}.${att.type ? ' Type: ' + att.type : ''}`
-                    });
-                    persistedAttachments.push({ name: att.name, type: att.type, url: fileProxyUrl });
+                    const note = `[Attached file: ${filename}] This file has been uploaded${fileProxyUrl ? ' and stored' : ''}.${att.type ? ' Type: ' + att.type : ''}`;
+                    contentParts.push({ type: 'text', text: note });
+                    await pushAttachment({ name: att.name, type: att.type, url: fileProxyUrl }, note);
                 }
             }
             messages.push({ role: 'user', content: contentParts });
@@ -2395,6 +2466,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                 completion_tokens: streamUsage?.completion_tokens || 0,
                 total_tokens: streamUsage?.total_tokens || ((streamUsage?.prompt_tokens || 0) + (streamUsage?.completion_tokens || 0)),
                 cached_tokens: streamUsage?.cached_tokens || 0,
+                cache_creation_tokens: streamUsage?.cache_creation_tokens || 0,
                 source: 'direct_chat',
                 duration_ms: Date.now() - streamStartTime,
                 organization_id: userOrgId || null,

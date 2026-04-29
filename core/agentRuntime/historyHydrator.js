@@ -68,9 +68,35 @@ function refreshExistingContentArray(content) {
     });
 }
 
+// Per-attachment cap when re-injecting persisted extracted text into history.
+// 30k chars ≈ 7-8k tokens — generous enough to fully restore a typical PDF or
+// DOCX, but small enough that 3-4 attachments don't blow the context window.
+// Larger attachments are tail-truncated with a marker so the model knows the
+// rest is recoverable via the storageKey/extractionKey.
+const REINJECT_MAX_CHARS = 30_000;
+
+function emitExtractedText(att, name) {
+    const raw = typeof att.extractedText === 'string' ? att.extractedText : '';
+    if (!raw) return null;
+    if (raw.length <= REINJECT_MAX_CHARS) {
+        return { type: 'text', text: raw };
+    }
+    const head = raw.slice(0, REINJECT_MAX_CHARS - 200);
+    const ref = att.extractionKey ? ` storageKey=${att.extractionKey}` : (att.storageKey ? ` storageKey=${att.storageKey}` : '');
+    return {
+        type: 'text',
+        text: `${head}\n\n[…${name} truncated for replay; full text available on demand${ref}]`,
+    };
+}
+
 /**
  * Build image_url / text blocks for a list of persisted attachments.
  * Skips attachments without a recoverable URL.
+ *
+ * If an attachment carries `extractedText` from its original turn, we
+ * re-inject it instead of the bare `[… previously attached]` placeholder.
+ * This is the load-bearing fix for "AI forgot the file": placeholders never
+ * gave the model anything to reason about; the persisted text does.
  */
 async function attachmentsToContentBlocks(attachments, userId) {
     const blocks = [];
@@ -100,14 +126,21 @@ async function attachmentsToContentBlocks(attachments, userId) {
             if (url) {
                 blocks.push({ type: 'image_url', image_url: { url, detail: 'auto' } });
             } else {
-                blocks.push({ type: 'text', text: `[Image previously attached: ${name}]` });
+                const reinjected = emitExtractedText(att, name);
+                blocks.push(reinjected || { type: 'text', text: `[Image previously attached: ${name}]` });
             }
-        } else if (type.includes('pdf')) {
-            // PDFs were OCR-expanded into the text content on their original
-            // turn. Re-extracting here would double-count tokens.
-            blocks.push({ type: 'text', text: `[PDF previously attached: ${name}]` });
         } else {
-            blocks.push({ type: 'text', text: `[File previously attached: ${name}]` });
+            // PDF / DOCX / XLSX / Drive / generic — prefer the persisted
+            // extracted text from the original turn. Falls back to a typed
+            // placeholder so the model still sees that a file exists.
+            const reinjected = emitExtractedText(att, name);
+            if (reinjected) {
+                blocks.push(reinjected);
+            } else if (type.includes('pdf')) {
+                blocks.push({ type: 'text', text: `[PDF previously attached: ${name}]` });
+            } else {
+                blocks.push({ type: 'text', text: `[File previously attached: ${name}]` });
+            }
         }
     }
     return blocks;

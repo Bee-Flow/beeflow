@@ -311,7 +311,7 @@ class GoogleProvider extends BaseProvider {
                 config: {
                     displayName: `beeflow-${hash.substring(0, 8)}`,
                     systemInstruction,
-                    ttl: '600s', // 10 minutes
+                    ttl: '3600s', // 1 hour — matches Anthropic's longest TTL
                 },
                 contents: [], // Empty — we only cache system instruction + tools
             };
@@ -323,10 +323,13 @@ class GoogleProvider extends BaseProvider {
             const cache = await ai.caches.create(cacheConfig);
             const cacheName = cache.name;
 
-            // Store in memory with expiration
+            // Store in memory expiring slightly before the server-side TTL so
+            // we don't try to read a cache that has just been GC'd. Active
+            // users hitting the same agent for an afternoon now amortize a
+            // single cache write across many reads at -90%.
             this._cacheMap.set(hash, {
                 cacheName,
-                expiresAt: Date.now() + 9 * 60 * 1000, // 9 min (slightly before 10 min TTL)
+                expiresAt: Date.now() + 59 * 60 * 1000,
             });
 
             console.log(`[Google] Created explicit cache: ${cacheName} (~${estimatedTokens} tokens)`);

@@ -22,6 +22,7 @@ async function initDB() {
             completion_tokens INTEGER DEFAULT 0,
             total_tokens INTEGER DEFAULT 0,
             cached_tokens INTEGER DEFAULT 0,
+            cache_creation_tokens INTEGER DEFAULT 0,
             tool_name TEXT,
             source TEXT DEFAULT 'unknown',
             duration_ms INTEGER DEFAULT 0,
@@ -32,6 +33,10 @@ async function initDB() {
     `);
     // Add cached_tokens column if table already exists (safe for existing installs)
     try { await exec(`ALTER TABLE ai_usage_log ADD COLUMN IF NOT EXISTS cached_tokens INTEGER DEFAULT 0`); } catch (e) { /* ignore */ }
+    // cache_creation_tokens — Anthropic returns this separately so we can tell
+    // a write-and-discard (paid +25%/100% surcharge) apart from a true read
+    // (paid -90%). Without the split, dashboards conflate the two.
+    try { await exec(`ALTER TABLE ai_usage_log ADD COLUMN IF NOT EXISTS cache_creation_tokens INTEGER DEFAULT 0`); } catch (e) { /* ignore */ }
     await exec(`CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON ai_usage_log(timestamp DESC)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_usage_model ON ai_usage_log(model)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_usage_agent ON ai_usage_log(agent_id)`);
@@ -66,12 +71,13 @@ async function logUsage(entry) {
         const promptTokens = entry.prompt_tokens || 0;
         const completionTokens = entry.completion_tokens || 0;
         const cachedTokens = entry.cached_tokens || 0;
+        const cacheCreationTokens = entry.cache_creation_tokens || 0;
         const model = entry.model || 'unknown';
         // Cache-aware cost: cached input tokens are billed at a provider-specific discount
         const cost = computeCost(model, promptTokens, completionTokens, cachedTokens);
         await run(`
-            INSERT INTO ai_usage_log (timestamp, user_id, agent_id, agent_name, agent_type, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, tool_name, source, duration_ms, organization_id, estimated_cost, conversation_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            INSERT INTO ai_usage_log (timestamp, user_id, agent_id, agent_name, agent_type, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_creation_tokens, tool_name, source, duration_ms, organization_id, estimated_cost, conversation_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
         `, [
             entry.timestamp || now,
             entry.user_id || null,
@@ -83,6 +89,7 @@ async function logUsage(entry) {
             completionTokens,
             entry.total_tokens || (promptTokens + completionTokens),
             cachedTokens,
+            cacheCreationTokens,
             entry.tool_name || null,
             entry.source || 'unknown',
             entry.duration_ms || 0,
@@ -146,6 +153,7 @@ async function getUsageSummary(filters = {}) {
             COALESCE(SUM(completion_tokens), 0) as total_completion_tokens,
             COALESCE(SUM(total_tokens), 0) as total_tokens,
             COALESCE(SUM(cached_tokens), 0) as total_cached_tokens,
+            COALESCE(SUM(cache_creation_tokens), 0) as total_cache_creation_tokens,
             COALESCE(AVG(duration_ms), 0) as avg_duration_ms,
             COUNT(DISTINCT model) as unique_models,
             COUNT(DISTINCT agent_id) as unique_agents,
@@ -165,6 +173,7 @@ async function getUsageByModel(filters = {}) {
             COALESCE(SUM(completion_tokens), 0) as completion_tokens,
             COALESCE(SUM(total_tokens), 0) as total_tokens,
             COALESCE(SUM(cached_tokens), 0) as cached_tokens,
+            COALESCE(SUM(cache_creation_tokens), 0) as cache_creation_tokens,
             COALESCE(AVG(duration_ms), 0) as avg_duration_ms,
             COALESCE(SUM(estimated_cost), 0) as estimated_cost
         FROM ai_usage_log ${where}

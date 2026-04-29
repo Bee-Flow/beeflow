@@ -11,6 +11,11 @@
 const COMPACTION_THRESHOLD = 10;  // Start compacting after this many messages
 const RECENT_WINDOW = 6;         // Keep this many recent messages verbatim
 const TOOL_RESULT_MAX_LEN = 500; // Truncate tool results beyond this in recent window
+// Per-file cap when carrying extracted text forward into the summary block.
+// Smaller than the live-replay cap (30k) because we may carry several files,
+// and the older they are the less likely the user is asking for verbatim
+// details from them. Anything larger gets head-truncated with a marker.
+const SUMMARY_FILE_TEXT_MAX_CHARS = 8_000;
 
 /**
  * Compact a message array for efficient LLM consumption.
@@ -52,26 +57,57 @@ async function compactMessages(messages, options = {}) {
         }
     }
 
+    // Hoist unique attachment sidecars from old messages so file context
+    // survives compaction. Without this, a PDF uploaded on turn 2 would be
+    // visible to the model up to turn 10 (via the historyHydrator extractedText
+    // re-injection) and then disappear once compaction folds turn 2 into the
+    // summary. We keep per-file extracted text on the summary message itself.
+    const hoistedAttachments = collectUniqueAttachments(oldMessages);
+
     // Generate summary of old messages (incorporates existing summary if present)
-    const newSummary = await generateSummary(oldMessages, options.existingSummary, options.summaryModelId, options.userOrgId);
+    const newSummary = await generateSummary(oldMessages, options.existingSummary, options.summaryModelId, options.userOrgId, hoistedAttachments);
 
     // Build compacted message array: system + summary-as-context + recent messages
     const compacted = [
         ...systemMessages,
     ];
 
-    if (newSummary || hoistedImages.length > 0) {
+    if (newSummary || hoistedImages.length > 0 || hoistedAttachments.length > 0) {
         const summaryText = newSummary
             ? `[Conversation Summary — earlier messages have been compacted]\n${newSummary}`
-            : '[Earlier messages have been compacted. Images from those turns are still attached below.]';
+            : '[Earlier messages have been compacted. Files and images from those turns are still attached below.]';
 
-        // Attach hoisted images onto the summary user message so the model sees
-        // them as context belonging to the summarised history.
-        const summaryContent = hoistedImages.length > 0
-            ? [{ type: 'text', text: summaryText }, ...hoistedImages]
+        // Build the summary content: narrative + extracted text per hoisted
+        // file (so the model can still answer detail questions about earlier
+        // attachments) + the actual image_url blocks for hoisted images.
+        const fileBlocks = hoistedAttachments
+            .map(att => {
+                const raw = typeof att.extractedText === 'string' ? att.extractedText : '';
+                if (!raw) return null;
+                if (raw.length <= SUMMARY_FILE_TEXT_MAX_CHARS) {
+                    return { type: 'text', text: raw };
+                }
+                const head = raw.slice(0, SUMMARY_FILE_TEXT_MAX_CHARS - 200);
+                const ref = att.storageKey ? ` storageKey=${att.storageKey}` : '';
+                return {
+                    type: 'text',
+                    text: `${head}\n\n[…${att.name || 'file'} truncated for summary; full text available on demand${ref}]`,
+                };
+            })
+            .filter(Boolean);
+
+        const hasMultimodalParts = hoistedImages.length > 0 || fileBlocks.length > 0;
+        const summaryContent = hasMultimodalParts
+            ? [{ type: 'text', text: summaryText }, ...fileBlocks, ...hoistedImages]
             : summaryText;
 
-        compacted.push({ role: 'user', content: summaryContent });
+        // Carry the sidecar forward too, so any future hydration pass (e.g. on
+        // a retry) can still see which files this summary represents.
+        const summaryMsg = { role: 'user', content: summaryContent };
+        if (hoistedAttachments.length > 0) {
+            summaryMsg.attachments = hoistedAttachments.map(({ extractedText, ...rest }) => rest);
+        }
+        compacted.push(summaryMsg);
         compacted.push({
             role: 'assistant',
             content: 'Understood, I have the context from our earlier conversation. Let\'s continue.',
@@ -86,9 +122,32 @@ async function compactMessages(messages, options = {}) {
 }
 
 /**
- * Generate a summary of conversation messages using the fast tier model.
+ * Collect unique attachment sidecars across an array of messages.
+ * Dedupe key prefers storageKey, falls back to url, finally name+type.
  */
-async function generateSummary(oldMessages, existingSummary, summaryModelId, userOrgId = null) {
+function collectUniqueAttachments(messages) {
+    const seen = new Set();
+    const out = [];
+    for (const msg of messages) {
+        if (!Array.isArray(msg.attachments) || msg.attachments.length === 0) continue;
+        for (const att of msg.attachments) {
+            const key = att.storageKey || att.url || `${att.name || ''}::${att.type || ''}`;
+            if (!key || seen.has(key)) continue;
+            seen.add(key);
+            out.push(att);
+        }
+    }
+    return out;
+}
+
+/**
+ * Generate a summary of conversation messages using the fast tier model.
+ *
+ * If hoistedAttachments are provided, the summarizer is given a separate
+ * inventory block and instructed to preserve those file references verbatim.
+ * The narrative stays under 200 words; the inventory is rendered alongside.
+ */
+async function generateSummary(oldMessages, existingSummary, summaryModelId, userOrgId = null, hoistedAttachments = []) {
     const llmClient = require('./llmClient');
 
     // Build the content to summarize
@@ -122,6 +181,13 @@ async function generateSummary(oldMessages, existingSummary, summaryModelId, use
         }
     }
 
+    if (hoistedAttachments && hoistedAttachments.length > 0) {
+        const inventory = hoistedAttachments
+            .map(att => `- ${att.name || 'unnamed'} (${att.type || 'unknown'})`)
+            .join('\n');
+        contentToSummarize += `\n---\nFiles attached during these turns (full text is preserved separately, do NOT re-summarize their contents in your narrative):\n${inventory}\n`;
+    }
+
     // Resolve model — handle tier: prefix (EU-aware)
     let modelId = summaryModelId || 'tier:fast';
     if (modelId.startsWith('tier:')) {
@@ -138,7 +204,7 @@ async function generateSummary(oldMessages, existingSummary, summaryModelId, use
         const result = await llmClient.chat(modelId, [
             {
                 role: 'system',
-                content: 'You are a conversation summarizer. Produce a concise summary of the conversation below. Include: key topics discussed, important decisions or conclusions, specific file/code/data references, and any pending tasks or questions. Keep it under 200 words. Output only the summary, no preamble.',
+                content: 'You are a conversation summarizer. Produce a concise summary of the conversation below. Include: key topics discussed, important decisions or conclusions, specific file/code/data references named verbatim, and any pending tasks or questions. If a "Files attached during these turns" inventory is provided, mention each file by name in your narrative but do NOT attempt to summarize their contents — the full text is preserved separately. Keep the narrative under 200 words. Output only the summary, no preamble.',
             },
             { role: 'user', content: contentToSummarize },
         ], { maxTokens: 300, temperature: 0.2 });
@@ -177,4 +243,4 @@ function pruneToolResults(messages) {
     });
 }
 
-module.exports = { compactMessages, COMPACTION_THRESHOLD };
+module.exports = { compactMessages, COMPACTION_THRESHOLD, collectUniqueAttachments };
