@@ -184,7 +184,7 @@ async function listUserProjects(userId, groupIds = []) {
         ownerId: row.owner_id,
         organizationId: row.organization_id,
         extractMemories: row.extract_memories,
-        permission: row.user_permission || 'view',
+        permission: row.user_permission || 'viewer',
         createdAt: row.created_at,
         updatedAt: row.updated_at,
     }));

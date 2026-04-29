@@ -142,7 +142,7 @@ function requireAuth(req, res, next) {
 // ─── Streaming Direct Chat ───────────────────────────────────────
 
 router.post('/chat/direct/stream', requireAuth, async (req, res) => {
-    const { message, conversationId, modelTier, history, attachments, imageGenSettings, nanoBananaSettings, disabledMedia, webSearchEnabled = true, notebookspaceContent, notebookspaceSelection, projectId, timezone, systemPrompt: requestSystemPrompt, activeSkillIds, reasoningEffort: requestReasoningEffort, sessionSkills: requestSessionSkills, activatedSessionSkillIds: requestActivatedSessionSkillIds } = req.body;
+    const { message, conversationId, modelTier, history, attachments, imageGenSettings, nanoBananaSettings, disabledMedia, webSearchEnabled = true, notebookspaceContent, notebookspaceSelection, projectId, timezone, systemPrompt: requestSystemPrompt, activeSkillIds, reasoningEffort: requestReasoningEffort, sessionSkills: requestSessionSkills, activatedSessionSkillIds: requestActivatedSessionSkillIds, knowledgeBaseIds: requestedKbIds } = req.body;
     const userId = req.session.user.id;
 
     if (!message && (!attachments || attachments.length === 0)) {
@@ -555,6 +555,53 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                 }
             } catch (projErr) {
                 console.warn('[DirectChat] Project context failed:', projErr.message);
+            }
+        }
+
+        // ─── Direct-chat attached KBs ───────────────────────────────
+        // User picked KBs via the input-area picker. Validate access (owner,
+        // super-admin, or org-published + group-allowed) before searching.
+        if (Array.isArray(requestedKbIds) && requestedKbIds.length > 0) {
+            try {
+                const kbStore = require('../../stores/knowledgeBases');
+                const userGroupsRaw = (await userStore.getUser(userId))?.groups;
+                const userGroups = Array.isArray(userGroupsRaw)
+                    ? userGroupsRaw
+                    : (() => { try { return JSON.parse(userGroupsRaw || '[]'); } catch (_) { return []; } })();
+                const userOrgIds = orgIdsForTiers; // null = super admin
+                const isSuperAdmin = userOrgIds === null;
+
+                const accessibleKbIds = [];
+                for (const kbId of requestedKbIds) {
+                    const kb = await kbStore.getKB(kbId);
+                    if (!kb) continue;
+                    if (kb.tenant_id === userId || isSuperAdmin) { accessibleKbIds.push(kb.id); continue; }
+                    if (kb.organization_id && userOrgIds && userOrgIds.has(kb.organization_id) && kb.is_published) {
+                        let groups = [];
+                        try { groups = JSON.parse(kb.shared_groups || '[]'); } catch { groups = []; }
+                        if (!Array.isArray(groups) || groups.length === 0 || groups.some(g => userGroups.includes(g))) {
+                            accessibleKbIds.push(kb.id);
+                        }
+                    }
+                }
+
+                if (accessibleKbIds.length > 0) {
+                    const { quickKBSearch } = require('../../core/agentRuntime/knowledgeSearch');
+                    const kbResults = await quickKBSearch(userId, accessibleKbIds, message, { topK: 6 });
+                    if (kbResults.length > 0) {
+                        const kbText = kbResults.map((c, i) => {
+                            const src = c.source_uri || c.title || 'KB';
+                            return `### Source ${i + 1}: ${src}\n${c.content}`;
+                        }).join('\n\n');
+                        projectContext += `\n\n[ATTACHED KNOWLEDGE BASES]\nRelevant information from the knowledge bases attached to this chat:\n${kbText}`;
+                        console.log(`[DirectChat] Injected ${kbResults.length} KB chunks from ${accessibleKbIds.length} attached KBs`);
+                    }
+                }
+                if (accessibleKbIds.length < requestedKbIds.length) {
+                    console.warn(`[DirectChat] User ${userId} requested ${requestedKbIds.length} KBs but only ${accessibleKbIds.length} were accessible`);
+                }
+            } catch (kbErr) {
+                console.warn('[DirectChat] Direct-chat KB search failed:', kbErr.message);
             }
         }
 

@@ -313,6 +313,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     // Assign new conversation to project if projectId provided
     let extractMemoriesEnabled = false;
     let validProjectId = null;
+    let validProject = null;
     if (messageMetadata.projectId) {
         try {
             const projectStore = require('../../stores/projectStore');
@@ -322,6 +323,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 const hasAccess = await projectStore.userHasAccess(userId, messageMetadata.projectId);
                 if (hasAccess) {
                     validProjectId = messageMetadata.projectId;
+                    validProject = project;
                     extractMemoriesEnabled = project.extractMemories === true;
                 } else {
                     console.warn(`[AgentRuntime] User ${userId} has no access to project ${messageMetadata.projectId}, skipping project context`);
@@ -768,6 +770,38 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     // prevents the same chunk from being re-serialized into the tool message
     // (tokens) and re-emitted to the UI (visual noise).
     const _seenChunkIds = new Set();
+
+    // ============ PROJECT CONTEXT ============
+    // Mirrors directChat.js project handling: inject the project's custom
+    // instructions and auto-search its knowledge bases. Skipped for embed-enabled
+    // agents — same privacy guard used for memory injection.
+    if (validProject && !agent.embed_enabled) {
+        if (validProject.customInstructions && validProject.customInstructions.trim()) {
+            systemPrompt += `\n\n[PROJECT INSTRUCTIONS — "${validProject.name}"]\n${validProject.customInstructions}`;
+        }
+        const kbIds = validProject.knowledgeBaseIds || [];
+        if (kbIds.length > 0) {
+            try {
+                const { quickKBSearch } = require('./knowledgeSearch');
+                const kbResults = await quickKBSearch(userId, kbIds, userMessage, { topK: 6 });
+                if (kbResults.length > 0) {
+                    const kbText = kbResults.map((c, i) => {
+                        const src = c.source_uri || c.title || 'KB';
+                        return `### Source ${i + 1}: ${src}\n${c.content}`;
+                    }).join('\n\n');
+                    systemPrompt += `\n\n[PROJECT KNOWLEDGE BASE — "${validProject.name}"]\nRelevant information from this project's knowledge base:\n${kbText}`;
+                    _kbSources.push(...kbResults.map(c => ({
+                        document_id: c.document_id, kb_id: c.kb_id,
+                        title: c.title, source_uri: c.source_uri,
+                        score: c.score, snippet: (c.content || '').slice(0, 240),
+                    })));
+                    console.log(`[AgentRuntime] Injected ${kbResults.length} KB chunks from project "${validProject.name}"`);
+                }
+            } catch (kbErr) {
+                console.warn('[AgentRuntime] Project KB search failed:', kbErr.message);
+            }
+        }
+    }
 
     // ============ VECTOR KNOWLEDGE BASE ============
     // When the kb_search TOOL is available, skip auto-injection — let the LLM

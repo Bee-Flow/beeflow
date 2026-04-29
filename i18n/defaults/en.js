@@ -106,7 +106,7 @@ const GUI_DEFAULTS = {
     'sidebar.older': 'Older',
     'sidebar.pinned': 'Pinned',
     'sidebar.direct_chat': 'Direct Chat',
-    'sidebar.agent_store': 'Agent Store',
+    'sidebar.agent_store': 'Agents',
     'sidebar.my_agents': 'My Agents',
     'sidebar.discover_agents': 'Discover AI Agents',
     'sidebar.projects': 'Projects',
@@ -327,8 +327,8 @@ const GUI_DEFAULTS = {
     'org.default_language_info': "This setting only affects new users who haven't chosen a language yet. Existing users keep their current language preference. To add more languages to BeeFlow, go to the admin dashboard > Languages section.",
     'org.description': 'Description',
 
-    // ── Agent Store ─────────────────────────────────────────────
-    'store.title': 'Agent Store',
+    // ── Agents ──────────────────────────────────────────────────
+    'store.title': 'Agents',
     'store.count': '{visible} of {total} agents',
     'store.search_placeholder': 'Search agents...',
     'store.tab_popular': 'Popular',

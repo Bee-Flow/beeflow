@@ -81,8 +81,8 @@ const NL_TRANSLATIONS = {
     'org.default_language_info': 'Deze instelling geldt alleen voor nieuwe gebruikers die nog geen taal hebben gekozen. Bestaande gebruikers behouden hun huidige taalvoorkeur. Ga naar het beheerdersdashboard > Talen om meer talen aan BeeFlow toe te voegen.',
     'org.description': 'Beschrijving',
 
-    // ── Agent Store ─────────────────────────────────────────────
-    'store.title': 'Agentwinkel',
+    // ── Agents ──────────────────────────────────────────────────
+    'store.title': 'Agents',
     'store.count': '{visible} van {total} agents',
     'store.search_placeholder': 'Agents zoeken...',
     'store.tab_popular': 'Populair',

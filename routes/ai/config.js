@@ -531,9 +531,52 @@ router.post('/config/chat-models', requireAuth, async (req, res) => {
             pro: pro || { modelId: '', label: 'Pro' }
         };
         await configStore.setConfig('chat_model_tiers', tiers);
+        try { require('../../core/promptClassifier').clearClassifierCache(); } catch (_) { /* non-fatal */ }
         res.json({ success: true });
     } catch (e) {
         console.error('Failed to save chat model tiers:', e);
+        res.status(500).json({ error: 'Failed to save config' });
+    }
+});
+
+// ─── Auto-tier Classifier Model ──────────────────────────────────
+// The classifier picks a tier for Auto-mode prompts. It runs an LLM
+// call only on ambiguous prompts (the heuristic shortcut handles the
+// easy 60–70%). Admins can pin the cheapest/fastest model here so the
+// classification call is as snappy as possible. When unset, falls back
+// to the Fast tier model.
+
+router.get('/config/auto-classifier', requireAuth, async (req, res) => {
+    if (!(await isAdminUser(req))) return res.status(403).json({ error: 'Admin access required' });
+    try {
+        const modelId = await configStore.getConfig('auto_classifier_model');
+        res.json({ modelId: typeof modelId === 'string' ? modelId : null });
+    } catch (e) {
+        console.error('Failed to get auto-classifier model:', e);
+        res.status(500).json({ error: 'Failed to fetch config' });
+    }
+});
+
+router.post('/config/auto-classifier', requireAuth, async (req, res) => {
+    if (!(await isAdminUser(req))) return res.status(403).json({ error: 'Admin access required' });
+    try {
+        const raw = req.body?.modelId;
+        const modelId = typeof raw === 'string' && raw.trim() ? raw.trim() : null;
+
+        if (modelId) {
+            const { getProviderForModel } = require('../../core/aiAgent');
+            try {
+                await getProviderForModel(modelId);
+            } catch (_) {
+                return res.status(400).json({ error: `Model "${modelId}" not found in any configured provider` });
+            }
+        }
+
+        await configStore.setConfig('auto_classifier_model', modelId);
+        try { require('../../core/promptClassifier').clearClassifierCache(); } catch (_) { /* non-fatal */ }
+        res.json({ success: true, modelId });
+    } catch (e) {
+        console.error('Failed to save auto-classifier model:', e);
         res.status(500).json({ error: 'Failed to save config' });
     }
 });
@@ -582,6 +625,7 @@ router.post('/config/chat-models-eu', requireAuth, async (req, res) => {
         }
 
         await configStore.setConfig('chat_model_tiers_eu', tiers);
+        try { require('../../core/promptClassifier').clearClassifierCache(); } catch (_) { /* non-fatal */ }
         if (warnings.length > 0) {
             console.warn('[Config] EU tier validation warnings:', warnings);
         }
