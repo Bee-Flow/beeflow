@@ -7,9 +7,11 @@
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
+const crypto = require('crypto');
 const kbStore = require('../stores/knowledgeBases');
 const configStore = require('../stores/configStore');
-const { requireAuth, resolveUserOrgIds, requirePermission } = require('../auth');
+const userStore = require('../stores/userStore');
+const { requireAuth, resolveUserOrgIds, requirePermission, hasPermission } = require('../auth');
 
 const SEARCH_SERVICE_URL = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
 const { getServiceHeaders } = require('../core/serviceAuth');
@@ -23,6 +25,21 @@ const {
 
 // Auth helper
 const getUserId = (req) => req.session?.user?.id || null;
+
+// Resolve user's group IDs from userStore (used for shared_groups filtering)
+async function resolveUserGroups(req) {
+    const userId = getUserId(req);
+    if (!userId) return [];
+    try {
+        const user = await userStore.getUser(userId);
+        if (!user) return [];
+        if (Array.isArray(user.groups)) return user.groups;
+        if (typeof user.groups === 'string') {
+            try { return JSON.parse(user.groups || '[]'); } catch { return []; }
+        }
+    } catch (_) { /* ignore */ }
+    return [];
+}
 
 /**
  * Centralized KB access check.
@@ -56,9 +73,70 @@ router.get('/', requireAuth, async (req, res) => {
         const userId = getUserId(req);
         const orgIds = await resolveUserOrgIds(req);
         const kbs = await kbStore.listKBs(userId, orgIds);
-        res.json(kbs);
+        const userGroups = await resolveUserGroups(req);
+        // Owners always see drafts; org members see only published KBs that pass
+        // shared_groups restriction.
+        const filtered = kbStore.filterByGroupAccess(kbs, userId, userGroups);
+        res.json(filtered);
     } catch (e) {
         console.error('[KB] List error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * List org-published KBs (mirrors /api/agents/published). Drafts are excluded.
+ */
+router.get('/published', requireAuth, async (req, res) => {
+    try {
+        const userId = getUserId(req);
+        const orgIds = await resolveUserOrgIds(req);
+        const userGroups = await resolveUserGroups(req);
+        const kbs = await kbStore.listKBs(userId, orgIds);
+        const accessible = kbStore.filterByGroupAccess(kbs, userId, userGroups);
+        // Only KBs that are explicitly published (drafts owned by the user are dropped here)
+        res.json(accessible.filter(kb => !!kb.is_published));
+    } catch (e) {
+        console.error('[KB] Published list error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ── KB Categories (org-level, mirrors agent_categories) ─────────────
+
+router.get('/categories', requireAuth, async (req, res) => {
+    try {
+        const orgIds = await resolveUserOrgIds(req);
+        const orgId = orgIds !== null && orgIds.size > 0 ? Array.from(orgIds)[0] : null;
+        const categories = await kbStore.listKBCategories(orgId);
+        res.json(categories);
+    } catch (e) {
+        console.error('[KB] Categories list error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+router.post('/categories', requireAuth, requirePermission('manage_knowledge'), async (req, res) => {
+    try {
+        const { name, icon, color } = req.body || {};
+        if (!name || !name.trim()) return res.status(400).json({ error: 'Name is required' });
+        const orgIds = await resolveUserOrgIds(req);
+        const orgId = orgIds !== null && orgIds.size > 0 ? Array.from(orgIds)[0] : null;
+        const id = crypto.randomUUID();
+        const category = await kbStore.createKBCategory({ id, organizationId: orgId, name: name.trim(), icon, color });
+        res.status(201).json(category);
+    } catch (e) {
+        console.error('[KB] Category create error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+router.delete('/categories/:id', requireAuth, requirePermission('manage_knowledge'), async (req, res) => {
+    try {
+        await kbStore.deleteKBCategory(req.params.id);
+        res.json({ success: true });
+    } catch (e) {
+        console.error('[KB] Category delete error:', e.message);
         res.status(500).json({ error: e.message });
     }
 });
@@ -69,7 +147,7 @@ router.get('/', requireAuth, async (req, res) => {
 router.post('/', requireAuth, requirePermission('manage_knowledge'), async (req, res) => {
     try {
         const userId = getUserId(req);
-        const { name, description, defaultLang, organizationId } = req.body;
+        const { name, description, defaultLang, organizationId, categoryId, icon } = req.body;
         if (!name || !name.trim()) {
             return res.status(400).json({ error: 'Name is required' });
         }
@@ -83,7 +161,14 @@ router.post('/', requireAuth, requirePermission('manage_knowledge'), async (req,
             }
         }
 
-        const kb = await kbStore.createKB(userId, name.trim(), description || '', defaultLang, assignOrgId || null);
+        const kb = await kbStore.createKB(
+            userId,
+            name.trim(),
+            description || '',
+            defaultLang,
+            assignOrgId || null,
+            { categoryId: categoryId || null, icon: icon || null }
+        );
         res.status(201).json(kb);
     } catch (e) {
         console.error('[KB] Create error:', e.message);
@@ -121,6 +206,37 @@ router.patch('/:id', requireAuth, requirePermission('manage_knowledge'), async (
         res.json(updated);
     } catch (e) {
         console.error('[KB] Update error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * Toggle publish state + set sharing scope. Mirrors PATCH /api/agents/:id/publish.
+ * Owner can always publish/unpublish; non-owners need manage_knowledge.
+ */
+router.patch('/:id/publish', requireAuth, async (req, res) => {
+    try {
+        const userId = getUserId(req);
+        const kb = await kbStore.getKB(req.params.id);
+        if (!kb) return res.status(404).json({ error: 'KB not found' });
+
+        const isOwner = kb.tenant_id === userId;
+        const isAdmin = req.session?.isAdmin || req.session?.user?.role === 'admin';
+        if (!isOwner && !isAdmin) {
+            const hasPerm = await hasPermission(userId, 'manage_knowledge', req.session);
+            if (!hasPerm) return res.status(403).json({ error: 'Permission denied' });
+        }
+
+        // A KB must be attached to an organization to be published.
+        if (req.body.isPublished && !kb.organization_id) {
+            return res.status(400).json({ error: 'KB must belong to an organization before publishing' });
+        }
+
+        const { isPublished, sharedGroups } = req.body || {};
+        const updated = await kbStore.setPublished(kb.id, !!isPublished, sharedGroups || []);
+        res.json({ success: true, kb: updated });
+    } catch (e) {
+        console.error('[KB] Publish error:', e.message);
         res.status(500).json({ error: e.message });
     }
 });

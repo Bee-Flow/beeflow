@@ -333,6 +333,13 @@ async function getAllUsers() {
     });
 }
 
+// Lightweight list that *does* include the avatar blob. Use only when callers
+// need to render avatars for many users (e.g. the usage / monitoring page).
+async function getAllUserAvatars() {
+    await initDB();
+    return getAll(`SELECT id, username, "displayName", "avatarType", avatar FROM users`);
+}
+
 
 async function getUser(userId) {
     await initDB();
@@ -1012,7 +1019,7 @@ async function getAuditLog(opts = {}) {
 }
 
 module.exports = {
-    getAllUsers, getUser, getUserByEmail, createUser, updateUser, deleteUser,
+    getAllUsers, getAllUserAvatars, getUser, getUserByEmail, createUser, updateUser, deleteUser,
     getAllOrganizations, getOrganization, createOrganization, updateOrganization, deleteOrganization,
     getAllGroups, createGroup, updateGroup, deleteGroup, getGroupByAzureId, getUserByAzureId,
     storeAppPassword, getAppPassword, hasAppPassword, deleteAppPassword,

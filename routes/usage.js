@@ -41,15 +41,33 @@ async function attachOrgFilter(req, res, next) {
 
 router.use(attachOrgFilter);
 
-// Helper to load user display names
+// Helper to load user display info (name + avatar) for usage rendering.
+// Returns Map<userId, { display_name, avatarType, avatar }>.
 async function getUserMap() {
     try {
         const userStore = require('../stores/userStore');
-        const allUsers = await userStore.getAllUsers();
+        const allUsers = await userStore.getAllUserAvatars();
         const map = new Map();
-        for (const u of allUsers) map.set(u.id, u.display_name || u.username || u.id);
+        for (const u of allUsers) {
+            map.set(u.id, {
+                display_name: u.displayName || u.username || u.id,
+                avatarType: u.avatarType || null,
+                avatar: u.avatar || null,
+            });
+        }
         return map;
     } catch { return new Map(); }
+}
+
+// Spread a userMap entry onto a row (display_name + avatar fields).
+function withUser(row, userMap) {
+    const info = userMap.get(row.user_id);
+    return {
+        ...row,
+        display_name: info?.display_name || row.user_id || 'Unknown',
+        avatarType: info?.avatarType || null,
+        avatar: info?.avatar || null,
+    };
 }
 
 // Helper: enrich model-level rows with input/output cost split
@@ -121,11 +139,7 @@ router.get('/users', async (req, res) => {
     try {
         const usersUsage = await usageStore.getUsageByUser(req.usageFilters);
         const userMap = await getUserMap();
-        const enriched = (usersUsage || []).map(u => ({
-            ...u,
-            display_name: userMap.get(u.user_id) || u.user_id || 'Unknown'
-        }));
-        res.json(enriched);
+        res.json((usersUsage || []).map(u => withUser(u, userMap)));
     } catch (err) {
         console.error('[Usage API] /users error:', err.message);
         res.status(500).json({ error: 'Failed to fetch user usage' });
@@ -136,11 +150,7 @@ router.get('/by-user', async (req, res) => {
     try {
         const usersUsage = await usageStore.getUsageByUser(req.usageFilters);
         const userMap = await getUserMap();
-        const enriched = (usersUsage || []).map(u => ({
-            ...u,
-            display_name: userMap.get(u.user_id) || u.user_id || 'Unknown'
-        }));
-        res.json(enriched);
+        res.json((usersUsage || []).map(u => withUser(u, userMap)));
     } catch (err) {
         console.error('[Usage API] /by-user error:', err.message);
         res.status(500).json({ error: 'Failed to fetch user usage' });
@@ -283,11 +293,7 @@ router.get('/models-by-user', async (req, res) => {
     try {
         const data = await usageStore.getUsageByModelAndUser(req.usageFilters);
         const userMap = await getUserMap();
-        const enriched = enrichWithCostSplit(data).map(row => ({
-            ...row,
-            display_name: userMap.get(row.user_id) || row.user_id || 'Unknown'
-        }));
-        res.json(enriched);
+        res.json(enrichWithCostSplit(data).map(row => withUser(row, userMap)));
     } catch (err) {
         console.error('[Usage API] /models-by-user error:', err.message);
         res.status(500).json({ error: 'Failed to fetch model-user data' });
@@ -327,11 +333,7 @@ router.get('/guardrails/by-user', async (req, res) => {
     try {
         const data = await guardrailEventStore.getGuardrailByUser(req.usageFilters);
         const userMap = await getUserMap();
-        const enriched = (data || []).map(row => ({
-            ...row,
-            display_name: userMap.get(row.user_id) || row.user_id || 'Unknown'
-        }));
-        res.json(enriched);
+        res.json((data || []).map(row => withUser(row, userMap)));
     } catch (err) {
         console.error('[Usage API] /guardrails/by-user error:', err.message);
         res.status(500).json({ error: 'Failed to fetch guardrail user data' });
@@ -355,11 +357,7 @@ router.get('/guardrails/recent', async (req, res) => {
         const limit = parseInt(req.query.limit, 10) || 50;
         const data = await guardrailEventStore.getRecentGuardrailEvents(limit, req.usageFilters);
         const userMap = await getUserMap();
-        const enriched = (data || []).map(row => ({
-            ...row,
-            display_name: userMap.get(row.user_id) || row.user_id || 'Unknown'
-        }));
-        res.json(enriched);
+        res.json((data || []).map(row => withUser(row, userMap)));
     } catch (err) {
         console.error('[Usage API] /guardrails/recent error:', err.message);
         res.status(500).json({ error: 'Failed to fetch recent guardrail events' });
@@ -461,8 +459,7 @@ router.get('/integrations/recent', async (req, res) => {
         const data = await integrationActivityStore.getRecentIntegrationActivity(limit, req.usageFilters);
         const userMap = await getUserMap();
         const enriched = (data || []).map(row => ({
-            ...row,
-            display_name: userMap.get(row.user_id) || row.user_id || 'Unknown',
+            ...withUser(row, userMap),
             country_flag: countryFlag(row.country_code),
         }));
         res.json(enriched);
@@ -506,11 +503,7 @@ router.get('/azure-services/by-user', async (req, res) => {
     try {
         const data = await azureServiceUsageStore.getAzureServiceByUser(req.usageFilters);
         const userMap = await getUserMap();
-        const enriched = (data || []).map(row => ({
-            ...row,
-            display_name: userMap.get(row.user_id) || row.user_id || 'Unknown'
-        }));
-        res.json(enriched);
+        res.json((data || []).map(row => withUser(row, userMap)));
     } catch (err) {
         console.error('[Usage API] /azure-services/by-user error:', err.message);
         res.status(500).json({ error: 'Failed to fetch Azure service user data' });
@@ -535,11 +528,7 @@ router.get('/azure-services/recent', async (req, res) => {
         const limit = parseInt(req.query.limit, 10) || 50;
         const data = await azureServiceUsageStore.getRecentAzureServiceUsage(limit, req.usageFilters);
         const userMap = await getUserMap();
-        const enriched = (data || []).map(row => ({
-            ...row,
-            display_name: userMap.get(row.user_id) || row.user_id || 'Unknown'
-        }));
-        res.json(enriched);
+        res.json((data || []).map(row => withUser(row, userMap)));
     } catch (err) {
         console.error('[Usage API] /azure-services/recent error:', err.message);
         res.status(500).json({ error: 'Failed to fetch recent Azure service usage' });

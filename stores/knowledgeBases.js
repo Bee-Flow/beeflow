@@ -49,6 +49,39 @@ async function initDB() {
     // ── Column migrations ──
     try { await exec(`ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS organization_id TEXT`); } catch (e) { /* column already exists */ }
     try { await exec(`CREATE INDEX IF NOT EXISTS idx_kb_org ON knowledge_bases(organization_id) WHERE organization_id IS NOT NULL`); } catch (e) { /* index already exists */ }
+    // Publish lifecycle (mirrors agents.is_published / agents.shared_groups)
+    let publishedColumnIsNew = false;
+    try {
+        // pg_attribute lookup so we know whether to backfill below
+        const existing = await getOne(`SELECT 1 AS ok FROM information_schema.columns WHERE table_name = 'knowledge_bases' AND column_name = 'is_published'`);
+        publishedColumnIsNew = !existing;
+    } catch (_) { /* tolerate */ }
+    try { await exec(`ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS is_published BOOLEAN DEFAULT FALSE`); } catch (e) { /* column already exists */ }
+    try { await exec(`ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS shared_groups TEXT DEFAULT '[]'`); } catch (e) { /* column already exists */ }
+    try { await exec(`ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS category_id TEXT`); } catch (e) { /* column already exists */ }
+    try { await exec(`ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS icon TEXT`); } catch (e) { /* column already exists */ }
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_kb_org_published ON knowledge_bases(organization_id, is_published) WHERE is_published = TRUE`); } catch (e) { /* index already exists */ }
+    // First-deploy backfill: org KBs that already existed before the publish flow
+    // were visible to the whole org; preserve that by marking them published.
+    // Personal KBs (organization_id IS NULL) stay as drafts.
+    if (publishedColumnIsNew) {
+        try {
+            await exec(`UPDATE knowledge_bases SET is_published = TRUE WHERE organization_id IS NOT NULL AND is_published = FALSE`);
+            console.log('[KnowledgeBases] Backfilled is_published=TRUE for existing org KBs');
+        } catch (e) { console.warn('[KnowledgeBases] Backfill failed:', e.message); }
+    }
+    // Org-level KB categories (mirrors agent_categories)
+    await exec(`
+        CREATE TABLE IF NOT EXISTS kb_categories (
+            id TEXT PRIMARY KEY,
+            organization_id TEXT,
+            name TEXT NOT NULL,
+            icon TEXT DEFAULT '📚',
+            color TEXT DEFAULT '#6366f1',
+            created_at TIMESTAMPTZ DEFAULT now()
+        )
+    `);
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_kb_categories_org ON kb_categories(organization_id)`); } catch (e) { /* index already exists */ }
     // Rich metadata on documents (sender, threadId, attachments, simhash, …)
     try { await exec(`ALTER TABLE documents ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb`); } catch (e) { /* column already exists */ }
     // Duplicate tracking for content-hash / simhash dedup
@@ -74,14 +107,15 @@ const KnowledgeBasesStore = {
      * @param {string} description
      * @param {string} defaultLang
      * @param {string|null} organizationId - Organization this KB belongs to (null = personal)
+     * @param {object} extra - Optional { categoryId, icon }
      */
-    createKB: async (tenantId, name, description = '', defaultLang = 'unknown', organizationId = null) => {
+    createKB: async (tenantId, name, description = '', defaultLang = 'unknown', organizationId = null, extra = {}) => {
         await initDB();
         const row = await getOne(
-            `INSERT INTO knowledge_bases (tenant_id, name, description, default_lang, organization_id)
-             VALUES ($1, $2, $3, $4, $5)
+            `INSERT INTO knowledge_bases (tenant_id, name, description, default_lang, organization_id, category_id, icon)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              RETURNING *`,
-            [tenantId, name, description, defaultLang, organizationId || null]
+            [tenantId, name, description, defaultLang, organizationId || null, extra.categoryId || null, extra.icon || null]
         );
         return row;
     },
@@ -155,23 +189,49 @@ const KnowledgeBasesStore = {
             );
         }
 
-        // Org member — personal KBs + KBs from user's org(s)
+        // Org member — personal KBs (any state) + PUBLISHED KBs from user's org(s)
+        // Group restriction (shared_groups) is applied in JS by callers via filterByGroupAccess.
         return getAll(
-            `SELECT kb.*, 
+            `SELECT kb.*,
                     COALESCE(d.doc_count, 0) AS document_count,
                     COALESCE(d.total_chunks, 0) AS total_chunks
              FROM knowledge_bases kb
              LEFT JOIN (
-                 SELECT knowledge_base_id, 
+                 SELECT knowledge_base_id,
                         COUNT(*) AS doc_count,
                         SUM(chunk_count) AS total_chunks
-                 FROM documents 
+                 FROM documents
                  GROUP BY knowledge_base_id
              ) d ON d.knowledge_base_id = kb.id
-             WHERE kb.tenant_id = $1 OR kb.organization_id = ANY($2)
+             WHERE kb.tenant_id = $1 OR (kb.organization_id = ANY($2) AND kb.is_published = TRUE)
              ORDER BY kb.created_at DESC`,
             [tenantId, orgIdArray]
         );
+    },
+
+    /**
+     * Filter a KB list down to those the user is allowed to see based on
+     * `shared_groups` group restrictions. Owner KBs (tenant_id = userId)
+     * always pass. Drafts (is_published = false) always pass for the owner.
+     *
+     * @param {Array} kbs - Result of listKBs
+     * @param {string} userId - The user's ID
+     * @param {Array<string>} userGroups - Group IDs the user belongs to
+     */
+    filterByGroupAccess: (kbs, userId, userGroups = []) => {
+        if (!Array.isArray(kbs)) return [];
+        return kbs.filter(kb => {
+            // Owner sees everything they own
+            if (kb.tenant_id === userId) return true;
+            // Drafts (not published) hidden from non-owners
+            if (!kb.is_published) return false;
+            // No group restriction → visible to whole org
+            let groups = [];
+            try { groups = JSON.parse(kb.shared_groups || '[]'); } catch { groups = []; }
+            if (!Array.isArray(groups) || groups.length === 0) return true;
+            // User must be in at least one shared group
+            return groups.some(g => userGroups.includes(g));
+        });
     },
 
     getKB: async (id) => {
@@ -179,18 +239,69 @@ const KnowledgeBasesStore = {
         return getOne('SELECT * FROM knowledge_bases WHERE id = $1', [id]);
     },
 
-    updateKB: async (id, { name, description, defaultLang }) => {
+    updateKB: async (id, { name, description, defaultLang, categoryId, icon }) => {
         await initDB();
         return getOne(
-            `UPDATE knowledge_bases 
+            `UPDATE knowledge_bases
              SET name = COALESCE($2, name),
                  description = COALESCE($3, description),
                  default_lang = COALESCE($4, default_lang),
+                 category_id = COALESCE($5, category_id),
+                 icon = COALESCE($6, icon),
                  updated_at = now()
              WHERE id = $1
              RETURNING *`,
-            [id, name, description, defaultLang]
+            [id, name, description, defaultLang, categoryId, icon]
         );
+    },
+
+    /**
+     * Toggle publish state and shared groups. Owner-only operation enforced
+     * at the route layer.
+     */
+    setPublished: async (id, isPublished, sharedGroups = []) => {
+        await initDB();
+        const groupsJson = JSON.stringify(Array.isArray(sharedGroups) ? sharedGroups : []);
+        return getOne(
+            `UPDATE knowledge_bases
+             SET is_published = $2,
+                 shared_groups = $3,
+                 updated_at = now()
+             WHERE id = $1
+             RETURNING *`,
+            [id, !!isPublished, groupsJson]
+        );
+    },
+
+    // ── KB Categories (org-level, mirrors agent_categories) ─────────────
+
+    listKBCategories: async (organizationId) => {
+        await initDB();
+        if (!organizationId) {
+            return getAll(`SELECT * FROM kb_categories WHERE organization_id IS NULL ORDER BY name`);
+        }
+        return getAll(
+            `SELECT * FROM kb_categories WHERE organization_id = $1 ORDER BY name`,
+            [organizationId]
+        );
+    },
+
+    createKBCategory: async ({ id, organizationId, name, icon, color }) => {
+        await initDB();
+        return getOne(
+            `INSERT INTO kb_categories (id, organization_id, name, icon, color)
+             VALUES ($1, $2, $3, COALESCE($4, '📚'), COALESCE($5, '#6366f1'))
+             RETURNING *`,
+            [id, organizationId || null, name, icon, color]
+        );
+    },
+
+    deleteKBCategory: async (id) => {
+        await initDB();
+        // Detach any KBs from this category, then remove it
+        await run(`UPDATE knowledge_bases SET category_id = NULL WHERE category_id = $1`, [id]);
+        await run(`DELETE FROM kb_categories WHERE id = $1`, [id]);
+        return true;
     },
 
     deleteKB: async (id) => {
