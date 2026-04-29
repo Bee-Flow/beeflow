@@ -1,63 +1,51 @@
 /**
- * Swarm Runtime — phased multi-agent orchestrator.
+ * Swarm Runtime — phased multi-agent orchestrator built on the direct-chat
+ * tool stack.
  *
- * Loads a swarm manifest (`builtin:*` for now; `swarm:*` custom swarms in v3)
- * and executes its phases. Two execution kinds:
+ * Each worker is a direct-chat-style LLM agent: same adapter, same tools
+ * (components + integrations + MCP, via buildDirectChatToolStack), same
+ * dispatcher (toolDispatcher.executeTool). Workers run in parallel within
+ * a phase; phases run sequentially; the final phase is a single synthesiser
+ * whose tokens stream as ordinary `content` events so the regular chat
+ * renderer handles the answer.
  *
- *   - `kind: 'native'` — delegates the entire run to a hand-written module
- *     (e.g. the existing deepResearch pipeline). Used as a low-risk path so
- *     v1 ships Deep Research without rewriting it.
+ * v2 ships one built-in swarm — `builtin:research_swarm` — with a fixed
+ * worker manifest (3 parallel researchers + 1 synthesiser). The runtime is
+ * already generic over manifests, so v3 can drop in a dynamic LLM planner
+ * (mirroring Flow's bootstrap) without touching anything else here.
  *
- *   - `kind: 'generic'` — runs `swarm.phases` sequentially, with each phase's
- *     `workers` running in parallel via `mapWithConcurrency`. v2 lands this
- *     for Component Pipeline + custom swarms.
- *
- * Hive Mind: a per-conversation shared bag of structured findings. v1 stores
- * it in `direct_conversations.meta_json.hiveMind`; v2 will mirror it into the
- * user-facing notebook drawer.
+ * Hive Mind: a per-conversation shared bag of structured findings
+ * persisted in `direct_conversations.meta_json.hiveMind`. Researcher
+ * workers' summaries land in it; the synthesiser reads them all.
  */
 
 const { mapWithConcurrency } = require('../concurrencyUtil');
+const { resolveModelForTier, getTierConfig } = require('../modelResolver');
+const { getProviderForModel } = require('../aiAgent');
+const { getAdapter } = require('../providers');
+const { buildDirectChatToolStack } = require('../directChatToolStack');
+const { executeTool: dispatchTool } = require('../toolDispatcher');
 
 // ─── Built-in registry ───────────────────────────────────────────────────
 
 const BUILTINS = {
-    'builtin:deep_research': require('./builtins/deepResearch'),
+    'builtin:research_swarm': require('./builtins/researchSwarm'),
 };
 
 function loadSwarmById(id) {
     if (!id || typeof id !== 'string') return null;
     if (BUILTINS[id]) return BUILTINS[id];
-    // v3: custom swarms loaded from DB go here.
     return null;
 }
 
 function listAvailableSwarms() {
-    return Object.values(BUILTINS).map(b => ({
-        id: b.MANIFEST.id,
-        name: b.MANIFEST.name,
-        icon: b.MANIFEST.icon,
-        description: b.MANIFEST.description,
-        bestFor: b.MANIFEST.bestFor,
-        notFor: b.MANIFEST.notFor,
-        depthPresets: b.MANIFEST.depthPresets,
-        defaultDepth: b.MANIFEST.defaultDepth,
-        phases: b.MANIFEST.phases,
-    }));
+    return Object.values(BUILTINS).map(b => ({ ...b.MANIFEST }));
 }
 
 // ─── Hive Mind ───────────────────────────────────────────────────────────
 
-/**
- * Initialize a Hive Mind from existing conversation state. v1 keeps it as a
- * plain object: { entries: [{ at, byWorker, kind, title, body }], summary }.
- * Workers don't write to it directly in v1 (the native deepResearch path
- * manages its own state internally); the runtime captures the run's outputs
- * into the Hive Mind on completion so the next turn / UI / future workers
- * can see what's been done.
- */
 function emptyHiveMind() {
-    return { entries: [], summary: null, updatedAt: null };
+    return { entries: [], updatedAt: null };
 }
 
 function appendHiveMindEntry(hive, entry) {
@@ -73,34 +61,234 @@ function appendHiveMindEntry(hive, entry) {
     return hive;
 }
 
+function renderHiveMindForPrompt(hive, { excludeByWorker = null } = {}) {
+    if (!hive || !Array.isArray(hive.entries) || hive.entries.length === 0) {
+        return '(empty — you are the first worker to write to it)';
+    }
+    return hive.entries
+        .filter(e => excludeByWorker == null || e.byWorker !== excludeByWorker)
+        .map((e, i) => {
+            const head = `## [${i + 1}] ${e.title || e.kind} — by ${e.byWorker}`;
+            return `${head}\n${e.body}`;
+        })
+        .join('\n\n');
+}
+
+// ─── Worker execution ────────────────────────────────────────────────────
+
+const MAX_TOOL_ROUNDS_PER_WORKER = 8;
+const WORKER_DEFAULT_MAX_TOKENS = 6000;
+
+/**
+ * Resolve the model + adapter the worker should use for this run.
+ * Falls back to the conversation-level synthesiser model when the worker's
+ * tier can't be resolved.
+ */
+async function resolveWorkerModel({ worker, fallbackModelId, userOrgId, userId }) {
+    const tier = worker.tier || 'auto';
+    let modelId = fallbackModelId;
+    try {
+        const resolved = await resolveModelForTier(`tier:${tier === 'auto' ? 'fast' : tier}`, {
+            userOrgId, userId, fallbackTier: 'fast',
+        });
+        if (resolved) modelId = resolved;
+    } catch (_) { /* fall back to fallbackModelId */ }
+
+    const config = await getProviderForModel(modelId);
+    const adapter = getAdapter(config.providerType, (config.url || '').replace(/\/+$/, ''));
+    return {
+        modelId,
+        adapter,
+        apiKey: config.apiKey,
+        apiUrl: (config.url || '').replace(/\/+$/, ''),
+        config,
+    };
+}
+
+/**
+ * Execute one worker — tool-call loop, then stream the final response.
+ * Streamed tokens go to either `swarm_worker_content` (research workers)
+ * or ordinary `content` (the synthesiser worker).
+ */
+async function runWorker({
+    worker,
+    userMessage,
+    hive,
+    send,
+    tools,
+    toolContext,
+    fallbackModelId,
+    userOrgId,
+    userId,
+    isSynthesiser = false,
+}) {
+    const startedAt = Date.now();
+    const workerId = worker.id;
+    let model;
+    try {
+        model = await resolveWorkerModel({ worker, fallbackModelId, userOrgId, userId });
+    } catch (err) {
+        send('swarm_worker_completed', {
+            workerId, role: worker.role, status: 'failed',
+            error: `Model resolution failed: ${err.message}`,
+            durationMs: Date.now() - startedAt,
+        });
+        return { workerId, role: worker.role, status: 'failed', error: err.message };
+    }
+
+    send('swarm_worker_started', {
+        workerId, role: worker.role, name: worker.name,
+        tier: worker.tier || 'auto', modelId: model.modelId,
+    });
+
+    // Filter the global tool stack down to this worker's allowlist (if any).
+    // Empty allowlist = all tools available; tagged allowlist = whitelist.
+    const allowed = Array.isArray(worker.toolAllowlist) && worker.toolAllowlist.length > 0
+        ? new Set(worker.toolAllowlist)
+        : null;
+    const workerTools = allowed
+        ? tools.filter(t => allowed.has(t.function.name))
+        : tools;
+
+    // Build messages: per-worker system prompt + Hive Mind context + user request.
+    const hiveBlock = renderHiveMindForPrompt(hive, { excludeByWorker: workerId });
+    const systemPrompt = [
+        worker.systemPrompt || '',
+        '',
+        '── HIVE MIND (shared scratchpad written by sibling workers) ──',
+        hiveBlock,
+        '',
+        '── User request ──',
+        '(Reply by completing your specific role. Use the tools available — they are the same integrations the user has in direct chat. When you have enough material to deliver your role\'s output, stop calling tools and write your final response.)',
+    ].join('\n');
+
+    const messages = [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userMessage },
+    ];
+
+    // ── Tool-call loop ───────────────────────────────────────────────
+    let collectedToolHistory = [];
+    let finalText = '';
+    let lastError = null;
+
+    try {
+        for (let round = 0; round < MAX_TOOL_ROUNDS_PER_WORKER; round++) {
+            const result = await model.adapter.chat(model.apiKey, model.apiUrl, model.modelId, messages, {
+                maxTokens: WORKER_DEFAULT_MAX_TOKENS,
+                temperature: isSynthesiser ? 0.4 : 0.3,
+                tools: workerTools,
+                toolChoice: 'auto',
+            });
+
+            const toolCalls = Array.isArray(result?.toolCalls) ? result.toolCalls : [];
+            const content = typeof result?.content === 'string' ? result.content : '';
+
+            if (toolCalls.length === 0) {
+                // No more tools — this is the worker's final output.
+                finalText = content;
+                break;
+            }
+
+            // Echo the assistant tool-call message so the model has full history.
+            messages.push({
+                role: 'assistant',
+                content: content || null,
+                tool_calls: toolCalls,
+            });
+
+            // Execute each tool call (parallel within a round).
+            const results = await Promise.all(toolCalls.map(async (tc) => {
+                const name = tc.function?.name || tc.name;
+                let args = {};
+                try { args = JSON.parse(tc.function?.arguments || tc.arguments || '{}'); } catch (_) { /* default to {} */ }
+                send('swarm_worker_tool', { workerId, role: worker.role, toolName: name, status: 'start' });
+                let toolResult;
+                try {
+                    toolResult = await dispatchTool(name, args, toolContext);
+                } catch (err) {
+                    toolResult = { error: err.message };
+                }
+                collectedToolHistory.push({ name, status: toolResult?.error ? 'error' : 'done' });
+                send('swarm_worker_tool', { workerId, role: worker.role, toolName: name, status: toolResult?.error ? 'error' : 'done' });
+                return { tc, toolResult };
+            }));
+
+            // Push tool-result messages back so the next round sees them.
+            for (const { tc, toolResult } of results) {
+                messages.push({
+                    role: 'tool',
+                    tool_call_id: tc.id,
+                    name: tc.function?.name || tc.name,
+                    content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult || ''),
+                });
+            }
+        }
+
+        // ── Stream the final text chunk-by-chunk ─────────────────────
+        // Researchers get a private content channel keyed by workerId.
+        // The synthesiser streams as ordinary `content` so the chat
+        // renderer treats it as the assistant's reply with no special
+        // handling.
+        if (finalText && finalText.length > 0) {
+            const eventName = isSynthesiser ? 'content' : 'swarm_worker_content';
+            const chunkSize = 256;
+            for (let i = 0; i < finalText.length; i += chunkSize) {
+                const delta = finalText.slice(i, i + chunkSize);
+                send(eventName, isSynthesiser ? { content: delta } : { workerId, delta });
+            }
+        }
+    } catch (err) {
+        lastError = err.message;
+    }
+
+    const durationMs = Date.now() - startedAt;
+    if (lastError) {
+        send('swarm_worker_completed', { workerId, role: worker.role, status: 'failed', error: lastError, durationMs });
+        return { workerId, role: worker.role, status: 'failed', error: lastError, content: finalText };
+    }
+
+    // Researchers append a Hive Mind entry. The synthesiser doesn't (its
+    // output already streamed live as the assistant reply).
+    if (!isSynthesiser && finalText) {
+        appendHiveMindEntry(hive, {
+            byWorker: workerId,
+            kind: 'finding',
+            title: `${worker.name} (${worker.role})`,
+            body: finalText,
+        });
+    }
+
+    send('swarm_worker_completed', {
+        workerId, role: worker.role, status: 'done',
+        durationMs,
+        toolCount: collectedToolHistory.length,
+    });
+    return { workerId, role: worker.role, status: 'done', content: finalText, toolHistory: collectedToolHistory };
+}
+
 // ─── Run a turn ──────────────────────────────────────────────────────────
 
 /**
  * Execute one swarm turn for a chat conversation.
  *
- * @param {object}   args
- * @param {string}   args.swarmId           — Swarm manifest id (e.g. 'builtin:deep_research')
- * @param {string}   args.message           — Current user message
- * @param {object}   args.options           — Per-swarm runtime options (e.g. { depth: 'normal' })
- * @param {object}   args.hiveMind          — Existing Hive Mind state from prior turns (or empty)
- * @param {function} args.send              — SSE emitter: (eventName, payload) => void
- * @param {string}   args.userId
- * @param {string|null} args.userOrgId
- * @param {string|null} args.modelOverride  — Optional concrete model to pass through
+ * Required args:
+ *   swarmId, message, hiveMind, send, userId, session, fallbackModelId
  *
- * @returns {Promise<{ paused: boolean, finalText?: string, sources?: array,
- *                     metadata?: object, hiveMind: object,
- *                     clarification?: object }>}
+ * Optional:
+ *   userOrgId, isAdmin, resolvedTier (for tier-tools filtering)
  */
 async function runSwarmTurn({
     swarmId,
     message,
-    options = {},
     hiveMind: incomingHive,
     send,
     userId,
+    session = null,
+    isAdmin = false,
+    fallbackModelId,
     userOrgId = null,
-    modelOverride = null,
+    resolvedTier = 'swarm',
 }) {
     const entry = loadSwarmById(swarmId);
     if (!entry) {
@@ -108,8 +296,8 @@ async function runSwarmTurn({
         err.code = 'SWARM_NOT_FOUND';
         throw err;
     }
-    const { MANIFEST, runNative } = entry;
-    const hive = incomingHive && typeof incomingHive === 'object'
+    const { MANIFEST, getWorkerManifest } = entry;
+    const hive = incomingHive && typeof incomingHive === 'object' && Array.isArray(incomingHive.entries)
         ? incomingHive
         : emptyHiveMind();
 
@@ -118,87 +306,66 @@ async function runSwarmTurn({
         swarmId: MANIFEST.id,
         swarmName: MANIFEST.name,
         phases: MANIFEST.phases,
-        depth: options.depth || MANIFEST.defaultDepth,
     });
 
-    // v1 only ships native swarms (Deep Research). Generic phase-by-phase
-    // execution lands in v2 for Component Pipeline + custom swarms.
-    if (MANIFEST.kind !== 'native' || typeof runNative !== 'function') {
-        send('swarm_completed', { error: `Generic swarm execution is not implemented yet (manifest kind: ${MANIFEST.kind})` });
-        const err = new Error(`Swarm kind "${MANIFEST.kind}" is not implemented yet.`);
-        err.code = 'SWARM_NOT_IMPLEMENTED';
-        throw err;
-    }
-
-    let result;
-    try {
-        result = await runNative({
-            message,
-            options: { ...options, model: modelOverride, userId },
-            send,
-            manifest: MANIFEST,
-        });
-    } catch (err) {
-        send('swarm_completed', { error: err.message, durationMs: Date.now() - startedAt });
-        throw err;
-    }
-
-    // Clarification path: the swarm asked the user a follow-up. Don't stream
-    // a final answer; the chat UI renders the clarification questions inline
-    // and the user's reply re-enters this function with `clarificationAnswers`.
-    if (result.paused && result.reason === 'clarification') {
-        send('swarm_completed', {
-            paused: true,
-            reason: 'clarification',
-            durationMs: Date.now() - startedAt,
-        });
-        return {
-            paused: true,
-            clarification: result.payload,
-            hiveMind: hive,
-        };
-    }
-
-    // Persist the run's headline output into the Hive Mind so the next turn
-    // (and the UI) can see what the swarm produced.
-    appendHiveMindEntry(hive, {
-        byWorker: 'deep_research',
-        kind: 'final_report',
-        title: result.metadata?.topic || 'Deep Research',
-        body: result.finalText || '',
+    // Build the directChat tool stack ONCE per turn — every worker shares
+    // the same view of available integrations.
+    const { tools, n8nOrgId } = await buildDirectChatToolStack({
+        userId, session, isAdmin, resolvedTier,
     });
-    if (Array.isArray(result.sources) && result.sources.length > 0) {
-        appendHiveMindEntry(hive, {
-            byWorker: 'deep_research',
-            kind: 'sources',
-            title: `${result.sources.length} sources`,
-            body: JSON.stringify(result.sources.slice(0, 50)),
+    const toolContext = {
+        userId,
+        session,
+        userAuth: session?.user || null,
+        n8nOrgId,
+        send,    // some tools (image gen) stream their own SSE events
+    };
+
+    // Resolve the per-turn worker manifest from the swarm's planner.
+    // For v2 builtins this is a deterministic function; v3's dynamic
+    // planner returns workers based on the user message.
+    const phases = await getWorkerManifest({ message, hive });
+
+    let lastResult = null;
+    for (const phase of phases) {
+        send('swarm_phase_started', {
+            phaseId: phase.id, phaseName: phase.name,
+            workers: phase.workers.map(w => ({ id: w.id, role: w.role, name: w.name, tier: w.tier || 'auto' })),
+        });
+        const phaseStartedAt = Date.now();
+
+        // Workers in a phase run in parallel via Promise.allSettled so a
+        // single failure doesn't kill the rest of the phase.
+        const settled = await Promise.allSettled(phase.workers.map(worker =>
+            runWorker({
+                worker,
+                userMessage: message,
+                hive,
+                send,
+                tools,
+                toolContext,
+                fallbackModelId,
+                userOrgId,
+                userId,
+                isSynthesiser: !!phase.synthesiser,
+            })
+        ));
+
+        const outcomes = settled.map((r, i) => r.status === 'fulfilled'
+            ? r.value
+            : { workerId: phase.workers[i].id, role: phase.workers[i].role, status: 'failed', error: r.reason?.message || 'unknown error' });
+        lastResult = outcomes[outcomes.length - 1];
+
+        send('swarm_phase_completed', {
+            phaseId: phase.id,
+            durationMs: Date.now() - phaseStartedAt,
         });
     }
 
-    // Stream the final answer as ordinary `content` events so the existing
-    // chat renderer handles it with no special UI mode. Chunked so the SSE
-    // looks like a normal streamed reply (some clients buffer huge single
-    // events and re-render less smoothly).
-    if (typeof result.finalText === 'string' && result.finalText.length > 0) {
-        const chunkSize = 256;
-        for (let i = 0; i < result.finalText.length; i += chunkSize) {
-            send('content', { content: result.finalText.slice(i, i + chunkSize) });
-        }
-    }
-
-    send('swarm_completed', {
-        paused: false,
-        durationMs: Date.now() - startedAt,
-        sourceCount: Array.isArray(result.sources) ? result.sources.length : 0,
-        metadata: result.metadata || null,
-    });
-
+    send('swarm_completed', { paused: false, durationMs: Date.now() - startedAt });
     return {
         paused: false,
-        finalText: result.finalText || '',
-        sources: result.sources || [],
-        metadata: result.metadata || null,
+        finalText: lastResult?.content || '',
         hiveMind: hive,
     };
 }
@@ -209,6 +376,5 @@ module.exports = {
     listAvailableSwarms,
     emptyHiveMind,
     appendHiveMindEntry,
-    // Re-exported for downstream consumers that want bounded parallelism.
     mapWithConcurrency,
 };

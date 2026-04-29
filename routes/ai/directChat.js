@@ -152,14 +152,16 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
 
     // ─── Swarm tier branch ─────────────────────────────────────────
     // When the user picked the "Swarm" tier in the model dropdown, the entire
-    // turn runs through the swarm runtime. Phase progress + Hive Mind + final
-    // answer all stream over the same SSE channel; the rest of the directChat
-    // route (tier resolution, Flow stages, tool-call loop, …) is bypassed.
-    // v1 always runs the Deep Research built-in; per-conversation swarm choice
-    // ('which swarm?') becomes a sub-picker in v2.
+    // turn runs through the swarm runtime. Each worker uses the SAME tool
+    // stack as a regular direct-chat call (components + integrations + MCP),
+    // so research workers can hit web search, KB, gmail, drive, calendar,
+    // notebook, custom components — anything the user has wired up.
+    // The synthesiser worker streams its tokens as ordinary `content` events
+    // so the existing chat renderer handles the answer with no special UI.
     if (modelTier === 'swarm') {
         const { runSwarmTurn, loadSwarmById } = require('../../core/swarms/swarmRuntime');
         const { userHasBetaFeature } = require('../../core/betaFeatures');
+        const { resolveModelForTier: resolveSwarmTierModel } = require('../../core/modelResolver');
 
         // Beta gate (defensive — `tiers-for-user` already hides the Swarm
         // tier from the dropdown when this feature is off, but never trust
@@ -168,12 +170,27 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         if (!allowed) {
             return res.status(403).json({ error: 'Swarm Agents beta is not enabled for your organisation.' });
         }
-        // v1: Deep Research is the only built-in. v2 adds Component Pipeline
-        // and exposes a sub-picker on the swarm tier so the user chooses.
-        const swarmId = 'builtin:deep_research';
+        const swarmId = 'builtin:research_swarm';
         const swarmEntry = loadSwarmById(swarmId);
         if (!swarmEntry) {
             return res.status(500).json({ error: `Swarm runtime is misconfigured: ${swarmId} not registered.` });
+        }
+
+        // Resolve the Swarm tier's configured model (used as a fallback
+        // any time a worker's tier doesn't resolve to a specific model).
+        let fallbackModelId = null;
+        try {
+            // Need the user's org for EU-aware resolution. Resolve it cheaply
+            // here — we don't need the full Flow tier-resolution dance.
+            const userStoreLocal = require('../../stores/userStore');
+            const localUser = await userStoreLocal.getUser(userId).catch(() => null);
+            const userOrgId = localUser?.organizationId || null;
+            fallbackModelId = await resolveSwarmTierModel('tier:swarm', { userOrgId, userId, fallbackTier: 'fast' });
+        } catch (e) {
+            console.warn('[DirectChat/Swarm] tier model resolution failed:', e.message);
+        }
+        if (!fallbackModelId) {
+            return res.status(400).json({ error: 'No model is configured for the Swarm tier. Ask an admin to set one in Chat Model Tiers → Swarm (Direct).' });
         }
 
         // SSE handshake (mirror of the block further down for the regular
@@ -204,28 +221,25 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
             const result = await runSwarmTurn({
                 swarmId,
                 message,
-                options: requestedSwarmOptions || {},
                 hiveMind,
                 send,
                 userId,
-                userOrgId: null,        // swarm doesn't need EU-tier resolution in v1
-                modelOverride: null,
+                session: req.session,
+                isAdmin: !!req.session?.isAdmin,
+                fallbackModelId,
+                userOrgId: null,
+                resolvedTier: 'swarm',
             });
 
             // Persist updated state on the conversation (best-effort; failure
             // here mustn't abort the response — the user already saw the answer).
             try {
                 if (!convId) {
-                    // model_tier is recorded on the conversation row; for a
-                    // swarm conversation we tag it 'swarm' so the sidebar
-                    // list renderer can label it appropriately.
                     const created = await agentStore.createDirectConversation(userId, 'swarm');
                     convId = created?.id || null;
                     if (convId) send('conversation_created', { conversationId: convId });
                 }
                 if (convId) {
-                    // Read existing messages so we can append the user message
-                    // and the assistant's final answer in one write.
                     const existingConv = await agentStore.getDirectConversation(convId, userId);
                     const messages = Array.isArray(existingConv?.messages) ? [...existingConv.messages] : [];
                     if (!result.paused && typeof result.finalText === 'string' && result.finalText.length > 0) {
@@ -238,11 +252,7 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                         messages.push({
                             role: 'assistant',
                             content: result.finalText,
-                            metadata: {
-                                swarmId,
-                                sourceCount: (result.sources || []).length,
-                                topic: result.metadata?.topic || null,
-                            },
+                            metadata: { swarmId },
                             timestamp: new Date().toISOString(),
                         });
                     }
