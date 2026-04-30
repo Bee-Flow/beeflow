@@ -39,6 +39,10 @@ const { ONEDRIVE_TOOLS } = require('../integrations/oneDriveTools');
 const { MS_CONTACTS_TOOLS } = require('../integrations/msContactsTools');
 const { TRANSCRIPTION_TOOLS } = require('../integrations/transcriptionTools');
 const { NEXTCLOUD_TOOLS } = require('../integrations/nextcloudTools');
+const { NEXTCLOUD_CALENDAR_TOOLS } = require('../integrations/nextcloudCalendarTools');
+const { NEXTCLOUD_CONTACTS_TOOLS } = require('../integrations/nextcloudContactsTools');
+const { NEXTCLOUD_DECK_TOOLS } = require('../integrations/nextcloudDeckTools');
+const { NEXTCLOUD_NOTIFICATIONS_TOOLS } = require('../integrations/nextcloudNotificationsTools');
 
 // IDs that are exempt from org-level gating (admin-only tools, internal utilities)
 const ORG_EXEMPT_APPS = ['workspace', 'regex-gen'];
@@ -88,7 +92,7 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
 
     // Auto-enable new integrations for users with existing saved lists
     // (these were added after the user saved their enabledApps, so they wouldn't be included)
-    const AUTO_ENABLED_APPS = ['agent-search', 'workspace', 'image-gen', 'music-gen', 'video-gen', 'elevenlabs', 'google-maps', 'linkedin', 'github', 'google-contacts', 'google-keep', 'outlook', 'outlook-readonly', 'ms-calendar', 'onedrive', 'ms-contacts', 'google-groups', 'n8n', 'nextcloud'];
+    const AUTO_ENABLED_APPS = ['agent-search', 'workspace', 'image-gen', 'music-gen', 'video-gen', 'elevenlabs', 'google-maps', 'linkedin', 'github', 'google-contacts', 'google-keep', 'outlook', 'outlook-readonly', 'ms-calendar', 'onedrive', 'ms-contacts', 'google-groups', 'n8n', 'nextcloud', 'nextcloud-calendar', 'nextcloud-contacts', 'nextcloud-deck', 'nextcloud-notifications'];
 
     const isAppOn = (appId) => {
         // Must be enabled at user level
@@ -261,17 +265,26 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
 
     // Nextcloud — OAuth path (parity with Google/Microsoft above) with
     // app-password fallback for users not logged in via Nextcloud OAuth.
+    // Once a Nextcloud connection (either mode) is established, every
+    // sub-app (files, calendar, contacts, Deck, notifications) gates on its
+    // own per-app toggle so admins can disable individual surfaces.
     try {
         const oauthCfg = (await configStore.getConfig('oauth')) || {};
-        if (oauthCfg.nextcloudUrl && isAppOn('nextcloud')) {
+        if (oauthCfg.nextcloudUrl) {
+            let nextcloudConnected = false;
             if (session?.oauthProvider === 'nextcloud' && session?.accessToken) {
-                addTools(NEXTCLOUD_TOOLS);
+                nextcloudConnected = true;
             } else {
                 const userStoreLocal = require('../stores/userStore');
                 const ncCreds = await userStoreLocal.getAppPassword(userId);
-                if (ncCreds?.username && ncCreds?.password) {
-                    addTools(NEXTCLOUD_TOOLS);
-                }
+                if (ncCreds?.username && ncCreds?.password) nextcloudConnected = true;
+            }
+            if (nextcloudConnected) {
+                if (isAppOn('nextcloud')) addTools(NEXTCLOUD_TOOLS);
+                if (isAppOn('nextcloud-calendar')) addTools(NEXTCLOUD_CALENDAR_TOOLS);
+                if (isAppOn('nextcloud-contacts')) addTools(NEXTCLOUD_CONTACTS_TOOLS);
+                if (isAppOn('nextcloud-deck')) addTools(NEXTCLOUD_DECK_TOOLS);
+                if (isAppOn('nextcloud-notifications')) addTools(NEXTCLOUD_NOTIFICATIONS_TOOLS);
             }
         }
     } catch (e) { /* ignore — credentials missing or store unavailable */ }
@@ -367,6 +380,11 @@ async function buildToolHint(tools, userId = null) {
     if (tools.some(t => t.function.name.startsWith('onedrive_'))) integrations.push('OneDrive (search, list, manage files and folders)');
     if (tools.some(t => t.function.name.startsWith('ms_contacts_'))) integrations.push('Microsoft Contacts (search, list, create, update contacts — create/update require user approval)');
     if (tools.some(t => t.function.name === 'transcribe_audio')) integrations.push('Meeting Transcription (transcribe uploaded audio files with speaker diarization using Voxtral AI — supports up to 3 hours of audio, Dutch and other languages)');
+    if (tools.some(t => t.function.name.startsWith('nextcloud_calendar_'))) integrations.push('Nextcloud Calendar (list calendars, list/search/get events, create/update/delete events via CalDAV — create/update/delete require user approval)');
+    if (tools.some(t => t.function.name.startsWith('nextcloud_contacts_'))) integrations.push('Nextcloud Contacts (list address books, list/search/get contacts, create/update/delete contacts via CardDAV — create/update/delete require user approval)');
+    if (tools.some(t => t.function.name.startsWith('nextcloud_deck_'))) integrations.push('Nextcloud Deck (list boards/stacks/cards, search cards, create/update/move/archive/delete cards, manage labels, add comments — create/update/move require user approval, delete always requires confirmation)');
+    if (tools.some(t => t.function.name.startsWith('nextcloud_notifications_'))) integrations.push('Nextcloud Notifications (list pending notifications, dismiss one or all — dismiss-all always requires user confirmation)');
+    if (tools.some(t => t.function.name.startsWith('nextcloud_') && !t.function.name.startsWith('nextcloud_calendar_') && !t.function.name.startsWith('nextcloud_contacts_') && !t.function.name.startsWith('nextcloud_deck_') && !t.function.name.startsWith('nextcloud_notifications_'))) integrations.push('Nextcloud Files (list/search/read/upload/delete files & folders, create public share links via WebDAV — destructive ops require user approval)');
 
     // MCP (Model Context Protocol) tools — dynamically discovered from connected external servers
     const mcpTools = tools.filter(t => t.function?.name?.startsWith('mcp_'));

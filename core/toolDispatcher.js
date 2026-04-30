@@ -40,6 +40,10 @@ const { isOneDriveTool, executeOneDriveTool } = require('../integrations/oneDriv
 const { isMsContactsTool, executeMsContactsTool } = require('../integrations/msContactsTools');
 const { isTranscriptionTool, executeTranscriptionTool } = require('../integrations/transcriptionTools');
 const { isNextcloudTool, executeNextcloudTool } = require('../integrations/nextcloudTools');
+const { isNextcloudCalendarTool, executeNextcloudCalendarTool } = require('../integrations/nextcloudCalendarTools');
+const { isNextcloudContactsTool, executeNextcloudContactsTool } = require('../integrations/nextcloudContactsTools');
+const { isNextcloudDeckTool, executeNextcloudDeckTool } = require('../integrations/nextcloudDeckTools');
+const { isNextcloudNotificationsTool, executeNextcloudNotificationsTool } = require('../integrations/nextcloudNotificationsTools');
 
 /**
  * Execute a tool by name.
@@ -346,6 +350,20 @@ async function executeTool(toolName, toolArgs, context = {}) {
     }
     if (isGitHubTool(toolName)) {
         return await executeGitHubTool(toolName, toolArgs, userId);
+    }
+    // Nextcloud sub-apps must dispatch BEFORE the generic nextcloud check —
+    // isNextcloudTool matches the broad "nextcloud_*" prefix.
+    if (isNextcloudCalendarTool(toolName)) {
+        return await executeNextcloudCalendarTool(toolName, toolArgs, userId, session);
+    }
+    if (isNextcloudContactsTool(toolName)) {
+        return await executeNextcloudContactsTool(toolName, toolArgs, userId, session);
+    }
+    if (isNextcloudDeckTool(toolName)) {
+        return await executeNextcloudDeckTool(toolName, toolArgs, userId, session);
+    }
+    if (isNextcloudNotificationsTool(toolName)) {
+        return await executeNextcloudNotificationsTool(toolName, toolArgs, userId, session);
     }
     if (isNextcloudTool(toolName)) {
         return await executeNextcloudTool(toolName, toolArgs, userId, session);

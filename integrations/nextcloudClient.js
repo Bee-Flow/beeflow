@@ -142,12 +142,62 @@ async function ncFetch(url, session, options = {}) {
     return response;
 }
 
+/**
+ * Resolve the auth context shared by every Nextcloud tool module (files,
+ * calendar, contacts, Deck, notifications). Returns a pre-bound `fetch` so
+ * callers don't have to know about Bearer-vs-Basic — they just call it.
+ *
+ *   { mode: 'bearer', baseUrl, uid, fetch, authError }
+ *   { mode: 'basic',  baseUrl, uid, username, password, fetch, authError }
+ *
+ * In both modes `uid` is the Nextcloud user identifier needed to construct
+ * /remote.php/dav/{calendars,addressbooks,files}/<uid>/... paths.
+ */
+async function resolveAuth(session, userId) {
+    const baseUrl = await getBaseUrl();
+
+    if (isNextcloudOAuthSession(session)) {
+        const uid = await resolveUid(session, baseUrl);
+        return {
+            mode: 'bearer',
+            baseUrl,
+            uid,
+            session,
+            fetch: (url, options) => ncFetch(url, session, options),
+            authError: 'Nextcloud session expired — please log in again.',
+        };
+    }
+
+    // App-password fallback. Lazy-required so we don't pull userStore into
+    // every importer of this module.
+    const userStore = require('../stores/userStore');
+    const creds = await userStore.getAppPassword(userId);
+    if (!creds || !creds.username || !creds.password) {
+        throw new Error('Nextcloud not connected. Log in via Nextcloud OAuth, or add your username and app password in Settings → Integrations.');
+    }
+    const auth = 'Basic ' + Buffer.from(`${creds.username}:${creds.password}`).toString('base64');
+    return {
+        mode: 'basic',
+        baseUrl,
+        uid: creds.username,
+        username: creds.username,
+        password: creds.password,
+        fetch: (url, options = {}) => fetch(url, {
+            ...options,
+            headers: { 'Authorization': auth, ...(options.headers || {}) },
+            signal: options.signal || AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        }),
+        authError: 'Nextcloud rejected credentials. Re-save your app password in Settings → Integrations.',
+    };
+}
+
 module.exports = {
     isNextcloudOAuthSession,
     getBaseUrl,
     webdavRoot,
     refreshAccessToken,
     resolveUid,
+    resolveAuth,
     ncFetch,
     REQUEST_TIMEOUT_MS,
 };

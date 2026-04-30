@@ -56,6 +56,13 @@ const INTEGRATION_PREFIXES = {
 
     // Transcription
     transcribe_:    { integration: 'transcription',   label: 'Transcription',       server: process.env.WHISPER_URL || 'whisper-service (local)' },
+
+    // Nextcloud (longest prefix wins via the sort in resolveIntegration)
+    nextcloud_calendar_:      { integration: 'nextcloud_calendar',      label: 'Nextcloud Calendar',      server: 'nextcloud (CalDAV)' },
+    nextcloud_contacts_:      { integration: 'nextcloud_contacts',      label: 'Nextcloud Contacts',      server: 'nextcloud (CardDAV)' },
+    nextcloud_deck_:          { integration: 'nextcloud_deck',          label: 'Nextcloud Deck',          server: 'nextcloud (Deck app)' },
+    nextcloud_notifications_: { integration: 'nextcloud_notifications', label: 'Nextcloud Notifications', server: 'nextcloud (OCS)' },
+    nextcloud_:               { integration: 'nextcloud',               label: 'Nextcloud Files',         server: 'nextcloud (WebDAV)' },
 };
 
 // ── Static overrides for specific tools ──────────────────────────────

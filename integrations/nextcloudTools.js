@@ -15,7 +15,6 @@
  * uses.
  */
 
-const userStore = require('../stores/userStore');
 const ncClient = require('./nextcloudClient');
 
 const MAX_TEXT_BYTES = 200 * 1024;          // 200 KB cap on file reads
@@ -141,50 +140,6 @@ const NEXTCLOUD_TOOLS = [
 
 // ─── Helpers ──────────────────────────────────────────────────────
 
-/**
- * Resolve the auth context for the current call. Returns either:
- *   { mode: 'bearer', baseUrl, uid, session, fetch, authError }
- *   { mode: 'basic',  baseUrl, username, password,    fetch, authError }
- *
- * `fetch` is a pre-bound function the caller uses for every request. In Bearer
- * mode it routes through ncClient.ncFetch (so 401s trigger refresh+retry); in
- * Basic mode it adds the Authorization header explicitly. `authError` is the
- * 401 message to surface to the LLM, varies by mode.
- */
-async function resolveAuth(session, userId) {
-    const baseUrl = await ncClient.getBaseUrl();
-
-    if (ncClient.isNextcloudOAuthSession(session)) {
-        const uid = await ncClient.resolveUid(session, baseUrl);
-        return {
-            mode: 'bearer',
-            baseUrl,
-            uid,
-            session,
-            fetch: (url, options) => ncClient.ncFetch(url, session, options),
-            authError: 'Nextcloud session expired — please log in again.',
-        };
-    }
-
-    const creds = await userStore.getAppPassword(userId);
-    if (!creds || !creds.username || !creds.password) {
-        throw new Error('Nextcloud not connected. Log in via Nextcloud OAuth, or add your username and app password in Settings → Integrations.');
-    }
-    const auth = 'Basic ' + Buffer.from(`${creds.username}:${creds.password}`).toString('base64');
-    return {
-        mode: 'basic',
-        baseUrl,
-        username: creds.username,
-        password: creds.password,
-        fetch: (url, options = {}) => fetch(url, {
-            ...options,
-            headers: { 'Authorization': auth, ...(options.headers || {}) },
-            signal: options.signal || AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-        }),
-        authError: 'Nextcloud rejected credentials. Re-save your app password in Settings → Integrations.',
-    };
-}
-
 function joinDavPath(root, path) {
     const cleaned = String(path || '/').replace(/^\/+/, '').replace(/\/+$/, '');
     if (!cleaned) return root + '/';
@@ -238,9 +193,8 @@ function parsePropfind(xml, baseUrl, uid) {
 // ─── Tool Execution ───────────────────────────────────────────────
 
 async function executeNextcloudTool(toolName, args, userId, session) {
-    const ctx = await resolveAuth(session, userId);
-    const { baseUrl, fetch: ncFetch, authError, mode } = ctx;
-    const uid = mode === 'bearer' ? ctx.uid : ctx.username;
+    const ctx = await ncClient.resolveAuth(session, userId);
+    const { baseUrl, fetch: ncFetch, authError, uid } = ctx;
     const root = ncClient.webdavRoot(baseUrl, uid);
 
     switch (toolName) {
