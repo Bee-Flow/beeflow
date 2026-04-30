@@ -810,8 +810,16 @@ router.post('/create-app-password', async (req, res) => {
         return res.status(400).json({ error: 'Nextcloud URL not configured' });
     }
 
+    // Nextcloud uid for WebDAV Basic auth — falls back to id, then displayName
+    const nextcloudUsername = req.session.user?.id || req.session.user?.['display-name'] || userId;
+
     try {
-        const response = await fetch(`${nextcloudUrl}/ocs/v2.php/core/apppassword`, {
+        // Correct OCS endpoint per Nextcloud docs: /core/getapppassword (not /core/apppassword)
+        // https://docs.nextcloud.com/server/latest/developer_manual/client_apis/OCS/ocs-api-overview.html
+        // Note: app passwords minted with a Bearer token inherit the OAuth access-token TTL
+        // (~10 min). For persistent WebDAV access the user should paste a manually-generated
+        // app password via /save-app-password instead.
+        const response = await fetch(`${nextcloudUrl}/ocs/v2.php/core/getapppassword`, {
             method: 'GET',
             headers: {
                 'Authorization': `Bearer ${accessToken}`,
@@ -821,18 +829,28 @@ router.post('/create-app-password', async (req, res) => {
         });
 
         if (!response.ok) {
-            return res.status(500).json({ error: 'Failed to create app password' });
+            const text = await response.text().catch(() => '');
+            console.warn(`[Nextcloud] getapppassword failed (${response.status}): ${text.slice(0, 200)}`);
+            return res.status(response.status === 403 ? 403 : 502).json({
+                error: response.status === 403
+                    ? 'Already authenticated with an app password — generate a new one in Nextcloud Settings → Security.'
+                    : 'Failed to create app password from Nextcloud'
+            });
         }
 
         const data = await response.json();
         const appPassword = data.ocs?.data?.apppassword;
 
         if (!appPassword) {
-            return res.status(500).json({ error: 'No app password returned' });
+            return res.status(502).json({ error: 'No app password returned by Nextcloud' });
         }
 
-        await userStore.storeAppPassword(userId, userId, appPassword);
-        res.json({ success: true, message: 'App password created' });
+        await userStore.storeAppPassword(userId, nextcloudUsername, appPassword);
+        res.json({
+            success: true,
+            message: 'App password created',
+            warning: 'App passwords minted via OAuth inherit the access-token lifetime. For persistent WebDAV access, generate one manually in Nextcloud (Settings → Security) and save it via the password form.'
+        });
 
     } catch (err) {
         res.status(500).json({ error: err.message });

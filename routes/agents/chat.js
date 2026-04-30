@@ -111,7 +111,7 @@ router.post('/:id/chat', async (req, res) => {
     }
 
     try {
-        const userAuth = getUserAuth(req);
+        const userAuth = await getUserAuth(req);
         const result = await agentRuntime.chatWithAgent(
             req.params.id,
             req.session.user.id,
@@ -217,7 +217,7 @@ router.post('/:id/chat/stream', async (req, res) => {
     const { sendEvent, abortController, markEnded } = setupSSE(res);
 
     try {
-        const userAuth = getUserAuth(req);
+        const userAuth = await getUserAuth(req);
 
         const result = await agentRuntime.chatWithAgentStream(
             req.params.id,

@@ -47,6 +47,7 @@ function compactToolResultForLLM(toolResult) {
     return toolResult;
 }
 const { getIntegrationTools, buildToolHint } = require('../../core/integrationTools');
+const { getUserAuth } = require('../../utils/routeHelpers');
 const { checkRegexPatterns } = require('../../core/guardrails');
 const { checkSubscriptionLimits, resolveOrgId } = require('../../core/limits');
 const { getServiceHeaders } = require('../../core/serviceAuth');
@@ -2228,7 +2229,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                     toolCallRounds++;
 
                     // Execute all tool calls in parallel
-                    const userAuth = { userId, session: req.session };
+                    const userAuth = await getUserAuth(req);
                     const toolPromises = result.toolCalls.map(async (toolCall) => {
                         const toolName = toolCall.function?.name || toolCall.name;
                         let toolArgs = {};
@@ -2811,7 +2812,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                 tool_calls: streamToolCalls,
             });
 
-            const userAuth = { userId, session: req.session };
+            const userAuth = await getUserAuth(req);
             const toolPromises = streamToolCalls.map(async (toolCall) => {
                 const toolName = toolCall.function?.name;
                 let toolArgs = {};

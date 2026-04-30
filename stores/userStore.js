@@ -660,18 +660,39 @@ async function initDefaultGroups() {
 }
 initDefaultGroups().catch(err => console.error('[UserStore] initDefaultGroups error:', err.message));
 
-// ── App Password (Legacy) ─────────────────────────────
+// ── App Password (Nextcloud / WebDAV) ─────────────────
+// Stores `{username, password}` as encrypted JSON in users.appPassword. The username is
+// the Nextcloud uid used for WebDAV Basic auth, which may differ from the BeeFlow login
+// (e.g. SSO email vs Nextcloud uid). Reads tolerate the legacy plain-password format.
 async function storeAppPassword(userId, username, appPassword) {
     await initDB();
     const user = await getUser(userId);
     if (!user) await createUser({ id: userId, username });
-    try { await run('UPDATE users SET "appPassword" = $1, "appPasswordCreated" = $2 WHERE id = $3', [JSON.stringify(encrypt(appPassword)), new Date().toISOString(), userId]); return true; } catch (e) { console.error(e); return false; }
+    try {
+        const payload = JSON.stringify({ username, password: appPassword });
+        await run('UPDATE users SET "appPassword" = $1, "appPasswordCreated" = $2 WHERE id = $3',
+            [JSON.stringify(encrypt(payload)), new Date().toISOString(), userId]);
+        return true;
+    } catch (e) { console.error(e); return false; }
 }
 
 async function getAppPassword(userId) {
     const user = await getUser(userId);
     if (!user || !user.appPassword) return null;
-    return { username: user.username, password: decrypt(user.appPassword), createdAt: user.appPasswordCreated };
+    const decrypted = decrypt(user.appPassword);
+    if (!decrypted) return null;
+    // New format: encrypted JSON { username, password }. Legacy: encrypted password only.
+    try {
+        const parsed = JSON.parse(decrypted);
+        if (parsed && typeof parsed === 'object' && parsed.password) {
+            return {
+                username: parsed.username || user.username,
+                password: parsed.password,
+                createdAt: user.appPasswordCreated
+            };
+        }
+    } catch (_) { /* legacy bare-password path */ }
+    return { username: user.username, password: decrypted, createdAt: user.appPasswordCreated };
 }
 
 async function hasAppPassword(userId) { const user = await getUser(userId); return !!(user && user.appPassword); }

@@ -27,9 +27,9 @@ function getEffectiveUserId(req) {
  * Get user authentication credentials for component execution.
  * Extracts OAuth tokens, Nextcloud app passwords, and encryption keys.
  * @param {import('express').Request} req
- * @returns {object} { accessToken, nextcloudUrl, appPasswordUsername, appPassword, encryptionKey }
+ * @returns {Promise<object>} { accessToken, nextcloudUrl, appPasswordUsername, appPassword, encryptionKey }
  */
-function getUserAuth(req) {
+async function getUserAuth(req) {
     const { resolveUserOrgIds } = require('../auth');
 
     // Resolve user's org for EU mode and other org-scoped features
@@ -49,7 +49,7 @@ function getUserAuth(req) {
 
     const configStore = require('../stores/configStore');
     try {
-        const oauth = configStore.getConfig('oauth') || {};
+        const oauth = (await configStore.getConfig('oauth')) || {};
         userAuth.nextcloudUrl = oauth.nextcloudUrl || null;
     } catch (e) { }
 
@@ -62,7 +62,7 @@ function getUserAuth(req) {
         const userId = req.session?.user?.id;
         if (userId) {
             const userStore = require('../stores/userStore');
-            const appPasswordData = userStore.getAppPassword(userId);
+            const appPasswordData = await userStore.getAppPassword(userId);
             if (appPasswordData) {
                 userAuth.appPasswordUsername = appPasswordData.username;
                 userAuth.appPassword = appPasswordData.password;

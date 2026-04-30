@@ -11,7 +11,7 @@ const { getUserAuth } = require('../utils/routeHelpers');
 // Execute a workflow
 router.post('/execute', async (req, res) => {
     const { workflow, workflowId, workflowName } = req.body;
-    const userAuth = getUserAuth(req);
+    const userAuth = await getUserAuth(req);
     const userId = req.session?.user?.id || 'anonymous';
     const workflowStore = require('../stores/workflowStore');
 
@@ -59,7 +59,7 @@ router.post('/test-component', async (req, res) => {
         return res.status(404).json({ error: `Component '${componentId}' not found` });
     }
 
-    const userAuth = getUserAuth(req);
+    const userAuth = await getUserAuth(req);
 
     const testWorkflow = {
         nodes: [{
@@ -87,7 +87,7 @@ router.post('/test-component', async (req, res) => {
 router.post('/subworkflow/:workflowId', async (req, res) => {
     const { workflowId } = req.params;
     const { inputData, callerId } = req.body;
-    const userAuth = getUserAuth(req);
+    const userAuth = await getUserAuth(req);
     const userId = req.session?.user?.id || 'anonymous';
     const workflowStore = require('../stores/workflowStore');
 
