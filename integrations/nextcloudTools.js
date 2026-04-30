@@ -135,6 +135,276 @@ const NEXTCLOUD_TOOLS = [
                 required: ['path']
             }
         }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_share_with_user',
+            description: 'Share a file or folder with a specific Nextcloud user. The user has approved this. permissions: 1=read, 2=update, 4=create, 8=delete, 16=share — combine with bitwise OR (e.g. 31 = full).',
+            parameters: {
+                type: 'object',
+                properties: {
+                    path: { type: 'string', description: 'Path of the file or folder.' },
+                    shareWith: { type: 'string', description: 'Target user uid.' },
+                    permissions: { type: 'integer', description: 'Permission bitmask, default 1 (read).' },
+                    expireDate: { type: 'string', description: 'Optional YYYY-MM-DD.' },
+                    note: { type: 'string', description: 'Optional note shown to the recipient.' }
+                },
+                required: ['path', 'shareWith']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_share_with_group',
+            description: 'Share a file or folder with a Nextcloud group. The user has approved this. permissions bitmask same as share_with_user (1=read, 2=update, 4=create, 8=delete, 16=share).',
+            parameters: {
+                type: 'object',
+                properties: {
+                    path: { type: 'string' },
+                    shareWith: { type: 'string', description: 'Target group id.' },
+                    permissions: { type: 'integer', description: 'Permission bitmask, default 1 (read).' },
+                    expireDate: { type: 'string' },
+                    note: { type: 'string' }
+                },
+                required: ['path', 'shareWith']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_share_by_email',
+            description: 'Share a file or folder by email (creates a hidden public link emailed to the recipient). The user has approved this.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    path: { type: 'string' },
+                    shareWith: { type: 'string', description: 'Recipient email address.' },
+                    password: { type: 'string', description: 'Optional access password.' },
+                    expireDate: { type: 'string' },
+                    note: { type: 'string' }
+                },
+                required: ['path', 'shareWith']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_list_shares',
+            description: 'List shares. Defaults to outgoing shares. Pass shared_with_me=true for incoming, or path=… for shares of a specific path.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    path: { type: 'string', description: 'Optional path filter — list shares for this exact file/folder.' },
+                    shared_with_me: { type: 'boolean', description: 'true = shares shared with the user (incoming).' }
+                }
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_update_share',
+            description: 'Update an existing share — change permissions, password, expiry, or note. The user has approved this.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    shareId: { type: 'integer' },
+                    permissions: { type: 'integer' },
+                    password: { type: 'string', description: 'New password (empty string clears).' },
+                    expireDate: { type: 'string' },
+                    note: { type: 'string' }
+                },
+                required: ['shareId']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_delete_share',
+            description: 'Revoke a share by id. Always confirm with the user before calling.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    shareId: { type: 'integer' }
+                },
+                required: ['shareId']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_list_file_comments',
+            description: 'List comments on a file. fileId is the numeric id (from nextcloud_list_files).',
+            parameters: {
+                type: 'object',
+                properties: {
+                    fileId: { type: 'integer' },
+                    limit: { type: 'integer', description: 'Max comments (default 50, max 200).' }
+                },
+                required: ['fileId']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_add_file_comment',
+            description: 'Add a comment to a file. The user has approved this.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    fileId: { type: 'integer' },
+                    message: { type: 'string', description: 'Plain-text comment body.' }
+                },
+                required: ['fileId', 'message']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_list_tags',
+            description: 'List system tags available on this Nextcloud (id, name, visibility, assignable flag).',
+            parameters: { type: 'object', properties: {} }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_create_tag',
+            description: 'Create a new system tag. The user has approved this. Most servers require admin rights for visible tags.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    name: { type: 'string' },
+                    userVisible: { type: 'boolean', description: 'Visible to all users (default true).' },
+                    userAssignable: { type: 'boolean', description: 'Assignable by all users (default true).' }
+                },
+                required: ['name']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_tag_file',
+            description: 'Attach a system tag to a file or folder.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    fileId: { type: 'integer' },
+                    tagId: { type: 'integer' }
+                },
+                required: ['fileId', 'tagId']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_untag_file',
+            description: 'Remove a system tag from a file.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    fileId: { type: 'integer' },
+                    tagId: { type: 'integer' }
+                },
+                required: ['fileId', 'tagId']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_find_files_by_tag',
+            description: 'Find all files and folders that carry a given system tag.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    tagId: { type: 'integer' },
+                    limit: { type: 'integer', description: 'Max results (default 100, max 500).' }
+                },
+                required: ['tagId']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_list_trash',
+            description: 'List items in the user\'s Nextcloud trash bin (deleted files awaiting permanent removal).',
+            parameters: {
+                type: 'object',
+                properties: {
+                    limit: { type: 'integer', description: 'Max items (default 200, max 1000).' }
+                }
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_restore_from_trash',
+            description: 'Restore a single item from the trash to its original location. Use the trashPath returned by list_trash.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    trashPath: { type: 'string', description: 'Trash item path (from list_trash).' },
+                    originalPath: { type: 'string', description: 'Optional override for the destination — defaults to the original location.' }
+                },
+                required: ['trashPath']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_permanent_delete_trash',
+            description: 'Permanently remove an item from the trash bin. Always confirm with the user before calling — this is unrecoverable.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    trashPath: { type: 'string', description: 'Trash item path (from list_trash).' }
+                },
+                required: ['trashPath']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_list_versions',
+            description: 'List previous versions of a file (by fileId).',
+            parameters: {
+                type: 'object',
+                properties: {
+                    fileId: { type: 'integer' }
+                },
+                required: ['fileId']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_restore_version',
+            description: 'Restore a previous version of a file. The user has approved this.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    fileId: { type: 'integer' },
+                    versionId: { type: 'string', description: 'Version id (from list_versions).' }
+                },
+                required: ['fileId', 'versionId']
+            }
+        }
     }
 ];
 
@@ -392,6 +662,422 @@ async function executeNextcloudTool(toolName, args, userId, session) {
                 path: args.path,
                 expiration: share?.expiration || null,
             };
+        }
+
+        case 'nextcloud_share_with_user':
+        case 'nextcloud_share_with_group':
+        case 'nextcloud_share_by_email': {
+            if (!args.path || !args.shareWith) return { error: 'path and shareWith are required' };
+            const shareType = toolName === 'nextcloud_share_with_user' ? 0
+                : toolName === 'nextcloud_share_with_group' ? 1
+                : 4;
+            const params = new URLSearchParams();
+            params.set('path', args.path);
+            params.set('shareType', String(shareType));
+            params.set('shareWith', args.shareWith);
+            if (args.permissions !== undefined) params.set('permissions', String(args.permissions));
+            if (args.password) params.set('password', args.password);
+            if (args.expireDate) params.set('expireDate', args.expireDate);
+            if (args.note) params.set('note', args.note);
+            const res = await ncFetch(`${baseUrl}/ocs/v2.php/apps/files_sharing/api/v1/shares?format=json`, {
+                method: 'POST',
+                headers: {
+                    'OCS-APIRequest': 'true',
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Accept': 'application/json',
+                },
+                body: params.toString(),
+            });
+            if (res.status === 401) return { error: authError };
+            if (!res.ok) {
+                const text = await res.text().catch(() => '');
+                return { error: `Share create failed (${res.status}): ${text.slice(0, 200)}` };
+            }
+            const data = await res.json().catch(() => ({}));
+            const meta = data?.ocs?.meta;
+            const share = data?.ocs?.data;
+            if (meta?.statuscode && meta.statuscode >= 400) {
+                return { error: `Nextcloud rejected share: ${meta.message || 'unknown error'}` };
+            }
+            return {
+                success: true,
+                shareId: share?.id || null,
+                shareType,
+                shareWith: args.shareWith,
+                path: args.path,
+                permissions: share?.permissions,
+                expiration: share?.expiration || null,
+            };
+        }
+
+        case 'nextcloud_list_shares': {
+            const params = new URLSearchParams({ format: 'json' });
+            if (args.path) params.set('path', args.path);
+            if (args.shared_with_me) params.set('shared_with_me', 'true');
+            const res = await ncFetch(`${baseUrl}/ocs/v2.php/apps/files_sharing/api/v1/shares?${params.toString()}`, {
+                headers: { 'OCS-APIRequest': 'true', 'Accept': 'application/json' },
+            });
+            if (res.status === 401) return { error: authError };
+            if (!res.ok) return { error: `Share list failed (${res.status})` };
+            const data = await res.json().catch(() => ({}));
+            const shares = (data?.ocs?.data || []).map(s => ({
+                id: s.id,
+                shareType: s.share_type,
+                shareWith: s.share_with,
+                shareWithDisplayName: s.share_with_displayname,
+                path: s.path,
+                fileTarget: s.file_target,
+                permissions: s.permissions,
+                expiration: s.expiration,
+                token: s.token,
+                url: s.url,
+                stime: s.stime,
+                note: s.note,
+            }));
+            return { count: shares.length, shares };
+        }
+
+        case 'nextcloud_update_share': {
+            if (!args.shareId) return { error: 'shareId is required' };
+            // Run each provided field through its own PUT — Nextcloud expects
+            // one property per request on this endpoint.
+            const fields = [];
+            if (args.permissions !== undefined) fields.push(['permissions', String(args.permissions)]);
+            if (args.password !== undefined) fields.push(['password', args.password]);
+            if (args.expireDate !== undefined) fields.push(['expireDate', args.expireDate]);
+            if (args.note !== undefined) fields.push(['note', args.note]);
+            if (fields.length === 0) return { error: 'no fields to update' };
+            for (const [key, val] of fields) {
+                const params = new URLSearchParams();
+                params.set(key, val);
+                const res = await ncFetch(`${baseUrl}/ocs/v2.php/apps/files_sharing/api/v1/shares/${encodeURIComponent(args.shareId)}?format=json`, {
+                    method: 'PUT',
+                    headers: {
+                        'OCS-APIRequest': 'true',
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'Accept': 'application/json',
+                    },
+                    body: params.toString(),
+                });
+                if (res.status === 401) return { error: authError };
+                if (!res.ok) {
+                    const text = await res.text().catch(() => '');
+                    return { error: `Share update (${key}) failed (${res.status}): ${text.slice(0, 200)}` };
+                }
+            }
+            return { success: true, shareId: args.shareId };
+        }
+
+        case 'nextcloud_delete_share': {
+            if (!args.shareId) return { error: 'shareId is required' };
+            const res = await ncFetch(`${baseUrl}/ocs/v2.php/apps/files_sharing/api/v1/shares/${encodeURIComponent(args.shareId)}?format=json`, {
+                method: 'DELETE',
+                headers: { 'OCS-APIRequest': 'true', 'Accept': 'application/json' },
+            });
+            if (res.status === 401) return { error: authError };
+            if (res.status === 404) return { error: `Share not found: ${args.shareId}` };
+            if (!res.ok) return { error: `Share delete failed (${res.status})` };
+            return { success: true, shareId: args.shareId };
+        }
+
+        case 'nextcloud_list_file_comments': {
+            if (!args.fileId) return { error: 'fileId is required' };
+            const limit = Math.min(Math.max(args.limit || 50, 1), 200);
+            const body = `<?xml version="1.0" encoding="utf-8" ?>
+<oc:filter-comments xmlns:oc="http://owncloud.org/ns" xmlns:d="DAV:">
+  <oc:limit>${limit}</oc:limit>
+  <oc:offset>0</oc:offset>
+</oc:filter-comments>`;
+            const res = await ncFetch(`${baseUrl}/remote.php/dav/comments/files/${encodeURIComponent(args.fileId)}/`, {
+                method: 'REPORT',
+                headers: { 'Content-Type': 'application/xml; charset=utf-8' },
+                body,
+            });
+            if (res.status === 401) return { error: authError };
+            if (res.status === 404) return { error: `File not found or no comments support: ${args.fileId}` };
+            if (!res.ok) return { error: `Comments fetch failed (${res.status})` };
+            const xml = await res.text();
+            const comments = [];
+            const respRegex = /<d:response[\s>][\s\S]*?<\/d:response>/g;
+            const matches = xml.match(respRegex) || [];
+            for (const block of matches) {
+                const id = (block.match(/<d:href>[^<]*\/(\d+)<\/d:href>/) || [])[1];
+                const message = (block.match(/<oc:message>([\s\S]*?)<\/oc:message>/) || [])[1];
+                const actor = (block.match(/<oc:actorDisplayName>([^<]+)<\/oc:actorDisplayName>/) || [])[1];
+                const actorId = (block.match(/<oc:actorId>([^<]+)<\/oc:actorId>/) || [])[1];
+                const created = (block.match(/<oc:creationDateTime>([^<]+)<\/oc:creationDateTime>/) || [])[1];
+                if (id) comments.push({
+                    id: parseInt(id, 10),
+                    message: (message || '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&'),
+                    actor, actorId, created,
+                });
+            }
+            return { fileId: args.fileId, count: comments.length, comments };
+        }
+
+        case 'nextcloud_add_file_comment': {
+            if (!args.fileId || !args.message) return { error: 'fileId and message are required' };
+            const res = await ncFetch(`${baseUrl}/remote.php/dav/comments/files/${encodeURIComponent(args.fileId)}/`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ actorType: 'users', verb: 'comment', message: args.message }),
+            });
+            if (res.status === 401) return { error: authError };
+            if (res.status === 404) return { error: `File not found: ${args.fileId}` };
+            if (!res.ok && res.status !== 201) {
+                const text = await res.text().catch(() => '');
+                return { error: `Comment failed (${res.status}): ${text.slice(0, 200)}` };
+            }
+            return { success: true, fileId: args.fileId };
+        }
+
+        case 'nextcloud_list_tags': {
+            const body = `<?xml version="1.0" encoding="utf-8" ?>
+<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+  <d:prop>
+    <oc:id/>
+    <oc:display-name/>
+    <oc:user-visible/>
+    <oc:user-assignable/>
+    <oc:can-assign/>
+  </d:prop>
+</d:propfind>`;
+            const res = await ncFetch(`${baseUrl}/remote.php/dav/systemtags/`, {
+                method: 'PROPFIND',
+                headers: { 'Depth': '1', 'Content-Type': 'application/xml; charset=utf-8' },
+                body,
+            });
+            if (res.status === 401) return { error: authError };
+            if (!res.ok) return { error: `Tags list failed (${res.status})` };
+            const xml = await res.text();
+            const tags = [];
+            const respRegex = /<d:response[\s>][\s\S]*?<\/d:response>/g;
+            const matches = xml.match(respRegex) || [];
+            for (const block of matches) {
+                const id = (block.match(/<oc:id>(\d+)<\/oc:id>/) || [])[1];
+                if (!id) continue;
+                const name = (block.match(/<oc:display-name>([^<]+)<\/oc:display-name>/) || [])[1];
+                const visible = /<oc:user-visible>(?:true|1)<\/oc:user-visible>/.test(block);
+                const assignable = /<oc:user-assignable>(?:true|1)<\/oc:user-assignable>/.test(block);
+                tags.push({ id: parseInt(id, 10), name, userVisible: visible, userAssignable: assignable });
+            }
+            return { count: tags.length, tags };
+        }
+
+        case 'nextcloud_create_tag': {
+            if (!args.name) return { error: 'name is required' };
+            const res = await ncFetch(`${baseUrl}/remote.php/dav/systemtags/`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    name: args.name,
+                    userVisible: args.userVisible !== false,
+                    userAssignable: args.userAssignable !== false,
+                    canAssign: args.userAssignable !== false,
+                }),
+            });
+            if (res.status === 401) return { error: authError };
+            if (res.status === 403) return { error: 'Tag creation requires admin privileges on this Nextcloud server.' };
+            if (res.status === 409) return { error: `Tag already exists: ${args.name}` };
+            if (!res.ok && res.status !== 201) {
+                const text = await res.text().catch(() => '');
+                return { error: `Tag create failed (${res.status}): ${text.slice(0, 200)}` };
+            }
+            // Tag id comes back in the Content-Location header.
+            const loc = res.headers.get('content-location') || '';
+            const id = parseInt((loc.match(/\/(\d+)\/?$/) || [])[1] || '0', 10) || null;
+            return { success: true, id, name: args.name };
+        }
+
+        case 'nextcloud_tag_file': {
+            if (!args.fileId || !args.tagId) return { error: 'fileId and tagId are required' };
+            const res = await ncFetch(`${baseUrl}/remote.php/dav/systemtags-relations/files/${encodeURIComponent(args.fileId)}/${encodeURIComponent(args.tagId)}`, {
+                method: 'PUT',
+            });
+            if (res.status === 401) return { error: authError };
+            if (res.status === 404) return { error: 'File or tag not found.' };
+            if (res.status === 409) return { error: 'File already has this tag.' };
+            if (!res.ok && res.status !== 201 && res.status !== 204) {
+                return { error: `Tag attach failed (${res.status})` };
+            }
+            return { success: true, fileId: args.fileId, tagId: args.tagId };
+        }
+
+        case 'nextcloud_untag_file': {
+            if (!args.fileId || !args.tagId) return { error: 'fileId and tagId are required' };
+            const res = await ncFetch(`${baseUrl}/remote.php/dav/systemtags-relations/files/${encodeURIComponent(args.fileId)}/${encodeURIComponent(args.tagId)}`, {
+                method: 'DELETE',
+            });
+            if (res.status === 401) return { error: authError };
+            if (res.status === 404) return { error: 'File or tag relation not found.' };
+            if (!res.ok && res.status !== 204) return { error: `Untag failed (${res.status})` };
+            return { success: true, fileId: args.fileId, tagId: args.tagId };
+        }
+
+        case 'nextcloud_find_files_by_tag': {
+            if (!args.tagId) return { error: 'tagId is required' };
+            const limit = Math.min(Math.max(args.limit || 100, 1), 500);
+            const body = `<?xml version="1.0" encoding="utf-8" ?>
+<oc:filter-files xmlns:oc="http://owncloud.org/ns" xmlns:d="DAV:" xmlns:nc="http://nextcloud.org/ns">
+  <d:prop>
+    <d:displayname/>
+    <d:getcontentlength/>
+    <d:getcontenttype/>
+    <d:getlastmodified/>
+    <d:resourcetype/>
+    <oc:fileid/>
+  </d:prop>
+  <oc:filter-rules>
+    <oc:systemtag>${args.tagId}</oc:systemtag>
+  </oc:filter-rules>
+</oc:filter-files>`;
+            const res = await ncFetch(`${root}/`, {
+                method: 'REPORT',
+                headers: { 'Content-Type': 'application/xml; charset=utf-8' },
+                body,
+            });
+            if (res.status === 401) return { error: authError };
+            if (!res.ok) return { error: `Tag search failed (${res.status})` };
+            const xml = await res.text();
+            const items = parsePropfind(xml, baseUrl, uid).slice(0, limit);
+            return { tagId: args.tagId, count: items.length, items };
+        }
+
+        case 'nextcloud_list_trash': {
+            const limit = Math.min(Math.max(args.limit || 200, 1), 1000);
+            const body = `<?xml version="1.0"?>
+<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">
+  <d:prop>
+    <d:displayname/>
+    <d:getcontentlength/>
+    <d:getcontenttype/>
+    <d:getlastmodified/>
+    <d:resourcetype/>
+    <oc:fileid/>
+    <nc:trashbin-original-location/>
+    <nc:trashbin-deletion-time/>
+  </d:prop>
+</d:propfind>`;
+            const url = `${baseUrl}/remote.php/dav/trashbin/${encodeURIComponent(uid)}/trash/`;
+            const res = await ncFetch(url, {
+                method: 'PROPFIND',
+                headers: { 'Depth': '1', 'Content-Type': 'application/xml; charset=utf-8' },
+                body,
+            });
+            if (res.status === 401) return { error: authError };
+            if (!res.ok) return { error: `Trash list failed (${res.status})` };
+            const xml = await res.text();
+            const responses = [];
+            const respRegex = /<d:response[\s>][\s\S]*?<\/d:response>/g;
+            const matches = xml.match(respRegex) || [];
+            for (const block of matches) {
+                const href = (block.match(/<d:href>([^<]+)<\/d:href>/) || [])[1];
+                if (!href) continue;
+                const name = (block.match(/<d:displayname>([^<]*)<\/d:displayname>/) || [])[1] || '';
+                const isCollection = /<d:resourcetype>\s*<d:collection\s*\/>\s*<\/d:resourcetype>/.test(block);
+                const size = parseInt((block.match(/<d:getcontentlength>(\d+)<\/d:getcontentlength>/) || [])[1] || '0', 10);
+                const fileId = (block.match(/<oc:fileid>([^<]+)<\/oc:fileid>/) || [])[1] || null;
+                const originalLocation = (block.match(/<nc:trashbin-original-location>([^<]+)<\/nc:trashbin-original-location>/) || [])[1] || null;
+                const deletionTime = (block.match(/<nc:trashbin-deletion-time>([^<]+)<\/nc:trashbin-deletion-time>/) || [])[1] || null;
+                const trashPath = decodeURIComponent(href).replace(`/remote.php/dav/trashbin/${decodeURIComponent(uid)}/`, '/');
+                if (trashPath.replace(/\/$/, '') === '/trash') continue;
+                responses.push({
+                    name,
+                    trashPath,
+                    type: isCollection ? 'folder' : 'file',
+                    size: isCollection ? undefined : size,
+                    fileId,
+                    originalLocation,
+                    deletionTime: deletionTime ? new Date(parseInt(deletionTime, 10) * 1000).toISOString() : null,
+                });
+                if (responses.length >= limit) break;
+            }
+            return { count: responses.length, items: responses };
+        }
+
+        case 'nextcloud_restore_from_trash': {
+            if (!args.trashPath) return { error: 'trashPath is required' };
+            // The trashbin path returned by list_trash starts with "/trash/<file>" — strip leading /.
+            const cleaned = String(args.trashPath).replace(/^\/+/, '');
+            const sourceUrl = `${baseUrl}/remote.php/dav/trashbin/${encodeURIComponent(uid)}/${cleaned.split('/').map(encodeURIComponent).join('/')}`;
+            const destPath = args.originalPath || cleaned.replace(/^trash\//, '');
+            const destUrl = `${baseUrl}/remote.php/dav/trashbin/${encodeURIComponent(uid)}/restore/${destPath.split('/').map(encodeURIComponent).join('/')}`;
+            const res = await ncFetch(sourceUrl, {
+                method: 'MOVE',
+                headers: { 'Destination': destUrl },
+            });
+            if (res.status === 401) return { error: authError };
+            if (res.status === 404) return { error: `Trash item not found: ${args.trashPath}` };
+            if (!res.ok && res.status !== 201 && res.status !== 204) {
+                return { error: `Restore failed (${res.status})` };
+            }
+            return { success: true, restoredFrom: args.trashPath };
+        }
+
+        case 'nextcloud_permanent_delete_trash': {
+            if (!args.trashPath) return { error: 'trashPath is required' };
+            const cleaned = String(args.trashPath).replace(/^\/+/, '');
+            const url = `${baseUrl}/remote.php/dav/trashbin/${encodeURIComponent(uid)}/${cleaned.split('/').map(encodeURIComponent).join('/')}`;
+            const res = await ncFetch(url, { method: 'DELETE' });
+            if (res.status === 401) return { error: authError };
+            if (res.status === 404) return { error: `Trash item not found: ${args.trashPath}` };
+            if (!res.ok && res.status !== 204) return { error: `Permanent delete failed (${res.status})` };
+            return { success: true, deleted: args.trashPath };
+        }
+
+        case 'nextcloud_list_versions': {
+            if (!args.fileId) return { error: 'fileId is required' };
+            const url = `${baseUrl}/remote.php/dav/versions/${encodeURIComponent(uid)}/versions/${encodeURIComponent(args.fileId)}/`;
+            const body = `<?xml version="1.0"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop>
+    <d:getcontentlength/>
+    <d:getcontenttype/>
+    <d:getlastmodified/>
+  </d:prop>
+</d:propfind>`;
+            const res = await ncFetch(url, {
+                method: 'PROPFIND',
+                headers: { 'Depth': '1', 'Content-Type': 'application/xml; charset=utf-8' },
+                body,
+            });
+            if (res.status === 401) return { error: authError };
+            if (res.status === 404) return { error: `No version history for fileId ${args.fileId}` };
+            if (!res.ok) return { error: `Version list failed (${res.status})` };
+            const xml = await res.text();
+            const versions = [];
+            const respRegex = /<d:response[\s>][\s\S]*?<\/d:response>/g;
+            const matches = xml.match(respRegex) || [];
+            for (const block of matches) {
+                const href = (block.match(/<d:href>([^<]+)<\/d:href>/) || [])[1];
+                if (!href) continue;
+                // The first response is the version container itself — skip.
+                const segments = decodeURIComponent(href).split('/').filter(Boolean);
+                const versionId = segments[segments.length - 1];
+                if (versionId === String(args.fileId)) continue;
+                const size = parseInt((block.match(/<d:getcontentlength>(\d+)<\/d:getcontentlength>/) || [])[1] || '0', 10);
+                const modified = (block.match(/<d:getlastmodified>([^<]+)<\/d:getlastmodified>/) || [])[1] || null;
+                const contentType = (block.match(/<d:getcontenttype>([^<]+)<\/d:getcontenttype>/) || [])[1] || null;
+                versions.push({ versionId, size, modified, contentType, href: decodeURIComponent(href) });
+            }
+            return { fileId: args.fileId, count: versions.length, versions };
+        }
+
+        case 'nextcloud_restore_version': {
+            if (!args.fileId || !args.versionId) return { error: 'fileId and versionId are required' };
+            const sourceUrl = `${baseUrl}/remote.php/dav/versions/${encodeURIComponent(uid)}/versions/${encodeURIComponent(args.fileId)}/${encodeURIComponent(args.versionId)}`;
+            const destUrl = `${baseUrl}/remote.php/dav/versions/${encodeURIComponent(uid)}/restore/target`;
+            const res = await ncFetch(sourceUrl, {
+                method: 'MOVE',
+                headers: { 'Destination': destUrl },
+            });
+            if (res.status === 401) return { error: authError };
+            if (res.status === 404) return { error: `Version not found: ${args.versionId}` };
+            if (!res.ok && res.status !== 204) {
+                const text = await res.text().catch(() => '');
+                return { error: `Version restore failed (${res.status}): ${text.slice(0, 200)}` };
+            }
+            return { success: true, fileId: args.fileId, versionId: args.versionId };
         }
 
         default:

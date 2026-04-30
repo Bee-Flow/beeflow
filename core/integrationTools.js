@@ -43,6 +43,11 @@ const { NEXTCLOUD_CALENDAR_TOOLS } = require('../integrations/nextcloudCalendarT
 const { NEXTCLOUD_CONTACTS_TOOLS } = require('../integrations/nextcloudContactsTools');
 const { NEXTCLOUD_DECK_TOOLS } = require('../integrations/nextcloudDeckTools');
 const { NEXTCLOUD_NOTIFICATIONS_TOOLS } = require('../integrations/nextcloudNotificationsTools');
+const { NEXTCLOUD_TALK_TOOLS } = require('../integrations/nextcloudTalkTools');
+const { NEXTCLOUD_TASKS_TOOLS } = require('../integrations/nextcloudTasksTools');
+const { NEXTCLOUD_NOTES_TOOLS } = require('../integrations/nextcloudNotesTools');
+const { NEXTCLOUD_ACTIVITY_TOOLS } = require('../integrations/nextcloudActivityTools');
+const { NEXTCLOUD_STATUS_TOOLS } = require('../integrations/nextcloudStatusTools');
 
 // IDs that are exempt from org-level gating (admin-only tools, internal utilities)
 const ORG_EXEMPT_APPS = ['workspace', 'regex-gen'];
@@ -92,7 +97,7 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
 
     // Auto-enable new integrations for users with existing saved lists
     // (these were added after the user saved their enabledApps, so they wouldn't be included)
-    const AUTO_ENABLED_APPS = ['agent-search', 'workspace', 'image-gen', 'music-gen', 'video-gen', 'elevenlabs', 'google-maps', 'linkedin', 'github', 'google-contacts', 'google-keep', 'outlook', 'outlook-readonly', 'ms-calendar', 'onedrive', 'ms-contacts', 'google-groups', 'n8n', 'nextcloud', 'nextcloud-calendar', 'nextcloud-contacts', 'nextcloud-deck', 'nextcloud-notifications'];
+    const AUTO_ENABLED_APPS = ['agent-search', 'workspace', 'image-gen', 'music-gen', 'video-gen', 'elevenlabs', 'google-maps', 'linkedin', 'github', 'google-contacts', 'google-keep', 'outlook', 'outlook-readonly', 'ms-calendar', 'onedrive', 'ms-contacts', 'google-groups', 'n8n', 'nextcloud', 'nextcloud-calendar', 'nextcloud-contacts', 'nextcloud-deck', 'nextcloud-notifications', 'nextcloud-talk', 'nextcloud-tasks', 'nextcloud-notes', 'nextcloud-activity', 'nextcloud-status'];
 
     const isAppOn = (appId) => {
         // Must be enabled at user level
@@ -285,6 +290,11 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
                 if (isAppOn('nextcloud-contacts')) addTools(NEXTCLOUD_CONTACTS_TOOLS);
                 if (isAppOn('nextcloud-deck')) addTools(NEXTCLOUD_DECK_TOOLS);
                 if (isAppOn('nextcloud-notifications')) addTools(NEXTCLOUD_NOTIFICATIONS_TOOLS);
+                if (isAppOn('nextcloud-talk')) addTools(NEXTCLOUD_TALK_TOOLS);
+                if (isAppOn('nextcloud-tasks')) addTools(NEXTCLOUD_TASKS_TOOLS);
+                if (isAppOn('nextcloud-notes')) addTools(NEXTCLOUD_NOTES_TOOLS);
+                if (isAppOn('nextcloud-activity')) addTools(NEXTCLOUD_ACTIVITY_TOOLS);
+                if (isAppOn('nextcloud-status')) addTools(NEXTCLOUD_STATUS_TOOLS);
             }
         }
     } catch (e) { /* ignore — credentials missing or store unavailable */ }
@@ -384,7 +394,12 @@ async function buildToolHint(tools, userId = null) {
     if (tools.some(t => t.function.name.startsWith('nextcloud_contacts_'))) integrations.push('Nextcloud Contacts (list address books, list/search/get contacts, create/update/delete contacts via CardDAV — create/update/delete require user approval)');
     if (tools.some(t => t.function.name.startsWith('nextcloud_deck_'))) integrations.push('Nextcloud Deck (list boards/stacks/cards, search cards, create/update/move/archive/delete cards, manage labels, add comments — create/update/move require user approval, delete always requires confirmation)');
     if (tools.some(t => t.function.name.startsWith('nextcloud_notifications_'))) integrations.push('Nextcloud Notifications (list pending notifications, dismiss one or all — dismiss-all always requires user confirmation)');
-    if (tools.some(t => t.function.name.startsWith('nextcloud_') && !t.function.name.startsWith('nextcloud_calendar_') && !t.function.name.startsWith('nextcloud_contacts_') && !t.function.name.startsWith('nextcloud_deck_') && !t.function.name.startsWith('nextcloud_notifications_'))) integrations.push('Nextcloud Files (list/search/read/upload/delete files & folders, create public share links via WebDAV — destructive ops require user approval)');
+    if (tools.some(t => t.function.name.startsWith('nextcloud_talk_'))) integrations.push('Nextcloud Talk (list conversations, list/search messages, post messages with optional reply, react with emoji, mark rooms read, create rooms — sending messages always requires user approval, deletion always requires confirmation)');
+    if (tools.some(t => t.function.name.startsWith('nextcloud_tasks_'))) integrations.push('Nextcloud Tasks (VTODO via CalDAV — list lists, list/search/get tasks, create, update, mark complete/incomplete, delete — create/update require user approval, delete always requires confirmation)');
+    if (tools.some(t => t.function.name.startsWith('nextcloud_notes_'))) integrations.push('Nextcloud Notes (list/search/get notes, create/update/delete notes, list categories — create/update require user approval, delete always requires confirmation)');
+    if (tools.some(t => t.function.name.startsWith('nextcloud_activity_'))) integrations.push('Nextcloud Activity (read-only feed of recent file changes, shares, comments, mentions, calendar invites — useful for "what happened recently?" questions)');
+    if (tools.some(t => t.function.name.startsWith('nextcloud_status_'))) integrations.push('Nextcloud User Status (get / set / clear the user\'s availability and custom message — setting status requires user approval, except when auto-deriving from a calendar event the user explicitly asked about)');
+    if (tools.some(t => t.function.name.startsWith('nextcloud_') && !t.function.name.startsWith('nextcloud_calendar_') && !t.function.name.startsWith('nextcloud_contacts_') && !t.function.name.startsWith('nextcloud_deck_') && !t.function.name.startsWith('nextcloud_notifications_') && !t.function.name.startsWith('nextcloud_talk_') && !t.function.name.startsWith('nextcloud_tasks_') && !t.function.name.startsWith('nextcloud_notes_') && !t.function.name.startsWith('nextcloud_activity_') && !t.function.name.startsWith('nextcloud_status_'))) integrations.push('Nextcloud Files (list/search/read/upload/delete files, create folders, share with public links / users / groups / email, manage shares, file comments, system tags, trash bin recovery, file version history via WebDAV — destructive ops require user approval, permanent deletes always require confirmation)');
 
     // MCP (Model Context Protocol) tools — dynamically discovered from connected external servers
     const mcpTools = tools.filter(t => t.function?.name?.startsWith('mcp_'));

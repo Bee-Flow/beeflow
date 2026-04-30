@@ -62,6 +62,11 @@ const INTEGRATION_PREFIXES = {
     nextcloud_contacts_:      { integration: 'nextcloud_contacts',      label: 'Nextcloud Contacts',      server: 'nextcloud (CardDAV)' },
     nextcloud_deck_:          { integration: 'nextcloud_deck',          label: 'Nextcloud Deck',          server: 'nextcloud (Deck app)' },
     nextcloud_notifications_: { integration: 'nextcloud_notifications', label: 'Nextcloud Notifications', server: 'nextcloud (OCS)' },
+    nextcloud_talk_:          { integration: 'nextcloud_talk',          label: 'Nextcloud Talk',          server: 'nextcloud (Talk app)' },
+    nextcloud_tasks_:         { integration: 'nextcloud_tasks',         label: 'Nextcloud Tasks',         server: 'nextcloud (CalDAV / VTODO)' },
+    nextcloud_notes_:         { integration: 'nextcloud_notes',         label: 'Nextcloud Notes',         server: 'nextcloud (Notes app)' },
+    nextcloud_activity_:      { integration: 'nextcloud_activity',      label: 'Nextcloud Activity',      server: 'nextcloud (Activity app)' },
+    nextcloud_status_:        { integration: 'nextcloud_status',        label: 'Nextcloud User Status',   server: 'nextcloud (User Status)' },
     nextcloud_:               { integration: 'nextcloud',               label: 'Nextcloud Files',         server: 'nextcloud (WebDAV)' },
 };
 

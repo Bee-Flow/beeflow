@@ -44,6 +44,11 @@ const { isNextcloudCalendarTool, executeNextcloudCalendarTool } = require('../in
 const { isNextcloudContactsTool, executeNextcloudContactsTool } = require('../integrations/nextcloudContactsTools');
 const { isNextcloudDeckTool, executeNextcloudDeckTool } = require('../integrations/nextcloudDeckTools');
 const { isNextcloudNotificationsTool, executeNextcloudNotificationsTool } = require('../integrations/nextcloudNotificationsTools');
+const { isNextcloudTalkTool, executeNextcloudTalkTool } = require('../integrations/nextcloudTalkTools');
+const { isNextcloudTasksTool, executeNextcloudTasksTool } = require('../integrations/nextcloudTasksTools');
+const { isNextcloudNotesTool, executeNextcloudNotesTool } = require('../integrations/nextcloudNotesTools');
+const { isNextcloudActivityTool, executeNextcloudActivityTool } = require('../integrations/nextcloudActivityTools');
+const { isNextcloudStatusTool, executeNextcloudStatusTool } = require('../integrations/nextcloudStatusTools');
 
 /**
  * Execute a tool by name.
@@ -364,6 +369,21 @@ async function executeTool(toolName, toolArgs, context = {}) {
     }
     if (isNextcloudNotificationsTool(toolName)) {
         return await executeNextcloudNotificationsTool(toolName, toolArgs, userId, session);
+    }
+    if (isNextcloudTalkTool(toolName)) {
+        return await executeNextcloudTalkTool(toolName, toolArgs, userId, session);
+    }
+    if (isNextcloudTasksTool(toolName)) {
+        return await executeNextcloudTasksTool(toolName, toolArgs, userId, session);
+    }
+    if (isNextcloudNotesTool(toolName)) {
+        return await executeNextcloudNotesTool(toolName, toolArgs, userId, session);
+    }
+    if (isNextcloudActivityTool(toolName)) {
+        return await executeNextcloudActivityTool(toolName, toolArgs, userId, session);
+    }
+    if (isNextcloudStatusTool(toolName)) {
+        return await executeNextcloudStatusTool(toolName, toolArgs, userId, session);
     }
     if (isNextcloudTool(toolName)) {
         return await executeNextcloudTool(toolName, toolArgs, userId, session);
