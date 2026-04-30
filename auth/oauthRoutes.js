@@ -108,6 +108,12 @@ router.get('/login', async (req, res) => {
 
     req.session.returnTo = returnTo;
 
+    // Mirror the new /login/:provider route's iframe support so that BeeFlow
+    // installs whose Nextcloud OAuth client still points at the legacy
+    // /auth/callback URI keep working in embedded mode.
+    if (req.query.popup === '1') req.session.oauthPopup = true;
+    if (req.query.pickup) req.session.oauthPickupId = String(req.query.pickup).slice(0, 128);
+
     const host = req.get('host');
     const REDIRECT_URI = `${req.protocol}://${host}/auth/callback`;
 
@@ -122,7 +128,10 @@ router.get('/login', async (req, res) => {
         state: Math.random().toString(36).substring(7)
     }).toString();
 
-    res.redirect(authUrl);
+    req.session.save(() => {
+        if (req.session.oauthPopup) return popupRedirect(res, authUrl);
+        res.redirect(authUrl);
+    });
 });
 
 // Legacy Nextcloud callback
@@ -133,6 +142,8 @@ router.get('/callback', async (req, res) => {
 
     const returnTo = req.session.returnTo || 'http://localhost:5173';
     delete req.session.returnTo;
+
+    console.log(`[OAuth/legacy] CALLBACK session: oauthPopup=${!!req.session.oauthPopup} oauthPickupId=${req.session.oauthPickupId || '(none)'}`);
 
     const host = req.get('host');
     const REDIRECT_URI = `${req.protocol}://${host}/auth/callback`;
@@ -202,8 +213,42 @@ router.get('/callback', async (req, res) => {
             req.session.needsEncryptionPin = true;
         }
 
-        req.session.save((err) => {
+        req.session.save(async (err) => {
             if (err) console.error('Session save error:', err);
+
+            // Embedded-iframe popup handoff (mirrors /callback/:provider).
+            if (req.session.oauthPopup) {
+                const pickupId = req.session.oauthPickupId;
+                delete req.session.oauthPopup;
+                delete req.session.oauthPickupId;
+                req.session.save();
+
+                if (pickupId) {
+                    try {
+                        const { setSessionToken, setPickup, generateToken } = require('../utils/sessionToken');
+                        const userIdLegacy = user?.id || 'oauth-user';
+                        const appPasswordData = await userStore.getAppPassword(userIdLegacy);
+                        const sessionToken = generateToken();
+                        await setSessionToken(sessionToken, {
+                            user: req.session.user,
+                            accessToken: req.session.accessToken,
+                            appPassword: appPasswordData,
+                            isAuthenticated: true,
+                            isAdmin: req.session.isAdmin || false,
+                        });
+                        await setPickup(pickupId, { sessionToken });
+                        console.log(`[OAuth/legacy] Pickup ${pickupId} deposited (token len=${sessionToken.length})`);
+                    } catch (pickupErr) {
+                        console.error(`[OAuth/legacy] Pickup deposit failed:`, pickupErr.message);
+                    }
+                }
+
+                return res.send(`<!DOCTYPE html><html><head><title>Login Complete</title></head><body>
+<script>try{if(window.opener)window.opener.postMessage({type:'beeflow-oauth-complete'},'*');}catch(e){}window.close();</script>
+<p style="font-family:sans-serif;text-align:center;margin-top:40px">Login complete. You can close this window.</p>
+</body></html>`);
+            }
+
             res.redirect(returnTo);
         });
 
@@ -372,6 +417,7 @@ router.get('/callback/:provider', async (req, res) => {
 
     console.log(`[OAuth/${provider}] === CALLBACK START ===`);
     console.log(`[OAuth/${provider}] SessionID: ${req.sessionID}`);
+    console.log(`[OAuth/${provider}] CALLBACK session: oauthPopup=${!!req.session.oauthPopup} oauthPickupId=${req.session.oauthPickupId || '(none)'} oauthState=${req.session.oauthState ? '(present)' : '(missing)'}`);
     console.log(`[OAuth/${provider}] Query params — code present: ${!!code}, error: ${error || 'none'}, state present: ${!!state}`);
     if (error_description) console.log(`[OAuth/${provider}] Error description: ${error_description}`);
     console.log(`[OAuth/${provider}] Session returnTo: ${req.session.returnTo || '(not set)'}`);
