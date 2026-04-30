@@ -37,6 +37,7 @@ const SYSTEM_PERMISSIONS = [
     { id: 'manage_knowledge', name: 'Manage Knowledge', description: 'Create, edit, delete, and ingest knowledge bases', group: 'actions' },
     { id: 'manage_apps', name: 'Manage Apps', description: 'Create and publish apps', group: 'actions' },
     { id: 'use_notebooks', name: 'Use Notebooks', description: 'Create, edit, and delete personal notebooks', group: 'actions' },
+    { id: 'use_webpages', name: 'Use Webpages', description: 'Create, edit, and delete personal webpages', group: 'actions' },
 
     // ── n8n Integration ──
     { id: 'use_n8n_tools', name: 'Use n8n Tools', description: 'Run n8n webhook workflows and inspect workflow definitions via AI', group: 'actions' },

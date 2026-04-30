@@ -17,6 +17,7 @@ const directChatRoutes = require('./ai/directChat');
 const researchRoutes = require('./ai/research');
 const templateChatRoutes = require('./ai/templateChat');
 const notebookChatRoutes = require('./ai/notebookChat');
+const webpageChatRoutes = require('./ai/webpageChat');
 const voiceRoutes = require('./ai/voice');
 const swarmsRoutes = require('./ai/swarms');
 const { requireBetaFeature } = require('../core/betaFeatures');
@@ -43,6 +44,21 @@ const notebookChatGate = async (req, res, next) => {
 };
 router.use(notebookChatGate);
 router.use('/', notebookChatRoutes);
+
+// Webpage chat feature gate
+const webpageChatGate = async (req, res, next) => {
+    if (!req.path.startsWith('/chat/webpage')) return next();
+    try {
+        const configStore = require('../stores/configStore');
+        const enabled = await configStore.getConfig('feature_webpages_enabled');
+        if (enabled === false) {
+            return res.status(403).json({ error: 'Webpages feature is disabled' });
+        }
+    } catch (_) { /* fail open */ }
+    next();
+};
+router.use(webpageChatGate);
+router.use('/', webpageChatRoutes);
 
 // Voice Chat (Beta) — gated on org-level beta feature flag.
 // Further gated on a configured Mistral API key by the voice router itself.

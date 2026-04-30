@@ -106,6 +106,10 @@ router.get('/config', async (req, res) => {
             const val = await configStore.getConfig('feature_notebooks_enabled');
             return val !== false && val !== 'false';
         })(),
+        webpagesEnabled: await (async () => {
+            const val = await configStore.getConfig('feature_webpages_enabled');
+            return val !== false && val !== 'false';
+        })(),
         projectsEnabled: await (async () => {
             const val = await configStore.getConfig('feature_projects_enabled');
             return val !== false && val !== 'false';
@@ -141,7 +145,7 @@ router.post('/config', requireAuth, async (req, res) => {
     if (!(await isAdminUser(req))) {
         return res.status(403).json({ error: 'Admin access required' });
     }
-    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, minimaxApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, llamaGuardConfig, moderationProvider, azureContentSafetyEndpoint, azureContentSafetyKey, azureContentSafetySeverityThreshold, azureContentSafetyCategories, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionScope, piiDetectionAction, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing, serviceEmailAddress, serviceEmailPassword, serviceEmailDisplayName, azureSpeechKey, azureSpeechRegion, transcriptionProvider, notebooksEnabled, projectsEnabled, askAiEnabled, exportEnabled, openInNotebookEnabled, notebooksMenuEnabled, azureRerankerEndpoint, azureRerankerKey, azureRerankerModel, stripeSecretKey, stripeWebhookSecret, stripePublishableKey, stripeEnabled, stripeTaxEnabled, stripeTaxCountry } = req.body;
+    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, minimaxApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, llamaGuardConfig, moderationProvider, azureContentSafetyEndpoint, azureContentSafetyKey, azureContentSafetySeverityThreshold, azureContentSafetyCategories, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionScope, piiDetectionAction, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing, serviceEmailAddress, serviceEmailPassword, serviceEmailDisplayName, azureSpeechKey, azureSpeechRegion, transcriptionProvider, notebooksEnabled, webpagesEnabled, projectsEnabled, askAiEnabled, exportEnabled, openInNotebookEnabled, notebooksMenuEnabled, azureRerankerEndpoint, azureRerankerKey, azureRerankerModel, stripeSecretKey, stripeWebhookSecret, stripePublishableKey, stripeEnabled, stripeTaxEnabled, stripeTaxCountry } = req.body;
     const existing = await getAIConfig();
 
     if (allowedModelsByAgentType !== undefined) {
@@ -250,6 +254,9 @@ router.post('/config', requireAuth, async (req, res) => {
     // Feature flags (runtime-togglable)
     if (notebooksEnabled !== undefined) {
         await configStore.setConfig('feature_notebooks_enabled', notebooksEnabled ? true : false);
+    }
+    if (webpagesEnabled !== undefined) {
+        await configStore.setConfig('feature_webpages_enabled', webpagesEnabled ? true : false);
     }
     if (projectsEnabled !== undefined) {
         await configStore.setConfig('feature_projects_enabled', projectsEnabled ? true : false);

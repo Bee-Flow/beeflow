@@ -80,6 +80,60 @@ function buildKey(userId, category, filename) {
 }
 
 /**
+ * Build a deterministic key for a webpage file slot.
+ * Used by the Webpages feature to host index.html / style.css / script.js
+ * (and their version snapshots) in RustFS at predictable paths.
+ *
+ * @param {string} userId
+ * @param {string} webpageId
+ * @param {'html'|'css'|'js'} slot
+ * @param {string} [versionId] — when present, returns the version path
+ */
+function buildWebpageKey(userId, webpageId, slot, versionId = null) {
+    const filename = slot === 'html' ? 'index.html' : slot === 'css' ? 'style.css' : 'script.js';
+    const prefix = versionId
+        ? `users/${userId}/webpages/${webpageId}/versions/${versionId}`
+        : `users/${userId}/webpages/${webpageId}/current`;
+    return `${prefix}/${filename}`;
+}
+
+/**
+ * List all keys under a prefix (used to purge a webpage's entire object tree on delete).
+ * Returns an array of keys.
+ */
+async function listKeys(prefix) {
+    if (!s3) throw new Error('StorageStore not initialized');
+    const { ListObjectsV2Command } = require('@aws-sdk/client-s3');
+    const keys = [];
+    let continuationToken;
+    do {
+        const r = await s3.send(new ListObjectsV2Command({
+            Bucket: BUCKET,
+            Prefix: prefix,
+            ContinuationToken: continuationToken,
+        }));
+        for (const obj of (r.Contents || [])) keys.push(obj.Key);
+        continuationToken = r.IsTruncated ? r.NextContinuationToken : null;
+    } while (continuationToken);
+    return keys;
+}
+
+/**
+ * Server-side copy of one object to another key. Used for snapshotting
+ * a webpage's "current" trio into a versions/{vid}/ prefix without
+ * round-tripping bytes through Node.
+ */
+async function copyObject(sourceKey, destKey) {
+    if (!s3) throw new Error('StorageStore not initialized');
+    const { CopyObjectCommand } = require('@aws-sdk/client-s3');
+    await s3.send(new CopyObjectCommand({
+        Bucket: BUCKET,
+        CopySource: `/${BUCKET}/${encodeURIComponent(sourceKey).replace(/%2F/g, '/')}`,
+        Key: destKey,
+    }));
+}
+
+/**
  * Upload a file to RustFS.
  * @param {string} key - S3 object key (use buildKey() to generate)
  * @param {Buffer} buffer - File content
@@ -167,10 +221,13 @@ module.exports = {
     init,
     isAvailable,
     buildKey,
+    buildWebpageKey,
     uploadFile,
     getPresignedUrl,
     streamFile,
     buildProxyUrl,
     deleteFile,
+    listKeys,
+    copyObject,
     BUCKET,
 };
