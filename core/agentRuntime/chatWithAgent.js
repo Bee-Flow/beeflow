@@ -16,6 +16,8 @@ const { processSystemPrompt } = require('../promptUtils');
 const { validateInput } = require('../moderation');
 const { validateInputForPii } = require('../azurePiiDetection');
 const { resolveOrgShield } = require('../orgShield');
+const dlpRunner = require('../dlp/dlpRunner');
+const { buildTokenPreservationAddendum } = require('../dlp/tokenPreservationPrompt');
 
 async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
     const swarm = null; // Swarm agents removed
@@ -110,6 +112,7 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
                     if (textPart) textPart.text = piiResult.tokenizedText;
                 }
                 piiTokenMap = piiResult.tokenMap;
+                if (conversation?.id) dlpRunner.mergeTokenMap(conversation.id, piiTokenMap);
                 console.warn(`[ChatWithAgent] 🔒 PII tokenized (${Object.keys(piiTokenMap).length} tokens)`);
             }
         } catch (piiError) {
@@ -118,6 +121,15 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
             }
             // Service unavailable → fail-open
         }
+    }
+
+    // PII tokens: instruct the LLM to preserve & reuse them rather than invent new placeholders.
+    {
+        const _convTokenMap = conversation?.id
+            ? dlpRunner.getConversationTokenMap(conversation.id)
+            : (piiTokenMap || {});
+        const _tokenAddendum = buildTokenPreservationAddendum(_convTokenMap);
+        if (_tokenAddendum) systemPrompt += _tokenAddendum;
     }
 
     // Enrich messages with form data context

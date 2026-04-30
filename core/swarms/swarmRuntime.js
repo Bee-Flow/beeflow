@@ -27,6 +27,8 @@ const { getAdapter } = require('../providers');
 const { buildDirectChatToolStack } = require('../directChatToolStack');
 const { executeTool: dispatchTool } = require('../toolDispatcher');
 const usageStore = require('../../stores/usageStore');
+const dlpRunner = require('../dlp/dlpRunner');
+const { buildTokenPreservationAddendum } = require('../dlp/tokenPreservationPrompt');
 
 // ─── Built-in registry ───────────────────────────────────────────────────
 
@@ -186,7 +188,7 @@ async function runWorker({
 
     // Build messages: per-worker system prompt + Hive Mind context + user request.
     const hiveBlock = renderHiveMindForPrompt(hive, { excludeByWorker: workerId });
-    const systemPrompt = [
+    const baseSystemPrompt = [
         worker.systemPrompt || '',
         '',
         '── HIVE MIND (shared scratchpad written by sibling workers) ──',
@@ -195,6 +197,8 @@ async function runWorker({
         '── User request ──',
         '(Reply by completing your specific role. Use the tools available — they are the same integrations the user has in direct chat. When you have enough material to deliver your role\'s output, stop calling tools and write your final response.)',
     ].join('\n');
+    const _convTokenMap = dlpRunner.getConversationTokenMap(conversationId);
+    const systemPrompt = baseSystemPrompt + buildTokenPreservationAddendum(_convTokenMap);
 
     const messages = [
         { role: 'system', content: systemPrompt },

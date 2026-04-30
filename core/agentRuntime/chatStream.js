@@ -35,6 +35,7 @@ const guardrailEventStore = require('../../stores/guardrailEventStore');
 const { processAttachments } = require('./attachmentProcessor');
 const { hydrateHistoryAttachments } = require('./historyHydrator');
 const { compactMessages } = require('../compaction');
+const { buildTokenPreservationAddendum } = require('../dlp/tokenPreservationPrompt');
 
 /**
  * Serialize a tool result for the LLM's tool message.
@@ -986,6 +987,12 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     messages[lastIdx] = { ...messages[lastIdx], content: `[Message flagged by content moderation: ${moderationViolation}]` };
                 }
             }
+
+            // PII tokens: tell the LLM to preserve & reuse them rather than invent new placeholders.
+            // Reads the conversation-scoped accumulator so prior turns' tokens still apply.
+            const _convTokenMap = require('../dlp/dlpRunner').getConversationTokenMap(conversation?.id);
+            const _tokenAddendum = buildTokenPreservationAddendum(_convTokenMap);
+            if (_tokenAddendum) effectiveSystemPrompt += _tokenAddendum;
 
             // For swarms: update system prompt and tools for the current phase
             if (isSwarm) {
