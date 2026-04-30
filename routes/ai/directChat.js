@@ -253,6 +253,12 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                             role: 'assistant',
                             content: result.finalText,
                             metadata: { swarmId },
+                            // Top-level `swarm` field mirrors what useChatEngine
+                            // builds from SSE during a live run, so when the
+                            // conversation reloads from DB the assistant message
+                            // already has everything SwarmTimeline needs to
+                            // re-render the worker grid + tool calls.
+                            swarm: result.snapshot || null,
                             timestamp: new Date().toISOString(),
                         });
                     }

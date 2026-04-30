@@ -121,19 +121,48 @@ async function runWorker({
     userOrgId,
     userId,
     isSynthesiser = false,
+    runSnapshot = null,
 }) {
     const startedAt = Date.now();
     const workerId = worker.id;
+    // Seed the snapshot entry early so a model-resolution failure still
+    // shows up as a failed worker card after refresh.
+    if (runSnapshot) {
+        runSnapshot.workers[workerId] = {
+            workerId,
+            role: worker.role,
+            name: worker.name,
+            tier: worker.tier || 'auto',
+            modelId: null,
+            status: 'running',
+            content: '',
+            tools: [],
+            startedAt,
+            durationMs: null,
+            error: null,
+        };
+    }
+
     let model;
     try {
         model = await resolveWorkerModel({ worker, fallbackModelId, userOrgId, userId });
     } catch (err) {
+        const durationMs = Date.now() - startedAt;
+        if (runSnapshot?.workers?.[workerId]) {
+            runSnapshot.workers[workerId].status = 'failed';
+            runSnapshot.workers[workerId].error = `Model resolution failed: ${err.message}`;
+            runSnapshot.workers[workerId].durationMs = durationMs;
+        }
         send('swarm_worker_completed', {
             workerId, role: worker.role, status: 'failed',
             error: `Model resolution failed: ${err.message}`,
-            durationMs: Date.now() - startedAt,
+            durationMs,
         });
         return { workerId, role: worker.role, status: 'failed', error: err.message };
+    }
+
+    if (runSnapshot?.workers?.[workerId]) {
+        runSnapshot.workers[workerId].modelId = model.modelId;
     }
 
     send('swarm_worker_started', {
@@ -167,41 +196,81 @@ async function runWorker({
         { role: 'user', content: userMessage },
     ];
 
-    // ── Tool-call loop ───────────────────────────────────────────────
+    // ── Tool-call loop with real token streaming ────────────────────
+    // adapter.stream() pipes deltas through a streamCallback. We forward
+    // text deltas to either `content` (synthesiser → goes straight to the
+    // chat bubble) or `swarm_worker_content` (researcher → goes to its
+    // own card). Tool calls are accumulated and, once the stream ends,
+    // dispatched in parallel; the loop continues until the model produces
+    // a tool-call-free response.
     let collectedToolHistory = [];
     let finalText = '';
     let lastError = null;
 
     try {
-        for (let round = 0; round < MAX_TOOL_ROUNDS_PER_WORKER; round++) {
-            const result = await model.adapter.chat(model.apiKey, model.apiUrl, model.modelId, messages, {
+        outer: for (let round = 0; round < MAX_TOOL_ROUNDS_PER_WORKER; round++) {
+            let roundText = '';
+            const roundToolCalls = [];
+
+            const streamCallback = (type, data) => {
+                if (type === 'text' && typeof data?.text === 'string') {
+                    roundText += data.text;
+                    if (runSnapshot?.workers?.[workerId]) {
+                        runSnapshot.workers[workerId].content += data.text;
+                    }
+                    if (isSynthesiser) {
+                        send('content', { text: data.text });
+                    } else {
+                        send('swarm_worker_content', { workerId, delta: data.text });
+                    }
+                } else if (type === 'tool_use' && data) {
+                    roundToolCalls.push({
+                        id: data.id || `call_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
+                        type: 'function',
+                        function: {
+                            name: data.name || data.function?.name,
+                            arguments: typeof data.arguments === 'string'
+                                ? data.arguments
+                                : JSON.stringify(data.arguments || data.function?.arguments || {}),
+                        },
+                    });
+                }
+                // We deliberately don't forward `thinking_*` from workers — it
+                // would clutter the worker cards. The synthesiser's reasoning
+                // (when on a thinking-tier model) would surface in its own
+                // streamed text anyway.
+            };
+
+            await model.adapter.stream(model.apiKey, model.apiUrl, model.modelId, messages, {
                 maxTokens: WORKER_DEFAULT_MAX_TOKENS,
                 temperature: isSynthesiser ? 0.4 : 0.3,
                 tools: workerTools,
                 toolChoice: 'auto',
-            });
+            }, streamCallback);
 
-            const toolCalls = Array.isArray(result?.toolCalls) ? result.toolCalls : [];
-            const content = typeof result?.content === 'string' ? result.content : '';
-
-            if (toolCalls.length === 0) {
-                // No more tools — this is the worker's final output.
-                finalText = content;
-                break;
+            if (roundToolCalls.length === 0) {
+                // No more tools — this round's text IS the final output. The
+                // tokens already streamed live via the callback; we just
+                // record the buffer so persistence + Hive Mind have it.
+                finalText = roundText;
+                break outer;
             }
 
-            // Echo the assistant tool-call message so the model has full history.
+            // Echo the assistant message (including any text emitted alongside
+            // tool calls) so the model has full conversational history.
             messages.push({
                 role: 'assistant',
-                content: content || null,
-                tool_calls: toolCalls,
+                content: roundText || null,
+                tool_calls: roundToolCalls,
             });
 
-            // Execute each tool call (parallel within a round).
-            const results = await Promise.all(toolCalls.map(async (tc) => {
-                const name = tc.function?.name || tc.name;
+            // Execute the round's tool calls in parallel.
+            const results = await Promise.all(roundToolCalls.map(async (tc) => {
+                const name = tc.function.name;
                 let args = {};
-                try { args = JSON.parse(tc.function?.arguments || tc.arguments || '{}'); } catch (_) { /* default to {} */ }
+                try { args = JSON.parse(tc.function.arguments || '{}'); } catch (_) { /* default to {} */ }
+                const toolEntry = { name, status: 'running', at: Date.now() };
+                if (runSnapshot?.workers?.[workerId]) runSnapshot.workers[workerId].tools.push(toolEntry);
                 send('swarm_worker_tool', { workerId, role: worker.role, toolName: name, status: 'start' });
                 let toolResult;
                 try {
@@ -209,33 +278,20 @@ async function runWorker({
                 } catch (err) {
                     toolResult = { error: err.message };
                 }
-                collectedToolHistory.push({ name, status: toolResult?.error ? 'error' : 'done' });
-                send('swarm_worker_tool', { workerId, role: worker.role, toolName: name, status: toolResult?.error ? 'error' : 'done' });
+                const finalStatus = toolResult?.error ? 'error' : 'done';
+                toolEntry.status = finalStatus;
+                collectedToolHistory.push({ name, status: finalStatus });
+                send('swarm_worker_tool', { workerId, role: worker.role, toolName: name, status: finalStatus });
                 return { tc, toolResult };
             }));
 
-            // Push tool-result messages back so the next round sees them.
             for (const { tc, toolResult } of results) {
                 messages.push({
                     role: 'tool',
                     tool_call_id: tc.id,
-                    name: tc.function?.name || tc.name,
+                    name: tc.function.name,
                     content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult || ''),
                 });
-            }
-        }
-
-        // ── Stream the final text chunk-by-chunk ─────────────────────
-        // Researchers get a private content channel keyed by workerId.
-        // The synthesiser streams as ordinary `content` so the chat
-        // renderer treats it as the assistant's reply with no special
-        // handling.
-        if (finalText && finalText.length > 0) {
-            const eventName = isSynthesiser ? 'content' : 'swarm_worker_content';
-            const chunkSize = 256;
-            for (let i = 0; i < finalText.length; i += chunkSize) {
-                const delta = finalText.slice(i, i + chunkSize);
-                send(eventName, isSynthesiser ? { content: delta } : { workerId, delta });
             }
         }
     } catch (err) {
@@ -244,6 +300,11 @@ async function runWorker({
 
     const durationMs = Date.now() - startedAt;
     if (lastError) {
+        if (runSnapshot?.workers?.[workerId]) {
+            runSnapshot.workers[workerId].status = 'failed';
+            runSnapshot.workers[workerId].error = lastError;
+            runSnapshot.workers[workerId].durationMs = durationMs;
+        }
         send('swarm_worker_completed', { workerId, role: worker.role, status: 'failed', error: lastError, durationMs });
         return { workerId, role: worker.role, status: 'failed', error: lastError, content: finalText };
     }
@@ -259,6 +320,10 @@ async function runWorker({
         });
     }
 
+    if (runSnapshot?.workers?.[workerId]) {
+        runSnapshot.workers[workerId].status = 'done';
+        runSnapshot.workers[workerId].durationMs = durationMs;
+    }
     send('swarm_worker_completed', {
         workerId, role: worker.role, status: 'done',
         durationMs,
@@ -308,6 +373,20 @@ async function runSwarmTurn({
         phases: MANIFEST.phases,
     });
 
+    // Live snapshot of the run — mirrors the shape useChatEngine builds
+    // from SSE events on the assistant message. Persisted server-side so
+    // a page refresh re-renders the timeline without replaying SSE.
+    const runSnapshot = {
+        state: 'running',
+        swarmId: MANIFEST.id,
+        swarmName: MANIFEST.name,
+        phases: MANIFEST.phases,
+        phaseStates: {},
+        workers: {},
+        startedAt,
+        durationMs: null,
+    };
+
     // Build the directChat tool stack ONCE per turn — every worker shares
     // the same view of available integrations.
     const { tools, n8nOrgId } = await buildDirectChatToolStack({
@@ -328,6 +407,9 @@ async function runSwarmTurn({
 
     let lastResult = null;
     for (const phase of phases) {
+        runSnapshot.activePhaseId = phase.id;
+        runSnapshot.phaseStates[phase.id] = { status: 'active', startedAt: Date.now(), durationMs: null };
+
         send('swarm_phase_started', {
             phaseId: phase.id, phaseName: phase.name,
             workers: phase.workers.map(w => ({ id: w.id, role: w.role, name: w.name, tier: w.tier || 'auto' })),
@@ -348,6 +430,7 @@ async function runSwarmTurn({
                 userOrgId,
                 userId,
                 isSynthesiser: !!phase.synthesiser,
+                runSnapshot,
             })
         ));
 
@@ -356,17 +439,22 @@ async function runSwarmTurn({
             : { workerId: phase.workers[i].id, role: phase.workers[i].role, status: 'failed', error: r.reason?.message || 'unknown error' });
         lastResult = outcomes[outcomes.length - 1];
 
+        const phaseDurationMs = Date.now() - phaseStartedAt;
+        runSnapshot.phaseStates[phase.id] = { status: 'done', startedAt: phaseStartedAt, durationMs: phaseDurationMs };
         send('swarm_phase_completed', {
             phaseId: phase.id,
-            durationMs: Date.now() - phaseStartedAt,
+            durationMs: phaseDurationMs,
         });
     }
 
-    send('swarm_completed', { paused: false, durationMs: Date.now() - startedAt });
+    runSnapshot.state = 'done';
+    runSnapshot.durationMs = Date.now() - startedAt;
+    send('swarm_completed', { paused: false, durationMs: runSnapshot.durationMs });
     return {
         paused: false,
         finalText: lastResult?.content || '',
         hiveMind: hive,
+        snapshot: runSnapshot,
     };
 }
 
