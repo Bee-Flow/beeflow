@@ -259,14 +259,19 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
         addTools(GITHUB_TOOLS);
     }
 
-    // Nextcloud — requires global Nextcloud URL + per-user app password
+    // Nextcloud — OAuth path (parity with Google/Microsoft above) with
+    // app-password fallback for users not logged in via Nextcloud OAuth.
     try {
         const oauthCfg = (await configStore.getConfig('oauth')) || {};
-        if (oauthCfg.nextcloudUrl) {
-            const userStoreLocal = require('../stores/userStore');
-            const ncCreds = await userStoreLocal.getAppPassword(userId);
-            if (ncCreds?.username && ncCreds?.password && isAppOn('nextcloud')) {
+        if (oauthCfg.nextcloudUrl && isAppOn('nextcloud')) {
+            if (session?.oauthProvider === 'nextcloud' && session?.accessToken) {
                 addTools(NEXTCLOUD_TOOLS);
+            } else {
+                const userStoreLocal = require('../stores/userStore');
+                const ncCreds = await userStoreLocal.getAppPassword(userId);
+                if (ncCreds?.username && ncCreds?.password) {
+                    addTools(NEXTCLOUD_TOOLS);
+                }
             }
         }
     } catch (e) { /* ignore — credentials missing or store unavailable */ }

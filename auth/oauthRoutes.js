@@ -191,10 +191,16 @@ router.get('/callback', async (req, res) => {
         if (userResponse.ok) {
             const userData = await userResponse.json();
             user = userData.ocs?.data || null;
+            // Persist the raw Nextcloud uid for WebDAV path construction.
+            if (user?.id) req.session.nextcloudUid = user.id;
         }
 
         req.session.accessToken = tokenData.access_token;
         req.session.refreshToken = tokenData.refresh_token;
+        req.session.oauthProvider = 'nextcloud';
+        if (tokenData.expires_in) {
+            req.session.nextcloudTokenExpiresAt = Date.now() + Number(tokenData.expires_in) * 1000;
+        }
         req.session.user = user;
         req.session.isAuthenticated = true;
         // Check stored user role — SSO users can also be admins
@@ -232,6 +238,9 @@ router.get('/callback', async (req, res) => {
                         await setSessionToken(sessionToken, {
                             user: req.session.user,
                             accessToken: req.session.accessToken,
+                            refreshToken: req.session.refreshToken,
+                            oauthProvider: req.session.oauthProvider,
+                            nextcloudUid: req.session.nextcloudUid,
                             appPassword: appPasswordData,
                             isAuthenticated: true,
                             isAdmin: req.session.isAdmin || false,
@@ -624,6 +633,12 @@ router.get('/callback/:provider', async (req, res) => {
             if (userResponse.ok) {
                 const userData = await userResponse.json();
                 const ocs = userData.ocs?.data || {};
+                // Persist the raw uid for WebDAV path construction. Must be
+                // captured BEFORE we mint the prefixed local id below.
+                if (ocs.id) req.session.nextcloudUid = ocs.id;
+                if (tokenData.expires_in) {
+                    req.session.nextcloudTokenExpiresAt = Date.now() + Number(tokenData.expires_in) * 1000;
+                }
                 user = {
                     id: `nextcloud-${ocs.id || ocs['display-name']}`,
                     displayName: ocs['display-name'] || ocs.id,
@@ -921,6 +936,9 @@ router.get('/callback/:provider', async (req, res) => {
                         await setSessionToken(sessionToken, {
                             user: req.session.user,
                             accessToken: req.session.accessToken,
+                            refreshToken: req.session.refreshToken,
+                            oauthProvider: req.session.oauthProvider,
+                            nextcloudUid: req.session.nextcloudUid,
                             appPassword: appPasswordData,
                             isAuthenticated: true,
                             isAdmin: req.session.isAdmin || false,

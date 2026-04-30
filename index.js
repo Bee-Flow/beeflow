@@ -174,7 +174,12 @@ app.get('/api/session-token', async (req, res) => {
     await setSessionToken(token, {
         user: req.session.user,
         accessToken: req.session.accessToken,
-        appPassword: appPasswordData
+        refreshToken: req.session.refreshToken,
+        oauthProvider: req.session.oauthProvider,
+        nextcloudUid: req.session.nextcloudUid,
+        appPassword: appPasswordData,
+        isAuthenticated: req.session.isAuthenticated || false,
+        isAdmin: req.session.isAdmin || false,
     });
     res.json({ token });
 });

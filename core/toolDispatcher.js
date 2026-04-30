@@ -348,7 +348,7 @@ async function executeTool(toolName, toolArgs, context = {}) {
         return await executeGitHubTool(toolName, toolArgs, userId);
     }
     if (isNextcloudTool(toolName)) {
-        return await executeNextcloudTool(toolName, toolArgs, userId);
+        return await executeNextcloudTool(toolName, toolArgs, userId, session);
     }
     if (isOutlookTool(toolName)) {
         return await executeOutlookTool(toolName, toolArgs, session);

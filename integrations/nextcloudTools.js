@@ -1,18 +1,25 @@
 /**
  * Nextcloud Tools — AI tools for files via WebDAV + OCS.
  *
- * App-password based (users set username + app password in Settings → Integrations,
- * generated in Nextcloud → Settings → Security → Devices & sessions). Auth is
- * HTTP Basic. The Nextcloud base URL is read from the global oauth.nextcloudUrl
- * config, so admins configure it once for the whole tenant — same place OAuth
- * SSO uses.
+ * Dual-mode auth:
+ *   • Bearer (preferred when the user logged in via Nextcloud OAuth) —
+ *     uses session.accessToken with automatic 401-refresh through
+ *     nextcloudClient.ncFetch. Mirrors the Google/Microsoft pattern so
+ *     tools are available in direct chat the moment the user logs in.
+ *   • Basic (fallback) — username + app password from userStore. Used by
+ *     users who didn't log in via Nextcloud OAuth (e.g. logged in via
+ *     Google/Microsoft and connected Nextcloud as a side integration).
+ *
+ * The Nextcloud base URL is read from the global oauth.nextcloudUrl config,
+ * so admins configure it once for the whole tenant — same place OAuth SSO
+ * uses.
  */
 
-const configStore = require('../stores/configStore');
 const userStore = require('../stores/userStore');
+const ncClient = require('./nextcloudClient');
 
 const MAX_TEXT_BYTES = 200 * 1024;          // 200 KB cap on file reads
-const REQUEST_TIMEOUT_MS = 20000;
+const REQUEST_TIMEOUT_MS = ncClient.REQUEST_TIMEOUT_MS;
 const PROPFIND_BODY = `<?xml version="1.0"?>
 <d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">
   <d:prop>
@@ -134,25 +141,48 @@ const NEXTCLOUD_TOOLS = [
 
 // ─── Helpers ──────────────────────────────────────────────────────
 
-async function getCreds(userId) {
-    const oauth = (await configStore.getConfig('oauth')) || {};
-    const baseUrl = (oauth.nextcloudUrl || '').replace(/\/+$/, '');
-    if (!baseUrl) {
-        throw new Error('Nextcloud URL not configured. Ask an admin to set it under Admin → Authentication.');
+/**
+ * Resolve the auth context for the current call. Returns either:
+ *   { mode: 'bearer', baseUrl, uid, session, fetch, authError }
+ *   { mode: 'basic',  baseUrl, username, password,    fetch, authError }
+ *
+ * `fetch` is a pre-bound function the caller uses for every request. In Bearer
+ * mode it routes through ncClient.ncFetch (so 401s trigger refresh+retry); in
+ * Basic mode it adds the Authorization header explicitly. `authError` is the
+ * 401 message to surface to the LLM, varies by mode.
+ */
+async function resolveAuth(session, userId) {
+    const baseUrl = await ncClient.getBaseUrl();
+
+    if (ncClient.isNextcloudOAuthSession(session)) {
+        const uid = await ncClient.resolveUid(session, baseUrl);
+        return {
+            mode: 'bearer',
+            baseUrl,
+            uid,
+            session,
+            fetch: (url, options) => ncClient.ncFetch(url, session, options),
+            authError: 'Nextcloud session expired — please log in again.',
+        };
     }
+
     const creds = await userStore.getAppPassword(userId);
     if (!creds || !creds.username || !creds.password) {
-        throw new Error('Nextcloud not connected. Add your username and app password in Settings → Integrations.');
+        throw new Error('Nextcloud not connected. Log in via Nextcloud OAuth, or add your username and app password in Settings → Integrations.');
     }
-    return { baseUrl, username: creds.username, password: creds.password };
-}
-
-function basicAuth(username, password) {
-    return 'Basic ' + Buffer.from(`${username}:${password}`).toString('base64');
-}
-
-function webdavRoot(baseUrl, username) {
-    return `${baseUrl}/remote.php/dav/files/${encodeURIComponent(username)}`;
+    const auth = 'Basic ' + Buffer.from(`${creds.username}:${creds.password}`).toString('base64');
+    return {
+        mode: 'basic',
+        baseUrl,
+        username: creds.username,
+        password: creds.password,
+        fetch: (url, options = {}) => fetch(url, {
+            ...options,
+            headers: { 'Authorization': auth, ...(options.headers || {}) },
+            signal: options.signal || AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        }),
+        authError: 'Nextcloud rejected credentials. Re-save your app password in Settings → Integrations.',
+    };
 }
 
 function joinDavPath(root, path) {
@@ -162,19 +192,12 @@ function joinDavPath(root, path) {
     return `${root}/${encoded}`;
 }
 
-async function ncFetch(url, options = {}) {
-    return fetch(url, {
-        ...options,
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
-}
-
-function relativeFromRoot(href, baseUrl, username) {
+function relativeFromRoot(href, baseUrl, uid) {
     // Convert WebDAV href like "/remote.php/dav/files/alice/Documents/foo.md"
     // to "/Documents/foo.md" (the user-facing path).
     try {
         const decoded = decodeURIComponent(href);
-        const rootPath = `/remote.php/dav/files/${decodeURIComponent(username)}`;
+        const rootPath = `/remote.php/dav/files/${decodeURIComponent(uid)}`;
         const idx = decoded.indexOf(rootPath);
         if (idx === -1) return decoded;
         return decoded.slice(idx + rootPath.length) || '/';
@@ -185,7 +208,7 @@ function relativeFromRoot(href, baseUrl, username) {
 
 // Minimal PROPFIND XML parser — extracts <d:response> blocks. Avoids pulling
 // in a heavy XML dep; the response shape is well-defined and stable.
-function parsePropfind(xml, baseUrl, username) {
+function parsePropfind(xml, baseUrl, uid) {
     const responses = [];
     const respRegex = /<d:response[\s>][\s\S]*?<\/d:response>/g;
     const matches = xml.match(respRegex) || [];
@@ -197,7 +220,7 @@ function parsePropfind(xml, baseUrl, username) {
         const contentType = (block.match(/<d:getcontenttype>([^<]*)<\/d:getcontenttype>/) || [])[1] || null;
         const lastMod = (block.match(/<d:getlastmodified>([^<]+)<\/d:getlastmodified>/) || [])[1] || null;
         const fileId = (block.match(/<oc:fileid>([^<]+)<\/oc:fileid>/) || [])[1] || null;
-        const path = relativeFromRoot(href, baseUrl, username);
+        const path = relativeFromRoot(href, baseUrl, uid);
         const name = path.replace(/\/$/, '').split('/').pop() || '/';
         responses.push({
             name,
@@ -214,10 +237,11 @@ function parsePropfind(xml, baseUrl, username) {
 
 // ─── Tool Execution ───────────────────────────────────────────────
 
-async function executeNextcloudTool(toolName, args, userId) {
-    const { baseUrl, username, password } = await getCreds(userId);
-    const auth = basicAuth(username, password);
-    const root = webdavRoot(baseUrl, username);
+async function executeNextcloudTool(toolName, args, userId, session) {
+    const ctx = await resolveAuth(session, userId);
+    const { baseUrl, fetch: ncFetch, authError, mode } = ctx;
+    const uid = mode === 'bearer' ? ctx.uid : ctx.username;
+    const root = ncClient.webdavRoot(baseUrl, uid);
 
     switch (toolName) {
         case 'nextcloud_list_files': {
@@ -225,7 +249,6 @@ async function executeNextcloudTool(toolName, args, userId) {
             const res = await ncFetch(url, {
                 method: 'PROPFIND',
                 headers: {
-                    'Authorization': auth,
                     'Depth': '1',
                     'Content-Type': 'application/xml; charset=utf-8',
                     'Accept': 'application/xml',
@@ -233,13 +256,13 @@ async function executeNextcloudTool(toolName, args, userId) {
                 body: PROPFIND_BODY,
             });
             if (res.status === 404) return { error: `Folder not found: ${args.path}` };
-            if (res.status === 401) return { error: 'Nextcloud rejected credentials. Re-save your app password in Settings → Integrations.' };
+            if (res.status === 401) return { error: authError };
             if (!res.ok) {
                 const text = await res.text().catch(() => '');
                 return { error: `Nextcloud PROPFIND failed (${res.status}): ${text.slice(0, 200)}` };
             }
             const xml = await res.text();
-            const all = parsePropfind(xml, baseUrl, username);
+            const all = parsePropfind(xml, baseUrl, uid);
             // First entry is the folder itself — drop it.
             const folderPath = (args.path || '/').replace(/\/+$/, '') || '/';
             const items = all.filter(item => item.path !== folderPath);
@@ -253,9 +276,9 @@ async function executeNextcloudTool(toolName, args, userId) {
             // OCS Files API search endpoint (works on Nextcloud 12+).
             const url = `${baseUrl}/ocs/v2.php/search/providers/files/search?term=${encodeURIComponent(query)}&limit=${limit}&format=json`;
             const res = await ncFetch(url, {
-                headers: { 'Authorization': auth, 'OCS-APIRequest': 'true', 'Accept': 'application/json' },
+                headers: { 'OCS-APIRequest': 'true', 'Accept': 'application/json' },
             });
-            if (res.status === 401) return { error: 'Nextcloud rejected credentials.' };
+            if (res.status === 401) return { error: authError };
             if (!res.ok) return { error: `Nextcloud search failed (${res.status})` };
             const data = await res.json();
             const entries = data?.ocs?.data?.entries || [];
@@ -274,9 +297,9 @@ async function executeNextcloudTool(toolName, args, userId) {
         case 'nextcloud_read_file': {
             if (!args.path) return { error: 'path is required' };
             const url = joinDavPath(root, args.path);
-            const res = await ncFetch(url, { headers: { 'Authorization': auth } });
+            const res = await ncFetch(url, {});
             if (res.status === 404) return { error: `File not found: ${args.path}` };
-            if (res.status === 401) return { error: 'Nextcloud rejected credentials.' };
+            if (res.status === 401) return { error: authError };
             if (!res.ok) return { error: `Nextcloud read failed (${res.status})` };
             const contentType = res.headers.get('content-type') || '';
             const buf = Buffer.from(await res.arrayBuffer());
@@ -301,12 +324,11 @@ async function executeNextcloudTool(toolName, args, userId) {
             const res = await ncFetch(url, {
                 method: 'PUT',
                 headers: {
-                    'Authorization': auth,
                     'Content-Type': args.contentType || 'text/plain; charset=utf-8',
                 },
                 body: args.content,
             });
-            if (res.status === 401) return { error: 'Nextcloud rejected credentials.' };
+            if (res.status === 401) return { error: authError };
             if (res.status === 409) return { error: `Parent folder for ${args.path} does not exist. Create it first with nextcloud_create_folder.` };
             if (!res.ok && res.status !== 201 && res.status !== 204) {
                 const text = await res.text().catch(() => '');
@@ -318,8 +340,8 @@ async function executeNextcloudTool(toolName, args, userId) {
         case 'nextcloud_create_folder': {
             if (!args.path) return { error: 'path is required' };
             const url = joinDavPath(root, args.path);
-            const res = await ncFetch(url, { method: 'MKCOL', headers: { 'Authorization': auth } });
-            if (res.status === 401) return { error: 'Nextcloud rejected credentials.' };
+            const res = await ncFetch(url, { method: 'MKCOL' });
+            if (res.status === 401) return { error: authError };
             if (res.status === 405) return { error: `Folder already exists: ${args.path}` };
             if (res.status === 409) return { error: `Parent folder for ${args.path} does not exist.` };
             if (!res.ok) return { error: `Folder creation failed (${res.status})` };
@@ -329,9 +351,9 @@ async function executeNextcloudTool(toolName, args, userId) {
         case 'nextcloud_delete': {
             if (!args.path) return { error: 'path is required' };
             const url = joinDavPath(root, args.path);
-            const res = await ncFetch(url, { method: 'DELETE', headers: { 'Authorization': auth } });
+            const res = await ncFetch(url, { method: 'DELETE' });
             if (res.status === 404) return { error: `Not found: ${args.path}` };
-            if (res.status === 401) return { error: 'Nextcloud rejected credentials.' };
+            if (res.status === 401) return { error: authError };
             if (!res.ok && res.status !== 204) return { error: `Delete failed (${res.status})` };
             return { success: true, path: args.path };
         }
@@ -348,14 +370,13 @@ async function executeNextcloudTool(toolName, args, userId) {
             const res = await ncFetch(url, {
                 method: 'POST',
                 headers: {
-                    'Authorization': auth,
                     'OCS-APIRequest': 'true',
                     'Content-Type': 'application/x-www-form-urlencoded',
                     'Accept': 'application/json',
                 },
                 body: params.toString(),
             });
-            if (res.status === 401) return { error: 'Nextcloud rejected credentials.' };
+            if (res.status === 401) return { error: authError };
             if (!res.ok) {
                 const text = await res.text().catch(() => '');
                 return { error: `Share creation failed (${res.status}): ${text.slice(0, 200)}` };
