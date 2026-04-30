@@ -209,6 +209,13 @@ function tokenizeText(text, entities) {
     const sorted = [...entities].sort((a, b) => b.offset - a.offset);
     const tokenMap = {};
     const counters = {};
+    // Dedup within a category: identical real values share one token. Without
+    // this, the same name appearing 5 times in an email becomes [person_2..6]
+    // — five rows in the token-map UI, all pointing at "Jack". Match is
+    // case-sensitive + whitespace-trimmed: "Jack" and "Jack " collapse, but
+    // "Jack" and "jack" stay separate so restoration preserves original casing
+    // at every site.
+    const seenByCategory = new Map();
 
     let tokenized = text;
     for (const entity of sorted) {
@@ -217,9 +224,14 @@ function tokenizeText(text, entities) {
         // The restore path is format-agnostic (see server/core/dlp/untokeniseStream.js),
         // so this change is backwards-compatible with any tokens still in flight.
         const catKey = (entity.category || 'data').toLowerCase().replace(/[^a-z0-9]/g, '_');
-        counters[catKey] = (counters[catKey] || 0) + 1;
-        const token = `[${catKey}_${counters[catKey]}]`;
-        tokenMap[token] = entity.text;
+        const dedupKey = `${catKey}|${(entity.text || '').trim()}`;
+        let token = seenByCategory.get(dedupKey);
+        if (!token) {
+            counters[catKey] = (counters[catKey] || 0) + 1;
+            token = `[${catKey}_${counters[catKey]}]`;
+            seenByCategory.set(dedupKey, token);
+            tokenMap[token] = entity.text;
+        }
         // Replace the exact span (using offset if available, else string replace)
         if (entity.offset !== undefined && entity.offset >= 0) {
             tokenized = tokenized.slice(0, entity.offset) + token + tokenized.slice(entity.offset + entity.length);
