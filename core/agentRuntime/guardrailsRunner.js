@@ -187,6 +187,9 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
                             source: 'pii',
                             timestamp: Date.now(),
                         });
+                        if (piiResult.tokenMap && Object.keys(piiResult.tokenMap).length > 0) {
+                            onEvent('privacy_token_map', { tokenMap: piiResult.tokenMap, source: 'pii' });
+                        }
                     }
                 }
 

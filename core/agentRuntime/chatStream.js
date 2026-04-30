@@ -620,6 +620,9 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     source: 'dlp',
                     timestamp: Date.now(),
                 });
+                if (dlpResult.tokenMap && Object.keys(dlpResult.tokenMap).length > 0) {
+                    onEvent?.('privacy_token_map', { tokenMap: dlpResult.tokenMap, source: 'dlp' });
+                }
             }
             dlpStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'redacted' }).catch(() => {});
         } else if (dlpResult.action === 'ask') {
@@ -689,6 +692,9 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         source: 'dlp',
                         timestamp: Date.now(),
                     });
+                    if (tokenMap && Object.keys(tokenMap).length > 0) {
+                        onEvent?.('privacy_token_map', { tokenMap, source: 'dlp' });
+                    }
                 }
                 dlpStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'redacted' }).catch(() => {});
             } else {

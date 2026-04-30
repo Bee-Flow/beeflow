@@ -1624,6 +1624,9 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                         source: 'pii',
                         timestamp: Date.now(),
                     });
+                    if (piiResult.tokenMap && Object.keys(piiResult.tokenMap).length > 0) {
+                        send('privacy_token_map', { tokenMap: piiResult.tokenMap, source: 'pii' });
+                    }
                 }
 
                 // Log PII tokenize event (fire-and-forget)
@@ -1744,6 +1747,9 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                         source: 'dlp',
                         timestamp: Date.now(),
                     });
+                    if (dlpResult.tokenMap && Object.keys(dlpResult.tokenMap).length > 0) {
+                        send('privacy_token_map', { tokenMap: dlpResult.tokenMap, source: 'dlp' });
+                    }
                 }
                 guardrailEventStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'redacted' }).catch(() => {});
             } else if (dlpResult.action === 'ask') {
@@ -1801,6 +1807,9 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                             source: 'dlp',
                             timestamp: Date.now(),
                         });
+                        if (tokenMap && Object.keys(tokenMap).length > 0) {
+                            send('privacy_token_map', { tokenMap, source: 'dlp' });
+                        }
                     }
                     guardrailEventStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'redacted' }).catch(() => {});
                 } else {
