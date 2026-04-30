@@ -1500,6 +1500,11 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
 
         // Check if org shield or global config enables moderation for direct chat
         let moderationViolation = null;
+        // Privacy / DLP metadata accumulators — attached to the saved user/assistant
+        // messages just before persistence so the redaction badge and "How I got this
+        // answer" panel survive a page refresh.
+        let _userPrivacyMeta = null;
+        let _assistantTokenisationInfo = null;
         const orgShield = userOrgId ? await configStore.getConfig(`org_privacy_shield_${userOrgId}`) : null;
         const globalModerationEnabled = (await getAIConfig()).llamaGuardConfig?.enabled;
         const moderationEnabled = (orgShield?.enabled && orgShield?.moderationEnabled) || globalModerationEnabled;
@@ -1615,6 +1620,23 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                     tokenCount: Object.keys(piiResult.tokenMap).length,
                 });
 
+                // Persistence: stash the same data on the request-scoped accumulators
+                // so the user message gets a redacted badge and the assistant message
+                // gets the privacy panel after a refresh.
+                {
+                    const piiCats = [...new Set(piiResult.entities.map(e => e.label || e.category).filter(Boolean))];
+                    const piiCount = Object.keys(piiResult.tokenMap).length;
+                    _userPrivacyMeta = { piiTokenizedCount: piiCount, piiCategories: piiCats };
+                    _assistantTokenisationInfo = {
+                        source: 'pii',
+                        action: 'redact',
+                        count: piiCount,
+                        categories: piiCats,
+                        provider: modelId || null,
+                        automatic: true,
+                    };
+                }
+
                 // Transparency: when enabled per-org, surface the exact tokenised
                 // outbound string so the user can verify what the LLM received.
                 if (orgShield?.showRawPayload) {
@@ -1624,8 +1646,10 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                         source: 'pii',
                         timestamp: Date.now(),
                     });
+                    if (_assistantTokenisationInfo) _assistantTokenisationInfo.tokenizedPrompt = piiResult.tokenizedText;
                     if (piiResult.tokenMap && Object.keys(piiResult.tokenMap).length > 0) {
                         send('privacy_token_map', { tokenMap: piiResult.tokenMap, source: 'pii' });
+                        if (_assistantTokenisationInfo) _assistantTokenisationInfo.tokenMap = piiResult.tokenMap;
                     }
                 }
 
@@ -1732,14 +1756,25 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             if (dlpResult.action === 'redact') {
                 applyRedactionToMessages(dlpResult.redactedText);
                 piiTokenMap = dlpResult.tokenMap; // reuse existing un-tokenise path on the response
+                const dlpCount = Object.keys(dlpResult.tokenMap || {}).length;
+                const dlpCats = Object.keys(dlpResult.summary || {});
                 send('dlp_resolved', {
                     appliedChoice: 'redact',
-                    redactedCount: Object.keys(dlpResult.tokenMap || {}).length,
+                    redactedCount: dlpCount,
                     provider: dlpResult.provider,
-                    categories: Object.keys(dlpResult.summary || {}),
+                    categories: dlpCats,
                     automatic: true,
                     decisionMs: Date.now() - scanStart,
                 });
+                _userPrivacyMeta = { dlpRedactedCount: dlpCount, dlpCategories: dlpCats };
+                _assistantTokenisationInfo = {
+                    source: 'dlp',
+                    action: 'redact',
+                    count: dlpCount,
+                    categories: dlpCats,
+                    provider: dlpResult.provider?.displayName || null,
+                    automatic: true,
+                };
                 if (resolvedShield?.showRawPayload && dlpResult.redactedText) {
                     send('privacy_payload', {
                         tokenizedPrompt: dlpResult.redactedText,
@@ -1747,8 +1782,10 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                         source: 'dlp',
                         timestamp: Date.now(),
                     });
+                    _assistantTokenisationInfo.tokenizedPrompt = dlpResult.redactedText;
                     if (dlpResult.tokenMap && Object.keys(dlpResult.tokenMap).length > 0) {
                         send('privacy_token_map', { tokenMap: dlpResult.tokenMap, source: 'dlp' });
+                        _assistantTokenisationInfo.tokenMap = dlpResult.tokenMap;
                     }
                 }
                 guardrailEventStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'redacted' }).catch(() => {});
@@ -1792,14 +1829,25 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                     });
                     applyRedactionToMessages(tokenizedText);
                     piiTokenMap = tokenMap;
+                    const dlpCount = Object.keys(tokenMap).length;
+                    const dlpCats = Object.keys(dlpResult.summary || {});
                     send('dlp_resolved', {
                         appliedChoice: 'redact',
-                        redactedCount: Object.keys(tokenMap).length,
+                        redactedCount: dlpCount,
                         provider: dlpResult.provider,
-                        categories: Object.keys(dlpResult.summary || {}),
+                        categories: dlpCats,
                         automatic: false,
                         decisionMs: Date.now() - scanStart,
                     });
+                    _userPrivacyMeta = { dlpRedactedCount: dlpCount, dlpCategories: dlpCats };
+                    _assistantTokenisationInfo = {
+                        source: 'dlp',
+                        action: 'redact',
+                        count: dlpCount,
+                        categories: dlpCats,
+                        provider: dlpResult.provider?.displayName || null,
+                        automatic: false,
+                    };
                     if (resolvedShield?.showRawPayload && tokenizedText) {
                         send('privacy_payload', {
                             tokenizedPrompt: tokenizedText,
@@ -1807,8 +1855,10 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                             source: 'dlp',
                             timestamp: Date.now(),
                         });
+                        _assistantTokenisationInfo.tokenizedPrompt = tokenizedText;
                         if (tokenMap && Object.keys(tokenMap).length > 0) {
                             send('privacy_token_map', { tokenMap, source: 'dlp' });
+                            _assistantTokenisationInfo.tokenMap = tokenMap;
                         }
                     }
                     guardrailEventStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'redacted' }).catch(() => {});
@@ -3067,11 +3117,16 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         if (orgShield?.showRawPayload && fullContent) {
             const RAW_BUFFER_MAX = 64 * 1024;
             const truncated = fullContent.length > RAW_BUFFER_MAX;
+            const rawForClient = truncated ? fullContent.slice(0, RAW_BUFFER_MAX) + '…' : fullContent;
             send('privacy_response_raw', {
-                rawResponse: truncated ? fullContent.slice(0, RAW_BUFFER_MAX) + '…' : fullContent,
+                rawResponse: rawForClient,
                 truncated,
                 timestamp: Date.now(),
             });
+            if (_assistantTokenisationInfo) {
+                _assistantTokenisationInfo.rawResponse = rawForClient;
+                _assistantTokenisationInfo.rawTruncated = truncated;
+            }
         }
 
         // ─── PII Token Restoration ──────────────────────────────────
@@ -3180,8 +3235,10 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             }
             const userSave = { role: 'user', content: moderationViolation ? '[Message removed - policy violation]' : message, timestamp: new Date().toISOString() };
             if (persistedAttachments.length > 0) userSave.attachments = persistedAttachments;
+            if (_userPrivacyMeta) Object.assign(userSave, _userPrivacyMeta);
             savedMessages.push(userSave);
             const assistantSave = { role: 'assistant', content: fullContent, timestamp: new Date().toISOString() };
+            if (_assistantTokenisationInfo) assistantSave.tokenisationInfo = _assistantTokenisationInfo;
             // Prefer the structured thinking parts (with signatures + timing) over the flat string.
             // The flat string is kept as a fallback for providers that only emit `thinking` without
             // wrapping start/stop events.

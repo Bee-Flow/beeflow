@@ -515,6 +515,11 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     let moderationViolation = guardrailsResult.moderationViolation;
     let guardrailViolation = guardrailsResult.guardrailViolation;
     let processedUserMessage = guardrailsResult.processedUserMessage;
+    // Privacy / DLP metadata accumulators — attached to the saved user/assistant
+    // messages just before persistence so the redaction badge and "How I got this
+    // answer" panel survive a page refresh.
+    let _userPrivacyMeta = guardrailsResult.userPrivacyMeta || null;
+    let _assistantTokenisationInfo = guardrailsResult.assistantTokenisationInfo || null;
     const regexConfig = guardrailsResult.regexConfig;
     const webSearchGuardEnabled = guardrailsResult.webSearchGuardEnabled;
     const disableSearchOnUpload = guardrailsResult.disableSearchOnUpload;
@@ -605,14 +610,25 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
 
         if (dlpResult.action === 'redact') {
             await applyRedactionToMessages(dlpResult.redactedText);
+            const dlpCount = Object.keys(dlpResult.tokenMap || {}).length;
+            const dlpCats = Object.keys(dlpResult.summary || {});
             onEvent?.('dlp_resolved', {
                 appliedChoice: 'redact',
-                redactedCount: Object.keys(dlpResult.tokenMap || {}).length,
+                redactedCount: dlpCount,
                 provider: dlpResult.provider,
-                categories: Object.keys(dlpResult.summary || {}),
+                categories: dlpCats,
                 automatic: true,
                 decisionMs: scanMs,
             });
+            _userPrivacyMeta = { dlpRedactedCount: dlpCount, dlpCategories: dlpCats };
+            _assistantTokenisationInfo = {
+                source: 'dlp',
+                action: 'redact',
+                count: dlpCount,
+                categories: dlpCats,
+                provider: dlpResult.provider?.displayName || null,
+                automatic: true,
+            };
             if (dlpShield?.showRawPayload && dlpResult.redactedText) {
                 onEvent?.('privacy_payload', {
                     tokenizedPrompt: dlpResult.redactedText,
@@ -620,8 +636,10 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     source: 'dlp',
                     timestamp: Date.now(),
                 });
+                _assistantTokenisationInfo.tokenizedPrompt = dlpResult.redactedText;
                 if (dlpResult.tokenMap && Object.keys(dlpResult.tokenMap).length > 0) {
                     onEvent?.('privacy_token_map', { tokenMap: dlpResult.tokenMap, source: 'dlp' });
+                    _assistantTokenisationInfo.tokenMap = dlpResult.tokenMap;
                 }
             }
             dlpStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'redacted' }).catch(() => {});
@@ -677,14 +695,25 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     findings: dlpResult.findings,
                 });
                 await applyRedactionToMessages(tokenizedText);
+                const dlpCount = Object.keys(tokenMap).length;
+                const dlpCats = Object.keys(dlpResult.summary || {});
                 onEvent?.('dlp_resolved', {
                     appliedChoice: 'redact',
-                    redactedCount: Object.keys(tokenMap).length,
+                    redactedCount: dlpCount,
                     provider: dlpResult.provider,
-                    categories: Object.keys(dlpResult.summary || {}),
+                    categories: dlpCats,
                     automatic: false,
                     decisionMs: Date.now() - scanStart,
                 });
+                _userPrivacyMeta = { dlpRedactedCount: dlpCount, dlpCategories: dlpCats };
+                _assistantTokenisationInfo = {
+                    source: 'dlp',
+                    action: 'redact',
+                    count: dlpCount,
+                    categories: dlpCats,
+                    provider: dlpResult.provider?.displayName || null,
+                    automatic: false,
+                };
                 if (dlpShield?.showRawPayload && tokenizedText) {
                     onEvent?.('privacy_payload', {
                         tokenizedPrompt: tokenizedText,
@@ -692,8 +721,10 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         source: 'dlp',
                         timestamp: Date.now(),
                     });
+                    _assistantTokenisationInfo.tokenizedPrompt = tokenizedText;
                     if (tokenMap && Object.keys(tokenMap).length > 0) {
                         onEvent?.('privacy_token_map', { tokenMap, source: 'dlp' });
+                        _assistantTokenisationInfo.tokenMap = tokenMap;
                     }
                 }
                 dlpStore.logDlpDecision({ ...auditBase, violation_categories: categoryList, action_taken: 'redacted' }).catch(() => {});
@@ -2104,6 +2135,24 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     brain: swarmBrain
                 };
                 console.log(`[AgentRuntime] Persisting swarm activity: ${swarmLogs.length} logs, ${swarmBrain.length} brain entries`);
+            }
+            // Privacy / DLP — persist redaction metadata so the badge + "How I got
+            // this answer" panel survive a refresh. Raw response is captured live
+            // into _rawResponseBuffer above; copy it here before persistence.
+            if (_assistantTokenisationInfo) {
+                if (_captureRaw && _rawResponseBuffer) {
+                    _assistantTokenisationInfo.rawResponse = _rawResponseBuffer;
+                    _assistantTokenisationInfo.rawTruncated = _rawResponseBuffer.endsWith('…');
+                }
+                assistantMsg.tokenisationInfo = _assistantTokenisationInfo;
+            }
+            if (_userPrivacyMeta) {
+                for (let i = messages.length - 1; i >= 0; i--) {
+                    if (messages[i]?.role === 'user') {
+                        Object.assign(messages[i], _userPrivacyMeta);
+                        break;
+                    }
+                }
             }
             messages.push(assistantMsg);
             if (!isEphemeral) {

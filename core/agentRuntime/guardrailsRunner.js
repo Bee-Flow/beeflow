@@ -10,6 +10,8 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
     let moderationViolation = null;
     let guardrailViolation = null;
     let processedUserMessage = userMessage;
+    let userPrivacyMeta = null;
+    let assistantTokenisationInfo = null;
 
     // ── Unicode Smuggling Defense (must run FIRST) ───────────────────
     const unicodeResult = sanitizeMessagesUnicode(messages);
@@ -193,6 +195,28 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
                     }
                 }
 
+                // Persistence accumulators returned to the caller (chatStream)
+                // so the redaction badge + privacy panel survive page refreshes.
+                {
+                    const piiCats = [...new Set(piiResult.entities.map(e => e.label || e.category).filter(Boolean))];
+                    const piiCount = Object.keys(piiResult.tokenMap).length;
+                    userPrivacyMeta = { piiTokenizedCount: piiCount, piiCategories: piiCats };
+                    assistantTokenisationInfo = {
+                        source: 'pii',
+                        action: 'redact',
+                        count: piiCount,
+                        categories: piiCats,
+                        provider: model || null,
+                        automatic: true,
+                    };
+                    if (orgShield?.showRawPayload && piiResult.tokenizedText) {
+                        assistantTokenisationInfo.tokenizedPrompt = piiResult.tokenizedText;
+                        if (piiResult.tokenMap && Object.keys(piiResult.tokenMap).length > 0) {
+                            assistantTokenisationInfo.tokenMap = piiResult.tokenMap;
+                        }
+                    }
+                }
+
                 // Log PII redact event (fire-and-forget)
                 guardrailEventStore.logGuardrailEvent({
                     ...eventCtx,
@@ -315,15 +339,17 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
         }
     }
 
-    return { 
-        moderationViolation, 
-        guardrailViolation, 
-        processedUserMessage, 
-        regexConfig, 
+    return {
+        moderationViolation,
+        guardrailViolation,
+        processedUserMessage,
+        regexConfig,
         webSearchGuardEnabled,
         disableSearchOnUpload,
         webSearchGuardPiiCategories,
-        orgShieldCategories
+        orgShieldCategories,
+        userPrivacyMeta,
+        assistantTokenisationInfo,
     };
 }
 
