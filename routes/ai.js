@@ -45,17 +45,20 @@ const notebookChatGate = async (req, res, next) => {
 router.use(notebookChatGate);
 router.use('/', notebookChatRoutes);
 
-// Webpage chat feature gate
+// Webpage chat — gated per-organization via the beta-feature registry. Path-
+// scoped so the gate only fires on /chat/webpage/* and not on the rest of /ai.
+const { userHasBetaFeature: userHasWebpagesBeta } = require('../core/betaFeatures');
 const webpageChatGate = async (req, res, next) => {
     if (!req.path.startsWith('/chat/webpage')) return next();
+    if (!req.session?.user) return res.status(401).json({ error: 'Not authenticated' });
     try {
-        const configStore = require('../stores/configStore');
-        const enabled = await configStore.getConfig('feature_webpages_enabled');
-        if (enabled === false) {
-            return res.status(403).json({ error: 'Webpages feature is disabled' });
+        if (await userHasWebpagesBeta(req.session.user.id, 'webpages', req.session)) {
+            return next();
         }
-    } catch (_) { /* fail open */ }
-    next();
+        return res.status(403).json({ error: "Beta feature 'webpages' is not enabled for your organization" });
+    } catch (_) {
+        return res.status(403).json({ error: "Beta feature 'webpages' is not enabled for your organization" });
+    }
 };
 router.use(webpageChatGate);
 router.use('/', webpageChatRoutes);

@@ -322,19 +322,10 @@ const notebookFeatureGate = async (req, res, next) => {
 };
 app.use('/api/notebooks', notebookFeatureGate, require('./routes/notebooks'));
 app.use('/api/notebooks', notebookFeatureGate, require('./routes/notebookExport'));
-// Webpage feature gate middleware
-const webpageFeatureGate = async (req, res, next) => {
-    try {
-        const configStore = require('./stores/configStore');
-        const enabled = await configStore.getConfig('feature_webpages_enabled');
-        if (enabled === false) {
-            return res.status(403).json({ error: 'Webpages feature is disabled' });
-        }
-    } catch (_) { /* allow on error — fail open */ }
-    next();
-};
-app.use('/api/webpages', webpageFeatureGate, require('./routes/webpages'));
-app.use('/api/webpages', webpageFeatureGate, require('./routes/webpageExport'));
+// Webpages — gated per-organization via the beta-feature registry.
+const { requireBetaFeature: requireWebpagesBeta } = require('./core/betaFeatures');
+app.use('/api/webpages', requireWebpagesBeta('webpages'), require('./routes/webpages'));
+app.use('/api/webpages', requireWebpagesBeta('webpages'), require('./routes/webpageExport'));
 // Meeting Notes beta feature gate
 const { requireBetaFeature } = require('./core/betaFeatures');
 app.use('/api/transcriptions', requireBetaFeature('meeting_notes'), require('./routes/transcriptions'));

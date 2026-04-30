@@ -36,6 +36,7 @@ const BETA_FEATURES = [
     { id: 'voice_chat', name: 'Voice Chat (Beta)', description: 'Realtime voice conversation with direct chat or agents, powered by Mistral Voxtral (STT + TTS). Requires a configured Mistral API key.' },
     { id: 'swarm', name: 'Swarm Agents', description: 'Multi-agent swarms (Deep Research, etc.) that run specialised AI workers in parallel phases and synthesise a single answer. Workers share findings via a Hive Mind notebook.' },
     { id: 'knowledge_bases_beta', name: 'Knowledge Bases (Beta badge)', description: 'Show a "beta" badge on the Knowledge Bases sidebar item. Cosmetic — does not gate access.' },
+    { id: 'webpages', name: 'Webpages', description: 'AI-built static webpages. Three-file projects (index.html / style.css / script.js) hosted in RustFS, with sandboxed live preview, auto-versioning, KB-grounded AI chat, and a one-click ZIP download.' },
 ];
 
 // -──────────────────────────────────────────────
