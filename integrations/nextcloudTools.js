@@ -67,11 +67,11 @@ const NEXTCLOUD_TOOLS = [
         type: 'function',
         function: {
             name: 'nextcloud_read_file',
-            description: 'Read the text contents of a file from Nextcloud. Files larger than ~200 KB are truncated. Binary files are not supported.',
+            description: 'Read the contents of a file from Nextcloud. Handles plain text, PDFs (text layer plus Azure / Mistral OCR fallback), DOCX, and XLSX/CSV — the same extraction pipeline used when a user uploads a file directly to chat. Extracted text larger than ~200 KB is truncated.',
             parameters: {
                 type: 'object',
                 properties: {
-                    path: { type: 'string', description: 'Full path to the file (e.g. "/Documents/notes.md").' }
+                    path: { type: 'string', description: 'Full path to the file (e.g. "/Documents/notes.md", "/Invoices/2026/invoice.pdf").' }
                 },
                 required: ['path']
             }
@@ -303,9 +303,52 @@ async function executeNextcloudTool(toolName, args, userId, session) {
             if (!res.ok) return { error: `Nextcloud read failed (${res.status})` };
             const contentType = res.headers.get('content-type') || '';
             const buf = Buffer.from(await res.arrayBuffer());
+            const filename = args.path.split('/').pop() || args.path;
+            const att = { name: filename, type: contentType };
+
+            // Rich-document extraction — PDF, DOCX, XLSX/CSV go through the
+            // same pipeline used for chat uploads (pdfjs → Azure DI → Mistral
+            // OCR for PDFs; Azure DI → mammoth/xlsx for Office docs).
+            const { extractAttachment, isPdf, isDocx, isSpreadsheet } = require('../core/attachmentExtractor');
+            if (isPdf(att) || isDocx(att) || isSpreadsheet(att)) {
+                const result = await extractAttachment({
+                    name: filename,
+                    type: contentType,
+                    content: buf.toString('base64'),
+                });
+                if (result.kind === 'text') {
+                    const truncated = result.text.length > MAX_TEXT_BYTES;
+                    const text = truncated
+                        ? result.text.slice(0, MAX_TEXT_BYTES) + '\n\n... [truncated — extracted text too large]'
+                        : result.text;
+                    return {
+                        path: args.path,
+                        size: buf.length,
+                        contentType,
+                        extractedVia: result.source,
+                        truncated,
+                        content: text,
+                        meta: result.meta,
+                    };
+                }
+                if (result.kind === 'images') {
+                    return {
+                        error: `${filename} appears to be an image-only document (${result.meta?.numPages || '?'} pages) with no extractable text. Configure Azure Document Intelligence or Mistral OCR to read scanned PDFs from Nextcloud.`,
+                        size: buf.length,
+                        contentType,
+                    };
+                }
+                return {
+                    error: `Could not extract text from ${filename}: ${result.reason}.`,
+                    size: buf.length,
+                    contentType,
+                };
+            }
+
+            // Plain text path — UTF-8 decode with binary-safety probe.
             const isText = /^(text\/|application\/(json|xml|x-yaml|x-sh|javascript))/i.test(contentType) || buf.slice(0, 1024).every(b => b === 9 || b === 10 || b === 13 || (b >= 32 && b < 127));
             if (!isText) {
-                return { error: `File appears to be binary (${contentType || 'unknown type'}). Reading binary files is not supported.`, size: buf.length, contentType };
+                return { error: `File appears to be binary (${contentType || 'unknown type'}). Reading binary files of this type is not supported.`, size: buf.length, contentType };
             }
             const truncated = buf.length > MAX_TEXT_BYTES;
             const content = buf.slice(0, MAX_TEXT_BYTES).toString('utf-8');
