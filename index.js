@@ -150,27 +150,9 @@ app.use(require('./auth/patAuth'));
 
 
 
-// ── Session token for embedded iframes (Redis-backed or in-memory fallback) ──
-const _sessionTokenFallback = new Map(); // only used if Redis is unavailable
-
-async function getSessionToken(token) {
-    const r = getRedis();
-    if (r) {
-        const val = await r.get(`bf:stok:${token}`);
-        return val ? JSON.parse(val) : null;
-    }
-    return _sessionTokenFallback.get(token) || null;
-}
-
-async function setSessionToken(token, data, ttlSeconds = 3600) {
-    const r = getRedis();
-    if (r) {
-        await r.set(`bf:stok:${token}`, JSON.stringify(data), 'EX', ttlSeconds);
-    } else {
-        _sessionTokenFallback.set(token, data);
-        setTimeout(() => _sessionTokenFallback.delete(token), ttlSeconds * 1000);
-    }
-}
+// ── Session-token bridge (popup→iframe handoff for embedded mode) ──
+// Helpers live in utils/sessionToken so OAuth callback can mint pickup tokens.
+const { getSessionToken, setSessionToken, generateToken } = require('./utils/sessionToken');
 
 app.use(async (req, res, next) => {
     const sessionToken = req.headers['x-session-token'];
@@ -184,11 +166,10 @@ app.use(async (req, res, next) => {
 app.get('/api/session-token', async (req, res) => {
     if (!req.session?.user?.id) return res.status(401).json({ error: 'Not authenticated' });
 
-    const crypto = require('crypto');
     const userStore = require('./stores/userStore');
-    const token = crypto.randomBytes(32).toString('hex');
+    const token = generateToken();
     const userId = req.session.user.id;
-    const appPasswordData = userStore.getAppPassword(userId);
+    const appPasswordData = await userStore.getAppPassword(userId);
 
     await setSessionToken(token, {
         user: req.session.user,

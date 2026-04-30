@@ -70,6 +70,25 @@ function getReturnUrl(req) {
     return 'http://localhost:5173';
 }
 
+// Pickup claim — used by embedded iframes that can't see the popup's session
+// cookie (Chrome storage partitioning). The popup deposits a session token
+// under a random pickup id (see callback below); the iframe polls this
+// endpoint until the token is available, then sends it as X-Session-Token on
+// every subsequent request. One-time read.
+router.get('/login-pickup', async (req, res) => {
+    const id = String(req.query.id || '');
+    if (!id || id.length > 128) return res.status(400).json({ error: 'invalid id' });
+    try {
+        const { claimPickup } = require('../utils/sessionToken');
+        const data = await claimPickup(id);
+        if (!data) return res.status(404).json({ pending: true });
+        return res.json({ sessionToken: data.sessionToken });
+    } catch (e) {
+        console.error('[OAuth/login-pickup] error:', e.message);
+        return res.status(500).json({ error: e.message });
+    }
+});
+
 // Legacy Nextcloud login redirect
 router.get('/login', async (req, res) => {
     const config = await loadConfig();
@@ -223,6 +242,12 @@ router.get('/login/:provider', async (req, res) => {
     // can render a postMessage page instead of a redirect.
     if (req.query.popup === '1') {
         req.session.oauthPopup = true;
+    }
+    // When ?pickup=<id> is set (storage-partitioned iframe), the iframe is
+    // polling /auth/login-pickup?id=<id> for a session token to bridge the
+    // cookie gap. Stash the id so the callback can deposit a token.
+    if (req.query.pickup) {
+        req.session.oauthPickupId = String(req.query.pickup).slice(0, 128);
     }
 
     console.log(`[OAuth] Login SessionID: ${req.sessionID}`);
@@ -826,15 +851,41 @@ router.get('/callback/:provider', async (req, res) => {
         }
 
         console.log(`[OAuth/${provider}] Saving session and redirecting to: ${returnTo}`);
-        req.session.save((err) => {
+        req.session.save(async (err) => {
             if (err) console.error(`[OAuth/${provider}] SESSION SAVE ERROR:`, err);
             else console.log(`[OAuth/${provider}] === LOGIN COMPLETE === Redirecting user ${user.id}`);
 
             // Popup mode (embedded iframe): render a tiny HTML page that
             // posts a message to the parent/opener and closes itself.
             if (req.session.oauthPopup) {
+                const pickupId = req.session.oauthPickupId;
                 delete req.session.oauthPopup;
+                delete req.session.oauthPickupId;
                 req.session.save(); // persist the deletion
+
+                // If the iframe handed us a pickup id, deposit a session token
+                // under it so the iframe (which is in a partitioned cookie
+                // store and never sees our Set-Cookie) can claim it.
+                if (pickupId) {
+                    try {
+                        const { setSessionToken, setPickup, generateToken } = require('../utils/sessionToken');
+                        const userStore = require('../stores/userStore');
+                        const appPasswordData = await userStore.getAppPassword(user.id);
+                        const sessionToken = generateToken();
+                        await setSessionToken(sessionToken, {
+                            user: req.session.user,
+                            accessToken: req.session.accessToken,
+                            appPassword: appPasswordData,
+                            isAuthenticated: true,
+                            isAdmin: req.session.isAdmin || false,
+                        });
+                        await setPickup(pickupId, { sessionToken });
+                        console.log(`[OAuth/${provider}] Pickup ${pickupId} deposited (token len=${sessionToken.length})`);
+                    } catch (pickupErr) {
+                        console.error(`[OAuth/${provider}] Pickup deposit failed:`, pickupErr.message);
+                    }
+                }
+
                 const html = `<!DOCTYPE html><html><head><title>Login Complete</title></head><body>
 <script>
   try {
