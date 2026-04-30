@@ -183,6 +183,8 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
                     total_tokens: data.usage.total_tokens || 0,
                     cached_tokens: data.usage.prompt_tokens_details?.cached_tokens || data.usage.cached_tokens || 0,
                     cache_creation_tokens: data.usage.cache_creation_input_tokens || 0,
+                    reasoning_tokens: data.usage.completion_tokens_details?.reasoning_tokens || 0,
+                    stop_reason: choice?.finish_reason || null,
                     source: isSwarm ? 'swarm_orchestrator' : 'agent_chat',
                     duration_ms: Date.now() - _callStart,
                     organization_id: agent.organization_id || null,

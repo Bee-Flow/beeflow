@@ -73,7 +73,7 @@ function withUser(row, userMap) {
 // Helper: enrich model-level rows with input/output cost split
 function enrichWithCostSplit(rows) {
     return (rows || []).map(row => {
-        const { input_cost, output_cost } = computeCostSplit(row.model, row.prompt_tokens || 0, row.completion_tokens || 0);
+        const { input_cost, output_cost } = computeCostSplit(row.model, row.prompt_tokens || 0, row.completion_tokens || 0, row.cached_tokens || 0, row.cache_creation_tokens || 0);
         return { ...row, input_cost, output_cost };
     });
 }
@@ -86,7 +86,7 @@ router.get('/summary', async (req, res) => {
         const modelData = await usageStore.getUsageByModel(req.usageFilters);
         let total_input_cost = 0, total_output_cost = 0;
         for (const m of (modelData || [])) {
-            const { input_cost, output_cost } = computeCostSplit(m.model, m.prompt_tokens || 0, m.completion_tokens || 0);
+            const { input_cost, output_cost } = computeCostSplit(m.model, m.prompt_tokens || 0, m.completion_tokens || 0, m.cached_tokens || 0, m.cache_creation_tokens || 0);
             total_input_cost += input_cost;
             total_output_cost += output_cost;
         }
@@ -218,6 +218,18 @@ router.get('/by-conversation', async (req, res) => {
     } catch (err) {
         console.error('[Usage API] /by-conversation error:', err.message);
         res.status(500).json({ error: 'Failed to fetch conversation usage' });
+    }
+});
+
+// Per-swarm-run roll-up: tokens + cost grouped by swarm_run_id, with the
+// orchestrator vs. worker split derived from parent_call_id.
+router.get('/by-swarm-run', async (req, res) => {
+    try {
+        const data = await usageStore.getUsageBySwarmRun(req.usageFilters);
+        res.json(data || []);
+    } catch (err) {
+        console.error('[Usage API] /by-swarm-run error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch swarm run usage' });
     }
 });
 

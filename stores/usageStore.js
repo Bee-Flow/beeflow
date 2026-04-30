@@ -23,6 +23,11 @@ async function initDB() {
             total_tokens INTEGER DEFAULT 0,
             cached_tokens INTEGER DEFAULT 0,
             cache_creation_tokens INTEGER DEFAULT 0,
+            reasoning_tokens INTEGER DEFAULT 0,
+            cache_ttl TEXT,
+            stop_reason TEXT,
+            parent_call_id TEXT,
+            swarm_run_id TEXT,
             tool_name TEXT,
             source TEXT DEFAULT 'unknown',
             duration_ms INTEGER DEFAULT 0,
@@ -37,12 +42,29 @@ async function initDB() {
     // a write-and-discard (paid +25%/100% surcharge) apart from a true read
     // (paid -90%). Without the split, dashboards conflate the two.
     try { await exec(`ALTER TABLE ai_usage_log ADD COLUMN IF NOT EXISTS cache_creation_tokens INTEGER DEFAULT 0`); } catch (e) { /* ignore */ }
+    // reasoning_tokens — OpenAI o-series + GPT-5, Gemini thoughtsTokenCount.
+    // Already counted in completion_tokens for billing; tracked separately so
+    // dashboards can show the reasoning vs. visible-output split.
+    try { await exec(`ALTER TABLE ai_usage_log ADD COLUMN IF NOT EXISTS reasoning_tokens INTEGER DEFAULT 0`); } catch (e) { /* ignore */ }
+    // cache_ttl — '5m' or '1h' for Anthropic cache writes. Without the TTL we
+    // can't price cache_creation_tokens correctly (1.25× input vs 2× input).
+    try { await exec(`ALTER TABLE ai_usage_log ADD COLUMN IF NOT EXISTS cache_ttl TEXT`); } catch (e) { /* ignore */ }
+    // stop_reason / finish_reason — distinguishes natural completion from
+    // max_tokens truncation. Truncations often mean replies were cut off.
+    try { await exec(`ALTER TABLE ai_usage_log ADD COLUMN IF NOT EXISTS stop_reason TEXT`); } catch (e) { /* ignore */ }
+    // swarm_run_id / parent_call_id — group orchestrator + sub-agent rows
+    // belonging to a single swarm invocation so per-swarm cost is derivable.
+    try { await exec(`ALTER TABLE ai_usage_log ADD COLUMN IF NOT EXISTS parent_call_id TEXT`); } catch (e) { /* ignore */ }
+    try { await exec(`ALTER TABLE ai_usage_log ADD COLUMN IF NOT EXISTS swarm_run_id TEXT`); } catch (e) { /* ignore */ }
     await exec(`CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON ai_usage_log(timestamp DESC)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_usage_model ON ai_usage_log(model)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_usage_agent ON ai_usage_log(agent_id)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_usage_user ON ai_usage_log(user_id)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_usage_org ON ai_usage_log(organization_id)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_usage_conversation ON ai_usage_log(conversation_id)`);
+    // Swarm aggregation indexes
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_usage_swarm_run ON ai_usage_log(swarm_run_id) WHERE swarm_run_id IS NOT NULL`); } catch (e) { /* ignore */ }
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_usage_parent_call ON ai_usage_log(parent_call_id) WHERE parent_call_id IS NOT NULL`); } catch (e) { /* ignore */ }
     // Phase 2: composite index for the most common dashboard query pattern:
     // filter by org + date range, ordered by most recent first
     await exec(`CREATE INDEX IF NOT EXISTS idx_usage_org_timestamp ON ai_usage_log(organization_id, timestamp DESC)`);
@@ -72,12 +94,18 @@ async function logUsage(entry) {
         const completionTokens = entry.completion_tokens || 0;
         const cachedTokens = entry.cached_tokens || 0;
         const cacheCreationTokens = entry.cache_creation_tokens || 0;
+        const reasoningTokens = entry.reasoning_tokens || 0;
+        const cacheTtl = entry.cache_ttl || null;
+        const stopReason = entry.stop_reason || null;
+        const parentCallId = entry.parent_call_id || null;
+        const swarmRunId = entry.swarm_run_id || null;
         const model = entry.model || 'unknown';
-        // Cache-aware cost: cached input tokens are billed at a provider-specific discount
-        const cost = computeCost(model, promptTokens, completionTokens, cachedTokens);
+        // Cache-aware cost: cached reads at provider discount, cache writes at
+        // TTL-specific premium (Anthropic 1.25× for 5m, 2× for 1h).
+        const cost = computeCost(model, promptTokens, completionTokens, cachedTokens, cacheCreationTokens, cacheTtl);
         await run(`
-            INSERT INTO ai_usage_log (timestamp, user_id, agent_id, agent_name, agent_type, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_creation_tokens, tool_name, source, duration_ms, organization_id, estimated_cost, conversation_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            INSERT INTO ai_usage_log (timestamp, user_id, agent_id, agent_name, agent_type, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_creation_tokens, reasoning_tokens, cache_ttl, stop_reason, parent_call_id, swarm_run_id, tool_name, source, duration_ms, organization_id, estimated_cost, conversation_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
         `, [
             entry.timestamp || now,
             entry.user_id || null,
@@ -90,6 +118,11 @@ async function logUsage(entry) {
             entry.total_tokens || (promptTokens + completionTokens),
             cachedTokens,
             cacheCreationTokens,
+            reasoningTokens,
+            cacheTtl,
+            stopReason,
+            parentCallId,
+            swarmRunId,
             entry.tool_name || null,
             entry.source || 'unknown',
             entry.duration_ms || 0,
@@ -107,10 +140,16 @@ async function logUsage(entry) {
 
 // ============ Queries ============
 
-function buildFilters(filters, startIdx = 1) {
+// Cost-bearing queries pass excludeToolRows=true so per-tool zero-token rows
+// don't inflate call counts or distort cost summaries. The /tools endpoint
+// uses a separate filter (`tool_name IS NOT NULL`) to count those rows.
+function buildFilters(filters, startIdx = 1, excludeToolRows = false) {
     const conditions = [];
     const params = [];
     let idx = startIdx;
+    if (excludeToolRows) {
+        conditions.push(`tool_name IS NULL`);
+    }
     if (filters?.startDate) {
         conditions.push(`timestamp >= $${idx++}`);
         params.push(filters.startDate);
@@ -145,7 +184,7 @@ function buildFilters(filters, startIdx = 1) {
 
 async function getUsageSummary(filters = {}) {
     await initDB();
-    const { where, params } = buildFilters(filters);
+    const { where, params } = buildFilters(filters, 1, true);
     return getOne(`
         SELECT
             COUNT(*) as total_calls,
@@ -154,9 +193,11 @@ async function getUsageSummary(filters = {}) {
             COALESCE(SUM(total_tokens), 0) as total_tokens,
             COALESCE(SUM(cached_tokens), 0) as total_cached_tokens,
             COALESCE(SUM(cache_creation_tokens), 0) as total_cache_creation_tokens,
+            COALESCE(SUM(reasoning_tokens), 0) as total_reasoning_tokens,
             COALESCE(AVG(duration_ms), 0) as avg_duration_ms,
             COUNT(DISTINCT model) as unique_models,
             COUNT(DISTINCT agent_id) as unique_agents,
+            COUNT(DISTINCT user_id) as unique_users,
             COALESCE(SUM(estimated_cost), 0) as total_estimated_cost
         FROM ai_usage_log ${where}
     `, params);
@@ -164,7 +205,7 @@ async function getUsageSummary(filters = {}) {
 
 async function getUsageByModel(filters = {}) {
     await initDB();
-    const { where, params } = buildFilters(filters);
+    const { where, params } = buildFilters(filters, 1, true);
     return getAll(`
         SELECT
             model,
@@ -174,6 +215,7 @@ async function getUsageByModel(filters = {}) {
             COALESCE(SUM(total_tokens), 0) as total_tokens,
             COALESCE(SUM(cached_tokens), 0) as cached_tokens,
             COALESCE(SUM(cache_creation_tokens), 0) as cache_creation_tokens,
+            COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens,
             COALESCE(AVG(duration_ms), 0) as avg_duration_ms,
             COALESCE(SUM(estimated_cost), 0) as estimated_cost
         FROM ai_usage_log ${where}
@@ -184,7 +226,7 @@ async function getUsageByModel(filters = {}) {
 
 async function getUsageByAgent(filters = {}) {
     await initDB();
-    const { where, params } = buildFilters(filters);
+    const { where, params } = buildFilters(filters, 1, true);
     return getAll(`
         SELECT
             agent_id, agent_name, agent_type,
@@ -202,7 +244,7 @@ async function getUsageByAgent(filters = {}) {
 
 async function getUsageTimeline(filters = {}, interval = 'day') {
     await initDB();
-    const { where, params } = buildFilters(filters);
+    const { where, params } = buildFilters(filters, 1, true);
     const groupExpr = interval === 'hour'
         ? "to_char(date_trunc('hour', timestamp), 'YYYY-MM-DD HH24:00')"
         : "to_char(date_trunc('day', timestamp), 'YYYY-MM-DD')";
@@ -289,7 +331,7 @@ async function getRecentCalls(limit = 50, filters = {}) {
 
 async function getCostTimeline(filters = {}, interval = 'day') {
     await initDB();
-    const { where, params } = buildFilters(filters);
+    const { where, params } = buildFilters(filters, 1, true);
     const groupExpr = interval === 'hour'
         ? "to_char(date_trunc('hour', timestamp), 'YYYY-MM-DD HH24:00')"
         : "to_char(date_trunc('day', timestamp), 'YYYY-MM-DD')";
@@ -333,7 +375,7 @@ async function getUsageModels() {
 
 async function getUsageBySource(filters = {}) {
     await initDB();
-    const { where, params } = buildFilters(filters);
+    const { where, params } = buildFilters(filters, 1, true);
     return getAll(`
         SELECT source, COUNT(*) as calls,
             COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
@@ -348,7 +390,7 @@ async function getUsageBySource(filters = {}) {
 
 async function getUsageByUser(filters = {}) {
     await initDB();
-    const { where, params } = buildFilters(filters);
+    const { where, params } = buildFilters(filters, 1, true);
     return getAll(`
         SELECT user_id, COUNT(*) as calls,
             COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
@@ -364,7 +406,7 @@ async function getUsageByUser(filters = {}) {
 
 async function getUsageByConversation(filters = {}) {
     await initDB();
-    const { where, params, nextIdx } = buildFilters(filters);
+    const { where, params, nextIdx } = buildFilters(filters, 1, true);
     const extraWhere = where ? where + ' AND conversation_id IS NOT NULL' : 'WHERE conversation_id IS NOT NULL';
     return getAll(`
         SELECT conversation_id, agent_name, agent_id,
@@ -386,7 +428,7 @@ async function getUsageByConversation(filters = {}) {
 
 async function getUsageByAgentType(filters = {}) {
     await initDB();
-    const { where, params } = buildFilters(filters);
+    const { where, params } = buildFilters(filters, 1, true);
     return getAll(`
         SELECT COALESCE(agent_type, 'chat') as agent_type,
             COUNT(*) as calls,
@@ -399,7 +441,7 @@ async function getUsageByAgentType(filters = {}) {
 
 async function getUsageByModelAndAgent(filters = {}) {
     await initDB();
-    const { where, params } = buildFilters(filters);
+    const { where, params } = buildFilters(filters, 1, true);
     return getAll(`
         SELECT
             model,
@@ -418,7 +460,7 @@ async function getUsageByModelAndAgent(filters = {}) {
 
 async function getUsageByModelAndUser(filters = {}) {
     await initDB();
-    const { where, params } = buildFilters(filters);
+    const { where, params } = buildFilters(filters, 1, true);
     return getAll(`
         SELECT
             model,
@@ -431,6 +473,36 @@ async function getUsageByModelAndUser(filters = {}) {
         FROM ai_usage_log ${where}
         GROUP BY model, user_id
         ORDER BY total_tokens DESC
+    `, params);
+}
+
+// Per-swarm-run roll-up: groups orchestrator + worker rows by swarm_run_id
+// so dashboards can attribute total spend to a single swarm invocation.
+async function getUsageBySwarmRun(filters = {}) {
+    await initDB();
+    const { where, params, nextIdx } = buildFilters(filters, 1, true);
+    const extraWhere = where ? where + ' AND swarm_run_id IS NOT NULL' : 'WHERE swarm_run_id IS NOT NULL';
+    return getAll(`
+        SELECT
+            swarm_run_id,
+            COUNT(*) as phase_count,
+            COUNT(DISTINCT agent_id) as agent_count,
+            COALESCE(SUM(CASE WHEN parent_call_id IS NULL THEN total_tokens ELSE 0 END), 0) as orchestrator_tokens,
+            COALESCE(SUM(CASE WHEN parent_call_id IS NOT NULL THEN total_tokens ELSE 0 END), 0) as worker_tokens,
+            COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
+            COALESCE(SUM(completion_tokens), 0) as completion_tokens,
+            COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens,
+            COALESCE(SUM(cached_tokens), 0) as cached_tokens,
+            COALESCE(SUM(total_tokens), 0) as total_tokens,
+            COALESCE(SUM(estimated_cost), 0) as total_cost,
+            MIN(timestamp) as started_at,
+            MAX(timestamp) as ended_at,
+            STRING_AGG(DISTINCT agent_name, ', ') as agents_used,
+            STRING_AGG(DISTINCT model, ', ') as models_used
+        FROM ai_usage_log ${extraWhere}
+        GROUP BY swarm_run_id
+        ORDER BY ended_at DESC
+        LIMIT 200
     `, params);
 }
 
@@ -451,4 +523,5 @@ module.exports = {
     getUsageByAgentType,
     getUsageByModelAndAgent,
     getUsageByModelAndUser,
+    getUsageBySwarmRun,
 };

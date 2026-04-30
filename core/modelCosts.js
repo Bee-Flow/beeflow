@@ -77,10 +77,8 @@ function getModelCost(modelName) {
 }
 
 /**
- * Get the cache discount multiplier for a model's provider.
+ * Get the cache READ discount multiplier for a model's provider.
  * Cached input tokens are billed at this fraction of the normal input rate.
- * @param {string} model
- * @returns {number} Discount multiplier (e.g. 0.1 = pay 10% of normal rate)
  */
 function getCacheDiscount(model) {
     if (!model) return 1;
@@ -96,21 +94,49 @@ function getCacheDiscount(model) {
 }
 
 /**
- * Compute estimated cost for a single API call.
- * Supports cache-aware pricing — cached input tokens are billed at a discount.
+ * Get the cache WRITE multiplier for a model's provider.
+ * Anthropic charges a premium on cache writes; the premium depends on the TTL
+ * the request asked for (5-min default vs 1-hour extended). OpenAI and Gemini
+ * don't separately bill cache writes, so cache_creation_tokens is effectively
+ * 0 for those providers and this multiplier is irrelevant.
+ *
  * @param {string} model
- * @param {number} promptTokens - Total input tokens (including cached)
- * @param {number} completionTokens - Output tokens
+ * @param {string|null} ttl  — '5m' (or null/falsy default) → 1.25×; '1h' → 2×
+ */
+function getCacheWriteMultiplier(model, ttl) {
+    if (!model) return 1;
+    const m = model.toLowerCase();
+    if (/claude/.test(m)) {
+        return ttl === '1h' ? 2.0 : 1.25;  // 5-min is the default
+    }
+    return 1;
+}
+
+/**
+ * Compute estimated cost for a single API call.
+ * Supports cache-aware pricing — cached input tokens are billed at a read
+ * discount, cache-creation tokens at a TTL-specific write premium.
+ * @param {string} model
+ * @param {number} promptTokens - Total input tokens (including cached + cache-write)
+ * @param {number} completionTokens - Output tokens (includes reasoning, billed at output rate)
  * @param {number} cachedTokens - Input tokens served from cache (subset of promptTokens)
+ * @param {number} cacheCreationTokens - Anthropic cache write tokens (already counted in promptTokens by Anthropic)
+ * @param {string|null} cacheTtl - '5m' or '1h' — only meaningful for Anthropic cache writes
  * @returns {number} cost in USD
  */
-function computeCost(model, promptTokens = 0, completionTokens = 0, cachedTokens = 0) {
+function computeCost(model, promptTokens = 0, completionTokens = 0, cachedTokens = 0, cacheCreationTokens = 0, cacheTtl = null) {
     const rates = getModelCost(model);
     if (!rates) return 0;
-    const uncachedInput = Math.max(0, promptTokens - cachedTokens);
-    const cacheRate = rates.input * getCacheDiscount(model);
+    // Anthropic returns input_tokens NOT including cached_read or cache_creation.
+    // Other providers include cached_tokens IN prompt_tokens. We treat
+    // promptTokens as the canonical "uncached + cached + cache-write" sum and
+    // subtract the cache pieces to get the uncached portion.
+    const uncachedInput = Math.max(0, promptTokens - cachedTokens - cacheCreationTokens);
+    const cacheReadRate = rates.input * getCacheDiscount(model);
+    const cacheWriteRate = rates.input * getCacheWriteMultiplier(model, cacheTtl);
     return ((uncachedInput / 1_000_000) * rates.input)
-         + ((cachedTokens / 1_000_000) * cacheRate)
+         + ((cachedTokens / 1_000_000) * cacheReadRate)
+         + ((cacheCreationTokens / 1_000_000) * cacheWriteRate)
          + ((completionTokens / 1_000_000) * rates.output);
 }
 
@@ -118,13 +144,16 @@ function computeCost(model, promptTokens = 0, completionTokens = 0, cachedTokens
  * Compute estimated cost split into input and output.
  * @returns {{ input_cost: number, output_cost: number }}
  */
-function computeCostSplit(model, promptTokens = 0, completionTokens = 0, cachedTokens = 0) {
+function computeCostSplit(model, promptTokens = 0, completionTokens = 0, cachedTokens = 0, cacheCreationTokens = 0, cacheTtl = null) {
     const rates = getModelCost(model);
     if (!rates) return { input_cost: 0, output_cost: 0 };
-    const uncachedInput = Math.max(0, promptTokens - cachedTokens);
-    const cacheRate = rates.input * getCacheDiscount(model);
+    const uncachedInput = Math.max(0, promptTokens - cachedTokens - cacheCreationTokens);
+    const cacheReadRate = rates.input * getCacheDiscount(model);
+    const cacheWriteRate = rates.input * getCacheWriteMultiplier(model, cacheTtl);
     return {
-        input_cost: ((uncachedInput / 1_000_000) * rates.input) + ((cachedTokens / 1_000_000) * cacheRate),
+        input_cost: ((uncachedInput / 1_000_000) * rates.input)
+                  + ((cachedTokens / 1_000_000) * cacheReadRate)
+                  + ((cacheCreationTokens / 1_000_000) * cacheWriteRate),
         output_cost: (completionTokens / 1_000_000) * rates.output,
     };
 }
@@ -210,6 +239,7 @@ function getModelCostsForConfig(modelEntries = []) {
 module.exports = {
     getModelCost,
     getCacheDiscount,
+    getCacheWriteMultiplier,
     computeCost,
     computeCostSplit,
     getAllModelCosts,

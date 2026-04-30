@@ -19,12 +19,14 @@
  * workers' summaries land in it; the synthesiser reads them all.
  */
 
+const crypto = require('crypto');
 const { mapWithConcurrency } = require('../concurrencyUtil');
 const { resolveModelForTier, getTierConfig } = require('../modelResolver');
 const { getProviderForModel } = require('../aiAgent');
 const { getAdapter } = require('../providers');
 const { buildDirectChatToolStack } = require('../directChatToolStack');
 const { executeTool: dispatchTool } = require('../toolDispatcher');
+const usageStore = require('../../stores/usageStore');
 
 // ─── Built-in registry ───────────────────────────────────────────────────
 
@@ -122,6 +124,9 @@ async function runWorker({
     userId,
     isSynthesiser = false,
     runSnapshot = null,
+    swarmRunId = null,
+    organizationId = null,
+    conversationId = null,
 }) {
     const startedAt = Date.now();
     const workerId = worker.id;
@@ -206,13 +211,16 @@ async function runWorker({
     let collectedToolHistory = [];
     let finalText = '';
     let lastError = null;
+    // Accumulate per-round usage so we log one row per worker stream call.
+    let workerTotalUsage = null;
 
     try {
         outer: for (let round = 0; round < MAX_TOOL_ROUNDS_PER_WORKER; round++) {
             let roundText = '';
             const roundToolCalls = [];
 
-            const streamCallback = (type, data) => {
+            let streamErrorMessage = null;
+            const streamCallback = async (type, data) => {
                 if (type === 'text' && typeof data?.text === 'string') {
                     roundText += data.text;
                     if (runSnapshot?.workers?.[workerId]) {
@@ -224,29 +232,78 @@ async function runWorker({
                         send('swarm_worker_content', { workerId, delta: data.text });
                     }
                 } else if (type === 'tool_use' && data) {
+                    // Providers emit { id, name, input } — `input` is the
+                    // parsed args object. Echo back into OpenAI-shape so
+                    // adapters (incl. the Claude one which converts internally)
+                    // get a consistent assistant tool_calls history.
                     roundToolCalls.push({
                         id: data.id || `call_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
                         type: 'function',
                         function: {
-                            name: data.name || data.function?.name,
-                            arguments: typeof data.arguments === 'string'
-                                ? data.arguments
-                                : JSON.stringify(data.arguments || data.function?.arguments || {}),
+                            name: data.name,
+                            arguments: typeof data.input === 'string'
+                                ? data.input
+                                : JSON.stringify(data.input || {}),
                         },
                     });
+                } else if (type === 'error') {
+                    streamErrorMessage = data?.error || 'Stream error';
+                } else if (type === 'done' && data) {
+                    // Adapters emit final usage on `done`. Log per worker per
+                    // round so swarm dashboards see real token counts (workers
+                    // were previously invisible because the runtime ignored
+                    // this event).
+                    const roundStart = Date.now();
+                    try {
+                        await usageStore.logUsage({
+                            user_id: userId,
+                            agent_id: workerId,
+                            agent_name: worker.name || workerId,
+                            agent_type: 'swarm',
+                            model: model.modelId,
+                            prompt_tokens: data.prompt_tokens || 0,
+                            completion_tokens: data.completion_tokens || 0,
+                            total_tokens: data.total_tokens || 0,
+                            cached_tokens: data.cached_tokens || 0,
+                            cache_creation_tokens: data.cache_creation_tokens || 0,
+                            reasoning_tokens: data.reasoning_tokens || 0,
+                            cache_ttl: data.cache_ttl || null,
+                            stop_reason: data.stop_reason || null,
+                            swarm_run_id: swarmRunId,
+                            parent_call_id: swarmRunId,  // worker's parent is the swarm run itself
+                            source: 'swarm_orchestrator',
+                            organization_id: organizationId,
+                            conversation_id: conversationId,
+                            duration_ms: Date.now() - startedAt,
+                        });
+                    } catch (e) { /* ignore logging errors */ }
+                    // Track totals for snapshot
+                    workerTotalUsage = workerTotalUsage || { prompt: 0, completion: 0, reasoning: 0 };
+                    workerTotalUsage.prompt += data.prompt_tokens || 0;
+                    workerTotalUsage.completion += data.completion_tokens || 0;
+                    workerTotalUsage.reasoning += data.reasoning_tokens || 0;
                 }
-                // We deliberately don't forward `thinking_*` from workers — it
-                // would clutter the worker cards. The synthesiser's reasoning
-                // (when on a thinking-tier model) would surface in its own
-                // streamed text anyway.
+                // thinking_* and image events are intentionally ignored for
+                // workers — the synthesiser's reasoning surfaces in its
+                // streamed text either way.
             };
 
-            await model.adapter.stream(model.apiKey, model.apiUrl, model.modelId, messages, {
-                maxTokens: WORKER_DEFAULT_MAX_TOKENS,
-                temperature: isSynthesiser ? 0.4 : 0.3,
-                tools: workerTools,
-                toolChoice: 'auto',
-            }, streamCallback);
+            try {
+                await model.adapter.stream(model.apiKey, model.apiUrl, model.modelId, messages, {
+                    maxTokens: WORKER_DEFAULT_MAX_TOKENS,
+                    temperature: isSynthesiser ? 0.4 : 0.3,
+                    tools: workerTools.length > 0 ? workerTools : undefined,
+                    toolChoice: workerTools.length > 0 ? 'auto' : undefined,
+                }, streamCallback);
+            } catch (streamErr) {
+                streamErrorMessage = streamErr?.error?.message || streamErr?.message || 'Stream failed';
+            }
+
+            if (streamErrorMessage) {
+                console.error(`[Swarm/${workerId}] stream error round ${round}: ${streamErrorMessage}`);
+                throw new Error(streamErrorMessage);
+            }
+            console.log(`[Swarm/${workerId}] round ${round}: ${roundText.length} text chars, ${roundToolCalls.length} tool calls`);
 
             if (roundToolCalls.length === 0) {
                 // No more tools — this round's text IS the final output. The
@@ -354,6 +411,8 @@ async function runSwarmTurn({
     fallbackModelId,
     userOrgId = null,
     resolvedTier = 'swarm',
+    organizationId = null,
+    conversationId = null,
 }) {
     const entry = loadSwarmById(swarmId);
     if (!entry) {
@@ -367,10 +426,13 @@ async function runSwarmTurn({
         : emptyHiveMind();
 
     const startedAt = Date.now();
+    // Group every worker's usage row under one id so per-swarm spend is queryable.
+    const swarmRunId = crypto.randomUUID();
     send('swarm_started', {
         swarmId: MANIFEST.id,
         swarmName: MANIFEST.name,
         phases: MANIFEST.phases,
+        swarmRunId,
     });
 
     // Live snapshot of the run — mirrors the shape useChatEngine builds
@@ -431,6 +493,9 @@ async function runSwarmTurn({
                 userId,
                 isSynthesiser: !!phase.synthesiser,
                 runSnapshot,
+                swarmRunId,
+                organizationId: organizationId || userOrgId || null,
+                conversationId,
             })
         ));
 

@@ -459,19 +459,33 @@ class ClaudeProvider extends BaseProvider {
                 console.log('[Claude] Final message — stop_reason:', finalMessage.stop_reason,
                     'usage:', JSON.stringify(finalMessage.usage));
                 if (finalMessage.usage) {
+                    const u = finalMessage.usage;
+                    const cacheCreate5m = u.cache_creation?.ephemeral_5m_input_tokens || 0;
+                    const cacheCreate1h = u.cache_creation?.ephemeral_1h_input_tokens || 0;
+                    const cacheCreateTotal = u.cache_creation_input_tokens
+                        || (cacheCreate5m + cacheCreate1h)
+                        || 0;
+                    // When both TTLs were written, attribute the row to the
+                    // dominant TTL so cost stays approximately right. Mixed
+                    // writes are rare in this codebase (only system gets 1h).
+                    let cacheTtl = null;
+                    if (cacheCreate1h > 0 && cacheCreate1h >= cacheCreate5m) cacheTtl = '1h';
+                    else if (cacheCreate5m > 0) cacheTtl = '5m';
+                    else if (cacheCreateTotal > 0) cacheTtl = '1h';  // fallback: extractSystem places a 1h breakpoint
                     streamUsage = {
-                        prompt_tokens: finalMessage.usage.input_tokens || 0,
-                        completion_tokens: finalMessage.usage.output_tokens || 0,
-                        total_tokens: (finalMessage.usage.input_tokens || 0) + (finalMessage.usage.output_tokens || 0),
-                        // Cache metrics — track cache reads and creation for cost optimization
-                        cached_tokens: finalMessage.usage.cache_read_input_tokens || 0,
-                        cache_creation_tokens: finalMessage.usage.cache_creation_input_tokens || 0,
+                        prompt_tokens: u.input_tokens || 0,
+                        completion_tokens: u.output_tokens || 0,
+                        total_tokens: (u.input_tokens || 0) + (u.output_tokens || 0),
+                        cached_tokens: u.cache_read_input_tokens || 0,
+                        cache_creation_tokens: cacheCreateTotal,
+                        cache_ttl: cacheTtl,
+                        stop_reason: finalMessage.stop_reason || null,
                     };
                     if (streamUsage.cached_tokens > 0) {
                         console.log(`[Claude] ⚡ Cache hit: ${streamUsage.cached_tokens} cached input tokens (saved ~${Math.round(streamUsage.cached_tokens * 0.9)} token-equivalents)`);
                     }
                     if (streamUsage.cache_creation_tokens > 0) {
-                        console.log(`[Claude] 📦 Cache created: ${streamUsage.cache_creation_tokens} tokens cached for future requests`);
+                        console.log(`[Claude] 📦 Cache created: ${streamUsage.cache_creation_tokens} tokens (ttl=${streamUsage.cache_ttl}, 5m=${cacheCreate5m}, 1h=${cacheCreate1h})`);
                     }
                 }
             } catch (e) {

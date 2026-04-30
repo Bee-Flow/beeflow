@@ -551,6 +551,7 @@ class GoogleProvider extends BaseProvider {
         let textChunks = 0;
         let thinkingChunks = 0;
         let streamUsage = null;
+        let streamFinishReason = null;
         let thinkingOpen = false;
         const thinkingPartId = 'gemini-0';
 
@@ -560,17 +561,29 @@ class GoogleProvider extends BaseProvider {
             for await (const chunk of response) {
                 // Capture usage metadata (available on chunks, last one has totals)
                 if (chunk.usageMetadata) {
+                    const thoughts = chunk.usageMetadata.thoughtsTokenCount || 0;
+                    const candidates = chunk.usageMetadata.candidatesTokenCount || 0;
                     streamUsage = {
                         prompt_tokens: chunk.usageMetadata.promptTokenCount || 0,
-                        completion_tokens: chunk.usageMetadata.candidatesTokenCount || 0,
+                        // Gemini reports candidatesTokenCount = visible output only.
+                        // thoughts are billed at output rate but not counted in
+                        // candidates, so add them for cost-accurate completion.
+                        completion_tokens: candidates + thoughts,
                         total_tokens: chunk.usageMetadata.totalTokenCount || 0,
                         cached_tokens: chunk.usageMetadata.cachedContentTokenCount || 0,
+                        reasoning_tokens: thoughts,
                     };
                     // Log cache hits for monitoring
                     if (chunk.usageMetadata.cachedContentTokenCount > 0) {
                         console.log(`[Google] ⚡ Cache hit: ${chunk.usageMetadata.cachedContentTokenCount} cached tokens`);
                     }
+                    if (thoughts > 0) {
+                        console.log(`[Google] 🧠 Thinking: ${thoughts} thought tokens (visible: ${candidates})`);
+                    }
                 }
+                // Capture finish reason from final candidate
+                const finishReason = chunk.candidates?.[0]?.finishReason;
+                if (finishReason) streamFinishReason = finishReason;
                 if (chunk.candidates?.[0]?.content?.parts) {
                     for (const part of chunk.candidates[0].content.parts) {
                         if (part.thought && part.text) {
@@ -623,6 +636,10 @@ class GoogleProvider extends BaseProvider {
             onEvent('thinking_stop', { partId: thinkingPartId });
         }
 
+        if (streamFinishReason) {
+            streamUsage = streamUsage || {};
+            streamUsage.stop_reason = streamFinishReason;
+        }
         console.log(`[Google] Stream complete — ${textChunks} text chunks, ${thinkingChunks} thinking chunks`);
         onEvent('done', streamUsage || {});
     }

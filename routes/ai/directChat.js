@@ -179,12 +179,13 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         // Resolve the Swarm tier's configured model (used as a fallback
         // any time a worker's tier doesn't resolve to a specific model).
         let fallbackModelId = null;
+        let userOrgId = null;
         try {
             // Need the user's org for EU-aware resolution. Resolve it cheaply
             // here — we don't need the full Flow tier-resolution dance.
             const userStoreLocal = require('../../stores/userStore');
             const localUser = await userStoreLocal.getUser(userId).catch(() => null);
-            const userOrgId = localUser?.organizationId || null;
+            userOrgId = localUser?.organizationId || null;
             fallbackModelId = await resolveSwarmTierModel('tier:swarm', { userOrgId, userId, fallbackTier: 'fast' });
         } catch (e) {
             console.warn('[DirectChat/Swarm] tier model resolution failed:', e.message);
@@ -227,8 +228,10 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                 session: req.session,
                 isAdmin: !!req.session?.isAdmin,
                 fallbackModelId,
-                userOrgId: null,
+                userOrgId,
                 resolvedTier: 'swarm',
+                organizationId: userOrgId,
+                conversationId: convId || null,
             });
 
             // Persist updated state on the conversation (best-effort; failure

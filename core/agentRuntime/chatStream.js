@@ -1179,6 +1179,11 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         total_tokens: _adapterStreamUsage?.total_tokens || 0,
                         cached_tokens: _adapterStreamUsage?.cached_tokens || 0,
                         cache_creation_tokens: _adapterStreamUsage?.cache_creation_tokens || 0,
+                        reasoning_tokens: _adapterStreamUsage?.reasoning_tokens || 0,
+                        cache_ttl: _adapterStreamUsage?.cache_ttl || null,
+                        stop_reason: _adapterStreamUsage?.stop_reason || null,
+                        parent_call_id: messageMetadata.parentCallId || null,
+                        swarm_run_id: messageMetadata.swarmRunId || null,
                         source: isSwarm ? 'swarm_orchestrator' : 'agent_stream',
                         duration_ms: Date.now() - _streamCallStart,
                         organization_id: agent.organization_id || null,
@@ -1256,6 +1261,11 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 const reader = response.body.getReader();
                 const decoder = new TextDecoder();
                 let buffer = '';
+                // Buffer the latest usage frame and finish_reason; log once after the stream ends.
+                // Logging inside the loop caused duplicate rows whenever a server emitted more
+                // than one usage frame (and was racy with the inner async path).
+                let _sseStreamUsage = null;
+                let _sseFinishReason = null;
 
 
                 while (true) {
@@ -1274,25 +1284,12 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                             try {
                                 const parsed = JSON.parse(data);
 
-                                // Capture usage from final streaming chunk
+                                // Buffer the latest usage frame — log once after stream completes.
                                 if (parsed.usage) {
-                                    await usageStore.logUsage({
-                                        user_id: userId,
-                                        agent_id: agentId,
-                                        agent_name: agent.name,
-                                        agent_type: isSwarm ? 'swarm' : 'chat',
-                                        model: modelToUse,
-                                        prompt_tokens: parsed.usage.prompt_tokens || 0,
-                                        completion_tokens: parsed.usage.completion_tokens || 0,
-                                        total_tokens: parsed.usage.total_tokens || 0,
-                                        cached_tokens: parsed.usage.prompt_tokens_details?.cached_tokens || parsed.usage.cached_tokens || 0,
-                                        cache_creation_tokens: parsed.usage.cache_creation_input_tokens || 0,
-                                        source: isSwarm ? 'swarm_orchestrator' : 'agent_stream',
-                                        duration_ms: Date.now() - _streamCallStart,
-                                        organization_id: agent.organization_id || null,
-                                        conversation_id: conversation?.id || null
-                                    });
+                                    _sseStreamUsage = parsed.usage;
                                 }
+                                const fr = parsed.choices?.[0]?.finish_reason;
+                                if (fr) _sseFinishReason = fr;
 
                                 const delta = parsed.choices?.[0]?.delta;
 
@@ -1374,6 +1371,34 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                             }
                         }
                     }
+                }
+
+                // Log usage once after the SSE stream finishes. Buffering inside
+                // the loop and writing here avoids duplicate rows when servers
+                // emit multiple usage frames or when [DONE] races the last frame.
+                if (_sseStreamUsage) {
+                    try {
+                        await usageStore.logUsage({
+                            user_id: userId,
+                            agent_id: agentId,
+                            agent_name: agent.name,
+                            agent_type: isSwarm ? 'swarm' : 'chat',
+                            model: modelToUse,
+                            prompt_tokens: _sseStreamUsage.prompt_tokens || 0,
+                            completion_tokens: _sseStreamUsage.completion_tokens || 0,
+                            total_tokens: _sseStreamUsage.total_tokens || 0,
+                            cached_tokens: _sseStreamUsage.prompt_tokens_details?.cached_tokens || _sseStreamUsage.cached_tokens || 0,
+                            cache_creation_tokens: _sseStreamUsage.cache_creation_input_tokens || 0,
+                            reasoning_tokens: _sseStreamUsage.completion_tokens_details?.reasoning_tokens || 0,
+                            stop_reason: _sseFinishReason,
+                            parent_call_id: messageMetadata.parentCallId || null,
+                            swarm_run_id: messageMetadata.swarmRunId || null,
+                            source: isSwarm ? 'swarm_orchestrator' : 'agent_stream',
+                            duration_ms: Date.now() - _streamCallStart,
+                            organization_id: agent.organization_id || null,
+                            conversation_id: conversation?.id || null
+                        });
+                    } catch (e) { /* ignore usage errors */ }
                 }
             } // end else (raw fetch SSE)
 
@@ -1730,7 +1755,11 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         _audioFiles.push({ url: finalToolResult.audioUrl, source: toolName });
                     }
 
-                    // Log tool usage
+                    // Log tool invocation for the per-tool dashboard. These rows
+                    // intentionally carry zero token counts — tool execution
+                    // doesn't consume model tokens. Cost-bearing queries
+                    // (summary, by-model, by-source) filter `tool_name IS NULL`
+                    // so these rows don't inflate call count or distort cost.
                     try {
                         await usageStore.logUsage({
                             user_id: userId,
@@ -1742,6 +1771,8 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                             source: isSwarm ? 'swarm_orchestrator' : 'agent_chat',
                             organization_id: agent.organization_id || null,
                             conversation_id: conversation?.id || null,
+                            parent_call_id: messageMetadata.parentCallId || null,
+                            swarm_run_id: messageMetadata.swarmRunId || null,
                         });
                     } catch (e) { /* ignore */ }
 

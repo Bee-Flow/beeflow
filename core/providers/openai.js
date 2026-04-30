@@ -279,6 +279,7 @@ class OpenAIProvider extends BaseProvider {
         // Accumulate tool calls across streaming chunks
         const toolCallAccumulator = {};
         let streamUsage = null;
+        let streamFinishReason = null;
 
         for await (const chunk of stream) {
             // Capture usage from final chunk
@@ -289,9 +290,15 @@ class OpenAIProvider extends BaseProvider {
                     total_tokens: chunk.usage.total_tokens || 0,
                     // OpenAI automatic prompt caching — track cache hits
                     cached_tokens: chunk.usage.prompt_tokens_details?.cached_tokens || 0,
+                    // GPT-5 / o-series reasoning tokens are billed as output
+                    // but reported separately so dashboards can split them.
+                    reasoning_tokens: chunk.usage.completion_tokens_details?.reasoning_tokens || 0,
                 };
                 if (streamUsage.cached_tokens > 0) {
                     console.log(`[OpenAI] ⚡ Cache hit: ${streamUsage.cached_tokens} cached prompt tokens`);
+                }
+                if (streamUsage.reasoning_tokens > 0) {
+                    console.log(`[OpenAI] 🧠 Reasoning: ${streamUsage.reasoning_tokens} tokens (of ${streamUsage.completion_tokens} output)`);
                 }
             }
             const delta = chunk.choices?.[0]?.delta;
@@ -316,6 +323,7 @@ class OpenAIProvider extends BaseProvider {
             }
             // Check for finish_reason to emit accumulated tool calls
             const finishReason = chunk.choices?.[0]?.finish_reason;
+            if (finishReason) streamFinishReason = finishReason;
             if (finishReason === 'tool_calls' || finishReason === 'stop') {
                 for (const [, tc] of Object.entries(toolCallAccumulator)) {
                     if (tc.name) {
@@ -332,6 +340,10 @@ class OpenAIProvider extends BaseProvider {
             }
         }
 
+        if (streamFinishReason) {
+            streamUsage = streamUsage || {};
+            streamUsage.stop_reason = streamFinishReason;
+        }
         onEvent('done', streamUsage || {});
     }
 
@@ -445,15 +457,23 @@ class OpenAIProvider extends BaseProvider {
                         total_tokens: (usage.input_tokens || 0) + (usage.output_tokens || 0),
                         // Responses API: cache hits are in input_tokens_details
                         cached_tokens: usage.input_tokens_details?.cached_tokens || 0,
+                        // o-series / GPT-5 reasoning tokens (billed at output rate)
+                        reasoning_tokens: usage.output_tokens_details?.reasoning_tokens || 0,
                     };
                     if (streamUsage.cached_tokens > 0) {
                         console.log(`[OpenAI] ⚡ Responses API cache hit: ${streamUsage.cached_tokens} cached tokens`);
                     }
+                    if (streamUsage.reasoning_tokens > 0) {
+                        console.log(`[OpenAI] 🧠 Responses reasoning: ${streamUsage.reasoning_tokens} tokens (of ${streamUsage.completion_tokens} output)`);
+                    }
                 }
-                // Capture response ID for chaining
-                if (event.response?.id) {
-                    streamUsage = streamUsage || {};
-                    streamUsage.responseId = event.response.id;
+                // Capture response ID + completion status for chaining/logging
+                streamUsage = streamUsage || {};
+                if (event.response?.id) streamUsage.responseId = event.response.id;
+                if (event.response?.status) streamUsage.stop_reason = event.response.status;
+                if (event.response?.incomplete_details?.reason) {
+                    // e.g. 'max_output_tokens' — surface this so truncations are visible
+                    streamUsage.stop_reason = event.response.incomplete_details.reason;
                 }
             }
         }
