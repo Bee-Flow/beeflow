@@ -39,6 +39,7 @@ const { isMsCalendarTool, executeMsCalendarTool } = require('../integrations/msC
 const { isOneDriveTool, executeOneDriveTool } = require('../integrations/oneDriveTools');
 const { isMsContactsTool, executeMsContactsTool } = require('../integrations/msContactsTools');
 const { isTranscriptionTool, executeTranscriptionTool } = require('../integrations/transcriptionTools');
+const { isNextcloudTool, executeNextcloudTool } = require('../integrations/nextcloudTools');
 
 /**
  * Execute a tool by name.
@@ -345,6 +346,9 @@ async function executeTool(toolName, toolArgs, context = {}) {
     }
     if (isGitHubTool(toolName)) {
         return await executeGitHubTool(toolName, toolArgs, userId);
+    }
+    if (isNextcloudTool(toolName)) {
+        return await executeNextcloudTool(toolName, toolArgs, userId);
     }
     if (isOutlookTool(toolName)) {
         return await executeOutlookTool(toolName, toolArgs, session);

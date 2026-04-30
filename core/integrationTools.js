@@ -38,6 +38,7 @@ const { MS_CALENDAR_TOOLS } = require('../integrations/msCalendarTools');
 const { ONEDRIVE_TOOLS } = require('../integrations/oneDriveTools');
 const { MS_CONTACTS_TOOLS } = require('../integrations/msContactsTools');
 const { TRANSCRIPTION_TOOLS } = require('../integrations/transcriptionTools');
+const { NEXTCLOUD_TOOLS } = require('../integrations/nextcloudTools');
 
 // IDs that are exempt from org-level gating (admin-only tools, internal utilities)
 const ORG_EXEMPT_APPS = ['workspace', 'regex-gen'];
@@ -257,6 +258,18 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
     if (hasGitHub && isAppOn('github')) {
         addTools(GITHUB_TOOLS);
     }
+
+    // Nextcloud — requires global Nextcloud URL + per-user app password
+    try {
+        const oauthCfg = (await configStore.getConfig('oauth')) || {};
+        if (oauthCfg.nextcloudUrl) {
+            const userStoreLocal = require('../stores/userStore');
+            const ncCreds = await userStoreLocal.getAppPassword(userId);
+            if (ncCreds?.username && ncCreds?.password && isAppOn('nextcloud')) {
+                addTools(NEXTCLOUD_TOOLS);
+            }
+        }
+    } catch (e) { /* ignore — credentials missing or store unavailable */ }
 
     // Transcription — requires existing Mistral API key
     const hasMistralKey = !!(await configStore.getSecret('mistral_api_key'));
