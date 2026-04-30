@@ -41,7 +41,8 @@ async function n8nApiFetch(orgId, path, options = {}) {
 
     if (!res.ok) {
         const errText = await res.text().catch(() => '');
-        throw new Error(`n8n API error (${res.status}): ${errText.slice(0, 300)}`);
+        const cap = res.status >= 400 && res.status < 500 ? 1500 : 300;
+        throw new Error(`n8n API error (${res.status}): ${errText.slice(0, cap)}`);
     }
 
     // Some endpoints (activate/deactivate) return 204 No Content
@@ -111,7 +112,7 @@ const N8N_WORKFLOW_TOOLS = [
         type: 'function',
         function: {
             name: 'n8n_workflow_create',
-            description: 'Create a new workflow. `nodes` MUST be a real JSON array; `connections` MUST be a real JSON object. Never pass stringified JSON. Do not wrap in an extra "workflow" key.',
+            description: 'Create a new workflow. `nodes` MUST be a real JSON array; `connections` MUST be a real JSON object. Never pass stringified JSON. Do not wrap in an extra "workflow" key. Do NOT include `id`, `active`, `tags`, `pinData`, `versionId`, `meta`, `createdAt`, or `updatedAt` in the body — those are read-only on n8n\'s public API and the request will 400. Activation is handled via the `active` parameter on this tool (server makes a separate /activate call after create).',
             parameters: {
                 type: 'object',
                 properties: {
@@ -123,7 +124,7 @@ const N8N_WORKFLOW_TOOLS = [
                     },
                     connections: { type: 'object', description: 'Keyed by source node name. connections[src][outputType][outputIndex] = [{ node, type, index }, ...].' },
                     settings: { type: 'object', description: 'Optional, e.g. { "executionOrder": "v1" }.' },
-                    active: { type: 'boolean', description: 'Whether to activate the workflow immediately (default: false)' },
+                    active: { type: 'boolean', description: 'If true, the server activates the workflow after creation via a separate POST /workflows/{id}/activate call (default: false).' },
                 },
                 required: ['name', 'nodes', 'connections'],
             },
@@ -697,10 +698,37 @@ async function executeN8nWorkflowTool(toolName, args, orgId) {
                     return { error: 'connections must be a JSON object' };
                 }
                 assertConnectionsIntegrity(nodes, connections);
-                const body = { name, nodes, connections, active: !!active };
-                if (settings) body.settings = settings;
-                const created = await n8nApiFetch(orgId, '/workflows', { method: 'POST', body: JSON.stringify(body) });
-                return { success: true, message: `Workflow "${created.name}" created.`, ...summarizeWorkflow(created) };
+
+                // n8n's POST /workflows rejects `active`, `tags`, `id`, `pinData`, etc.
+                // Reuse the same hygiene as PUT: stripReadOnly drops forbidden top-level
+                // keys and filters settings to n8n's accepted whitelist.
+                const body = stripReadOnly({
+                    name,
+                    nodes,
+                    connections,
+                    settings: settings || {},
+                });
+
+                const created = await n8nApiFetch(orgId, '/workflows', {
+                    method: 'POST',
+                    body: JSON.stringify(body),
+                });
+
+                // Activation is a separate endpoint on the public API.
+                if (active) {
+                    try {
+                        await n8nApiFetch(orgId, `/workflows/${encodeURIComponent(created.id)}/activate`, { method: 'POST' });
+                        created.active = true;
+                    } catch (e) {
+                        return {
+                            success: true,
+                            message: `Workflow "${created.name}" created but activation failed: ${e.message}`,
+                            ...summarizeWorkflow(created),
+                        };
+                    }
+                }
+
+                return { success: true, message: `Workflow "${created.name}" created${active ? ' and activated' : ''}.`, ...summarizeWorkflow(created) };
             }
 
             // ── Full Update (PUT) ───────────────────────────────
