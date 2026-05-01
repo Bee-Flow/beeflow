@@ -88,6 +88,10 @@ const COMMON_GENERATION_PROPERTIES = {
             }
         }
     },
+    enablePublicEmbed: {
+        type: 'boolean',
+        description: 'Whether to make the generated Gamma externally viewable so it can be embedded in Bee Flow. Default: true. Set false only when the Gamma must remain private.'
+    },
     exportAs: {
         type: 'string',
         enum: ['pdf', 'pptx', 'png'],
@@ -465,6 +469,12 @@ function buildCardOptions(args) {
     });
 }
 
+function buildSharingOptions(args) {
+    if (args.sharingOptions) return args.sharingOptions;
+    if (args.enablePublicEmbed === false) return undefined;
+    return { externalAccess: 'view' };
+}
+
 function buildCreateBody(args) {
     const body = compactObject({
         inputText: args.inputText,
@@ -477,7 +487,7 @@ function buildCreateBody(args) {
         textOptions: buildTextOptions(args),
         imageOptions: buildImageOptions(args),
         cardOptions: buildCardOptions(args),
-        sharingOptions: args.sharingOptions,
+        sharingOptions: buildSharingOptions(args),
         folderIds: args.folderIds,
         exportAs: args.exportAs,
     });
@@ -490,7 +500,7 @@ function buildTemplateBody(args) {
         gammaId: args.gammaId,
         themeId: args.themeId,
         imageOptions: buildImageOptions(args),
-        sharingOptions: args.sharingOptions,
+        sharingOptions: buildSharingOptions(args),
         folderIds: args.folderIds,
         exportAs: args.exportAs,
     });
@@ -517,7 +527,7 @@ function buildRevisionBody(args) {
         textOptions: compactObject({ language: args.language || 'en' }),
         imageOptions: buildImageOptions(args),
         cardOptions: buildCardOptions(args),
-        sharingOptions: args.sharingOptions,
+        sharingOptions: buildSharingOptions(args),
         folderIds: args.folderIds,
         exportAs: args.exportAs,
     });
