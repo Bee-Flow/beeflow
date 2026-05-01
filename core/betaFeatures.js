@@ -172,7 +172,7 @@ async function userHasBetaFeature(userId, featureId, session = null) {
  */
 function requireBetaFeature(featureId) {
     return async (req, res, next) => {
-        if (!req.session.isAuthenticated) {
+        if (!req.session?.user) {
             return res.status(401).json({ error: 'Not authenticated' });
         }
         const userId = req.session.user?.id;

@@ -30,6 +30,7 @@ const {
 } = require('../../core/sessionSkillRuntime');
 const { resolveModelForTier } = require('../../core/modelResolver');
 const { WORKSPACE_TOOLS } = require('../../integrations/workspaceTools');
+const { BUILDER_TOOLS, isBuilderTool, executeBuilderTool } = require('../../integrations/webpageBuilderTools');
 const guardrailEventStore = require('../../stores/guardrailEventStore');
 const { buildTokenPreservationAddendum } = require('../../core/dlp/tokenPreservationPrompt');
 
@@ -87,8 +88,13 @@ Use for interactive charts (bar, line, scatter, heatmap, etc). Provide a complet
 {"$schema":"https://vega.github.io/schema/vega-lite/v5.json","data":{"values":[{"x":"A","y":28},{"x":"B","y":55}]},"mark":"bar","encoding":{"x":{"field":"x"},"y":{"field":"y","type":"quantitative"}}}
 \`\`\`
 
-### Interactive Mini-Apps — \`\`\`html-app
-Use for calculators, interactive demos, visualizations, games, or any self-contained HTML+CSS+JS app. Write a SINGLE complete HTML document (with inline <style> and <script> tags). It renders in a sandboxed iframe. Use dark themes to match the platform (#0a0a1a background, #fff text). Do NOT use external scripts or imports. Example use cases: unit converters, mortgage calculators, interactive timers, drawing tools, physics simulations.
+### Interactive Webpages — call create_webpage + webpage_file_write
+Use for calculators, interactive demos, visualizations, games, landing pages, or any self-contained HTML+CSS+JS thing. The flow:
+  1. Call create_webpage({ name: "<short title>" }) — returns { webpageId, url }.
+  2. Call webpage_file_write({ webpageId, file: "html", content: "<full HTML>" }) — and the same for "css" and (if needed) "js".
+  3. End your reply with: "I built it: [<title>](<url>)" — the user can click to open the editor and refine it further.
+Vanilla HTML/CSS/JS only. CDN <script> tags inside the HTML are fine. Do NOT depend on parent-page cookies, localStorage, or fetches to the host app — the preview iframe is sandboxed with allow-scripts only.
+DO NOT emit \`\`\`html-app\`\`\` code blocks — they no longer render. Always use create_webpage + webpage_file_write instead.
 
 ### Quotes / Proposals — \`\`\`quote
 Use for professional business quotes, proposals, or offer documents. Provide a JSON object with:
@@ -596,6 +602,21 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                     directChatTools.push(wsTool);
                 }
             }
+        }
+
+        // ─── Built-in: webpage builder tools (gated on webpages beta) ─
+        try {
+            const { userHasBetaFeature: userHasWebpagesBetaForBuilder } = require('../../core/betaFeatures');
+            if (await userHasWebpagesBetaForBuilder(userId, 'webpages', req.session)) {
+                for (const tool of BUILDER_TOOLS) {
+                    if (!directChatTools.find(t => t.function.name === tool.function.name)) {
+                        directChatTools.push(tool);
+                    }
+                }
+                console.log('[DirectChat] Webpage builder tools enabled for user');
+            }
+        } catch (builderErr) {
+            console.warn('[DirectChat] Failed to check webpages beta for builder tools:', builderErr.message);
         }
 
         // Filter out user-disabled media tools
@@ -2322,34 +2343,43 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                                     }
                                 }
                             }
-                            toolResult = await dispatchTool(toolName, toolArgs, {
-                                userId,
-                                session: req.session,
-                                userAuth,
-                                fixedParams: tierOverrides,
-                                agentId: null,
-                                conversationId: convId,
-                                orgId: n8nOrgId,
-                                send,
-                                imageGenSettings,
-                                nanoBananaSettings,
-                                req,
-                                attachments,
-                                sessionSkills,
-                                activatedSessionSkillIds,
-                                completedSessionSkillIds,
-                                roundsInCurrentStep,
-                                timezone: timezone || 'Europe/Amsterdam',
-                                onImageGenerated: (data) => generatedImages.push(data),
-                                terminalCtx: {
-                                    agentId: `user-${userId}`,
-                                    containerKey: `direct-${convId}`,
-                                    timeout: 60000,
-                                    blockedCommands: [],
-                                    onEvent: (type, data) => { send(type, data); },
-                                    signal: undefined
-                                },
-                            });
+                            if (isBuilderTool(toolName)) {
+                                const builderOut = await executeBuilderTool(toolName, toolArgs, { userId });
+                                toolResult = builderOut.result;
+                                if (builderOut.webpageUpdate) {
+                                    const { webpageId, file, content, title } = builderOut.webpageUpdate;
+                                    send('webpage_doc_update', { webpageId, file, content, title });
+                                }
+                            } else {
+                                toolResult = await dispatchTool(toolName, toolArgs, {
+                                    userId,
+                                    session: req.session,
+                                    userAuth,
+                                    fixedParams: tierOverrides,
+                                    agentId: null,
+                                    conversationId: convId,
+                                    orgId: n8nOrgId,
+                                    send,
+                                    imageGenSettings,
+                                    nanoBananaSettings,
+                                    req,
+                                    attachments,
+                                    sessionSkills,
+                                    activatedSessionSkillIds,
+                                    completedSessionSkillIds,
+                                    roundsInCurrentStep,
+                                    timezone: timezone || 'Europe/Amsterdam',
+                                    onImageGenerated: (data) => generatedImages.push(data),
+                                    terminalCtx: {
+                                        agentId: `user-${userId}`,
+                                        containerKey: `direct-${convId}`,
+                                        timeout: 60000,
+                                        blockedCommands: [],
+                                        onEvent: (type, data) => { send(type, data); },
+                                        signal: undefined
+                                    },
+                                });
+                            }
                         } catch (err) {
                             console.error(`[DirectChat] Tool execution failed for ${toolName}:`, err);
                             toolResult = { error: err.message };
@@ -2905,34 +2935,43 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                             }
                         }
                     }
-                    toolResult = await dispatchTool(toolName, toolArgs, {
-                        userId,
-                        session: req.session,
-                        userAuth,
-                        fixedParams: tierOverrides,
-                        agentId: null,
-                        conversationId: convId,
-                        orgId: n8nOrgId,
-                        send,
-                        imageGenSettings,
-                        nanoBananaSettings,
-                        req,
-                        attachments,
-                        sessionSkills,
-                        activatedSessionSkillIds,
-                        completedSessionSkillIds,
-                        roundsInCurrentStep,
-                        timezone: timezone || 'Europe/Amsterdam',
-                        onImageGenerated: (data) => generatedImages.push(data),
-                        terminalCtx: {
-                            agentId: `user-${userId}`,
-                            containerKey: `direct-${convId}`,
-                            timeout: 60000,
-                            blockedCommands: [],
-                            onEvent: (type, data) => { send(type, data); },
-                            signal: undefined
-                        },
-                    });
+                    if (isBuilderTool(toolName)) {
+                        const builderOut = await executeBuilderTool(toolName, toolArgs, { userId });
+                        toolResult = builderOut.result;
+                        if (builderOut.webpageUpdate) {
+                            const { webpageId, file, content, title } = builderOut.webpageUpdate;
+                            send('webpage_doc_update', { webpageId, file, content, title });
+                        }
+                    } else {
+                        toolResult = await dispatchTool(toolName, toolArgs, {
+                            userId,
+                            session: req.session,
+                            userAuth,
+                            fixedParams: tierOverrides,
+                            agentId: null,
+                            conversationId: convId,
+                            orgId: n8nOrgId,
+                            send,
+                            imageGenSettings,
+                            nanoBananaSettings,
+                            req,
+                            attachments,
+                            sessionSkills,
+                            activatedSessionSkillIds,
+                            completedSessionSkillIds,
+                            roundsInCurrentStep,
+                            timezone: timezone || 'Europe/Amsterdam',
+                            onImageGenerated: (data) => generatedImages.push(data),
+                            terminalCtx: {
+                                agentId: `user-${userId}`,
+                                containerKey: `direct-${convId}`,
+                                timeout: 60000,
+                                blockedCommands: [],
+                                onEvent: (type, data) => { send(type, data); },
+                                signal: undefined
+                            },
+                        });
+                    }
                 } catch (err) {
                     console.error(`[DirectChat] Streamed tool execution failed for ${toolName}:`, err);
                     toolResult = { error: err.message };
