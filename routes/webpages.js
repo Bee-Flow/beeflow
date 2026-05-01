@@ -82,12 +82,13 @@ router.get('/:id', requireAuth, async (req, res) => {
 
         await webpageStore.timeoutStuckSources(webpage.id).catch(() => {});
 
-        const [sources, files, chatMessages] = await Promise.all([
+        const [sources, files, chatMessages, extraFiles] = await Promise.all([
             webpageStore.getSources(webpage.id),
             webpageStore.readAllSlots(userId, webpage.id),
             webpageStore.getChatMessages(webpage.id, userId),
+            webpageStore.listExtraFiles(webpage.id),
         ]);
-        res.json({ webpage, sources, files, chatMessages });
+        res.json({ webpage, sources, files, chatMessages, extraFiles });
     } catch (err) {
         console.error('[Webpages] Get failed:', err);
         res.status(500).json({ error: 'Failed to get webpage' });
@@ -156,6 +157,32 @@ router.put('/:id', requireAuth, async (req, res) => {
     } catch (err) {
         console.error('[Webpages] Update failed:', err);
         res.status(500).json({ error: 'Failed to update webpage: ' + err.message });
+    }
+});
+
+// ── Extra files (multi-file projects) ────────────────────────────────
+// Read content of one extra file. Used by the frontend to fetch the bytes
+// for the live preview and the file-explorer detail view.
+router.get('/:id/files', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const wp = await webpageStore.getWebpage(req.params.id, userId);
+        if (!wp) return res.status(404).json({ error: 'Webpage not found' });
+        const path = req.query.path;
+        if (!path) {
+            const list = await webpageStore.listExtraFiles(req.params.id);
+            return res.json({ files: list });
+        }
+        const file = await webpageStore.readExtraFile({ webpageId: req.params.id, userId, path });
+        if (!file) return res.status(404).json({ error: 'File not found' });
+        if (file.meta.isText) {
+            return res.json({ meta: file.meta, content: file.text });
+        }
+        // Binary: return base64 so the frontend can build a data URL.
+        return res.json({ meta: file.meta, contentBase64: file.bytes.toString('base64') });
+    } catch (err) {
+        console.error('[Webpages] Get extra file failed:', err);
+        res.status(500).json({ error: 'Failed to get file' });
     }
 });
 

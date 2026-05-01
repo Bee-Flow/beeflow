@@ -93,6 +93,24 @@ async function initDB() {
         await exec(`ALTER TABLE webpages ADD COLUMN IF NOT EXISTS chat_messages JSONB DEFAULT '[]'::jsonb`);
     } catch (_) { /* column already exists or table doesn't yet — fine */ }
 
+    // Multi-file support — arbitrary additional files under a webpage.
+    // The three primary slots (index.html / style.css / script.js) keep their
+    // dedicated columns and RustFS keys; this table stores everything else.
+    await exec(`
+        CREATE TABLE IF NOT EXISTS webpage_extra_files (
+            id TEXT PRIMARY KEY,
+            webpage_id TEXT NOT NULL REFERENCES webpages(id) ON DELETE CASCADE,
+            path TEXT NOT NULL,
+            mime_type TEXT NOT NULL DEFAULT 'text/plain',
+            is_text BOOLEAN NOT NULL DEFAULT TRUE,
+            sha256 TEXT NOT NULL DEFAULT '',
+            size INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_webpage_extra_path ON webpage_extra_files(webpage_id, path);
+    `);
+
     initialized = true;
     console.log('[WebpageStore] PostgreSQL initialized');
 }
@@ -170,6 +188,197 @@ async function copySlotToVersion(userId, webpageId, versionId, slot) {
         if (err?.name === 'NoSuchKey' || err?.$metadata?.httpStatusCode === 404) return;
         throw err;
     }
+}
+
+// ── Extra-files (multi-file) RustFS helpers ────────────────────────
+//
+// Extra files live at `users/{userId}/webpages/{webpageId}/extras/{path}`.
+// The path is the user-facing relative path (e.g. "components/header.html",
+// "assets/logo.svg"). RustFS S3 supports slashes in keys natively.
+
+const TEXT_MIME_PREFIXES = ['text/', 'application/javascript', 'application/json', 'application/xml', 'image/svg+xml'];
+const TEXT_EXTENSIONS = new Set(['html', 'htm', 'css', 'js', 'mjs', 'json', 'txt', 'md', 'svg', 'xml', 'csv', 'tsv', 'yaml', 'yml']);
+
+function isTextFile(mime, ext) {
+    if (mime && TEXT_MIME_PREFIXES.some(p => mime.startsWith(p))) return true;
+    if (ext && TEXT_EXTENSIONS.has(ext.toLowerCase())) return true;
+    return false;
+}
+
+function guessMime(path) {
+    const ext = (path.split('.').pop() || '').toLowerCase();
+    const map = {
+        html: 'text/html; charset=utf-8',
+        htm: 'text/html; charset=utf-8',
+        css: 'text/css; charset=utf-8',
+        js: 'application/javascript; charset=utf-8',
+        mjs: 'application/javascript; charset=utf-8',
+        json: 'application/json; charset=utf-8',
+        txt: 'text/plain; charset=utf-8',
+        md: 'text/markdown; charset=utf-8',
+        svg: 'image/svg+xml; charset=utf-8',
+        xml: 'application/xml; charset=utf-8',
+        csv: 'text/csv; charset=utf-8',
+        png: 'image/png',
+        jpg: 'image/jpeg',
+        jpeg: 'image/jpeg',
+        gif: 'image/gif',
+        webp: 'image/webp',
+        ico: 'image/x-icon',
+        woff: 'font/woff',
+        woff2: 'font/woff2',
+        ttf: 'font/ttf',
+        otf: 'font/otf',
+        mp3: 'audio/mpeg',
+        mp4: 'video/mp4',
+        webm: 'video/webm',
+        pdf: 'application/pdf',
+    };
+    return { mime: map[ext] || 'application/octet-stream', ext };
+}
+
+/**
+ * Path validation: allow nested folders, reject path traversal, leading /,
+ * empty segments, or anything weird. Reserved names are blocked because
+ * they collide with the primary slots' filenames.
+ */
+const RESERVED_PATHS = new Set(['index.html', 'style.css', 'script.js']);
+function validateExtraPath(path) {
+    if (typeof path !== 'string' || !path.trim()) return 'path is required';
+    if (path.length > 240) return 'path is too long';
+    if (path.startsWith('/') || path.startsWith('\\')) return 'path must be relative (no leading slash)';
+    if (path.includes('..')) return 'path may not contain ".."';
+    if (/^\s|\s$/.test(path)) return 'path may not start or end with whitespace';
+    const segs = path.split('/').filter(Boolean);
+    if (segs.length === 0) return 'path is empty';
+    for (const s of segs) {
+        if (!s || s === '.' || s === '..') return `invalid path segment "${s}"`;
+        if (!/^[A-Za-z0-9_.\- @]+$/.test(s)) return `path segment "${s}" contains unsupported characters`;
+    }
+    if (RESERVED_PATHS.has(path)) return `"${path}" is a primary slot — use webpage_file_write({file:"${path === 'index.html' ? 'html' : path === 'style.css' ? 'css' : 'js'}", ...}) instead`;
+    return null;
+}
+
+function extraKey(userId, webpageId, path) {
+    return `users/${userId}/webpages/${webpageId}/extras/${path}`;
+}
+
+async function readExtra(userId, webpageId, path) {
+    if (!storageStore.isAvailable()) return null;
+    try {
+        const { stream } = await storageStore.streamFile(extraKey(userId, webpageId, path));
+        const chunks = [];
+        for await (const chunk of stream) chunks.push(chunk);
+        return Buffer.concat(chunks);
+    } catch (err) {
+        if (err?.name === 'NoSuchKey' || err?.$metadata?.httpStatusCode === 404) return null;
+        throw err;
+    }
+}
+
+async function writeExtra(userId, webpageId, path, content, mimeType) {
+    if (!storageStore.isAvailable()) {
+        throw new Error('RustFS not configured — cannot persist extra files');
+    }
+    const buf = Buffer.isBuffer(content) ? content : Buffer.from(String(content), 'utf8');
+    await storageStore.uploadFile(extraKey(userId, webpageId, path), buf, mimeType);
+    return { sha: sha256(buf.toString('utf8')), size: buf.length };
+}
+
+async function deleteExtra(userId, webpageId, path) {
+    if (!storageStore.isAvailable()) return;
+    try { await storageStore.deleteFile(extraKey(userId, webpageId, path)); } catch (_) { /* ignore */ }
+}
+
+// ── Extra-files DB CRUD ───────────────────────────────────────────
+
+async function listExtraFiles(webpageId) {
+    await initDB();
+    const rows = await getAll(
+        `SELECT * FROM webpage_extra_files WHERE webpage_id = $1 ORDER BY path ASC`,
+        [webpageId]
+    );
+    return rows.map(mapExtraFileRow);
+}
+
+async function getExtraFile(webpageId, path) {
+    await initDB();
+    const r = await getOne(
+        `SELECT * FROM webpage_extra_files WHERE webpage_id = $1 AND path = $2`,
+        [webpageId, path]
+    );
+    return r ? mapExtraFileRow(r) : null;
+}
+
+/**
+ * Upsert a single extra file. Writes bytes to RustFS and metadata to DB.
+ */
+async function upsertExtraFile({ webpageId, userId, path, content }) {
+    await initDB();
+    const validation = validateExtraPath(path);
+    if (validation) throw new Error(validation);
+
+    const { mime, ext } = guessMime(path);
+    const isText = isTextFile(mime, ext);
+    const { sha, size } = await writeExtra(userId, webpageId, path, content, mime);
+
+    const existing = await getExtraFile(webpageId, path);
+    if (existing) {
+        await run(
+            `UPDATE webpage_extra_files SET mime_type = $1, is_text = $2, sha256 = $3, size = $4, updated_at = NOW()
+             WHERE webpage_id = $5 AND path = $6`,
+            [mime, isText, sha, size, webpageId, path]
+        );
+        return { ...existing, mimeType: mime, isText, sha256: sha, size, updatedAt: new Date().toISOString() };
+    }
+
+    const id = crypto.randomUUID();
+    await run(
+        `INSERT INTO webpage_extra_files (id, webpage_id, path, mime_type, is_text, sha256, size)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [id, webpageId, path, mime, isText, sha, size]
+    );
+    await run('UPDATE webpages SET updated_at = NOW() WHERE id = $1', [webpageId]);
+    return { id, webpageId, path, mimeType: mime, isText, sha256: sha, size };
+}
+
+async function deleteExtraFile({ webpageId, userId, path }) {
+    await initDB();
+    const existing = await getExtraFile(webpageId, path);
+    if (!existing) return false;
+    await run('DELETE FROM webpage_extra_files WHERE webpage_id = $1 AND path = $2', [webpageId, path]);
+    await deleteExtra(userId, webpageId, path);
+    await run('UPDATE webpages SET updated_at = NOW() WHERE id = $1', [webpageId]);
+    return true;
+}
+
+/**
+ * Read a single extra file's content. Returns { meta, text? , bytes? } where
+ * `text` is set for text files and `bytes` (Buffer) for binary. Returns null
+ * when the file doesn't exist.
+ */
+async function readExtraFile({ webpageId, userId, path }) {
+    const meta = await getExtraFile(webpageId, path);
+    if (!meta) return null;
+    const buf = await readExtra(userId, webpageId, path);
+    if (!buf) return { meta, text: '', bytes: Buffer.alloc(0) };
+    return meta.isText
+        ? { meta, text: buf.toString('utf8'), bytes: buf }
+        : { meta, bytes: buf };
+}
+
+function mapExtraFileRow(r) {
+    return {
+        id: r.id,
+        webpageId: r.webpage_id,
+        path: r.path,
+        mimeType: r.mime_type,
+        isText: r.is_text === true || r.is_text === 't',
+        sha256: r.sha256 || '',
+        size: parseInt(r.size) || 0,
+        createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+        updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : null,
+    };
 }
 
 /**
@@ -583,6 +792,15 @@ module.exports = {
     readAllSlots,
     writeSlot,
     purgeWebpageObjects,
+    // Extra files (multi-file)
+    listExtraFiles,
+    getExtraFile,
+    readExtraFile,
+    upsertExtraFile,
+    deleteExtraFile,
+    validateExtraPath,
+    isTextFile,
+    guessMime,
     // Sources
     addSource,
     getSources,

@@ -30,6 +30,11 @@ const {
     executeWebpageDocTool,
 } = require('../../integrations/webpageDocTools');
 const { PROPOSE_WEBPAGE_PLAN_TOOL, executeProposeWebpagePlan } = require('../../integrations/webpagePlanTool');
+const {
+    WEBPAGE_MULTI_FILE_TOOLS,
+    executeMultiFileTool,
+    isMultiFileTool,
+} = require('../../integrations/webpageMultiFileTools');
 const { AGENT_SEARCH_TOOLS, executeAgentSearchTool, isAgentSearchTool } = require('../../integrations/agentSearchTools');
 const {
     searchWebpageKB,
@@ -51,8 +56,11 @@ router.post('/chat/webpage/stream', requireAuth, async (req, res) => {
         message, webpageId, history, modelTier, timezone, attachments,
         htmlContent, cssContent, jsContent, webpageSelection,
         planExecution, // { planId, action: 'execute' } when user approved a plan
+        chatMode: rawChatMode, // 'ask' | 'auto' | 'plan'
     } = req.body;
     const userId = req.session.user.id;
+    // Sanitise mode — fall back to 'auto' for unknown values.
+    const chatMode = ['ask', 'auto', 'plan'].includes(rawChatMode) ? rawChatMode : 'auto';
 
     if (!message) return res.status(400).json({ error: 'Message required' });
     if (!webpageId) return res.status(400).json({ error: 'Webpage ID required' });
@@ -217,45 +225,83 @@ router.post('/chat/webpage/stream', requireAuth, async (req, res) => {
 
         const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 
-        const systemPrompt = `You are an intelligent webpage-building assistant. Today is ${today}.
+        // Mode-aware planning rule (see chatMode above)
+        const planningRule = chatMode === 'plan'
+            ? `MODE: PLAN.
+You MUST call propose_webpage_plan FIRST for every request that touches code. Even small edits — explore the relevant files via webpage_file_read, then propose a short plan and stop. Do NOT call any webpage_file_write / replace / patch / create_file / delete_file in the same turn. The system pauses and waits for the user to approve. After approval an authorisation message is injected and you may execute.`
+            : chatMode === 'ask'
+            ? `MODE: ASK.
+Always propose a plan before making changes. Call propose_webpage_plan FIRST, list every file you intend to touch and what each change does, then stop. The user must approve before any edits run. After approval an authorisation message is injected and you may execute. Use this mode for high-stakes work where the user wants to review every change up front.`
+            : `MODE: AUTO.
+You decide whether to plan first. Plan first (call propose_webpage_plan, then stop) when the user asks for a brand-new page, a multi-file change, or any rewrite that touches more than ~80 lines. For small, surgical edits (typo fix, single CSS tweak, single line change) skip planning and edit directly. After approval the system injects an authorisation; do NOT propose again on that turn.`;
 
-[WEBPAGE: "${webpage.name}"]
-${webpage.description ? `Description: ${webpage.description}` : ''}
-${webpage.instructions ? `\nCustom Instructions: ${webpage.instructions}` : ''}
+        const systemPrompt = `You are a precise, efficient webpage-building assistant. Today is ${today}.
 
-[AVAILABLE SOURCES]
-${sourceSummary}
+────────────────────────────────────────
+WEBPAGE
+────────────────────────────────────────
+Name: "${webpage.name}"
+${webpage.description ? `Description: ${webpage.description}` : ''}${webpage.instructions ? `\nCustom instructions from the user: ${webpage.instructions}` : ''}
 
-[FILES — three slots, exposed via webpage_file_* tools]
-- index.html (page structure)
-- style.css (styles)
-- script.js (interactive behavior, optional)
+The page is rendered live in a sandboxed iframe visible to the user while you work. Every webpage_file_write / replace / patch you call updates the preview in real time.
 
-CRITICAL EDITING RULES:
-1. Always call webpage_file_read({ file }) before webpage_file_replace or webpage_file_patch on the same file.
-2. Prefer partial edits over full rewrites:
-   - webpage_file_replace({file, find_text, replace_text [, replace_all]}) — substring replace. find_text must match EXACTLY ONCE by default; if it matches multiple places the tool errors with line numbers and asks you to either narrow the snippet or set replace_all: true.
-   - webpage_file_patch({file, start_line, end_line, expected_text, replacement}) — line-anchored replace with sanity check. Use when you know the line range; expected_text must match the current contents of those lines or the tool refuses (preventing corruption from a stale read).
-   - webpage_file_write — reserve for full-file rewrites or initial creation only.
-3. The HTML is rendered in a sandboxed iframe (sandbox="allow-scripts", no same-origin) — do NOT depend on parent-page cookies, localStorage, or fetches to the host app.
-4. Vanilla HTML/CSS/JS only — there is no build step. CDN <script> tags are fine when needed (loaded inside the iframe).
-5. The HTML can reference external CSS/JS via <link href="style.css"> and <script src="script.js"></script> — at download time the zip will contain real files matching those names. The in-app preview inlines them automatically, so EITHER style works.
-6. Style and behavior should match the user's described intent. If the description is sparse, default to a clean, modern aesthetic with sensible spacing, readable typography, and accessible color contrast.
-7. After applying changes via tool, briefly confirm what you did in the chat reply (e.g. "I added a hero section to index.html and centered the menu grid in style.css").
+────────────────────────────────────────
+RUNTIME CONSTRAINTS — READ ONCE, OBEY ALWAYS
+────────────────────────────────────────
+1. Vanilla HTML / CSS / JavaScript only. There is NO build step.
+2. NO package installation. No \`npm install\`, no \`yarn add\`, no \`require()\` of node modules, no bundler. If you need a library, use a CDN \`<script>\` tag inside the HTML (e.g. \`<script src="https://cdn.jsdelivr.net/...">\`).
+3. NO TypeScript, JSX, SCSS, LESS, or any language that needs compilation.
+4. The preview iframe runs with \`sandbox="allow-scripts"\` and NO \`allow-same-origin\`. That means:
+   - \`document.cookie\`, \`localStorage\`, \`sessionStorage\` are unavailable inside the page.
+   - \`fetch()\` to the host app or any same-origin URL fails (CORS / opaque origin).
+   - \`parent.window\` access throws SecurityError.
+   Use in-memory variables for state. CDN fetches are allowed.
+5. Reference styles and scripts however you like — \`<link href="style.css">\` and \`<script src="script.js"></script>\` work in the downloaded zip; the in-app preview inlines them automatically.
+6. Default to a clean, modern aesthetic when the user's brief is sparse: sensible spacing, readable typography, accessible color contrast (WCAG AA), responsive on mobile.
 
-[PLANNING — propose_webpage_plan]
-Before doing any non-trivial work, decide whether to plan first:
-- Plan first (call propose_webpage_plan ONCE, then stop) when: the user asks for a brand-new webpage, a multi-file change, or any rewrite that touches more than ~80 lines.
-- Edit directly (skip planning) when: the user asks for a small surgical change, a typo fix, a CSS tweak, or anything contained to a few lines.
-When you call propose_webpage_plan, do NOT call any webpage_file_* tool in the same turn — the system will pause and wait for the user to approve. After approval the system will inject an authorisation message and you can then execute using the regular file tools.
-
-[CURRENT FILE CONTENTS]
+────────────────────────────────────────
+FILES
+────────────────────────────────────────
 ${filesBlock}
 
-${searchAvailable ? `[WEB SEARCH & SOURCES]
-- Use agent_search for current information and research.
-- Use webpage_add_source to attach search results / references as a webpage source.
-` : ''}${kbContext}${selectionContext}
+────────────────────────────────────────
+EDITING TOOLS — pick the right one
+────────────────────────────────────────
+• webpage_file_read({ file }) — ALWAYS call this before any partial edit on the same file in the same turn. The tool tracks reads and warns when an edit is issued cold.
+• webpage_file_replace({ file, find_text, replace_text [, replace_all] }) — surgical substring replace. find_text must match EXACTLY ONCE by default; if it appears multiple times the tool errors with the matching line numbers and asks you to either narrow the snippet or set \`replace_all: true\`. Whitespace-normalised matching is a fallback.
+• webpage_file_patch({ file, start_line, end_line, expected_text, replacement }) — line-anchored replace with a sanity check. Use when you know the exact line range. \`expected_text\` must match the current contents of those lines or the tool refuses to write — protects against corruption from stale reads.
+• webpage_file_write({ file, content [, title] }) — full-file overwrite. Reserve for INITIAL creation or genuine full rewrites only. For any edit on existing content, prefer the partial tools above (faster, cheaper, more robust).
+
+Iteration discipline:
+- Read first, then edit. Never call a partial-edit tool on a file you haven't read this turn.
+- Make ONE focused edit at a time. Don't bundle unrelated changes.
+- After edits land, briefly confirm what changed in plain language: "I added the hero section to index.html and centered the menu grid in style.css."
+
+────────────────────────────────────────
+EXTRA FILES & FOLDERS — beyond the three primary slots
+────────────────────────────────────────
+You can split your work across additional files when it makes the project clearer (e.g. components/header.html, modules/state.js, assets/products.json). Folders are created implicitly from the path.
+• webpage_list_files() — see every file currently in the project.
+• webpage_create_file({ path, content }) — create or overwrite an extra file. Reject reserved paths (index.html, style.css, script.js); for those, use webpage_file_write({ file: "html"|"css"|"js" }).
+• webpage_read_file({ path }) — read an extra file's contents.
+• webpage_replace_in_file({ path, find_text, replace_text [, replace_all] }) — partial edit on an extra file. Same single-match-required contract as webpage_file_replace.
+• webpage_delete_file({ path }) — remove an extra file.
+
+When to split files: only when it genuinely simplifies the project. A small page belongs in the three primary slots. Split when you have multiple components, reusable modules, or content that wants its own file. Don't pre-emptively scaffold dozens of files for a simple page.
+
+────────────────────────────────────────
+PLANNING
+────────────────────────────────────────
+${planningRule}
+
+────────────────────────────────────────
+SOURCES & RESEARCH
+────────────────────────────────────────
+${sourceSummary}
+${searchAvailable ? `\nWeb research:
+• agent_search — current information, factual lookups.
+• webpage_add_source — attach search results / references as a webpage source for grounding future questions.` : ''}${kbContext}${selectionContext}
+
 Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = new Date(); const _dp = _now.toLocaleString('sv-SE', { timeZone: _tz }); const _lp = new Date(_now.toLocaleString('en-US', { timeZone: _tz })); const _om = Math.round((_lp - _now) / 60000); const _s = _om >= 0 ? '+' : '-'; const _a = Math.abs(_om); return `${_dp} UTC${_s}${String(Math.floor(_a / 60)).padStart(2, '0')}:${String(_a % 60).padStart(2, '0')} (${_tz})`; } catch (_) { return new Date().toISOString(); } })()}`;
 
         let messages = [{ role: 'system', content: systemPrompt }];
@@ -305,7 +351,7 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
         }
 
         // Tool list
-        const webpageTools = [...WEBPAGE_DOC_TOOLS, WEBPAGE_ADD_SOURCE_TOOL];
+        const webpageTools = [...WEBPAGE_DOC_TOOLS, ...WEBPAGE_MULTI_FILE_TOOLS, WEBPAGE_ADD_SOURCE_TOOL];
         // Plan tool only on regular (non-execution) turns. When the user
         // approves a plan, we don't want the AI to propose another one.
         if (!planExecution) webpageTools.push(PROPOSE_WEBPAGE_PLAN_TOOL);
@@ -360,6 +406,13 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
                     liveFiles[slot] = toolResult.content;
                     dirtySlots.add(slot);
                     send('webpage_doc_update', { file: slot, content: toolResult.content, title: toolResult.title });
+                }
+            } else if (isMultiFileTool(toolName)) {
+                toolResult = await executeMultiFileTool(toolName, toolArgs, { webpageId, userId });
+                if (toolResult?._action === 'webpage_extra_update') {
+                    send('webpage_extra_update', { path: toolResult.path, meta: toolResult.meta });
+                } else if (toolResult?._action === 'webpage_extra_deleted') {
+                    send('webpage_extra_deleted', { path: toolResult.path });
                 }
             } else if (toolName === 'webpage_add_source') {
                 try {
