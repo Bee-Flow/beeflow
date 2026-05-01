@@ -425,7 +425,11 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             console.log(`[AgentRuntime] Memory lookup - userId: ${userId}, agentId: ${agentId}`);
             // Limit to ~300 tokens (approx 1200 chars) to prevent context pollution
             // Always pass projectId for retrieval (project memories should be available regardless of extractMemories flag)
-            const relevantMemories = await memoryStore.findRelevantMemories(userId, agentId, userMessage, 300, validProjectId || null);
+            // Per-agent memory: when memoryEnabled is on AND useGeneralMemory is
+            // false, restrict retrieval to this agent's own bucket.
+            const cfg = agent.config || {};
+            const includeGeneral = !(cfg.memoryEnabled === true && cfg.useGeneralMemory === false);
+            const relevantMemories = await memoryStore.findRelevantMemories(userId, agentId, userMessage, 300, validProjectId || null, { includeGeneral });
             if (relevantMemories.length > 0) {
                 memoryContext = memoryStore.formatMemoriesForPrompt(relevantMemories);
                 console.log(`[AgentRuntime] Injected ${relevantMemories.length} memories into prompt`);

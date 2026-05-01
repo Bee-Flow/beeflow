@@ -38,7 +38,17 @@ router.get('/', async (req, res) => {
         if (projectId) {
             memories = await memoryStore.getMemoriesForProject(userId, projectId);
         } else if (agentId) {
-            memories = await memoryStore.getMemoriesForAgent(userId, agentId);
+            // Honor the agent's "use general memory" flag for per-agent agents.
+            let includeGeneral = true;
+            try {
+                const agentStore = require('../stores/agentStore');
+                const a = await agentStore.getAgent(agentId);
+                const cfg = a?.config || {};
+                if (cfg.memoryEnabled === true && cfg.useGeneralMemory === false) {
+                    includeGeneral = false;
+                }
+            } catch (_) { /* default to true */ }
+            memories = await memoryStore.getMemoriesForAgent(userId, agentId, 50, { includeGeneral });
         } else {
             memories = await memoryStore.getMemories(userId);
         }

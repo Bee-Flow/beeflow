@@ -64,6 +64,16 @@ function verifyEvidence(memory, sourceText) {
  * @param {string} userOrgId - Optional org ID for EU-mode model overrides
  */
 async function extractFromConversation(userId, agentId, messages, conversationId = null, projectId = null, userOrgId = null) {
+    // If this agent has per-agent memory enabled, route writes to its own
+    // bucket (agent_id = X). Otherwise keep the legacy behaviour and store
+    // memories at the user-global level (agent_id IS NULL).
+    let writeAgentId = null;
+    try {
+        if (agentId) {
+            const a = await agentStore.getAgent(agentId);
+            if (a?.config?.memoryEnabled === true) writeAgentId = agentId;
+        }
+    } catch (_) { /* fall back to global */ }
 
     // Only analyze the LATEST user message (not last 5 - prevents blending)
     const userMessages = messages.filter(m => m.role === 'user').slice(-1);
@@ -164,7 +174,7 @@ async function extractFromConversation(userId, agentId, messages, conversationId
             }
             const id = await memoryStore.createMemory(
                 userId,
-                null,  // agentId null = global memory
+                writeAgentId,  // null = user-global; non-null = per-agent bucket
                 memory.type,
                 memory.content,
                 null,

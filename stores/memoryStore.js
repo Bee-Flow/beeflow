@@ -222,12 +222,21 @@ async function getMemoriesForProject(userId, projectId, limit = 50) {
     `, [projectId, limit]);
 }
 
-async function getMemoriesForAgent(userId, agentId, limit = 20) {
+async function getMemoriesForAgent(userId, agentId, limit = 20, { includeGeneral = true } = {}) {
     await initDB();
-    // Return agent-specific memories + global (agent_id IS NULL) memories
+    // includeGeneral=true (default): return agent-specific + user-global memories.
+    // includeGeneral=false: only this agent's bucket — used when an agent has
+    // memoryEnabled and explicitly opts out of reading the user's general memory.
+    if (includeGeneral) {
+        return getAll(`
+            SELECT * FROM user_memories
+            WHERE user_id = $1 AND status = 'active' AND (agent_id = $2 OR agent_id IS NULL)
+            ORDER BY importance DESC, updated_at DESC LIMIT $3
+        `, [userId, agentId, limit]);
+    }
     return getAll(`
         SELECT * FROM user_memories
-        WHERE user_id = $1 AND status = 'active' AND (agent_id = $2 OR agent_id IS NULL)
+        WHERE user_id = $1 AND status = 'active' AND agent_id = $2
         ORDER BY importance DESC, updated_at DESC LIMIT $3
     `, [userId, agentId, limit]);
 }
@@ -308,14 +317,26 @@ async function findSimilarMemory(userId, content, projectId = null) {
 
 // ============ Memory Retrieval ============
 
-async function findRelevantMemories(userId, agentId, userMessage, tokenLimit = 800, projectId = null) {
+async function findRelevantMemories(userId, agentId, userMessage, tokenLimit = 800, projectId = null, { includeGeneral = true } = {}) {
     await initDB();
-    
-    let query = `
-        SELECT * FROM user_memories
-        WHERE status = 'active' AND (agent_id = $1 OR agent_id IS NULL)
-    `;
-    let params = [agentId || null];
+
+    // When the agent has its own bucket and opts out of reading the user's
+    // general memory, restrict to agent-specific rows only.
+    let query;
+    let params;
+    if (!includeGeneral && agentId) {
+        query = `
+            SELECT * FROM user_memories
+            WHERE status = 'active' AND agent_id = $1
+        `;
+        params = [agentId];
+    } else {
+        query = `
+            SELECT * FROM user_memories
+            WHERE status = 'active' AND (agent_id = $1 OR agent_id IS NULL)
+        `;
+        params = [agentId || null];
+    }
     
     // Strict project isolation: only project memories in project context, only global in non-project
     if (projectId) {
@@ -336,7 +357,7 @@ async function findRelevantMemories(userId, agentId, userMessage, tokenLimit = 8
     // These are behavioural settings that should apply everywhere.
     // Project-specific data is still strictly isolated — only instruction/preference
     // types cross the boundary.
-    if (projectId) {
+    if (projectId && includeGeneral) {
         const userGlobalBehaviour = await getAll(`
             SELECT * FROM user_memories
             WHERE user_id = $1 AND project_id IS NULL AND status = 'active'
