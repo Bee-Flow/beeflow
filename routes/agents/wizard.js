@@ -12,9 +12,8 @@ const router = express.Router();
 
 const PLAN_SCHEMA = `{
   "name": "string (short, friendly agent name)",
-  "description": "string (1-2 sentences, second person, Dutch if user wrote Dutch)",
+  "description": "string (1-2 sentences, second person, in the user's language)",
   "avatar": "single emoji",
-  "channels": ["chat" | "slack" | "teams" | "discord" | "email"],
   "capabilities": ["string", ...]  // 2-5 short capability bullets
   "suggestedSkills": [{ "name": "string", "reason": "string" }],
   "systemPrompt": "string (concrete instructions for the agent, written in the user's language)"
@@ -31,7 +30,6 @@ ${PLAN_SCHEMA}
 Rules:
 - Write all user-facing text (name, description, capabilities, systemPrompt) in ${langName}. If the user's prompt is clearly in another language, prefer that language.
 - Keep "name" under 40 characters.
-- Channels must be lowercase identifiers from the allowed list. Default to ["chatgpt"] if unclear.
 - Capabilities are short user-visible bullets, not technical jargon.
 - systemPrompt must be self-contained: tone, scope, what to do, what to avoid.
 - Respond with raw JSON only, no markdown fences.`;
@@ -66,7 +64,7 @@ async function generatePlan({ userPrompt, priorPlan, refinement, modelTier, loca
         throw err;
     }
 
-    if (!Array.isArray(plan.channels) || plan.channels.length === 0) plan.channels = ['chatgpt'];
+    delete plan.channels;
     if (!Array.isArray(plan.capabilities)) plan.capabilities = [];
     if (!Array.isArray(plan.suggestedSkills)) plan.suggestedSkills = [];
     if (!plan.avatar) plan.avatar = '🤖';
