@@ -196,6 +196,9 @@ router.post('/stream', requireAuth, async (req, res) => {
 });
 
 function mutates(toolName) {
+    // builder_inspect_tool, builder_summarise, builder_request_dry_run,
+    // and builder_finalize are all non-mutating from the draft definition's
+    // perspective (finalize flips a flag but doesn't change `def`).
     return [
         'builder_propose_trigger', 'builder_add_action', 'builder_add_ai_step',
         'builder_add_condition', 'builder_add_loop', 'builder_add_code_step',

@@ -116,6 +116,65 @@ async function main() {
         ok('detects side-effects', r.hasSideEffects === true);
     }
 
+    console.log('\n— outputSchemas.js (must match real integration return shapes) —');
+    {
+        const { describeShape, getOutputSchema } = require('../automation/outputSchemas');
+        ok('gmail_search shape uses results, not items', /results.*array.*from.*subject/i.test(describeShape('gmail_search') || ''));
+        ok('calendar_list_events shape uses results', /results.*array.*summary.*start/i.test(describeShape('calendar_list_events') || ''));
+        ok('drive_search shape uses results', /results.*array.*name.*mimeType/i.test(describeShape('drive_search') || ''));
+        ok('outlook_search shape uses results', /results.*array.*from.*subject/i.test(describeShape('outlook_search') || ''));
+        ok('youtrack_search_issues shape uses results', /results.*array.*summary.*state/i.test(describeShape('youtrack_search_issues') || ''));
+        ok('agent_search marked as string', /string/.test(describeShape('agent_search') || ''));
+        // Sample shape sanity
+        const gs = getOutputSchema('gmail_search');
+        ok('gmail_search sample.results is array of objects with from/subject', Array.isArray(gs?.sample?.results) && gs.sample.results[0]?.from && gs.sample.results[0]?.subject);
+    }
+
+    console.log('\n— builderTools.canonicalizeInputs —');
+    {
+        const { applyToolCall, emptyDefinition } = require('../automation/builderTools');
+        const wrap = { userId: 'test', def: emptyDefinition() };
+        // Raw string input → wrapped to literal binding
+        const r = await applyToolCall('builder_add_action', {
+            tool: 'gmail_search',
+            inputs: { query: 'label:Invoices is:unread', maxResults: 10 },
+        }, wrap);
+        const added = r.added;
+        ok('canonicalize: raw string → literal', added.inputs.query?.kind === 'literal' && added.inputs.query.value === 'label:Invoices is:unread');
+        ok('canonicalize: raw number → literal', added.inputs.maxResults?.kind === 'literal' && added.inputs.maxResults.value === 10);
+        // Template string with {{ }} → upgraded to template
+        const r2 = await applyToolCall('builder_add_notification', {
+            title: 'Found {{steps.s.output.count}}',
+            body: 'plain body without templates',
+        }, wrap);
+        // notification.title/body live on the step itself, not in inputs — but
+        // confirm the step structure is accepted.
+        ok('add_notification accepts plain title/body', r2.added.type === 'notification');
+    }
+
+    console.log('\n— builder_inspect_tool —');
+    {
+        const { applyToolCall, emptyDefinition } = require('../automation/builderTools');
+        const wrap = { userId: 'test', def: emptyDefinition() };
+        const r = await applyToolCall('builder_inspect_tool', { tool: 'gmail_search' }, wrap);
+        ok('inspect_tool returns shape from curated schema', typeof r.shape === 'string' && r.shape.includes('results'));
+        ok('inspect_tool exposes source', r.source === 'curated' || r.source === 'runtime');
+        const r2 = await applyToolCall('builder_inspect_tool', { tool: 'this_tool_does_not_exist' }, wrap);
+        ok('inspect_tool gracefully handles unknown tool', r2.shape === null && r2.source === 'unknown');
+    }
+
+    console.log('\n— shapeCache.describeValue (no PII leaks) —');
+    {
+        const { describeValue, renderShapeHint } = require('../automation/shapeCache');
+        const desc = describeValue({ results: [{ from: 'a@b.com', subject: 'secret', amount: 1234 }], total: 1 });
+        // Descriptor must NOT include the actual email content
+        const json = JSON.stringify(desc);
+        ok('shapeCache does not leak content', !json.includes('a@b.com') && !json.includes('secret'));
+        ok('shapeCache captures structure', /from/.test(json) && /subject/.test(json) && /total/.test(json));
+        const hint = renderShapeHint(desc);
+        ok('renderShapeHint produces a one-liner', typeof hint === 'string' && hint.length > 5);
+    }
+
     console.log('\n— cron.js —');
     {
         const next = cron.nextRunAt('0 9 * * 1', 'Europe/Amsterdam', Date.UTC(2026, 4, 1, 0, 0, 0));

@@ -7,11 +7,16 @@
  */
 
 function buildSystemPrompt({ catalog, codeStepEnabled, userTimezone = 'Europe/Amsterdam', existingDraftSummary = null, webSearchEnabled = true, disabledMedia = {} }) {
+    const { describeShape } = require('./outputSchemas');
     const apps = (catalog?.apps || [])
         .filter(a => a.available && a.actions.length)
         .map(a => {
             const actions = a.actions
-                .map(act => `  - ${act.name}${act.sideEffect ? ' [side-effect]' : ''} — ${act.description?.split('\n')[0] || ''}`)
+                .map(act => {
+                    const shape = describeShape(act.name);
+                    const shapeNote = shape ? `\n      → output: ${shape}` : '';
+                    return `  - ${act.name}${act.sideEffect ? ' [side-effect]' : ''} — ${act.description?.split('\n')[0] || ''}${shapeNote}`;
+                })
                 .slice(0, 30) // cap so the prompt doesn't blow up
                 .join('\n');
             return `### ${a.label} (${a.id})\n${actions}`;
@@ -81,9 +86,11 @@ ${Object.entries(disabledMedia || {}).filter(([, v]) => v).map(([k]) => `- The u
 
 ## Common pitfalls to avoid
 
-- Output field names you "guess": e.g. \`gmail_search\` returns
-  \`{ items: [...] }\` (NOT \`emails\` or \`messages\`). When in doubt,
-  do a dry-run, see what's actually there, then update bindings.
+- Output field names you "guess": each tool in the catalog below shows
+  its actual output shape. Use exactly those keys. When the catalog
+  doesn't list a shape, call \`builder_inspect_tool\` BEFORE you bind —
+  don't guess. After a dry-run, every step result also includes a
+  \`_hint\` with the real top-level keys; use those to self-correct.
 - Forgetting binding wrappers around literal values.
 - Wiring a notification AFTER a loop while referencing
   \`loop.<itemVar>\` — those refs only resolve INSIDE the loop body.

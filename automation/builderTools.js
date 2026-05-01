@@ -28,6 +28,41 @@ function emptyDefinition() {
     };
 }
 
+/**
+ * Coerce a step's inputs into canonical binding form.
+ *
+ * Tolerates the AI's common mistakes:
+ *   - raw strings/numbers/booleans/arrays passed where a binding wrapper
+ *     was expected → wrapped as { kind: 'literal', value: ... }
+ *   - strings that look like template paths "{{...}}" → upgraded to template
+ *   - already-canonical bindings → passed through unchanged
+ *
+ * Lossless: anything already valid keeps its shape. Anything ambiguous
+ * defaults to literal so the runtime won't crash on bad refs.
+ */
+function canonicalizeInputs(inputs) {
+    if (!inputs || typeof inputs !== 'object' || Array.isArray(inputs)) return {};
+    const out = {};
+    for (const [k, v] of Object.entries(inputs)) {
+        out[k] = canonicalizeBinding(v);
+    }
+    return out;
+}
+
+function canonicalizeBinding(v) {
+    // Already a binding wrapper — pass through.
+    if (v && typeof v === 'object' && !Array.isArray(v) && typeof v.kind === 'string'
+        && ['literal', 'ref', 'template', 'expr'].includes(v.kind)) {
+        return v;
+    }
+    // String containing {{...}} → template.
+    if (typeof v === 'string' && /\{\{[^}]+\}\}/.test(v)) {
+        return { kind: 'template', value: v };
+    }
+    // Anything else → literal. This is the safe, runtime-friendly choice.
+    return { kind: 'literal', value: v };
+}
+
 function lastStepId(def) {
     if (def.steps.length === 0) return def.trigger.id;
     return def.steps[def.steps.length - 1].id;
@@ -193,6 +228,18 @@ const TOOL_SCHEMAS = [
     {
         type: 'function',
         function: {
+            name: 'builder_inspect_tool',
+            description: 'Look up the EXACT output shape of an integration tool. Use this BEFORE adding actions whose output you need to chain — so you know whether the field is "results" or "items" or "events" without guessing. Returns a one-line shape descriptor (e.g. "results: array of { id, from, subject, ... }; total: integer") sourced from runtime samples when available, otherwise from the curated schema.',
+            parameters: {
+                type: 'object',
+                properties: { tool: { type: 'string', description: 'Exact tool name from the catalog.' } },
+                required: ['tool'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
             name: 'builder_summarise',
             description: 'Return a deterministic plain-English summary of the current draft. Call after every batch of mutations so the user sees what changed.',
             parameters: { type: 'object', properties: {} },
@@ -238,7 +285,7 @@ function applyAddAction(draft, args) {
         id: newId('a'),
         type: 'integration_action',
         tool: args.tool,
-        inputs: args.inputs || {},
+        inputs: canonicalizeInputs(args.inputs || {}),
         label: args.label || args.tool,
         sideEffect: isSideEffect(args.tool),
     };
@@ -251,7 +298,7 @@ function applyAddAi(draft, args) {
         id: newId('ai'),
         type: 'ai_step',
         prompt: args.prompt,
-        inputs: args.inputs || {},
+        inputs: canonicalizeInputs(args.inputs || {}),
         outputSchema: args.outputSchema || null,
         modelTier: args.modelTier || 'fast',
         label: args.label || 'AI step',
@@ -276,11 +323,12 @@ function applyAddLoop(draft, args) {
     // type-specific required fields. Missing ids would crash the runner with
     // a null step_id DB constraint.
     const rawBody = Array.isArray(args.body) ? args.body : [];
-    const body = rawBody.map((child, i) => {
+    const body = rawBody.map((child) => {
         if (!child || typeof child !== 'object') return null;
         const fixed = { ...child };
         if (!fixed.id || typeof fixed.id !== 'string') fixed.id = newId('lb');
         if (!fixed.type || typeof fixed.type !== 'string') fixed.type = 'ai_step';
+        if (fixed.inputs) fixed.inputs = canonicalizeInputs(fixed.inputs);
         return fixed;
     }).filter(Boolean);
 
@@ -304,7 +352,7 @@ function applyAddCode(draft, args) {
         language: 'javascript',
         code: args.code,
         codeHash: crypto.createHash('sha256').update(args.code || '').digest('hex'),
-        inputs: args.inputs || {},
+        inputs: canonicalizeInputs(args.inputs || {}),
         outputSchema: args.outputSchema || null,
         allowedTools: Array.isArray(args.allowedTools) ? args.allowedTools : [],
         limits: { cpuMs: 1000, memoryMb: 64, wallMs: 5000 },
@@ -345,6 +393,32 @@ function applySummarise(draft) {
     return { summary, hasSideEffects };
 }
 
+async function applyInspectTool(args, draftWrap) {
+    const tool = args && typeof args.tool === 'string' ? args.tool : null;
+    if (!tool) return { error: 'tool name required' };
+    const shapeCache = require('./shapeCache');
+    const { describeShape, getOutputSchema } = require('./outputSchemas');
+
+    // Prefer runtime-cached shape (the source of truth from real runs).
+    let shapeHint = null;
+    let source = 'curated';
+    try {
+        const cached = await shapeCache.getShape({ userId: draftWrap.userId, toolName: tool });
+        if (cached) {
+            shapeHint = shapeCache.renderShapeHint(cached);
+            source = 'runtime';
+        }
+    } catch (_) {}
+    if (!shapeHint) {
+        shapeHint = describeShape(tool);
+    }
+    if (!shapeHint) {
+        return { tool, shape: null, source: 'unknown', note: 'No declared schema and no runtime sample. Run the tool once via dry-run / live to learn its shape, or just bind defensively.' };
+    }
+    const schema = getOutputSchema(tool);
+    return { tool, shape: shapeHint, source, sample: schema?.sample ?? null };
+}
+
 // ── Public API ──────────────────────────────────────────
 
 /**
@@ -365,12 +439,29 @@ async function applyToolCall(name, args, draftWrap) {
         case 'builder_remove_step':        return applyRemoveStep(draft, args);
         case 'builder_set_metadata':       return applySetMetadata(draftWrap, args);
         case 'builder_summarise':          return applySummarise(draft);
+        case 'builder_inspect_tool':       return applyInspectTool(args, draftWrap);
         case 'builder_request_dry_run': {
             const automation = await persistDraft(draftWrap);
             const runner = require('../core/automationRunner');
             const run = await runner.executeAutomation(automation, { triggerKind: 'dry_run', triggerPayload: args.triggerPayload || null, mode: 'dry_run' });
             const steps = await automationStore.getRunSteps(run.id);
-            return { run, steps };
+            // Annotate each step with a top-level field hint so the AI
+            // immediately sees what keys are available for binding.
+            const shapeCache = require('./shapeCache');
+            const annotated = steps.map(s => {
+                const out = s.output;
+                const topKeys = (out && typeof out === 'object' && !Array.isArray(out)) ? Object.keys(out) : null;
+                const shapeHint = topKeys ? shapeCache.renderShapeHint(shapeCache.describeValue(out)) : null;
+                return {
+                    ...s,
+                    _hint: {
+                        outputType: Array.isArray(out) ? 'array' : (out === null ? 'null' : typeof out),
+                        topKeys,
+                        shape: shapeHint,
+                    },
+                };
+            });
+            return { run, steps: annotated };
         }
         case 'builder_finalize': {
             const automation = await persistDraft(draftWrap, { finalize: true });

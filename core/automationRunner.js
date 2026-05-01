@@ -22,6 +22,7 @@ const { resolveValue, resolveDeep, resolveInputs } = require('../automation/bind
 const { evaluate } = require('../automation/expr');
 const { isSideEffect } = require('../automation/sideEffectMap');
 const { synthesizeDryRunOutput } = require('../automation/outputSchemas');
+const shapeCache = require('../automation/shapeCache');
 const { summariseDefinition } = require('../automation/summarise');
 const cron = require('../automation/cron');
 const sandbox = require('../automation/codeSandbox');
@@ -94,6 +95,12 @@ async function execIntegrationAction(step, ctx, runState, mode) {
         session: ctx.session,
         orgId: ctx.orgId,
     });
+    // Cache the actual output shape so the Builder agent gets ground-truth
+    // bindings on its next turn (no more guessing items vs results).
+    // Only for real runs — dry-run synth output would pollute the cache.
+    if (mode !== 'dry_run') {
+        try { await shapeCache.recordShape({ userId: ctx.userId, toolName: step.tool, output: result }); } catch (_) {}
+    }
     return { output: result };
 }
 
@@ -130,8 +137,10 @@ async function execAiStep(step, ctx, runState, mode) {
 
 async function execCondition(step, ctx, runState) {
     let v;
-    try { v = evaluate(step.expr || 'false', runState); } catch (e) { v = false; }
-    return { output: { branch: v ? 'then' : 'else', value: !!v } };
+    let evalError = null;
+    try { v = evaluate(step.expr || 'false', runState); }
+    catch (e) { v = false; evalError = e.message || String(e); }
+    return { output: { branch: v ? 'then' : 'else', value: !!v, expr: step.expr, ...(evalError ? { _evalError: evalError } : {}) } };
 }
 
 async function execNotification(step, ctx, runState, mode) {
