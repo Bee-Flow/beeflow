@@ -121,29 +121,6 @@ router.patch('/:id/conversations/:convId/thread-titles', async (req, res) => {
     res.json({ success: true });
 });
 
-// Save form data to a message in a conversation
-router.patch('/:id/conversations/:convId/form-data', async (req, res) => {
-    const userId = getEffectiveUserId(req);
-    const conversation = await agentStore.getConversationById(req.params.convId, req.session?.encryptionKey);
-    if (!conversation || conversation.user_id !== userId) {
-        return res.status(404).json({ error: 'Conversation not found' });
-    }
-
-    const { messageId, formData } = req.body;
-    if (!messageId || !formData) {
-        return res.status(400).json({ error: 'messageId and formData required' });
-    }
-
-    // Update the message with form data
-    const messages = conversation.messages || [];
-    const updatedMessages = messages.map(msg =>
-        msg.id === messageId ? { ...msg, savedFormData: formData } : msg
-    );
-
-    await agentStore.updateConversation(req.params.convId, updatedMessages, req.session?.encryptionKey, req.session?.user?.id);
-    res.json({ success: true });
-});
-
 // Get workspace content for a conversation
 router.get('/:id/conversations/:convId/workspace', async (req, res) => {
     const userId = getEffectiveUserId(req);

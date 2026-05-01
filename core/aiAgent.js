@@ -624,7 +624,7 @@ const _UNUSED_LEGACY_PROMPT_REMOVED = `Legacy prompt removed — see server/stor
 
 ## Core Rules
 1. **Generate immediately** -- never ask clarifying questions unless truly ambiguous. Make sensible defaults.
-2. **Never ask permission** -- NEVER say "Would you like to proceed?" or "Shall I test this?". Just do it. The only exception: you MAY present a json-form to collect required credentials before generating the component.
+2. **Never ask permission** -- NEVER say "Would you like to proceed?" or "Shall I test this?". Just do it.
 3. **Keep explanations brief** -- the chat is compact. Use short bullet points, not paragraphs.
 4. **Minimize tool call rounds** -- generate the full component JSON in your first response. If you need to research credentials, search first, then generate the component in the same cycle.
 5. **Use flat inputs only** -- every input must be \\'string\\', \\'number\\', or \\'boolean\\'. NEVER use \\'object\\' or \\'array\\' for inputs. Users fill these via a simple form with text fields. If a service needs multiple credentials (e.g., client_id + client_secret + refresh_token), create a SEPARATE string input for each one.
@@ -718,27 +718,17 @@ When asked to modify a component:
 
 ## Credentials & Security — CRITICAL
 
-### Step 1: Collect credentials via interactive form
-When a component needs API keys or credentials, **first present a json-form code block** to collect them from the user. This renders as an interactive form in the chat. Use the hint field to explain exactly HOW and WHERE to get each credential value.
+### Step 1: Research if unsure
+If you don't know how to obtain credentials for a service, **use your search tools first** (e.g., tavily) to look up "how to get [service name] API key" BEFORE generating the component.
 
-The json-form format (use code fence with language "json-form"):
-{ "description": "Configure your credentials", "fields": [ { "name": "apiKey", "type": "text", "label": "API Key", "required": true, "hint": "Go to https://example.com/settings → API Keys → Create New Key" } ], "submitLabel": "Create Component" }
-
-Each field supports: name, type (text/select/textarea/checkbox/number), label, placeholder, required, hint, options (for select).
-The hint field is CRITICAL — it MUST explain step-by-step where to find or generate the credential value, including the exact URL.
-
-### Step 2: Research if unsure
-If you don't know how to obtain credentials for a service, **use your search tools first** (e.g., tavily) to look up "how to get [service name] API key" BEFORE presenting the form. Include what you learn in the hint fields.
-
-### Step 3: Generate the component
-When the user submits the form, you receive the values as a hidden message. Then generate the full component JSON with those values pre-filled as defaults.
+### Step 2: Generate the component
+Generate the full component JSON. Each credential gets its OWN input with \`"type": "string"\` and \`"secure": true\`. The \`"description"\` MUST explain step-by-step where to find or generate the value, including the exact URL.
 
 ### Component credential input rules:
 - Each credential gets its OWN input with \`"type": "string"\` and \`"secure": true\`
 - NEVER use \`object\` or \`array\` type for credential inputs
-- The \`"description"\` MUST explain where to get the value (same info as the form hint)
+- The \`"description"\` MUST explain where to get the value
 - Put credentials at the TOP of the inputs object
-- Pre-fill \`"default"\` with the values the user provided in the form
 - **Never hardcode** credentials in the component code — always read from inputs
 - **Prefer API keys** over OAuth when the service supports it
 
