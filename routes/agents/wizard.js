@@ -18,24 +18,29 @@ const PLAN_SCHEMA = `{
   "systemPrompt": "string (concrete instructions for the agent, written in the user's language)"
 }`;
 
-const PLAN_SYSTEM_PROMPT = `You design AI agent configurations. Given a user's natural-language description, return ONLY a JSON object matching this schema:
+const LOCALE_NAMES = { en: 'English', nl: 'Dutch', de: 'German', fr: 'French', es: 'Spanish', it: 'Italian', pt: 'Portuguese' };
+
+function planSystemPrompt(locale) {
+    const langName = LOCALE_NAMES[(locale || 'en').toLowerCase().split('-')[0]] || 'English';
+    return `You design AI agent configurations. Given a user's natural-language description, return ONLY a JSON object matching this schema:
 
 ${PLAN_SCHEMA}
 
 Rules:
-- Match the user's language (Dutch input -> Dutch output).
+- Write all user-facing text (name, description, capabilities, systemPrompt) in ${langName}. If the user's prompt is clearly in another language, prefer that language.
 - Keep "name" under 40 characters.
 - Channels must be lowercase identifiers from the allowed list. Default to ["chatgpt"] if unclear.
 - Capabilities are short user-visible bullets, not technical jargon.
 - systemPrompt must be self-contained: tone, scope, what to do, what to avoid.
 - Respond with raw JSON only, no markdown fences.`;
+}
 
-async function generatePlan({ userPrompt, priorPlan, refinement, modelTier, userOrgId, userId }) {
+async function generatePlan({ userPrompt, priorPlan, refinement, modelTier, locale, userOrgId, userId }) {
     const tier = modelTier || 'fast';
     const modelId = await resolveModelForTier(`tier:${tier}`, { userOrgId, userId, fallbackTier: 'fast' });
     const tierConfig = await getTierConfig(tier, { userOrgId, userId });
 
-    const messages = [{ role: 'system', content: PLAN_SYSTEM_PROMPT }];
+    const messages = [{ role: 'system', content: planSystemPrompt(locale) }];
     if (priorPlan) {
         messages.push({ role: 'user', content: userPrompt || '' });
         messages.push({ role: 'assistant', content: JSON.stringify(priorPlan) });
@@ -70,13 +75,13 @@ async function generatePlan({ userPrompt, priorPlan, refinement, modelTier, user
 // POST /agents/wizard/draft  { prompt, modelTier }
 router.post('/wizard/draft', requirePermission('manage_agents'), async (req, res) => {
     try {
-        const { prompt, modelTier } = req.body || {};
+        const { prompt, modelTier, locale } = req.body || {};
         if (!prompt || !prompt.trim()) return res.status(400).json({ error: 'Prompt is required' });
         const userId = getEffectiveUserId(req);
         const orgIds = await resolveUserOrgIds(req);
         const userOrgId = orgIds && orgIds.size > 0 ? Array.from(orgIds)[0] : null;
 
-        const plan = await generatePlan({ userPrompt: prompt, modelTier, userOrgId, userId });
+        const plan = await generatePlan({ userPrompt: prompt, modelTier, locale, userOrgId, userId });
         res.json({ plan });
     } catch (err) {
         console.error('Agent wizard draft failed:', err);
@@ -87,14 +92,14 @@ router.post('/wizard/draft', requirePermission('manage_agents'), async (req, res
 // POST /agents/wizard/refine  { prompt, plan, refinement, modelTier }
 router.post('/wizard/refine', requirePermission('manage_agents'), async (req, res) => {
     try {
-        const { prompt, plan, refinement, modelTier } = req.body || {};
+        const { prompt, plan, refinement, modelTier, locale } = req.body || {};
         if (!plan) return res.status(400).json({ error: 'Prior plan is required' });
         if (!refinement || !refinement.trim()) return res.status(400).json({ error: 'Refinement is required' });
         const userId = getEffectiveUserId(req);
         const orgIds = await resolveUserOrgIds(req);
         const userOrgId = orgIds && orgIds.size > 0 ? Array.from(orgIds)[0] : null;
 
-        const updated = await generatePlan({ userPrompt: prompt, priorPlan: plan, refinement, modelTier, userOrgId, userId });
+        const updated = await generatePlan({ userPrompt: prompt, priorPlan: plan, refinement, modelTier, locale, userOrgId, userId });
         res.json({ plan: updated });
     } catch (err) {
         console.error('Agent wizard refine failed:', err);
