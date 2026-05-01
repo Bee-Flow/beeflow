@@ -3,8 +3,9 @@ FROM node:20-slim
 
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y wget curl gnupg && rm -rf /var/lib/apt/lists/*
+# Install system dependencies (build-essential + python3 are required by
+# isolated-vm's native addon used for the automation `code` step sandbox)
+RUN apt-get update && apt-get install -y wget curl gnupg python3 build-essential && rm -rf /var/lib/apt/lists/*
 
 # Install Docker CLI for terminal-agent container management (Docker-out-of-Docker pattern)
 RUN install -m 0755 -d /etc/apt/keyrings \

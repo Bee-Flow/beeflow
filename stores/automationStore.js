@@ -1,0 +1,451 @@
+/**
+ * Automation Store — PostgreSQL-backed automation definitions, runs, and triggers.
+ *
+ * Sibling of aiTaskStore. Automations are typed-DAG workflows (the conversational
+ * builder produces them); aiTaskStore stays as the prompt-only path.
+ */
+
+const crypto = require('crypto');
+const { run, getOne, getAll, exec, getClient } = require('../db');
+
+let initialized = false;
+
+async function initDB() {
+    if (initialized) return;
+    const migration = require('../migrations/automation-builder-2026-05-init');
+    await migration.up();
+    initialized = true;
+    console.log('[AutomationStore] PostgreSQL initialized');
+}
+
+initDB().catch(err => console.error('[AutomationStore] Init error:', err.message));
+
+function rowToAutomation(r) {
+    if (!r) return null;
+    return {
+        id: r.id,
+        userId: r.user_id,
+        organizationId: r.organization_id,
+        title: r.title,
+        description: r.description,
+        definition: typeof r.definition_json === 'string' ? safeParse(r.definition_json, {}) : (r.definition_json || {}),
+        version: r.version,
+        isActive: r.is_active,
+        isDraft: r.is_draft,
+        needsFirstRunConfirm: r.needs_first_run_confirm,
+        triggerType: r.trigger_type,
+        scheduleCron: r.schedule_cron,
+        scheduleTz: r.schedule_tz,
+        nextRunAt: r.next_run_at ? new Date(r.next_run_at).toISOString() : null,
+        lastRunAt: r.last_run_at ? new Date(r.last_run_at).toISOString() : null,
+        lastStatus: r.last_status,
+        createdFromChatId: r.created_from_chat_id,
+        createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+        updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : null,
+    };
+}
+
+function rowToRun(r) {
+    if (!r) return null;
+    return {
+        id: r.id,
+        automationId: r.automation_id,
+        version: r.version,
+        userId: r.user_id,
+        triggerKind: r.trigger_kind,
+        triggerPayload: typeof r.trigger_payload === 'string' ? safeParse(r.trigger_payload, null) : (r.trigger_payload || null),
+        mode: r.mode,
+        status: r.status,
+        startedAt: r.started_at ? new Date(r.started_at).toISOString() : null,
+        finishedAt: r.finished_at ? new Date(r.finished_at).toISOString() : null,
+        durationMs: r.duration_ms,
+        error: r.error,
+        summary: r.summary,
+    };
+}
+
+function rowToRunStep(r) {
+    if (!r) return null;
+    return {
+        runId: r.run_id,
+        stepId: r.step_id,
+        stepType: r.step_type,
+        attempts: r.attempts,
+        status: r.status,
+        startedAt: r.started_at ? new Date(r.started_at).toISOString() : null,
+        finishedAt: r.finished_at ? new Date(r.finished_at).toISOString() : null,
+        input: typeof r.input_json === 'string' ? safeParse(r.input_json, null) : (r.input_json ?? null),
+        output: typeof r.output_json === 'string' ? safeParse(r.output_json, null) : (r.output_json ?? null),
+        error: r.error,
+    };
+}
+
+function safeParse(s, fallback) {
+    try { return JSON.parse(s); } catch { return fallback; }
+}
+
+// ── Automations CRUD ───────────────────────────────────
+
+async function createAutomation({ userId, organizationId = null, title, description = '', definition, triggerType, scheduleCron = null, scheduleTz = 'Europe/Amsterdam', nextRunAt = null, createdFromChatId = null }) {
+    await initDB();
+    const id = crypto.randomUUID();
+    await run(
+        `INSERT INTO automations (id, user_id, organization_id, title, description, definition_json,
+            version, is_active, is_draft, needs_first_run_confirm, trigger_type, schedule_cron, schedule_tz, next_run_at, created_from_chat_id)
+         VALUES ($1,$2,$3,$4,$5,$6,1,FALSE,TRUE,TRUE,$7,$8,$9,$10,$11)`,
+        [id, userId, organizationId, title, description, JSON.stringify(definition || {}),
+            triggerType, scheduleCron, scheduleTz, nextRunAt, createdFromChatId],
+    );
+    return getAutomation(id);
+}
+
+async function getAutomation(id) {
+    await initDB();
+    const r = await getOne('SELECT * FROM automations WHERE id = $1', [id]);
+    return rowToAutomation(r);
+}
+
+async function getAutomationsForUser(userId) {
+    await initDB();
+    const rows = await getAll('SELECT * FROM automations WHERE user_id = $1 ORDER BY updated_at DESC', [userId]);
+    return rows.map(rowToAutomation);
+}
+
+async function getDueAutomations() {
+    await initDB();
+    const rows = await getAll(
+        `SELECT * FROM automations
+         WHERE is_active = TRUE
+           AND is_draft = FALSE
+           AND trigger_type = 'schedule'
+           AND next_run_at IS NOT NULL
+           AND next_run_at <= NOW()
+           AND (last_status IS NULL OR last_status != 'running')
+         ORDER BY next_run_at ASC LIMIT 20`,
+    );
+    return rows.map(rowToAutomation);
+}
+
+async function updateAutomation(id, updates, savedByUserId) {
+    await initDB();
+    const fieldMap = {
+        title: 'title',
+        description: 'description',
+        definition: 'definition_json',
+        isActive: 'is_active',
+        isDraft: 'is_draft',
+        needsFirstRunConfirm: 'needs_first_run_confirm',
+        triggerType: 'trigger_type',
+        scheduleCron: 'schedule_cron',
+        scheduleTz: 'schedule_tz',
+        nextRunAt: 'next_run_at',
+        lastRunAt: 'last_run_at',
+        lastStatus: 'last_status',
+    };
+    const setClauses = ['updated_at = NOW()'];
+    const params = [];
+    let idx = 1;
+    let definitionChanged = false;
+    for (const [jsKey, dbCol] of Object.entries(fieldMap)) {
+        if (updates[jsKey] === undefined) continue;
+        let v = updates[jsKey];
+        if (jsKey === 'definition') {
+            v = JSON.stringify(v || {});
+            definitionChanged = true;
+        }
+        setClauses.push(`"${dbCol}" = $${idx++}`);
+        params.push(v);
+    }
+    if (params.length === 0) return false;
+
+    const client = await getClient();
+    try {
+        await client.query('BEGIN');
+        // Bump version when definition is mutated
+        if (definitionChanged) {
+            setClauses.push(`version = version + 1`);
+        }
+        params.push(id);
+        const upd = await client.query(
+            `UPDATE automations SET ${setClauses.join(', ')} WHERE id = $${idx} RETURNING *`,
+            params,
+        );
+        const updatedRow = upd.rows[0];
+        if (definitionChanged && updatedRow) {
+            await client.query(
+                `INSERT INTO automation_versions (id, automation_id, version, definition_json, saved_by_user_id)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (automation_id, version) DO NOTHING`,
+                [crypto.randomUUID(), id, updatedRow.version, JSON.stringify(updatedRow.definition_json || {}), savedByUserId || updatedRow.user_id],
+            );
+        }
+        await client.query('COMMIT');
+        return rowToAutomation(updatedRow);
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw e;
+    } finally {
+        client.release();
+    }
+}
+
+async function deleteAutomation(id) {
+    await initDB();
+    const { rowCount } = await run('DELETE FROM automations WHERE id = $1', [id]);
+    return rowCount > 0;
+}
+
+async function listVersions(automationId) {
+    await initDB();
+    const rows = await getAll(
+        'SELECT id, automation_id, version, saved_by_user_id, saved_at FROM automation_versions WHERE automation_id = $1 ORDER BY version DESC',
+        [automationId],
+    );
+    return rows.map(r => ({
+        id: r.id, automationId: r.automation_id, version: r.version,
+        savedByUserId: r.saved_by_user_id, savedAt: r.saved_at,
+    }));
+}
+
+// ── Runs ───────────────────────────────────────────────
+
+async function createRun({ automationId, version, userId, triggerKind, triggerPayload = null, mode = 'live' }) {
+    await initDB();
+    const id = crypto.randomUUID();
+    await run(
+        `INSERT INTO automation_runs (id, automation_id, version, user_id, trigger_kind, trigger_payload, mode, status, started_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'queued',NOW())`,
+        [id, automationId, version, userId, triggerKind, triggerPayload ? JSON.stringify(triggerPayload) : null, mode],
+    );
+    return getRun(id);
+}
+
+async function getRun(id) {
+    await initDB();
+    const r = await getOne('SELECT * FROM automation_runs WHERE id = $1', [id]);
+    return rowToRun(r);
+}
+
+async function getRunsForAutomation(automationId, { limit = 50 } = {}) {
+    await initDB();
+    const rows = await getAll(
+        'SELECT * FROM automation_runs WHERE automation_id = $1 ORDER BY started_at DESC NULLS LAST LIMIT $2',
+        [automationId, limit],
+    );
+    return rows.map(rowToRun);
+}
+
+async function updateRun(id, updates) {
+    await initDB();
+    const map = { status: 'status', startedAt: 'started_at', finishedAt: 'finished_at', durationMs: 'duration_ms', error: 'error', summary: 'summary' };
+    const setClauses = []; const params = []; let idx = 1;
+    for (const [jsKey, dbCol] of Object.entries(map)) {
+        if (updates[jsKey] === undefined) continue;
+        setClauses.push(`"${dbCol}" = $${idx++}`);
+        params.push(updates[jsKey]);
+    }
+    if (params.length === 0) return false;
+    params.push(id);
+    const { rowCount } = await run(`UPDATE automation_runs SET ${setClauses.join(', ')} WHERE id = $${idx}`, params);
+    return rowCount > 0;
+}
+
+async function recordRunStep({ runId, stepId, stepType, attempts = 1, status, startedAt, finishedAt, input, output, error }) {
+    await initDB();
+    await run(
+        `INSERT INTO automation_run_steps (run_id, step_id, step_type, attempts, status, started_at, finished_at, input_json, output_json, error)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+         ON CONFLICT (run_id, step_id, attempts) DO UPDATE SET
+            status = EXCLUDED.status,
+            finished_at = EXCLUDED.finished_at,
+            output_json = EXCLUDED.output_json,
+            error = EXCLUDED.error`,
+        [
+            runId, stepId, stepType, attempts, status,
+            startedAt || null, finishedAt || null,
+            input != null ? JSON.stringify(input) : null,
+            output != null ? JSON.stringify(output) : null,
+            error || null,
+        ],
+    );
+}
+
+async function getRunSteps(runId) {
+    await initDB();
+    const rows = await getAll(
+        'SELECT * FROM automation_run_steps WHERE run_id = $1 ORDER BY started_at NULLS LAST, step_id, attempts',
+        [runId],
+    );
+    return rows.map(rowToRunStep);
+}
+
+// ── Webhooks ──────────────────────────────────────────
+
+async function createWebhook(automationId) {
+    await initDB();
+    const id = crypto.randomBytes(12).toString('hex');
+    const secret = crypto.randomBytes(32).toString('hex');
+    await run(
+        `INSERT INTO automation_webhooks (id, automation_id, secret) VALUES ($1, $2, $3)`,
+        [id, automationId, secret],
+    );
+    return { id, automationId, secret };
+}
+
+async function getWebhook(id) {
+    await initDB();
+    const r = await getOne('SELECT * FROM automation_webhooks WHERE id = $1', [id]);
+    if (!r) return null;
+    return { id: r.id, automationId: r.automation_id, secret: r.secret, allowMethods: r.allow_methods, lastSeenAt: r.last_seen_at };
+}
+
+async function getWebhooksForAutomation(automationId) {
+    await initDB();
+    const rows = await getAll('SELECT id, automation_id, allow_methods, last_seen_at, created_at FROM automation_webhooks WHERE automation_id = $1', [automationId]);
+    return rows.map(r => ({ id: r.id, automationId: r.automation_id, allowMethods: r.allow_methods, lastSeenAt: r.last_seen_at, createdAt: r.created_at }));
+}
+
+async function touchWebhook(id) {
+    await initDB();
+    await run(`UPDATE automation_webhooks SET last_seen_at = NOW() WHERE id = $1`, [id]);
+}
+
+async function checkAndStoreNonce(nonce) {
+    await initDB();
+    // Garbage-collect old nonces (> 24h) opportunistically.
+    await run(`DELETE FROM automation_webhook_seen_nonces WHERE seen_at < NOW() - INTERVAL '24 hours'`).catch(() => {});
+    try {
+        await run(`INSERT INTO automation_webhook_seen_nonces (nonce) VALUES ($1)`, [nonce]);
+        return true;
+    } catch {
+        return false; // duplicate
+    }
+}
+
+// ── Event subscriptions ───────────────────────────────
+
+async function createSubscription({ automationId, userId, provider, eventType, mode = 'webhook', externalRef = null, expiresAt = null, lastCursor = null, filter = null }) {
+    await initDB();
+    const id = crypto.randomUUID();
+    await run(
+        `INSERT INTO automation_event_subscriptions
+            (id, automation_id, user_id, provider, event_type, mode, external_ref, expires_at, last_cursor, filter_json)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+        [id, automationId, userId, provider, eventType, mode, externalRef, expiresAt, lastCursor, filter ? JSON.stringify(filter) : null],
+    );
+    return getSubscription(id);
+}
+
+async function getSubscription(id) {
+    await initDB();
+    const r = await getOne('SELECT * FROM automation_event_subscriptions WHERE id = $1', [id]);
+    if (!r) return null;
+    return {
+        id: r.id, automationId: r.automation_id, userId: r.user_id,
+        provider: r.provider, eventType: r.event_type, mode: r.mode,
+        externalRef: r.external_ref, expiresAt: r.expires_at,
+        lastCursor: r.last_cursor, lastPolledAt: r.last_polled_at,
+        filter: typeof r.filter_json === 'string' ? safeParse(r.filter_json, null) : r.filter_json,
+    };
+}
+
+async function getSubscriptionsForProvider(provider, eventType) {
+    await initDB();
+    const rows = await getAll(
+        'SELECT * FROM automation_event_subscriptions WHERE provider = $1 AND event_type = $2',
+        [provider, eventType],
+    );
+    return rows.map(r => ({
+        id: r.id, automationId: r.automation_id, userId: r.user_id,
+        provider: r.provider, eventType: r.event_type, mode: r.mode,
+        externalRef: r.external_ref, expiresAt: r.expires_at,
+        lastCursor: r.last_cursor, lastPolledAt: r.last_polled_at,
+        filter: typeof r.filter_json === 'string' ? safeParse(r.filter_json, null) : r.filter_json,
+    }));
+}
+
+async function getPollingSubscriptions({ olderThanMs = 60_000 } = {}) {
+    await initDB();
+    const rows = await getAll(
+        `SELECT * FROM automation_event_subscriptions
+         WHERE mode = 'polling'
+           AND (last_polled_at IS NULL OR last_polled_at < NOW() - ($1 * INTERVAL '1 millisecond'))
+         LIMIT 50`,
+        [olderThanMs],
+    );
+    return rows.map(r => ({
+        id: r.id, automationId: r.automation_id, userId: r.user_id,
+        provider: r.provider, eventType: r.event_type, mode: r.mode,
+        externalRef: r.external_ref, expiresAt: r.expires_at,
+        lastCursor: r.last_cursor, lastPolledAt: r.last_polled_at,
+        filter: typeof r.filter_json === 'string' ? safeParse(r.filter_json, null) : r.filter_json,
+    }));
+}
+
+async function getExpiringSubscriptions({ withinMs = 5 * 60_000 } = {}) {
+    await initDB();
+    const rows = await getAll(
+        `SELECT * FROM automation_event_subscriptions
+         WHERE mode = 'webhook'
+           AND expires_at IS NOT NULL
+           AND expires_at < NOW() + ($1 * INTERVAL '1 millisecond')`,
+        [withinMs],
+    );
+    return rows.map(r => ({
+        id: r.id, automationId: r.automation_id, userId: r.user_id,
+        provider: r.provider, eventType: r.event_type, mode: r.mode,
+        externalRef: r.external_ref, expiresAt: r.expires_at,
+        lastCursor: r.last_cursor, lastPolledAt: r.last_polled_at,
+        filter: typeof r.filter_json === 'string' ? safeParse(r.filter_json, null) : r.filter_json,
+    }));
+}
+
+async function updateSubscription(id, updates) {
+    await initDB();
+    const map = { externalRef: 'external_ref', expiresAt: 'expires_at', lastCursor: 'last_cursor', lastPolledAt: 'last_polled_at' };
+    const setClauses = []; const params = []; let idx = 1;
+    for (const [jsKey, dbCol] of Object.entries(map)) {
+        if (updates[jsKey] === undefined) continue;
+        setClauses.push(`"${dbCol}" = $${idx++}`);
+        params.push(updates[jsKey]);
+    }
+    if (params.length === 0) return false;
+    params.push(id);
+    const { rowCount } = await run(`UPDATE automation_event_subscriptions SET ${setClauses.join(', ')} WHERE id = $${idx}`, params);
+    return rowCount > 0;
+}
+
+async function deleteSubscription(id) {
+    await initDB();
+    const { rowCount } = await run('DELETE FROM automation_event_subscriptions WHERE id = $1', [id]);
+    return rowCount > 0;
+}
+
+module.exports = {
+    initDB,
+    createAutomation,
+    getAutomation,
+    getAutomationsForUser,
+    getDueAutomations,
+    updateAutomation,
+    deleteAutomation,
+    listVersions,
+    createRun,
+    getRun,
+    getRunsForAutomation,
+    updateRun,
+    recordRunStep,
+    getRunSteps,
+    createWebhook,
+    getWebhook,
+    getWebhooksForAutomation,
+    touchWebhook,
+    checkAndStoreNonce,
+    createSubscription,
+    getSubscription,
+    getSubscriptionsForProvider,
+    getPollingSubscriptions,
+    getExpiringSubscriptions,
+    updateSubscription,
+    deleteSubscription,
+};

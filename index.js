@@ -283,6 +283,8 @@ const projectFeatureGate = async (req, res, next) => {
 app.use('/api/projects', projectFeatureGate, require('./routes/projects'));
 app.use('/api/reminders', require('./routes/reminders'));
 app.use('/api/ai-tasks', require('./routes/aiTasks'));
+app.use('/api/automation/builder', require('./routes/ai/automationBuilder'));
+app.use('/api/automation', require('./routes/automation'));
 app.use('/api/integrations/gdrive', require('./routes/integrations/googleDrive'));
 app.use('/api/integrations/gmail', require('./routes/integrations/gmail'));
 app.use('/api/integrations/calendar', require('./routes/integrations/calendar'));
@@ -384,6 +386,15 @@ app.listen(PORT, '0.0.0.0', () => {
         require('./core/aiTaskRunner');
     } catch (err) {
         console.warn('[Server] AI Task runner load failed:', err.message);
+    }
+    // Initialize Automation Runner — boot is gated on feature_automations_enabled
+    try {
+        const automationRunner = require('./core/automationRunner');
+        automationRunner.start().catch(err =>
+            console.warn('[Server] Automation runner start error:', err.message)
+        );
+    } catch (err) {
+        console.warn('[Server] Automation runner load failed:', err.message);
     }
     // Ticket Assistant sync engine (beta — polling-based background sync)
     try {
