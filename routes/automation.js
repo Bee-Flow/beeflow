@@ -346,12 +346,36 @@ router.post('/:id/run', async (req, res) => {
         if (!a) return res.status(404).json({ error: 'Not found' });
         if (a.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
         const runner = require('../core/automationRunner');
-        // Manual runs default to live; first-run confirm gate still applies.
-        setImmediate(async () => {
-            try { await runner.executeAutomation(a, { triggerKind: 'manual', triggerPayload: req.body?.triggerPayload || null, mode: 'live' }); }
-            catch (e) { console.error('[automation/run] error:', e.message); }
+
+        // Manual runs are user-initiated and should execute synchronously
+        // so the UI can immediately show what happened (success / per-step
+        // output / errors). Cap the wait so a misbehaving step can't hang
+        // the request; if the cap is hit, fall back to fire-and-forget.
+        const RESPONSE_TIMEOUT_MS = 60_000;
+        let timedOut = false;
+        const guard = new Promise((resolve) => setTimeout(() => { timedOut = true; resolve(null); }, RESPONSE_TIMEOUT_MS));
+
+        const runPromise = runner.executeAutomation(a, {
+            triggerKind: 'manual',
+            triggerPayload: req.body?.triggerPayload || null,
+            mode: 'live',
+        }).catch(e => { console.error('[automation/run] error:', e.message); return null; });
+
+        const run = await Promise.race([runPromise, guard]);
+
+        if (timedOut || !run) {
+            return res.status(202).json({
+                accepted: true,
+                pending: true,
+                message: 'Run is still in progress. Check the run history shortly.',
+            });
+        }
+        const steps = await automationStore.getRunSteps(run.id).catch(() => []);
+        return res.status(200).json({
+            accepted: true,
+            run,
+            steps,
         });
-        res.status(202).json({ accepted: true });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }

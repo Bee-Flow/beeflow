@@ -287,14 +287,27 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
     const session = await resolveUserSession(automation.userId);
 
     // First-run confirmation gate: any side-effect step + still-needed flag → flip to dry-run.
+    //
+    // Manual runs (the user clicked "Run now") are themselves explicit
+    // user confirmation — execute live and clear the flag for future
+    // scheduled runs. The gate only applies to scheduled / webhook /
+    // app-event triggers where the user isn't actively present.
     let effectiveMode = mode;
     let firstRunNeedsConfirm = false;
-    if (mode === 'live' && automation.needsFirstRunConfirm && !confirmFirstRun) {
+    const isUserInitiated = triggerKind === 'manual' || confirmFirstRun;
+    if (mode === 'live' && automation.needsFirstRunConfirm && !isUserInitiated) {
         const { hasSideEffects } = summariseDefinition(automation.definition || {});
         if (hasSideEffects) {
             effectiveMode = 'dry_run';
             firstRunNeedsConfirm = true;
         }
+    }
+    // For user-initiated manual runs, also clear the persisted flag so
+    // future scheduled runs no longer need a confirmation step. The
+    // user has now seen and approved this automation by running it.
+    if (isUserInitiated && automation.needsFirstRunConfirm) {
+        try { await automationStore.updateAutomation(automation.id, { needsFirstRunConfirm: false }, automation.userId); }
+        catch (_) { /* non-fatal */ }
     }
 
     // Create a run row (queued → running).
@@ -322,7 +335,8 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
         orgId: automation.organizationId,
         session,
         runId: run.id,
-        needsFirstRunConfirm: !!automation.needsFirstRunConfirm,
+        // Manual / confirmed runs bypass the per-step first-run guard too.
+        needsFirstRunConfirm: !!automation.needsFirstRunConfirm && !isUserInitiated,
         automationId: automation.id,
     };
 
