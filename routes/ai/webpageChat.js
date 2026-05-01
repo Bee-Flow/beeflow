@@ -225,7 +225,9 @@ router.post('/chat/webpage/stream', requireAuth, async (req, res) => {
 
         const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 
-        // Mode-aware planning rule (see chatMode above)
+        // Mode-aware planning rule (see chatMode above). The propose_webpage_plan
+        // tool is only EXPOSED in ask/plan modes — in auto mode it isn't even
+        // present in the tool list, so the AI literally cannot stop and ask.
         const planningRule = chatMode === 'plan'
             ? `MODE: PLAN.
 You MUST call propose_webpage_plan FIRST for every request that touches code. Even small edits — explore the relevant files via webpage_file_read, then propose a short plan and stop. Do NOT call any webpage_file_write / replace / patch / create_file / delete_file in the same turn. The system pauses and waits for the user to approve. After approval an authorisation message is injected and you may execute.`
@@ -233,7 +235,11 @@ You MUST call propose_webpage_plan FIRST for every request that touches code. Ev
             ? `MODE: ASK.
 Always propose a plan before making changes. Call propose_webpage_plan FIRST, list every file you intend to touch and what each change does, then stop. The user must approve before any edits run. After approval an authorisation message is injected and you may execute. Use this mode for high-stakes work where the user wants to review every change up front.`
             : `MODE: AUTO.
-You decide whether to plan first. Plan first (call propose_webpage_plan, then stop) when the user asks for a brand-new page, a multi-file change, or any rewrite that touches more than ~80 lines. For small, surgical edits (typo fix, single CSS tweak, single line change) skip planning and edit directly. After approval the system injects an authorisation; do NOT propose again on that turn.`;
+Just do the work — no approval step. The propose_webpage_plan tool is NOT available in this mode. For any user request:
+1. If you need to understand the current state, call webpage_file_read / webpage_list_files first. That is allowed and encouraged for non-trivial work.
+2. Then go straight to editing with the appropriate tool (webpage_file_write / replace / patch / create_file / delete_file).
+3. Never stop to ask the user "should I proceed?" — they chose Auto specifically to skip that. After your edits land, briefly explain what you did.
+For very large changes you can still narrate your approach in a sentence or two before the first tool call so the user sees what's coming, but DO NOT pause for approval.`;
 
         const systemPrompt = `You are a precise, efficient webpage-building assistant. Today is ${today}.
 
@@ -352,9 +358,11 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
 
         // Tool list
         const webpageTools = [...WEBPAGE_DOC_TOOLS, ...WEBPAGE_MULTI_FILE_TOOLS, WEBPAGE_ADD_SOURCE_TOOL];
-        // Plan tool only on regular (non-execution) turns. When the user
-        // approves a plan, we don't want the AI to propose another one.
-        if (!planExecution) webpageTools.push(PROPOSE_WEBPAGE_PLAN_TOOL);
+        // Plan tool exposed ONLY in ask/plan modes — auto mode is "just work,
+        // no approval gate". Also dropped on plan-execution turns so the AI
+        // can't propose another plan after the user already approved one.
+        const planToolAvailable = !planExecution && (chatMode === 'ask' || chatMode === 'plan');
+        if (planToolAvailable) webpageTools.push(PROPOSE_WEBPAGE_PLAN_TOOL);
         if (kbIds.length > 0) webpageTools.push(WEBPAGE_KB_SEARCH_TOOL);
         if (searchAvailable) webpageTools.push(...AGENT_SEARCH_TOOLS);
 
@@ -391,13 +399,19 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
 
             let toolResult;
             if (toolName === 'propose_webpage_plan') {
-                toolResult = executeProposeWebpagePlan(toolArgs);
-                if (toolResult._action === 'webpage_plan_proposed') {
-                    planProposedThisTurn = true;
-                    send('webpage_plan_proposed', {
-                        planId: toolResult.planId,
-                        plan: toolResult.plan,
-                    });
+                // Auto mode strips this tool from the toolset; if the AI
+                // somehow still calls it, refuse and tell it to just edit.
+                if (!planToolAvailable) {
+                    toolResult = { error: 'propose_webpage_plan is not available in Auto mode. Just make the edits directly using webpage_file_* / webpage_create_file / webpage_delete_file.' };
+                } else {
+                    toolResult = executeProposeWebpagePlan(toolArgs);
+                    if (toolResult._action === 'webpage_plan_proposed') {
+                        planProposedThisTurn = true;
+                        send('webpage_plan_proposed', {
+                            planId: toolResult.planId,
+                            plan: toolResult.plan,
+                        });
+                    }
                 }
             } else if (toolName.startsWith('webpage_file_')) {
                 toolResult = executeWebpageDocTool(toolName, toolArgs, liveFiles, { readSlots });
