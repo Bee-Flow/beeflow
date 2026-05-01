@@ -10,6 +10,8 @@ router.use('/', require('./published'));
 router.use('/', require('./system'));
 // Favorites must come before /:id routes so GET /favorites is not captured by GET /:id
 router.use('/', require('./favorites'));
+// Wizard endpoints (/wizard/*) must come before /:id routes
+router.use('/', require('./wizard'));
 
 // Specific /:id routes
 router.use('/', require('./crud'));

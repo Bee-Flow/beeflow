@@ -29,6 +29,7 @@ const {
     WEBPAGE_ADD_SOURCE_TOOL,
     executeWebpageDocTool,
 } = require('../../integrations/webpageDocTools');
+const { PROPOSE_WEBPAGE_PLAN_TOOL, executeProposeWebpagePlan } = require('../../integrations/webpagePlanTool');
 const { AGENT_SEARCH_TOOLS, executeAgentSearchTool, isAgentSearchTool } = require('../../integrations/agentSearchTools');
 const {
     searchWebpageKB,
@@ -49,6 +50,7 @@ router.post('/chat/webpage/stream', requireAuth, async (req, res) => {
     const {
         message, webpageId, history, modelTier, timezone, attachments,
         htmlContent, cssContent, jsContent, webpageSelection,
+        planExecution, // { planId, action: 'execute' } when user approved a plan
     } = req.body;
     const userId = req.session.user.id;
 
@@ -230,13 +232,22 @@ ${sourceSummary}
 - script.js (interactive behavior, optional)
 
 CRITICAL EDITING RULES:
-1. Always call webpage_file_read({ file }) before webpage_file_replace on the same file.
-2. Prefer webpage_file_replace for partial edits; reserve webpage_file_write for whole-file rewrites.
+1. Always call webpage_file_read({ file }) before webpage_file_replace or webpage_file_patch on the same file.
+2. Prefer partial edits over full rewrites:
+   - webpage_file_replace({file, find_text, replace_text [, replace_all]}) — substring replace. find_text must match EXACTLY ONCE by default; if it matches multiple places the tool errors with line numbers and asks you to either narrow the snippet or set replace_all: true.
+   - webpage_file_patch({file, start_line, end_line, expected_text, replacement}) — line-anchored replace with sanity check. Use when you know the line range; expected_text must match the current contents of those lines or the tool refuses (preventing corruption from a stale read).
+   - webpage_file_write — reserve for full-file rewrites or initial creation only.
 3. The HTML is rendered in a sandboxed iframe (sandbox="allow-scripts", no same-origin) — do NOT depend on parent-page cookies, localStorage, or fetches to the host app.
 4. Vanilla HTML/CSS/JS only — there is no build step. CDN <script> tags are fine when needed (loaded inside the iframe).
 5. The HTML can reference external CSS/JS via <link href="style.css"> and <script src="script.js"></script> — at download time the zip will contain real files matching those names. The in-app preview inlines them automatically, so EITHER style works.
 6. Style and behavior should match the user's described intent. If the description is sparse, default to a clean, modern aesthetic with sensible spacing, readable typography, and accessible color contrast.
 7. After applying changes via tool, briefly confirm what you did in the chat reply (e.g. "I added a hero section to index.html and centered the menu grid in style.css").
+
+[PLANNING — propose_webpage_plan]
+Before doing any non-trivial work, decide whether to plan first:
+- Plan first (call propose_webpage_plan ONCE, then stop) when: the user asks for a brand-new webpage, a multi-file change, or any rewrite that touches more than ~80 lines.
+- Edit directly (skip planning) when: the user asks for a small surgical change, a typo fix, a CSS tweak, or anything contained to a few lines.
+When you call propose_webpage_plan, do NOT call any webpage_file_* tool in the same turn — the system will pause and wait for the user to approve. After approval the system will inject an authorisation message and you can then execute using the regular file tools.
 
 [CURRENT FILE CONTENTS]
 ${filesBlock}
@@ -248,6 +259,18 @@ ${searchAvailable ? `[WEB SEARCH & SOURCES]
 Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = new Date(); const _dp = _now.toLocaleString('sv-SE', { timeZone: _tz }); const _lp = new Date(_now.toLocaleString('en-US', { timeZone: _tz })); const _om = Math.round((_lp - _now) / 60000); const _s = _om >= 0 ? '+' : '-'; const _a = Math.abs(_om); return `${_dp} UTC${_s}${String(Math.floor(_a / 60)).padStart(2, '0')}:${String(_a % 60).padStart(2, '0')} (${_tz})`; } catch (_) { return new Date().toISOString(); } })()}`;
 
         let messages = [{ role: 'system', content: systemPrompt }];
+
+        // Plan-execution turn: the user clicked Approve & build on a previously
+        // proposed plan. Inject a system-style authorisation so the AI proceeds
+        // straight to webpage_file_write / replace / patch without proposing
+        // another plan (the propose_webpage_plan tool is also stripped from
+        // the toolset above when planExecution is set).
+        if (planExecution && planExecution.action === 'execute' && planExecution.planId) {
+            messages.push({
+                role: 'system',
+                content: `The user APPROVED your previously proposed plan (planId=${planExecution.planId}). Execute it now using webpage_file_write / webpage_file_replace / webpage_file_patch. Do NOT call propose_webpage_plan again — the plan is already locked in.`,
+            });
+        }
 
         if (history && Array.isArray(history)) {
             for (const msg of history) {
@@ -283,6 +306,9 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
 
         // Tool list
         const webpageTools = [...WEBPAGE_DOC_TOOLS, WEBPAGE_ADD_SOURCE_TOOL];
+        // Plan tool only on regular (non-execution) turns. When the user
+        // approves a plan, we don't want the AI to propose another one.
+        if (!planExecution) webpageTools.push(PROPOSE_WEBPAGE_PLAN_TOOL);
         if (kbIds.length > 0) webpageTools.push(WEBPAGE_KB_SEARCH_TOOL);
         if (searchAvailable) webpageTools.push(...AGENT_SEARCH_TOOLS);
 
@@ -290,6 +316,9 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
         // model sees its own writes mid-turn.
         const liveFiles = { html, css, js };
         const dirtySlots = new Set();
+        // Per-turn read-set: tracks slots the AI called webpage_file_read on so
+        // the read-before-edit guard can warn when an edit comes in cold.
+        const readSlots = new Set();
 
         const tierSettings = tiers[resolvedTier] || {};
         const { TIER_DEFAULTS } = require('../../core/modelResolver');
@@ -301,6 +330,10 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
 
         let toolCallRounds = 0;
         const MAX_TOOL_ROUNDS = 5;
+        // Flips to true when the AI calls propose_webpage_plan — the chat
+        // handler exits the streaming/tool loop after the current round so the
+        // user gets a chance to approve before any files are touched.
+        let planProposedThisTurn = false;
 
         async function dispatchToolCall(toolCall) {
             const toolName = toolCall.function?.name || toolCall.name;
@@ -308,11 +341,20 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             try { toolArgs = JSON.parse(toolCall.function?.arguments || '{}'); } catch (e) {}
 
             console.log(`[WebpageChat] Tool: ${toolName}(${JSON.stringify(toolArgs).substring(0, 160)})`);
-            send('thinking', { text: `Using tool: ${toolName}...` });
+            send('tool_start', { name: toolName, args: toolArgs });
 
             let toolResult;
-            if (toolName.startsWith('webpage_file_')) {
-                toolResult = executeWebpageDocTool(toolName, toolArgs, liveFiles);
+            if (toolName === 'propose_webpage_plan') {
+                toolResult = executeProposeWebpagePlan(toolArgs);
+                if (toolResult._action === 'webpage_plan_proposed') {
+                    planProposedThisTurn = true;
+                    send('webpage_plan_proposed', {
+                        planId: toolResult.planId,
+                        plan: toolResult.plan,
+                    });
+                }
+            } else if (toolName.startsWith('webpage_file_')) {
+                toolResult = executeWebpageDocTool(toolName, toolArgs, liveFiles, { readSlots });
                 if (toolResult._action === 'webpage_doc_update') {
                     const slot = toolResult.file;
                     liveFiles[slot] = toolResult.content;
@@ -395,6 +437,12 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             toolCallRounds++;
             const toolResults = await Promise.all(result.toolCalls.map(dispatchToolCall));
             messages.push(...toolResults);
+
+            // If the AI proposed a plan this round, the turn is over — the
+            // user must approve before any further work happens. We still let
+            // the model emit a final natural-language response below so the
+            // chat shows a friendly "I'll build the following…" message.
+            if (planProposedThisTurn) break;
         }
 
         // Final streamed response
@@ -434,16 +482,19 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             const streamToolResults = await Promise.all(streamToolCalls.map(dispatchToolCall));
             messages.push(...streamToolResults);
 
-            fullContent = '';
-            const followUpCallback = (type, data) => {
-                if (type === 'text') {
-                    fullContent += data.text;
-                    send('content', { text: data.text });
-                } else if (type === 'thinking') {
-                    send('thinking', { text: data.text });
-                }
-            };
-            await adapter.stream(apiKey, apiUrl, modelId, messages, chatOptions, followUpCallback);
+            // Plan proposed via streaming path — same halt as the chat-loop branch.
+            if (!planProposedThisTurn) {
+                fullContent = '';
+                const followUpCallback = (type, data) => {
+                    if (type === 'text') {
+                        fullContent += data.text;
+                        send('content', { text: data.text });
+                    } else if (type === 'thinking') {
+                        send('thinking', { text: data.text });
+                    }
+                };
+                await adapter.stream(apiKey, apiUrl, modelId, messages, chatOptions, followUpCallback);
+            }
         }
 
         // Persist any tool-driven file updates to RustFS so versioning + sha256s

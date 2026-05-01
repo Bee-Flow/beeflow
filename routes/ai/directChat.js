@@ -31,6 +31,7 @@ const {
 const { resolveModelForTier } = require('../../core/modelResolver');
 const { WORKSPACE_TOOLS } = require('../../integrations/workspaceTools');
 const { BUILDER_TOOLS, isBuilderTool, executeBuilderTool } = require('../../integrations/webpageBuilderTools');
+const { PROPOSE_WEBPAGE_PLAN_TOOL, executeProposeWebpagePlan } = require('../../integrations/webpagePlanTool');
 const guardrailEventStore = require('../../stores/guardrailEventStore');
 const { buildTokenPreservationAddendum } = require('../../core/dlp/tokenPreservationPrompt');
 
@@ -88,11 +89,12 @@ Use for interactive charts (bar, line, scatter, heatmap, etc). Provide a complet
 {"$schema":"https://vega.github.io/schema/vega-lite/v5.json","data":{"values":[{"x":"A","y":28},{"x":"B","y":55}]},"mark":"bar","encoding":{"x":{"field":"x"},"y":{"field":"y","type":"quantitative"}}}
 \`\`\`
 
-### Interactive Webpages — call create_webpage + webpage_file_write
+### Interactive Webpages — call create_webpage + webpage_file_*
 Use for calculators, interactive demos, visualizations, games, landing pages, or any self-contained HTML+CSS+JS thing. The flow:
-  1. Call create_webpage({ name: "<short title>" }) — returns { webpageId, url }.
-  2. Call webpage_file_write({ webpageId, file: "html", content: "<full HTML>" }) — and the same for "css" and (if needed) "js".
-  3. End your reply with: "I built it: [<title>](<url>)" — the user can click to open the editor and refine it further.
+  1. **Plan first for non-trivial work.** When the user asks for a brand-new webpage or a multi-file change, your FIRST tool call should be propose_webpage_plan({ title, summary, steps[] }) and you should make NO other tool calls in that turn. The system pauses and waits for the user to approve. After approval, the system injects an authorisation message and you proceed with the build. Skip planning for tiny edits.
+  2. After approval (or for small edits), call create_webpage({ name }) if the page doesn't exist yet → returns { webpageId, url }.
+  3. Call webpage_file_write({ webpageId, file, content }) for each slot. Use webpage_file_replace / webpage_file_patch for partial edits.
+  4. End your reply with: "I built it: [<title>](<url>)" — the user can click to open the editor and refine it further.
 Vanilla HTML/CSS/JS only. CDN <script> tags inside the HTML are fine. Do NOT depend on parent-page cookies, localStorage, or fetches to the host app — the preview iframe is sandboxed with allow-scripts only.
 DO NOT emit \`\`\`html-app\`\`\` code blocks — they no longer render. Always use create_webpage + webpage_file_write instead.
 
@@ -145,7 +147,7 @@ function requireAuth(req, res, next) {
 // ─── Streaming Direct Chat ───────────────────────────────────────
 
 router.post('/chat/direct/stream', requireAuth, async (req, res) => {
-    const { message, conversationId, modelTier, history, attachments, imageGenSettings, nanoBananaSettings, disabledMedia, webSearchEnabled = true, notebookspaceContent, notebookspaceSelection, projectId, timezone, systemPrompt: requestSystemPrompt, activeSkillIds, reasoningEffort: requestReasoningEffort, sessionSkills: requestSessionSkills, activatedSessionSkillIds: requestActivatedSessionSkillIds, knowledgeBaseIds: requestedKbIds, swarmOptions: requestedSwarmOptions } = req.body;
+    const { message, conversationId, modelTier, history, attachments, imageGenSettings, nanoBananaSettings, disabledMedia, webSearchEnabled = true, notebookspaceContent, notebookspaceSelection, projectId, timezone, systemPrompt: requestSystemPrompt, activeSkillIds, reasoningEffort: requestReasoningEffort, sessionSkills: requestSessionSkills, activatedSessionSkillIds: requestActivatedSessionSkillIds, knowledgeBaseIds: requestedKbIds, swarmOptions: requestedSwarmOptions, planExecution: webpagePlanExecution } = req.body;
     const userId = req.session.user.id;
 
     if (!message && (!attachments || attachments.length === 0)) {
@@ -460,6 +462,15 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         send('model_selected', { tier: resolvedTier, modelId });
     }
 
+    // Per-turn webpage builder read-set — shared across every webpage_file_*
+    // call this turn so the read-before-edit guard can warn when an edit is
+    // issued on a slot the AI never read.
+    const webpageBuilderReadSlots = new Map();
+    // Flips to true when the AI calls propose_webpage_plan — the chat handler
+    // exits the tool loop after the current round so the user gets a chance to
+    // approve before any files are touched.
+    let webpagePlanProposedThisTurn = false;
+
     try {
         // Load tools enabled for this tier
         const allComponents = componentManager.getComponents();
@@ -605,13 +616,21 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         }
 
         // ─── Built-in: webpage builder tools (gated on webpages beta) ─
+        let webpageBetaEnabled = false;
         try {
             const { userHasBetaFeature: userHasWebpagesBetaForBuilder } = require('../../core/betaFeatures');
-            if (await userHasWebpagesBetaForBuilder(userId, 'webpages', req.session)) {
+            webpageBetaEnabled = await userHasWebpagesBetaForBuilder(userId, 'webpages', req.session);
+            if (webpageBetaEnabled) {
                 for (const tool of BUILDER_TOOLS) {
                     if (!directChatTools.find(t => t.function.name === tool.function.name)) {
                         directChatTools.push(tool);
                     }
+                }
+                // Plan tool only when this is NOT a plan-execution turn — on
+                // execution we strip it so the AI can't propose another plan
+                // mid-flight.
+                if (!webpagePlanExecution) {
+                    directChatTools.push(PROPOSE_WEBPAGE_PLAN_TOOL);
                 }
                 console.log('[DirectChat] Webpage builder tools enabled for user');
             }
@@ -866,6 +885,18 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             { role: 'system', content: basePrompt + toolHint + memoryContext + notebookspaceContext + projectContext + skillsContext },
             { role: 'system', content: `Now: ${_nowStr}` },
         ];
+
+        // Plan-execution turn: the user clicked Approve & build on a previously
+        // proposed webpage plan. Inject an authorisation so the AI proceeds
+        // straight to webpage_file_* / create_webpage without proposing a new
+        // plan. The propose_webpage_plan tool is also stripped from the
+        // toolset above when webpagePlanExecution is set.
+        if (webpagePlanExecution && webpagePlanExecution.action === 'execute' && webpagePlanExecution.planId) {
+            messages.push({
+                role: 'system',
+                content: `The user APPROVED your previously proposed webpage plan (planId=${webpagePlanExecution.planId}). Execute it now using create_webpage / webpage_file_write / webpage_file_replace / webpage_file_patch. Do NOT call propose_webpage_plan again — the plan is already locked in.`,
+            });
+        }
 
         // Add conversation history — preserve the `attachments` sidecar so the
         // hydrator below can rebuild multimodal content (images stay visible
@@ -2343,8 +2374,17 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                                     }
                                 }
                             }
-                            if (isBuilderTool(toolName)) {
-                                const builderOut = await executeBuilderTool(toolName, toolArgs, { userId });
+                            if (toolName === 'propose_webpage_plan') {
+                                toolResult = executeProposeWebpagePlan(toolArgs);
+                                if (toolResult._action === 'webpage_plan_proposed') {
+                                    webpagePlanProposedThisTurn = true;
+                                    send('webpage_plan_proposed', {
+                                        planId: toolResult.planId,
+                                        plan: toolResult.plan,
+                                    });
+                                }
+                            } else if (isBuilderTool(toolName)) {
+                                const builderOut = await executeBuilderTool(toolName, toolArgs, { userId, readSlots: webpageBuilderReadSlots });
                                 toolResult = builderOut.result;
                                 if (builderOut.webpageUpdate) {
                                     const { webpageId, file, content, title } = builderOut.webpageUpdate;
@@ -2527,6 +2567,12 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
 
                     // Strip internal _toolResult before pushing to messages
                     messages.push(...toolResults.map(({ _toolResult, ...rest }) => rest));
+                    // If the AI proposed a webpage plan this round, halt the
+                    // tool loop so the user can approve before any work
+                    // happens. The streamed final response below still runs so
+                    // the chat shows the AI's "I'd like to do X — review the
+                    // plan above" message.
+                    if (webpagePlanProposedThisTurn) break;
                     continue;
                 }
             }
@@ -2935,8 +2981,17 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                             }
                         }
                     }
-                    if (isBuilderTool(toolName)) {
-                        const builderOut = await executeBuilderTool(toolName, toolArgs, { userId });
+                    if (toolName === 'propose_webpage_plan') {
+                        toolResult = executeProposeWebpagePlan(toolArgs);
+                        if (toolResult._action === 'webpage_plan_proposed') {
+                            webpagePlanProposedThisTurn = true;
+                            send('webpage_plan_proposed', {
+                                planId: toolResult.planId,
+                                plan: toolResult.plan,
+                            });
+                        }
+                    } else if (isBuilderTool(toolName)) {
+                        const builderOut = await executeBuilderTool(toolName, toolArgs, { userId, readSlots: webpageBuilderReadSlots });
                         toolResult = builderOut.result;
                         if (builderOut.webpageUpdate) {
                             const { webpageId, file, content, title } = builderOut.webpageUpdate;
@@ -3125,6 +3180,12 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
 
             // Strip internal fields before pushing to messages
             messages.push(...toolResults.map(({ _toolResult, _toolName, ...rest }) => rest));
+
+            // If the AI proposed a webpage plan, stop the streaming tool loop
+            // and let the next streamed text come out (so the chat shows the
+            // AI's natural-language summary alongside the plan card). No
+            // further file edits run this turn.
+            if (webpagePlanProposedThisTurn) break;
 
             // Stream the follow-up response after tool execution (with tools for multi-round)
             fullContent = '';

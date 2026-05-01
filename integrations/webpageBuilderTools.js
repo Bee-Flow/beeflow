@@ -114,10 +114,24 @@ function isBuilderTool(toolName) {
 
 /**
  * Execute a builder tool call.
- * Returns { result, webpageUpdate? } where webpageUpdate = { webpageId, file, content }
- * for tools that mutate a file (so directChat can emit the SSE event).
+ *
+ * @param {string} toolName
+ * @param {object} args
+ * @param {{ userId: string, readSlots?: Map<string, Set<string>> }} ctx
+ *   readSlots is keyed by webpageId — tracks which slots the AI has read this
+ *   call-batch so the read-before-edit guard can warn when an edit comes in
+ *   on a slot it never read.
+ * @returns {{ result, webpageUpdate?: { webpageId, file, content, title? } }}
  */
-async function executeBuilderTool(toolName, args, { userId }) {
+async function executeBuilderTool(toolName, args, ctx) {
+    const { userId, readSlots } = ctx;
+
+    function readSetFor(webpageId) {
+        if (!readSlots) return null;
+        if (!readSlots.has(webpageId)) readSlots.set(webpageId, new Set());
+        return readSlots.get(webpageId);
+    }
+
     if (toolName === 'create_webpage') {
         const name = (args.name || 'Untitled Webpage').trim().slice(0, 120);
         const description = (args.description || '').slice(0, 500);
@@ -135,7 +149,7 @@ async function executeBuilderTool(toolName, args, { userId }) {
         const webpage = await webpageStore.getWebpage(webpageId, userId).catch(() => null);
         if (!webpage) return { result: { error: `Webpage ${webpageId} not found.` } };
         const files = await webpageStore.readAllSlots(userId, webpageId);
-        const docResult = executeWebpageDocTool('webpage_file_read', { file }, files);
+        const docResult = executeWebpageDocTool('webpage_file_read', { file }, files, { readSlots: readSetFor(webpageId) });
         return { result: docResult };
     }
 
@@ -145,12 +159,10 @@ async function executeBuilderTool(toolName, args, { userId }) {
         const webpage = await webpageStore.getWebpage(webpageId, userId).catch(() => null);
         if (!webpage) return { result: { error: `Webpage ${webpageId} not found.` } };
 
-        // Apply to in-memory triple, get result for SSE emission
         const files = { html: '', css: '', js: '' };
         const docResult = executeWebpageDocTool('webpage_file_write', { file, content, title }, files);
         if (docResult.error) return { result: docResult };
 
-        // Persist to RustFS
         await webpageStore.writeSlot(userId, webpageId, file, content);
         console.log(`[WebpageBuilder] webpage_file_write: ${file} → ${webpageId} (${content.length} chars)`);
 
@@ -160,21 +172,22 @@ async function executeBuilderTool(toolName, args, { userId }) {
         };
     }
 
-    if (toolName === 'webpage_file_replace') {
-        const { webpageId, file, find_text, replace_text } = args;
+    if (toolName === 'webpage_file_replace' || toolName === 'webpage_file_patch') {
+        const { webpageId, file } = args;
         if (!webpageId) return { result: { error: 'webpageId is required.' } };
         const webpage = await webpageStore.getWebpage(webpageId, userId).catch(() => null);
         if (!webpage) return { result: { error: `Webpage ${webpageId} not found.` } };
 
-        // Read current content from RustFS
+        // Read current content from RustFS — pass through to the doc tool
         const files = await webpageStore.readAllSlots(userId, webpageId);
-        const docResult = executeWebpageDocTool('webpage_file_replace', { file, find_text, replace_text }, files);
+        const docArgs = { ...args };
+        delete docArgs.webpageId;
+        const docResult = executeWebpageDocTool(toolName, docArgs, files, { readSlots: readSetFor(webpageId) });
         if (docResult.error) return { result: docResult };
 
-        // Persist the patched content
         const newContent = docResult.content;
         await webpageStore.writeSlot(userId, webpageId, file, newContent);
-        console.log(`[WebpageBuilder] webpage_file_replace: ${file} in ${webpageId}`);
+        console.log(`[WebpageBuilder] ${toolName}: ${file} in ${webpageId}`);
 
         return {
             result: { message: docResult.message, file, webpageId },
