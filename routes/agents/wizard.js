@@ -1,5 +1,6 @@
 const express = require('express');
 const agentStore = require('../../stores/agentStore');
+const skillStore = require('../../stores/skillStore');
 const { requirePermission, resolveUserOrgIds } = require('../../auth');
 const { getEffectiveUserId } = require('../../utils/routeHelpers');
 const { extractJSON } = require('../../pipeline/llmHelpers');
@@ -117,13 +118,33 @@ router.post('/wizard/commit', requirePermission('manage_agents'), async (req, re
         const orgIds = await resolveUserOrgIds(req);
         const orgId = orgIds && orgIds.size > 0 ? Array.from(orgIds)[0] : null;
 
+        // Best-effort: resolve suggestedSkills (by name) to real skill IDs in this org.
+        let attachedSkillIds = [];
+        try {
+            if (orgId && Array.isArray(plan.suggestedSkills) && plan.suggestedSkills.length > 0) {
+                const orgSkills = await skillStore.getAvailableSkills(orgId, userId);
+                const byName = new Map(orgSkills.map(s => [String(s.name || '').toLowerCase().trim(), s.id]));
+                attachedSkillIds = plan.suggestedSkills
+                    .map(s => byName.get(String(s.name || '').toLowerCase().trim()))
+                    .filter(Boolean);
+            }
+        } catch (_) { /* skills feature may be disabled — leave empty */ }
+
+        // Canonical agent config shape — must match what AgentEditorUI / agentRuntime read.
+        // `enabledIntegrations: null` means "all org-allowed integrations enabled" (matches AgentDesigner default).
         const config = {
             avatar: plan.avatar || '🤖',
+            enabledIntegrations: null,
+            knowledge_base_ids: [],
+            attachedSkillIds,
+            memoryEnabled: false,
+            strictKnowledge: false,
+            includeSourceReferences: false,
+            // Keep the wizard plan around for traceability / re-opening the wizard later.
             wizard: {
                 channels: plan.channels || [],
                 capabilities: plan.capabilities || [],
                 suggestedSkills: plan.suggestedSkills || [],
-                memoryEnabled: false,
             },
         };
 
