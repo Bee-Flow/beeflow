@@ -249,45 +249,57 @@ router.post('/wizard/commit', requirePermission('manage_agents'), async (req, re
         let attachedSkillIds = [];
         const createdSkills = [];
         if (orgId && Array.isArray(plan.skills) && plan.skills.length > 0) {
+            // Best-effort lookup of existing skills — but a failure here must NOT
+            // block creation of new ones. Default to empty list on error.
+            let orgSkills = [];
             try {
-                const orgSkills = await skillStore.getAvailableSkills(orgId, userId);
-                const knownIds = new Set(orgSkills.map(s => s.id));
-                const byName = new Map(orgSkills.map(s => [String(s.name || '').toLowerCase().trim(), s.id]));
+                orgSkills = await skillStore.getAvailableSkills(orgId, userId);
+            } catch (lookupErr) {
+                console.warn('Wizard: getAvailableSkills failed, will only create new skills:', lookupErr.message);
+            }
+            const knownIds = new Set((orgSkills || []).map(s => s.id));
+            const byName = new Map((orgSkills || []).map(s => [String(s.name || '').toLowerCase().trim(), s.id]));
 
-                for (const s of plan.skills) {
-                    const wantId = s.id && knownIds.has(s.id) ? s.id : null;
-                    if (wantId) { attachedSkillIds.push(wantId); continue; }
+            for (const s of plan.skills) {
+                if (!s || !s.name) continue;
 
-                    // Try a name match before creating a duplicate
-                    const matchByName = byName.get(String(s.name || '').toLowerCase().trim());
-                    if (matchByName) { attachedSkillIds.push(matchByName); continue; }
+                // Reuse existing skill by id when valid
+                if (s.id && knownIds.has(s.id)) { attachedSkillIds.push(s.id); continue; }
 
-                    // Create the skill
-                    try {
-                        const created = await skillStore.createSkill({
-                            orgId,
-                            userId,
-                            name: s.name,
-                            description: s.description || '',
-                            instructions: (s.instructions || '').slice(0, 4000),
-                            workflow: '',
-                            rules: '',
-                            examples: '',
-                            icon: null,
-                            isShared: false,
-                            dynamicActivation: false,
-                            sharedGroups: [],
-                        });
-                        if (created?.id) {
-                            attachedSkillIds.push(created.id);
-                            createdSkills.push(created);
-                        }
-                    } catch (createErr) {
-                        console.warn('Wizard: skill create failed (non-fatal):', createErr.message);
+                // Reuse by case-insensitive name match before creating a duplicate
+                const nameKey = String(s.name).toLowerCase().trim();
+                const matchByName = byName.get(nameKey);
+                if (matchByName) { attachedSkillIds.push(matchByName); continue; }
+
+                // Create the skill — isolate failures per skill so one bad
+                // entry doesn't drop the rest.
+                try {
+                    const created = await skillStore.createSkill({
+                        orgId,
+                        userId,
+                        name: s.name,
+                        description: s.description || '',
+                        instructions: (s.instructions || '').slice(0, 4000),
+                        workflow: '',
+                        rules: '',
+                        examples: '',
+                        icon: null,
+                        isShared: false,
+                        dynamicActivation: false,
+                        sharedGroups: [],
+                    });
+                    if (created?.id) {
+                        attachedSkillIds.push(created.id);
+                        createdSkills.push(created);
+                    } else {
+                        console.warn('Wizard: createSkill returned no id for', s.name);
                     }
+                } catch (createErr) {
+                    console.warn('Wizard: skill create failed for', s.name, ':', createErr.message);
                 }
-            } catch (_) { /* skills feature may be disabled */ }
+            }
         }
+        console.log(`[Wizard commit] attached skills: ${attachedSkillIds.length}, newly created: ${createdSkills.length}`);
 
         // ── Integrations: validate ids against the user's allow-list ──
         // (defensive — the LLM should already only pick from allowed ones,
