@@ -1,6 +1,7 @@
 const express = require('express');
 const agentStore = require('../../stores/agentStore');
 const skillStore = require('../../stores/skillStore');
+const kbStore = require('../../stores/knowledgeBases');
 const { requirePermission, resolveUserOrgIds } = require('../../auth');
 const { getEffectiveUserId } = require('../../utils/routeHelpers');
 const { extractJSON } = require('../../pipeline/llmHelpers');
@@ -13,7 +14,7 @@ const PLAN_SCHEMA = `{
   "name": "string (short, friendly agent name)",
   "description": "string (1-2 sentences, second person, Dutch if user wrote Dutch)",
   "avatar": "single emoji",
-  "channels": ["chatgpt" | "slack" | "teams" | "discord" | "email"],
+  "channels": ["chat" | "slack" | "teams" | "discord" | "email"],
   "capabilities": ["string", ...]  // 2-5 short capability bullets
   "suggestedSkills": [{ "name": "string", "reason": "string" }],
   "systemPrompt": "string (concrete instructions for the agent, written in the user's language)"
@@ -130,21 +131,38 @@ router.post('/wizard/commit', requirePermission('manage_agents'), async (req, re
             }
         } catch (_) { /* skills feature may be disabled — leave empty */ }
 
+        // Auto-create a dedicated KB so users can upload files immediately —
+        // they shouldn't need to leave the wizard to set up a knowledge base.
+        let knowledge_base_ids = [];
+        try {
+            const kb = await kbStore.createKB(
+                userId,
+                plan.name,
+                `Auto-generated knowledge base for agent "${plan.name}"`,
+                'unknown',
+                orgId,
+                {}
+            );
+            if (kb?.id) knowledge_base_ids = [kb.id];
+        } catch (err) {
+            console.warn('Wizard: KB auto-create failed (non-fatal):', err.message);
+        }
+
         // Canonical agent config shape — must match what AgentEditorUI / agentRuntime read.
         // `enabledIntegrations: null` means "all org-allowed integrations enabled" (matches AgentDesigner default).
         const config = {
             avatar: plan.avatar || '🤖',
             enabledIntegrations: null,
-            knowledge_base_ids: [],
+            knowledge_base_ids,
             attachedSkillIds,
             memoryEnabled: false,
             strictKnowledge: false,
             includeSourceReferences: false,
             // Keep the wizard plan around for traceability / re-opening the wizard later.
             wizard: {
-                channels: plan.channels || [],
                 capabilities: plan.capabilities || [],
                 suggestedSkills: plan.suggestedSkills || [],
+                primaryKbId: knowledge_base_ids[0] || null,
             },
         };
 
