@@ -407,6 +407,8 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
                 toolResult = { error: `Unknown tool: ${toolName}` };
             }
 
+            send('tool_end', { name: toolName, result: toolResult });
+
             return {
                 role: 'tool',
                 tool_call_id: toolCall.id,
@@ -414,86 +416,96 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             };
         }
 
-        // Tool-calling loop (chat-style)
-        while (toolCallRounds < MAX_TOOL_ROUNDS) {
-            let result;
-            try {
-                result = await adapter.chat(apiKey, apiUrl, modelId, messages, {
-                    ...chatOptions,
-                    tools: webpageTools,
-                    toolChoice: 'auto',
-                });
-            } catch (err) {
-                console.error('[WebpageChat] Tool-check error:', err.message);
-                break;
-            }
-            if (!result.toolCalls || result.toolCalls.length === 0) break;
-
-            messages.push({
-                role: 'assistant',
-                content: result.content || null,
-                tool_calls: result.toolCalls,
-            });
-            toolCallRounds++;
-            const toolResults = await Promise.all(result.toolCalls.map(dispatchToolCall));
-            messages.push(...toolResults);
-
-            // If the AI proposed a plan this round, the turn is over — the
-            // user must approve before any further work happens. We still let
-            // the model emit a final natural-language response below so the
-            // chat shows a friendly "I'll build the following…" message.
-            if (planProposedThisTurn) break;
-        }
-
-        // Final streamed response
+        // Unified streaming loop: every model round streams, so users see
+        // text + reasoning + tool calls immediately rather than waiting on
+        // blocking chat completions before the first paint.
         let fullContent = '';
-        const streamOptions = {
-            ...chatOptions,
-            tools: toolCallRounds === 0 ? webpageTools : undefined,
-            toolChoice: toolCallRounds === 0 ? 'auto' : undefined,
-        };
         let streamToolCalls = [];
+        let streamThinkingParts = {};
+
         const streamCallback = (type, data) => {
             if (type === 'text') {
                 fullContent += data.text;
                 send('content', { text: data.text });
+            } else if (type === 'thinking_start') {
+                if (data.partId) {
+                    streamThinkingParts[data.partId] = { redacted: !!data.redacted };
+                    send('thinking_start', { partId: data.partId, redacted: data.redacted || undefined });
+                }
             } else if (type === 'thinking') {
-                send('thinking', { text: data.text });
-            } else if (type === 'tool_use') {
+                send('thinking', { text: data.text, partId: data.partId });
+            } else if (type === 'thinking_stop') {
+                if (data.partId) {
+                    send('thinking_stop', { partId: data.partId, redacted: data.redacted || undefined });
+                }
+            } else if (type === 'tool_use' || type === 'tool_call') {
                 streamToolCalls.push({
                     id: data.id || `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                     type: 'function',
-                    function: { name: data.name, arguments: JSON.stringify(data.input || {}) },
+                    function: {
+                        name: data.name || data.function?.name,
+                        arguments: typeof data.input !== 'undefined'
+                            ? JSON.stringify(data.input || {})
+                            : (data.function?.arguments || '{}'),
+                    },
                 });
             } else if (type === 'error') {
                 send('error', data);
             }
         };
 
-        await adapter.stream(apiKey, apiUrl, modelId, messages, streamOptions, streamCallback);
+        while (toolCallRounds < MAX_TOOL_ROUNDS) {
+            fullContent = '';
+            streamToolCalls = [];
+            streamThinkingParts = {};
 
-        // Stream-driven tool calls (e.g. Anthropic / Google adapters)
-        if (streamToolCalls.length > 0 && toolCallRounds < MAX_TOOL_ROUNDS) {
+            const streamOptions = {
+                ...chatOptions,
+                tools: webpageTools,
+                toolChoice: 'auto',
+            };
+
+            try {
+                await adapter.stream(apiKey, apiUrl, modelId, messages, streamOptions, streamCallback);
+            } catch (err) {
+                console.error('[WebpageChat] Stream error:', err.message);
+                send('error', { error: `Chat error: ${err.message}` });
+                break;
+            }
+
+            if (streamToolCalls.length === 0) break;
+
             messages.push({
                 role: 'assistant',
                 content: fullContent || null,
                 tool_calls: streamToolCalls,
             });
-            const streamToolResults = await Promise.all(streamToolCalls.map(dispatchToolCall));
-            messages.push(...streamToolResults);
+            toolCallRounds++;
+            const toolResults = await Promise.all(streamToolCalls.map(dispatchToolCall));
+            messages.push(...toolResults);
 
-            // Plan proposed via streaming path — same halt as the chat-loop branch.
-            if (!planProposedThisTurn) {
+            // Plan proposed — stop the loop. Then run one more streaming
+            // round (no tools) so the model can deliver its natural-language
+            // "I'll build the following…" message above the plan card.
+            if (planProposedThisTurn) {
                 fullContent = '';
-                const followUpCallback = (type, data) => {
-                    if (type === 'text') {
-                        fullContent += data.text;
-                        send('content', { text: data.text });
-                    } else if (type === 'thinking') {
-                        send('thinking', { text: data.text });
-                    }
-                };
-                await adapter.stream(apiKey, apiUrl, modelId, messages, chatOptions, followUpCallback);
+                streamToolCalls = [];
+                try {
+                    await adapter.stream(apiKey, apiUrl, modelId, messages, chatOptions, streamCallback);
+                } catch (err) {
+                    console.error('[WebpageChat] Plan wrap-up stream error:', err.message);
+                }
+                break;
+            }
+        }
+
+        // Hit MAX_TOOL_ROUNDS with tool calls still pending — give the model
+        // one chance to summarise without offering more tools.
+        if (toolCallRounds >= MAX_TOOL_ROUNDS && streamToolCalls.length > 0) {
+            try {
+                await adapter.stream(apiKey, apiUrl, modelId, messages, chatOptions, streamCallback);
+            } catch (err) {
+                console.error('[WebpageChat] Final wrap-up stream error:', err.message);
             }
         }
 
