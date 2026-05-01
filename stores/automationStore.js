@@ -252,6 +252,11 @@ async function updateRun(id, updates) {
 
 async function recordRunStep({ runId, stepId, stepType, attempts = 1, status, startedAt, finishedAt, input, output, error }) {
     await initDB();
+    if (!runId || !stepId) {
+        // Defensive: NOT NULL columns; skip rather than crash the whole run.
+        console.warn(`[AutomationStore] recordRunStep called with null runId/stepId — skipping (runId=${runId}, stepId=${stepId})`);
+        return;
+    }
     await run(
         `INSERT INTO automation_run_steps (run_id, step_id, step_type, attempts, status, started_at, finished_at, input_json, output_json, error)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)

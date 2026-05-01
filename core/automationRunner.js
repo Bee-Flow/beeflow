@@ -319,6 +319,13 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
 
     const dispatchStep = async (step, ctx_, state_, mode_) => {
         const stepStartedAt = new Date().toISOString();
+        // Defensive: a step missing `id` would crash recordRunStep
+        // (step_id is NOT NULL). Synthesize one so we never write null
+        // and so retries / errors still get a unique row.
+        if (!step.id) {
+            step.id = `unknown_${Math.random().toString(36).slice(2, 8)}`;
+            console.warn(`[AutomationRunner] Step missing id; synthesized ${step.id}`);
+        }
         let result;
         try {
             switch (step.type) {

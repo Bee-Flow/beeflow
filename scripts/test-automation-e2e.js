@@ -65,7 +65,7 @@ async function main() {
         const badRef = JSON.parse(JSON.stringify(def));
         badRef.steps[0].inputs.query = { kind: 'ref', path: 'steps.unknown.output.foo' };
         const v3 = validateDefinition(badRef);
-        ok('forward/unknown ref rejected', !v3.ok);
+        ok('forward/unknown ref produces warning, not error', v3.ok && Array.isArray(v3.warnings) && v3.warnings.some(w => w.includes('unknown')));
     }
 
     console.log('\n— expr.js —');

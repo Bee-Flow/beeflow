@@ -35,21 +35,30 @@ function lastStepId(def) {
 
 // ── Tool schemas (injected to the LLM) ─────────────────
 
+// ─── Binding format reminder for the AI ──────────────────────────
+// Every input value MUST be one of these shapes (or a plain JSON literal,
+// which is treated as { kind: 'literal', value: ... }):
+//   { "kind": "literal",  "value": <any> }
+//   { "kind": "ref",      "path":  "steps.s1.output.items[0].subject" }
+//   { "kind": "template", "value": "Found {{steps.s1.output.count}} items" }
+//   { "kind": "expr",     "value": "steps.s1.output.amount > 1000" }
+const BINDING_HINT = 'Each input value must be a binding: {"kind":"literal","value":...} OR {"kind":"ref","path":"steps.<id>.output.<field>"} OR {"kind":"template","value":"... {{steps.x.output.y}} ..."} OR {"kind":"expr","value":"<restricted-js>"}.';
+
 const TOOL_SCHEMAS = [
     {
         type: 'function',
         function: {
             name: 'builder_propose_trigger',
-            description: 'Set the automation trigger. Call this first when starting a new draft.',
+            description: 'Set or replace the automation trigger. ALWAYS call this first when starting a new draft. Cron uses standard 5-field syntax (minute hour dom month dow). EXAMPLES: weekly Monday 9am Europe/Amsterdam → {kind:"schedule",cron:"0 9 * * 1",tz:"Europe/Amsterdam"}. First Monday of the month → {kind:"schedule",cron:"0 9 1-7 * 1",tz:"Europe/Amsterdam"}. New Gmail event → {kind:"app_event",appProvider:"gmail",appEvent:"mail.new",filter:{label:"Invoices"}}.',
             parameters: {
                 type: 'object',
                 properties: {
                     kind: { type: 'string', enum: ['schedule', 'manual', 'webhook', 'app_event'] },
-                    cron: { type: 'string', description: '5-field cron expression (when kind=schedule)' },
-                    tz: { type: 'string', description: 'IANA timezone (when kind=schedule)' },
-                    appProvider: { type: 'string', description: 'Provider id (when kind=app_event), e.g. gmail' },
-                    appEvent: { type: 'string', description: 'Event name (when kind=app_event), e.g. mail.new' },
-                    filter: { type: 'object', description: 'Optional filter object to match on payload (kind=app_event)' },
+                    cron: { type: 'string', description: 'Standard 5-field cron, REQUIRED when kind=schedule. Use exact format: minute hour day-of-month month day-of-week. Example: "0 9 * * 1" = every Monday at 9:00.' },
+                    tz: { type: 'string', description: 'IANA timezone, e.g. Europe/Amsterdam (when kind=schedule).' },
+                    appProvider: { type: 'string', description: 'Provider id (when kind=app_event): gmail | google-calendar | msgraph | github' },
+                    appEvent: { type: 'string', description: 'Event name (when kind=app_event), e.g. mail.new for Gmail.' },
+                    filter: { type: 'object', description: 'Optional filter object that must shallowly match the event payload.' },
                 },
                 required: ['kind'],
             },
@@ -59,14 +68,14 @@ const TOOL_SCHEMAS = [
         type: 'function',
         function: {
             name: 'builder_add_action',
-            description: 'Append an integration action step that calls a tool the user has connected.',
+            description: `Append an integration action that calls a real connected tool. The tool name MUST match the catalog exactly. ${BINDING_HINT} EXAMPLE — search Gmail for unread invoices: {tool:"gmail_search",inputs:{query:{kind:"literal",value:"label:Invoices is:unread"},maxResults:{kind:"literal",value:20}},label:"Find invoices"}. EXAMPLE — read a specific email: {tool:"gmail_read",inputs:{messageId:{kind:"ref",path:"loop.email.id"}}}. NEVER pass plain strings as input values; ALWAYS wrap in {kind,...}.`,
             parameters: {
                 type: 'object',
                 properties: {
-                    afterStepId: { type: 'string', description: 'Insert after this step id (default: last step)' },
-                    tool: { type: 'string', description: 'Tool name from the catalog' },
-                    inputs: { type: 'object', description: 'Map of input-name to binding ({kind:"literal"|"ref"|"template"|"expr",...})' },
-                    label: { type: 'string' },
+                    afterStepId: { type: 'string', description: 'Insert after this step id. Default: last step.' },
+                    tool: { type: 'string', description: 'Exact tool name from the catalog (e.g. gmail_search, gmail_compose, calendar_create_event).' },
+                    inputs: { type: 'object', description: `Map of input-name to a binding object. ${BINDING_HINT}` },
+                    label: { type: 'string', description: 'Short human-readable label for the diagram.' },
                 },
                 required: ['tool'],
             },
@@ -76,15 +85,15 @@ const TOOL_SCHEMAS = [
         type: 'function',
         function: {
             name: 'builder_add_ai_step',
-            description: 'Append an AI reasoning step that processes upstream data. No tool calls allowed.',
+            description: `Append an AI reasoning step that transforms or summarises upstream data. No tool calls allowed inside an ai_step. Use this for: extracting structured fields from text, summarising, classifying, drafting reply text, etc. ${BINDING_HINT} EXAMPLE — extract invoice fields: {prompt:"Extract amount, currency, vendor, dueDate from this invoice email.",inputs:{emailBody:{kind:"ref",path:"loop.email.body"},emailSubject:{kind:"ref",path:"loop.email.subject"}},outputSchema:{type:"object",properties:{amount:{type:"number"},currency:{type:"string"},vendor:{type:"string"},dueDate:{type:"string"}}},modelTier:"fast"}.`,
             parameters: {
                 type: 'object',
                 properties: {
                     afterStepId: { type: 'string' },
-                    prompt: { type: 'string', description: 'Prompt for the model' },
-                    inputs: { type: 'object', description: 'Map of binding-name to {kind,...}' },
-                    outputSchema: { type: 'object', description: 'Optional JSON schema; the runner will request structured output' },
-                    modelTier: { type: 'string', enum: ['fast', 'standard', 'thinking'], description: 'Default: fast' },
+                    prompt: { type: 'string', description: 'The instruction for the AI. Reference the inputs by name.' },
+                    inputs: { type: 'object', description: `Map of binding-name to a binding object. ${BINDING_HINT}` },
+                    outputSchema: { type: 'object', description: 'JSON schema describing the desired structured output. Strongly recommended so downstream steps can reference fields.' },
+                    modelTier: { type: 'string', enum: ['auto', 'fast', 'standard', 'thinking'], description: 'Default: fast. Use "thinking" only for complex multi-step reasoning.' },
                     label: { type: 'string' },
                 },
                 required: ['prompt'],
@@ -95,14 +104,14 @@ const TOOL_SCHEMAS = [
         type: 'function',
         function: {
             name: 'builder_add_condition',
-            description: 'Append an if/else branch on a restricted JS expression.',
+            description: 'Append an if/else branch. The expr is a restricted JS expression — supports member access, comparisons, &&, ||, ?:, math. NO function calls. EXAMPLES: "steps.parse.output.amount > 1000", "steps.s1.output.count == 0", "loop.email.subject == \\"Urgent\\"". After adding, call builder_add_action / builder_add_ai_step / builder_add_notification with afterStepId pointing to this condition\'s id to grow the "then" branch; the "else" branch is built by passing thenStepId/elseStepId on this same call.',
             parameters: {
                 type: 'object',
                 properties: {
                     afterStepId: { type: 'string' },
-                    expr: { type: 'string', description: 'Expression like "steps.s1.output.amount > 1000"' },
-                    thenStepId: { type: 'string' },
-                    elseStepId: { type: 'string' },
+                    expr: { type: 'string', description: 'Restricted JS expression (no function calls).' },
+                    thenStepId: { type: 'string', description: 'Optional id of an existing step to wire as the "then" branch.' },
+                    elseStepId: { type: 'string', description: 'Optional id of an existing step to wire as the "else" branch.' },
                     label: { type: 'string' },
                 },
                 required: ['expr'],
@@ -113,15 +122,15 @@ const TOOL_SCHEMAS = [
         type: 'function',
         function: {
             name: 'builder_add_loop',
-            description: 'Append a for-each loop over an upstream array.',
+            description: `Append a for-each loop over an upstream array. The body is a SUB-DAG of steps that runs once per item. Inside the body, refer to the current item as loop.<itemVar>. ${BINDING_HINT} EXAMPLE — for each invoice email, extract fields and create YouTrack issue: {overRef:"steps.search.output.items",itemVar:"email",maxIterations:50,body:[{type:"ai_step",prompt:"Extract amount and vendor.",inputs:{body:{kind:"ref",path:"loop.email.body"}}},{type:"integration_action",tool:"youtrack_create_issue",inputs:{summary:{kind:"template",value:"Invoice {{loop.email.subject}}"}}}]}. IMPORTANT: every body step MUST have a "type" field; the system will assign ids if missing.`,
             parameters: {
                 type: 'object',
                 properties: {
                     afterStepId: { type: 'string' },
-                    overRef: { type: 'string', description: 'Path to the array, e.g. steps.s1.output.items' },
-                    itemVar: { type: 'string', description: 'Variable name; available inside body as loop.<itemVar>' },
-                    body: { type: 'array', description: 'Sub-DAG step objects (linear)' },
-                    maxIterations: { type: 'integer', description: 'Cap, default 100' },
+                    overRef: { type: 'string', description: 'Path to the array, e.g. steps.search.output.items.' },
+                    itemVar: { type: 'string', description: 'Loop variable name; available inside body as loop.<itemVar>.' },
+                    body: { type: 'array', description: 'Sub-DAG step objects (linear). Each must include "type". "id" is auto-assigned if missing.' },
+                    maxIterations: { type: 'integer', description: 'Cap, default 100, max 1000.' },
                     label: { type: 'string' },
                 },
                 required: ['overRef', 'itemVar'],
@@ -132,15 +141,15 @@ const TOOL_SCHEMAS = [
         type: 'function',
         function: {
             name: 'builder_add_code_step',
-            description: 'Append a sandboxed JavaScript step. Use ONLY when no integration fits. Disabled when code is gated off.',
+            description: 'Append a sandboxed JavaScript step. Use ONLY when no integration fits. Code receives `inputs` and `ctx` (with ctx.log, ctx.http, ctx.integrations.<tool>, ctx.secrets). Define `function main(inputs, ctx)` and return the result. Code is gated by org policy; only propose this when the catalog clearly lacks a fitting tool.',
             parameters: {
                 type: 'object',
                 properties: {
                     afterStepId: { type: 'string' },
-                    code: { type: 'string', description: 'JavaScript source. Define `function main(inputs, ctx)` for a clean entry-point.' },
+                    code: { type: 'string', description: 'JavaScript source. Define `async function main(inputs, ctx) { ... return result; }`.' },
                     inputs: { type: 'object' },
                     outputSchema: { type: 'object' },
-                    allowedTools: { type: 'array', items: { type: 'string' }, description: 'Tools this step is allowed to call via ctx.integrations.<tool>(args).' },
+                    allowedTools: { type: 'array', items: { type: 'string' }, description: 'Tool names this step may call via ctx.integrations.<tool>(args).' },
                     label: { type: 'string' },
                 },
                 required: ['code'],
@@ -151,14 +160,14 @@ const TOOL_SCHEMAS = [
         type: 'function',
         function: {
             name: 'builder_add_notification',
-            description: 'Append a notification step to deliver the result to the user.',
+            description: `Append a notification step that delivers a result to the user. The title and body are TEMPLATES — interpolate upstream data with double curly braces. EXAMPLE: {title:"Monthly invoice report",body:"Found {{steps.search.output.count}} invoices totalling €{{steps.sum.output.total}}",channels:["notification"]}. For Gmail-delivered notifications, instead use builder_add_action with tool gmail_compose.`,
             parameters: {
                 type: 'object',
                 properties: {
                     afterStepId: { type: 'string' },
-                    title: { type: 'string' },
-                    body: { type: 'string', description: 'Supports {{steps.<id>.output.<path>}} interpolation' },
-                    channels: { type: 'array', items: { type: 'string' } },
+                    title: { type: 'string', description: 'Template string. Supports {{steps.<id>.output.<path>}}.' },
+                    body: { type: 'string', description: 'Template string. Supports {{steps.<id>.output.<path>}}.' },
+                    channels: { type: 'array', items: { type: 'string' }, description: 'Default: ["notification"].' },
                     label: { type: 'string' },
                 },
                 required: ['title'],
@@ -169,7 +178,7 @@ const TOOL_SCHEMAS = [
         type: 'function',
         function: {
             name: 'builder_remove_step',
-            description: 'Remove a step from the draft.',
+            description: 'Remove a step from the draft by id, including its incident edges.',
             parameters: { type: 'object', properties: { stepId: { type: 'string' } }, required: ['stepId'] },
         },
     },
@@ -177,7 +186,7 @@ const TOOL_SCHEMAS = [
         type: 'function',
         function: {
             name: 'builder_set_metadata',
-            description: 'Set the title and/or description of the automation.',
+            description: 'Set the user-visible title and/or description for this automation.',
             parameters: { type: 'object', properties: { title: { type: 'string' }, description: { type: 'string' } } },
         },
     },
@@ -185,7 +194,7 @@ const TOOL_SCHEMAS = [
         type: 'function',
         function: {
             name: 'builder_summarise',
-            description: 'Return a deterministic plain-English summary of the current draft.',
+            description: 'Return a deterministic plain-English summary of the current draft. Call after every batch of mutations so the user sees what changed.',
             parameters: { type: 'object', properties: {} },
         },
     },
@@ -193,15 +202,15 @@ const TOOL_SCHEMAS = [
         type: 'function',
         function: {
             name: 'builder_request_dry_run',
-            description: 'Run the current draft in dry-run mode and return the run record + per-step output. Use to preview before activating.',
-            parameters: { type: 'object', properties: { triggerPayload: { type: 'object' } } },
+            description: 'Execute the draft in dry-run mode. Side-effect actions are simulated (no real emails sent, no real issues created); read-only and AI steps run for real. Returns the run row + per-step output. ALWAYS dry-run after building a complete draft, then read the per-step output. If any step errored, fix it (remove_step + add_*) and dry-run again. Only after a clean dry-run should you call builder_finalize.',
+            parameters: { type: 'object', properties: { triggerPayload: { type: 'object', description: 'Optional fake trigger payload (used to feed app_event triggers a sample).' } } },
         },
     },
     {
         type: 'function',
         function: {
             name: 'builder_finalize',
-            description: 'Mark the draft as finalised (still inactive). User must explicitly activate after seeing the dry-run.',
+            description: 'Mark the draft as finalised (is_draft=false). The automation remains INACTIVE until the user clicks Activate in the UI. Only call this after a successful dry-run.',
             parameters: { type: 'object', properties: {} },
         },
     },
@@ -263,12 +272,24 @@ function applyAddCondition(draft, args) {
 }
 
 function applyAddLoop(draft, args) {
+    // Sanitize child body steps: every child must have an id, type, and any
+    // type-specific required fields. Missing ids would crash the runner with
+    // a null step_id DB constraint.
+    const rawBody = Array.isArray(args.body) ? args.body : [];
+    const body = rawBody.map((child, i) => {
+        if (!child || typeof child !== 'object') return null;
+        const fixed = { ...child };
+        if (!fixed.id || typeof fixed.id !== 'string') fixed.id = newId('lb');
+        if (!fixed.type || typeof fixed.type !== 'string') fixed.type = 'ai_step';
+        return fixed;
+    }).filter(Boolean);
+
     const step = {
         id: newId('loop'),
         type: 'loop',
         overRef: args.overRef,
         itemVar: args.itemVar,
-        body: Array.isArray(args.body) ? args.body : [],
+        body,
         maxIterations: args.maxIterations || 100,
         label: args.label || `Loop over ${args.overRef}`,
     };

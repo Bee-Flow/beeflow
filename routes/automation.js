@@ -309,6 +309,7 @@ router.post('/:id/activate', async (req, res) => {
         if (a.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
         const v = validateDefinition(a.definition || {});
         if (!v.ok) return res.status(400).json({ error: 'Invalid definition', details: v.errors });
+        // Warnings are non-blocking but reported to the client.
         const summary = summariseDefinition(a.definition || {});
         const updates = {
             isActive: true,
@@ -319,7 +320,7 @@ router.post('/:id/activate', async (req, res) => {
             updates.nextRunAt = cron.nextRunAt(a.scheduleCron, a.scheduleTz || 'Europe/Amsterdam', Date.now());
         }
         const u = await automationStore.updateAutomation(a.id, updates, userId);
-        res.json({ automation: u });
+        res.json({ automation: u, warnings: v.warnings || [] });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }

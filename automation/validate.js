@@ -5,10 +5,13 @@
  *   - Required top-level shape (trigger, steps[], edges[]).
  *   - Each step has a unique id.
  *   - DAG is acyclic via Kahn's algorithm.
- *   - Every reference path (in inputs/template/expr) resolves to a known
- *     upstream output, vars, or secret root — no forward refs.
  *   - condition.expr parses under the restricted grammar.
  *   - integration_action.tool is a string (catalog lookup happens at run time).
+ *
+ * Reference paths (`{{steps.x.output.y}}`) are NOT validated as blocking
+ * errors. The runtime resolves missing refs to `undefined` safely, and
+ * forward refs / typos there shouldn't stop the user from saving or
+ * running their automation. They are returned as warnings instead.
  */
 
 const { parseExpr } = require('./expr');
@@ -81,7 +84,9 @@ function secondSegment(path) {
  */
 function validateDefinition(def, { availableTools = null } = {}) {
     const errors = [];
+    const warnings = [];
     const push = (msg) => errors.push(msg);
+    const warn = (msg) => warnings.push(msg);
 
     if (!isObject(def)) return { ok: false, errors: ['Definition must be an object'] };
     if (!isObject(def.trigger)) push('Missing or invalid `trigger`.');
@@ -143,10 +148,11 @@ function validateDefinition(def, { availableTools = null } = {}) {
                 try { parseExpr(step.expr); }
                 catch (e) { push(`Step ${step.id}: condition expr parse error — ${e.message}`); }
             }
-            // Edges must include 'then' and 'else' labels.
+            // 'then'/'else' edges are recommended but not required — when
+            // missing the runner just stops traversal on that branch.
             const out = def.edges.filter(e => e.from === step.id);
             const labels = new Set(out.map(e => e.label));
-            if (!labels.has('then') || !labels.has('else')) push(`Step ${step.id}: condition needs 'then' and 'else' edges.`);
+            if (!labels.has('then') && !labels.has('else')) warn(`Step ${step.id}: condition has no 'then' or 'else' edges — branch will dead-end.`);
         }
         if (step.type === 'loop') {
             if (!step.itemVar || typeof step.itemVar !== 'string') push(`Step ${step.id}: loop requires \`itemVar\`.`);
@@ -189,23 +195,23 @@ function validateDefinition(def, { availableTools = null } = {}) {
             // safely return undefined for unknown lookups.
             if (!path) continue;
             const root = rootOf(path);
-            if (!root) { push(`Step ${step.id}: invalid ref "${path}".`); continue; }
+            if (!root) { warn(`Step ${step.id}: invalid ref "${path}".`); continue; }
             if (root === 'trigger' || root === 'vars' || root === 'secrets' || root === 'loop') continue;
             if (root === 'steps') {
                 const upstreamId = secondSegment(path);
-                if (!upstreamId) { push(`Step ${step.id}: ref must include a step id.`); continue; }
+                if (!upstreamId) { warn(`Step ${step.id}: ref must include a step id.`); continue; }
                 if (!seenSoFar.has(upstreamId) && upstreamId !== step.id) {
-                    push(`Step ${step.id}: refers to step "${upstreamId}" that hasn't run yet (or doesn't exist).`);
+                    warn(`Step ${step.id}: refers to step "${upstreamId}" — will resolve to undefined at runtime if it doesn't produce output by then.`);
                 }
                 continue;
             }
-            push(`Step ${step.id}: unknown ref root "${root}".`);
+            warn(`Step ${step.id}: unknown ref root "${root}".`);
         }
         seenSoFar.add(step.id);
     }
 
-    if (errors.length) return { ok: false, errors };
-    return { ok: true };
+    if (errors.length) return { ok: false, errors, warnings };
+    return { ok: true, warnings };
 }
 
 module.exports = { validateDefinition, topoOrder };

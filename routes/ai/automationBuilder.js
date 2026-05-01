@@ -39,7 +39,9 @@ function requireAuth(req, res, next) {
     res.status(401).json({ error: 'Not authenticated' });
 }
 
-const MAX_ITERATIONS = 8;
+// The AI may need: propose_trigger → multiple add_*  → summarise → dry_run
+// → fix → dry_run → finalize. Bumped so the auto-test loop has room.
+const MAX_ITERATIONS = 16;
 
 router.post('/stream', requireAuth, async (req, res) => {
     const userId = req.session.user.id;
