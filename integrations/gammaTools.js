@@ -11,6 +11,7 @@
 const configStore = require('../stores/configStore');
 
 const GAMMA_API_BASE_URL = 'https://public-api.gamma.app/v1.0';
+const DEFAULT_REQUEST_TIMEOUT_MS = 45000;
 const DEFAULT_POLL_INTERVAL_MS = 5000;
 const DEFAULT_TIMEOUT_SECONDS = 180;
 const MAX_TIMEOUT_SECONDS = 300;
@@ -94,7 +95,7 @@ const COMMON_GENERATION_PROPERTIES = {
     },
     waitForCompletion: {
         type: 'boolean',
-        description: 'Whether to poll until the Gamma is completed or failed. Default: true.'
+        description: 'Whether to poll until the Gamma is completed or failed before returning. Default: false to keep chat streaming reliable; use gamma_get_generation_status later to check completion.'
     },
     timeoutSeconds: {
         type: 'number',
@@ -112,7 +113,7 @@ const GAMMA_TOOLS = [
         type: 'function',
         function: {
             name: 'gamma_create_presentation',
-            description: 'Create a new Gamma presentation, document, webpage, or social post from text. Returns a Gamma URL and optional export URL after polling by default. Use this for new presentations, pitch decks, reports, webpages, social posts, or fully regenerated replacements. Gamma does not edit existing items in place.',
+            description: 'Start creating a new Gamma presentation, document, webpage, or social post from text. Returns a generationId quickly by default; call gamma_get_generation_status later to get gammaUrl/exportUrl. Use this for new presentations, pitch decks, reports, webpages, social posts, or fully regenerated replacements. Gamma does not edit existing items in place.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -188,21 +189,29 @@ const GAMMA_TOOLS = [
         type: 'function',
         function: {
             name: 'gamma_create_from_template',
-            description: 'Create a new Gamma from an existing Gamma template using variable/content substitution. Use this when the user has a template Gamma ID and wants to preserve a fixed layout while changing content. Returns a Gamma URL and optional export URL after polling by default.',
+            description: 'Start creating a new Gamma from an existing Gamma item used as a template. Use this when the user provides a Gamma template ID or a gamma.app/docs URL and wants a new item with the same layout/style but different content. This does not read or summarize the existing Gamma content; the prompt supplies the new content/instructions. Returns a generationId quickly by default; call gamma_get_generation_status later to get gammaUrl/exportUrl.',
             parameters: {
                 type: 'object',
                 properties: {
                     gammaId: {
                         type: 'string',
-                        description: 'File ID of the template Gamma. The template must have exactly one Page in Gamma.'
+                        description: 'File ID of the template Gamma. The template must have exactly one Page in Gamma. If the user pasted a gamma.app/docs URL instead, use templateUrl.'
+                    },
+                    templateUrl: {
+                        type: 'string',
+                        description: 'Gamma share URL to use as a template source, e.g. https://gamma.app/docs/Title-abc123. The integration extracts the trailing URL ID as a template ID candidate. Prefer gammaId when the user explicitly provides one.'
+                    },
+                    gammaUrl: {
+                        type: 'string',
+                        description: 'Alias for templateUrl. Use this when the user pasted a Gamma URL and asks to create a new Gamma from it.'
                     },
                     prompt: {
                         type: 'string',
-                        description: 'Text prompt or content describing what to generate from the template.'
+                        description: 'Text prompt or content describing what to generate from the template. Include the desired new content here; Gamma API does not read the current template content for you.'
                     },
                     ...COMMON_GENERATION_PROPERTIES,
                 },
-                required: ['gammaId', 'prompt']
+                required: ['prompt']
             }
         }
     },
@@ -381,6 +390,55 @@ function extractErrorMessage(errorBody) {
     return JSON.stringify(errorBody);
 }
 
+function extractGammaIdFromUrl(value) {
+    if (!value || typeof value !== 'string') return null;
+    const input = value.trim();
+    if (!input) return null;
+
+    try {
+        const url = new URL(input);
+        const host = url.hostname.replace(/^www\./, '').toLowerCase();
+        if (!host.endsWith('gamma.app') && !host.endsWith('gamma.site')) return null;
+
+        const segments = url.pathname
+            .split('/')
+            .map(segment => decodeURIComponent(segment).trim())
+            .filter(Boolean);
+        if (segments.length === 0) return null;
+
+        const lastSegment = segments[segments.length - 1].replace(/\.[a-z0-9]+$/i, '');
+        if (!lastSegment) return null;
+        if (/^g_[A-Za-z0-9_-]+$/.test(lastSegment)) return lastSegment;
+
+        const parts = lastSegment.split('-').filter(Boolean);
+        const candidate = parts[parts.length - 1] || lastSegment;
+        if (/^[A-Za-z0-9_-]{6,}$/.test(candidate)) return candidate;
+    } catch {
+        // Not a URL. Fall through and treat a bare ID as a possible candidate.
+    }
+
+    if (/^g_[A-Za-z0-9_-]+$/.test(input)) return input;
+    return null;
+}
+
+function resolveTemplateGammaId(args) {
+    if (args.gammaId) {
+        return {
+            gammaId: String(args.gammaId).trim(),
+            templateUrl: args.templateUrl || args.gammaUrl || null,
+            usedUrlCandidate: false,
+        };
+    }
+
+    const templateUrl = args.templateUrl || args.gammaUrl;
+    const gammaId = extractGammaIdFromUrl(templateUrl);
+    return {
+        gammaId,
+        templateUrl: templateUrl || null,
+        usedUrlCandidate: !!gammaId && !!templateUrl,
+    };
+}
+
 function buildImageOptions(args) {
     const imageOptions = compactObject({
         source: args.imageSource,
@@ -480,6 +538,8 @@ function formatGenerationResult(result, meta = {}) {
     if (meta.note) response.note = meta.note;
     if (meta.sourceGammaId) response.sourceGammaId = meta.sourceGammaId;
     if (meta.sourceGammaUrl) response.sourceGammaUrl = meta.sourceGammaUrl;
+    if (meta.templateGammaId) response.templateGammaId = meta.templateGammaId;
+    if (meta.templateUrl) response.templateUrl = meta.templateUrl;
     return response;
 }
 
@@ -487,14 +547,29 @@ function formatGenerationResult(result, meta = {}) {
 
 async function gammaApiRequest(apiKey, path, { method = 'GET', body, query } = {}) {
     const url = `${GAMMA_API_BASE_URL}${path}${buildQuery(query)}`;
-    const response = await fetch(url, {
-        method,
-        headers: {
-            'X-API-KEY': apiKey,
-            'Content-Type': 'application/json',
-        },
-        body: body ? JSON.stringify(body) : undefined,
-    });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), DEFAULT_REQUEST_TIMEOUT_MS);
+    if (typeof timeout.unref === 'function') timeout.unref();
+
+    let response;
+    try {
+        response = await fetch(url, {
+            method,
+            headers: {
+                'X-API-KEY': apiKey,
+                'Content-Type': 'application/json',
+            },
+            body: body ? JSON.stringify(body) : undefined,
+            signal: controller.signal,
+        });
+    } catch (err) {
+        if (err.name === 'AbortError') {
+            throw new Error(`Gamma API request timed out after ${Math.round(DEFAULT_REQUEST_TIMEOUT_MS / 1000)}s`);
+        }
+        throw err;
+    } finally {
+        clearTimeout(timeout);
+    }
 
     const text = await response.text();
     let data = null;
@@ -536,7 +611,7 @@ async function pollGeneration(apiKey, generationId, timeoutSeconds) {
 }
 
 async function createAndMaybePoll(apiKey, path, body, args, meta = {}) {
-    const waitForCompletion = args.waitForCompletion !== false;
+    const waitForCompletion = args.waitForCompletion === true;
     const timeoutSeconds = clampTimeoutSeconds(args.timeoutSeconds);
     const created = await gammaApiRequest(apiKey, path, { method: 'POST', body });
     const generationId = created.generationId;
@@ -546,10 +621,11 @@ async function createAndMaybePoll(apiKey, path, body, args, meta = {}) {
     }
 
     if (!waitForCompletion) {
+        const startNote = 'Generation started. Use gamma_get_generation_status with this generationId to check completion and retrieve gammaUrl/exportUrl.';
         return formatGenerationResult(created, {
             ...meta,
             generationId,
-            note: 'Generation started. Use gamma_get_generation_status to check completion.',
+            note: meta.note ? `${meta.note} ${startNote}` : startNote,
         });
     }
 
@@ -582,11 +658,24 @@ async function executeGammaTool(toolName, args = {}, userId) {
         }
 
         if (toolName === 'gamma_create_from_template') {
-            if (!args.gammaId) return { error: 'gammaId is required' };
             if (!args.prompt) return { error: 'prompt is required' };
-            const body = buildTemplateBody(args);
-            console.log(`[Gamma] Starting template generation from ${args.gammaId}: "${(args.prompt || '').substring(0, 80)}..."`);
-            return await createAndMaybePoll(apiKey, '/generations/from-template', body, args);
+            const template = resolveTemplateGammaId(args);
+            if (!template.gammaId) {
+                return {
+                    error: 'gammaId or templateUrl is required. If using a Gamma URL, paste a gamma.app/docs link or copy the template gammaId from Gamma.',
+                };
+            }
+
+            const body = buildTemplateBody({ ...args, gammaId: template.gammaId });
+            const note = template.usedUrlCandidate
+                ? 'Started from a Gamma URL by using the trailing URL ID as the template ID candidate. If Gamma returns not found, copy the exact gammaId from Gamma and retry.'
+                : undefined;
+            console.log(`[Gamma] Starting template generation from ${template.gammaId}: "${(args.prompt || '').substring(0, 80)}..."`);
+            return await createAndMaybePoll(apiKey, '/generations/from-template', body, args, {
+                templateGammaId: template.gammaId,
+                templateUrl: template.templateUrl,
+                note,
+            });
         }
 
         if (toolName === 'gamma_revise_as_new') {
@@ -630,6 +719,15 @@ async function executeGammaTool(toolName, args = {}, userId) {
         return { error: `Unknown Gamma tool: ${toolName}` };
     } catch (err) {
         console.error('[Gamma] Error:', err.message);
+        if (
+            toolName === 'gamma_create_from_template'
+            && (args.templateUrl || args.gammaUrl)
+            && /Gamma API error 404|not found/i.test(err.message)
+        ) {
+            return {
+                error: `${err.message}. I tried to use the trailing ID from the Gamma URL as the template gammaId. Gamma did not accept it, so copy the exact template gammaId from Gamma and retry.`,
+            };
+        }
         return { error: err.message };
     }
 }
