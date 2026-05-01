@@ -2,7 +2,8 @@ const express = require('express');
 const agentStore = require('../../stores/agentStore');
 const { requirePermission, resolveUserOrgIds } = require('../../auth');
 const { getEffectiveUserId } = require('../../utils/routeHelpers');
-const { callLLM, extractJSON } = require('../../pipeline/llmHelpers');
+const { extractJSON } = require('../../pipeline/llmHelpers');
+const llmClient = require('../../core/llmClient');
 const { resolveModelForTier, getTierConfig } = require('../../core/modelResolver');
 
 const router = express.Router();
@@ -34,7 +35,7 @@ async function generatePlan({ userPrompt, priorPlan, refinement, modelTier, user
     const modelId = await resolveModelForTier(`tier:${tier}`, { userOrgId, userId, fallbackTier: 'fast' });
     const tierConfig = await getTierConfig(tier, { userOrgId, userId });
 
-    const messages = [];
+    const messages = [{ role: 'system', content: PLAN_SYSTEM_PROMPT }];
     if (priorPlan) {
         messages.push({ role: 'user', content: userPrompt || '' });
         messages.push({ role: 'assistant', content: JSON.stringify(priorPlan) });
@@ -43,15 +44,14 @@ async function generatePlan({ userPrompt, priorPlan, refinement, modelTier, user
         messages.push({ role: 'user', content: `Build an agent for this request:\n\n${userPrompt}` });
     }
 
-    const response = await callLLM({
-        systemPrompt: PLAN_SYSTEM_PROMPT,
-        messages,
-        model: modelId,
+    const result = await llmClient.chat(modelId, messages, {
         temperature: tierConfig?.temperature ?? 0.4,
         maxTokens: Math.min(tierConfig?.maxTokens ?? 2000, 4000),
+        budgetTokens: 0,
+        reasoningEffort: 'none',
     });
 
-    const text = response?.choices?.[0]?.message?.content || '';
+    const text = result?.content || '';
     const plan = extractJSON(text);
     if (!plan || !plan.name) {
         const err = new Error('Could not parse agent plan from model output');
