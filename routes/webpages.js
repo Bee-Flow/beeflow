@@ -37,7 +37,6 @@ const {
     ingestDriveSource,
 } = require('../agents/webpages/sourceIngestion');
 const { deleteDocumentChunks, findDocumentBySourceUri } = require('../core/kbIngestionHelpers');
-const { requirePermission } = require('../auth');
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
@@ -46,7 +45,9 @@ function requireAuth(req, res, next) {
     res.status(401).json({ error: 'Unauthorized' });
 }
 
-router.use(requirePermission('use_webpages'));
+// Access control: the beta-feature gate at server/index.js (`requireBetaFeature('webpages')`)
+// is the single source of truth. The previous `requirePermission('use_webpages')` here was
+// redundant and blocked org members who had the beta enabled but not the legacy permission.
 
 // ── Webpage CRUD ──────────────────────────────────────────────────
 

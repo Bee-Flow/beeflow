@@ -1,13 +1,19 @@
 /**
  * Webpage Document Tools
  *
- * Exposes three parameterized AI tools — webpage_file_read, webpage_file_write,
- * webpage_file_replace — operating on the three slots (html / css / js) of a
- * webpage. The matcher is plain-text (no HTML-tag walking) since webpage code
- * is canonical, unlike TipTap-encoded notebook prose.
+ * Four parameterised AI tools, all operating on the three slots (html / css / js)
+ * of a webpage:
  *
- * Plus webpage_add_source, mirroring notebook_add_source minus the tax-specific
- * metadata (which only existed for the bookkeeping notebook flow).
+ *   webpage_file_read     — return current content
+ *   webpage_file_write    — replace ENTIRE slot
+ *   webpage_file_replace  — substring replace (default: must be unique; replace_all opts in)
+ *   webpage_file_patch    — line-anchored replace with expected_text sanity check
+ *
+ * Plus webpage_add_source.
+ *
+ * Edit-tool design follows Claude Code's parity: strict by default, no silent
+ * first-match-only behaviour, line-numbered error messages so the AI can
+ * self-correct in one round-trip.
  */
 
 const VALID_SLOTS = ['html', 'css', 'js'];
@@ -17,7 +23,7 @@ const WEBPAGE_DOC_TOOLS = [
         type: 'function',
         function: {
             name: 'webpage_file_read',
-            description: 'Read the current content of one of the three webpage files (index.html, style.css, or script.js). The webpage is rendered live in a sandboxed iframe visible to the user. ALWAYS use this BEFORE webpage_file_replace on the same file so you operate on the latest content.',
+            description: 'Read the current content of one of the three webpage files (index.html, style.css, or script.js). The webpage is rendered live in a sandboxed iframe visible to the user. ALWAYS use this BEFORE webpage_file_replace / webpage_file_patch on the same file so you operate on the latest content.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -35,23 +41,13 @@ const WEBPAGE_DOC_TOOLS = [
         type: 'function',
         function: {
             name: 'webpage_file_write',
-            description: 'Replace the ENTIRE content of one webpage file. Use this for new files or full rewrites. For partial edits, prefer webpage_file_replace.\n\nRules of the slot:\n- "html": valid HTML5 document or fragment. The preview iframe will inline the CSS and JS, but the downloaded zip will use <link rel="stylesheet" href="style.css"> and <script src="script.js"></script>, so you can write either way.\n- "css": plain CSS. No SCSS/LESS — there is no build step.\n- "js": vanilla JavaScript. No bundler, no imports of npm modules. CDN <script> tags belong in the HTML, not here.\n\nThe iframe runs with sandbox="allow-scripts" (no same-origin) — code that depends on parent cookies, localStorage, or fetches to the host app will fail.',
+            description: 'Replace the ENTIRE content of one webpage file. Use this for new files or full rewrites. For partial edits, prefer webpage_file_replace or webpage_file_patch.\n\nRules of the slot:\n- "html": valid HTML5 document or fragment.\n- "css": plain CSS. No SCSS/LESS — there is no build step.\n- "js": vanilla JavaScript. No bundler, no npm imports. CDN <script> tags belong in the HTML, not here.\n\nThe iframe runs with sandbox="allow-scripts" (no same-origin) — code that depends on parent cookies, localStorage, or fetches to the host app will fail.',
             parameters: {
                 type: 'object',
                 properties: {
-                    file: {
-                        type: 'string',
-                        enum: VALID_SLOTS,
-                        description: 'Which file to overwrite.',
-                    },
-                    content: {
-                        type: 'string',
-                        description: 'The full new content of the file. Replaces all existing content.',
-                    },
-                    title: {
-                        type: 'string',
-                        description: 'Optional short label of what was written, shown to the user (e.g. "Initial layout", "Dark theme").',
-                    },
+                    file: { type: 'string', enum: VALID_SLOTS, description: 'Which file to overwrite.' },
+                    content: { type: 'string', description: 'The full new content of the file. Replaces all existing content.' },
+                    title: { type: 'string', description: 'Optional short label of what was written, shown to the user (e.g. "Initial layout", "Dark theme").' },
                 },
                 required: ['file', 'content'],
             },
@@ -61,25 +57,34 @@ const WEBPAGE_DOC_TOOLS = [
         type: 'function',
         function: {
             name: 'webpage_file_replace',
-            description: 'Replace a SPECIFIC portion of one webpage file. Preserves all other content. Plain-text matching — find_text must appear verbatim (or with normalized whitespace) in the file.\n\nIMPORTANT: Always call webpage_file_read on the same file first to see the EXACT current content before replacing.',
+            description: 'Replace a SPECIFIC substring of one webpage file. Preserves all other content.\n\nBy default, find_text must match exactly ONCE in the file — if it matches in multiple places, the tool errors and asks you to either narrow the snippet or set replace_all: true. This prevents silent unintended changes. The matcher prefers verbatim equality; if the verbatim search fails it retries with whitespace-normalized matching.\n\nIMPORTANT: Always call webpage_file_read on the same file first so you copy the EXACT current text into find_text.',
             parameters: {
                 type: 'object',
                 properties: {
-                    file: {
-                        type: 'string',
-                        enum: VALID_SLOTS,
-                        description: 'Which file to edit.',
-                    },
-                    find_text: {
-                        type: 'string',
-                        description: 'The exact text to find. Must be present verbatim in the file (whitespace-normalized matching is applied as a fallback).',
-                    },
-                    replace_text: {
-                        type: 'string',
-                        description: 'The new text to insert in place of find_text. Set to empty string to delete.',
-                    },
+                    file: { type: 'string', enum: VALID_SLOTS, description: 'Which file to edit.' },
+                    find_text: { type: 'string', description: 'The exact text to find. Must currently appear in the file (verbatim, or whitespace-normalized as a fallback).' },
+                    replace_text: { type: 'string', description: 'The new text to insert in place of find_text. Set to empty string to delete.' },
+                    replace_all: { type: 'boolean', description: 'When true, replace every occurrence of find_text. Default false — single-match required.' },
                 },
                 required: ['file', 'find_text', 'replace_text'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'webpage_file_patch',
+            description: 'Replace a contiguous range of LINES in one webpage file. Use when you know which lines you want to rewrite (you read the file and counted lines). Provides an expected_text sanity check so a stale read doesn\'t corrupt the file.\n\nLine numbers are 1-indexed and inclusive (start_line=5, end_line=7 replaces 3 lines).',
+            parameters: {
+                type: 'object',
+                properties: {
+                    file: { type: 'string', enum: VALID_SLOTS, description: 'Which file to edit.' },
+                    start_line: { type: 'integer', description: '1-indexed first line of the range (inclusive).' },
+                    end_line: { type: 'integer', description: '1-indexed last line of the range (inclusive).' },
+                    expected_text: { type: 'string', description: 'The current content of those lines exactly as it appears in the file. If it does not match, the patch errors instead of corrupting the file. Use the latest webpage_file_read output.' },
+                    replacement: { type: 'string', description: 'The new content to put in place of the range. Can be any number of lines, including 0 (empty string) to delete.' },
+                },
+                required: ['file', 'start_line', 'end_line', 'expected_text', 'replacement'],
             },
         },
     },
@@ -93,18 +98,9 @@ const WEBPAGE_ADD_SOURCE_TOOL = {
         parameters: {
             type: 'object',
             properties: {
-                name: {
-                    type: 'string',
-                    description: 'A short descriptive name for the source (e.g. "Brand style guide", "Bakery menu draft").',
-                },
-                content: {
-                    type: 'string',
-                    description: 'The full text content to add as a source.',
-                },
-                metadata: {
-                    type: 'object',
-                    description: 'Optional structured metadata for the source.',
-                },
+                name: { type: 'string', description: 'A short descriptive name for the source (e.g. "Brand style guide", "Bakery menu draft").' },
+                content: { type: 'string', description: 'The full text content to add as a source.' },
+                metadata: { type: 'object', description: 'Optional structured metadata for the source.' },
             },
             required: ['name', 'content'],
         },
@@ -113,16 +109,21 @@ const WEBPAGE_ADD_SOURCE_TOOL = {
 
 /**
  * Execute a webpage document tool call.
- * `files` is an in-memory `{ html, css, js }` object that the chat handler
- * keeps in sync with the frontend (the frontend is the source of truth for
- * the editor while a chat turn is in flight).
+ *
+ * @param {string} toolName
+ * @param {object} args
+ * @param {{html:string, css:string, js:string}} files — in-memory triple kept in sync with the editor.
+ * @param {object} [ctx] — optional per-turn context: `{ readSlots: Set<string> }` for the read-before-edit guard.
  */
-function executeWebpageDocTool(toolName, args, files) {
+function executeWebpageDocTool(toolName, args, files, ctx = {}) {
+    const readSlots = ctx.readSlots instanceof Set ? ctx.readSlots : null;
+
     if (toolName === 'webpage_file_read') {
         const file = args.file;
         if (!VALID_SLOTS.includes(file)) {
             return { error: `Invalid file "${file}" — must be one of: ${VALID_SLOTS.join(', ')}.` };
         }
+        if (readSlots) readSlots.add(file);
         const content = files?.[file] || '';
         if (!content.trim()) {
             return { content: '', message: `${slotFilename(file)} is currently empty.` };
@@ -150,6 +151,7 @@ function executeWebpageDocTool(toolName, args, files) {
         const file = args.file;
         const findText = args.find_text;
         const replaceText = args.replace_text ?? '';
+        const replaceAll = args.replace_all === true;
 
         if (!VALID_SLOTS.includes(file)) {
             return { error: `Invalid file "${file}" — must be one of: ${VALID_SLOTS.join(', ')}.` };
@@ -163,63 +165,188 @@ function executeWebpageDocTool(toolName, args, files) {
             return { error: `${slotFilename(file)} is empty. Use webpage_file_write to create content first.` };
         }
 
-        // Try exact substring match first.
-        if (current.includes(findText)) {
-            const newContent = current.replace(findText, replaceText);
-            return {
-                _action: 'webpage_doc_update',
-                file,
-                content: newContent,
+        // 1. Verbatim occurrence count
+        const occurrences = findAllOccurrences(current, findText);
+
+        if (occurrences.length === 1) {
+            const newContent = spliceAt(current, occurrences[0].start, occurrences[0].end, replaceText);
+            return wrapEditResult(file, newContent, {
                 message: replaceText
-                    ? `${slotFilename(file)} updated.`
-                    : `${slotFilename(file)} text removed.`,
+                    ? `${slotFilename(file)} updated (1 replacement at line ${occurrences[0].line}).`
+                    : `${slotFilename(file)} text removed at line ${occurrences[0].line}.`,
+                readSlots,
+            });
+        }
+
+        if (occurrences.length >= 2) {
+            if (!replaceAll) {
+                const lines = occurrences.map(o => o.line);
+                return {
+                    error: `find_text matches ${occurrences.length} places in ${slotFilename(file)} (lines ${lines.join(', ')}). Either narrow find_text so it matches exactly once, or set replace_all: true to replace every occurrence.`,
+                };
+            }
+            // Replace all — walk back-to-front so byte offsets remain valid.
+            let next = current;
+            for (let i = occurrences.length - 1; i >= 0; i--) {
+                next = spliceAt(next, occurrences[i].start, occurrences[i].end, replaceText);
+            }
+            return wrapEditResult(file, next, {
+                message: `${slotFilename(file)} updated (${occurrences.length} replacements, lines ${occurrences.map(o => o.line).join(', ')}).`,
+                readSlots,
+            });
+        }
+
+        // 0 verbatim matches — try whitespace-normalized fallback
+        const range = locateOriginalRange(current, findText);
+        if (range) {
+            // Whitespace fallback: only single replacement supported (the normalized
+            // mapping is order-dependent; replace_all here would be ambiguous).
+            const newContent = spliceAt(current, range.start, range.end, replaceText);
+            const line = lineNumberForOffset(current, range.start);
+            return wrapEditResult(file, newContent, {
+                message: replaceText
+                    ? `${slotFilename(file)} updated at line ${line} (whitespace-normalized match).`
+                    : `${slotFilename(file)} text removed at line ${line} (whitespace-normalized match).`,
+                readSlots,
+            });
+        }
+
+        // Not found at all — produce a diff-style hint.
+        return {
+            error: `Could not find the find_text snippet in ${slotFilename(file)}. ${buildNearestMatchHint(current, findText, file)}`,
+        };
+    }
+
+    if (toolName === 'webpage_file_patch') {
+        const file = args.file;
+        const startLine = Number(args.start_line);
+        const endLine = Number(args.end_line);
+        const expected = args.expected_text ?? '';
+        const replacement = args.replacement ?? '';
+
+        if (!VALID_SLOTS.includes(file)) {
+            return { error: `Invalid file "${file}" — must be one of: ${VALID_SLOTS.join(', ')}.` };
+        }
+        if (!Number.isInteger(startLine) || !Number.isInteger(endLine) || startLine < 1 || endLine < startLine) {
+            return { error: `start_line and end_line must be 1-indexed integers with start_line ≤ end_line. Got start_line=${args.start_line}, end_line=${args.end_line}.` };
+        }
+
+        const current = files?.[file] || '';
+        const lines = current.split('\n');
+        if (endLine > lines.length) {
+            return { error: `end_line (${endLine}) is past end of ${slotFilename(file)} which has ${lines.length} lines. Call webpage_file_read to recount.` };
+        }
+
+        const actual = lines.slice(startLine - 1, endLine).join('\n');
+        if (normalizeWhitespace(actual) !== normalizeWhitespace(expected)) {
+            return {
+                error: `expected_text does not match actual content of lines ${startLine}-${endLine} in ${slotFilename(file)}. The file has likely changed since you last read it. Call webpage_file_read({file:"${file}"}) and retry.\n\nWhat the file actually contains on those lines:\n${truncate(actual, 400)}`,
             };
         }
 
-        // Fall back to whitespace-normalized comparison.
-        const normalize = (s) => s.replace(/\s+/g, ' ').trim();
-        const findNorm = normalize(findText);
-        const idxNorm = normalize(current).indexOf(findNorm);
-        if (idxNorm >= 0) {
-            // Map normalized offset back to a real range in the original string.
-            const range = locateOriginalRange(current, findText);
-            if (range) {
-                const newContent = current.slice(0, range.start) + replaceText + current.slice(range.end);
-                return {
-                    _action: 'webpage_doc_update',
-                    file,
-                    content: newContent,
-                    message: replaceText
-                        ? `${slotFilename(file)} updated (whitespace-normalized match).`
-                        : `${slotFilename(file)} text removed.`,
-                };
-            }
-        }
+        const replacementLines = replacement === '' ? [] : replacement.split('\n');
+        const newLines = [...lines.slice(0, startLine - 1), ...replacementLines, ...lines.slice(endLine)];
+        const newContent = newLines.join('\n');
 
-        // Help the AI self-correct: suggest the closest matching snippet.
-        const words = findNorm.split(' ').filter(Boolean);
-        let suggestion = '';
-        if (words.length >= 2) {
-            const needle = words.slice(0, Math.min(4, words.length)).join(' ').toLowerCase();
-            const lc = current.toLowerCase();
-            const idx = lc.indexOf(needle);
-            if (idx >= 0) {
-                suggestion = current.slice(idx, idx + Math.min(160, findText.length + 60));
-            }
-        }
-        const hint = suggestion
-            ? ` The file contains something similar starting with: "${suggestion.slice(0, 160)}…" — use that exact text as find_text.`
-            : ` Call webpage_file_read({ file: "${file}" }) first to see the exact current content, then retry.`;
-        return {
-            error: `Could not find "${findText.substring(0, 100)}${findText.length > 100 ? '…' : ''}" in ${slotFilename(file)}.${hint}`,
-        };
+        return wrapEditResult(file, newContent, {
+            message: `${slotFilename(file)} patched: replaced lines ${startLine}-${endLine} (${endLine - startLine + 1} → ${replacementLines.length} lines).`,
+            readSlots,
+        });
     }
 
     return { error: `Unknown webpage document tool: ${toolName}` };
 }
 
+// ───────────────────────────────────────────────────────────────────
+// Helpers
+// ───────────────────────────────────────────────────────────────────
+
 function slotFilename(slot) {
     return slot === 'html' ? 'index.html' : slot === 'css' ? 'style.css' : 'script.js';
+}
+
+function spliceAt(str, start, end, insert) {
+    return str.slice(0, start) + insert + str.slice(end);
+}
+
+function truncate(s, n) {
+    if (typeof s !== 'string') return '';
+    return s.length > n ? s.slice(0, n) + '…' : s;
+}
+
+function normalizeWhitespace(s) {
+    return (s || '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Wrap a successful edit with the standard `_action` envelope plus a soft
+ * read-before-edit warning when the AI skipped reading the slot this turn.
+ */
+function wrapEditResult(file, newContent, { message, readSlots }) {
+    let finalMessage = message;
+    if (readSlots && !readSlots.has(file)) {
+        finalMessage += ` Note: you didn't call webpage_file_read({file:"${file}"}) this turn before editing — read first next time so whitespace differences don't cause a retry.`;
+    }
+    return {
+        _action: 'webpage_doc_update',
+        file,
+        content: newContent,
+        message: finalMessage,
+    };
+}
+
+/**
+ * Find every occurrence of `needle` in `haystack`. Returns an array of
+ * `{ start, end, line }`. Empty needle returns []. Overlap is not supported —
+ * advances by needle.length after each hit.
+ */
+function findAllOccurrences(haystack, needle) {
+    const out = [];
+    if (!needle) return out;
+    let i = 0;
+    while (true) {
+        const idx = haystack.indexOf(needle, i);
+        if (idx < 0) break;
+        out.push({ start: idx, end: idx + needle.length, line: lineNumberForOffset(haystack, idx) });
+        i = idx + needle.length;
+    }
+    return out;
+}
+
+function lineNumberForOffset(text, offset) {
+    let line = 1;
+    for (let i = 0; i < offset && i < text.length; i++) {
+        if (text.charCodeAt(i) === 10 /* \n */) line++;
+    }
+    return line;
+}
+
+/**
+ * When the AI's find_text doesn't match, surface a short diff-style hint so it
+ * can self-correct in one round-trip instead of guessing again.
+ */
+function buildNearestMatchHint(current, findText, file) {
+    const norm = normalizeWhitespace(findText);
+    if (!norm) return ` Call webpage_file_read({file:"${file}"}) first to see the exact current content, then retry.`;
+
+    const words = norm.split(' ').filter(Boolean);
+    if (words.length === 0) return '';
+
+    const probe = words.slice(0, Math.min(4, words.length)).join(' ').toLowerCase();
+    const lc = current.toLowerCase();
+    const idx = lc.indexOf(probe);
+    if (idx < 0) {
+        return ` No similar snippet found. Call webpage_file_read({file:"${file}"}) and copy the exact text into find_text.`;
+    }
+
+    // Build a 3-line diff-style preview around the nearest hit.
+    const previewStart = Math.max(0, current.lastIndexOf('\n', idx) + 1);
+    const previewEnd = current.indexOf('\n', idx + Math.min(160, findText.length));
+    const realEnd = previewEnd < 0 ? Math.min(current.length, idx + 200) : previewEnd;
+    const actualSlice = current.slice(previewStart, realEnd);
+    const line = lineNumberForOffset(current, idx);
+
+    return ` The closest match is at line ${line}. Whitespace likely differs. Diff:\n- ${truncate(findText.replace(/\n/g, '⏎'), 160)}\n+ ${truncate(actualSlice.replace(/\n/g, '⏎'), 160)}\nUse the "+" line verbatim as your next find_text.`;
 }
 
 /**
@@ -231,11 +358,9 @@ function slotFilename(slot) {
  * whitespace, but the file has the same characters separated by newlines).
  */
 function locateOriginalRange(original, needle) {
-    const normNeedle = needle.replace(/\s+/g, ' ').trim();
+    const normNeedle = normalizeWhitespace(needle);
     if (!normNeedle) return null;
 
-    // Walk `original`, accumulating non-whitespace chars and tracking a
-    // sliding window in normalized space.
     let normalized = '';
     const idxMap = []; // normalized-position → original-position
     let lastWasSpace = false;
@@ -272,4 +397,7 @@ module.exports = {
     WEBPAGE_ADD_SOURCE_TOOL,
     executeWebpageDocTool,
     VALID_SLOTS,
+    // Exported for tests / reuse by builder tools
+    findAllOccurrences,
+    lineNumberForOffset,
 };

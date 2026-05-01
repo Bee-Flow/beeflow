@@ -1,12 +1,15 @@
 /**
  * Skill Store — PostgreSQL-backed reusable instruction pack management.
  *
- * Skills are scoped to an organization. A skill can be personal
- * (visible only to the creator) or shared (visible to all org members).
+ * Skills are scoped to an organization. A skill can be:
+ *   - personal (visible only to the creator)
+ *   - shared with the whole org (is_shared=true, shared_groups=[])
+ *   - shared with specific groups (is_shared=true, shared_groups=["g1","g2"])
  */
 
 const crypto = require('crypto');
 const { run, getOne, getAll, exec } = require('../db');
+const userStore = require('./userStore');
 
 // ── GitHub Sync hook (fire-and-forget) ───────────────────────────
 async function _notifySkillSync(orgId, skillId, action = 'pending') {
@@ -42,11 +45,13 @@ async function initDB() {
             icon TEXT DEFAULT '⚡',
             is_shared BOOLEAN DEFAULT false,
             dynamic_activation BOOLEAN DEFAULT false,
+            shared_groups TEXT DEFAULT '[]',
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
 
         ALTER TABLE skills ADD COLUMN IF NOT EXISTS dynamic_activation BOOLEAN DEFAULT false;
+        ALTER TABLE skills ADD COLUMN IF NOT EXISTS shared_groups TEXT DEFAULT '[]';
 
         CREATE INDEX IF NOT EXISTS idx_skills_org ON skills(org_id);
         CREATE INDEX IF NOT EXISTS idx_skills_user ON skills(user_id);
@@ -64,13 +69,14 @@ initDB().catch(err => console.error('[SkillStore] Init error:', err.message));
 /**
  * Create a new skill.
  */
-async function createSkill({ orgId, userId, name, description, instructions, workflow, rules, examples, icon, isShared, dynamicActivation }) {
+async function createSkill({ orgId, userId, name, description, instructions, workflow, rules, examples, icon, isShared, dynamicActivation, sharedGroups }) {
     await initDB();
     const id = crypto.randomUUID();
+    const groupsJson = JSON.stringify(Array.isArray(sharedGroups) ? sharedGroups : []);
     await run(
-        `INSERT INTO skills (id, org_id, user_id, name, description, instructions, workflow, rules, examples, icon, is_shared, dynamic_activation)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-        [id, orgId, userId, name, description || '', instructions || '', workflow || '', rules || '', examples || '', icon || '⚡', isShared === true, dynamicActivation === true]
+        `INSERT INTO skills (id, org_id, user_id, name, description, instructions, workflow, rules, examples, icon, is_shared, dynamic_activation, shared_groups)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+        [id, orgId, userId, name, description || '', instructions || '', workflow || '', rules || '', examples || '', icon || '⚡', isShared === true, dynamicActivation === true, groupsJson]
     );
     console.log(`[SkillStore] Created skill "${name}" for org ${orgId}`);
     _notifySkillSync(orgId, id);
@@ -78,20 +84,54 @@ async function createSkill({ orgId, userId, name, description, instructions, wor
         id, orgId, userId, name, description: description || '', instructions: instructions || '',
         workflow: workflow || '', rules: rules || '', examples: examples || '',
         icon: icon || '⚡', isShared: isShared === true, dynamicActivation: dynamicActivation === true,
+        sharedGroups: Array.isArray(sharedGroups) ? sharedGroups : [],
         createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
     };
 }
 
+// Resolve the user's group IDs (used for sharedGroups visibility checks).
+async function _getUserGroupIds(userId) {
+    if (!userId) return [];
+    try {
+        const user = await userStore.getUser(userId);
+        if (!user) return [];
+        if (Array.isArray(user.groups)) return user.groups;
+        try { return JSON.parse(user.groups || '[]'); } catch (_) { return []; }
+    } catch (_) {
+        return [];
+    }
+}
+
+// Build the shared visibility WHERE fragment + params for a single user.
+//   "skill is owned by user, OR (is_shared AND (no group restriction OR user is in one of the groups))"
+// Returns { sql, params } where the params slot in starting at `nextParamIdx`.
+function _buildVisibilityClause(userId, userGroups, nextParamIdx) {
+    const params = [userId];
+    let userIdx = nextParamIdx;
+    let sql = `(user_id = $${userIdx}`;
+    sql += ` OR (is_shared = true AND (shared_groups IS NULL OR shared_groups = '' OR shared_groups = '[]'`;
+    if (userGroups && userGroups.length > 0) {
+        const groupParams = userGroups.map((_, i) => `$${userIdx + 1 + i}`);
+        sql += ` OR shared_groups::jsonb ?| array[${groupParams.join(', ')}]`;
+        params.push(...userGroups);
+    }
+    sql += `)))`;
+    return { sql, params };
+}
+
 /**
- * Get all skills available to a user (own + shared within org).
+ * Get all skills available to a user (own + shared within org, scoped by group).
  */
 async function getAvailableSkills(orgId, userId) {
     await initDB();
+    const userGroups = await _getUserGroupIds(userId);
+    // $1 = orgId, then visibility clause starts at $2
+    const { sql: visSql, params: visParams } = _buildVisibilityClause(userId, userGroups, 2);
     const rows = await getAll(
         `SELECT * FROM skills
-         WHERE org_id = $1 AND (user_id = $2 OR is_shared = true)
+         WHERE org_id = $1 AND ${visSql}
          ORDER BY created_at DESC`,
-        [orgId, userId]
+        [orgId, ...visParams]
     );
     return rows.map(mapRow);
 }
@@ -101,9 +141,12 @@ async function getAvailableSkills(orgId, userId) {
  */
 async function getSkill(id, orgId, userId) {
     await initDB();
+    const userGroups = await _getUserGroupIds(userId);
+    // $1 = id, $2 = orgId, then visibility clause starts at $3
+    const { sql: visSql, params: visParams } = _buildVisibilityClause(userId, userGroups, 3);
     const r = await getOne(
-        `SELECT * FROM skills WHERE id = $1 AND org_id = $2 AND (user_id = $3 OR is_shared = true)`,
-        [id, orgId, userId]
+        `SELECT * FROM skills WHERE id = $1 AND org_id = $2 AND ${visSql}`,
+        [id, orgId, ...visParams]
     );
     return r ? mapRow(r) : null;
 }
@@ -114,12 +157,15 @@ async function getSkill(id, orgId, userId) {
 async function getSkillsByIds(ids, orgId, userId) {
     await initDB();
     if (!ids || ids.length === 0) return [];
-    // Build parameterized IN clause
-    const placeholders = ids.map((_, i) => `$${i + 3}`).join(', ');
+    const userGroups = await _getUserGroupIds(userId);
+    // $1 = orgId, then visibility clause, then IN-list
+    const { sql: visSql, params: visParams } = _buildVisibilityClause(userId, userGroups, 2);
+    const baseParamCount = 1 + visParams.length; // orgId + visibility params
+    const placeholders = ids.map((_, i) => `$${baseParamCount + 1 + i}`).join(', ');
     const rows = await getAll(
         `SELECT * FROM skills
-         WHERE id IN (${placeholders}) AND org_id = $1 AND (user_id = $2 OR is_shared = true)`,
-        [orgId, userId, ...ids]
+         WHERE org_id = $1 AND ${visSql} AND id IN (${placeholders})`,
+        [orgId, ...visParams, ...ids]
     );
     return rows.map(mapRow);
 }
@@ -147,6 +193,10 @@ async function updateSkill(id, userId, updates) {
     if (updates.dynamicActivation !== undefined) {
         setClauses.push(`dynamic_activation = $${idx++}`);
         params.push(updates.dynamicActivation === true);
+    }
+    if (updates.sharedGroups !== undefined) {
+        setClauses.push(`shared_groups = $${idx++}`);
+        params.push(JSON.stringify(Array.isArray(updates.sharedGroups) ? updates.sharedGroups : []));
     }
 
     if (setClauses.length === 0) return false;
@@ -197,6 +247,7 @@ function mapRow(r) {
         icon: r.icon || '⚡',
         isShared: r.is_shared === true,
         dynamicActivation: r.dynamic_activation === true,
+        sharedGroups: (() => { try { return JSON.parse(r.shared_groups || '[]'); } catch (_) { return []; } })(),
         createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
         updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : null,
     };

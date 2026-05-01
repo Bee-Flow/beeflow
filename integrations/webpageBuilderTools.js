@@ -71,7 +71,7 @@ const BUILDER_TOOLS = [
         type: 'function',
         function: {
             name: 'webpage_file_replace',
-            description: 'Replace a specific substring inside one webpage file. Call webpage_file_read first to get the exact current text.',
+            description: 'Replace a specific substring inside one webpage file. Call webpage_file_read first to get the exact current text.\n\nBy default find_text must match exactly once. If it matches in multiple places the tool errors with line numbers; either narrow the snippet or set replace_all: true.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -79,8 +79,28 @@ const BUILDER_TOOLS = [
                     file: { type: 'string', enum: ['html', 'css', 'js'], description: 'Which file to edit.' },
                     find_text: { type: 'string', description: 'The exact text to find (verbatim or whitespace-normalized).' },
                     replace_text: { type: 'string', description: 'The replacement text. Empty string to delete.' },
+                    replace_all: { type: 'boolean', description: 'When true, replace every occurrence. Default false — single-match required.' },
                 },
                 required: ['webpageId', 'file', 'find_text', 'replace_text'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'webpage_file_patch',
+            description: 'Replace a contiguous range of LINES in one webpage file with sanity-check on expected_text. 1-indexed, inclusive on both ends.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    webpageId: { type: 'string', description: 'The ID of the webpage.' },
+                    file: { type: 'string', enum: ['html', 'css', 'js'], description: 'Which file to edit.' },
+                    start_line: { type: 'integer', description: '1-indexed first line of the range (inclusive).' },
+                    end_line: { type: 'integer', description: '1-indexed last line of the range (inclusive).' },
+                    expected_text: { type: 'string', description: 'The current content of those lines exactly as it appears.' },
+                    replacement: { type: 'string', description: 'The new content for the range.' },
+                },
+                required: ['webpageId', 'file', 'start_line', 'end_line', 'expected_text', 'replacement'],
             },
         },
     },
