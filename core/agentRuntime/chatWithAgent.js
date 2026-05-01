@@ -119,9 +119,6 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
         if (_tokenAddendum) systemPrompt += _tokenAddendum;
     }
 
-    // Enrich messages with form data context
-    messages = enrichMessagesWithFormData(messages);
-
     while (iterations < maxIterations) {
         iterations++;
 
@@ -280,41 +277,4 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
     throw new Error('Agent exceeded maximum tool call iterations');
 }
 
-function enrichMessagesWithFormData(messages) {
-    if (!messages || !Array.isArray(messages)) return messages;
-
-    return messages.map(msg => {
-        if (msg.savedFormData && Object.keys(msg.savedFormData).length > 0) {
-            // Clone message to avoid mutating the original persistent object
-            const newMsg = { ...msg };
-
-            // Format form data
-            const formDataStr = Object.entries(msg.savedFormData)
-                .map(([key, value]) => `  - ${key}: ${value}`)
-                .join('\n');
-
-            // Append to content
-            // If content is array (multi-modal), append to last text block or add new one
-            if (Array.isArray(newMsg.content)) {
-                newMsg.content = [...newMsg.content]; // Clone array
-                const lastTextBlock = newMsg.content.slice().reverse().find(c => c.type === 'text');
-                const injection = `\n\n[USER SUBMITTED FORM DATA]:\n${formDataStr}`;
-
-                if (lastTextBlock) {
-                    // We modify the cloned array's object... wait, we need to shallow copy the text block too
-                    // Actually, simpler to just append a new text block
-                    newMsg.content.push({ type: 'text', text: injection });
-                } else {
-                    newMsg.content.push({ type: 'text', text: injection });
-                }
-            } else {
-                // String content
-                newMsg.content = (newMsg.content || '') + `\n\n[USER SUBMITTED FORM DATA]:\n${formDataStr}`;
-            }
-            return newMsg;
-        }
-        return msg;
-    });
-}
-
-module.exports = { chatWithAgent, enrichMessagesWithFormData };
+module.exports = { chatWithAgent };

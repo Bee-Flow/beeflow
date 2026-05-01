@@ -21,7 +21,6 @@ const { sanitizeMessages } = require('../../utils/messageUtils');
 const { componentToTool, executeComponentTool, executeSystemTool, SYSTEM_TOOLS } = require('../toolExecution');
 const { resolveAgentModel } = require('./modelResolver');
 const { getAgentTools } = require('./agentTools');
-const { enrichMessagesWithFormData } = require('./chatWithAgent');
 const { checkRegexPatterns } = require('../guardrails');
 const { validateInput } = require('../moderation');
 const { resolveOrgShield, mergeWithOrgShield } = require('../orgShield');
@@ -970,11 +969,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             const _tokenAddendum = buildTokenPreservationAddendum(_convTokenMap);
             if (_tokenAddendum) effectiveSystemPrompt += _tokenAddendum;
 
-            // Enrich messages with form data context
-            // We do this inside the loop to ensure it persists across tool calls if needed (though usually it's static)
-            // But strict guardrails might want to check it. Ideally we do it once.
-            // However, doing it here ensures `processedMessages` (which handles attachments) gets enriched.
-            const finalMessages = enrichMessagesWithFormData(processedMessages);
+            const finalMessages = processedMessages;
 
             // Sanitize messages — Mistral rejects extra fields like parentId, id, etc.
             const sanitize = sanitizeMessages;

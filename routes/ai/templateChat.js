@@ -169,32 +169,13 @@ ${paramNames.map(p => `  "${p}": "filled value here"`).join(',\n')}
 }
 \`\`\`
 
-5. ONLY use a form for the ABSOLUTE MINIMUM of truly unknown values (max 2-3 fields).
-   A form should be a LAST RESORT, not a first response.
-
-[WHEN YOU MUST USE A FORM — RARE]
-If after exhausting all context you still have 2-3 values that are impossible to determine:
-
-\`\`\`json-form
-{
-  "description": "I filled [X] of [Y] parameters from context. I just need [2-3] values I couldn't find:",
-  "submitLabel": "Bevestig & Genereer",
-  "fields": [
-    { "name": "field_id", "type": "text", "label": "Label", "defaultValue": "Best guess", "hint": "Why I need this" }
-  ]
-}
-\`\`\`
-
-Available types: text, select, textarea, checkbox, radio, number, date, time, email, tel, url
-Fields support: name, type, label, placeholder, required, options, hint, min, max, step, defaultValue.
+5. If you cannot determine a value with reasonable confidence, ask the user in plain text for the specific missing values — keep it short.
 
 ABSOLUTE RULES:
-- NEVER show a form with more than 5 fields. If you have that many unknowns, you're not trying hard enough.
 - NEVER ask for information that exists in the meeting notes, KB, or conversation
-- ALWAYS pre-fill defaultValue with your best guess
-- Prefer outputting the complete JSON over showing a form
-- If a value is ambiguous, use your best judgment and note it — don't ask
-- When the user submits a form or says "use what you have", output the COMPLETE JSON immediately`;
+- ALWAYS make your best guess when context allows it; only ask for values you truly cannot infer
+- If a value is ambiguous, use your best judgment and note it
+- Once the user provides the missing values, output the COMPLETE JSON immediately`;
 
 
 
