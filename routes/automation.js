@@ -182,8 +182,10 @@ router.get('/catalog', async (req, res) => {
             return { id: entry.app, label: entry.label, available, actions };
         });
 
-        const codeFlag = (await configStore.getConfig('automation_code_step_enabled')) === true;
-        const automationsFlag = (await configStore.getConfig('feature_automations_enabled')) === true;
+        const codeFlagRaw = await configStore.getConfig('automation_code_step_enabled');
+        const codeFlag = codeFlagRaw === true || codeFlagRaw === 'true';
+        const autoFlagRaw = await configStore.getConfig('feature_automations_enabled');
+        const automationsFlag = autoFlagRaw === true || autoFlagRaw === 'true';
 
         res.json({
             apps,

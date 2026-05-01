@@ -159,7 +159,7 @@ async function execCode(step, ctx, runState, mode) {
     }
     if (!sandbox.isAvailable()) throw new Error(`Code step unavailable: ${sandbox.loadError()}`);
     const codeFlag = await configStore.getConfig('automation_code_step_enabled');
-    if (codeFlag !== true) throw new Error('Code steps are disabled by org policy.');
+    if (codeFlag !== true && codeFlag !== 'true') throw new Error('Code steps are disabled by org policy.');
 
     const inputs = resolveInputs(step.inputs || {}, runState, { allowSecrets: false });
     // Secrets — only the names the step explicitly declared in inputs.secretKeys[].
@@ -490,8 +490,11 @@ async function processPollingAndRenewals() {
 async function start() {
     if (started) return;
     const enabled = await configStore.getConfig('feature_automations_enabled');
-    if (enabled !== true) {
-        console.log('[AutomationRunner] feature_automations_enabled=false — runner not started');
+    // Accept boolean true OR string "true" (configStore round-trips JSON, but
+    // older admin UIs may have written a plain string).
+    const isOn = enabled === true || enabled === 'true';
+    if (!isOn) {
+        console.log('[AutomationRunner] feature_automations_enabled is not set — runner not started');
         return;
     }
     started = true;

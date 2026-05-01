@@ -6,7 +6,7 @@
  * time so the model can only refer to tools the user has connected.
  */
 
-function buildSystemPrompt({ catalog, codeStepEnabled, userTimezone = 'Europe/Amsterdam', existingDraftSummary = null }) {
+function buildSystemPrompt({ catalog, codeStepEnabled, userTimezone = 'Europe/Amsterdam', existingDraftSummary = null, webSearchEnabled = true, disabledMedia = {} }) {
     const apps = (catalog?.apps || [])
         .filter(a => a.available && a.actions.length)
         .map(a => {
@@ -48,6 +48,8 @@ draft is a typed DAG of steps:
   \`steps.<id>.output.<field>\`, \`trigger.output.<field>\`,
   \`vars.<name>\`, or \`loop.<itemVar>\`.
 - All times use the user's timezone: ${userTimezone}.
+- Web search preference: the user has web-search ${webSearchEnabled ? 'ENABLED' : 'DISABLED'} for this builder session.${webSearchEnabled ? ' You may propose `agent_search` as a step when the automation needs current information from the web.' : ' Avoid proposing `agent_search` steps unless the user explicitly asks for web-based data.'}
+${Object.entries(disabledMedia || {}).filter(([, v]) => v).map(([k]) => `- The user disabled ${k} generation. Do not propose ${k}-related actions.`).join('\n')}
 - When the user is satisfied, call \`builder_request_dry_run\`. Report
   the dry-run output. If they accept, call \`builder_finalize\`.
 

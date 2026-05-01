@@ -43,7 +43,17 @@ const MAX_ITERATIONS = 8;
 
 router.post('/stream', requireAuth, async (req, res) => {
     const userId = req.session.user.id;
-    const { message, builderSessionId: clientSession, automationId, modelTier = 'fast', history = [] } = req.body || {};
+    const {
+        message,
+        builderSessionId: clientSession,
+        automationId,
+        modelTier = 'auto',
+        history = [],
+        attachments = [],
+        webSearchEnabled = true,
+        disabledMedia = {},
+        timezone,
+    } = req.body || {};
 
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
@@ -56,12 +66,16 @@ router.post('/stream', requireAuth, async (req, res) => {
     };
 
     try {
-        const featureOn = (await configStore.getConfig('feature_automations_enabled')) === true;
-        if (!featureOn) {
-            send('error', { error: 'Automation builder is not enabled for your organisation.' });
+        // Feature gate: open by default. Only block when explicitly disabled.
+        // Accepts boolean true/false or string "true"/"false" from configStore.
+        const flagRaw = await configStore.getConfig('feature_automations_enabled');
+        const featureOff = flagRaw === false || flagRaw === 'false';
+        if (featureOff) {
+            send('error', { error: 'Automation builder is disabled by your organisation administrator.' });
             return res.end();
         }
-        const codeStepEnabled = (await configStore.getConfig('automation_code_step_enabled')) === true;
+        const codeFlagRaw = await configStore.getConfig('automation_code_step_enabled');
+        const codeStepEnabled = codeFlagRaw === true || codeFlagRaw === 'true';
 
         // Resolve / load the draft.
         let draftWrap = await loadOrCreateDraft({ userId, builderSessionId: clientSession, automationId });
@@ -71,7 +85,14 @@ router.post('/stream', requireAuth, async (req, res) => {
         const catalog = await buildCatalogForUser(userId, req.session);
 
         const summary = summariseDefinition(draftWrap.def).summary;
-        const sys = buildSystemPrompt({ catalog, codeStepEnabled, userTimezone: req.body?.timezone || 'Europe/Amsterdam', existingDraftSummary: summary });
+        const sys = buildSystemPrompt({
+            catalog,
+            codeStepEnabled,
+            userTimezone: timezone || 'Europe/Amsterdam',
+            existingDraftSummary: summary,
+            webSearchEnabled: !!webSearchEnabled,
+            disabledMedia: disabledMedia || {},
+        });
 
         // Resolve model.
         const modelId = await resolveModelForTier(`tier:${modelTier}`, { userId });
@@ -86,10 +107,16 @@ router.post('/stream', requireAuth, async (req, res) => {
         const tools = TOOL_SCHEMAS.filter(t => codeStepEnabled || t.function.name !== 'builder_add_code_step');
 
         // Compose messages.
+        // Attachments are NOT actually executed (the Builder is a design-time
+        // agent, not a runtime). We surface their names/types so the user can
+        // reference them in the automation, e.g. "use this CSV as the contact list".
+        const attachmentSummary = Array.isArray(attachments) && attachments.length
+            ? `\n\n[User attached ${attachments.length} file(s) to this turn: ${attachments.map(a => a?.name || a?.filename || 'untitled').join(', ')}. They are not executed by the Builder, but you can refer to them when proposing steps.]`
+            : '';
         const messages = [
             { role: 'system', content: sys },
             ...sanitizeHistory(history),
-            { role: 'user', content: message || '' },
+            { role: 'user', content: (message || '') + attachmentSummary },
         ];
 
         let lastFinalized = false;
