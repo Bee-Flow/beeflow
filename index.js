@@ -293,6 +293,7 @@ app.use('/api/integrations/linkedin', require('./routes/integrations/linkedin'))
 app.use('/api/integrations/whatsapp', require('./routes/integrations/whatsapp'));
 app.use('/api/integrations/github', require('./routes/integrations/github'));
 app.use('/api/integrations/github-sync', require('./routes/integrations/githubSync'));
+app.use('/api/integrations/gamma', require('./routes/integrations/gamma'));
 app.use('/api/integrations/outlook', require('./routes/integrations/outlook'));
 app.use('/api/integrations/onedrive', require('./routes/integrations/oneDrive'));
 app.use('/api/templates', require('./routes/templates'));
