@@ -18,6 +18,7 @@ const GUI_DEFAULTS = {
     'admin.tab_monitoring': 'Monitoring',
     'admin.tab_subscriptions': 'Subscriptions',
     'admin.tab_languages': 'Languages',
+    'admin.tab_product_website': 'Product Website',
     'admin.access_denied_title': 'Access Denied',
     'admin.access_denied_desc': "You don't have permission to access the Admin Dashboard.",
     'admin.forbidden_title': 'Forbidden',

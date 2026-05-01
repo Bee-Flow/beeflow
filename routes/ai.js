@@ -14,7 +14,6 @@ const providerRoutes = require('./ai/providers');
 const agentChatRoutes = require('./ai/agentChat');
 const directChatRoutes = require('./ai/directChat');
 
-const researchRoutes = require('./ai/research');
 const templateChatRoutes = require('./ai/templateChat');
 const notebookChatRoutes = require('./ai/notebookChat');
 const webpageChatRoutes = require('./ai/webpageChat');
@@ -28,7 +27,6 @@ router.use('/', providerRoutes);
 router.use('/', agentChatRoutes);
 router.use('/', directChatRoutes);
 
-router.use('/', researchRoutes);
 router.use('/', templateChatRoutes);
 // Notebook chat feature gate
 const notebookChatGate = async (req, res, next) => {
