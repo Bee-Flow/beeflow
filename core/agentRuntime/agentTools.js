@@ -1,9 +1,8 @@
 /**
- * Agent tool loading — builds tool definitions for agents and swarms
+ * Agent tool loading — builds tool definitions for agents
  */
 const componentManager = require('../componentManager');
 const agentStore = require('../../stores/agentStore');
-// Legacy swarm modules removed
 const { componentToTool, SYSTEM_TOOLS } = require('../toolExecution');
 
 

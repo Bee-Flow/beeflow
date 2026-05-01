@@ -4,7 +4,6 @@
  */
 const { resolveAgentModel } = require('./modelResolver');
 const { getAgentTools, getAvailableComponents } = require('./agentTools');
-const { executeWorkerTool } = require('./workerExecution');
 const { chatWithAgent, enrichMessagesWithFormData } = require('./chatWithAgent');
 const { chatWithAgentStream } = require('./chatStream');
 const { generateChatTitle } = require('./chatTitle');

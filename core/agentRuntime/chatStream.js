@@ -10,7 +10,6 @@ const agentStore = require('../../stores/agentStore');
 const { sanitizeToolResult } = require('../../utils/sanitize');
 const fs = require('fs');
 const path = require('path');
-// Legacy swarm modules removed — isSwarm is always false
 const usageStore = require('../../stores/usageStore');
 const integrationActivityStore = require('../../stores/integrationActivityStore');
 const { resolveIntegration } = require('../integrationToolMap');
@@ -22,7 +21,6 @@ const { sanitizeMessages } = require('../../utils/messageUtils');
 const { componentToTool, executeComponentTool, executeSystemTool, SYSTEM_TOOLS } = require('../toolExecution');
 const { resolveAgentModel } = require('./modelResolver');
 const { getAgentTools } = require('./agentTools');
-const { executeWorkerTool } = require('./workerExecution');
 const { enrichMessagesWithFormData } = require('./chatWithAgent');
 const { checkRegexPatterns } = require('../guardrails');
 const { validateInput } = require('../moderation');
@@ -143,49 +141,10 @@ async function retryStreamCall(fn, maxRetries = 3) {
 }
 
 async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, onEvent, historyOverride = null, messageMetadata = {}) {
-    const swarm = null; // Swarm agents removed
     let agent = await agentStore.getAgent(agentId);
-    let isSwarm = false;
-    let brain = null;
 
     if (!agent) {
         throw new Error('Agent not found');
-    }
-
-    // Swarm execution history collector
-    const swarmLogs = [];
-    const swarmBrain = [];
-    const SWARM_EVENT_TYPES = new Set(['phase', 'worker_start', 'worker_tool', 'worker_complete', 'worker_error', 'brain_update']);
-
-    // Worker call counter for unique IDs (e.g. "Web Searcher #1", "Web Searcher #2")
-    const workerCallCounts = {};
-
-    // Wrap onEvent to intercept swarm events for persistence
-    const originalOnEvent = onEvent;
-    if (isSwarm) {
-        onEvent = (type, data) => {
-            // Enrich worker events with call number
-            if (type === 'worker_start' || type === 'worker_complete' || type === 'worker_error' || type === 'brain_update') {
-                const workerName = data.worker || 'unknown';
-                if (type === 'worker_start') {
-                    workerCallCounts[workerName] = (workerCallCounts[workerName] || 0) + 1;
-                }
-                data.workerId = `${workerName.toLowerCase().replace(/\s+/g, '_')}_${workerCallCounts[workerName] || 1}`;
-                data.callNumber = workerCallCounts[workerName] || 1;
-            }
-
-            // Collect swarm events for persistence
-            if (SWARM_EVENT_TYPES.has(type)) {
-                const entry = { type, ...data, timestamp: new Date().toISOString() };
-                if (type === 'brain_update') {
-                    swarmBrain.push(entry);
-                } else {
-                    swarmLogs.push(entry);
-                }
-            }
-            // Always forward to the original handler for SSE streaming
-            originalOnEvent(type, data);
-        };
     }
 
     // Get global config for guardrails and defaults
@@ -200,10 +159,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     const config = await getProviderForModel(modelToUse);
     console.log(`[AgentRuntime] Streaming with model: ${modelToUse} from provider: ${config.providerName || 'default'}`);
 
-    // For swarms, tools are loaded per-phase; for normal agents, load all tools
-    let tools = isSwarm
-        ? swarmOrchestrator.getSwarmToolsForPhase(swarm, 0)
-        : await getAgentTools(agentId);
+    let tools = await getAgentTools(agentId);
 
     // ── Check per-agent external tools disable flag ──────
     const disableExternalTools = agent.config?.disableExternalTools === true;
@@ -511,7 +467,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     let systemPrompt = await buildSystemPrompt({ agent, tools, userId, messageMetadata, memoryContext, isStrictKnowledge });
 
     // ============ GUARDRAILS (before KB search — block early) ============
-    const guardrailsResult = await runInputGuardrails({ agent, messages, userMessage, globalConfig, onEvent, userId, conversationId: conversation?.id, source: isSwarm ? 'swarm_orchestrator' : 'agent_stream', model: modelToUse });
+    const guardrailsResult = await runInputGuardrails({ agent, messages, userMessage, globalConfig, onEvent, userId, conversationId: conversation?.id, source: 'agent_stream', model: modelToUse });
     let moderationViolation = guardrailsResult.moderationViolation;
     let guardrailViolation = guardrailsResult.guardrailViolation;
     let processedUserMessage = guardrailsResult.processedUserMessage;
@@ -931,18 +887,8 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         };
     }
 
-    // Phase-driven execution state for swarms
-    // Filter out disabled phases before execution
-    if (isSwarm && swarm.phases) {
-        swarm.phases = swarm.phases.filter(p => p.enabled !== false);
-    }
-    let currentPhaseIndex = 0;
-    const phaseResults = [];
-    const totalPhases = isSwarm ? (swarm.phases?.length || 1) : 1;
-    const calledWorkersInPhase = new Set(); // Track called workers for runOnce enforcement
-
     let iterations = 0;
-    const maxIterations = isSwarm ? (totalPhases * 8) : 10;
+    const maxIterations = 10;
     let toolCalls = [];
     let fullResponse = '';
     let _emailDrafts = [];
@@ -953,7 +899,6 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     let _toolHistory = []; // Track tool calls for persistence
     let _thinking = '';    // Accumulate model reasoning for persistence (legacy string form)
     let _thinkingParts = []; // Structured thinking parts — carry signature (Claude) + timing for UI
-    let _orchestratorThinking = ''; // Accumulate swarm orchestrator thinking
     // Helper: look up / create a thinking part by provider-supplied partId.
     const _getThinkingPart = (partId) => {
         if (!partId) return null;
@@ -967,12 +912,6 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
 
     // Abort signal from the route handler (client disconnect)
     const signal = messageMetadata.signal || null;
-
-    // Emit first phase start event
-    if (isSwarm && swarm.phases?.length > 0) {
-        onEvent('phase', { phase: swarm.phases[0].name, message: `Starting phase: ${swarm.phases[0].name}` });
-    }
-
 
     while (iterations < maxIterations) {
         // Check if client disconnected
@@ -1030,15 +969,6 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             const _convTokenMap = require('../dlp/dlpRunner').getConversationTokenMap(conversation?.id);
             const _tokenAddendum = buildTokenPreservationAddendum(_convTokenMap);
             if (_tokenAddendum) effectiveSystemPrompt += _tokenAddendum;
-
-            // For swarms: update system prompt and tools for the current phase
-            if (isSwarm) {
-                effectiveSystemPrompt = swarmOrchestrator.generatePhasePrompt(swarm, currentPhaseIndex, phaseResults);
-                tools = swarmOrchestrator.getSwarmToolsForPhase(swarm, currentPhaseIndex);
-                console.log(`[AgentRuntime] 🐝 Phase ${currentPhaseIndex + 1}/${totalPhases}: "${swarm.phases[currentPhaseIndex]?.name}" — ${tools.length} workers available: [${tools.map(t => t.function?.name).join(', ')}]`);
-
-
-            }
 
             // Enrich messages with form data context
             // We do this inside the loop to ensure it persists across tool calls if needed (though usually it's static)
@@ -1144,48 +1074,38 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                                 }
                             }
 
-                            if (!isSwarm) {
-                                onEvent('content', { text: textChunk });
-                            } else {
-                                onEvent('orchestrator_thinking', { text: textChunk });
-                                _orchestratorThinking += textChunk;
-                            }
+                            onEvent('content', { text: textChunk });
                         } else if (type === 'thinking_start') {
-                            if (!isSwarm && data.partId) {
+                            if (data.partId) {
                                 const part = _getThinkingPart(data.partId);
                                 if (data.redacted) part.redacted = true;
                                 onEvent('thinking_start', { partId: data.partId, redacted: data.redacted || undefined });
                             }
                         } else if (type === 'thinking') {
-                            if (isSwarm) {
-                                onEvent('orchestrator_thinking', { text: data.text });
-                                _orchestratorThinking += data.text;
+                            // Route into the right thinking part if provider supplied partId;
+                            // otherwise append to the most recent part (or open an implicit one).
+                            if (data.partId) {
+                                const part = _getThinkingPart(data.partId);
+                                part.text += data.text;
                             } else {
-                                // Route into the right thinking part if provider supplied partId;
-                                // otherwise append to the most recent part (or open an implicit one).
-                                if (data.partId) {
-                                    const part = _getThinkingPart(data.partId);
-                                    part.text += data.text;
-                                } else {
-                                    let part = _thinkingParts[_thinkingParts.length - 1];
-                                    if (!part || part.endedAt) {
-                                        part = { id: `auto-${_thinkingParts.length}`, text: '', startedAt: Date.now(), endedAt: null };
-                                        _thinkingParts.push(part);
-                                    }
-                                    part.text += data.text;
+                                let part = _thinkingParts[_thinkingParts.length - 1];
+                                if (!part || part.endedAt) {
+                                    part = { id: `auto-${_thinkingParts.length}`, text: '', startedAt: Date.now(), endedAt: null };
+                                    _thinkingParts.push(part);
                                 }
-                                onEvent('thinking', { text: data.text, partId: data.partId });
-                                _thinking += data.text;
+                                part.text += data.text;
                             }
+                            onEvent('thinking', { text: data.text, partId: data.partId });
+                            _thinking += data.text;
                         } else if (type === 'thinking_signature') {
                             // Server-side only — persist onto the matching part so Claude multi-turn
                             // tool flows replay with signature intact. Never forwarded to SSE.
-                            if (!isSwarm && data.partId && data.signature) {
+                            if (data.partId && data.signature) {
                                 const part = _getThinkingPart(data.partId);
                                 part.signature = data.signature;
                             }
                         } else if (type === 'thinking_stop') {
-                            if (!isSwarm && data.partId) {
+                            if (data.partId) {
                                 const part = _getThinkingPart(data.partId);
                                 part.endedAt = Date.now();
                                 if (data.redacted) part.redacted = true;
@@ -1216,7 +1136,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         user_id: userId,
                         agent_id: agentId,
                         agent_name: agent.name,
-                        agent_type: isSwarm ? 'swarm' : 'chat',
+                        agent_type: 'chat',
                         model: modelToUse,
                         prompt_tokens: _adapterStreamUsage?.prompt_tokens || 0,
                         completion_tokens: _adapterStreamUsage?.completion_tokens || 0,
@@ -1227,8 +1147,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         cache_ttl: _adapterStreamUsage?.cache_ttl || null,
                         stop_reason: _adapterStreamUsage?.stop_reason || null,
                         parent_call_id: messageMetadata.parentCallId || null,
-                        swarm_run_id: messageMetadata.swarmRunId || null,
-                        source: isSwarm ? 'swarm_orchestrator' : 'agent_stream',
+                        source: 'agent_stream',
                         duration_ms: Date.now() - _streamCallStart,
                         organization_id: agent.organization_id || null,
                         conversation_id: conversation?.id || null
@@ -1261,12 +1180,6 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         return clean;
                     });
                     requestBody.tool_choice = 'auto';
-
-                    // Enable parallel tool calls when the swarm phase is configured for parallel execution
-                    if (isSwarm && swarm.phases?.[currentPhaseIndex]?.parallel) {
-                        requestBody.parallel_tool_calls = true;
-                        console.log(`[AgentRuntime] ⚡ Parallel tool calls enabled for phase "${swarm.phases[currentPhaseIndex].name}"`);
-                    }
                 }
 
                 // Debug logging: what is being sent to the LLM
@@ -1352,13 +1265,8 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                                                     .map(t => t.text)
                                                     .join('');
                                                 if (thinkText) {
-                                                    if (isSwarm) {
-                                                        onEvent('orchestrator_thinking', { text: thinkText });
-                                                        _orchestratorThinking += thinkText;
-                                                    } else {
-                                                        onEvent('thinking', { text: thinkText });
-                                                        _thinking += thinkText;
-                                                    }
+                                                    onEvent('thinking', { text: thinkText });
+                                                    _thinking += thinkText;
                                                 }
                                             } else if (chunk.type === 'text' && chunk.text) {
                                                 textChunk += chunk.text;
@@ -1384,14 +1292,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                                                 break;
                                             }
                                         }
-                                        // Stream content to user (suppress during swarm phases — workers handle output)
-                                        if (!isSwarm) {
-                                            onEvent('content', { text: textChunk });
-                                        } else {
-                                            // In swarm mode, emit orchestrator text as thinking so the UI can show it
-                                            onEvent('orchestrator_thinking', { text: textChunk });
-                                            _orchestratorThinking += textChunk;
-                                        }
+                                        onEvent('content', { text: textChunk });
                                     }
                                 }
 
@@ -1426,7 +1327,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                             user_id: userId,
                             agent_id: agentId,
                             agent_name: agent.name,
-                            agent_type: isSwarm ? 'swarm' : 'chat',
+                            agent_type: 'chat',
                             model: modelToUse,
                             prompt_tokens: _sseStreamUsage.prompt_tokens || 0,
                             completion_tokens: _sseStreamUsage.completion_tokens || 0,
@@ -1436,8 +1337,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                             reasoning_tokens: _sseStreamUsage.completion_tokens_details?.reasoning_tokens || 0,
                             stop_reason: _sseFinishReason,
                             parent_call_id: messageMetadata.parentCallId || null,
-                            swarm_run_id: messageMetadata.swarmRunId || null,
-                            source: isSwarm ? 'swarm_orchestrator' : 'agent_stream',
+                            source: 'agent_stream',
                             duration_ms: Date.now() - _streamCallStart,
                             organization_id: agent.organization_id || null,
                             conversation_id: conversation?.id || null
@@ -1450,7 +1350,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             if (currentToolCalls.length > 0 && currentToolCalls[0]?.function?.name) {
                 // Clear intermediate planning text from the UI — only the final response
                 // (from the last iteration without tool calls) should be visible to the user
-                if (contentBuffer && !isSwarm) {
+                if (contentBuffer) {
                     onEvent('content_replace', { text: '' });
                 }
 
@@ -1467,23 +1367,6 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 };
                 messages.push(assistantMessage);
 
-                // In the last phase, only execute the FIRST worker_* call to avoid duplicates
-                // (the LLM sometimes issues parallel calls to the same worker)
-                let effectiveToolCalls = currentToolCalls;
-                if (isSwarm && currentPhaseIndex === totalPhases - 1) {
-                    let firstWorkerSeen = false;
-                    effectiveToolCalls = currentToolCalls.filter(tc => {
-                        if (tc.function?.name?.startsWith('worker_')) {
-                            if (firstWorkerSeen) {
-                                console.log(`[AgentRuntime] ⚠️ Last phase: skipping duplicate worker call "${tc.function.name}"`);
-                                return false;
-                            }
-                            firstWorkerSeen = true;
-                        }
-                        return true;
-                    });
-                }
-
                 // Check abort before tool execution
                 if (signal?.aborted) {
                     console.log('[AgentRuntime] Aborting before tool execution — client disconnected');
@@ -1491,7 +1374,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 }
 
                 // Execute all tools in parallel
-                const toolExecutionPromises = effectiveToolCalls.map(async (toolCall) => {
+                const toolExecutionPromises = currentToolCalls.map(async (toolCall) => {
                     const toolName = toolCall.function.name;
                     let toolArgs = {};
                     try {
@@ -1503,41 +1386,6 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     const fixedParams = toolParamsMap[toolName] || null;
                     console.log(`[AgentRuntime] Tool lookup: ${toolName}, found fixedParams:`, fixedParams);
                     onEvent('tool_start', { name: toolName, args: toolArgs });
-
-                    // Phase boundary enforcement: reject worker calls not in current phase
-                    if (isSwarm && toolName.startsWith('worker_')) {
-                        const allowedToolNames = tools.map(t => t.function?.name);
-                        if (!allowedToolNames.includes(toolName)) {
-                            const phaseName = swarm.phases[currentPhaseIndex]?.name || `Phase ${currentPhaseIndex + 1}`;
-                            console.log(`[AgentRuntime] ⛔ Blocked worker call "${toolName}" — not available in current phase "${phaseName}". Allowed: [${allowedToolNames.join(', ')}]`);
-                            onEvent('tool_end', { name: toolName, result: `[Blocked: ${toolName} is not available in the current phase "${phaseName}"]` });
-                            return {
-                                toolCall,
-                                toolName,
-                                toolArgs,
-                                finalToolResult: `Error: ${toolName} is not available in the current phase "${phaseName}". Only use the workers provided for this phase.`,
-                                blocked: true
-                            };
-                        }
-
-                        // RunOnce enforcement: block duplicate worker calls in the same phase
-                        const currentPhase = swarm.phases[currentPhaseIndex];
-                        if (currentPhase?.runOnce && calledWorkersInPhase.has(toolName)) {
-                            const phaseName = currentPhase.name || `Phase ${currentPhaseIndex + 1}`;
-                            console.log(`[AgentRuntime] ⛔ Blocked duplicate worker call "${toolName}" — runOnce enabled for phase "${phaseName}"`);
-                            onEvent('tool_end', { name: toolName, result: `[Blocked: ${toolName} already executed in this phase (run-once mode)]` });
-                            return {
-                                toolCall,
-                                toolName,
-                                toolArgs,
-                                finalToolResult: `Error: ${toolName} has already been called in this phase. Each worker can only be called once in "${phaseName}". Move on to the next phase.`,
-                                blocked: true
-                            };
-                        }
-
-                        // Track the worker call
-                        calledWorkersInPhase.add(toolName);
-                    }
 
                     // Regex Guardrails - Tool Input scope
                     if (regexConfig?.enabled && regexConfig?.scope?.toolInput) {
@@ -1574,7 +1422,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                                 violation_categories: 'Web Search Guard',
                                 direction: 'input',
                                 action_taken: 'search_blocked',
-                                source: isSwarm ? 'swarm_orchestrator' : 'agent_stream',
+                                source: 'agent_stream',
                                 model: modelToUse,
                             }).catch(() => {});
                             onEvent('tool_end', { name: toolName, result: `[Web search blocked — query violates content policy]` });
@@ -1606,7 +1454,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                                     violation_categories: cats,
                                     direction: 'input',
                                     action_taken: webSearchGuardEnabled ? 'search_blocked' : 'pii_detected',
-                                    source: isSwarm ? 'swarm_orchestrator' : 'agent_stream',
+                                    source: 'agent_stream',
                                     model: modelToUse,
                                 }).catch(() => {});
                                 // Only block when Web Search Guard is enabled
@@ -1630,27 +1478,22 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         }
                     }
 
-                    let toolResult;
-                    if (isSwarm && toolName.startsWith('worker_')) {
-                        toolResult = await executeWorkerTool(toolName, toolArgs, agentId, userAuth, onEvent, brain, signal);
-                    } else {
-                        // Use unified tool dispatcher — supports integrations + components
-                        const { executeTool: dispatchTool } = require('../toolDispatcher');
-                        toolResult = await dispatchTool(toolName, toolArgs, {
-                            userId,
-                            session: userAuth?.session,
-                            userAuth,
-                            fixedParams: fixedParams,
-                            agentId: agent.id,
-                            conversationId: conversation.id,
-                            send: onEvent,
-                            req: messageMetadata.req || null,
-                            nanoBananaSettings: messageMetadata.nanoBananaSettings || null,
-                            onImageGenerated: (data) => {
-                                onEvent('image', data);
-                            },
-                        });
-                    }
+                    // Use unified tool dispatcher — supports integrations + components
+                    const { executeTool: dispatchTool } = require('../toolDispatcher');
+                    let toolResult = await dispatchTool(toolName, toolArgs, {
+                        userId,
+                        session: userAuth?.session,
+                        userAuth,
+                        fixedParams: fixedParams,
+                        agentId: agent.id,
+                        conversationId: conversation.id,
+                        send: onEvent,
+                        req: messageMetadata.req || null,
+                        nanoBananaSettings: messageMetadata.nanoBananaSettings || null,
+                        onImageGenerated: (data) => {
+                            onEvent('image', data);
+                        },
+                    });
 
                     // Regex Guardrails - Tool Output scope
                     let finalToolResult = toolResult;
@@ -1676,40 +1519,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 console.log(`[AgentRuntime] Executing ${currentToolCalls.length} tools in parallel...`);
                 const toolResults = await Promise.all(toolExecutionPromises);
 
-                // Check if any worker directly streamed to the user
-                const directStreamResult = toolResults.find(r =>
-                    r.finalToolResult && typeof r.finalToolResult === 'object' && r.finalToolResult.__direct_streamed__
-                );
-
-                if (directStreamResult) {
-                    // The last worker already streamed directly to the user
-                    // Save the conversation with the streamed content as the assistant response
-                    fullResponse = directStreamResult.finalToolResult.content;
-                    console.log(`[AgentRuntime] Worker streamed directly to user (${fullResponse.length} chars) — skipping orchestrator synthesis`);
-
-                    // Add the assistant message with the streamed content
-                    const directStreamMsg = {
-                        role: 'assistant',
-                        content: fullResponse,
-                        parentId: messageMetadata.parentId || null
-                    };
-                    // Attach swarm execution history if available
-                    if (isSwarm && (swarmLogs.length > 0 || swarmBrain.length > 0)) {
-                        directStreamMsg.swarmActivity = {
-                            type: 'swarm',
-                            logs: swarmLogs,
-                            brain: swarmBrain
-                        };
-                        console.log(`[AgentRuntime] Persisting swarm activity: ${swarmLogs.length} logs, ${swarmBrain.length} brain entries`);
-                    }
-                    messages.push(directStreamMsg);
-                    await agentStore.updateConversation(conversation.id, messages, userAuth.encryptionKey, userAuth.userId);
-
-                    // Note: 'done' event will be sent by the route handler when chatWithAgentStream returns
-                    break; // Exit the orchestrator loop
-                }
-
-                // Process results in order (normal path)
+                // Process results in order
                 for (const result of toolResults) {
                     const { toolCall, toolName, toolArgs, finalToolResult } = result;
 
@@ -1809,14 +1619,13 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                             user_id: userId,
                             agent_id: agentId,
                             agent_name: agent.name,
-                            agent_type: isSwarm ? 'swarm' : 'chat',
+                            agent_type: 'chat',
                             model: modelToUse,
                             tool_name: toolName,
-                            source: isSwarm ? 'swarm_orchestrator' : 'agent_chat',
+                            source: 'agent_chat',
                             organization_id: agent.organization_id || null,
                             conversation_id: conversation?.id || null,
                             parent_call_id: messageMetadata.parentCallId || null,
-                            swarm_run_id: messageMetadata.swarmRunId || null,
                         });
                     } catch (e) { /* ignore */ }
 
@@ -1853,7 +1662,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                                     data_categories: integMeta.dataCategories,
                                     pii_categories_detected: piiDetected || null,
                                     pii_scan_enabled: true,
-                                    source: isSwarm ? 'swarm_orchestrator' : 'agent_stream',
+                                    source: 'agent_stream',
                                     model: modelToUse,
                                 }).catch(e => console.error('[IntegrationActivityLog] Error:', e.message));
                             }).catch(() => {});
@@ -1867,152 +1676,13 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     });
                 }
 
-                // In the LAST phase: ANY worker call produces the final output
-                // Break immediately — don't let the orchestrator add meta-commentary
-                if (isSwarm && currentPhaseIndex === totalPhases - 1) {
-                    const workerResult = toolResults.find(r => r.toolName?.startsWith('worker_') && !r.blocked);
-                    if (workerResult) {
-                        const lastPhase = swarm.phases[currentPhaseIndex];
-                        const workerName = workerResult.toolName.replace('worker_', '');
-                        console.log(`[AgentRuntime] 🐝 Final phase worker "${workerResult.toolName}" completed — using as final output`);
-                        fullResponse = typeof workerResult.finalToolResult === 'string'
-                            ? workerResult.finalToolResult
-                            : JSON.stringify(workerResult.finalToolResult);
-
-                        // Stream the worker's result to the user
-                        onEvent('content', { text: fullResponse });
-                        onEvent('worker_complete', { worker: workerName, result: fullResponse.slice(0, 100) + '...' });
-
-                        // Save conversation and break
-                        const finalMsg = {
-                            role: 'assistant',
-                            content: fullResponse,
-                            parentId: messageMetadata.parentId || null
-                        };
-                        if (swarmLogs.length > 0 || swarmBrain.length > 0) {
-                            finalMsg.swarmActivity = {
-                                type: 'swarm',
-                                logs: swarmLogs,
-                                brain: swarmBrain
-                            };
-                        }
-                        messages.push(finalMsg);
-                        await agentStore.updateConversation(conversation.id, messages, userAuth.encryptionKey, userAuth.userId);
-                        break; // Exit the orchestrator loop
-                    }
-                }
-
                 // Save conversation after tool execution (so tool calls are persisted)
                 console.log('[AgentStream] Saving conversation with tool calls:', JSON.stringify(messages.slice(-3), null, 2));
                 await agentStore.updateConversation(conversation.id, messages, userAuth.encryptionKey, userAuth.userId);
                 continue;
             }
 
-            // No tool calls — check if swarm phase is complete
-            if (isSwarm && currentPhaseIndex < totalPhases - 1) {
-                // Phase complete but NOT the last phase — advance to next phase
-                const phaseSummary = contentBuffer;
-                const phaseName = swarm.phases[currentPhaseIndex]?.name || `Phase ${currentPhaseIndex + 1}`;
-                phaseResults.push(phaseSummary);
-                console.log(`[AgentRuntime] ✅ Phase "${phaseName}" complete (${phaseSummary.length} chars). Advancing to phase ${currentPhaseIndex + 2}/${totalPhases}`);
-
-                // Add phase summary to Hive Mind so later workers can access it
-                if (brain && phaseSummary.trim()) {
-                    brain.addEntry(`Orchestrator`, `Phase "${phaseName}" summary: ${phaseSummary}`);
-                    onEvent('brain_update', {
-                        worker: 'Orchestrator',
-                        phase: phaseName,
-                        content: phaseSummary
-                    });
-                }
-
-                // Emit phase completion event
-                onEvent('phase', { phase: phaseName, message: `Phase complete: ${phaseName}`, status: 'complete' });
-
-                currentPhaseIndex++;
-                calledWorkersInPhase.clear(); // Reset worker tracking for the new phase
-                const nextPhaseName = swarm.phases[currentPhaseIndex]?.name || `Phase ${currentPhaseIndex + 1}`;
-
-                // Emit next phase start event
-                onEvent('phase', { phase: nextPhaseName, message: `Starting phase: ${nextPhaseName}` });
-
-                // For the last phase, also emit worker_start so the UI shows which agent will respond
-                if (currentPhaseIndex === totalPhases - 1) {
-                    const lastPhase = swarm.phases[currentPhaseIndex];
-                    const lastAgent = lastPhase?.agents?.[lastPhase.agents.length - 1];
-                    if (lastAgent) {
-                        onEvent('worker_start', {
-                            worker: lastAgent.name,
-                            role: lastAgent.role,
-                            phase: nextPhaseName,
-                            message: `${lastAgent.name} is preparing the final response...`
-                        });
-                    }
-                }
-
-                // Trim conversation to prevent cross-phase context bleed
-                // Keep only the original user message(s) and add a compact transition
-                const originalMessages = messages.filter(m => m.role === 'user' && !m.content?.startsWith('Previous phases'));
-                messages.length = 0;
-                messages.push(...originalMessages);
-
-                // Inject Hive Mind context so the orchestrator can see all findings
-                const hiveMindContext = brain && brain.size > 0 ? `\n\n${brain.toPromptContext()}` : '';
-                messages.push({
-                    role: 'user',
-                    content: `Previous phases complete.${hiveMindContext}\n\nBegin phase "${nextPhaseName}" now. Use only the workers provided.`
-                });
-
-                // Reset content buffer for next phase
-                fullResponse = '';
-                continue;
-            }
-
-            // Final response (last phase or non-swarm)
-            if (isSwarm && currentPhaseIndex === totalPhases - 1) {
-                // Last phase: orchestrator didn't call the worker — force-call it
-                const lastPhase = swarm.phases[currentPhaseIndex];
-                const lastAgent = lastPhase?.agents?.[lastPhase.agents.length - 1];
-                const lastWorkerKey = lastAgent?.role || lastAgent?.name?.toLowerCase().replace(/\s+/g, '_');
-
-                if (lastAgent && lastWorkerKey) {
-                    console.log(`[AgentRuntime] 🐝 Orchestrator didn't call last worker "${lastAgent.name}" — force-invoking it`);
-
-                    // Emit worker attribution
-                    onEvent('worker_start', {
-                        worker: lastAgent.name,
-                        role: lastAgent.role,
-                        phase: lastPhase.name,
-                        message: `${lastAgent.name} is preparing the final response...`
-                    });
-
-                    // Use orchestrator's output as instruction for the last worker
-                    const workerResult = await executeWorkerTool(
-                        `worker_${lastWorkerKey}`,
-                        { instruction: contentBuffer || 'Produce the final comprehensive response based on all Hive Mind findings.' },
-                        agentId,
-                        userAuth,
-                        onEvent,
-                        brain,
-                        signal
-                    );
-
-                    if (workerResult && typeof workerResult === 'object' && workerResult.__direct_streamed__) {
-                        fullResponse = workerResult.content;
-                        onEvent('worker_complete', { worker: lastAgent.name, result: '(streamed directly to user)' });
-                    } else {
-                        fullResponse = typeof workerResult === 'string' ? workerResult : JSON.stringify(workerResult);
-                        // Stream the worker's response to the user
-                        onEvent('content', { text: fullResponse });
-                        onEvent('worker_complete', { worker: lastAgent.name, result: fullResponse.slice(0, 100) + '...' });
-                    }
-                } else {
-                    // Fallback: no last agent found, use orchestrator's response
-                    fullResponse = contentBuffer;
-                }
-            } else {
-                fullResponse = contentBuffer;
-            }
+            fullResponse = contentBuffer;
 
             // Strip raw tool-call XML tags from the response — some models (e.g. Mistral thinking)
             // output <tool_call>/<tool_response> as plain text instead of structured function calls
@@ -2079,7 +1749,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                                 violation_categories: violationLabels.join(', '),
                                 direction: 'output',
                                 action_taken: 'soft_block',
-                                source: isSwarm ? 'swarm_orchestrator' : 'agent_stream',
+                                source: 'agent_stream',
                                 model: modelToUse,
                             }).catch(() => {});
                         }
@@ -2119,23 +1789,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 // Legacy path: flat-string thinking without part metadata.
                 assistantMsg.thinking = _thinking;
             }
-            if (_orchestratorThinking) assistantMsg.orchestratorThinking = _orchestratorThinking;
 
-            // Emit phase completion for the last phase
-            if (isSwarm && swarm.phases?.length > 0) {
-                const lastPhaseName = swarm.phases[currentPhaseIndex]?.name || `Phase ${currentPhaseIndex + 1}`;
-                onEvent('phase', { phase: lastPhaseName, message: `Phase complete: ${lastPhaseName}`, status: 'complete' });
-            }
-
-            // Attach swarm execution history if available
-            if (isSwarm && (swarmLogs.length > 0 || swarmBrain.length > 0)) {
-                assistantMsg.swarmActivity = {
-                    type: 'swarm',
-                    logs: swarmLogs,
-                    brain: swarmBrain
-                };
-                console.log(`[AgentRuntime] Persisting swarm activity: ${swarmLogs.length} logs, ${swarmBrain.length} brain entries`);
-            }
             // Privacy / DLP — persist redaction metadata so the badge + "How I got
             // this answer" panel survive a refresh. Raw response is captured live
             // into _rawResponseBuffer above; copy it here before persistence.

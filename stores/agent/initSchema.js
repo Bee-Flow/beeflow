@@ -72,8 +72,6 @@ async function _doInit() {
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     `);
-    // Legacy swarm tables (swarm_orchestrator, swarm_workers, swarm_phases) removed.
-    // The Swarm system was purged — see conversation e9a327a6.
     await exec('CREATE INDEX IF NOT EXISTS idx_agents_owner ON agents(owner_id)');
     await exec('CREATE INDEX IF NOT EXISTS idx_agent_tools_agent ON agent_tools(agent_id)');
     await exec('CREATE INDEX IF NOT EXISTS idx_agent_conversations_agent ON agent_conversations(agent_id)');

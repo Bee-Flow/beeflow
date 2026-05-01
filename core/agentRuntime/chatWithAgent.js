@@ -4,14 +4,12 @@
 const { getAIConfig, getProviderForModel, resolveModelId } = require('../aiAgent');
 const { getAdapter } = require('../providers');
 const agentStore = require('../../stores/agentStore');
-// Legacy swarm modules removed
 const usageStore = require('../../stores/usageStore');
 const { sanitizeToolResult } = require('../../utils/sanitize');
 const { sanitizeMessages } = require('../../utils/messageUtils');
 const { componentToTool, executeComponentTool } = require('../toolExecution');
 const { resolveAgentModel } = require('./modelResolver');
 const { getAgentTools } = require('./agentTools');
-const { executeWorkerTool } = require('./workerExecution');
 const { processSystemPrompt } = require('../promptUtils');
 const { validateInput } = require('../moderation');
 const { validateInputForPii } = require('../azurePiiDetection');
@@ -20,10 +18,7 @@ const dlpRunner = require('../dlp/dlpRunner');
 const { buildTokenPreservationAddendum } = require('../dlp/tokenPreservationPrompt');
 
 async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
-    const swarm = null; // Swarm agents removed
     let agent = await agentStore.getAgent(agentId);
-    let isSwarm = false;
-    let brain = null;
 
     if (!agent) {
         throw new Error('Agent not found');
@@ -39,22 +34,14 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
     const tools = await getAgentTools(agentId);
 
     // Load tool configs with fixed params
-    // For Swarms, we don't have this yet, so empty map
-    let toolParamsMap = {};
-    if (!isSwarm) {
-        const toolConfigs = await agentStore.getAgentToolsWithParams(agentId);
-        for (const tc of toolConfigs) {
-            // Convert component ID to tool name format (replace hyphens with underscores)
-            const toolName = tc.componentId.replace(/-/g, '_');
-            toolParamsMap[toolName] = tc.params;
-        }
+    const toolParamsMap = {};
+    const toolConfigs = await agentStore.getAgentToolsWithParams(agentId);
+    for (const tc of toolConfigs) {
+        // Convert component ID to tool name format (replace hyphens with underscores)
+        const toolName = tc.componentId.replace(/-/g, '_');
+        toolParamsMap[toolName] = tc.params;
     }
 
-    // Get or create conversation
-    // For swarms, we use the same table but the ID is the swarm ID
-    if (isSwarm) {
-        await agentStore.ensurePlaceholderAgent(agent.id, agent.name, agent.description);
-    }
     const conversation = await agentStore.getOrCreateConversation(agentId, userId);
     let messages = [...conversation.messages];
 
@@ -188,7 +175,7 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
                     user_id: userId,
                     agent_id: agentId,
                     agent_name: agent.name,
-                    agent_type: isSwarm ? 'swarm' : 'chat',
+                    agent_type: 'chat',
                     model: modelToUse,
                     prompt_tokens: data.usage.prompt_tokens || 0,
                     completion_tokens: data.usage.completion_tokens || 0,
@@ -197,7 +184,7 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
                     cache_creation_tokens: data.usage.cache_creation_input_tokens || 0,
                     reasoning_tokens: data.usage.completion_tokens_details?.reasoning_tokens || 0,
                     stop_reason: choice?.finish_reason || null,
-                    source: isSwarm ? 'swarm_orchestrator' : 'agent_chat',
+                    source: 'agent_chat',
                     duration_ms: Date.now() - _callStart,
                     organization_id: agent.organization_id || null,
                     conversation_id: conversation?.id || null
@@ -209,9 +196,7 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
                 // Add assistant message with tool calls
                 messages.push(assistantMessage);
 
-                // Execute each tool call
-                // Execute tool calls in parallel to support swarm concurrency
-                // We map each tool call to a promise that resolves to its result message
+                // Execute tool calls in parallel
                 const toolExecutionPromises = assistantMessage.tool_calls.map(async (toolCall) => {
                     const toolName = toolCall.function.name;
                     let toolArgs = {};
@@ -229,20 +214,15 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
 
                     let toolResult;
                     try {
-                        if (isSwarm && toolName.startsWith('worker_')) {
-                            // Workers might take time, so parallel execution is key here
-                            toolResult = await executeWorkerTool(toolName, toolArgs, agentId, userAuth, undefined, brain, signal);
-                        } else {
-                            // Use unified tool dispatcher — supports integrations + components
-                            const { executeTool: dispatchTool } = require('../toolDispatcher');
-                            toolResult = await dispatchTool(toolName, toolArgs, {
-                                userId,
-                                session: userAuth?.session,
-                                userAuth,
-                                fixedParams: fixedParams,
-                                agentId,
-                            });
-                        }
+                        // Use unified tool dispatcher — supports integrations + components
+                        const { executeTool: dispatchTool } = require('../toolDispatcher');
+                        toolResult = await dispatchTool(toolName, toolArgs, {
+                            userId,
+                            session: userAuth?.session,
+                            userAuth,
+                            fixedParams: fixedParams,
+                            agentId,
+                        });
                     } catch (err) {
                         console.error(`[Agent] Tool execution failed for ${toolName}:`, err);
                         toolResult = { error: err.message };
