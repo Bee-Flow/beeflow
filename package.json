@@ -51,7 +51,7 @@
     "helmet": "^8.1.0",
     "html-to-docx": "^1.8.0",
     "ioredis": "^5.10.0",
-    "isolated-vm": "^5.0.5",
+    "isolated-vm": "^5.0.4",
     "jsdom": "^28.1.0",
     "mammoth": "^1.11.0",
     "microsoft-cognitiveservices-speech-sdk": "^1.48.0",
