@@ -43,8 +43,8 @@ const PROPOSE_WEBPAGE_PLAN_TOOL = {
                             },
                             action: {
                                 type: 'string',
-                                enum: ['create', 'rewrite', 'partial_edit'],
-                                description: '"create" (new file), "rewrite" (full replace), or "partial_edit" (small targeted change).',
+                                enum: ['edit', 'create', 'rewrite'],
+                                description: 'What kind of change this step is. Default to "edit" for any change to an existing file (it maps to partial-edit tools — webpage_file_replace / webpage_file_patch — which preserve surrounding content). Use "create" only for brand-new files. Use "rewrite" ONLY when you genuinely intend to throw away ≥80% of an existing file — that\'s rare; if in doubt, say "edit".',
                             },
                             why: {
                                 type: 'string',
@@ -82,12 +82,19 @@ function executeProposeWebpagePlan(args) {
     if (!summary) return { error: 'plan summary is required.' };
     if (stepsRaw.length === 0) return { error: 'plan must include at least one step.' };
 
-    const steps = stepsRaw.slice(0, 8).map(s => ({
-        file: s?.file === 'html' || s?.file === 'css' || s?.file === 'js' ? s.file : 'html',
-        action: ['create', 'rewrite', 'partial_edit'].includes(s?.action) ? s.action : 'partial_edit',
-        why: String(s?.why || '').trim().slice(0, 400),
-        preview: s?.preview ? String(s.preview).slice(0, 400) : undefined,
-    }));
+    const steps = stepsRaw.slice(0, 8).map(s => {
+        // Normalise legacy `partial_edit` to the new `edit` label so older
+        // models still produce well-formed plans during the transition.
+        let action = s?.action;
+        if (action === 'partial_edit') action = 'edit';
+        if (!['edit', 'create', 'rewrite'].includes(action)) action = 'edit';
+        return {
+            file: s?.file === 'html' || s?.file === 'css' || s?.file === 'js' ? s.file : 'html',
+            action,
+            why: String(s?.why || '').trim().slice(0, 400),
+            preview: s?.preview ? String(s.preview).slice(0, 400) : undefined,
+        };
+    });
 
     const planId = crypto.randomUUID();
     const plan = { title, summary, steps };

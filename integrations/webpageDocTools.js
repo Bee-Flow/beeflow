@@ -41,7 +41,7 @@ const WEBPAGE_DOC_TOOLS = [
         type: 'function',
         function: {
             name: 'webpage_file_write',
-            description: 'Replace the ENTIRE content of one webpage file. Use this for new files or full rewrites. For partial edits, prefer webpage_file_replace or webpage_file_patch.\n\nRules of the slot:\n- "html": valid HTML5 document or fragment.\n- "css": plain CSS. No SCSS/LESS — there is no build step.\n- "js": vanilla JavaScript. No bundler, no npm imports. CDN <script> tags belong in the HTML, not here.\n\nThe iframe runs with sandbox="allow-scripts" (no same-origin) — code that depends on parent cookies, localStorage, or fetches to the host app will fail.',
+            description: 'Overwrite the ENTIRE content of one webpage file. STRICTLY for two cases:\n  (1) the file is currently empty (initial creation), or\n  (2) you genuinely need to replace ≥80% of the content (a from-scratch rewrite).\n\nFor any other change — adding a section, tweaking styles, fixing a bug, swapping a word, restructuring a small piece — use webpage_file_replace or webpage_file_patch instead. Those preserve everything around the edit and are dramatically cheaper, faster, and safer than re-emitting the whole file. The system will WARN you in the tool result if you call webpage_file_write on a non-empty file, because in 95% of cases that\'s a mistake.\n\nFile rules:\n- "html": valid HTML5 document or fragment.\n- "css": plain CSS. No SCSS/LESS — no build step.\n- "js": vanilla JavaScript. No npm imports. CDN <script> tags belong in the HTML.\n\nThe iframe runs with sandbox="allow-scripts" (no same-origin) — code that depends on parent cookies, localStorage, or fetches to the host app will fail.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -57,7 +57,7 @@ const WEBPAGE_DOC_TOOLS = [
         type: 'function',
         function: {
             name: 'webpage_file_replace',
-            description: 'Replace a SPECIFIC substring of one webpage file. Preserves all other content.\n\nBy default, find_text must match exactly ONCE in the file — if it matches in multiple places, the tool errors and asks you to either narrow the snippet or set replace_all: true. This prevents silent unintended changes. The matcher prefers verbatim equality; if the verbatim search fails it retries with whitespace-normalized matching.\n\nIMPORTANT: Always call webpage_file_read on the same file first so you copy the EXACT current text into find_text.',
+            description: 'PREFERRED tool for editing existing webpage files. Replace a specific substring while preserving everything else. Use this for: adding/removing/changing sections, tweaking styles, swapping copy, fixing bugs, refactoring blocks — anything that doesn\'t require throwing away the whole file.\n\nWorkflow: webpage_file_read({file}) first to see the exact current text, then webpage_file_replace with find_text copied verbatim from what you read. find_text must match EXACTLY ONCE by default; if it appears multiple times the tool errors with line numbers and you either narrow the snippet or set replace_all: true. Whitespace-normalized matching is a fallback when verbatim fails.\n\nTo INSERT new content (without removing anything), set find_text to a stable anchor near where you want the insertion (e.g. an existing element\'s closing tag) and set replace_text to that anchor PLUS your new content. To DELETE content, set replace_text to "".\n\nDo many small replaces rather than one big rewrite when possible — each replace shows the user exactly what changed.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -74,7 +74,7 @@ const WEBPAGE_DOC_TOOLS = [
         type: 'function',
         function: {
             name: 'webpage_file_patch',
-            description: 'Replace a contiguous range of LINES in one webpage file. Use when you know which lines you want to rewrite (you read the file and counted lines). Provides an expected_text sanity check so a stale read doesn\'t corrupt the file.\n\nLine numbers are 1-indexed and inclusive (start_line=5, end_line=7 replaces 3 lines).',
+            description: 'Line-anchored partial edit — replace a contiguous range of lines, preserving everything else. Use this when you know exactly which lines to rewrite (you just read the file and counted) and the change spans more than a simple substring. Common cases: rewriting a function body, swapping a multi-line block, restructuring a CSS rule.\n\nLine numbers are 1-indexed and inclusive — start_line=5, end_line=7 replaces 3 lines (5, 6, 7).\n\nexpected_text sanity check: if the current contents of those lines don\'t match what you provide, the patch refuses to write — protects against corruption from a stale read. Always pair this tool with a fresh webpage_file_read on the same turn.\n\nPrefer this OR webpage_file_replace over webpage_file_write whenever the file already has content.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -138,12 +138,30 @@ function executeWebpageDocTool(toolName, args, files, ctx = {}) {
         }
         const content = args.content || '';
         const title = args.title || slotFilename(file);
+
+        // Soft warning when overwriting a non-empty file with new content of
+        // similar size. The write still applies, but the AI sees this in the
+        // tool result and learns to prefer partial edits next time.
+        const previous = files?.[file] || '';
+        let warning = '';
+        if (previous.trim().length > 0) {
+            // Heuristic: if both old and new are sizeable (>200 chars) and the
+            // new content shares <40% of its lines with the old, this is
+            // probably a wholesale rewrite that should have been a series of
+            // partial edits. Emit a warning either way for non-empty writes.
+            const overlap = lineOverlapRatio(previous, content);
+            const previewWasFull = previous.length > 200;
+            warning = previewWasFull && overlap < 0.4
+                ? ` ⚠ webpage_file_write replaced ${previous.length.toLocaleString()} chars of existing content (line overlap with old version: ${(overlap * 100).toFixed(0)}%). For most edits — adding a section, tweaking styles, fixing copy — webpage_file_replace or webpage_file_patch is faster, cheaper, and safer than rewriting the whole file. Only use webpage_file_write for empty files or genuine from-scratch rewrites.`
+                : ` Note: the file already had content — for partial changes, webpage_file_replace or webpage_file_patch are the preferred tools. webpage_file_write is for empty files or full rewrites.`;
+        }
+
         return {
             _action: 'webpage_doc_update',
             file,
             content,
             title,
-            message: `${slotFilename(file)} updated: "${title}"`,
+            message: `${slotFilename(file)} updated: "${title}".${warning}`,
         };
     }
 
@@ -276,6 +294,23 @@ function truncate(s, n) {
 
 function normalizeWhitespace(s) {
     return (s || '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Quick "how similar" check between two text blobs by counting how many
+ * lines from the new content appear verbatim in the old content. 1.0 means
+ * every line is preserved (probably a partial edit that became a full
+ * rewrite — should have used webpage_file_replace). 0.0 means none of the
+ * old structure survives.
+ */
+function lineOverlapRatio(oldText, newText) {
+    if (!oldText || !newText) return 0;
+    const oldLines = new Set(oldText.split('\n').map(s => s.trim()).filter(Boolean));
+    const newLines = newText.split('\n').map(s => s.trim()).filter(Boolean);
+    if (newLines.length === 0) return 0;
+    let kept = 0;
+    for (const ln of newLines) if (oldLines.has(ln)) kept++;
+    return kept / newLines.length;
 }
 
 /**

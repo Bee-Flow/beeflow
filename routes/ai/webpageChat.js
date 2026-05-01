@@ -271,16 +271,26 @@ FILES
 ${filesBlock}
 
 ────────────────────────────────────────
-EDITING TOOLS — pick the right one
+EDITING TOOLS — partial edits are the default, full rewrites are the exception
 ────────────────────────────────────────
-• webpage_file_read({ file }) — ALWAYS call this before any partial edit on the same file in the same turn. The tool tracks reads and warns when an edit is issued cold.
-• webpage_file_replace({ file, find_text, replace_text [, replace_all] }) — surgical substring replace. find_text must match EXACTLY ONCE by default; if it appears multiple times the tool errors with the matching line numbers and asks you to either narrow the snippet or set \`replace_all: true\`. Whitespace-normalised matching is a fallback.
-• webpage_file_patch({ file, start_line, end_line, expected_text, replacement }) — line-anchored replace with a sanity check. Use when you know the exact line range. \`expected_text\` must match the current contents of those lines or the tool refuses to write — protects against corruption from stale reads.
-• webpage_file_write({ file, content [, title] }) — full-file overwrite. Reserve for INITIAL creation or genuine full rewrites only. For any edit on existing content, prefer the partial tools above (faster, cheaper, more robust).
+The cardinal rule: when a file already has content, edit it partially. webpage_file_write is reserved for empty files or genuine from-scratch rewrites — using it on a non-empty file is almost always wrong and the system will warn you about it.
+
+Decision tree for any change:
+  1. Is the file empty or being created for the first time? → webpage_file_write
+  2. Does the change span ≥80% of the file (genuine total rewrite)? → webpage_file_write
+  3. Otherwise (the realistic 95% case) → webpage_file_replace or webpage_file_patch
+
+Tools, in order of preference:
+• webpage_file_read({ file }) — always call this BEFORE any partial edit on the same file in the same turn. The system tracks reads and warns when an edit comes in cold.
+• webpage_file_replace({ file, find_text, replace_text [, replace_all] }) — your default editing tool. Surgical substring replace; preserves everything around the change. find_text must match EXACTLY ONCE by default; if it appears multiple times the tool errors with the matching line numbers and asks you to either narrow the snippet or set \`replace_all: true\`. Whitespace-normalised matching is a fallback. Use this for: adding sections, removing sections, swapping copy, fixing bugs, restyling specific elements, anything contained.
+• webpage_file_patch({ file, start_line, end_line, expected_text, replacement }) — line-anchored partial edit. Use when you know exactly which lines to rewrite (you just read the file and counted) and the change is bigger than a clean substring. The expected_text sanity check protects against stale reads.
+• webpage_file_write({ file, content [, title] }) — LAST RESORT. Only for empty files or full rewrites where you're throwing away ≥80% of the existing content. The system emits a warning when you call this on a non-empty file because it's nearly always a mistake — use the partial tools instead.
+
+Inserting new content with webpage_file_replace: pick a stable anchor in the existing file (a closing tag, a CSS rule selector, a comment), use that as find_text, and put the anchor + your new content into replace_text. This is how you add things without destroying what's around them.
 
 Iteration discipline:
 - Read first, then edit. Never call a partial-edit tool on a file you haven't read this turn.
-- Make ONE focused edit at a time. Don't bundle unrelated changes.
+- Many small focused replaces > one giant rewrite. Each replace shows the user a clean diff card.
 - After edits land, briefly confirm what changed in plain language: "I added the hero section to index.html and centered the menu grid in style.css."
 
 ────────────────────────────────────────
