@@ -86,6 +86,13 @@ async function initDB() {
         CREATE INDEX IF NOT EXISTS idx_webpage_versions_webpage ON webpage_versions(webpage_id, created_at DESC);
     `);
 
+    // Lazy migration — `chat_messages` was added after the original schema for
+    // per-webpage chat history persistence. Stored as JSONB so we can read/
+    // write the full array atomically without RustFS round-trips.
+    try {
+        await exec(`ALTER TABLE webpages ADD COLUMN IF NOT EXISTS chat_messages JSONB DEFAULT '[]'::jsonb`);
+    } catch (_) { /* column already exists or table doesn't yet — fine */ }
+
     initialized = true;
     console.log('[WebpageStore] PostgreSQL initialized');
 }
@@ -264,6 +271,39 @@ async function updateWebpageMetadata(id, userId, updates) {
     const { rowCount } = await run(
         `UPDATE webpages SET ${setClauses.join(', ')} WHERE id = $${idx++} AND user_id = $${idx}`,
         params
+    );
+    return rowCount > 0;
+}
+
+/**
+ * Read the persisted chat history for a webpage. Returns [] when the column
+ * is empty, missing, or unparseable. Stored as JSONB so the array is the
+ * canonical type — no JSON.parse failures from invalid strings.
+ */
+async function getChatMessages(id, userId) {
+    await initDB();
+    const r = await getOne('SELECT chat_messages FROM webpages WHERE id = $1 AND user_id = $2', [id, userId]);
+    if (!r) return [];
+    const raw = r.chat_messages;
+    if (Array.isArray(raw)) return raw;
+    if (typeof raw === 'string') { try { const v = JSON.parse(raw); return Array.isArray(v) ? v : []; } catch (_) { return []; } }
+    return [];
+}
+
+/**
+ * Replace the chat history for a webpage. The frontend is the source of
+ * truth — it sends the full array on every save, so this is an idempotent
+ * overwrite (no merge logic needed). Validates the shape and trims to a
+ * reasonable size to keep the row lean.
+ */
+async function setChatMessages(id, userId, messages) {
+    await initDB();
+    const safe = Array.isArray(messages) ? messages : [];
+    // Cap at the most recent 200 messages to prevent unbounded row growth.
+    const trimmed = safe.slice(-200);
+    const { rowCount } = await run(
+        'UPDATE webpages SET chat_messages = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3',
+        [JSON.stringify(trimmed), id, userId]
     );
     return rowCount > 0;
 }
@@ -533,6 +573,9 @@ module.exports = {
     getWebpage,
     updateWebpageMetadata,
     deleteWebpage,
+    // Chat history
+    getChatMessages,
+    setChatMessages,
     // RustFS slot I/O
     sha256,
     keyFor,
