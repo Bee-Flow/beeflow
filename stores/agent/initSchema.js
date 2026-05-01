@@ -155,6 +155,16 @@ async function _doInit() {
         created_at TIMESTAMPTZ DEFAULT NOW()
     )`);
     try { await exec(`CREATE INDEX IF NOT EXISTS idx_conversation_labels_user ON conversation_labels(user_id)`); } catch (e) { /* already exists */ }
+
+    // Per-user agent favorites (replaces client-side localStorage `agentFavorites`)
+    await exec(`CREATE TABLE IF NOT EXISTS agent_favorites (
+        user_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (user_id, agent_id),
+        FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+    )`);
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_agent_favorites_user ON agent_favorites(user_id)`); } catch (e) { /* already exists */ }
 }
 
 module.exports = { initDB };

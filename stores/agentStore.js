@@ -13,6 +13,7 @@ const directConversations = require('./agent/directConversations');
 const systemAgents = require('./agent/systemAgents');
 const agentStats = require('./agent/agentStats');
 const conversationLabels = require('./agent/conversationLabels');
+const agentFavorites = require('./agent/agentFavorites');
 
 module.exports = {
     // ── Agent CRUD ───────────────────────────────────────────────────────────
@@ -118,4 +119,9 @@ module.exports = {
 
     // ── Skills cross-reference cleanup ───────────────────────────────────────
     scrubSkillFromAllAgents: agentCrud.scrubSkillFromAllAgents,
+
+    // ── Agent Favorites ──────────────────────────────────────────────────────
+    listAgentFavorites: agentFavorites.listFavorites,
+    addAgentFavorite: agentFavorites.addFavorite,
+    removeAgentFavorite: agentFavorites.removeFavorite,
 };

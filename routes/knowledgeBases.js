@@ -176,6 +176,63 @@ router.post('/', requireAuth, requirePermission('manage_knowledge'), async (req,
     }
 });
 
+// ── KB Favorites ────────────────────────────────────────────────────
+// Per-user favorited KBs (DB-backed; replaces client-side localStorage).
+// Defined before /:id routes so GET /favorites is not captured by GET /:id.
+
+router.get('/favorites', requireAuth, async (req, res) => {
+    try {
+        const userId = getUserId(req);
+        const ids = await kbStore.listFavorites(userId);
+        res.json(ids);
+    } catch (e) {
+        console.error('[KB] List favorites error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+router.post('/favorites/bulk', requireAuth, async (req, res) => {
+    try {
+        const userId = getUserId(req);
+        const { kbIds } = req.body || {};
+        if (!Array.isArray(kbIds)) {
+            return res.status(400).json({ error: 'kbIds array required' });
+        }
+        for (const id of kbIds) {
+            if (typeof id === 'string' && id) {
+                try { await kbStore.addFavorite(userId, id); } catch (_) { /* skip invalid */ }
+            }
+        }
+        const ids = await kbStore.listFavorites(userId);
+        res.json(ids);
+    } catch (e) {
+        console.error('[KB] Bulk favorite add error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+router.put('/:id/favorite', requireAuth, async (req, res) => {
+    try {
+        const userId = getUserId(req);
+        await kbStore.addFavorite(userId, req.params.id);
+        res.json({ success: true });
+    } catch (e) {
+        console.error('[KB] Add favorite error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+router.delete('/:id/favorite', requireAuth, async (req, res) => {
+    try {
+        const userId = getUserId(req);
+        await kbStore.removeFavorite(userId, req.params.id);
+        res.json({ success: true });
+    } catch (e) {
+        console.error('[KB] Remove favorite error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 /**
  * Get a single KB with documents
  */

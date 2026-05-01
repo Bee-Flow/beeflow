@@ -8,6 +8,8 @@ router.use('/', require('./meta'));
 router.use('/', require('./conversations_meta'));
 router.use('/', require('./published'));
 router.use('/', require('./system'));
+// Favorites must come before /:id routes so GET /favorites is not captured by GET /:id
+router.use('/', require('./favorites'));
 
 // Specific /:id routes
 router.use('/', require('./crud'));

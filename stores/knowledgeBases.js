@@ -90,6 +90,17 @@ async function initDB() {
     // GIN index for metadata lookups (sender/threadId filters)
     try { await exec(`CREATE INDEX IF NOT EXISTS idx_documents_metadata ON documents USING GIN (metadata jsonb_path_ops)`); } catch (e) { /* index already exists */ }
 
+    // Per-user KB favorites (replaces client-side localStorage `kb_favorites`)
+    await exec(`
+        CREATE TABLE IF NOT EXISTS kb_favorites (
+            user_id TEXT NOT NULL,
+            kb_id UUID NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (user_id, kb_id)
+        )
+    `);
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_kb_favorites_user ON kb_favorites(user_id)`); } catch (e) { /* index already exists */ }
+
     initialized = true;
     console.log('[KnowledgeBases] Tables initialized');
 }
@@ -521,7 +532,32 @@ const KnowledgeBasesStore = {
      */
     hashContent: (content) => {
         return crypto.createHash('sha256').update(content).digest('hex');
-    }
+    },
+
+    // ── KB Favorites ────────────────────────────────────────────────────
+    listFavorites: async (userId) => {
+        await initDB();
+        const rows = await getAll(
+            `SELECT kb_id FROM kb_favorites WHERE user_id = $1 ORDER BY created_at ASC`,
+            [userId]
+        );
+        return rows.map(r => r.kb_id);
+    },
+    addFavorite: async (userId, kbId) => {
+        await initDB();
+        await run(
+            `INSERT INTO kb_favorites (user_id, kb_id) VALUES ($1, $2)
+             ON CONFLICT (user_id, kb_id) DO NOTHING`,
+            [userId, kbId]
+        );
+    },
+    removeFavorite: async (userId, kbId) => {
+        await initDB();
+        await run(
+            `DELETE FROM kb_favorites WHERE user_id = $1 AND kb_id = $2`,
+            [userId, kbId]
+        );
+    },
 };
 
 module.exports = KnowledgeBasesStore;
