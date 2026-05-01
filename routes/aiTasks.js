@@ -18,6 +18,21 @@ const { executeTask } = require('../core/aiTaskRunner');
 // Default max tasks per user (admin-configurable via configStore)
 const DEFAULT_MAX_TASKS = 10;
 
+const VALID_REPEAT_INTERVALS = new Set([
+    'daily', 'weekdays', 'weekly', 'biweekly', 'monthly', 'quarterly', 'yearly',
+]);
+
+function normalizeRepeatInterval(value) {
+    if (value === undefined) return undefined; // no change (PUT)
+    if (value === null || value === '') return null;
+    if (typeof value !== 'string' || !VALID_REPEAT_INTERVALS.has(value)) {
+        const err = new Error(`Invalid repeatInterval: ${value}`);
+        err.statusCode = 400;
+        throw err;
+    }
+    return value;
+}
+
 async function getMaxTasks() {
     const limit = await configStore.getConfig('ai_tasks_max_per_user');
     return (typeof limit === 'number' && limit > 0) ? limit : DEFAULT_MAX_TASKS;
@@ -54,6 +69,13 @@ router.post('/', async (req, res) => {
         if (!prompt || !prompt.trim()) return res.status(400).json({ error: 'Prompt is required' });
         if (!nextRunAt) return res.status(400).json({ error: 'nextRunAt is required' });
 
+        let normalizedRepeat;
+        try {
+            normalizedRepeat = normalizeRepeatInterval(repeatInterval);
+        } catch (e) {
+            return res.status(400).json({ error: e.message });
+        }
+
         // Check task limit
         const maxTasks = await getMaxTasks();
         const currentCount = await aiTaskStore.getTaskCount(userId);
@@ -67,7 +89,7 @@ router.post('/', async (req, res) => {
             userId,
             title: title.trim(),
             prompt: prompt.trim(),
-            repeatInterval: repeatInterval || null,
+            repeatInterval: normalizedRepeat ?? null,
             nextRunAt,
             modelTier: modelTier || 'fast',
             timezone: timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
@@ -88,8 +110,18 @@ router.put('/:id', async (req, res) => {
         if (existing.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
 
         const { title, prompt, repeatInterval, nextRunAt, modelTier, timezone, isActive } = req.body;
+
+        let normalizedRepeat;
+        try {
+            normalizedRepeat = normalizeRepeatInterval(repeatInterval);
+        } catch (e) {
+            return res.status(400).json({ error: e.message });
+        }
+
         const ok = await aiTaskStore.updateTask(req.params.id, {
-            title, prompt, repeatInterval, nextRunAt, modelTier, timezone, isActive,
+            title, prompt,
+            repeatInterval: normalizedRepeat,
+            nextRunAt, modelTier, timezone, isActive,
         });
         res.json({ success: ok });
     } catch (err) {

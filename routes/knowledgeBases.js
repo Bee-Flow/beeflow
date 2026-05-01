@@ -42,19 +42,19 @@ async function resolveUserGroups(req) {
 }
 
 /**
- * Centralized KB access check.
- * Returns true if the user can access the given KB.
+ * Centralized KB access check. Mirrors `kbStore.canUserAccessKB` so that the
+ * list filter and per-id route guards never drift.
  * - Owner (tenant_id) always has access
  * - Super admin (resolveUserOrgIds returns null) always has access
- * - Org member has access if KB's organization_id is in their org set
+ * - Org member: KB must be in their org AND published AND, if shared_groups
+ *   is set, the user must belong to at least one of those groups
  */
 async function canAccessKB(req, kb) {
     const userId = getUserId(req);
     if (kb.tenant_id === userId) return true;
     const orgIds = await resolveUserOrgIds(req);
-    if (orgIds === null) return true; // super admin
-    if (kb.organization_id && orgIds.has(kb.organization_id)) return true;
-    return false;
+    const userGroups = await resolveUserGroups(req);
+    return kbStore.canUserAccessKB(kb, userId, orgIds, userGroups);
 }
 
 // Multer for file uploads
@@ -917,11 +917,22 @@ router.post('/search', requireAuth, async (req, res) => {
             return res.status(400).json({ error: 'query and kb_ids[] are required' });
         }
 
-        // Verify access to all KBs (supports org-shared KBs via canAccessKB)
-        for (const kbId of kb_ids) {
-            const kb = await kbStore.getKB(kbId);
-            if (!kb || !(await canAccessKB(req, kb))) {
-                return res.status(403).json({ error: `Access denied for KB ${kbId}` });
+        // Verify access to all KBs in a single round-trip
+        const orgIds = await resolveUserOrgIds(req);
+        const userGroups = await resolveUserGroups(req);
+        const { getAll } = require('../db');
+        const kbRows = await getAll(
+            `SELECT * FROM knowledge_bases WHERE id = ANY($1::uuid[])`,
+            [kb_ids]
+        );
+        const foundIds = new Set(kbRows.map(r => String(r.id)));
+        const missing = kb_ids.find(id => !foundIds.has(String(id)));
+        if (missing) {
+            return res.status(403).json({ error: `Access denied for KB ${missing}` });
+        }
+        for (const kb of kbRows) {
+            if (!kbStore.canUserAccessKB(kb, userId, orgIds, userGroups)) {
+                return res.status(403).json({ error: `Access denied for KB ${kb.id}` });
             }
         }
 

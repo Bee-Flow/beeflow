@@ -220,18 +220,38 @@ const KnowledgeBasesStore = {
      */
     filterByGroupAccess: (kbs, userId, userGroups = []) => {
         if (!Array.isArray(kbs)) return [];
-        return kbs.filter(kb => {
-            // Owner sees everything they own
-            if (kb.tenant_id === userId) return true;
-            // Drafts (not published) hidden from non-owners
-            if (!kb.is_published) return false;
-            // No group restriction → visible to whole org
-            let groups = [];
-            try { groups = JSON.parse(kb.shared_groups || '[]'); } catch { groups = []; }
-            if (!Array.isArray(groups) || groups.length === 0) return true;
-            // User must be in at least one shared group
-            return groups.some(g => userGroups.includes(g));
-        });
+        return kbs.filter(kb => module.exports.canUserAccessKB(kb, userId, undefined, userGroups));
+    },
+
+    /**
+     * Single source of truth for "is this user allowed to read this KB?".
+     * Used both by the list filter and by per-id route guards so the two
+     * paths can never drift.
+     *
+     * @param {object} kb - Row from knowledge_bases
+     * @param {string} userId - The requesting user's id
+     * @param {Set|null|undefined} orgIds - User's org ids; null = super admin.
+     *   When undefined, org membership is not considered (list-path callers
+     *   already constrained the query by org, so only group rules need to run).
+     * @param {Array<string>} userGroups - Group ids the user belongs to
+     */
+    canUserAccessKB: (kb, userId, orgIds = undefined, userGroups = []) => {
+        if (!kb) return false;
+        // Owner always has access
+        if (kb.tenant_id === userId) return true;
+        // Super admin
+        if (orgIds === null) return true;
+        // Direct-fetch path: must be in the KB's org
+        if (orgIds instanceof Set) {
+            if (!kb.organization_id || !orgIds.has(kb.organization_id)) return false;
+        }
+        // Drafts hidden from non-owners
+        if (!kb.is_published) return false;
+        // shared_groups restriction
+        let groups = [];
+        try { groups = JSON.parse(kb.shared_groups || '[]'); } catch { groups = []; }
+        if (!Array.isArray(groups) || groups.length === 0) return true;
+        return groups.some(g => userGroups.includes(g));
     },
 
     getKB: async (id) => {

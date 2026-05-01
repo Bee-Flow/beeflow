@@ -215,9 +215,17 @@ async function markError(id, error) {
 function advanceNextRun(currentNextRun, interval) {
     const d = new Date(currentNextRun);
     switch (interval) {
-        case 'daily': d.setDate(d.getDate() + 1); break;
-        case 'weekly': d.setDate(d.getDate() + 7); break;
-        case 'monthly': d.setMonth(d.getMonth() + 1); break;
+        case 'daily':     d.setDate(d.getDate() + 1); break;
+        case 'weekdays': {
+            do { d.setDate(d.getDate() + 1); }
+            while (d.getDay() === 0 || d.getDay() === 6);
+            break;
+        }
+        case 'weekly':    d.setDate(d.getDate() + 7); break;
+        case 'biweekly':  d.setDate(d.getDate() + 14); break;
+        case 'monthly':   d.setMonth(d.getMonth() + 1); break;
+        case 'quarterly': d.setMonth(d.getMonth() + 3); break;
+        case 'yearly':    d.setFullYear(d.getFullYear() + 1); break;
         default: return null;
     }
     return d.toISOString();
