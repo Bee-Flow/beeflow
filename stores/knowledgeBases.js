@@ -220,7 +220,7 @@ const KnowledgeBasesStore = {
      */
     filterByGroupAccess: (kbs, userId, userGroups = []) => {
         if (!Array.isArray(kbs)) return [];
-        return kbs.filter(kb => module.exports.canUserAccessKB(kb, userId, undefined, userGroups));
+        return kbs.filter(kb => KnowledgeBasesStore.canUserAccessKB(kb, userId, undefined, userGroups));
     },
 
     /**
