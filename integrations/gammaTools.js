@@ -1,13 +1,108 @@
 /**
- * Gamma Tools — Built-in tools for AI to generate presentations via Gamma API
- * 
- * These tools are injected into the LLM tool set when a Gamma API key is configured,
- * allowing the AI to create presentations, documents, and web pages.
+ * Gamma Tools - Built-in tools for AI to create Gamma presentations,
+ * documents, webpages, and social posts via the Gamma API v1.0.
+ *
+ * Gamma v1.0 is asynchronous: create a generation, then poll until it
+ * completes. The public API can create new Gammas, list themes/folders,
+ * and generate from templates. It does not currently list all Gamma files
+ * or edit existing Gammas in place.
  */
 
 const configStore = require('../stores/configStore');
 
-const GAMMA_API_URL = 'https://api.gamma.app/api/generate';
+const GAMMA_API_BASE_URL = 'https://public-api.gamma.app/v1.0';
+const DEFAULT_POLL_INTERVAL_MS = 5000;
+const DEFAULT_TIMEOUT_SECONDS = 180;
+const MAX_TIMEOUT_SECONDS = 300;
+
+const TEXT_MODE_ALIASES = {
+    cards: 'preserve',
+};
+
+const COMMON_GENERATION_PROPERTIES = {
+    themeId: {
+        type: 'string',
+        description: 'Optional Gamma theme ID. Use gamma_list_themes to discover available theme IDs.'
+    },
+    folderIds: {
+        type: 'array',
+        items: { type: 'string' },
+        maxItems: 10,
+        description: 'Optional Gamma folder IDs to place the generated item in. Use gamma_list_folders to discover folder IDs.'
+    },
+    imageSource: {
+        type: 'string',
+        enum: [
+            'aiGenerated',
+            'pictographic',
+            'pexels',
+            'giphy',
+            'webAllImages',
+            'webFreeToUse',
+            'webFreeToUseCommercially',
+            'themeAccent',
+            'placeholder',
+            'noImages'
+        ],
+        description: 'Image source for the Gamma. Default: aiGenerated.'
+    },
+    imageModel: {
+        type: 'string',
+        description: 'Optional Gamma image model. Only relevant when imageSource is aiGenerated.'
+    },
+    imageStyle: {
+        type: 'string',
+        description: 'Optional style direction for AI-generated images, e.g. "photorealistic", "minimal vector illustration".'
+    },
+    imageStylePreset: {
+        type: 'string',
+        enum: ['photorealistic', 'illustration', 'abstract', '3D', 'lineArt', 'custom'],
+        description: 'Optional Gamma built-in image style preset. Use custom with imageStyle for a custom prompt.'
+    },
+    sharingOptions: {
+        type: 'object',
+        description: 'Optional Gamma sharing settings.',
+        properties: {
+            workspaceAccess: {
+                type: 'string',
+                enum: ['noAccess', 'view', 'comment', 'edit']
+            },
+            externalAccess: {
+                type: 'string',
+                enum: ['noAccess', 'view', 'comment', 'edit']
+            },
+            emailOptions: {
+                type: 'object',
+                properties: {
+                    recipients: {
+                        type: 'array',
+                        items: { type: 'string' },
+                        description: 'Email addresses to share with.'
+                    },
+                    access: {
+                        type: 'string',
+                        enum: ['view', 'comment', 'edit']
+                    }
+                }
+            }
+        }
+    },
+    exportAs: {
+        type: 'string',
+        enum: ['pdf', 'pptx', 'png'],
+        description: 'Optionally export as PDF, PPTX, or PNG. Gamma returns a temporary signed export URL.'
+    },
+    waitForCompletion: {
+        type: 'boolean',
+        description: 'Whether to poll until the Gamma is completed or failed. Default: true.'
+    },
+    timeoutSeconds: {
+        type: 'number',
+        minimum: 10,
+        maximum: MAX_TIMEOUT_SECONDS,
+        description: `Maximum seconds to wait when waitForCompletion is true. Default: ${DEFAULT_TIMEOUT_SECONDS}.`
+    }
+};
 
 /**
  * Tool definitions in OpenAI function-calling format.
@@ -17,146 +112,522 @@ const GAMMA_TOOLS = [
         type: 'function',
         function: {
             name: 'gamma_create_presentation',
-            description: 'Create a presentation, document, or web page using Gamma AI. Provide a prompt or detailed content and Gamma will generate a polished presentation. Returns a shareable URL and optional PDF/PPTX export link. Use this when the user asks to create, generate, or make a presentation, slides, pitch deck, or report.',
+            description: 'Create a new Gamma presentation, document, webpage, or social post from text. Returns a Gamma URL and optional export URL after polling by default. Use this for new presentations, pitch decks, reports, webpages, social posts, or fully regenerated replacements. Gamma does not edit existing items in place.',
             parameters: {
                 type: 'object',
                 properties: {
                     inputText: {
                         type: 'string',
-                        description: 'The content or prompt for the presentation. Can be a brief prompt (e.g. "Benefits of AI in healthcare") or detailed markdown content.'
+                        description: 'The actual content, outline, notes, or topic to generate from. Image URLs can be included inline if they are publicly accessible.'
+                    },
+                    additionalInstructions: {
+                        type: 'string',
+                        description: 'Optional extra instructions for Gamma, e.g. "Keep headings short" or "Use bullet points".'
                     },
                     textMode: {
                         type: 'string',
-                        enum: ['generate', 'cards'],
-                        description: 'How to process the input. "generate" = AI generates full content from a short prompt. "cards" = structures provided content into slides. Default: "generate"'
+                        enum: ['generate', 'condense', 'preserve', 'cards'],
+                        description: 'How Gamma should interpret inputText. "generate" expands a topic, "condense" summarizes long text, "preserve" keeps provided text. "cards" is accepted as a deprecated alias for "preserve". Default: generate.'
+                    },
+                    format: {
+                        type: 'string',
+                        enum: ['presentation', 'document', 'social', 'webpage'],
+                        description: 'Output format. Default: presentation.'
+                    },
+                    numCards: {
+                        type: 'number',
+                        minimum: 1,
+                        description: 'Target number of cards/slides. Limits vary by Gamma plan.'
+                    },
+                    cardSplit: {
+                        type: 'string',
+                        enum: ['auto', 'inputTextBreaks'],
+                        description: 'Use inputTextBreaks when inputText contains --- separators for specific card breaks. Default: auto.'
                     },
                     language: {
                         type: 'string',
-                        description: 'Output language code, e.g. "en" for English, "nl" for Dutch, "de" for German. Default: "en"'
+                        description: 'Output language code, e.g. "en" for English, "nl" for Dutch, "de" for German. Default: en.'
                     },
                     audience: {
                         type: 'string',
-                        description: 'Target audience for the presentation, e.g. "marketing managers", "developers", "executives"'
+                        description: 'Target audience, e.g. "executives", "developers", "business decision makers".'
                     },
-                    imageSource: {
+                    tone: {
                         type: 'string',
-                        enum: ['aiGenerated', 'pexels', 'noImages'],
-                        description: 'Image source for slides. "aiGenerated" = AI-generated images, "pexels" = stock photos, "noImages" = text only. Default: "aiGenerated"'
+                        description: 'Tone or voice, e.g. "professional, concise, upbeat".'
                     },
-                    imageStyle: {
+                    textAmount: {
                         type: 'string',
-                        description: 'Style for AI-generated images, e.g. "photorealistic", "cinematic", "minimalist", "watercolor"'
+                        enum: ['brief', 'medium', 'detailed', 'extensive'],
+                        description: 'How much text each card should contain when textMode is generate or condense.'
                     },
-                    exportAs: {
+                    dimensions: {
                         type: 'string',
-                        enum: ['pdf', 'pptx'],
-                        description: 'Optionally export the presentation as PDF or PPTX. Returns a temporary download URL.'
-                    }
+                        enum: ['fluid', '16x9', '4x3', 'pageless', 'letter', 'a4', '1x1', '4x5', '9x16'],
+                        description: 'Card/page dimensions. Valid values depend on format: presentation supports fluid, 16x9, 4x3; document supports fluid, pageless, letter, a4; social supports 1x1, 4x5, 9x16.'
+                    },
+                    headerFooter: {
+                        type: 'object',
+                        description: 'Optional Gamma header/footer configuration. Pass through only when the user asks for page numbers, logo, or footer text.',
+                        properties: {
+                            topLeft: { type: 'object' },
+                            topRight: { type: 'object' },
+                            bottomLeft: { type: 'object' },
+                            bottomRight: { type: 'object' },
+                            hideFromFirstCard: { type: 'boolean' },
+                            hideFromLastCard: { type: 'boolean' }
+                        }
+                    },
+                    ...COMMON_GENERATION_PROPERTIES,
                 },
                 required: ['inputText']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'gamma_create_from_template',
+            description: 'Create a new Gamma from an existing Gamma template using variable/content substitution. Use this when the user has a template Gamma ID and wants to preserve a fixed layout while changing content. Returns a Gamma URL and optional export URL after polling by default.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    gammaId: {
+                        type: 'string',
+                        description: 'File ID of the template Gamma. The template must have exactly one Page in Gamma.'
+                    },
+                    prompt: {
+                        type: 'string',
+                        description: 'Text prompt or content describing what to generate from the template.'
+                    },
+                    ...COMMON_GENERATION_PROPERTIES,
+                },
+                required: ['gammaId', 'prompt']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'gamma_revise_as_new',
+            description: 'Workaround for editing: create a new revised Gamma from supplied existing content plus edit instructions. This does not modify an existing Gamma in place because Gamma API does not support in-place edits. Use when the user asks for partial edits and provides the current content or enough source material to regenerate.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    originalContent: {
+                        type: 'string',
+                        description: 'Current deck/document content to preserve and revise. The API cannot read existing Gamma content by URL, so this must be supplied.'
+                    },
+                    editInstructions: {
+                        type: 'string',
+                        description: 'Specific requested changes, e.g. "Replace slide 3 with pricing details and keep the rest unchanged".'
+                    },
+                    sourceGammaId: {
+                        type: 'string',
+                        description: 'Optional source Gamma ID for traceability only. It is not edited.'
+                    },
+                    sourceGammaUrl: {
+                        type: 'string',
+                        description: 'Optional source Gamma URL for traceability only. It is not edited.'
+                    },
+                    format: {
+                        type: 'string',
+                        enum: ['presentation', 'document', 'social', 'webpage'],
+                        description: 'Output format. Default: presentation.'
+                    },
+                    language: {
+                        type: 'string',
+                        description: 'Output language code, e.g. "en" or "nl". Default: en.'
+                    },
+                    dimensions: {
+                        type: 'string',
+                        enum: ['fluid', '16x9', '4x3', 'pageless', 'letter', 'a4', '1x1', '4x5', '9x16']
+                    },
+                    ...COMMON_GENERATION_PROPERTIES,
+                },
+                required: ['originalContent', 'editInstructions']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'gamma_get_generation_status',
+            description: 'Check the status of an existing Gamma generation ID. Use this if a generation timed out or the user asks whether a Gamma job is done.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    generationId: {
+                        type: 'string',
+                        description: 'Generation ID returned by Gamma.'
+                    }
+                },
+                required: ['generationId']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'gamma_list_themes',
+            description: 'List available Gamma themes in the authenticated workspace. Use returned IDs as themeId when creating a Gamma.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    query: {
+                        type: 'string',
+                        description: 'Optional search query to filter themes by name.'
+                    },
+                    limit: {
+                        type: 'number',
+                        minimum: 1,
+                        maximum: 50,
+                        description: 'Maximum results to return. Default: 20.'
+                    },
+                    after: {
+                        type: 'string',
+                        description: 'Pagination cursor from a previous response.'
+                    }
+                }
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'gamma_list_folders',
+            description: 'List Gamma folders the authenticated user can access. Use returned IDs as folderIds when creating a Gamma.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    query: {
+                        type: 'string',
+                        description: 'Optional search query to filter folders by name.'
+                    },
+                    limit: {
+                        type: 'number',
+                        minimum: 1,
+                        maximum: 50,
+                        description: 'Maximum results to return. Default: 20.'
+                    },
+                    after: {
+                        type: 'string',
+                        description: 'Pagination cursor from a previous response.'
+                    }
+                }
             }
         }
     }
 ];
 
-// ─── API Client ────────────────────────────────────────────────
+// Helpers
 
-async function gammaRequest(apiKey, body) {
-    console.log(`[Gamma] Creating presentation: "${(body.inputText || '').substring(0, 80)}..."`);
-
-    const response = await fetch(GAMMA_API_URL, {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${apiKey}`,
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(body),
-    });
-
-    if (!response.ok) {
-        const errorText = await response.text();
-        let errorMsg;
-        try {
-            const errorJson = JSON.parse(errorText);
-            errorMsg = errorJson.error || errorJson.message || errorText;
-        } catch {
-            errorMsg = errorText;
-        }
-        throw new Error(`Gamma API error ${response.status}: ${errorMsg}`);
-    }
-
-    return response.json();
+function normalizeTextMode(textMode = 'generate') {
+    return TEXT_MODE_ALIASES[textMode] || textMode;
 }
 
-// ─── Tool Execution ────────────────────────────────────────────
+function clampLimit(limit, fallback = 20) {
+    const n = Number(limit || fallback);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(1, Math.min(50, Math.floor(n)));
+}
 
-async function executeGammaTool(toolName, args, userId) {
-    const apiKey = await configStore.getSecret(`gamma_api_key_user_${userId}`);
-    if (!apiKey) {
-        return { error: 'Gamma API key not configured. Add it in Settings → Gamma.' };
+function clampTimeoutSeconds(timeoutSeconds) {
+    const n = Number(timeoutSeconds || DEFAULT_TIMEOUT_SECONDS);
+    if (!Number.isFinite(n)) return DEFAULT_TIMEOUT_SECONDS;
+    return Math.max(10, Math.min(MAX_TIMEOUT_SECONDS, Math.floor(n)));
+}
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function compactObject(value) {
+    if (!value || typeof value !== 'object') return value;
+    if (Array.isArray(value)) {
+        const items = value
+            .map(compactObject)
+            .filter(item => item !== undefined && item !== null && item !== '');
+        return items.length > 0 ? items : undefined;
     }
 
-    if (toolName !== 'gamma_create_presentation') {
-        return { error: `Unknown Gamma tool: ${toolName}` };
+    const out = {};
+    for (const [key, item] of Object.entries(value)) {
+        const compacted = compactObject(item);
+        if (compacted !== undefined && compacted !== null && compacted !== '') {
+            out[key] = compacted;
+        }
     }
+    return Object.keys(out).length > 0 ? out : undefined;
+}
 
-    const {
-        inputText,
-        textMode = 'generate',
-        language = 'en',
-        audience,
-        imageSource = 'aiGenerated',
-        imageStyle,
-        exportAs,
-    } = args;
-
-    if (!inputText) {
-        return { error: 'inputText is required' };
+function buildQuery(params = {}) {
+    const search = new URLSearchParams();
+    for (const [key, value] of Object.entries(params)) {
+        if (value !== undefined && value !== null && value !== '') {
+            search.set(key, String(value));
+        }
     }
+    const query = search.toString();
+    return query ? `?${query}` : '';
+}
 
-    const requestBody = {
-        inputText,
-        textMode,
-        textOptions: {
-            language,
-        },
-        imageOptions: {
-            source: imageSource,
-        },
+function extractErrorMessage(errorBody) {
+    if (!errorBody) return 'Unknown error';
+    if (typeof errorBody === 'string') return errorBody;
+    if (typeof errorBody.error === 'string') return errorBody.error;
+    if (errorBody.error?.message) return errorBody.error.message;
+    if (errorBody.message) return errorBody.message;
+    return JSON.stringify(errorBody);
+}
+
+function buildImageOptions(args) {
+    const imageOptions = compactObject({
+        source: args.imageSource,
+        model: args.imageModel,
+        style: args.imageStyle,
+        stylePreset: args.imageStylePreset,
+    });
+    return imageOptions;
+}
+
+function buildTextOptions(args) {
+    return compactObject({
+        language: args.language || 'en',
+        audience: args.audience,
+        tone: args.tone,
+        amount: args.textAmount,
+    });
+}
+
+function buildCardOptions(args) {
+    return compactObject({
+        dimensions: args.dimensions,
+        headerFooter: args.headerFooter,
+    });
+}
+
+function buildCreateBody(args) {
+    const body = compactObject({
+        inputText: args.inputText,
+        additionalInstructions: args.additionalInstructions,
+        textMode: normalizeTextMode(args.textMode),
+        format: args.format || 'presentation',
+        numCards: args.numCards,
+        cardSplit: args.cardSplit,
+        themeId: args.themeId,
+        textOptions: buildTextOptions(args),
+        imageOptions: buildImageOptions(args),
+        cardOptions: buildCardOptions(args),
+        sharingOptions: args.sharingOptions,
+        folderIds: args.folderIds,
+        exportAs: args.exportAs,
+    });
+    return body;
+}
+
+function buildTemplateBody(args) {
+    return compactObject({
+        prompt: args.prompt,
+        gammaId: args.gammaId,
+        themeId: args.themeId,
+        imageOptions: buildImageOptions(args),
+        sharingOptions: args.sharingOptions,
+        folderIds: args.folderIds,
+        exportAs: args.exportAs,
+    });
+}
+
+function buildRevisionBody(args) {
+    const trace = [
+        args.sourceGammaId ? `Source Gamma ID: ${args.sourceGammaId}` : null,
+        args.sourceGammaUrl ? `Source Gamma URL: ${args.sourceGammaUrl}` : null,
+    ].filter(Boolean).join('\n');
+
+    const additionalInstructions = [
+        'Create a new revised Gamma. Preserve all supplied content unless the edit instructions explicitly change it.',
+        args.editInstructions,
+        trace ? `Traceability only; do not imply the source was edited in place.\n${trace}` : null,
+    ].filter(Boolean).join('\n\n');
+
+    return compactObject({
+        inputText: args.originalContent,
+        additionalInstructions,
+        textMode: 'preserve',
+        format: args.format || 'presentation',
+        themeId: args.themeId,
+        textOptions: compactObject({ language: args.language || 'en' }),
+        imageOptions: buildImageOptions(args),
+        cardOptions: buildCardOptions(args),
+        sharingOptions: args.sharingOptions,
+        folderIds: args.folderIds,
+        exportAs: args.exportAs,
+    });
+}
+
+function formatGenerationResult(result, meta = {}) {
+    const response = {
+        generationId: result.generationId || meta.generationId || null,
+        status: result.status || 'pending',
+        gammaId: result.gammaId || null,
+        gammaUrl: result.gammaUrl || null,
     };
 
-    if (audience) {
-        requestBody.textOptions.audience = audience;
+    if (result.exportUrl) response.exportUrl = result.exportUrl;
+    if (result.credits) response.credits = result.credits;
+    if (result.warnings) response.warnings = result.warnings;
+    if (result.error) response.error = extractErrorMessage(result.error);
+    if (meta.note) response.note = meta.note;
+    if (meta.sourceGammaId) response.sourceGammaId = meta.sourceGammaId;
+    if (meta.sourceGammaUrl) response.sourceGammaUrl = meta.sourceGammaUrl;
+    return response;
+}
+
+// API Client
+
+async function gammaApiRequest(apiKey, path, { method = 'GET', body, query } = {}) {
+    const url = `${GAMMA_API_BASE_URL}${path}${buildQuery(query)}`;
+    const response = await fetch(url, {
+        method,
+        headers: {
+            'X-API-KEY': apiKey,
+            'Content-Type': 'application/json',
+        },
+        body: body ? JSON.stringify(body) : undefined,
+    });
+
+    const text = await response.text();
+    let data = null;
+    if (text) {
+        try {
+            data = JSON.parse(text);
+        } catch {
+            data = text;
+        }
     }
 
-    if (imageStyle && imageSource === 'aiGenerated') {
-        requestBody.imageOptions.style = imageStyle;
+    if (!response.ok) {
+        throw new Error(`Gamma API error ${response.status}: ${extractErrorMessage(data)}`);
     }
 
-    if (exportAs) {
-        requestBody.exportAs = exportAs;
+    return data || {};
+}
+
+async function pollGeneration(apiKey, generationId, timeoutSeconds) {
+    const started = Date.now();
+    const timeoutMs = timeoutSeconds * 1000;
+
+    while (Date.now() - started <= timeoutMs) {
+        const status = await gammaApiRequest(apiKey, `/generations/${encodeURIComponent(generationId)}`);
+        if (status.status === 'completed' || status.status === 'failed') {
+            return status;
+        }
+        await sleep(DEFAULT_POLL_INTERVAL_MS);
+    }
+
+    const latest = await gammaApiRequest(apiKey, `/generations/${encodeURIComponent(generationId)}`);
+    if (latest.status === 'completed' || latest.status === 'failed') {
+        return latest;
+    }
+    return {
+        ...latest,
+        timedOut: true,
+    };
+}
+
+async function createAndMaybePoll(apiKey, path, body, args, meta = {}) {
+    const waitForCompletion = args.waitForCompletion !== false;
+    const timeoutSeconds = clampTimeoutSeconds(args.timeoutSeconds);
+    const created = await gammaApiRequest(apiKey, path, { method: 'POST', body });
+    const generationId = created.generationId;
+
+    if (!generationId) {
+        return created;
+    }
+
+    if (!waitForCompletion) {
+        return formatGenerationResult(created, {
+            ...meta,
+            generationId,
+            note: 'Generation started. Use gamma_get_generation_status to check completion.',
+        });
+    }
+
+    const result = await pollGeneration(apiKey, generationId, timeoutSeconds);
+    const note = result.timedOut
+        ? `Generation is still ${result.status || 'pending'} after ${timeoutSeconds}s. Use gamma_get_generation_status with this generationId to check again.`
+        : meta.note;
+
+    return formatGenerationResult(result, {
+        ...meta,
+        generationId,
+        note,
+    });
+}
+
+// Tool Execution
+
+async function executeGammaTool(toolName, args = {}, userId) {
+    const apiKey = await configStore.getSecret(`gamma_api_key_user_${userId}`);
+    if (!apiKey) {
+        return { error: 'Gamma API key not configured. Add it in Settings -> Gamma.' };
     }
 
     try {
-        const result = await gammaRequest(apiKey, requestBody);
-
-        console.log(`[Gamma] Result: status=${result.status}, gammaId=${result.gammaId}`);
-
-        const response = {
-            status: result.status,
-            gammaId: result.gammaId || null,
-            gammaUrl: result.gammaUrl || null,
-        };
-
-        if (result.exportUrl) {
-            response.exportUrl = result.exportUrl;
+        if (toolName === 'gamma_create_presentation') {
+            if (!args.inputText) return { error: 'inputText is required' };
+            const body = buildCreateBody(args);
+            console.log(`[Gamma] Starting generation (${body.format || 'presentation'}): "${(body.inputText || '').substring(0, 80)}..."`);
+            return await createAndMaybePoll(apiKey, '/generations', body, args);
         }
 
-        if (result.status === 'failed') {
-            response.error = result.error || 'Generation failed';
+        if (toolName === 'gamma_create_from_template') {
+            if (!args.gammaId) return { error: 'gammaId is required' };
+            if (!args.prompt) return { error: 'prompt is required' };
+            const body = buildTemplateBody(args);
+            console.log(`[Gamma] Starting template generation from ${args.gammaId}: "${(args.prompt || '').substring(0, 80)}..."`);
+            return await createAndMaybePoll(apiKey, '/generations/from-template', body, args);
         }
 
-        return response;
+        if (toolName === 'gamma_revise_as_new') {
+            if (!args.originalContent) return { error: 'originalContent is required because Gamma API cannot read existing Gamma content by URL.' };
+            if (!args.editInstructions) return { error: 'editInstructions is required' };
+            const body = buildRevisionBody(args);
+            console.log(`[Gamma] Starting revised copy generation: "${(args.editInstructions || '').substring(0, 80)}..."`);
+            return await createAndMaybePoll(apiKey, '/generations', body, args, {
+                sourceGammaId: args.sourceGammaId || null,
+                sourceGammaUrl: args.sourceGammaUrl || null,
+                note: 'Created a new revised Gamma. The source Gamma was not edited in place because Gamma API does not support in-place edits.',
+            });
+        }
+
+        if (toolName === 'gamma_get_generation_status') {
+            if (!args.generationId) return { error: 'generationId is required' };
+            const result = await gammaApiRequest(apiKey, `/generations/${encodeURIComponent(args.generationId)}`);
+            return formatGenerationResult(result, { generationId: args.generationId });
+        }
+
+        if (toolName === 'gamma_list_themes') {
+            return await gammaApiRequest(apiKey, '/themes', {
+                query: {
+                    query: args.query,
+                    limit: clampLimit(args.limit),
+                    after: args.after,
+                }
+            });
+        }
+
+        if (toolName === 'gamma_list_folders') {
+            return await gammaApiRequest(apiKey, '/folders', {
+                query: {
+                    query: args.query,
+                    limit: clampLimit(args.limit),
+                    after: args.after,
+                }
+            });
+        }
+
+        return { error: `Unknown Gamma tool: ${toolName}` };
     } catch (err) {
         console.error('[Gamma] Error:', err.message);
         return { error: err.message };
@@ -164,7 +635,7 @@ async function executeGammaTool(toolName, args, userId) {
 }
 
 function isGammaTool(toolName) {
-    return toolName === 'gamma_create_presentation';
+    return typeof toolName === 'string' && toolName.startsWith('gamma_');
 }
 
 module.exports = {
