@@ -88,8 +88,19 @@ async function resolveUserSession(userId) {
 
 /**
  * Execute a single AI task.
+ *
+ * Two execution modes:
+ *   - Legacy user-scoped task (`task.agentId == null`): inline LLM loop with
+ *     the user's integration tools, no agent context.
+ *   - Agent routine (`task.agentId` set): dispatch through the full agent
+ *     runtime so the agent's system prompt, attached skills, knowledge bases,
+ *     guardrails, memory, and integrations all participate. Result lands in a
+ *     persistent conversation thread on that agent.
  */
 async function executeTask(task, { manual = false } = {}) {
+    if (task.agentId) {
+        return executeAgentRoutine(task, { manual });
+    }
     const startTime = Date.now();
     console.log(`[AITaskRunner] ▶ Executing task "${task.title}" (${task.id})`);
 
@@ -234,7 +245,7 @@ async function executeTask(task, { manual = false } = {}) {
 
         // Advance schedule (skip if this was a manual run-now trigger)
         if (task.repeatInterval && !manual) {
-            const next = await aiTaskStore.advanceSchedule(task.id, task.nextRunAt, task.repeatInterval);
+            const next = await aiTaskStore.advanceSchedule(task.id, task.nextRunAt, task.repeatInterval, task.daysOfWeek);
             console.log(`[AITaskRunner] ✅ Task "${task.title}" completed (${Date.now() - startTime}ms), next run: ${next}`);
         } else if (task.repeatInterval && manual) {
             console.log(`[AITaskRunner] ✅ Task "${task.title}" completed manually (${Date.now() - startTime}ms), next scheduled run unchanged: ${task.nextRunAt}`);
@@ -249,7 +260,7 @@ async function executeTask(task, { manual = false } = {}) {
 
         // Still advance schedule on error (don't let errors block future runs) — but not for manual runs
         if (task.repeatInterval && !manual) {
-            await aiTaskStore.advanceSchedule(task.id, task.nextRunAt, task.repeatInterval);
+            await aiTaskStore.advanceSchedule(task.id, task.nextRunAt, task.repeatInterval, task.daysOfWeek);
         }
 
         // Notify user about failure
@@ -260,6 +271,128 @@ async function executeTask(task, { manual = false } = {}) {
                 category: 'urgent',
                 title: `⚠️ AI Task Failed: ${task.title}`,
                 message: `The scheduled task "${task.title}" failed to execute: ${err.message}`,
+            });
+        } catch (_) { /* don't fail on notification failure */ }
+    }
+}
+
+/**
+ * Execute an agent-scoped routine: dispatch through the full agent runtime so
+ * the agent's system prompt, attached skills, knowledge bases, integrations,
+ * and guardrails all participate. Result lands in a persistent conversation
+ * thread so the user can open it from the notification and continue chatting.
+ */
+async function executeAgentRoutine(task, { manual = false } = {}) {
+    const startTime = Date.now();
+    console.log(`[AITaskRunner] ▶ Executing routine "${task.title}" (${task.id}) for agent ${task.agentId}`);
+
+    try {
+        await aiTaskStore.markRunning(task.id);
+
+        const agentStore = require('../stores/agentStore');
+        const agent = await agentStore.getAgent(task.agentId);
+        if (!agent) throw new Error(`Linked agent ${task.agentId} no longer exists`);
+        if (agent.userId !== task.userId) throw new Error('Routine agent owner mismatch — refusing to run');
+
+        // Reuse the user's last active session for OAuth/integration tokens.
+        // Without it the agent's tools would still load but couldn't talk to
+        // Gmail/Calendar/etc on behalf of the user.
+        const session = await resolveUserSession(task.userId);
+        const userAuth = {
+            accessToken: session?.accessToken || null,
+            nextcloudUrl: null,
+            appPasswordUsername: session?.appPassword?.username || null,
+            appPassword: session?.appPassword?.password || null,
+            encryptionKey: session?.encryptionKey || null,
+            userId: task.userId,
+            session,
+            userOrgId: session?.user?.organizationId || agent.organizationId || null,
+        };
+
+        const { chatWithAgentStream } = require('./agentRuntime');
+
+        // Per-routine tier override (optional). Falls back to whatever the
+        // agent itself is configured with.
+        const modelTier = task.modelTier && task.modelTier !== 'fast'
+            ? task.modelTier
+            : (typeof agent.model === 'string' && agent.model.startsWith('tier:') ? agent.model.slice(5) : (task.modelTier || null));
+
+        const messageMetadata = {
+            conversationId: task.conversationId || undefined,
+            timezone: task.timezone || 'Europe/Amsterdam',
+            modelTier: modelTier || undefined,
+            userOrgId: userAuth.userOrgId,
+            orgId: userAuth.userOrgId,
+            // Routines are unattended — never block on streaming back to a UI.
+            ephemeral: false,
+        };
+
+        const collectedChunks = [];
+        const result = await chatWithAgentStream(
+            task.agentId,
+            task.userId,
+            task.prompt,
+            userAuth,
+            (type, data) => {
+                if (type === 'content' && data?.text) collectedChunks.push(data.text);
+            },
+            null,
+            messageMetadata,
+        );
+
+        const finalResponse = (result?.message && result.message.length > 0)
+            ? result.message
+            : collectedChunks.join('');
+        const truncated = finalResponse.length > 50000
+            ? finalResponse.substring(0, 50000) + '\n\n… (truncated)'
+            : finalResponse;
+
+        // Persist conversation id back onto the task so future runs append to
+        // the same chat thread.
+        if (result?.conversationId && result.conversationId !== task.conversationId) {
+            try { await aiTaskStore.updateTask(task.id, { conversationId: result.conversationId }); }
+            catch (_) { /* non-fatal */ }
+        }
+
+        await aiTaskStore.markCompleted(task.id, truncated);
+
+        // Notification with deep link to the conversation so the user can open
+        // it and continue chatting.
+        try {
+            const notificationStore = require('../stores/notificationStore');
+            const preview = truncated.length > 280 ? truncated.substring(0, 280) + '…' : truncated;
+            await notificationStore.createNotification({
+                userId: task.userId,
+                taskId: task.id,
+                category: 'ai_task',
+                title: `🤖 ${agent.name || 'Agent'}: ${task.title}`,
+                message: preview,
+            });
+        } catch (_) { /* non-fatal */ }
+
+        // Schedule advance — same rules as legacy tasks.
+        if ((task.repeatInterval || (Array.isArray(task.daysOfWeek) && task.daysOfWeek.length > 0)) && !manual) {
+            const next = await aiTaskStore.advanceSchedule(task.id, task.nextRunAt, task.repeatInterval, task.daysOfWeek);
+            console.log(`[AITaskRunner] ✅ Routine "${task.title}" completed (${Date.now() - startTime}ms), next run: ${next}`);
+        } else if (task.repeatInterval && manual) {
+            console.log(`[AITaskRunner] ✅ Routine "${task.title}" completed manually (${Date.now() - startTime}ms)`);
+        } else {
+            await aiTaskStore.updateTask(task.id, { isActive: false });
+            console.log(`[AITaskRunner] ✅ Routine "${task.title}" completed (one-time, ${Date.now() - startTime}ms)`);
+        }
+    } catch (err) {
+        console.error(`[AITaskRunner] ❌ Routine "${task.title}" failed:`, err.message);
+        await aiTaskStore.markError(task.id, err);
+        if ((task.repeatInterval || (Array.isArray(task.daysOfWeek) && task.daysOfWeek.length > 0)) && !manual) {
+            await aiTaskStore.advanceSchedule(task.id, task.nextRunAt, task.repeatInterval, task.daysOfWeek);
+        }
+        try {
+            const notificationStore = require('../stores/notificationStore');
+            await notificationStore.createNotification({
+                userId: task.userId,
+                category: 'urgent',
+                title: `⚠️ Routine failed: ${task.title}`,
+                message: `The scheduled routine "${task.title}" failed to execute: ${err.message}`,
             });
         } catch (_) { /* don't fail on notification failure */ }
     }
