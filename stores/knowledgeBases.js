@@ -31,6 +31,8 @@ async function initDB() {
     try { await require('../migrations/drop-kb-default-lang').up(); } catch (e) { /* tolerate */ }
     // Add usage_contexts + source_kind columns and backfill auto-created KBs.
     try { await require('../migrations/add-kb-usage-contexts').up(); } catch (e) { /* tolerate */ }
+    // Add Dutch translations for the usage-context UI strings (idempotent).
+    try { await require('../migrations/add-nl-kb-usage-translations').up(); } catch (e) { /* tolerate */ }
 
     await exec(`
         CREATE TABLE IF NOT EXISTS documents (
