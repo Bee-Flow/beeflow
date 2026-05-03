@@ -292,7 +292,7 @@ async function executeAgentRoutine(task, { manual = false } = {}) {
         const agentStore = require('../stores/agentStore');
         const agent = await agentStore.getAgent(task.agentId);
         if (!agent) throw new Error(`Linked agent ${task.agentId} no longer exists`);
-        if (agent.userId !== task.userId) throw new Error('Routine agent owner mismatch — refusing to run');
+        if (agent.owner_id !== task.userId) throw new Error('Routine agent owner mismatch — refusing to run');
 
         // Reuse the user's last active session for OAuth/integration tokens.
         // Without it the agent's tools would still load but couldn't talk to
@@ -306,7 +306,7 @@ async function executeAgentRoutine(task, { manual = false } = {}) {
             encryptionKey: session?.encryptionKey || null,
             userId: task.userId,
             session,
-            userOrgId: session?.user?.organizationId || agent.organizationId || null,
+            userOrgId: session?.user?.organizationId || agent.organization_id || null,
         };
 
         const { chatWithAgentStream } = require('./agentRuntime');

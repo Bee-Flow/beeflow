@@ -68,13 +68,48 @@ router.delete('/categories/:id', requirePermission('manage_agents'), async (req,
     }
 });
 
-// Get single agent
+// Get single agent — visibility-gated. A user can read an agent only if:
+//   1. they own it, OR
+//   2. it's published (is_published=true) AND either
+//      a. shared with the entire org (empty sharedGroups), OR
+//      b. shared with one of the user's groups, OR
+//      c. it's a system agent (owner_id = 'system' / 'swarm').
+// Without this gate any authenticated user could fetch any other user's
+// drafts including the system_prompt, KB ids, and shared_groups.
 router.get('/:id', async (req, res) => {
     const id = req.params.id;
+    const userId = getEffectiveUserId(req);
     const agent = await agentStore.getAgent(id);
-    if (agent) {
-        return res.json(agent);
+    if (!agent) return res.status(404).json({ error: 'Agent not found' });
+
+    // Owner / system agents always pass.
+    if (agent.owner_id === userId) return res.json(agent);
+    if (agent.owner_id === 'system' || agent.owner_id === 'swarm') return res.json(agent);
+
+    // Non-owners must have visibility into the agent.
+    if (!agent.is_published) return res.status(404).json({ error: 'Agent not found' });
+
+    const sharedGroups = (() => {
+        if (Array.isArray(agent.shared_groups)) return agent.shared_groups;
+        if (typeof agent.shared_groups === 'string') {
+            try { return JSON.parse(agent.shared_groups); } catch (_) { return []; }
+        }
+        return [];
+    })();
+
+    if (sharedGroups.length === 0) {
+        // Org-wide publish — gate by org membership.
+        const orgIds = await resolveUserOrgIds(req).catch(() => null);
+        if (orgIds && agent.organization_id && orgIds.has(agent.organization_id)) {
+            return res.json(agent);
+        }
+        return res.status(404).json({ error: 'Agent not found' });
     }
+
+    // Group-restricted publish — gate by user's group membership.
+    const user = await userStore.getUser(userId).catch(() => null);
+    const userGroupIds = Array.isArray(user?.groups) ? user.groups : [];
+    if (sharedGroups.some(gid => userGroupIds.includes(gid))) return res.json(agent);
 
     return res.status(404).json({ error: 'Agent not found' });
 });
@@ -192,7 +227,13 @@ async function canModifyAgent(agent, userId, req) {
 // Update agent - requires manage_agents permission
 router.put('/:id', requirePermission('manage_agents'), async (req, res) => {
     const userId = getEffectiveUserId(req);
-    const { name, description, systemPrompt, tools, toolParams, model, starterPrompts, avatar, threadsEnabled, copyEnabled, workspaceEnabled, config, embedEnabled, organizationId, sharedGroups, categoryId } = req.body;
+    // `organizationId` and `sharedGroups` are intentionally NOT destructured
+    // here. organization is set on creation and only an org-admin should be
+    // able to move an agent across orgs (no UI surface today). sharedGroups is
+    // managed via the dedicated `PATCH /:id/publish` endpoint to keep the
+    // group-membership check in one place. Either field arriving here is
+    // silently dropped (the existing values are reused from `agent.*`).
+    const { name, description, systemPrompt, tools, toolParams, model, starterPrompts, avatar, threadsEnabled, copyEnabled, workspaceEnabled, config, embedEnabled, categoryId } = req.body;
 
     const agent = await agentStore.getAgent(req.params.id);
     if (!agent) {
@@ -204,17 +245,16 @@ router.put('/:id', requirePermission('manage_agents'), async (req, res) => {
     }
 
     // Tier gate: when the client sets a `tier:<key>` model, validate that the
-    // user is actually allowed to use that tier. Custom tiers (`custom:*`) are
-    // already gated by group membership at fetch time; we still allow non-tier
-    // raw model strings (legacy) to pass through unchanged.
+    // user is actually allowed to use that tier. Both standard and custom tiers
+    // are checked — getPermittedTierKeys returns all keys (standard + custom)
+    // permitted for this user's groups + beta features. Non-tier raw model
+    // strings (legacy) pass through unchanged.
     if (typeof model === 'string' && model.startsWith('tier:')) {
         const tierKey = model.slice('tier:'.length);
-        if (!tierKey.startsWith('custom:')) {
-            const { getPermittedTierKeys } = require('../../core/userTiers');
-            const allowed = await getPermittedTierKeys({ userId, session: req.session, taskType: 'direct_chat' });
-            if (!allowed.has(tierKey)) {
-                return res.status(403).json({ error: `Tier "${tierKey}" is not available on your account.` });
-            }
+        const { getPermittedTierKeys } = require('../../core/userTiers');
+        const allowed = await getPermittedTierKeys({ userId, session: req.session, taskType: 'direct_chat' });
+        if (!allowed.has(tierKey)) {
+            return res.status(403).json({ error: `Tier "${tierKey}" is not available on your account.` });
         }
     }
 
@@ -223,17 +263,36 @@ router.put('/:id', requirePermission('manage_agents'), async (req, res) => {
         ? JSON.parse(agent.starter_prompts || '[]')
         : (agent.starter_prompts || []);
 
-    // Parse existing shared_groups
+    // Parse existing shared_groups (preserved verbatim — only the publish
+    // endpoint may mutate this).
     const existingSharedGroups = typeof agent.shared_groups === 'string'
         ? (() => { try { return JSON.parse(agent.shared_groups || '[]'); } catch (_) { return []; } })()
         : (agent.shared_groups || []);
 
-    // Auto-assign the user's first organization if none provided and agent doesn't have one
-    let assignOrgId = organizationId !== undefined ? organizationId : agent.organization_id;
+    // Organization is sticky — only set on first save if the agent has none.
+    let assignOrgId = agent.organization_id || null;
     if (!assignOrgId) {
         const orgIds = await resolveUserOrgIds(req);
         if (orgIds !== null && orgIds.size > 0) {
             assignOrgId = Array.from(orgIds)[0];
+        }
+    }
+
+    // Validate categoryId belongs to the user's org. Users may not legitimately
+    // attach an agent to a category in another org. Null is always allowed
+    // (clears the category).
+    let resolvedCategoryId = categoryId !== undefined ? categoryId : (agent.category_id || null);
+    if (resolvedCategoryId && resolvedCategoryId !== agent.category_id) {
+        try {
+            const cats = await agentStore.getAgentCategories(assignOrgId);
+            const valid = Array.isArray(cats) && cats.some(c => c.id === resolvedCategoryId);
+            if (!valid) {
+                return res.status(400).json({ error: 'Category does not belong to your organization.' });
+            }
+        } catch (_) {
+            // If the category list can't be loaded, fall back to existing value
+            // rather than silently moving to an unverified category.
+            resolvedCategoryId = agent.category_id || null;
         }
     }
 
@@ -251,11 +310,10 @@ router.put('/:id', requirePermission('manage_agents'), async (req, res) => {
         workspaceEnabled !== undefined ? workspaceEnabled : (agent.workspace_enabled !== 0),
         config !== undefined ? config : (agent.config || {}),
         embedEnabled !== undefined ? embedEnabled : (agent.embed_enabled !== 0),
-        assignOrgId || null,
-        sharedGroups !== undefined ? sharedGroups : existingSharedGroups,
-        categoryId !== undefined ? categoryId : (agent.category_id || null)
+        assignOrgId,
+        existingSharedGroups,
+        resolvedCategoryId
     );
-    console.log('[AgentUpdate] workspaceEnabled received:', workspaceEnabled, 'type:', typeof workspaceEnabled);
 
     if (!updated) {
         return res.status(500).json({ error: 'Failed to update agent' });
@@ -263,10 +321,9 @@ router.put('/:id', requirePermission('manage_agents'), async (req, res) => {
 
     // Update tools if provided (also pass toolParams)
     if (tools && Array.isArray(tools)) {
-        // Transform toolParams from frontend format { param: { value, fixed } } 
+        // Transform toolParams from frontend format { param: { value, fixed } }
         // to storage format { param: value } (only fixed params)
         const transformedParams = {};
-        console.log('[AgentSave] Received toolParams:', JSON.stringify(toolParams, null, 2));
         if (toolParams) {
             for (const [componentId, params] of Object.entries(toolParams)) {
                 const fixedParams = {};
@@ -280,11 +337,16 @@ router.put('/:id', requirePermission('manage_agents'), async (req, res) => {
                 }
             }
         }
-        console.log('[AgentSave] Transformed params:', JSON.stringify(transformedParams, null, 2));
         await agentStore.setAgentTools(req.params.id, tools, transformedParams);
     }
 
-    res.json({ success: true });
+    // Return the freshly persisted agent (including server-derived fields like
+    // updated_at, parsed config, etc.) so the client can refresh its local
+    // shell without a second GET round-trip. The previous `{success:true}`
+    // shape silently corrupted the editor's `agent` state and broke every
+    // auto-save after the first.
+    const fresh = await agentStore.getAgent(req.params.id);
+    res.json(fresh || { success: true });
 });
 
 // Get tools with their fixed params
