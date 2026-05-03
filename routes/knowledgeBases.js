@@ -24,11 +24,18 @@ function parseContextQuery(req) {
     return VALID_USAGE_CONTEXTS.has(v) ? v : null;
 }
 
-/** Build the listKBs filter options from request query (?context, ?includeAuto). */
+/** Parse the optional ?excludeContext= query (inverse of ?context=). */
+function parseExcludeContextQuery(req) {
+    const v = (req.query.excludeContext || '').trim();
+    return VALID_USAGE_CONTEXTS.has(v) ? v : null;
+}
+
+/** Build the listKBs filter options from request query (?context, ?excludeContext, ?includeAuto). */
 function listFilterFromQuery(req) {
     return {
         sourceKind: req.query.includeAuto === '1' ? null : 'manual',
         usageContext: parseContextQuery(req),
+        excludeContext: parseExcludeContextQuery(req),
     };
 }
 

@@ -130,9 +130,11 @@ const KnowledgeBasesStore = {
     createKB: async (tenantId, name, description = '', organizationId = null, extra = {}) => {
         await initDB();
         const sourceKind = extra.sourceKind || 'manual';
+        // Default for manual KBs: studio-managed contexts only. Webpage-owned KBs
+        // pass usageContexts=['webpage'] explicitly via their auto-create paths.
         const usageContexts = Array.isArray(extra.usageContexts)
             ? extra.usageContexts
-            : ['agent', 'direct_chat', 'webpage'];
+            : ['agent', 'direct_chat'];
         const row = await getOne(
             `INSERT INTO knowledge_bases (tenant_id, name, description, organization_id, category_id, icon, source_kind, usage_contexts)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
@@ -151,12 +153,15 @@ const KnowledgeBasesStore = {
      * @param {string|null} [opts.sourceKind='manual'] - Filter by source kind. Pass null to disable.
      * @param {string|null} [opts.usageContext=null] - When set, only KBs whose `usage_contexts`
      *   array contains this value are returned ('agent' | 'direct_chat' | 'webpage').
+     * @param {string|null} [opts.excludeContext=null] - Inverse of `usageContext`. KBs whose
+     *   `usage_contexts` array contains this value are excluded.
      */
     listKBs: async (tenantId, orgIds = undefined, opts = {}) => {
         await initDB();
 
         const sourceKind = opts.sourceKind === undefined ? 'manual' : opts.sourceKind;
         const usageContext = opts.usageContext || null;
+        const excludeContext = opts.excludeContext || null;
 
         // Build optional filter clauses + their bound params. Each branch below
         // appends these so the marketplace, agent and direct-chat pickers all
@@ -172,6 +177,10 @@ const KnowledgeBasesStore = {
             if (usageContext) {
                 conds.push(`kb.usage_contexts ? $${idx++}`);
                 params.push(usageContext);
+            }
+            if (excludeContext) {
+                conds.push(`NOT (kb.usage_contexts ? $${idx++})`);
+                params.push(excludeContext);
             }
             return { sql: conds.length > 0 ? ' AND ' + conds.join(' AND ') : '', params };
         };

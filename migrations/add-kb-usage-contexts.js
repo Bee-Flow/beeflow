@@ -53,6 +53,19 @@ async function up() {
     // Index source_kind so the marketplace filter (source_kind='manual') is cheap.
     try { await exec(`CREATE INDEX IF NOT EXISTS idx_kb_source_kind ON knowledge_bases(source_kind)`); } catch (_) {}
 
+    // The 'webpage' usage-context is no longer offered to users from the studio
+    // (auto-created webpage KBs already live with `source_kind='webpage_auto'`).
+    // Strip 'webpage' from any manual KB still carrying the original default
+    // value `["agent","direct_chat","webpage"]` so existing manual KBs continue
+    // to show up in the studio. Targeted to the unchanged-default value so
+    // manual KBs that were explicitly configured for webpages are left alone.
+    await exec(`
+        UPDATE knowledge_bases
+           SET usage_contexts = '["agent","direct_chat"]'::jsonb
+         WHERE source_kind = 'manual'
+           AND usage_contexts = '["agent","direct_chat","webpage"]'::jsonb
+    `);
+
     console.log('[Migration] add-kb-usage-contexts applied');
 }
 
