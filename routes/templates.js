@@ -535,7 +535,6 @@ async function autoCreateTemplateKB(templateId, userId, fileName, text) {
             const result = await ingestLocally(userId, kb.id, doc.id, text, {
                 title: fileName,
                 source_uri: fileName,
-                lang: kb.default_lang || 'en'
             });
             await kbStore.updateChunkCount(doc.id, result.chunks_created || 0);
             await kbStore.bumpKBVersion(kb.id);
@@ -551,7 +550,6 @@ async function autoCreateTemplateKB(templateId, userId, fileName, text) {
                     content: text,
                     title: fileName,
                     source_uri: fileName,
-                    lang: kb.default_lang || 'en'
                 }),
                 signal: AbortSignal.timeout(120000)
             });

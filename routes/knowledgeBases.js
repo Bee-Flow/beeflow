@@ -147,7 +147,7 @@ router.delete('/categories/:id', requireAuth, requirePermission('manage_knowledg
 router.post('/', requireAuth, requirePermission('manage_knowledge'), async (req, res) => {
     try {
         const userId = getUserId(req);
-        const { name, description, defaultLang, organizationId, categoryId, icon } = req.body;
+        const { name, description, organizationId, categoryId, icon } = req.body;
         if (!name || !name.trim()) {
             return res.status(400).json({ error: 'Name is required' });
         }
@@ -165,7 +165,6 @@ router.post('/', requireAuth, requirePermission('manage_knowledge'), async (req,
             userId,
             name.trim(),
             description || '',
-            defaultLang,
             assignOrgId || null,
             { categoryId: categoryId || null, icon: icon || null }
         );
@@ -525,7 +524,7 @@ router.post('/:id/ingest/text', requireAuth, requirePermission('manage_knowledge
         const result = await ingestDocument(
             kb.tenant_id, kb.id, content,
             title || 'Text snippet', 'text', null,
-            { lang: kb.default_lang }
+            {}
         );
 
         res.status(201).json({
@@ -566,7 +565,7 @@ router.post('/:id/ingest/file', requireAuth, requirePermission('manage_knowledge
         const result = await ingestDocument(
             kb.tenant_id, kb.id, content,
             filename, 'upload', filename,
-            { lang: kb.default_lang }
+            {}
         );
 
         res.status(201).json({
@@ -601,7 +600,7 @@ router.post('/:id/ingest/url', requireAuth, requirePermission('manage_knowledge'
         const result = await ingestDocument(
             kb.tenant_id, kb.id, content,
             pageTitle, 'web', resolvedUrl,
-            { lang: kb.default_lang }
+            {}
         );
 
         res.status(201).json({
@@ -806,7 +805,7 @@ router.post('/:id/ingest/sitemap', requireAuth, requirePermission('manage_knowle
                     pageTitle,
                     'web',
                     response.url || pageUrl,
-                    { skipDedup: true, lang: kb.default_lang }
+                    { skipDedup: true }
                 );
 
                 results.ingested++;
@@ -978,7 +977,7 @@ router.post('/:id/ingest/n8n', requireAuth, requirePermission('manage_knowledge'
                 const result = await ingestDocument(
                     kb.tenant_id, kb.id, doc.markdown,
                     doc.title, 'n8n', doc.sourceUri,
-                    { lang: kb.default_lang }
+                    {}
                 );
                 totalChunks += result.chunks;
                 ingestedDocs++;
@@ -1221,7 +1220,6 @@ router.post('/:id/reindex', requireAuth, requirePermission('manage_knowledge'), 
                     const ingestResult = await ingestLocally(kb.tenant_id, kb.id, doc.id, content, {
                         title,
                         source_uri: doc.source_uri || null,
-                        lang: kb.default_lang,
                     });
                     await kbStore.updateChunkCount(doc.id, ingestResult.chunks_created || 0);
                     results.reindexed++;
@@ -1244,7 +1242,6 @@ router.post('/:id/reindex', requireAuth, requirePermission('manage_knowledge'), 
                             content,
                             title,
                             source_uri: doc.source_uri || null,
-                            lang: kb.default_lang,
                             ...azureParams,
                         }),
                         signal: AbortSignal.timeout(120000)

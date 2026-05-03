@@ -311,6 +311,25 @@ You can split your work across additional files when it makes the project cleare
 When to split files: only when it genuinely simplifies the project. A small page belongs in the three primary slots. Split when you have multiple components, reusable modules, or content that wants its own file. Don't pre-emptively scaffold dozens of files for a simple page.
 
 ────────────────────────────────────────
+SQLITE DATABASE — per-webpage server-side persistence
+────────────────────────────────────────
+Every webpage has a SQLite database (\`data.db\`, stored alongside the script files). The database is server-side; the running script.js talks to it via an injected client:
+
+  await window.beeflowDB.query("SELECT * FROM notes WHERE archived = ?", [0]);
+  await window.beeflowDB.exec("INSERT INTO notes (body) VALUES (?)", ["hi"]);
+  await window.beeflowDB.batch([{sql: "...", params: []}, ...]);
+  await window.beeflowDB.schema();
+
+Each call returns a Promise; reject = error string in \`.error\`. Use \`?\` placeholders — never interpolate user input into SQL.
+
+You have three tools to manage the DB directly:
+• webpage_db_schema() — list tables + columns. Call this BEFORE generating any query against tables you didn't just create yourself.
+• webpage_db_query({ sql, params? }) — read-only SELECT (errors if SQL would mutate). Rows capped at 10000.
+• webpage_db_exec({ sql, params? }) — INSERT/UPDATE/DELETE/CREATE/etc. Multi-statement DDL (e.g. several CREATE TABLEs separated by semicolons) is allowed only when params is empty.
+
+Use these to set up the schema and seed data the user describes. The DB persists across reloads; new webpages start empty. If the page doesn't actually need persistence, don't create a schema — local state in script.js is fine.
+
+────────────────────────────────────────
 PLANNING
 ────────────────────────────────────────
 ${planningRule}
@@ -442,6 +461,13 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
                     send('webpage_extra_update', { path: toolResult.path, meta: toolResult.meta });
                 } else if (toolResult?._action === 'webpage_extra_deleted') {
                     send('webpage_extra_deleted', { path: toolResult.path });
+                }
+            } else if (isDbTool(toolName)) {
+                toolResult = await executeDbTool(toolName, toolArgs, { webpageId, userId });
+                if (toolResult?._action === 'webpage_db_update') {
+                    // Lets the file explorer refresh the data.db size badge and
+                    // the iframe hot-reload if the user wants it.
+                    send('webpage_db_update', {});
                 }
             } else if (toolName === 'webpage_add_source') {
                 try {

@@ -19,7 +19,6 @@ async function initDB() {
             tenant_id TEXT NOT NULL,
             name TEXT NOT NULL,
             description TEXT DEFAULT '',
-            default_lang TEXT DEFAULT 'unknown',
             kb_version INT DEFAULT 1,
             embedding_model TEXT DEFAULT 'bge-m3',
             created_at TIMESTAMPTZ DEFAULT now(),
@@ -27,6 +26,9 @@ async function initDB() {
         )
     `);
     await exec(`CREATE INDEX IF NOT EXISTS idx_kb_tenant ON knowledge_bases(tenant_id)`);
+    // Drop the deprecated per-KB default_lang column on existing deployments
+    // (no-op once applied). Idempotent.
+    try { await require('../migrations/drop-kb-default-lang').up(); } catch (e) { /* tolerate */ }
 
     await exec(`
         CREATE TABLE IF NOT EXISTS documents (
@@ -116,17 +118,16 @@ const KnowledgeBasesStore = {
      * @param {string} tenantId - Owner user ID
      * @param {string} name
      * @param {string} description
-     * @param {string} defaultLang
      * @param {string|null} organizationId - Organization this KB belongs to (null = personal)
      * @param {object} extra - Optional { categoryId, icon }
      */
-    createKB: async (tenantId, name, description = '', defaultLang = 'unknown', organizationId = null, extra = {}) => {
+    createKB: async (tenantId, name, description = '', organizationId = null, extra = {}) => {
         await initDB();
         const row = await getOne(
-            `INSERT INTO knowledge_bases (tenant_id, name, description, default_lang, organization_id, category_id, icon)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+            `INSERT INTO knowledge_bases (tenant_id, name, description, organization_id, category_id, icon)
+             VALUES ($1, $2, $3, $4, $5, $6)
              RETURNING *`,
-            [tenantId, name, description, defaultLang, organizationId || null, extra.categoryId || null, extra.icon || null]
+            [tenantId, name, description, organizationId || null, extra.categoryId || null, extra.icon || null]
         );
         return row;
     },
@@ -270,19 +271,18 @@ const KnowledgeBasesStore = {
         return getOne('SELECT * FROM knowledge_bases WHERE id = $1', [id]);
     },
 
-    updateKB: async (id, { name, description, defaultLang, categoryId, icon }) => {
+    updateKB: async (id, { name, description, categoryId, icon }) => {
         await initDB();
         return getOne(
             `UPDATE knowledge_bases
              SET name = COALESCE($2, name),
                  description = COALESCE($3, description),
-                 default_lang = COALESCE($4, default_lang),
-                 category_id = COALESCE($5, category_id),
-                 icon = COALESCE($6, icon),
+                 category_id = COALESCE($4, category_id),
+                 icon = COALESCE($5, icon),
                  updated_at = now()
              WHERE id = $1
              RETURNING *`,
-            [id, name, description, defaultLang, categoryId, icon]
+            [id, name, description, categoryId, icon]
         );
     },
 
