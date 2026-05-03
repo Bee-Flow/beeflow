@@ -59,6 +59,28 @@ function normalizeTimeOfDay(value) {
     return value;
 }
 
+// Validate the timezone is an IANA zone the runtime knows about. An invalid
+// string would make the runner's Intl.DateTimeFormat construction throw,
+// silently breaking the cron with no UI signal.
+function normalizeTimezone(value) {
+    if (value === undefined) return undefined;
+    if (value === null || value === '') return null;
+    if (typeof value !== 'string') {
+        const err = new Error('timezone must be a string IANA zone name');
+        err.statusCode = 400;
+        throw err;
+    }
+    try {
+        // Will throw RangeError if the timezone isn't recognised.
+        new Intl.DateTimeFormat('en-US', { timeZone: value }).format(new Date());
+        return value;
+    } catch (_) {
+        const err = new Error(`Unknown timezone: ${value}`);
+        err.statusCode = 400;
+        throw err;
+    }
+}
+
 async function getMaxTasks() {
     const limit = await configStore.getConfig('ai_tasks_max_per_user');
     return (typeof limit === 'number' && limit > 0) ? limit : DEFAULT_MAX_TASKS;
@@ -125,21 +147,25 @@ router.post('/', async (req, res) => {
         let normalizedRepeat;
         let normalizedDays;
         let normalizedTime;
+        let normalizedTz;
         try {
             normalizedRepeat = normalizeRepeatInterval(repeatInterval);
             normalizedDays = normalizeDaysOfWeek(daysOfWeek);
             normalizedTime = normalizeTimeOfDay(timeOfDay);
+            normalizedTz = normalizeTimezone(timezone);
         } catch (e) {
             return res.status(400).json({ error: e.message });
         }
 
         // Beta gate + agent ownership check for agent-scoped routines.
+        // (agentStore returns the raw row; the column is `owner_id`. The prior
+        // `agent.userId` check was always undefined → rejected every call.)
         let resolvedAgentId = null;
         if (agentId) {
             const allowed = await userHasBetaFeature(userId, 'agent_routines', req.session).catch(() => false);
             if (!allowed) return res.status(403).json({ error: 'Agent routines beta is not enabled for this account' });
             const agent = await agentStore.getAgent(agentId);
-            if (!agent || agent.userId !== userId) {
+            if (!agent || agent.owner_id !== userId) {
                 return res.status(403).json({ error: 'Agent not found or not owned by you' });
             }
             resolvedAgentId = agent.id;
@@ -161,7 +187,7 @@ router.post('/', async (req, res) => {
             repeatInterval: normalizedRepeat ?? null,
             nextRunAt,
             modelTier: modelTier || 'fast',
-            timezone: timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+            timezone: normalizedTz || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
             agentId: resolvedAgentId,
             daysOfWeek: normalizedDays ?? null,
             timeOfDay: normalizedTime ?? null,
@@ -186,10 +212,12 @@ router.put('/:id', async (req, res) => {
         let normalizedRepeat;
         let normalizedDays;
         let normalizedTime;
+        let normalizedTz;
         try {
             normalizedRepeat = normalizeRepeatInterval(repeatInterval);
             normalizedDays = normalizeDaysOfWeek(daysOfWeek);
             normalizedTime = normalizeTimeOfDay(timeOfDay);
+            normalizedTz = normalizeTimezone(timezone);
         } catch (e) {
             return res.status(400).json({ error: e.message });
         }
@@ -197,7 +225,7 @@ router.put('/:id', async (req, res) => {
         const ok = await aiTaskStore.updateTask(req.params.id, {
             title, prompt,
             repeatInterval: normalizedRepeat,
-            nextRunAt, modelTier, timezone, isActive,
+            nextRunAt, modelTier, timezone: normalizedTz, isActive,
             daysOfWeek: normalizedDays,
             timeOfDay: normalizedTime,
         });

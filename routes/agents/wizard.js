@@ -9,8 +9,15 @@ const { getEffectiveUserId } = require('../../utils/routeHelpers');
 const { extractJSON } = require('../../pipeline/llmHelpers');
 const llmClient = require('../../core/llmClient');
 const { resolveModelForTier, getTierConfig } = require('../../core/modelResolver');
+const { perUserRateLimit } = require('../../utils/perUserRateLimit');
 
 const router = express.Router();
+
+// Wizard endpoints all back onto an LLM call. Without a per-user cap a
+// logged-in user can run up the org's LLM bill at request rate. 30/min is
+// generous for human use (a refine-burst rarely exceeds 5/min) and rejects
+// bot-like abuse.
+const wizardLimiter = perUserRateLimit({ windowMs: 60_000, max: 30 });
 
 // ─────────────────────────────────────────────────────────────────
 // Integration catalog the LLM can pick from. Mirrors the catalog in
@@ -256,7 +263,7 @@ async function generatePlan({ userPrompt, priorPlan, refinement, modelTier, loca
     return normalizePlan(plan, availableIds);
 }
 
-router.post('/wizard/draft', requirePermission('manage_agents'), async (req, res) => {
+router.post('/wizard/draft', requirePermission('manage_agents'), wizardLimiter, async (req, res) => {
     try {
         const { prompt, modelTier, locale } = req.body || {};
         if (!prompt || !prompt.trim()) return res.status(400).json({ error: 'Prompt is required' });
@@ -272,7 +279,7 @@ router.post('/wizard/draft', requirePermission('manage_agents'), async (req, res
     }
 });
 
-router.post('/wizard/refine', requirePermission('manage_agents'), async (req, res) => {
+router.post('/wizard/refine', requirePermission('manage_agents'), wizardLimiter, async (req, res) => {
     try {
         const { prompt, plan, refinement, modelTier, locale } = req.body || {};
         if (!plan) return res.status(400).json({ error: 'Prior plan is required' });
@@ -290,7 +297,7 @@ router.post('/wizard/refine', requirePermission('manage_agents'), async (req, re
 });
 
 // POST /agents/wizard/commit  { plan }  -> creates the agent, returns it
-router.post('/wizard/commit', requirePermission('manage_agents'), async (req, res) => {
+router.post('/wizard/commit', requirePermission('manage_agents'), wizardLimiter, async (req, res) => {
     try {
         const { plan } = req.body || {};
         if (!plan || !plan.name) return res.status(400).json({ error: 'Plan with name is required' });
@@ -425,32 +432,11 @@ router.post('/wizard/commit', requirePermission('manage_agents'), async (req, re
                 const allowed = await userHasBetaFeature(userId, 'agent_routines', req.session).catch(() => false);
                 if (allowed) {
                     const aiTaskStore = require('../../stores/aiTaskStore');
+                    const { computeRoutineNextRun } = require('../../utils/routineSchedule');
                     const r = plan.routine;
-                    // Compute first nextRunAt to match the cadence (mirrors the
-                    // logic in BuilderSplit's RoutineModal so behavior is identical
-                    // whether the routine was created here or via the modal).
-                    const now = new Date();
-                    let nextRunAt;
-                    if (r.repeatInterval === 'hourly') {
-                        const next = new Date(now);
-                        next.setHours(next.getHours() + 1);
-                        next.setMinutes(0); next.setSeconds(0); next.setMilliseconds(0);
-                        nextRunAt = next.toISOString();
-                    } else {
-                        const [hh, mm] = (r.timeOfDay || '08:00').split(':').map(n => parseInt(n, 10) || 0);
-                        const next = new Date(now);
-                        next.setHours(hh, mm, 0, 0);
-                        if (next <= now) next.setDate(next.getDate() + 1);
-                        if (Array.isArray(r.daysOfWeek) && r.daysOfWeek.length > 0) {
-                            const tokens = ['sun','mon','tue','wed','thu','fri','sat'];
-                            const allowedDays = new Set(r.daysOfWeek);
-                            for (let i = 0; i < 7; i += 1) {
-                                if (allowedDays.has(tokens[next.getDay()])) break;
-                                next.setDate(next.getDate() + 1);
-                            }
-                        }
-                        nextRunAt = next.toISOString();
-                    }
+                    // Shared TZ-aware helper — same one the modal and wizard chat
+                    // use, so behavior is identical regardless of entry point.
+                    const nextRunAt = computeRoutineNextRun(r, r.timezone || 'UTC');
                     createdRoutine = await aiTaskStore.createTask({
                         userId,
                         agentId: agent.id,
