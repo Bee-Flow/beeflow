@@ -103,7 +103,15 @@ const PLAN_SCHEMA = `{
       "instructions": "string (when and how the agent should use this skill, in the user's language)"
     }
   ],
-  "systemPrompt": "string (concrete instructions for the agent, written in the user's language)"
+  "systemPrompt": "string (concrete instructions for the agent, written in the user's language)",
+  "routine": null | {                       // OPTIONAL — set ONLY when the user is asking to schedule a recurring task for THIS agent.
+    "title": "string (short routine name, in the user's language)",
+    "prompt": "string (what the agent should do each time the routine fires)",
+    "repeatInterval": "hourly|daily|weekdays|weekly|biweekly|monthly",
+    "daysOfWeek": ["mon","tue","wed","thu","fri","sat","sun"] | null,  // only for daily/weekly/biweekly when specific days matter
+    "timeOfDay": "HH:MM" | null,             // 24h, in the user's local timezone; null for hourly
+    "timezone": "string IANA name" | null    // e.g. "Europe/Amsterdam"; null = use the user's default
+  }
 }`;
 
 const LOCALE_NAMES = { en: 'English', nl: 'Dutch', de: 'German', fr: 'French', es: 'Spanish', it: 'Italian', pt: 'Portuguese' };
@@ -134,6 +142,7 @@ Rules:
 - enabledIntegrations: include only the integrations this agent will actually use. Empty array means "no integrations needed".
 - skills: propose 0-5 skills. Reuse existing ones by id when there's a clear match; otherwise propose new skills with id=null and meaningful instructions.
 - systemPrompt must be self-contained: tone, scope, what to do, what to avoid.
+- routine: leave null UNLESS the user is explicitly asking to SCHEDULE a recurring task ("every morning", "each Monday", "weekly", "every 2 hours", "monthly report"). When set, write title/prompt in ${langName}, and pick the cadence and time that match the user's request. Do NOT invent a routine for vague capability requests like "summarize emails" — only when there's a clear time signal.
 - Respond with raw JSON only, no markdown fences.`;
 }
 
@@ -160,6 +169,34 @@ function normalizePlan(plan, availableIntegrationIds) {
             description: String(s.description || '').trim(),
             instructions: String(s.instructions || '').trim(),
         }));
+
+    // Routine: optional. Validate the cadence enum + day tokens; drop the
+    // whole field if it's malformed (the chat panel handles missing routines
+    // gracefully, but bad data would break the routine creator on the client).
+    if (plan.routine && typeof plan.routine === 'object') {
+        const r = plan.routine;
+        const VALID_CADENCES = ['hourly', 'daily', 'weekdays', 'weekly', 'biweekly', 'monthly'];
+        const VALID_DOW = new Set(['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']);
+        if (!r.title || !r.prompt || !VALID_CADENCES.includes(r.repeatInterval)) {
+            delete plan.routine;
+        } else {
+            plan.routine = {
+                title: String(r.title).trim().slice(0, 200),
+                prompt: String(r.prompt).trim().slice(0, 4000),
+                repeatInterval: r.repeatInterval,
+                daysOfWeek: Array.isArray(r.daysOfWeek)
+                    ? r.daysOfWeek.map(d => String(d).toLowerCase().slice(0, 3)).filter(d => VALID_DOW.has(d))
+                    : null,
+                timeOfDay: typeof r.timeOfDay === 'string' && /^\d{2}:\d{2}$/.test(r.timeOfDay) ? r.timeOfDay : null,
+                timezone: typeof r.timezone === 'string' && r.timezone.trim() ? r.timezone.trim() : null,
+            };
+            if (Array.isArray(plan.routine.daysOfWeek) && plan.routine.daysOfWeek.length === 0) {
+                plan.routine.daysOfWeek = null;
+            }
+        }
+    } else {
+        delete plan.routine;
+    }
 
     return plan;
 }

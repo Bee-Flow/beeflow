@@ -73,6 +73,9 @@ function requireAuth(req, res, next) {
 router.use(requireAuth);
 
 // GET / — list tasks. Optional `?agentId=<id>` filter for routines.
+// Tasks with `agentId` are enriched with `agentName` + `agentAvatar` so the
+// list view can show which agent each routine belongs to without a separate
+// fetch round-trip.
 router.get('/', async (req, res) => {
     try {
         const userId = req.session.user.id;
@@ -80,6 +83,27 @@ router.get('/', async (req, res) => {
         const tasks = agentId
             ? await aiTaskStore.getTasksByAgent(userId, agentId)
             : await aiTaskStore.getTasks(userId);
+
+        // Enrich agent-scoped tasks with name+avatar. Single-pass lookup keyed
+        // by agentId, so we hit agentStore once per distinct agent.
+        const agentIds = Array.from(new Set(tasks.map(t => t.agentId).filter(Boolean)));
+        if (agentIds.length > 0) {
+            const agentMap = new Map();
+            await Promise.all(agentIds.map(async (id) => {
+                try {
+                    const a = await agentStore.getAgent(id);
+                    if (a) agentMap.set(id, { name: a.name, avatar: a.avatar || a.config?.avatar || '🤖' });
+                } catch (_) { /* missing agent → leave unenriched */ }
+            }));
+            for (const t of tasks) {
+                if (t.agentId && agentMap.has(t.agentId)) {
+                    const a = agentMap.get(t.agentId);
+                    t.agentName = a.name;
+                    t.agentAvatar = a.avatar;
+                }
+            }
+        }
+
         const maxTasks = await getMaxTasks();
         res.json({ tasks, maxTasks });
     } catch (err) {
