@@ -207,7 +207,7 @@ router.put('/:id', async (req, res) => {
         if (!existing) return res.status(404).json({ error: 'Not found' });
         if (existing.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
 
-        const { title, prompt, repeatInterval, nextRunAt, modelTier, timezone, isActive, daysOfWeek, timeOfDay } = req.body;
+        const { title, prompt, repeatInterval, nextRunAt, modelTier, timezone, isActive, daysOfWeek, timeOfDay, agentId } = req.body;
 
         let normalizedRepeat;
         let normalizedDays;
@@ -222,12 +222,31 @@ router.put('/:id', async (req, res) => {
             return res.status(400).json({ error: e.message });
         }
 
+        // Allow attaching/detaching/changing the linked agent. Same beta + ownership
+        // gate as POST. `agentId === undefined` means "don't touch"; `null` means
+        // "detach"; a string means "switch to this agent".
+        let resolvedAgentId;
+        if (agentId !== undefined) {
+            if (agentId === null || agentId === '') {
+                resolvedAgentId = null;
+            } else {
+                const allowed = await userHasBetaFeature(userId, 'agent_routines', req.session).catch(() => false);
+                if (!allowed) return res.status(403).json({ error: 'Agent routines beta is not enabled for this account' });
+                const agent = await agentStore.getAgent(agentId);
+                if (!agent || agent.owner_id !== userId) {
+                    return res.status(403).json({ error: 'Agent not found or not owned by you' });
+                }
+                resolvedAgentId = agent.id;
+            }
+        }
+
         const ok = await aiTaskStore.updateTask(req.params.id, {
             title, prompt,
             repeatInterval: normalizedRepeat,
             nextRunAt, modelTier, timezone: normalizedTz, isActive,
             daysOfWeek: normalizedDays,
             timeOfDay: normalizedTime,
+            ...(resolvedAgentId !== undefined ? { agentId: resolvedAgentId } : {}),
         });
         res.json({ success: ok });
     } catch (err) {
