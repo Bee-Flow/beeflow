@@ -23,10 +23,14 @@ const storageStore = require('./storageStore');
 let initialized = false;
 
 const SLOTS = ['html', 'css', 'js'];
+// Versioned slots include the SQLite database — `data.db` is snapshotted
+// alongside the text files but isn't part of the text-write code paths.
+const VERSIONED_SLOTS = [...SLOTS, 'db'];
 const CONTENT_TYPES = {
     html: 'text/html; charset=utf-8',
     css: 'text/css; charset=utf-8',
     js: 'application/javascript; charset=utf-8',
+    db: 'application/vnd.sqlite3',
 };
 
 async function initDB() {
@@ -92,6 +96,13 @@ async function initDB() {
     try {
         await exec(`ALTER TABLE webpages ADD COLUMN IF NOT EXISTS chat_messages JSONB DEFAULT '[]'::jsonb`);
     } catch (_) { /* column already exists or table doesn't yet — fine */ }
+
+    // SQLite database slot — sha + size of the at-rest `data.db` blob in RustFS.
+    // The DB itself is run server-side by webpageDbStore.
+    try {
+        await exec(`ALTER TABLE webpages ADD COLUMN IF NOT EXISTS db_sha256 TEXT DEFAULT ''`);
+        await exec(`ALTER TABLE webpages ADD COLUMN IF NOT EXISTS db_size INTEGER DEFAULT 0`);
+    } catch (_) { /* column already exists — fine */ }
 
     // Multi-file support — arbitrary additional files under a webpage.
     // The three primary slots (index.html / style.css / script.js) keep their
@@ -186,6 +197,31 @@ async function copySlotToVersion(userId, webpageId, versionId, slot) {
     } catch (err) {
         // If the source slot is empty (no object), there's nothing to snapshot.
         if (err?.name === 'NoSuchKey' || err?.$metadata?.httpStatusCode === 404) return;
+        throw err;
+    }
+}
+
+/**
+ * Restore a versioned slot back over `current/` via a server-side copy.
+ * Used by the version restore route for the `db` slot (text slots use
+ * `writeSlot` because they need the content for the response payload).
+ * Returns `true` if the source object existed and was copied; `false` if
+ * the version had no object for this slot (e.g. a pre-DB snapshot).
+ */
+async function restoreSlotFromVersion(userId, webpageId, versionId, slot) {
+    if (!storageStore.isAvailable()) return false;
+    const src = keyFor(userId, webpageId, slot, versionId);
+    const dst = keyFor(userId, webpageId, slot);
+    try {
+        await storageStore.copyObject(src, dst);
+        return true;
+    } catch (err) {
+        if (err?.name === 'NoSuchKey' || err?.$metadata?.httpStatusCode === 404) {
+            // No DB in this snapshot — drop the current one too so the restore
+            // is a true reset to the snapshot's state.
+            try { await storageStore.deleteFile(dst); } catch (_) {}
+            return false;
+        }
         throw err;
     }
 }
@@ -473,6 +509,8 @@ async function updateWebpageMetadata(id, userId, updates) {
     if (updates.htmlSize !== undefined) { setClauses.push(`html_size = $${idx++}`); params.push(updates.htmlSize); }
     if (updates.cssSize !== undefined) { setClauses.push(`css_size = $${idx++}`); params.push(updates.cssSize); }
     if (updates.jsSize !== undefined) { setClauses.push(`js_size = $${idx++}`); params.push(updates.jsSize); }
+    if (updates.dbSha !== undefined) { setClauses.push(`db_sha256 = $${idx++}`); params.push(updates.dbSha); }
+    if (updates.dbSize !== undefined) { setClauses.push(`db_size = $${idx++}`); params.push(updates.dbSize); }
 
     if (setClauses.length === 0) return false;
     setClauses.push(`updated_at = NOW()`);
@@ -624,9 +662,11 @@ function mapWebpageRow(r) {
         htmlSha: r.html_sha256 || '',
         cssSha: r.css_sha256 || '',
         jsSha: r.js_sha256 || '',
+        dbSha: r.db_sha256 || '',
         htmlSize: parseInt(r.html_size) || 0,
         cssSize: parseInt(r.css_size) || 0,
         jsSize: parseInt(r.js_size) || 0,
+        dbSize: parseInt(r.db_size) || 0,
         sourceCount: parseInt(r.source_count) || 0,
         createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
         updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : null,
@@ -669,8 +709,10 @@ async function createVersion(userId, webpageId, summary = 'Auto-save', hashes = 
     await initDB();
     const id = crypto.randomUUID();
 
-    // Copy each slot's current object into the version prefix.
-    await Promise.all(SLOTS.map(slot => copySlotToVersion(userId, webpageId, id, slot)));
+    // Copy each slot's current object into the version prefix — text slots
+    // plus the SQLite database (if present). copySlotToVersion is a no-op
+    // when the source key doesn't exist, so empty slots cost nothing.
+    await Promise.all(VERSIONED_SLOTS.map(slot => copySlotToVersion(userId, webpageId, id, slot)));
 
     let htmlSha = hashes?.htmlSha;
     let cssSha = hashes?.cssSha;
@@ -702,7 +744,7 @@ async function createVersion(userId, webpageId, summary = 'Auto-save', hashes = 
         const ids = pruned.map(r => r.id);
         await run(`DELETE FROM webpage_versions WHERE id = ANY($1::text[])`, [ids]);
         for (const vid of ids) {
-            for (const slot of SLOTS) {
+            for (const slot of VERSIONED_SLOTS) {
                 const k = keyFor(userId, webpageId, slot, vid);
                 try { await storageStore.deleteFile(k); } catch (_) {}
             }
@@ -754,8 +796,8 @@ async function deleteVersion(userId, versionId) {
     const r = await getOne('SELECT * FROM webpage_versions WHERE id = $1', [versionId]);
     if (!r) return false;
     await run('DELETE FROM webpage_versions WHERE id = $1', [versionId]);
-    // Delete the version's RustFS objects
-    for (const slot of SLOTS) {
+    // Delete the version's RustFS objects (text slots + the snapshotted DB)
+    for (const slot of VERSIONED_SLOTS) {
         const k = keyFor(userId, r.webpage_id, slot, versionId);
         try { await storageStore.deleteFile(k); } catch (_) {}
     }
@@ -776,6 +818,7 @@ async function shouldAutoVersion(webpageId) {
 
 module.exports = {
     SLOTS,
+    VERSIONED_SLOTS,
     // Webpages
     createWebpage,
     getWebpages,
@@ -791,6 +834,7 @@ module.exports = {
     readSlot,
     readAllSlots,
     writeSlot,
+    restoreSlotFromVersion,
     purgeWebpageObjects,
     // Extra files (multi-file)
     listExtraFiles,

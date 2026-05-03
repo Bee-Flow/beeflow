@@ -84,13 +84,22 @@ function buildKey(userId, category, filename) {
  * Used by the Webpages feature to host index.html / style.css / script.js
  * (and their version snapshots) in RustFS at predictable paths.
  *
+ * The 'db' slot stores a per-webpage SQLite database alongside the script
+ * files — the engine runs server-side; this is just the at-rest blob.
+ *
  * @param {string} userId
  * @param {string} webpageId
- * @param {'html'|'css'|'js'} slot
+ * @param {'html'|'css'|'js'|'db'} slot
  * @param {string} [versionId] — when present, returns the version path
  */
 function buildWebpageKey(userId, webpageId, slot, versionId = null) {
-    const filename = slot === 'html' ? 'index.html' : slot === 'css' ? 'style.css' : 'script.js';
+    const filename =
+        slot === 'html' ? 'index.html' :
+        slot === 'css'  ? 'style.css'  :
+        slot === 'js'   ? 'script.js'  :
+        slot === 'db'   ? 'data.db'    :
+        null;
+    if (!filename) throw new Error(`Unknown webpage slot: ${slot}`);
     const prefix = versionId
         ? `users/${userId}/webpages/${webpageId}/versions/${versionId}`
         : `users/${userId}/webpages/${webpageId}/current`;

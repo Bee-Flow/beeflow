@@ -30,7 +30,7 @@ const iconStore = require('../stores/iconStore');
 const userStore = require('../stores/userStore');
 const configStore = require('../stores/configStore');
 const { googleAdapter } = require('../core/providers');
-const { ICON_CATEGORIES, ALL_ICON_KEYS } = require('../data/iconCatalog');
+const { ICON_CATEGORIES, ALL_ICON_KEYS } = require('../core/iconCatalog');
 
 // ── Storage ─────────────────────────────────────────────────────
 
