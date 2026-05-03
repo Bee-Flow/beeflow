@@ -29,6 +29,8 @@ async function initDB() {
     // Drop the deprecated per-KB default_lang column on existing deployments
     // (no-op once applied). Idempotent.
     try { await require('../migrations/drop-kb-default-lang').up(); } catch (e) { /* tolerate */ }
+    // Add usage_contexts + source_kind columns and backfill auto-created KBs.
+    try { await require('../migrations/add-kb-usage-contexts').up(); } catch (e) { /* tolerate */ }
 
     await exec(`
         CREATE TABLE IF NOT EXISTS documents (
@@ -119,15 +121,21 @@ const KnowledgeBasesStore = {
      * @param {string} name
      * @param {string} description
      * @param {string|null} organizationId - Organization this KB belongs to (null = personal)
-     * @param {object} extra - Optional { categoryId, icon }
+     * @param {object} extra - Optional { categoryId, icon, sourceKind, usageContexts }
+     *   - sourceKind: 'manual' | 'webpage_auto' | 'notebook_auto' (default 'manual')
+     *   - usageContexts: array of 'agent' | 'direct_chat' | 'webpage' (default all three)
      */
     createKB: async (tenantId, name, description = '', organizationId = null, extra = {}) => {
         await initDB();
+        const sourceKind = extra.sourceKind || 'manual';
+        const usageContexts = Array.isArray(extra.usageContexts)
+            ? extra.usageContexts
+            : ['agent', 'direct_chat', 'webpage'];
         const row = await getOne(
-            `INSERT INTO knowledge_bases (tenant_id, name, description, organization_id, category_id, icon)
-             VALUES ($1, $2, $3, $4, $5, $6)
+            `INSERT INTO knowledge_bases (tenant_id, name, description, organization_id, category_id, icon, source_kind, usage_contexts)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
              RETURNING *`,
-            [tenantId, name, description, organizationId || null, extra.categoryId || null, extra.icon || null]
+            [tenantId, name, description, organizationId || null, extra.categoryId || null, extra.icon || null, sourceKind, JSON.stringify(usageContexts)]
         );
         return row;
     },
@@ -137,87 +145,83 @@ const KnowledgeBasesStore = {
      * @param {string} tenantId - The user's ID
      * @param {Set|null} orgIds - User's org IDs from resolveUserOrgIds().
      *   null = super admin (see all), Set with values = org member, empty Set = no org
+     * @param {object} [opts]
+     * @param {string|null} [opts.sourceKind='manual'] - Filter by source kind. Pass null to disable.
+     * @param {string|null} [opts.usageContext=null] - When set, only KBs whose `usage_contexts`
+     *   array contains this value are returned ('agent' | 'direct_chat' | 'webpage').
      */
-    listKBs: async (tenantId, orgIds = undefined) => {
+    listKBs: async (tenantId, orgIds = undefined, opts = {}) => {
         await initDB();
+
+        const sourceKind = opts.sourceKind === undefined ? 'manual' : opts.sourceKind;
+        const usageContext = opts.usageContext || null;
+
+        // Build optional filter clauses + their bound params. Each branch below
+        // appends these so the marketplace, agent and direct-chat pickers all
+        // narrow the same way.
+        const buildFilters = (startIdx) => {
+            const conds = [];
+            const params = [];
+            let idx = startIdx;
+            if (sourceKind) {
+                conds.push(`kb.source_kind = $${idx++}`);
+                params.push(sourceKind);
+            }
+            if (usageContext) {
+                conds.push(`kb.usage_contexts ? $${idx++}`);
+                params.push(usageContext);
+            }
+            return { sql: conds.length > 0 ? ' AND ' + conds.join(' AND ') : '', params };
+        };
+
+        const baseSelect = `
+            SELECT kb.*,
+                   COALESCE(d.doc_count, 0) AS document_count,
+                   COALESCE(d.total_chunks, 0) AS total_chunks
+            FROM knowledge_bases kb
+            LEFT JOIN (
+                SELECT knowledge_base_id,
+                       COUNT(*) AS doc_count,
+                       SUM(chunk_count) AS total_chunks
+                FROM documents
+                GROUP BY knowledge_base_id
+            ) d ON d.knowledge_base_id = kb.id`;
 
         // Legacy fallback: if orgIds not provided, show only user's own KBs
         if (orgIds === undefined) {
+            const f = buildFilters(2);
             return getAll(
-                `SELECT kb.*, 
-                        COALESCE(d.doc_count, 0) AS document_count,
-                        COALESCE(d.total_chunks, 0) AS total_chunks
-                 FROM knowledge_bases kb
-                 LEFT JOIN (
-                     SELECT knowledge_base_id, 
-                            COUNT(*) AS doc_count,
-                            SUM(chunk_count) AS total_chunks
-                     FROM documents 
-                     GROUP BY knowledge_base_id
-                 ) d ON d.knowledge_base_id = kb.id
-                 WHERE kb.tenant_id = $1
-                 ORDER BY kb.created_at DESC`,
-                [tenantId]
+                `${baseSelect} WHERE kb.tenant_id = $1${f.sql} ORDER BY kb.created_at DESC`,
+                [tenantId, ...f.params]
             );
         }
 
         // Super admin — see all KBs
         if (orgIds === null) {
-            return getAll(
-                `SELECT kb.*, 
-                        COALESCE(d.doc_count, 0) AS document_count,
-                        COALESCE(d.total_chunks, 0) AS total_chunks
-                 FROM knowledge_bases kb
-                 LEFT JOIN (
-                     SELECT knowledge_base_id, 
-                            COUNT(*) AS doc_count,
-                            SUM(chunk_count) AS total_chunks
-                     FROM documents 
-                     GROUP BY knowledge_base_id
-                 ) d ON d.knowledge_base_id = kb.id
-                 ORDER BY kb.created_at DESC`
-            );
+            const f = buildFilters(1);
+            const where = f.sql ? ' WHERE ' + f.sql.replace(/^ AND /, '') : '';
+            return getAll(`${baseSelect}${where} ORDER BY kb.created_at DESC`, f.params);
         }
 
         const orgIdArray = Array.from(orgIds);
 
         if (orgIdArray.length === 0) {
             // No org membership — only personal KBs
+            const f = buildFilters(2);
             return getAll(
-                `SELECT kb.*, 
-                        COALESCE(d.doc_count, 0) AS document_count,
-                        COALESCE(d.total_chunks, 0) AS total_chunks
-                 FROM knowledge_bases kb
-                 LEFT JOIN (
-                     SELECT knowledge_base_id, 
-                            COUNT(*) AS doc_count,
-                            SUM(chunk_count) AS total_chunks
-                     FROM documents 
-                     GROUP BY knowledge_base_id
-                 ) d ON d.knowledge_base_id = kb.id
-                 WHERE kb.tenant_id = $1
-                 ORDER BY kb.created_at DESC`,
-                [tenantId]
+                `${baseSelect} WHERE kb.tenant_id = $1${f.sql} ORDER BY kb.created_at DESC`,
+                [tenantId, ...f.params]
             );
         }
 
         // Org member — personal KBs (any state) + PUBLISHED KBs from user's org(s)
         // Group restriction (shared_groups) is applied in JS by callers via filterByGroupAccess.
+        const f = buildFilters(3);
         return getAll(
-            `SELECT kb.*,
-                    COALESCE(d.doc_count, 0) AS document_count,
-                    COALESCE(d.total_chunks, 0) AS total_chunks
-             FROM knowledge_bases kb
-             LEFT JOIN (
-                 SELECT knowledge_base_id,
-                        COUNT(*) AS doc_count,
-                        SUM(chunk_count) AS total_chunks
-                 FROM documents
-                 GROUP BY knowledge_base_id
-             ) d ON d.knowledge_base_id = kb.id
-             WHERE kb.tenant_id = $1 OR (kb.organization_id = ANY($2) AND kb.is_published = TRUE)
+            `${baseSelect}
+             WHERE (kb.tenant_id = $1 OR (kb.organization_id = ANY($2) AND kb.is_published = TRUE))${f.sql}
              ORDER BY kb.created_at DESC`,
-            [tenantId, orgIdArray]
+            [tenantId, orgIdArray, ...f.params]
         );
     },
 
@@ -271,18 +275,20 @@ const KnowledgeBasesStore = {
         return getOne('SELECT * FROM knowledge_bases WHERE id = $1', [id]);
     },
 
-    updateKB: async (id, { name, description, categoryId, icon }) => {
+    updateKB: async (id, { name, description, categoryId, icon, usageContexts }) => {
         await initDB();
+        const usageJson = Array.isArray(usageContexts) ? JSON.stringify(usageContexts) : null;
         return getOne(
             `UPDATE knowledge_bases
              SET name = COALESCE($2, name),
                  description = COALESCE($3, description),
                  category_id = COALESCE($4, category_id),
                  icon = COALESCE($5, icon),
+                 usage_contexts = COALESCE($6::jsonb, usage_contexts),
                  updated_at = now()
              WHERE id = $1
              RETURNING *`,
-            [id, name, description, categoryId, icon]
+            [id, name, description, categoryId, icon, usageJson]
         );
     },
 

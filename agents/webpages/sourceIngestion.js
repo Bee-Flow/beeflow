@@ -26,7 +26,9 @@ async function ensureWebpageKB(webpageId, userId) {
         const kb = await kbStore.createKB(
             userId,
             `🌐 ${webpage.name}`,
-            `Auto-generated knowledge base for webpage "${webpage.name}"`
+            `Auto-generated knowledge base for webpage "${webpage.name}"`,
+            null,
+            { sourceKind: 'webpage_auto', usageContexts: ['webpage'] }
         );
         kbId = kb.id;
         await webpageStore.updateWebpageMetadata(webpageId, userId, {

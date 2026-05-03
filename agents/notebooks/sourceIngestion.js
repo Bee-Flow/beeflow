@@ -31,7 +31,9 @@ async function ensureNotebookKB(notebookId, userId) {
         const kb = await kbStore.createKB(
             userId,
             `📓 ${notebook.name}`,
-            `Auto-generated knowledge base for notebook "${notebook.name}"`
+            `Auto-generated knowledge base for notebook "${notebook.name}"`,
+            null,
+            { sourceKind: 'notebook_auto', usageContexts: ['webpage'] }
         );
         kbId = kb.id;
         await notebookStore.updateNotebook(notebookId, userId, {

@@ -15,6 +15,29 @@ const { requireAuth, resolveUserOrgIds, requirePermission, hasPermission } = req
 
 const SEARCH_SERVICE_URL = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
 const { getServiceHeaders } = require('../core/serviceAuth');
+
+const VALID_USAGE_CONTEXTS = new Set(['agent', 'direct_chat', 'webpage']);
+
+/** Parse the optional ?context= query into a single valid usage-context value, or null. */
+function parseContextQuery(req) {
+    const v = (req.query.context || '').trim();
+    return VALID_USAGE_CONTEXTS.has(v) ? v : null;
+}
+
+/** Build the listKBs filter options from request query (?context, ?includeAuto). */
+function listFilterFromQuery(req) {
+    return {
+        sourceKind: req.query.includeAuto === '1' ? null : 'manual',
+        usageContext: parseContextQuery(req),
+    };
+}
+
+/** Validate + normalise a usageContexts payload from the client. */
+function sanitizeUsageContexts(value) {
+    if (!Array.isArray(value)) return null;
+    const cleaned = Array.from(new Set(value.filter(v => VALID_USAGE_CONTEXTS.has(v))));
+    return cleaned.length > 0 ? cleaned : null;
+}
 const {
     getAzureIngestParams,
     extractFileContent,
@@ -72,7 +95,7 @@ router.get('/', requireAuth, async (req, res) => {
     try {
         const userId = getUserId(req);
         const orgIds = await resolveUserOrgIds(req);
-        const kbs = await kbStore.listKBs(userId, orgIds);
+        const kbs = await kbStore.listKBs(userId, orgIds, listFilterFromQuery(req));
         const userGroups = await resolveUserGroups(req);
         // Owners always see drafts; org members see only published KBs that pass
         // shared_groups restriction.
@@ -92,7 +115,7 @@ router.get('/published', requireAuth, async (req, res) => {
         const userId = getUserId(req);
         const orgIds = await resolveUserOrgIds(req);
         const userGroups = await resolveUserGroups(req);
-        const kbs = await kbStore.listKBs(userId, orgIds);
+        const kbs = await kbStore.listKBs(userId, orgIds, listFilterFromQuery(req));
         const accessible = kbStore.filterByGroupAccess(kbs, userId, userGroups);
         // Only KBs that are explicitly published (drafts owned by the user are dropped here)
         res.json(accessible.filter(kb => !!kb.is_published));
@@ -147,7 +170,7 @@ router.delete('/categories/:id', requireAuth, requirePermission('manage_knowledg
 router.post('/', requireAuth, requirePermission('manage_knowledge'), async (req, res) => {
     try {
         const userId = getUserId(req);
-        const { name, description, organizationId, categoryId, icon } = req.body;
+        const { name, description, organizationId, categoryId, icon, usageContexts } = req.body;
         if (!name || !name.trim()) {
             return res.status(400).json({ error: 'Name is required' });
         }
@@ -161,12 +184,22 @@ router.post('/', requireAuth, requirePermission('manage_knowledge'), async (req,
             }
         }
 
+        const cleanedContexts = sanitizeUsageContexts(usageContexts);
+
+        // sourceKind is intentionally NOT taken from the request body — anything
+        // created via this route is a manual KB. The webpage/notebook auto-create
+        // paths call kbStore.createKB() directly with sourceKind set.
         const kb = await kbStore.createKB(
             userId,
             name.trim(),
             description || '',
             assignOrgId || null,
-            { categoryId: categoryId || null, icon: icon || null }
+            {
+                categoryId: categoryId || null,
+                icon: icon || null,
+                sourceKind: 'manual',
+                ...(cleanedContexts ? { usageContexts: cleanedContexts } : {}),
+            }
         );
         res.status(201).json(kb);
     } catch (e) {
@@ -258,7 +291,12 @@ router.patch('/:id', requireAuth, requirePermission('manage_knowledge'), async (
         if (!kb) return res.status(404).json({ error: 'KB not found' });
         if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
 
-        const updated = await kbStore.updateKB(kb.id, req.body);
+        const { name, description, categoryId, icon, usageContexts } = req.body || {};
+        const cleanedContexts = sanitizeUsageContexts(usageContexts);
+        const updated = await kbStore.updateKB(kb.id, {
+            name, description, categoryId, icon,
+            ...(cleanedContexts ? { usageContexts: cleanedContexts } : {}),
+        });
         res.json(updated);
     } catch (e) {
         console.error('[KB] Update error:', e.message);
