@@ -234,15 +234,37 @@ async function markCompleted(id, result) {
 
 async function markError(id, error) {
     await initDB();
+    const msg = typeof error === 'string' ? error : error?.message || 'Unknown error';
+    // Tag credential-expired runs distinctly so the UI can render a
+    // "Reconnect <provider>" affordance instead of a generic error chip,
+    // and so resume-on-reauth can find the right rows.
+    const isReauth = msg.startsWith('needs_reauth');
     await run(
         `UPDATE ai_tasks
-         SET last_status = 'error',
-             last_result = $1,
+         SET last_status = $1,
+             last_result = $2,
              last_run_at = NOW(),
              run_count = run_count + 1
-         WHERE id = $2`,
-        [typeof error === 'string' ? error : error.message || 'Unknown error', id]
+         WHERE id = $3`,
+        [isReauth ? 'needs_reauth' : 'error', msg, id]
     );
+}
+
+/**
+ * Re-activate every routine of `userId` that was paused with
+ * last_status='needs_reauth'. Called from the OAuth callback once the user
+ * has reconnected. The runner picks them up on the next minute tick.
+ * Returns the number of resumed routines.
+ */
+async function resumeNeedsReauthForUser(userId) {
+    await initDB();
+    const { rowCount } = await run(
+        `UPDATE ai_tasks
+         SET is_active = TRUE, last_status = 'pending'
+         WHERE user_id = $1 AND is_active = FALSE AND last_status = 'needs_reauth'`,
+        [userId]
+    );
+    return rowCount || 0;
 }
 
 // Map a JS getDay() (0 = Sun … 6 = Sat) to the routine day-of-week tokens used
@@ -313,6 +335,7 @@ module.exports = {
     getTasks,
     getTasksByAgent,
     updateTask,
+    resumeNeedsReauthForUser,
     deleteTask,
     getDueTasks,
     markRunning,

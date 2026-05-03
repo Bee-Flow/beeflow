@@ -31,6 +31,32 @@ async function buildSystemPrompt({ agent, tools, userId, messageMetadata, memory
         systemPrompt = systemPrompt + '\n\n' + memoryContext;
     }
 
+    // ─── Routine coverage addendum (R3) ──────────────────────────
+    // When this turn is being driven by an agent routine, list the topics the
+    // routine has covered in the past so the model can avoid repeating them
+    // unless there's a real update. Only fires when memory is enabled on the
+    // agent — opt-in by design.
+    const routineId = messageMetadata?.routineId;
+    if (routineId && agent?.config?.memoryEnabled === true) {
+        try {
+            const memoryStore = require('../../stores/memoryStore');
+            const covered = await memoryStore.getRoutineCoverage(routineId, { limit: 30 });
+            if (covered && covered.length > 0) {
+                const items = covered.map(c => {
+                    const when = c.last_confirmed_at ? new Date(c.last_confirmed_at).toISOString().slice(0, 10) : 'previously';
+                    const label = c.value || c.summary || c.subject;
+                    return `- ${label} (last covered ${when})`;
+                }).join('\n');
+                systemPrompt += `\n\n[ROUTINE COVERAGE — items already surfaced in past runs of this routine]
+${items}
+
+Skip these unless there is a material update since the date shown. If you do include one, lead with what changed.`;
+            }
+        } catch (err) {
+            console.warn(`[contextBuilder] routine coverage lookup failed: ${err.message}`);
+        }
+    }
+
     // ─── Date/time context ───────────────────────────────────────
     const tz = messageMetadata?.timezone || 'UTC';
     systemPrompt += `\nNow: ${new Date().toLocaleString('sv-SE', { timeZone: tz, timeZoneName: 'short' })}`;

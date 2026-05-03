@@ -19,6 +19,51 @@ const MAX_CONCURRENT = 5;
 const MAX_TOOL_ITERATIONS = 5;
 
 /**
+ * R3: cheap, deterministic topic extraction from a routine result. Looks for
+ * markdown headings (### Topic) and numbered list items (1) Topic — summary)
+ * — the two patterns the wizard's routines tend to emit. Falls back to
+ * top-level headings only when no enumeration is found.
+ *
+ * Returns `[{ subject, title, summary }]`. `subject` is a stable slug used
+ * as the dedupe key across runs.
+ */
+function _slugify(s) {
+    return String(s || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 80);
+}
+function extractCoverageTopics(text) {
+    if (!text || typeof text !== 'string') return [];
+    const out = [];
+    const seen = new Set();
+    const push = (title, summary) => {
+        const cleanTitle = String(title).replace(/\*\*|__|\[|\]\(.*?\)/g, '').trim();
+        if (cleanTitle.length < 4 || cleanTitle.length > 200) return;
+        const subject = _slugify(cleanTitle);
+        if (!subject || seen.has(subject)) return;
+        seen.add(subject);
+        out.push({ subject, title: cleanTitle, summary: summary ? String(summary).trim().slice(0, 280) : null });
+    };
+
+    const lines = text.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i += 1) {
+        const line = lines[i];
+        // Numbered item:  "1) Title — summary"  or  "1. Title: summary"
+        const numbered = line.match(/^\s*\d+[\.\)]\s+(.+?)(?:\s*[—:\-]\s+(.*))?$/);
+        if (numbered) { push(numbered[1], numbered[2] || lines[i + 1]); continue; }
+        // Bold-led bullet:  "**Title** — summary"
+        const boldBullet = line.match(/^\s*[-*]\s+\*\*(.+?)\*\*\s*[—:\-]\s+(.+)$/);
+        if (boldBullet) { push(boldBullet[1], boldBullet[2]); continue; }
+        // Markdown heading at level 3+ (level 1/2 tend to be section names like "Beleid & defensie")
+        const heading = line.match(/^\s*#{3,6}\s+(.+?)\s*$/);
+        if (heading) { push(heading[1], lines[i + 1]); continue; }
+    }
+    return out;
+}
+
+/**
  * Build a minimal system prompt for task execution.
  */
 function buildTaskSystemPrompt(task, toolHint) {
@@ -294,20 +339,50 @@ async function executeAgentRoutine(task, { manual = false } = {}) {
         if (!agent) throw new Error(`Linked agent ${task.agentId} no longer exists`);
         if (agent.owner_id !== task.userId) throw new Error('Routine agent owner mismatch — refusing to run');
 
-        // Reuse the user's last active session for OAuth/integration tokens.
-        // Without it the agent's tools would still load but couldn't talk to
-        // Gmail/Calendar/etc on behalf of the user.
-        const session = await resolveUserSession(task.userId);
-        const userAuth = {
-            accessToken: session?.accessToken || null,
-            nextcloudUrl: null,
-            appPasswordUsername: session?.appPassword?.username || null,
-            appPassword: session?.appPassword?.password || null,
-            encryptionKey: session?.encryptionKey || null,
-            userId: task.userId,
-            session,
-            userOrgId: session?.user?.organizationId || agent.organization_id || null,
-        };
+        // Resolve OAuth credentials for this routine. Default path: long-lived
+        // encrypted vault (`routine_credentials`) with auto-refresh, so the
+        // routine works even when the user is offline. The legacy
+        // session-borrow path is kept behind ROUTINE_AUTH_LEGACY=1 for one
+        // release in case of regressions.
+        const useLegacy = process.env.ROUTINE_AUTH_LEGACY === '1';
+        let userAuth;
+        if (useLegacy) {
+            const session = await resolveUserSession(task.userId);
+            userAuth = {
+                accessToken: session?.accessToken || null,
+                nextcloudUrl: null,
+                appPasswordUsername: session?.appPassword?.username || null,
+                appPassword: session?.appPassword?.password || null,
+                encryptionKey: session?.encryptionKey || null,
+                userId: task.userId,
+                session,
+                userOrgId: session?.user?.organizationId || agent.organization_id || null,
+            };
+        } else {
+            const routineAuth = require('./routineAuth');
+            const enabledIntegrations = Array.isArray(agent?.config?.enabledIntegrations)
+                ? agent.config.enabledIntegrations
+                : [];
+            const built = await routineAuth.buildUserAuth(task.userId, { enabledIntegrations });
+            if (!built) {
+                // buildUserAuth already paused dependent routines + emitted a
+                // reauth notification. Surface the error on this run so the
+                // task row reflects the failure.
+                throw new Error('needs_reauth: required OAuth provider expired or revoked');
+            }
+            userAuth = {
+                accessToken: built.accessToken,
+                refreshToken: built.refreshToken,
+                oauthProvider: built.oauthProvider,
+                routineProviders: built.routineProviders,
+                nextcloudUrl: null,
+                appPasswordUsername: null,
+                appPassword: null,
+                encryptionKey: null,
+                userId: task.userId,
+                userOrgId: agent.organization_id || null,
+            };
+        }
 
         const { chatWithAgentStream } = require('./agentRuntime');
 
@@ -323,6 +398,9 @@ async function executeAgentRoutine(task, { manual = false } = {}) {
             modelTier: modelTier || undefined,
             userOrgId: userAuth.userOrgId,
             orgId: userAuth.userOrgId,
+            // R3: contextBuilder reads this to inject the "previously covered"
+            // addendum from past runs of the SAME routine.
+            routineId: task.id,
             // Routines are unattended — never block on streaming back to a UI.
             ephemeral: false,
         };
@@ -355,6 +433,29 @@ async function executeAgentRoutine(task, { manual = false } = {}) {
         }
 
         await aiTaskStore.markCompleted(task.id, truncated);
+
+        // R3: extract topics this run surfaced and write them to the routine's
+        // coverage memory bucket so the next run knows not to repeat them.
+        // Only fires when the agent has memory enabled — opt-in by design.
+        if (agent?.config?.memoryEnabled === true) {
+            try {
+                const topics = extractCoverageTopics(truncated);
+                if (topics.length > 0) {
+                    const memoryStore = require('../stores/memoryStore');
+                    await Promise.all(topics.slice(0, 30).map(t => memoryStore.upsertRoutineCoverage({
+                        userId: task.userId,
+                        agentId: task.agentId,
+                        routineId: task.id,
+                        subject: t.subject,
+                        title: t.title,
+                        summary: t.summary,
+                    })));
+                    console.log(`[AITaskRunner] R3: stored ${Math.min(topics.length, 30)} coverage memorie(s) for routine ${task.id}`);
+                }
+            } catch (err) {
+                console.warn(`[AITaskRunner] R3 coverage extraction failed: ${err.message}`);
+            }
+        }
 
         // Notification with deep link to the conversation so the user can open
         // it and continue chatting.
@@ -425,6 +526,20 @@ async function processDueTasks() {
 const _interval = setInterval(processDueTasks, RUNNER_INTERVAL_MS);
 // First run after 10s (let stores initialize)
 setTimeout(processDueTasks, 10_000);
+
+// R3: prune expired routine_coverage memories once per hour. Keeps the
+// "previously covered" addendum from suppressing topics forever (default TTL
+// is 30 days inside memoryStore).
+const _coveragePruneInterval = setInterval(async () => {
+    try {
+        const memoryStore = require('../stores/memoryStore');
+        const expired = await memoryStore.pruneExpiredCoverage();
+        if (expired > 0) console.log(`[AITaskRunner] R3: pruned ${expired} expired coverage memorie(s)`);
+    } catch (err) {
+        console.warn(`[AITaskRunner] R3 prune failed: ${err.message}`);
+    }
+}, 60 * 60_000);
+if (_coveragePruneInterval.unref) _coveragePruneInterval.unref();
 
 console.log('[AITaskRunner] Background runner started (60s interval)');
 

@@ -45,6 +45,17 @@ async function _vaultUpsertSafe({ userId, orgId, provider, tokenData }) {
             expiresAt,
             scope: tokenData.scope || null,
         });
+        // Re-activate any routines this user previously had paused for
+        // needs_reauth. The runner picks them up on the next 60s tick.
+        try {
+            const aiTaskStore = require('../stores/aiTaskStore');
+            const resumed = await aiTaskStore.resumeNeedsReauthForUser(userId);
+            if (resumed > 0) {
+                console.log(`[OAuth/${provider}] resumed ${resumed} routine(s) for user ${userId} after reconnect`);
+            }
+        } catch (resumeErr) {
+            console.warn(`[OAuth/${provider}] resume-routines failed for ${userId}: ${resumeErr.message}`);
+        }
     } catch (err) {
         console.warn(`[OAuth/${provider}] routine vault upsert failed for user ${userId}: ${err.message}`);
     }
@@ -231,15 +242,19 @@ router.get('/callback', async (req, res) => {
         }
         req.session.user = user;
         req.session.isAuthenticated = true;
-
-        // Long-lived encrypted vault copy for unattended routines.
-        const _vaultOrgIdNc = freshUserLegacy?.organizationId || null;
-        if (_vaultOrgIdNc && user?.id) {
-            await _vaultUpsertSafe({ userId: user.id, orgId: _vaultOrgIdNc, provider: 'nextcloud', tokenData });
-        }
         // Check stored user role — SSO users can also be admins
         const freshUserLegacy = await userStore.getUser(user?.id || 'oauth-user');
         req.session.isAdmin = freshUserLegacy?.role === 'admin';
+
+        // Long-lived encrypted vault copy for unattended routines.
+        if (freshUserLegacy?.organizationId && user?.id) {
+            await _vaultUpsertSafe({
+                userId: user.id,
+                orgId: freshUserLegacy.organizationId,
+                provider: 'nextcloud',
+                tokenData,
+            });
+        }
         // Handle SSO encryption with backward compatibility
         const encryptionEnabled = await isEncryptionEnabledForUser(user?.id || 'oauth-user');
         const ssoResult = await getOrCreateSSOUserDEKCompat(user?.id || 'oauth-user', encryptionEnabled);

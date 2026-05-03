@@ -165,6 +165,35 @@ async function _doInit() {
         FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
     )`);
     try { await exec(`CREATE INDEX IF NOT EXISTS idx_agent_favorites_user ON agent_favorites(user_id)`); } catch (e) { /* already exists */ }
+
+    // ── R4 backfill: legacy `enabledIntegrations: null` → explicit catalog ──
+    // Wizard-created agents historically stored `null`, which the runtime
+    // interpreted as "everything enabled". The new default is OFF — empty
+    // arrays mean nothing. Convert legacy null/missing rows to an explicit
+    // list mirroring every named integration in the wizard catalog so
+    // existing agents keep the access they had. Per-credential gating in
+    // integrationTools.js still filters tools the user can't actually call.
+    // Idempotent: only touches rows whose key is null or missing.
+    try {
+        const LEGACY_FULL = JSON.stringify([
+            'gmail','google-calendar','google-drive','google-sheets','google-docs','google-slides',
+            'google-contacts','google-keep','google-groups','outlook','ms-calendar','onedrive',
+            'ms-contacts','fireflies','youtrack','gamma','linkedin','n8n','agent-search','image-gen',
+        ]);
+        await exec(`
+            UPDATE agents
+            SET config = jsonb_set(
+                COALESCE(config, '{}'::jsonb),
+                '{enabledIntegrations}',
+                '${LEGACY_FULL}'::jsonb,
+                true
+            )
+            WHERE
+                config IS NULL
+                OR NOT (config ? 'enabledIntegrations')
+                OR config -> 'enabledIntegrations' = 'null'::jsonb
+        `);
+    } catch (e) { console.warn('[agentStore] R4 backfill skipped:', e.message); }
 }
 
 module.exports = { initDB };

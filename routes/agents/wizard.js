@@ -146,7 +146,7 @@ Rules:
 - Write all user-facing text (name, description, capabilities, skills.name, skills.description, skills.instructions, systemPrompt) in ${langName}. If the user's prompt is clearly in another language, prefer that language.
 - Keep "name" under 40 characters.
 - Capabilities are short user-visible bullets, not technical jargon.
-- enabledIntegrations: include only the integrations this agent will actually use. Empty array means "no integrations needed".
+- enabledIntegrations: APPS ARE OFF BY DEFAULT. Add an id ONLY when the agent's stated job clearly requires it (e.g. include "gmail" only if the agent must read or send email). Do not enable apps speculatively. If unsure, leave the array empty — the user can flip apps on later in the editor.
 - skills: propose 0-5 skills. Reuse existing ones by id when there's a clear match; otherwise propose new skills with id=null and meaningful instructions.
 - systemPrompt must be self-contained: tone, scope, what to do, what to avoid.
 - routine: leave null UNLESS the user is explicitly asking to SCHEDULE a recurring task ("every morning", "each Monday", "weekly", "every 2 hours", "monthly report"). When set, write title/prompt in ${langName}, and pick the cadence and time that match the user's request. Do NOT invent a routine for vague capability requests like "summarize emails" — only when there's a clear time signal.
@@ -370,9 +370,10 @@ router.post('/wizard/commit', requirePermission('manage_agents'), wizardLimiter,
         const requested = Array.isArray(plan.enabledIntegrations)
             ? plan.enabledIntegrations.filter(id => availableIds.has(id))
             : [];
-        // null = "all available enabled" (matches AgentDesigner default).
-        // If the AI explicitly picked a subset, store that subset.
-        const enabledIntegrations = requested.length > 0 ? requested : null;
+        // Apps are OFF BY DEFAULT — store the AI's literal pick (may be empty).
+        // Legacy semantic of `null = "all enabled"` is no longer produced here;
+        // pre-existing rows are converted by the backfill migration.
+        const enabledIntegrations = requested;
 
         // ── Auto-create knowledge base ─────────────────────────────────
         let knowledge_base_ids = [];
