@@ -360,13 +360,12 @@ async function executeAgentRoutine(task, { manual = false } = {}) {
         // it and continue chatting.
         try {
             const notificationStore = require('../stores/notificationStore');
-            const preview = truncated.length > 280 ? truncated.substring(0, 280) + '…' : truncated;
             await notificationStore.createNotification({
                 userId: task.userId,
                 taskId: task.id,
                 category: 'ai_task',
                 title: `🤖 ${agent.name || 'Agent'}: ${task.title}`,
-                message: preview,
+                message: truncated,
             });
         } catch (_) { /* non-fatal */ }
 
