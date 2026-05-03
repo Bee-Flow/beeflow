@@ -30,7 +30,7 @@ const iconStore = require('../stores/iconStore');
 const userStore = require('../stores/userStore');
 const configStore = require('../stores/configStore');
 const { googleAdapter } = require('../core/providers');
-const { ICON_CATEGORIES, ALL_ICON_KEYS } = require('../core/iconCatalog');
+const { EMOJI_CATEGORIES, ALL_EMOJI_IDS, EMOJI_BY_ID } = require('../core/emojiCatalog');
 
 // ── Storage ─────────────────────────────────────────────────────
 
@@ -60,7 +60,7 @@ router.use(requireAuth);
 
 router.get('/catalog', (req, res) => {
     res.set('Cache-Control', 'private, max-age=3600');
-    res.json({ categories: ICON_CATEGORIES, totalKeys: ALL_ICON_KEYS.length });
+    res.json({ categories: EMOJI_CATEGORIES, totalKeys: ALL_EMOJI_IDS.length });
 });
 
 // ── List + active pack ──────────────────────────────────────────
@@ -73,8 +73,8 @@ router.get('/', async (req, res) => {
         res.json({
             packs,
             activeIconPackId: user ? user.activeIconPackId : null,
-            categories: ICON_CATEGORIES,
-            totalKeys: ALL_ICON_KEYS.length,
+            categories: EMOJI_CATEGORIES,
+            totalKeys: ALL_EMOJI_IDS.length,
         });
     } catch (e) {
         console.error('[Icons API]', e);
@@ -242,10 +242,10 @@ router.post('/:id/bulk-generate', async (req, res) => {
         }
 
         const { style, model, overwrite = false, only } = req.body || {};
-        const targetKeys = (Array.isArray(only) && only.length ? only : ALL_ICON_KEYS)
-            .filter(k => overwrite || !(pack.icons || {})[k]);
+        const targetIds = (Array.isArray(only) && only.length ? only : ALL_EMOJI_IDS)
+            .filter(id => overwrite || !(pack.icons || {})[id]);
 
-        if (targetKeys.length === 0) {
+        if (targetIds.length === 0) {
             return res.json({ success: true, generated: 0, total: 0, message: 'No missing icons to generate.' });
         }
 
@@ -255,10 +255,12 @@ router.post('/:id/bulk-generate', async (req, res) => {
 
         // Cap concurrency — Gemini image gen is rate-limited.
         const CONCURRENCY = 3;
-        for (let i = 0; i < targetKeys.length; i += CONCURRENCY) {
-            const batch = targetKeys.slice(i, i + CONCURRENCY);
-            const results = await Promise.allSettled(batch.map(async (key) => {
-                const subject = `An icon representing "${key}"`;
+        for (let i = 0; i < targetIds.length; i += CONCURRENCY) {
+            const batch = targetIds.slice(i, i + CONCURRENCY);
+            const results = await Promise.allSettled(batch.map(async (id) => {
+                const entry = EMOJI_BY_ID[id];
+                const label = entry?.label || id;
+                const subject = `An icon representing "${label}"`;
                 const fullPrompt = buildIconPrompt(subject, { style });
                 const r = await googleAdapter.generateImage(apiKey, fullPrompt, {
                     aspectRatio: '1:1',
@@ -266,12 +268,12 @@ router.post('/:id/bulk-generate', async (req, res) => {
                 });
                 if (!r?.imageBase64) throw new Error('no image');
                 const url = await saveBase64Png(r.imageBase64, r.mimeType);
-                return { key, url };
+                return { id, url };
             }));
 
             for (const r of results) {
                 if (r.status === 'fulfilled') {
-                    next[r.value.key] = { type: 'image', value: r.value.url };
+                    next[r.value.id] = { type: 'image', value: r.value.url };
                     generated++;
                 } else {
                     errors++;
@@ -285,7 +287,7 @@ router.post('/:id/bulk-generate', async (req, res) => {
         res.json({
             success: true,
             generated,
-            total: targetKeys.length,
+            total: targetIds.length,
             errors,
             message: errors > 0
                 ? `Generated ${generated} icons (${errors} failed).`
