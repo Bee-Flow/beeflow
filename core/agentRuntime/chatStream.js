@@ -467,7 +467,15 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     }
 
     const isStrictKnowledge = agent.config?.strictKnowledge === true;
-    let systemPrompt = await buildSystemPrompt({ agent, tools, userId, messageMetadata, memoryContext, isStrictKnowledge });
+    // Effective tier for this request — direct override from the message wins,
+    // otherwise the agent's configured `tier:<name>` (or no tier at all). We
+    // pass this into buildSystemPrompt so attached skills can be treated as
+    // dynamic-on-demand when the user is on the Flow tier (key 'standard'),
+    // mirroring how direct chat handles its session skills.
+    const effectiveTier = (messageMetadata?.modelTier && String(messageMetadata.modelTier))
+        || (typeof agent.model === 'string' && agent.model.startsWith('tier:') ? agent.model.slice(5) : null);
+    const isStandardTier = effectiveTier === 'standard';
+    let systemPrompt = await buildSystemPrompt({ agent, tools, userId, messageMetadata, memoryContext, isStrictKnowledge, forceDynamicSkills: isStandardTier });
 
     // ============ GUARDRAILS (before KB search — block early) ============
     const guardrailsResult = await runInputGuardrails({ agent, messages, userMessage, globalConfig, onEvent, userId, conversationId: conversation?.id, source: 'agent_stream', model: modelToUse });

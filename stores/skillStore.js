@@ -52,6 +52,7 @@ async function initDB() {
 
         ALTER TABLE skills ADD COLUMN IF NOT EXISTS dynamic_activation BOOLEAN DEFAULT false;
         ALTER TABLE skills ADD COLUMN IF NOT EXISTS shared_groups TEXT DEFAULT '[]';
+        ALTER TABLE skills ADD COLUMN IF NOT EXISTS automation_id TEXT DEFAULT NULL;
 
         CREATE INDEX IF NOT EXISTS idx_skills_org ON skills(org_id);
         CREATE INDEX IF NOT EXISTS idx_skills_user ON skills(user_id);
@@ -69,22 +70,24 @@ initDB().catch(err => console.error('[SkillStore] Init error:', err.message));
 /**
  * Create a new skill.
  */
-async function createSkill({ orgId, userId, name, description, instructions, workflow, rules, examples, icon, isShared, dynamicActivation, sharedGroups }) {
+async function createSkill({ orgId, userId, name, description, instructions, workflow, rules, examples, icon, isShared, dynamicActivation, sharedGroups, automationId }) {
     await initDB();
     const id = crypto.randomUUID();
     const groupsJson = JSON.stringify(Array.isArray(sharedGroups) ? sharedGroups : []);
+    const linkedAutomationId = automationId || null;
     await run(
-        `INSERT INTO skills (id, org_id, user_id, name, description, instructions, workflow, rules, examples, icon, is_shared, dynamic_activation, shared_groups)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-        [id, orgId, userId, name, description || '', instructions || '', workflow || '', rules || '', examples || '', icon || '⚡', isShared === true, dynamicActivation === true, groupsJson]
+        `INSERT INTO skills (id, org_id, user_id, name, description, instructions, workflow, rules, examples, icon, is_shared, dynamic_activation, shared_groups, automation_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+        [id, orgId, userId, name, description || '', instructions || '', workflow || '', rules || '', examples || '', icon || '⚡', isShared === true, dynamicActivation === true, groupsJson, linkedAutomationId]
     );
-    console.log(`[SkillStore] Created skill "${name}" for org ${orgId}`);
+    console.log(`[SkillStore] Created skill "${name}" for org ${orgId}${linkedAutomationId ? ` (linked automation ${linkedAutomationId})` : ''}`);
     _notifySkillSync(orgId, id);
     return {
         id, orgId, userId, name, description: description || '', instructions: instructions || '',
         workflow: workflow || '', rules: rules || '', examples: examples || '',
         icon: icon || '⚡', isShared: isShared === true, dynamicActivation: dynamicActivation === true,
         sharedGroups: Array.isArray(sharedGroups) ? sharedGroups : [],
+        automationId: linkedAutomationId,
         createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
     };
 }
@@ -198,6 +201,10 @@ async function updateSkill(id, userId, updates) {
         setClauses.push(`shared_groups = $${idx++}`);
         params.push(JSON.stringify(Array.isArray(updates.sharedGroups) ? updates.sharedGroups : []));
     }
+    if (updates.automationId !== undefined) {
+        setClauses.push(`automation_id = $${idx++}`);
+        params.push(updates.automationId || null);
+    }
 
     if (setClauses.length === 0) return false;
     setClauses.push('updated_at = NOW()');
@@ -248,6 +255,7 @@ function mapRow(r) {
         isShared: r.is_shared === true,
         dynamicActivation: r.dynamic_activation === true,
         sharedGroups: (() => { try { return JSON.parse(r.shared_groups || '[]'); } catch (_) { return []; } })(),
+        automationId: r.automation_id || null,
         createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
         updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : null,
     };

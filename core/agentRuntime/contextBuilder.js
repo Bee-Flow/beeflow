@@ -2,7 +2,7 @@ const { processSystemPrompt } = require('../promptUtils');
 const { buildToolHint } = require('../integrationTools');
 const { buildSkillInjection } = require('../skillInjection');
 
-async function buildSystemPrompt({ agent, tools, userId, messageMetadata, memoryContext, isStrictKnowledge }) {
+async function buildSystemPrompt({ agent, tools, userId, messageMetadata, memoryContext, isStrictKnowledge, forceDynamicSkills = false }) {
     const defaultPrompt = tools.length > 0
         ? `You are a helpful AI assistant. You have access to the following tools to help accomplish tasks. Use them when appropriate.`
         : `You are a helpful AI assistant. Answer the user's questions to the best of your ability.`;
@@ -65,6 +65,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         attachedSkillIds,
         orgId: messageMetadata?.orgId,
         userId,
+        forceDynamicSkills,
     });
     if (skillInjection.systemPromptAddendum) {
         systemPrompt += skillInjection.systemPromptAddendum;

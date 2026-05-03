@@ -31,7 +31,7 @@ const ACTIVATE_SKILL_TOOL_NAME = 'activate_skill';
  *   staticCount: number,
  * }>}
  */
-async function buildSkillInjection({ sessionSkillIds = [], attachedSkillIds = [], orgId, userId }) {
+async function buildSkillInjection({ sessionSkillIds = [], attachedSkillIds = [], orgId, userId, forceDynamicSkills = false }) {
     if (!orgId) return { systemPromptAddendum: '', tools: [], dynamicSkillIds: [], staticCount: 0 };
 
     // Merge: attached first (so they survive the cap), then session-only
@@ -54,8 +54,13 @@ async function buildSkillInjection({ sessionSkillIds = [], attachedSkillIds = []
     }
     if (!skills || skills.length === 0) return { systemPromptAddendum: '', tools: [], dynamicSkillIds: [], staticCount: 0 };
 
-    const staticSkills = skills.filter(s => !s.dynamicActivation);
-    const dynamicSkills = skills.filter(s => s.dynamicActivation);
+    // Flow tier (forceDynamicSkills) treats every skill as dynamic so the
+    // model lazy-loads bodies via activate_skill instead of paying the static
+    // injection cost on every turn — matches how session skills work.
+    // Skills linked to an automation are also forced dynamic regardless of
+    // their per-row flag, since their "body" is the automation run output.
+    const staticSkills = forceDynamicSkills ? [] : skills.filter(s => !s.dynamicActivation && !s.automationId);
+    const dynamicSkills = forceDynamicSkills ? skills : skills.filter(s => s.dynamicActivation || s.automationId);
 
     let addendum = '';
 
@@ -74,7 +79,10 @@ async function buildSkillInjection({ sessionSkillIds = [], attachedSkillIds = []
     const tools = [];
     if (dynamicSkills.length > 0) {
         const manifest = dynamicSkills
-            .map(s => `- ${s.id} · ${s.name} — ${s.description || '(no description)'}`)
+            .map(s => {
+                const flowTag = s.automationId ? ' [runs an automation]' : '';
+                return `- ${s.id} · ${s.name}${flowTag} — ${s.description || '(no description)'}`;
+            })
             .join('\n');
         addendum += `\n\n[AVAILABLE SKILLS — ON DEMAND]\nThese skills are available but not yet loaded. Their full instructions cost tokens, so only load what you need.\nWhen a user request matches one or more of these skills, call the \`${ACTIVATE_SKILL_TOOL_NAME}\` tool with the matching skill id(s) BEFORE replying. Do NOT call it speculatively. Once loaded within a conversation, the full instructions stay in context — don't call the tool again for the same skill.\n${manifest}`;
 
@@ -126,7 +134,51 @@ async function executeActivateSkill({ args, orgId, userId }) {
         return `None of the requested skill ids were found or accessible: ${ids.join(', ')}`;
     }
 
-    const blocks = skills.map(s => {
+    // Lazily required to avoid pulling automation runtime into modules that
+    // don't need it. Falls back gracefully if the modules aren't available.
+    let automationStore = null;
+    let automationRunner = null;
+    try {
+        automationStore = require('../stores/automationStore');
+        automationRunner = require('./automationRunner');
+    } catch (_) { /* automation runtime not available — skill→automation links will be skipped */ }
+
+    const blocks = await Promise.all(skills.map(async (s) => {
+        // Linked automation: dispatch the flow and return its output instead of
+        // injecting the skill's text body. The text fields (instructions, etc.)
+        // become irrelevant — the automation IS the implementation.
+        if (s.automationId && automationStore && automationRunner) {
+            try {
+                const automation = await automationStore.getAutomation(s.automationId);
+                if (!automation) {
+                    return `### SKILL — "${s.name}" (id: ${s.id})\n_Linked automation ${s.automationId} not found._`;
+                }
+                const run = await automationRunner.executeAutomation(automation, {
+                    triggerKind: 'manual',
+                    triggerPayload: { invokedBy: 'skill', skillId: s.id, args: args || {} },
+                    mode: 'live',
+                });
+                const status = run?.status || 'unknown';
+                const summary = run?.summary || '';
+                let lastOutput = null;
+                try {
+                    const steps = run?.id ? await automationStore.getRunSteps(run.id) : [];
+                    if (Array.isArray(steps) && steps.length > 0) lastOutput = steps[steps.length - 1].output;
+                } catch (_) { /* non-fatal */ }
+                let body = `### SKILL — "${s.name}" (id: ${s.id})\nThis skill ran the linked automation "${automation.title || automation.id}".\nStatus: ${status}`;
+                if (summary) body += `\nSummary: ${summary}`;
+                if (lastOutput !== undefined && lastOutput !== null) {
+                    const rendered = typeof lastOutput === 'string'
+                        ? lastOutput
+                        : JSON.stringify(lastOutput, null, 2);
+                    body += `\n\nResult:\n${rendered.length > 4000 ? rendered.slice(0, 4000) + '\n…(truncated)' : rendered}`;
+                }
+                return body;
+            } catch (err) {
+                return `### SKILL — "${s.name}" (id: ${s.id})\n_Linked automation failed: ${err.message}_`;
+            }
+        }
+        // Plain text-instructions skill — original behaviour.
         let b = `### SKILL — "${s.name}" (id: ${s.id})`;
         if (s.description)  b += `\n${s.description}`;
         if (s.instructions) b += `\n\nInstructions:\n${s.instructions}`;
@@ -134,14 +186,15 @@ async function executeActivateSkill({ args, orgId, userId }) {
         if (s.rules)        b += `\n\nRules:\n${s.rules}`;
         if (s.examples)     b += `\n\nExamples:\n${s.examples}`;
         return b;
-    }).join('\n\n---\n\n');
+    }));
 
+    const joined = blocks.join('\n\n---\n\n');
     const missing = ids.filter(id => !skills.some(s => s.id === id));
     const missingNote = missing.length > 0
         ? `\n\n(Note: ${missing.length} id(s) not found or not accessible: ${missing.join(', ')})`
         : '';
 
-    return `Loaded ${skills.length} skill(s). Follow their guidance from this point on — you do NOT need to call activate_skill again for these in this conversation.\n\n${blocks}${missingNote}`;
+    return `Loaded ${skills.length} skill(s). Follow their guidance from this point on — you do NOT need to call activate_skill again for these in this conversation.\n\n${joined}${missingNote}`;
 }
 
 module.exports = {
