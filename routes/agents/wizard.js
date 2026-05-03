@@ -214,9 +214,26 @@ async function generatePlan({ userPrompt, priorPlan, refinement, modelTier, loca
 
     const messages = [{ role: 'system', content: planSystemPrompt(locale, availableIntegrations, existingSkills) }];
     if (priorPlan) {
-        messages.push({ role: 'user', content: userPrompt || '' });
-        messages.push({ role: 'assistant', content: JSON.stringify(priorPlan) });
-        messages.push({ role: 'user', content: `Update the plan to address this feedback. Return the full updated JSON only.\n\nFeedback: ${refinement}` });
+        // When refining a wizard-created agent we have the original prompt and
+        // can prime the model with the original-request → prior-plan turn.
+        // When refining an EXISTING agent (BuilderSplit flow), userPrompt is
+        // empty — sending a `{role:'user', content:''}` makes Anthropic 400 with
+        // "user messages must have non-empty content". Embed the prior plan in
+        // the user turn instead so there's exactly one non-empty user message.
+        const trimmedPrompt = (userPrompt || '').trim();
+        if (trimmedPrompt) {
+            messages.push({ role: 'user', content: trimmedPrompt });
+            messages.push({ role: 'assistant', content: JSON.stringify(priorPlan) });
+            messages.push({ role: 'user', content: `Update the plan to address this feedback. Return the full updated JSON only.\n\nFeedback: ${refinement}` });
+        } else {
+            messages.push({
+                role: 'user',
+                content:
+                    `Here is the current agent configuration as JSON:\n\n` +
+                    `${JSON.stringify(priorPlan)}\n\n` +
+                    `Update it to address this feedback. Return the full updated JSON only.\n\nFeedback: ${refinement}`,
+            });
+        }
     } else {
         messages.push({ role: 'user', content: `Build an agent for this request:\n\n${userPrompt}` });
     }
@@ -396,7 +413,63 @@ router.post('/wizard/commit', requirePermission('manage_agents'), async (req, re
             null
         );
 
-        res.json({ agent, createdSkills });
+        // ── Optional: AI proposed a routine for this new agent ─────────
+        // The wizard plan schema lets the model return an OPTIONAL `routine`
+        // block. When present and the user has the `agent_routines` beta we
+        // create the AI task atomically with agent creation so the user
+        // doesn't need a second round-trip.
+        let createdRoutine = null;
+        if (agent?.id && plan.routine && typeof plan.routine === 'object') {
+            try {
+                const { userHasBetaFeature } = require('../../core/betaFeatures');
+                const allowed = await userHasBetaFeature(userId, 'agent_routines', req.session).catch(() => false);
+                if (allowed) {
+                    const aiTaskStore = require('../../stores/aiTaskStore');
+                    const r = plan.routine;
+                    // Compute first nextRunAt to match the cadence (mirrors the
+                    // logic in BuilderSplit's RoutineModal so behavior is identical
+                    // whether the routine was created here or via the modal).
+                    const now = new Date();
+                    let nextRunAt;
+                    if (r.repeatInterval === 'hourly') {
+                        const next = new Date(now);
+                        next.setHours(next.getHours() + 1);
+                        next.setMinutes(0); next.setSeconds(0); next.setMilliseconds(0);
+                        nextRunAt = next.toISOString();
+                    } else {
+                        const [hh, mm] = (r.timeOfDay || '08:00').split(':').map(n => parseInt(n, 10) || 0);
+                        const next = new Date(now);
+                        next.setHours(hh, mm, 0, 0);
+                        if (next <= now) next.setDate(next.getDate() + 1);
+                        if (Array.isArray(r.daysOfWeek) && r.daysOfWeek.length > 0) {
+                            const tokens = ['sun','mon','tue','wed','thu','fri','sat'];
+                            const allowedDays = new Set(r.daysOfWeek);
+                            for (let i = 0; i < 7; i += 1) {
+                                if (allowedDays.has(tokens[next.getDay()])) break;
+                                next.setDate(next.getDate() + 1);
+                            }
+                        }
+                        nextRunAt = next.toISOString();
+                    }
+                    createdRoutine = await aiTaskStore.createTask({
+                        userId,
+                        agentId: agent.id,
+                        title: r.title,
+                        prompt: r.prompt,
+                        nextRunAt,
+                        repeatInterval: r.repeatInterval,
+                        modelTier: 'auto',
+                        timezone: r.timezone || 'UTC',
+                        daysOfWeek: r.daysOfWeek,
+                        timeOfDay: r.timeOfDay,
+                    });
+                }
+            } catch (routineErr) {
+                console.warn('Wizard: routine auto-create failed (non-fatal):', routineErr.message);
+            }
+        }
+
+        res.json({ agent, createdSkills, routine: createdRoutine });
     } catch (err) {
         console.error('Agent wizard commit failed:', err);
         res.status(500).json({ error: err.message });
