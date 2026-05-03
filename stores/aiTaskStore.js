@@ -38,6 +38,12 @@ async function initDB() {
 
         CREATE INDEX IF NOT EXISTS idx_ai_tasks_user ON ai_tasks(user_id);
         CREATE INDEX IF NOT EXISTS idx_ai_tasks_due ON ai_tasks(next_run_at, is_active);
+
+        ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS agent_id TEXT DEFAULT NULL;
+        ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS conversation_id TEXT DEFAULT NULL;
+        ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS days_of_week TEXT DEFAULT NULL;
+        ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS time_of_day TEXT DEFAULT NULL;
+        CREATE INDEX IF NOT EXISTS idx_ai_tasks_agent ON ai_tasks(agent_id);
     `);
 
     // Migrate existing tasks with old default (2000) to new default (50000)
@@ -73,6 +79,11 @@ function rowToTask(r) {
         runCount: r.run_count,
         timezone: r.timezone,
         createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+        // Routine extensions — agent-scoped scheduled tasks (beta).
+        agentId: r.agent_id || null,
+        conversationId: r.conversation_id || null,
+        daysOfWeek: r.days_of_week ? safeParseJSON(r.days_of_week, null) : null,
+        timeOfDay: r.time_of_day || null,
     };
 }
 
@@ -83,12 +94,13 @@ function safeParseJSON(str, fallback = []) {
 
 // ── CRUD ─────────────────────────────────────────────────
 
-async function createTask({ userId, title, prompt, repeatInterval, nextRunAt, modelTier, timezone, toolsEnabled }) {
+async function createTask({ userId, title, prompt, repeatInterval, nextRunAt, modelTier, timezone, toolsEnabled, agentId, daysOfWeek, timeOfDay }) {
     await initDB();
     const id = crypto.randomUUID();
+    const daysJson = Array.isArray(daysOfWeek) && daysOfWeek.length > 0 ? JSON.stringify(daysOfWeek) : null;
     await run(
-        `INSERT INTO ai_tasks (id, user_id, title, prompt, repeat_interval, next_run_at, model_tier, timezone, tools_enabled)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        `INSERT INTO ai_tasks (id, user_id, title, prompt, repeat_interval, next_run_at, model_tier, timezone, tools_enabled, agent_id, days_of_week, time_of_day)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
         [
             id, userId, title, prompt,
             repeatInterval || null,
@@ -96,9 +108,12 @@ async function createTask({ userId, title, prompt, repeatInterval, nextRunAt, mo
             modelTier || 'fast',
             timezone || 'Europe/Amsterdam',
             JSON.stringify(toolsEnabled || ['agent_search']),
+            agentId || null,
+            daysJson,
+            timeOfDay || null,
         ]
     );
-    console.log(`[AITaskStore] Created task "${title}" for user ${userId}, next run: ${nextRunAt}`);
+    console.log(`[AITaskStore] Created ${agentId ? 'routine' : 'task'} "${title}" for user ${userId}${agentId ? ` (agent ${agentId})` : ''}, next run: ${nextRunAt}`);
     return rowToTask({
         id, user_id: userId, title, prompt,
         repeat_interval: repeatInterval,
@@ -106,9 +121,13 @@ async function createTask({ userId, title, prompt, repeatInterval, nextRunAt, mo
         last_run_at: null, last_result: null, last_status: 'pending',
         is_active: true, model_tier: modelTier || 'fast',
         tools_enabled: JSON.stringify(toolsEnabled || ['agent_search']),
-        max_result_length: 2000, run_count: 0,
+        max_result_length: 50000, run_count: 0,
         timezone: timezone || 'Europe/Amsterdam',
         created_at: new Date().toISOString(),
+        agent_id: agentId || null,
+        conversation_id: null,
+        days_of_week: daysJson,
+        time_of_day: timeOfDay || null,
     });
 }
 
@@ -123,6 +142,15 @@ async function getTasks(userId) {
     const rows = await getAll(
         'SELECT * FROM ai_tasks WHERE user_id = $1 ORDER BY created_at DESC',
         [userId]
+    );
+    return rows.map(rowToTask);
+}
+
+async function getTasksByAgent(userId, agentId) {
+    await initDB();
+    const rows = await getAll(
+        'SELECT * FROM ai_tasks WHERE user_id = $1 AND agent_id = $2 ORDER BY created_at DESC',
+        [userId, agentId]
     );
     return rows.map(rowToTask);
 }
@@ -143,6 +171,10 @@ async function updateTask(id, updates) {
         timezone: 'timezone',
         toolsEnabled: 'tools_enabled',
         maxResultLength: 'max_result_length',
+        agentId: 'agent_id',
+        conversationId: 'conversation_id',
+        daysOfWeek: 'days_of_week',
+        timeOfDay: 'time_of_day',
     };
 
     for (const [jsKey, dbCol] of Object.entries(fieldMap)) {
@@ -150,6 +182,7 @@ async function updateTask(id, updates) {
             setClauses.push(`"${dbCol}" = $${idx++}`);
             let val = updates[jsKey];
             if (jsKey === 'toolsEnabled' && Array.isArray(val)) val = JSON.stringify(val);
+            if (jsKey === 'daysOfWeek') val = (Array.isArray(val) && val.length > 0) ? JSON.stringify(val) : null;
             params.push(val);
         }
     }
@@ -212,9 +245,25 @@ async function markError(id, error) {
     );
 }
 
-function advanceNextRun(currentNextRun, interval) {
+// Map a JS getDay() (0 = Sun … 6 = Sat) to the routine day-of-week tokens used
+// in the days_of_week JSON array. Keep in sync with the frontend day picker.
+const DOW_TOKENS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+
+function advanceNextRun(currentNextRun, interval, daysOfWeek = null) {
     const d = new Date(currentNextRun);
+    // Routine day-of-week mode: advance one day at a time until we hit a
+    // permitted weekday. Falls through to standard intervals below if the
+    // array is empty.
+    if (Array.isArray(daysOfWeek) && daysOfWeek.length > 0) {
+        const allowed = new Set(daysOfWeek.map(s => String(s).toLowerCase().slice(0, 3)));
+        for (let i = 0; i < 7; i += 1) {
+            d.setDate(d.getDate() + 1);
+            if (allowed.has(DOW_TOKENS[d.getDay()])) return d.toISOString();
+        }
+        return null; // no valid day in a week — defensive
+    }
     switch (interval) {
+        case 'hourly':    d.setHours(d.getHours() + 1); break;
         case 'daily':     d.setDate(d.getDate() + 1); break;
         case 'weekdays': {
             do { d.setDate(d.getDate() + 1); }
@@ -231,8 +280,8 @@ function advanceNextRun(currentNextRun, interval) {
     return d.toISOString();
 }
 
-async function advanceSchedule(id, currentNextRun, interval) {
-    const next = advanceNextRun(currentNextRun, interval);
+async function advanceSchedule(id, currentNextRun, interval, daysOfWeek = null) {
+    const next = advanceNextRun(currentNextRun, interval, daysOfWeek);
     if (next) {
         await run('UPDATE ai_tasks SET next_run_at = $1 WHERE id = $2', [next, id]);
         return next;
@@ -262,6 +311,7 @@ module.exports = {
     createTask,
     getTask,
     getTasks,
+    getTasksByAgent,
     updateTask,
     deleteTask,
     getDueTasks,
@@ -269,6 +319,7 @@ module.exports = {
     markCompleted,
     markError,
     advanceSchedule,
+    advanceNextRun,
     getTaskCount,
     deleteUserTasks,
 };
