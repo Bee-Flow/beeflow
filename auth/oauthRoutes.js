@@ -16,11 +16,39 @@ const { loadConfig, saveConfig, requireAdmin, OAUTH_PROVIDERS } = require('./per
 const { getOrCreateSSOUserDEKCompat, setupSSOUserDEK, unlockSSOUserDEK } = require('./encryption');
 const userStore = require('../stores/userStore');
 const { syncUserGroupsOnLogin } = require('../integrations/azureGroupSync');
+const routineCredentialStore = require('../stores/routineCredentialStore');
 const {
     deriveLocalUserId,
     resolveExistingSSOUser,
     resolveOrgByEmailDomain,
 } = require('./ssoUserResolver');
+
+/**
+ * Persist long-lived OAuth tokens into the routine credential vault. Called
+ * after every successful OAuth callback so unattended routines have an
+ * encrypted, refresh-capable copy of the user's credentials even after their
+ * web session expires. Failures are logged and swallowed — the user's login
+ * must not break because the vault write hiccupped.
+ */
+async function _vaultUpsertSafe({ userId, orgId, provider, tokenData }) {
+    if (!userId || !orgId || !provider || !tokenData) return;
+    try {
+        const expiresAt = tokenData.expires_in
+            ? Date.now() + Number(tokenData.expires_in) * 1000
+            : null;
+        await routineCredentialStore.upsertCredential({
+            userId,
+            orgId,
+            provider,
+            accessToken: tokenData.access_token || null,
+            refreshToken: tokenData.refresh_token || null,
+            expiresAt,
+            scope: tokenData.scope || null,
+        });
+    } catch (err) {
+        console.warn(`[OAuth/${provider}] routine vault upsert failed for user ${userId}: ${err.message}`);
+    }
+}
 
 /**
  * Check if encryption is enabled for a user based on their org's subscription plan.
@@ -203,6 +231,12 @@ router.get('/callback', async (req, res) => {
         }
         req.session.user = user;
         req.session.isAuthenticated = true;
+
+        // Long-lived encrypted vault copy for unattended routines.
+        const _vaultOrgIdNc = freshUserLegacy?.organizationId || null;
+        if (_vaultOrgIdNc && user?.id) {
+            await _vaultUpsertSafe({ userId: user.id, orgId: _vaultOrgIdNc, provider: 'nextcloud', tokenData });
+        }
         // Check stored user role — SSO users can also be admins
         const freshUserLegacy = await userStore.getUser(user?.id || 'oauth-user');
         req.session.isAdmin = freshUserLegacy?.role === 'admin';
@@ -888,6 +922,13 @@ router.get('/callback/:provider', async (req, res) => {
         req.session.isAuthenticated = true;
         req.session.isAdmin = freshUser?.role === 'admin';
         req.session.oauthProvider = provider;
+
+        // Long-lived encrypted vault copy for unattended routines. Only
+        // populates if we have an org context (org-scoped key derivation).
+        const vaultOrgId = freshUser?.organizationId || user?.organizationId || null;
+        if (vaultOrgId) {
+            await _vaultUpsertSafe({ userId: user.id, orgId: vaultOrgId, provider, tokenData });
+        }
         if (pendingApproval) {
             req.session.pendingApproval = true;
         }
