@@ -29,6 +29,8 @@ const crypto = require('crypto');
 
 const webpageStore = require('../stores/webpageStore');
 const storageStore = require('../stores/storageStore');
+const webpageDbStore = require('../stores/webpageDbStore');
+const { issuePreviewToken, requirePreviewToken } = require('../auth/webpagePreviewToken');
 const kbStore = require('../stores/knowledgeBases');
 const {
     ingestFileSource,
@@ -186,6 +188,45 @@ router.get('/:id/files', requireAuth, async (req, res) => {
     }
 });
 
+// ── Preview token (for sandboxed iframe → API calls) ────────────────
+//
+// The preview iframe runs with `sandbox="allow-scripts"` (no
+// `allow-same-origin`) so it can't carry the user's session cookie. The
+// editor calls this endpoint over the normal session-authenticated channel,
+// receives a short-lived HMAC token, and bakes it into the iframe document.
+// The iframe then sends `Authorization: Bearer <token>` on cross-origin
+// calls to /api/webpages-preview/...
+router.post('/:id/preview-token', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const wp = await webpageStore.getWebpage(req.params.id, userId);
+        if (!wp) return res.status(404).json({ error: 'Webpage not found' });
+        const { token, expiresAt } = issuePreviewToken({ userId, webpageId: wp.id });
+        res.json({ token, expiresAt, webpageId: wp.id });
+    } catch (err) {
+        console.error('[Webpages] Preview token failed:', err);
+        res.status(500).json({ error: 'Failed to issue preview token' });
+    }
+});
+
+// ── DB reset (privileged: session-auth) ─────────────────────────────
+//
+// Drops the entire SQLite database for this webpage. The token-authenticated
+// preview endpoints can write rows but can't reset the whole DB — that's a
+// destructive admin action that lives behind the session.
+router.delete('/:id/db', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const wp = await webpageStore.getWebpage(req.params.id, userId);
+        if (!wp) return res.status(404).json({ error: 'Webpage not found' });
+        await webpageDbStore.reset(userId, wp.id);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[Webpages] DB reset failed:', err);
+        res.status(500).json({ error: 'Failed to reset database' });
+    }
+});
+
 // ── Chat history (per-webpage persistence) ───────────────────────────
 // Decoupled from the file-update PUT so frequent chat saves don't trigger
 // the file-PUT's sha256 + auto-versioning logic.
@@ -219,6 +260,11 @@ router.delete('/:id/chat', requireAuth, async (req, res) => {
 router.delete('/:id', requireAuth, async (req, res) => {
     try {
         const userId = req.session.user.id;
+        // Drop any cached DB handle/local file before the row goes away —
+        // purgeWebpageObjects (called inside deleteWebpage) wipes the RustFS
+        // blob, so leaving a stale handle open would only confuse the next
+        // access to the (now-deleted) webpage.
+        try { await webpageDbStore.invalidate(req.params.id); } catch (_) {}
         const result = await webpageStore.deleteWebpage(req.params.id, userId);
         if (!result) return res.status(404).json({ error: 'Webpage not found' });
 
@@ -529,8 +575,14 @@ router.post('/:id/versions', requireAuth, async (req, res) => {
         if (!wp) return res.status(404).json({ error: 'Webpage not found' });
 
         const summary = req.body.summary || 'Manual snapshot';
-        if (wp.htmlSize + wp.cssSize + wp.jsSize === 0) {
+        if (wp.htmlSize + wp.cssSize + wp.jsSize + (wp.dbSize || 0) === 0) {
             return res.status(400).json({ error: 'Webpage is empty — nothing to snapshot' });
+        }
+
+        // Flush any pending DB writes before snapshotting so the version
+        // contains everything the user's done up to this moment.
+        try { await webpageDbStore.flush(userId, req.params.id); } catch (e) {
+            console.warn('[Webpages] Pre-snapshot DB flush failed:', e.message);
         }
 
         const version = await webpageStore.createVersion(userId, req.params.id, summary);
@@ -557,7 +609,11 @@ router.post('/:id/versions/:vid/restore', requireAuth, async (req, res) => {
         }
 
         // Snapshot the *current* state first so the restore is itself reversible.
-        const hadContent = wp.htmlSize + wp.cssSize + wp.jsSize > 0;
+        // Flush the DB first so the pre-restore snapshot captures pending writes too.
+        try { await webpageDbStore.flush(userId, req.params.id); } catch (e) {
+            console.warn('[Webpages] Pre-restore DB flush failed:', e.message);
+        }
+        const hadContent = wp.htmlSize + wp.cssSize + wp.jsSize + (wp.dbSize || 0) > 0;
         if (hadContent) {
             try {
                 await webpageStore.createVersion(userId, req.params.id, 'Pre-restore snapshot', {
@@ -580,6 +636,28 @@ router.post('/:id/versions/:vid/restore', requireAuth, async (req, res) => {
             updates[`${slot}Sha`] = sha;
             updates[`${slot}Size`] = size;
         }
+
+        // Restore the SQLite DB binary-side: copy the version's data.db over
+        // current/data.db (or delete it if the version has none), then drop
+        // the cached engine handle so the next access re-opens the restored bytes.
+        const restored = await webpageStore.restoreSlotFromVersion(userId, req.params.id, req.params.vid, 'db');
+        await webpageDbStore.invalidate(req.params.id);
+        if (restored) {
+            // Re-derive sha + size from the restored object so the metadata
+            // matches the at-rest blob (we don't store db sha in the version row).
+            const { stream } = await storageStore.streamFile(
+                storageStore.buildWebpageKey(userId, req.params.id, 'db')
+            );
+            const chunks = [];
+            for await (const c of stream) chunks.push(c);
+            const buf = Buffer.concat(chunks);
+            updates.dbSha = crypto.createHash('sha256').update(buf).digest('hex');
+            updates.dbSize = buf.length;
+        } else {
+            updates.dbSha = '';
+            updates.dbSize = 0;
+        }
+
         await webpageStore.updateWebpageMetadata(req.params.id, userId, updates);
 
         res.json({

@@ -316,6 +316,10 @@ app.use('/api/notebooks', notebookFeatureGate, require('./routes/notebookExport'
 const { requireBetaFeature: requireWebpagesBeta } = require('./core/betaFeatures');
 app.use('/api/webpages', requireWebpagesBeta('webpages'), require('./routes/webpages'));
 app.use('/api/webpages', requireWebpagesBeta('webpages'), require('./routes/webpageExport'));
+// Cross-origin endpoints called from the sandboxed preview iframe — guarded
+// by HMAC bearer tokens (issued by the session-authenticated route above),
+// not by the session itself, since the iframe has no cookies.
+app.use('/api/webpages-preview', require('./routes/webpagesPreview'));
 // Meeting Notes beta feature gate
 const { requireBetaFeature } = require('./core/betaFeatures');
 app.use('/api/transcriptions', requireBetaFeature('meeting_notes'), require('./routes/transcriptions'));

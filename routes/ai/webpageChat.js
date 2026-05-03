@@ -35,6 +35,11 @@ const {
     executeMultiFileTool,
     isMultiFileTool,
 } = require('../../integrations/webpageMultiFileTools');
+const {
+    WEBPAGE_DB_TOOLS,
+    executeDbTool,
+    isDbTool,
+} = require('../../integrations/webpageDbTools');
 const { AGENT_SEARCH_TOOLS, executeAgentSearchTool, isAgentSearchTool } = require('../../integrations/agentSearchTools');
 const {
     searchWebpageKB,
@@ -367,7 +372,7 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
         }
 
         // Tool list
-        const webpageTools = [...WEBPAGE_DOC_TOOLS, ...WEBPAGE_MULTI_FILE_TOOLS, WEBPAGE_ADD_SOURCE_TOOL];
+        const webpageTools = [...WEBPAGE_DOC_TOOLS, ...WEBPAGE_MULTI_FILE_TOOLS, ...WEBPAGE_DB_TOOLS, WEBPAGE_ADD_SOURCE_TOOL];
         // Plan tool exposed ONLY in ask/plan modes — auto mode is "just work,
         // no approval gate". Also dropped on plan-execution turns so the AI
         // can't propose another plan after the user already approved one.
