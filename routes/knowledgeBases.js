@@ -435,6 +435,56 @@ router.get('/:id/threads/:threadId/documents', requireAuth, async (req, res) => 
 });
 
 /**
+ * List chunks for a document. Reads from the local kb_chunks table; rows
+ * stored only in the remote search-service won't appear here, so we
+ * surface that as a soft empty state in the UI.
+ */
+router.get('/:id/documents/:docId/chunks', requireAuth, async (req, res) => {
+    try {
+        const kb = await kbStore.getKB(req.params.id);
+        if (!kb) return res.status(404).json({ error: 'KB not found' });
+        if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
+
+        const doc = await kbStore.getDocument(req.params.docId);
+        if (!doc || doc.knowledge_base_id !== kb.id) {
+            return res.status(404).json({ error: 'Document not found' });
+        }
+
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 200, 1), 500);
+
+        let chunks = [];
+        try {
+            const { getAll } = require('../db');
+            chunks = await getAll(
+                `SELECT chunk_id, content, chunk_type, source_uri, title, lang
+                 FROM kb_chunks
+                 WHERE tenant_id = $1
+                   AND knowledge_base_id = $2
+                   AND document_id = $3
+                 ORDER BY chunk_id ASC
+                 LIMIT $4`,
+                [kb.tenant_id, kb.id, doc.id, limit]
+            );
+        } catch (e) {
+            // kb_chunks table may not exist if no Azure ingest has happened yet
+            chunks = [];
+        }
+
+        res.json({
+            document: { id: doc.id, title: doc.title, source_type: doc.source_type, source_uri: doc.source_uri, chunk_count: doc.chunk_count || 0 },
+            chunks,
+            total: chunks.length,
+            // When the doc was ingested via the remote search-service, chunks live there and
+            // aren't readable from the main DB. Tell the UI so it can explain the empty state.
+            remote_only: chunks.length === 0 && (doc.chunk_count || 0) > 0,
+        });
+    } catch (e) {
+        console.error('[KB] List chunks error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
  * Delete a document (and its chunks)
  */
 router.delete('/:id/documents/:docId', requireAuth, requirePermission('manage_knowledge'), async (req, res) => {
