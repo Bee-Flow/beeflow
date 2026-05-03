@@ -227,6 +227,59 @@ router.delete('/:id/db', requireAuth, async (req, res) => {
     }
 });
 
+// ── DB viewer endpoints (session-auth) ──────────────────────────────
+//
+// Power the in-app DB viewer (Schema / Browse / SQL tabs). Each one mirrors
+// the AI tool surface in webpageDbTools.js but lives behind the session
+// instead of the LLM, so the auth boundary is the same as DB reset above.
+
+router.get('/:id/db/schema', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const wp = await webpageStore.getWebpage(req.params.id, userId);
+        if (!wp) return res.status(404).json({ error: 'Webpage not found' });
+        const result = await webpageDbStore.schema(userId, wp.id);
+        res.json(result);
+    } catch (err) {
+        console.error('[Webpages] DB schema failed:', err);
+        res.status(500).json({ error: `Schema lookup failed: ${err.message}` });
+    }
+});
+
+router.post('/:id/db/query', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const wp = await webpageStore.getWebpage(req.params.id, userId);
+        if (!wp) return res.status(404).json({ error: 'Webpage not found' });
+        const { sql, params } = req.body || {};
+        if (typeof sql !== 'string' || !sql.trim()) {
+            return res.status(400).json({ error: 'sql is required' });
+        }
+        const result = await webpageDbStore.query(userId, wp.id, sql, Array.isArray(params) ? params : []);
+        res.json(result);
+    } catch (err) {
+        // Mutation-attempt errors come back here too — surface the message verbatim
+        // so the SQL tab can render "use exec instead" inline.
+        res.status(400).json({ error: err.message });
+    }
+});
+
+router.post('/:id/db/exec', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const wp = await webpageStore.getWebpage(req.params.id, userId);
+        if (!wp) return res.status(404).json({ error: 'Webpage not found' });
+        const { sql, params } = req.body || {};
+        if (typeof sql !== 'string' || !sql.trim()) {
+            return res.status(400).json({ error: 'sql is required' });
+        }
+        const result = await webpageDbStore.exec(userId, wp.id, sql, Array.isArray(params) ? params : []);
+        res.json(result);
+    } catch (err) {
+        res.status(400).json({ error: err.message });
+    }
+});
+
 // ── Chat history (per-webpage persistence) ───────────────────────────
 // Decoupled from the file-update PUT so frequent chat saves don't trigger
 // the file-PUT's sha256 + auto-versioning logic.

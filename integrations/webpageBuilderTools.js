@@ -18,7 +18,7 @@ const BUILDER_TOOLS = [
         type: 'function',
         function: {
             name: 'create_webpage',
-            description: 'Create a new Webpage project (index.html + style.css + script.js) and return its ID and URL. Call this FIRST before writing any files. Then call webpage_file_write to populate the three files.',
+            description: 'Create a new Webpage project (three slots: index.html, style.css, script.js) owned by the current user. Returns { webpageId, url, name, message }. Call this FIRST when the user asks for a NEW webpage; do not call it for edits to an existing one.\n\nAfter creation, populate each slot with webpage_file_write({ webpageId, file, content }). Reply with a clickable link of the form "[<name>](<url>)" so the user can open the editor.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -39,7 +39,7 @@ const BUILDER_TOOLS = [
         type: 'function',
         function: {
             name: 'webpage_file_read',
-            description: 'Read the current content of one file in an existing webpage. Call this BEFORE webpage_file_replace so you operate on the latest content.',
+            description: 'Read the current content of one file (html/css/js) in an existing webpage. Returns { file, content, lineCount, message }.\n\nWhen to use: ALWAYS before webpage_file_replace or webpage_file_patch on the same file — those tools refuse to run on a slot you haven\'t read this turn (read-before-edit guard). NOT needed before webpage_file_write since that overwrites the whole file.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -54,7 +54,7 @@ const BUILDER_TOOLS = [
         type: 'function',
         function: {
             name: 'webpage_file_write',
-            description: 'Overwrite the ENTIRE content of one webpage file. Use for initial creation or full rewrites. For partial edits, use webpage_file_replace.\n\nIframe rules: sandbox="allow-scripts" only — no same-origin. Inline CSS/JS into the HTML for the preview, or use separate style.css / script.js. CDN <script> tags are fine inside HTML. No npm imports.',
+            description: 'Overwrite the ENTIRE content of one webpage file. STRICT use cases:\n  (1) the slot is currently empty (initial creation right after create_webpage), or\n  (2) you genuinely need to replace ≥80% of the content (a from-scratch rewrite).\n\nNOT for partial edits — adding a section, tweaking styles, fixing a single bug. Use webpage_file_replace (substring) or webpage_file_patch (line range) for those. They are dramatically faster, cheaper, and safer because they don\'t re-emit the whole file.\n\nIframe rules: the preview runs with sandbox="allow-scripts" only (no same-origin). Vanilla HTML/CSS/JS. CDN <script> tags inside the HTML are fine. No npm imports, no build step. Code that depends on parent cookies, localStorage, or fetches to the host app will fail.\n\nReturns { message, file, webpageId }.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -71,13 +71,13 @@ const BUILDER_TOOLS = [
         type: 'function',
         function: {
             name: 'webpage_file_replace',
-            description: 'Replace a specific substring inside one webpage file. Call webpage_file_read first to get the exact current text.\n\nBy default find_text must match exactly once. If it matches in multiple places the tool errors with line numbers; either narrow the snippet or set replace_all: true.',
+            description: 'PREFERRED tool for editing existing webpage files. Replace a specific substring inside one slot, preserving everything else.\n\nWorkflow: webpage_file_read({ webpageId, file }) FIRST to see the exact current text, then call webpage_file_replace with find_text copied verbatim. find_text must match EXACTLY ONCE by default; on multiple matches the tool errors with line numbers — either narrow the snippet or pass replace_all: true.\n\nINSERT new content by anchoring on a stable nearby snippet and including it in replace_text. DELETE by passing replace_text: "".\n\nPrefer many small replaces over one big rewrite — each replace shows the user exactly what changed.\n\nReturns { message, file, webpageId }. NOT for line-range edits where you already know exact line numbers — use webpage_file_patch instead.',
             parameters: {
                 type: 'object',
                 properties: {
                     webpageId: { type: 'string', description: 'The ID of the webpage.' },
                     file: { type: 'string', enum: ['html', 'css', 'js'], description: 'Which file to edit.' },
-                    find_text: { type: 'string', description: 'The exact text to find (verbatim or whitespace-normalized).' },
+                    find_text: { type: 'string', description: 'The exact text to find (verbatim, or whitespace-normalized as a fallback).' },
                     replace_text: { type: 'string', description: 'The replacement text. Empty string to delete.' },
                     replace_all: { type: 'boolean', description: 'When true, replace every occurrence. Default false — single-match required.' },
                 },
@@ -89,7 +89,7 @@ const BUILDER_TOOLS = [
         type: 'function',
         function: {
             name: 'webpage_file_patch',
-            description: 'Replace a contiguous range of LINES in one webpage file with sanity-check on expected_text. 1-indexed, inclusive on both ends.',
+            description: 'Line-anchored partial edit — replace a contiguous range of lines in one slot, preserving everything else. 1-indexed, inclusive on both ends (start_line=5, end_line=7 → 3 lines).\n\nWhen to use: you just read the file, you know the exact line numbers, and the change spans a multi-line block (function body, CSS rule, multi-line element). NOT for substring tweaks — use webpage_file_replace for that.\n\nexpected_text sanity check: if those lines don\'t currently equal expected_text, the patch refuses to write. This protects against stale reads. Always pair with a fresh webpage_file_read on the same turn.\n\nReturns { message, file, webpageId }.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -97,8 +97,8 @@ const BUILDER_TOOLS = [
                     file: { type: 'string', enum: ['html', 'css', 'js'], description: 'Which file to edit.' },
                     start_line: { type: 'integer', description: '1-indexed first line of the range (inclusive).' },
                     end_line: { type: 'integer', description: '1-indexed last line of the range (inclusive).' },
-                    expected_text: { type: 'string', description: 'The current content of those lines exactly as it appears.' },
-                    replacement: { type: 'string', description: 'The new content for the range.' },
+                    expected_text: { type: 'string', description: 'The current content of those lines exactly as it appears in the latest webpage_file_read output.' },
+                    replacement: { type: 'string', description: 'The new content for the range. Can be any number of lines, including 0 (empty string) to delete.' },
                 },
                 required: ['webpageId', 'file', 'start_line', 'end_line', 'expected_text', 'replacement'],
             },

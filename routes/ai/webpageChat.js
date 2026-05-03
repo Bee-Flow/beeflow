@@ -56,6 +56,72 @@ function slotFilename(slot) {
     return slot === 'html' ? 'index.html' : slot === 'css' ? 'style.css' : 'script.js';
 }
 
+/**
+ * Strip bulky payloads from tool results before they re-enter the model's
+ * message history. The frontend already received the full content via SSE
+ * (webpage_doc_update / webpage_extra_update / tool_end), so re-shipping it
+ * to the LLM doubles every tool round's prompt size for no benefit and
+ * pushes long sessions over context limits faster.
+ *
+ * Mirrors directChat.js's compactToolResultForLLM but with the rules tuned
+ * for the webpage tool surface (file/extra/db).
+ */
+function compactWebpageToolResult(toolResult) {
+    if (typeof toolResult !== 'object' || toolResult === null) return toolResult;
+
+    // Primary slot writes — the new content was streamed to the UI; the model
+    // can ask for it back via webpage_file_read if it needs to re-check.
+    if (toolResult._action === 'webpage_doc_update') {
+        return {
+            action: 'webpage_doc_update',
+            file: toolResult.file,
+            title: toolResult.title,
+            message: toolResult.message || `${toolResult.file} updated.`,
+        };
+    }
+
+    // Extra-file create/update — content already sent to the UI.
+    if (toolResult._action === 'webpage_extra_update') {
+        return {
+            action: 'webpage_extra_update',
+            path: toolResult.path,
+            meta: toolResult.meta,
+            message: toolResult.message || `${toolResult.path} updated.`,
+        };
+    }
+    if (toolResult._action === 'webpage_extra_deleted') {
+        return {
+            action: 'webpage_extra_deleted',
+            path: toolResult.path,
+            message: toolResult.message || `${toolResult.path} deleted.`,
+        };
+    }
+
+    // DB exec — already small; pass through but normalize the shape.
+    if (toolResult._action === 'webpage_db_update') {
+        return {
+            action: 'webpage_db_update',
+            multi: !!toolResult.multi,
+            changes: toolResult.changes,
+            lastInsertRowid: toolResult.lastInsertRowid,
+            message: toolResult.message,
+        };
+    }
+
+    // DB query — cap rows shipped back to the model (UI already has the full
+    // payload via tool_end). 50 rows is plenty to summarize/reason over.
+    if (Array.isArray(toolResult.rows) && toolResult.rows.length > 50) {
+        return {
+            ...toolResult,
+            rows: toolResult.rows.slice(0, 50),
+            truncatedForLlm: true,
+            originalRowCount: toolResult.rows.length,
+        };
+    }
+
+    return toolResult;
+}
+
 router.post('/chat/webpage/stream', requireAuth, async (req, res) => {
     const {
         message, webpageId, history, modelTier, timezone, attachments,
@@ -322,10 +388,10 @@ Every webpage has a SQLite database (\`data.db\`, stored alongside the script fi
 
 Each call returns a Promise; reject = error string in \`.error\`. Use \`?\` placeholders — never interpolate user input into SQL.
 
-You have three tools to manage the DB directly:
-• webpage_db_schema() — list tables + columns. Call this BEFORE generating any query against tables you didn't just create yourself.
-• webpage_db_query({ sql, params? }) — read-only SELECT (errors if SQL would mutate). Rows capped at 10000.
-• webpage_db_exec({ sql, params? }) — INSERT/UPDATE/DELETE/CREATE/etc. Multi-statement DDL (e.g. several CREATE TABLEs separated by semicolons) is allowed only when params is empty.
+Three tools to manage the DB directly. The user can also see and edit the DB live in the data.db viewer (Schema / Browse / SQL tabs in the editor) — keep that in mind when shaping schemas, since they will be visible to a human, not just consumed by your script.
+• webpage_db_schema() — returns { tables: [{ name, sql, columns: [...] }], message }. Call this BEFORE generating any query against tables you didn't just create yourself this turn.
+• webpage_db_query({ sql, params? }) — SELECT / WITH / PRAGMA only. Returns { rows, columns, truncated, message }. Errors and tells you to use exec if the SQL mutates. Rows capped at 10000; \`truncated: true\` means narrow the query and call again. Always parameterize values with \`?\` + params — never interpolate.
+• webpage_db_exec({ sql, params? }) — INSERT / UPDATE / DELETE / CREATE / ALTER / DROP / etc. Returns { changes, lastInsertRowid, multi, message }. Two modes: single statement (with or without params) or multi-statement script (only when params is empty/omitted; per-statement counts unavailable). For parameterized DML across many rows, call once per statement.
 
 Use these to set up the schema and seed data the user describes. The DB persists across reloads; new webpages start empty. If the page doesn't actually need persistence, don't create a schema — local state in script.js is fine.
 
@@ -417,7 +483,10 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
         };
 
         let toolCallRounds = 0;
-        const MAX_TOOL_ROUNDS = 5;
+        // 10 rounds — DB workflows (schema → seed → verify → fix) routinely run
+        // long, and partial edits via webpage_file_replace cluster the same way.
+        // Was 5; raised because the model was hitting the cap mid-task.
+        const MAX_TOOL_ROUNDS = 10;
         // Flips to true when the AI calls propose_webpage_plan — the chat
         // handler exits the streaming/tool loop after the current round so the
         // user gets a chance to approve before any files are touched.
@@ -517,10 +586,16 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
 
             send('tool_end', { name: toolName, result: toolResult });
 
+            // The full toolResult goes to the UI (SSE above). The compact
+            // shape goes back to the model — strips file content the model
+            // already wrote and over-large query rows so prompt size doesn't
+            // balloon round-over-round.
             return {
                 role: 'tool',
                 tool_call_id: toolCall.id,
-                content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult),
+                content: typeof toolResult === 'string'
+                    ? toolResult
+                    : JSON.stringify(compactWebpageToolResult(toolResult)),
             };
         }
 

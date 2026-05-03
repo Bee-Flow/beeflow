@@ -203,6 +203,21 @@ router.put('/:id', requirePermission('manage_agents'), async (req, res) => {
         return res.status(403).json({ error: 'Agent Editors cannot modify unpublished drafts from others.' });
     }
 
+    // Tier gate: when the client sets a `tier:<key>` model, validate that the
+    // user is actually allowed to use that tier. Custom tiers (`custom:*`) are
+    // already gated by group membership at fetch time; we still allow non-tier
+    // raw model strings (legacy) to pass through unchanged.
+    if (typeof model === 'string' && model.startsWith('tier:')) {
+        const tierKey = model.slice('tier:'.length);
+        if (!tierKey.startsWith('custom:')) {
+            const { getPermittedTierKeys } = require('../../core/userTiers');
+            const allowed = await getPermittedTierKeys({ userId, session: req.session, taskType: 'direct_chat' });
+            if (!allowed.has(tierKey)) {
+                return res.status(403).json({ error: `Tier "${tierKey}" is not available on your account.` });
+            }
+        }
+    }
+
     // Parse existing starter_prompts if stored as JSON string
     const existingStarterPrompts = typeof agent.starter_prompts === 'string'
         ? JSON.parse(agent.starter_prompts || '[]')

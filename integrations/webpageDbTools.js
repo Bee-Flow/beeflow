@@ -21,7 +21,7 @@ const WEBPAGE_DB_TOOLS = [
         type: 'function',
         function: {
             name: 'webpage_db_schema',
-            description: 'List every table and view in the webpage\'s SQLite database, with their columns, types, and constraints. Call this BEFORE writing queries against unfamiliar tables — the model can\'t see the schema otherwise. Returns an empty list when the DB has no tables yet (a brand new webpage starts with an empty DB).',
+            description: 'Inspect the webpage\'s SQLite database. Returns every user table and view with columns (name, type, notNull, defaultValue, primaryKey) plus the original CREATE statement.\n\nWhen to use: before writing any SELECT/INSERT/UPDATE against tables you didn\'t create yourself this turn — you cannot see the schema otherwise.\n\nReturn shape: { tables: [{ name, sql, columns: [...] }], message }. A brand new webpage starts with zero tables; the message will say so.',
             parameters: { type: 'object', properties: {} },
         },
     },
@@ -29,17 +29,17 @@ const WEBPAGE_DB_TOOLS = [
         type: 'function',
         function: {
             name: 'webpage_db_query',
-            description: 'Run a read-only SELECT against the webpage\'s SQLite database. Returns rows + column names. Errors if the SQL would mutate the database — use webpage_db_exec for that. Result rows are capped at 10000; the response includes `truncated: true` when the cap was hit so you can refine the query.',
+            description: 'Read rows from the webpage\'s SQLite database. SELECT / WITH / PRAGMA only.\n\nWhen to use: any time you need to look at data. NOT for writes — the engine refuses to run a statement that would mutate the database and tells you to call webpage_db_exec instead.\n\nReturn shape: { rows: [...], columns: [string], truncated: boolean, message }. Rows are capped at 10000; `truncated: true` means there were more — narrow the query (add WHERE, LIMIT, etc.) and call again.\n\nAlways use ? placeholders + params for any value that came from user input or another tool — never interpolate strings into the SQL.',
             parameters: {
                 type: 'object',
                 properties: {
                     sql: {
                         type: 'string',
-                        description: 'A SELECT statement. Use ? placeholders for parameters; do NOT interpolate user-supplied values into the SQL string.',
+                        description: 'A read-only SQL statement (SELECT / WITH / PRAGMA). Use ? placeholders for values.',
                     },
                     params: {
                         type: 'array',
-                        description: 'Optional array of values bound positionally to ? placeholders in `sql`. Strings, numbers, booleans, null. Objects/arrays are JSON-stringified.',
+                        description: 'Values bound positionally to ? placeholders. Strings, numbers, booleans, null. Objects/arrays are JSON-stringified. Omit or pass [] when the SQL has no placeholders.',
                         items: {},
                     },
                 },
@@ -51,17 +51,17 @@ const WEBPAGE_DB_TOOLS = [
         type: 'function',
         function: {
             name: 'webpage_db_exec',
-            description: 'Run a write or DDL statement against the webpage\'s SQLite database. Use this for INSERT, UPDATE, DELETE, CREATE TABLE, CREATE INDEX, ALTER TABLE, DROP, etc. Returns { changes, lastInsertRowid } for parameterized statements.\n\nMulti-statement scripts (several CREATE TABLEs separated by semicolons) are accepted ONLY when `params` is empty or omitted. For parameterized DML, send one statement per call (use this tool multiple times) or use a future batch tool.',
+            description: 'Mutate the webpage\'s SQLite database. INSERT / UPDATE / DELETE / CREATE / ALTER / DROP / REINDEX / etc.\n\nWhen to use: ANY write or DDL. NOT for reads — call webpage_db_query for SELECTs (this tool will run them but you get no rows back).\n\nTwo modes:\n  • Single statement (with or without params) — use ? placeholders + params for any user-supplied value.\n      Returns: { changes, lastInsertRowid, multi: false, message }. `changes` is the affected row count; `lastInsertRowid` is set after INSERT.\n  • Multi-statement script — several statements separated by ;  (e.g. seeding several CREATE TABLEs in one call). Allowed ONLY when `params` is empty or omitted; per-statement counts aren\'t available.\n      Returns: { changes: 0, lastInsertRowid: 0, multi: true, message: "Multi-statement script executed." }\n\nFor parameterized DML across many rows, call this tool once per statement — do NOT try to mix params with multi-statement.',
             parameters: {
                 type: 'object',
                 properties: {
                     sql: {
                         type: 'string',
-                        description: 'A SQL statement (or, with no params, a multi-statement script).',
+                        description: 'A single SQL statement, or — when params is empty/omitted — a multi-statement script (statements separated by ;).',
                     },
                     params: {
                         type: 'array',
-                        description: 'Optional array of values bound positionally to ? placeholders in `sql`. Required when `sql` contains placeholders. Must be empty/omitted when `sql` contains multiple statements.',
+                        description: 'Values bound positionally to ? placeholders. Required when SQL contains placeholders. MUST be empty or omitted when SQL contains multiple statements.',
                         items: {},
                     },
                 },
