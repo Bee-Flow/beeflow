@@ -148,6 +148,12 @@ router.post('/events/github', express.json({ limit: '256kb' }), async (req, res)
 
 router.use(requireAuth);
 
+// All authenticated automation routes are gated behind the 'automations'
+// beta feature. Admins toggle this per-organisation in the admin
+// dashboard → Security → Beta. Super admins always have access.
+const { requireBetaFeature } = require('../core/betaFeatures');
+router.use(requireBetaFeature('automations'));
+
 // Catalog — auto-introspect existing TOOLS arrays.
 router.get('/catalog', async (req, res) => {
     try {
@@ -184,8 +190,9 @@ router.get('/catalog', async (req, res) => {
 
         const codeFlagRaw = await configStore.getConfig('automation_code_step_enabled');
         const codeFlag = codeFlagRaw === true || codeFlagRaw === 'true';
-        const autoFlagRaw = await configStore.getConfig('feature_automations_enabled');
-        const automationsFlag = autoFlagRaw === true || autoFlagRaw === 'true';
+        // If we got here, the requireBetaFeature middleware already approved
+        // the user — so this user's org has the automations feature on.
+        const automationsFlag = true;
 
         res.json({
             apps,

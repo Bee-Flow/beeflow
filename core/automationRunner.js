@@ -8,7 +8,9 @@
  *   - 30s tick: app-event subscription renewal + polling.
  *   - executeAutomation(...) traverses the DAG and dispatches by step type.
  *
- * Boot is gated on the org-scoped feature flag `feature_automations_enabled`.
+ * Per-org access is gated by the 'automations' beta feature (set in
+ * the admin dashboard → Security → Beta). The runner always boots; due
+ * rows owned by orgs without the beta are skipped each tick.
  */
 
 const automationStore = require('../stores/automationStore');
@@ -494,8 +496,24 @@ async function processDueAutomations() {
     try {
         const due = await automationStore.getDueAutomations();
         if (due.length === 0) return;
-        for (let i = 0; i < due.length; i += MAX_CONCURRENT) {
-            const batch = due.slice(i, i + MAX_CONCURRENT);
+
+        // Filter by per-org beta access. If an org loses the 'automations'
+        // beta, their automations stop firing on schedule (but stay in the
+        // DB so re-enabling restores them instantly). User-initiated runs
+        // are gated at the route layer.
+        const { userHasBetaFeature } = require('./betaFeatures');
+        const allowed = [];
+        for (const a of due) {
+            try {
+                const ok = await userHasBetaFeature(a.userId, 'automations', null);
+                if (ok) allowed.push(a);
+                else console.log(`[AutomationRunner] Skipping ${a.id} — owner ${a.userId} no longer has automations beta`);
+            } catch (_) { /* on lookup failure, skip rather than fire incorrectly */ }
+        }
+        if (allowed.length === 0) return;
+
+        for (let i = 0; i < allowed.length; i += MAX_CONCURRENT) {
+            const batch = allowed.slice(i, i + MAX_CONCURRENT);
             await Promise.allSettled(batch.map(a => executeAutomation(a, { triggerKind: 'schedule' })));
         }
     } catch (e) {
@@ -519,19 +537,14 @@ async function processPollingAndRenewals() {
 
 async function start() {
     if (started) return;
-    const enabled = await configStore.getConfig('feature_automations_enabled');
-    // Accept boolean true OR string "true" (configStore round-trips JSON, but
-    // older admin UIs may have written a plain string).
-    const isOn = enabled === true || enabled === 'true';
-    if (!isOn) {
-        console.log('[AutomationRunner] feature_automations_enabled is not set — runner not started');
-        return;
-    }
+    // Always start the tick. Per-org gating via the 'automations' beta
+    // feature is enforced inside processDueAutomations() — orgs without
+    // the beta will have their due rows skipped each tick.
     started = true;
     setInterval(processDueAutomations, RUNNER_INTERVAL_MS).unref();
     setInterval(processPollingAndRenewals, POLLING_INTERVAL_MS).unref();
     setTimeout(processDueAutomations, 10_000).unref?.();
-    console.log('[AutomationRunner] started (60s schedule tick, 30s polling tick)');
+    console.log('[AutomationRunner] started (60s schedule tick, 30s polling tick) — per-org beta gating active');
 }
 
 module.exports = {

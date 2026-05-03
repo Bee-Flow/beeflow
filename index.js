@@ -387,7 +387,7 @@ app.listen(PORT, '0.0.0.0', () => {
     } catch (err) {
         console.warn('[Server] AI Task runner load failed:', err.message);
     }
-    // Initialize Automation Runner — boot is gated on feature_automations_enabled
+    // Initialize Automation Runner — gated per-org by the 'automations' beta feature
     try {
         const automationRunner = require('./core/automationRunner');
         automationRunner.start().catch(err =>

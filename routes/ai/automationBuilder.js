@@ -68,12 +68,13 @@ router.post('/stream', requireAuth, async (req, res) => {
     };
 
     try {
-        // Feature gate: open by default. Only block when explicitly disabled.
-        // Accepts boolean true/false or string "true"/"false" from configStore.
-        const flagRaw = await configStore.getConfig('feature_automations_enabled');
-        const featureOff = flagRaw === false || flagRaw === 'false';
-        if (featureOff) {
-            send('error', { error: 'Automation builder is disabled by your organisation administrator.' });
+        // Feature gate: 'automations' is a per-org beta feature.
+        // Admins toggle it from the admin dashboard → Security → Beta.
+        // Super admins always have access.
+        const { userHasBetaFeature } = require('../../core/betaFeatures');
+        const hasFeature = await userHasBetaFeature(userId, 'automations', req.session);
+        if (!hasFeature) {
+            send('error', { error: 'The Automations beta is not enabled for your organisation. Ask an administrator to enable it under Security → Beta Features.' });
             return res.end();
         }
         const codeFlagRaw = await configStore.getConfig('automation_code_step_enabled');
