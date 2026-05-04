@@ -7,6 +7,22 @@
 const express = require('express');
 const router = express.Router();
 const skillStore = require('../stores/skillStore');
+const userStore = require('../stores/userStore');
+
+// Drop any group IDs whose organizationId doesn't match the skill's org.
+// Skills are queried by org_id at read time, so a foreign-org group ID is
+// dead weight at best — but it's also a regression hazard if the org filter
+// is ever loosened. Strip it here so the column only ever holds valid IDs.
+async function sanitizeSharedGroups(orgId, sharedGroups) {
+    if (!Array.isArray(sharedGroups) || sharedGroups.length === 0) return [];
+    try {
+        const allGroups = await userStore.getAllGroups();
+        const orgGroupIds = new Set(allGroups.filter(g => g.organizationId === orgId).map(g => g.id));
+        return sharedGroups.filter(id => orgGroupIds.has(id));
+    } catch (_) {
+        return [];
+    }
+}
 
 // ── Auth guard (same pattern as other routes) ────────────────
 function requireAuth(req, res, next) {
@@ -53,6 +69,7 @@ router.post('/', async (req, res) => {
             return res.status(400).json({ error: 'Instructions too long (max 4000 characters)' });
         }
 
+        const cleanedGroups = await sanitizeSharedGroups(orgId, sharedGroups);
         const skill = await skillStore.createSkill({
             orgId,
             userId: req.session.user.id,
@@ -65,7 +82,7 @@ router.post('/', async (req, res) => {
             icon,
             isShared,
             dynamicActivation,
-            sharedGroups: Array.isArray(sharedGroups) ? sharedGroups : [],
+            sharedGroups: cleanedGroups,
             automationId: automationId || null,
         });
         res.status(201).json(skill);
@@ -98,9 +115,16 @@ router.put('/:id', async (req, res) => {
             return res.status(400).json({ error: 'Instructions too long (max 4000 characters)' });
         }
 
+        // Strip foreign-org group IDs before persisting. Only run when the
+        // caller explicitly sent sharedGroups — undefined means "leave as-is".
+        let cleanedGroups;
+        if (sharedGroups !== undefined) {
+            const orgId = await getOrgId(req);
+            cleanedGroups = await sanitizeSharedGroups(orgId, Array.isArray(sharedGroups) ? sharedGroups : []);
+        }
         const updated = await skillStore.updateSkill(req.params.id, req.session.user.id, {
             name, description, instructions, workflow, rules, examples, icon, isShared, dynamicActivation,
-            sharedGroups: sharedGroups !== undefined ? (Array.isArray(sharedGroups) ? sharedGroups : []) : undefined,
+            sharedGroups: cleanedGroups,
             automationId,
         });
         if (!updated) return res.status(404).json({ error: 'Skill not found or not owner' });

@@ -23,13 +23,14 @@ const express = require('express');
 const router = express.Router();
 const projectStore = require('../stores/projectStore');
 const userStore = require('../stores/userStore');
+const { resolveUserGroups } = require('../auth');
 
 function getUserId(req) { return req.session?.user?.id; }
+// Read groups from the DB on every request, not from req.session — group
+// removals must take effect without forcing a re-login. Mirrors the pattern
+// used by the agents and KB routes.
 function getUserGroups(req) {
-    const groups = req.session?.user?.groups;
-    if (Array.isArray(groups)) return groups;
-    if (typeof groups === 'string') { try { return JSON.parse(groups); } catch { return []; } }
-    return [];
+    return resolveUserGroups(getUserId(req));
 }
 
 // ── Role middleware ──────────────────────────────────────
@@ -40,7 +41,7 @@ function requireRole(minRole) {
         try {
             const userId = getUserId(req);
             if (!userId) return res.status(401).json({ error: 'Not authenticated' });
-            const role = await projectStore.getProjectRole(userId, req.params.id, getUserGroups(req));
+            const role = await projectStore.getProjectRole(userId, req.params.id, await getUserGroups(req));
             if (!role) return res.status(404).json({ error: 'Not found' });
             if (ROLE_ORDER[role] < ROLE_ORDER[minRole]) {
                 return res.status(403).json({ error: 'Insufficient permissions' });
@@ -61,7 +62,7 @@ router.get('/', async (req, res) => {
     try {
         const userId = getUserId(req);
         if (!userId) return res.status(401).json({ error: 'Not authenticated' });
-        const projects = await projectStore.listUserProjects(userId, getUserGroups(req));
+        const projects = await projectStore.listUserProjects(userId, await getUserGroups(req));
         res.json(projects);
     } catch (err) {
         console.error('[Projects] List error:', err.message);
@@ -184,6 +185,20 @@ router.post('/:id/share', requireRole('owner'), async (req, res) => {
 
         const role = projectStore.normalizePermission(permission || 'viewer');
         if (!['viewer', 'editor'].includes(role)) return res.status(400).json({ error: 'permission must be viewer or editor' });
+
+        // Cross-tenant guard: an owner could otherwise share their project
+        // with a foreign-org group ID and leak project content + KB IDs to
+        // members of another tenant. Match the target group's org against
+        // the project's org before persisting.
+        if (sharedWithType === 'group') {
+            const project = await projectStore.getProject(req.params.id);
+            const allGroups = await userStore.getAllGroups();
+            const targetGroup = allGroups.find(g => g.id === sharedWithId);
+            if (!targetGroup) return res.status(400).json({ error: 'Unknown group' });
+            if (project?.organizationId && targetGroup.organizationId !== project.organizationId) {
+                return res.status(400).json({ error: 'Group does not belong to this project\'s organisation' });
+            }
+        }
 
         const shareId = await projectStore.shareProject(req.params.id, sharedWithType, sharedWithId, role, userId);
         await projectStore.logActivity(req.params.id, userId, 'member_added', {
