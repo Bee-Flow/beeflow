@@ -15,6 +15,10 @@
 
 const path = require('path');
 
+// Load env vars from project-root .env so npm run db:migrate / direct node calls
+// see DATABASE_URL / CORE_DATABASE_URL / MONITORING_DATABASE_URL.
+require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
+
 // Safety timeout: force exit after 30s in case store modules keep the event loop alive
 setTimeout(() => {
     console.error('[migrate] ⚠️ Timeout — forcing exit');
