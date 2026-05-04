@@ -66,7 +66,7 @@ async function signIn(page, credentials) {
 
 async function joinAndRecord(sessionId, meetLink, options = {}) {
     const {
-        botName = 'Bee Flow - Meeting Assistant',
+        botName = 'Bee Flow - Meeting assistant',
         maxDurationMs = 3 * 60 * 60 * 1000,
         credentials = null,
         onStatusChange = () => {},

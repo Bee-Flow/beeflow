@@ -697,7 +697,7 @@ router.post('/join', async (req, res) => {
                 await meetBotStore.updateSession(session.id, { status: 'joining' });
 
                 const result = await meetBot.joinAndRecord(session.id, meetLink, {
-                    botName: 'Bee Flow - Meeting Assistant',
+                    botName: 'Bee Flow - Meeting assistant',
                     credentials,
                     session: req.session,
                     onStatusChange: async (status) => {

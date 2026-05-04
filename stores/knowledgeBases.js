@@ -304,11 +304,26 @@ const KnowledgeBasesStore = {
     },
 
     /**
-     * Toggle publish state and shared groups. Owner-only operation enforced
-     * at the route layer.
+     * Toggle publish state and (optionally) shared groups. Owner-only operation
+     * enforced at the route layer.
+     *
+     * When `sharedGroups` is undefined, the existing DB value is preserved —
+     * a toggle-publish call without an explicit groups payload must NOT
+     * silently flip a group-restricted KB to entire-org visibility. Mirrors
+     * the same fix in agentCrud.setAgentPublished.
      */
-    setPublished: async (id, isPublished, sharedGroups = []) => {
+    setPublished: async (id, isPublished, sharedGroups) => {
         await initDB();
+        if (sharedGroups === undefined) {
+            return getOne(
+                `UPDATE knowledge_bases
+                 SET is_published = $2,
+                     updated_at = now()
+                 WHERE id = $1
+                 RETURNING *`,
+                [id, !!isPublished]
+            );
+        }
         const groupsJson = JSON.stringify(Array.isArray(sharedGroups) ? sharedGroups : []);
         return getOne(
             `UPDATE knowledge_bases

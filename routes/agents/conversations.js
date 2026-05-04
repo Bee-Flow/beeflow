@@ -17,6 +17,25 @@ const { setupSSE, sendSSEError, persistAndTitle, getOrCreateAgentConversation } 
 
 const router = express.Router();
 
+// Reuse the agent visibility gate so list/create endpoints can't be used to
+// touch agents the caller has no audience for. Without this, an org-B user
+// who knows an org-A agent ID could create orphan conversation rows even
+// though the chat-stream endpoint correctly blocks them from sending.
+const { canReadAgent } = require('./crud');
+
+async function requireAgentReadAccess(req, res, agent) {
+    const userId = getEffectiveUserId(req);
+    if (!agent.is_published && !req.session?.user?.id) {
+        res.status(401).json({ error: 'Not authenticated' });
+        return false;
+    }
+    if (!(await canReadAgent(agent, userId, req))) {
+        res.status(403).json({ error: 'Access denied' });
+        return false;
+    }
+    return true;
+}
+
 // ============ Multi-Conversation Management ============
 
 // List all conversations for an agent
@@ -26,15 +45,9 @@ router.get('/:id/conversations', async (req, res) => {
         return res.status(404).json({ error: 'Agent not found' });
     }
 
-    const userId = getEffectiveUserId(req);
-    if (!agent.is_published && !req.session?.user?.id) {
-        return res.status(401).json({ error: 'Not authenticated' });
-    }
-    if (!agent.is_published && agent.owner_id !== userId) {
-        return res.status(403).json({ error: 'Access denied' });
-    }
+    if (!(await requireAgentReadAccess(req, res, agent))) return;
 
-    const conversations = await agentStore.listConversations(req.params.id, userId);
+    const conversations = await agentStore.listConversations(req.params.id, getEffectiveUserId(req));
     res.json(conversations);
 });
 
@@ -45,16 +58,10 @@ router.post('/:id/conversations', async (req, res) => {
         return res.status(404).json({ error: 'Agent not found' });
     }
 
-    const userId = getEffectiveUserId(req);
-    if (!agent.is_published && !req.session?.user?.id) {
-        return res.status(401).json({ error: 'Not authenticated' });
-    }
-    if (!agent.is_published && agent.owner_id !== userId) {
-        return res.status(403).json({ error: 'Access denied' });
-    }
+    if (!(await requireAgentReadAccess(req, res, agent))) return;
 
     const { title } = req.body;
-    const conversation = await agentStore.createConversation(req.params.id, userId, title || 'New Chat');
+    const conversation = await agentStore.createConversation(req.params.id, getEffectiveUserId(req), title || 'New Chat');
     res.json(conversation);
 });
 

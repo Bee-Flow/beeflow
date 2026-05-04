@@ -20,6 +20,11 @@ const {
     invalidatePermissionCache,
     invalidateAllPermissionCaches
 } = require('./permissions');
+const {
+    canSeePublished,
+    resolveUserGroups,
+    resolveAudienceContext,
+} = require('./audience');
 
 // Mount sub-routers
 router.use('/', require('./loginRoutes'));
@@ -38,5 +43,8 @@ module.exports = {
     resolveUserOrgIds,
     requireOrgAdmin,
     invalidatePermissionCache,
-    invalidateAllPermissionCaches
+    invalidateAllPermissionCaches,
+    canSeePublished,
+    resolveUserGroups,
+    resolveAudienceContext,
 };

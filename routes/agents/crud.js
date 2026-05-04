@@ -7,7 +7,7 @@ const { getAIConfig, getProviderForModel } = require('../../core/aiAgent');
 const configStore = require('../../stores/configStore');
 const { requirePermission } = require('../../auth');
 const MemoryStore = require('../../stores/memoryStore');
-const { resolveUserOrgIds } = require('../../auth');
+const { resolveUserOrgIds, canSeePublished, resolveUserGroups } = require('../../auth');
 const { getEffectiveUserId, getUserAuth } = require('../../utils/routeHelpers');
 
 const userStore = require('../../stores/userStore');
@@ -68,50 +68,28 @@ router.delete('/categories/:id', requirePermission('manage_agents'), async (req,
     }
 });
 
-// Get single agent — visibility-gated. A user can read an agent only if:
-//   1. they own it, OR
-//   2. it's published (is_published=true) AND either
-//      a. shared with the entire org (empty sharedGroups), OR
-//      b. shared with one of the user's groups, OR
-//      c. it's a system agent (owner_id = 'system' / 'swarm').
-// Without this gate any authenticated user could fetch any other user's
-// drafts including the system_prompt, KB ids, and shared_groups.
+// Visibility gate — a user can read an agent only if they own it, it's a
+// system/swarm agent, or `canSeePublished` accepts them given the agent's
+// org + shared_groups. Without this gate any authenticated user could fetch
+// any other user's drafts including the system_prompt, KB ids, and tool
+// params (which often hold API keys / customer-specific config).
+async function canReadAgent(agent, userId, req) {
+    if (!agent) return false;
+    if (agent.owner_id === userId) return true;
+    if (agent.owner_id === 'system' || agent.owner_id === 'swarm') return true;
+    const orgIds = await resolveUserOrgIds(req).catch(() => new Set());
+    const userGroups = await resolveUserGroups(userId);
+    return canSeePublished(agent, { userId, orgIds, userGroups });
+}
+
 router.get('/:id', async (req, res) => {
-    const id = req.params.id;
     const userId = getEffectiveUserId(req);
-    const agent = await agentStore.getAgent(id);
+    const agent = await agentStore.getAgent(req.params.id);
     if (!agent) return res.status(404).json({ error: 'Agent not found' });
-
-    // Owner / system agents always pass.
-    if (agent.owner_id === userId) return res.json(agent);
-    if (agent.owner_id === 'system' || agent.owner_id === 'swarm') return res.json(agent);
-
-    // Non-owners must have visibility into the agent.
-    if (!agent.is_published) return res.status(404).json({ error: 'Agent not found' });
-
-    const sharedGroups = (() => {
-        if (Array.isArray(agent.shared_groups)) return agent.shared_groups;
-        if (typeof agent.shared_groups === 'string') {
-            try { return JSON.parse(agent.shared_groups); } catch (_) { return []; }
-        }
-        return [];
-    })();
-
-    if (sharedGroups.length === 0) {
-        // Org-wide publish — gate by org membership.
-        const orgIds = await resolveUserOrgIds(req).catch(() => null);
-        if (orgIds && agent.organization_id && orgIds.has(agent.organization_id)) {
-            return res.json(agent);
-        }
+    if (!(await canReadAgent(agent, userId, req))) {
         return res.status(404).json({ error: 'Agent not found' });
     }
-
-    // Group-restricted publish — gate by user's group membership.
-    const user = await userStore.getUser(userId).catch(() => null);
-    const userGroupIds = Array.isArray(user?.groups) ? user.groups : [];
-    if (sharedGroups.some(gid => userGroupIds.includes(gid))) return res.json(agent);
-
-    return res.status(404).json({ error: 'Agent not found' });
+    res.json(agent);
 });
 
 // Delete agent - owner can delete own, admin/manage_agents can force-delete any
@@ -349,11 +327,13 @@ router.put('/:id', requirePermission('manage_agents'), async (req, res) => {
     res.json(fresh || { success: true });
 });
 
-// Get tools with their fixed params
+// Get tools with their fixed params — visibility-gated like GET /:id, since
+// fixed tool params often hold credentials or customer-specific config.
 router.get('/:id/tools', async (req, res) => {
     const userId = getEffectiveUserId(req);
     const agent = await agentStore.getAgent(req.params.id);
-    if (!agent || (agent.owner_id !== userId && !agent.is_published)) {
+    if (!agent) return res.status(404).json({ error: 'Agent not found' });
+    if (!(await canReadAgent(agent, userId, req))) {
         return res.status(404).json({ error: 'Agent not found' });
     }
 
@@ -376,3 +356,4 @@ router.put('/:id/tools/:componentId/params', async (req, res) => {
 
 module.exports = router;
 module.exports.canModifyAgent = canModifyAgent;
+module.exports.canReadAgent = canReadAgent;

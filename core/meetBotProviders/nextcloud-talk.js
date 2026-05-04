@@ -25,21 +25,6 @@ const PROFILE_DIR = path.resolve(__dirname, '../../data/meet-bot-profile-nextclo
 // Zoom URLs before this provider sees them.
 const TOKEN_RE = /(?:\/index\.php)?\/call\/([a-zA-Z0-9]+)(?:[/?#]|$)/;
 
-// Top-bar "Join call" button — opens the device-check modal.
-const TOP_BAR_JOIN_SELECTORS = [
-    'button.top-bar__button--call-start',
-    'button.top-bar__button[aria-label*="Join call" i]',
-    'button.top-bar__button[aria-label*="Start call" i]',
-    'button.top-bar__button[aria-label*="Deelnemen aan oproep" i]',
-    'button.top-bar__button[aria-label*="Oproep starten" i]',
-];
-
-// Final "Join call" button inside the device-check modal.
-const MODAL_JOIN_SELECTORS = [
-    'button.join-call.action-button',
-    'button.button-vue--success.join-call',
-];
-
 const END_PHRASES = [
     'call has ended',
     'the call has ended',
@@ -107,7 +92,7 @@ function originOf(url) {
 
 async function joinAndRecord(sessionId, meetLink, options = {}) {
     const {
-        botName = 'Bee Flow - Meeting Assistant',
+        botName = 'Bee Flow - Meeting assistant',
         maxDurationMs = 3 * 60 * 60 * 1000,
         onStatusChange = () => {},
         registerSession,
@@ -146,114 +131,104 @@ async function joinAndRecord(sessionId, meetLink, options = {}) {
         }
 
         console.log(`[MeetBot/Nextcloud] Navigating to ${meetLink}`);
-        await page.goto(meetLink, { waitUntil: 'networkidle', timeout: 30000 });
-        await page.waitForTimeout(3000);
-
-        // Dismiss first-run / cookie dialogs
+        // Nextcloud Talk keeps WebSocket signaling open after load, so
+        // 'networkidle' never resolves. Wait for the DOM only and then for
+        // the device-check dialog (or the in-call top bar) to appear.
+        await page.goto(meetLink, { waitUntil: 'domcontentloaded', timeout: 30000 });
         try {
-            const dismiss = page.locator('button:has-text("Got it"), button:has-text("Begrepen"), button[aria-label*="Close" i]');
-            if (await dismiss.count() > 0) { await dismiss.first().click(); await page.waitForTimeout(500); }
+            await page.locator('[role="dialog"], .top-bar, .talkRoom').first()
+                .waitFor({ state: 'visible', timeout: 20000 });
+            console.log('[MeetBot/Nextcloud] Talk room loaded');
+        } catch (_) {
+            console.warn('[MeetBot/Nextcloud] Timed out waiting for Talk room UI; continuing anyway');
+        }
+
+        // Talk caches the last guest display name in localStorage; that
+        // overrides anything we type. Wipe it so the field starts empty.
+        console.log('[MeetBot/Nextcloud] Clearing cached display name');
+        try {
+            await page.evaluate(() => {
+                try {
+                    Object.keys(localStorage).forEach(k => {
+                        if (/guest|display.?name|nick/i.test(k)) localStorage.removeItem(k);
+                    });
+                } catch (_) {}
+            });
         } catch (_) {}
 
-        // Step 1 — open the call flow by clicking the top-bar "Join call".
-        // This brings up Talk's "Check devices" pre-join modal.
-        let openedCallFlow = false;
-        for (const sel of TOP_BAR_JOIN_SELECTORS) {
-            try {
-                const btn = page.locator(sel);
-                if (await btn.count() > 0) { await btn.first().click(); openedCallFlow = true; break; }
-            } catch (_) {}
-        }
-        if (!openedCallFlow) {
-            // Generic fallback for translated/restyled instances.
-            openedCallFlow = await page.evaluate(() => {
-                for (const btn of document.querySelectorAll('button')) {
-                    const t = (btn.textContent || '').toLowerCase();
-                    const a = (btn.getAttribute('aria-label') || '').toLowerCase();
-                    if (t.includes('join call') || a.includes('join call')
-                        || t.includes('start call') || a.includes('start call')
-                        || t.includes('deelnemen aan oproep') || a.includes('deelnemen aan oproep')
-                        || t.includes('oproep starten') || a.includes('oproep starten')) {
-                        btn.click(); return true;
-                    }
-                }
-                return false;
-            });
-        }
-        if (!openedCallFlow) {
-            try { await page.screenshot({ path: path.join(shared.recordingsDir, `fail-nextcloud-${sessionId}.png`) }); } catch (_) {}
-            throw new Error('Could not find join-call button on the Nextcloud Talk page (room may require an account or password).');
-        }
+        // Dismiss first-run / cookie dialogs (only if present — no settle wait)
+        try {
+            const dismiss = page.locator('button:has-text("Got it"), button:has-text("Begrepen"), button[aria-label*="Close" i]');
+            if (await dismiss.count() > 0) { await dismiss.first().click(); }
+        } catch (_) {}
 
-        // Step 2 — fill the guest display name (skipped when signed in).
-        // Talk's input has placeholder="Guest" and an associated <label> — no
-        // aria-label, no predictable id. Same click+fill pattern as the
-        // Google Meet provider; the trailing Tab fires the blur event Vue
-        // needs to revalidate and enable the modal's Join call button.
-        const nameSelectors = [
-            'input[placeholder="Guest"]',
-            '.username-form input.input-field__input',
-            '.username-form__display-name input',
-        ];
-        let nameInput = null;
-        for (const sel of nameSelectors) {
-            const candidate = page.locator(sel).first();
-            try {
-                await candidate.waitFor({ state: 'visible', timeout: 3000 });
-                nameInput = candidate;
-                break;
-            } catch (_) {}
-        }
-        if (nameInput) {
-            await nameInput.click({ clickCount: 3 });
-            await nameInput.fill(botName);
-            await nameInput.press('Tab');
-            await page.waitForTimeout(400);
-            console.log(`[MeetBot/Nextcloud] Filled guest display name: "${botName}"`);
-        } else {
-            console.log('[MeetBot/Nextcloud] No name input found — assuming signed in');
-        }
+        // Joining a /call/<token> URL auto-opens the "Check devices" dialog
+        // (verified via Playwright codegen). The flow is:
+        //   1. Fill the guest display name (skipped when signed in).
+        //   2. Click the dialog's Join call button.
+        // Locators come straight from codegen — getByRole/getByLabel resolve
+        // through Vue's accessible-name machinery, which is what makes .fill()
+        // actually stick on Talk's custom input-field component.
 
-        // Step 3 — turn off mic and camera in the device-check modal so the bot
-        // doesn't broadcast the fake-device test pattern. Idempotent: if the
-        // toggle isn't present (already muted) the click is a no-op.
-        for (const sel of [
-            '.media-settings__toggles button[aria-label="Mute audio" i]',
-            '.media-settings__toggles button[aria-label="Disable video" i]',
-            '.media-settings__toggles button[aria-label="Microfoon dempen" i]',
-            '.media-settings__toggles button[aria-label="Video uitschakelen" i]',
-        ]) {
-            try {
-                const btn = page.locator(sel);
-                if (await btn.count() > 0) { await btn.first().click(); await page.waitForTimeout(200); }
-            } catch (_) {}
-        }
+        const checkDevicesDialog = page.getByRole('dialog', { name: /Check devices|Apparaten controleren/i });
 
-        // Step 4 — click the modal's "Join call" button. It's disabled until
-        // the name field validates, so retry a few times.
-        let inCall = false;
-        for (let attempt = 0; attempt < 8 && !inCall; attempt++) {
-            for (const sel of MODAL_JOIN_SELECTORS) {
+        // Detect once whether the device-check dialog appeared. Signed-in
+        // users skip it entirely, so we shouldn't sit on long waitFor budgets
+        // looking for elements that don't exist.
+        let dialogPresent = false;
+        try {
+            await checkDevicesDialog.waitFor({ state: 'visible', timeout: 1500 });
+            dialogPresent = true;
+        } catch (_) {}
+
+        if (dialogPresent) {
+            // Step 1 — fill the guest display name. Press Enter to commit
+            // the value to Vue's form state (verified via codegen).
+            try {
+                const nameInput = page.getByRole('textbox', { name: /Display name|Weergavenaam/i });
+                await nameInput.waitFor({ state: 'visible', timeout: 1500 });
+                await nameInput.fill(botName);
+                await nameInput.press('Enter');
+                console.log('[MeetBot/Nextcloud] Filled display name');
+            } catch (_) { /* signed in — no field */ }
+
+            // Step 2 — mute mic and camera in the dialog (idempotent, fast).
+            for (const name of [/Mute audio/i, /Disable video/i, /Microfoon dempen/i, /Video uitschakelen/i]) {
                 try {
-                    const btn = page.locator(sel);
-                    if (await btn.count() === 0) continue;
-                    const disabled = await btn.first().evaluate(el => el.disabled || el.hasAttribute('disabled'));
-                    if (disabled) continue;
-                    await btn.first().click();
-                    inCall = true;
-                    break;
+                    await checkDevicesDialog.getByRole('button', { name }).first()
+                        .click({ timeout: 500 });
                 } catch (_) {}
             }
-            if (!inCall) await page.waitForTimeout(700);
-        }
-        if (inCall) {
-            console.log('[MeetBot/Nextcloud] Confirmed Join call in device-check modal');
+
+            // Step 3 — click the dialog's Join call button.
+            try {
+                await checkDevicesDialog.getByLabel('Join call').click({ timeout: 5000 });
+                console.log('[MeetBot/Nextcloud] Clicked Join call in dialog');
+            } catch (e) {
+                try {
+                    const screenshotPath = path.join(shared.recordingsDir, `fail-nextcloud-${sessionId}-dialog.png`);
+                    await page.screenshot({ path: screenshotPath });
+                    console.warn(`[MeetBot/Nextcloud] Screenshot of failure: ${screenshotPath}`);
+                } catch (_) {}
+                throw new Error(`Could not click dialog Join call: ${e.message}`);
+            }
         } else {
-            console.log('[MeetBot/Nextcloud] No device-check modal detected — assuming direct join');
+            // Signed-in fast-path: click the top-bar Join call button directly.
+            try {
+                await page.getByRole('button', { name: /^Join call|^Start call|^Deelnemen aan oproep|^Oproep starten/i })
+                    .first().click({ timeout: 5000 });
+                console.log('[MeetBot/Nextcloud] Clicked top-bar Join call');
+            } catch (e) {
+                try {
+                    const screenshotPath = path.join(shared.recordingsDir, `fail-nextcloud-${sessionId}-topbar.png`);
+                    await page.screenshot({ path: screenshotPath });
+                } catch (_) {}
+                throw new Error(`Could not click Join call: ${e.message}`);
+            }
         }
 
         console.log('[MeetBot/Nextcloud] Waiting for call media...');
-        await page.waitForTimeout(5000);
+        await page.waitForTimeout(2000);
 
         onStatusChange('recording', { meetLink });
         audioCapture = await shared.startAudioCapture(page, audioPath, sinkName);

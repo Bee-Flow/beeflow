@@ -334,7 +334,10 @@ router.patch('/:id/publish', requireAuth, async (req, res) => {
         }
 
         const { isPublished, sharedGroups } = req.body || {};
-        const updated = await kbStore.setPublished(kb.id, !!isPublished, sharedGroups || []);
+        // Pass `sharedGroups` through verbatim — including undefined — so
+        // the store can preserve the current value when the client sent only
+        // a publish toggle. Coercing to `[]` here would wipe restrictions.
+        const updated = await kbStore.setPublished(kb.id, !!isPublished, sharedGroups);
         res.json({ success: true, kb: updated });
     } catch (e) {
         console.error('[KB] Publish error:', e.message);
