@@ -1,7 +1,6 @@
 const express = require('express');
 const agentStore = require('../../stores/agentStore');
 const skillStore = require('../../stores/skillStore');
-const kbStore = require('../../stores/knowledgeBases');
 const userStore = require('../../stores/userStore');
 const configStore = require('../../stores/configStore');
 const { requirePermission, resolveUserOrgIds } = require('../../auth');
@@ -375,33 +374,17 @@ router.post('/wizard/commit', requirePermission('manage_agents'), wizardLimiter,
         // pre-existing rows are converted by the backfill migration.
         const enabledIntegrations = requested;
 
-        // ── Auto-create knowledge base ─────────────────────────────────
-        let knowledge_base_ids = [];
-        try {
-            const kb = await kbStore.createKB(
-                userId,
-                plan.name,
-                `Auto-generated knowledge base for agent "${plan.name}"`,
-                'unknown',
-                orgId,
-                {}
-            );
-            if (kb?.id) knowledge_base_ids = [kb.id];
-        } catch (err) {
-            console.warn('Wizard: KB auto-create failed (non-fatal):', err.message);
-        }
-
         const config = {
             avatar: plan.avatar || '🤖',
             enabledIntegrations,
-            knowledge_base_ids,
+            knowledge_base_ids: [],
             attachedSkillIds,
             memoryEnabled: false,
             strictKnowledge: false,
             includeSourceReferences: false,
             wizard: {
                 capabilities: plan.capabilities || [],
-                primaryKbId: knowledge_base_ids[0] || null,
+                primaryKbId: null,
             },
         };
 
