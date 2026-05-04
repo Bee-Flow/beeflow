@@ -17,6 +17,7 @@ const googleProvider = require('./meetBotProviders/google');
 const googleMeetSdkProvider = require('./meetBotProviders/google-meet-sdk');
 const teamsGraphProvider = require('./meetBotProviders/teams-graph');
 const zoomProvider = require('./meetBotProviders/zoom');
+const nextcloudTalkProvider = require('./meetBotProviders/nextcloud-talk');
 
 // Order matters: earlier providers are considered first. SDK/Graph providers
 // go before browser-based counterparts so we prefer the official media/API
@@ -27,6 +28,7 @@ const providers = [
     googleProvider,
     teamsGraphProvider,
     zoomProvider,
+    nextcloudTalkProvider,
 ];
 
 const activeSessions = new Map(); // sessionId → { context, audioCapture, stopped }
@@ -57,7 +59,7 @@ async function validateMeetingUrl(url) {
     if (!provider) {
         return {
             valid: false,
-            error: 'URL is not a Google Meet, Microsoft Teams, or Zoom meeting link.',
+            error: 'URL is not a Google Meet, Microsoft Teams, Zoom, or Nextcloud Talk meeting link.',
         };
     }
     if (!provider.validateUrl(url)) {
@@ -78,7 +80,7 @@ async function validateMeetingUrl(url) {
 async function joinAndRecord(sessionId, meetLink, options = {}) {
     const provider = await detectProvider(meetLink);
     if (!provider) {
-        throw new Error('No provider matches this meeting URL (expected Google Meet, Teams, or Zoom).');
+        throw new Error('No provider matches this meeting URL (expected Google Meet, Teams, Zoom, or Nextcloud Talk).');
     }
 
     console.log(`[MeetBot] Session ${sessionId} → provider: ${provider.label}`);

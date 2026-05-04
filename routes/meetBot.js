@@ -21,6 +21,7 @@ const meetBot = require('../core/meetBot');
 const transcriptionStore = require('../stores/transcriptionStore');
 const configStore = require('../stores/configStore');
 const storageStore = require('../stores/storageStore');
+const { executeNextcloudTalkTool } = require('../integrations/nextcloudTalkTools');
 
 const AUDIO_MIME_BY_EXT = {
     '.webm': 'audio/webm',
@@ -309,6 +310,50 @@ async function transcribeBotRecording(audioPath, userId, title, language = 'nl')
         fileName,
         mapSpeakerNames: true,
     });
+}
+
+/**
+ * Post a meeting summary back into the originating Nextcloud Talk room.
+ *
+ * Best-effort: failures are logged but do not affect the transcription record.
+ * Authentication uses the user's session — Bearer for OAuth, Basic for the
+ * app-password fallback (resolved inside resolveAuth in nextcloudClient).
+ */
+async function postSummaryToTalkRoom({ token, summary, title, userId, session }) {
+    if (!token) return;
+    if (!session) {
+        console.log('[MeetBot/Nextcloud] No session available; skipping Talk summary post-back.');
+        return;
+    }
+    if (!summary || !summary.trim()) {
+        console.log('[MeetBot/Nextcloud] No summary text; skipping Talk summary post-back.');
+        return;
+    }
+
+    // Talk's chat message field has a generous limit but very long messages
+    // become unreadable. Truncate to 8 KB and append a hint to open the UI.
+    const MAX = 8000;
+    const trimmed = summary.length > MAX
+        ? summary.slice(0, MAX) + '\n\n…(truncated — see the full notes in Bee Flow)'
+        : summary;
+
+    const message = `📝 **${title || 'Meeting notes'}**\n\n${trimmed}`;
+
+    try {
+        const result = await executeNextcloudTalkTool(
+            'nextcloud_talk_send_message',
+            { token, message, silent: true },
+            userId,
+            session,
+        );
+        if (result?.error) {
+            console.warn(`[MeetBot/Nextcloud] Talk summary post-back failed: ${result.error}`);
+        } else {
+            console.log(`[MeetBot/Nextcloud] Summary posted to Talk room ${token}`);
+        }
+    } catch (err) {
+        console.warn(`[MeetBot/Nextcloud] Talk summary post-back error: ${err.message}`);
+    }
 }
 
 /**
@@ -759,6 +804,17 @@ router.post('/join', async (req, res) => {
                     });
 
                     console.log(`[MeetBot] Session ${session.id} completed. Transcription: ${transcription.id}`);
+
+                    // Post summary back to the originating Nextcloud Talk room.
+                    if (result.platform === 'nextcloud-talk' && result.providerMeta?.roomToken) {
+                        await postSummaryToTalkRoom({
+                            token: result.providerMeta.roomToken,
+                            summary: transcription.summary,
+                            title: transcription.title,
+                            userId,
+                            session: req.session,
+                        });
+                    }
                 } else {
                     await meetBotStore.updateSession(session.id, {
                         status: 'failed',

@@ -1425,10 +1425,12 @@ async function resolveUserOrgId(userId) {
     return null;
 }
 
-// Helper: get org ID from session
+// Helper: get org ID from session; super admins without an org fall back to '__system__'
 async function getOrgId(req) {
     const userId = req.session.user?.id;
-    return resolveUserOrgId(userId);
+    const orgId = await resolveUserOrgId(userId);
+    if (!orgId && (req.session.isAdmin || req.session.user?.role === 'admin')) return '__system__';
+    return orgId;
 }
 
 // Helper: check if user is org admin
@@ -1437,10 +1439,9 @@ async function requireOrgAdminForN8n(req, res, next) {
     if (!userId) return res.status(401).json({ error: 'Not authenticated' });
     const userStore = require('../../stores/userStore');
     const user = await userStore.getUser(userId);
-    // Super admins (global) can always manage n8n config
+    // Super admins (global) can always manage n8n config; fall back to '__system__' scope if not in any org
     if (req.session.isAdmin || req.session.user?.role === 'admin') {
-        req.orgId = await resolveUserOrgId(userId);
-        if (!req.orgId) return res.status(400).json({ error: 'No organization found. Create or join an organization before configuring n8n.' });
+        req.orgId = (await resolveUserOrgId(userId)) || '__system__';
         return next();
     }
     if (!user?.organizationId) return res.status(403).json({ error: 'No organization' });
@@ -1600,7 +1601,7 @@ router.get('/n8n/workflow/:workflowId', requireOrgAdminForN8n, async (req, res) 
 router.post('/n8n/test', requireOrgAdminForN8n, async (req, res) => {
     const fetch = require('node-fetch');
     const https = require('https');
-    const agent = new https.Agent({ rejectUnauthorized: false });
+    const http = require('http');
     try {
         const orgId = req.orgId;
         const n8nUrl = (req.body?.n8nUrl) || (await configStore.getConfig(`n8n_url_org_${orgId}`));
@@ -1611,6 +1612,7 @@ router.post('/n8n/test', requireOrgAdminForN8n, async (req, res) => {
         }
         const base = n8nUrl.replace(/\/+$/, '');
         const apiBase = base.includes('/api/v1') ? base : `${base}/api/v1`;
+        const agent = n8nUrl.startsWith('http://') ? new http.Agent() : new https.Agent({ rejectUnauthorized: false });
 
         const r = await fetch(`${apiBase}/workflows?limit=1`, {
             headers: { 'X-N8N-API-KEY': apiKey, 'Content-Type': 'application/json' },
@@ -1657,7 +1659,9 @@ router.get('/n8n/diagnostics', requireAuth, async (req, res) => {
         if (!userId) return res.status(401).json({ error: 'Not authenticated' });
 
         const user = await userStore.getUser(userId);
-        const organizationId = user?.organizationId || null;
+        const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
+        const rawOrgId = user?.organizationId || null;
+        const organizationId = rawOrgId || (isSuperAdmin ? '__system__' : null);
 
         // 1. n8n configured for the user's org?
         let n8nConfigured = false;
@@ -1670,8 +1674,8 @@ router.get('/n8n/diagnostics', requireAuth, async (req, res) => {
         // 2. Org-level integration gating.
         let orgEnabledIntegrations = null;
         let orgGateSource = 'all_enabled';
-        if (organizationId) {
-            const org = await userStore.getOrganization(organizationId);
+        if (rawOrgId) {
+            const org = await userStore.getOrganization(rawOrgId);
             if (org?.enabledIntegrations) {
                 orgEnabledIntegrations = typeof org.enabledIntegrations === 'string'
                     ? JSON.parse(org.enabledIntegrations) : org.enabledIntegrations;

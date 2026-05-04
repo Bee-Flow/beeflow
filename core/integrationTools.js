@@ -74,6 +74,7 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
     try {
         const userStore = require('../stores/userStore');
         const currentUser = await userStore.getUser(userId);
+        const isSuperAdmin = isAdmin || session?.user?.role === 'admin';
         if (currentUser?.organizationId) {
             userOrgId = currentUser.organizationId;
             const org = await userStore.getOrganization(currentUser.organizationId);
@@ -92,6 +93,9 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
                 }
                 // null globalDefaults = all enabled (no defaults configured yet)
             }
+        } else if (isSuperAdmin) {
+            // Super admins without an org use the '__system__' config scope
+            userOrgId = '__system__';
         }
     } catch (e) { /* ignore */ }
 

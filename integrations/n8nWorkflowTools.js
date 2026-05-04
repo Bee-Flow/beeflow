@@ -10,9 +10,12 @@
 const configStore = require('../stores/configStore');
 const fetch = require('node-fetch');
 const https = require('https');
+const http = require('http');
 
-// Reuse the permissive agent for self-hosted n8n with self-signed certs
-const n8nAgent = new https.Agent({ rejectUnauthorized: false });
+function getAgent(url) {
+    if (typeof url === 'string' && url.startsWith('http://')) return new http.Agent();
+    return new https.Agent({ rejectUnauthorized: false });
+}
 
 // ─── n8n API Helper ────────────────────────────────────────────
 
@@ -35,7 +38,7 @@ async function n8nApiFetch(orgId, path, options = {}) {
             'Content-Type': 'application/json',
             ...(options.headers || {}),
         },
-        agent: n8nAgent,
+        agent: getAgent(n8nUrl),
         signal: AbortSignal.timeout(options.timeoutMs || 30000),
     });
 
