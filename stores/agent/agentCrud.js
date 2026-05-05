@@ -23,9 +23,15 @@ async function _notifySync(orgId, agentId, action = 'pending') {
 }
 
 function parseConfig(agent) {
+    const config = agent.config ? (typeof agent.config === 'string' ? JSON.parse(agent.config) : agent.config) : {};
+    // Legacy agents stored their picture inside config.avatar instead of the
+    // dedicated column. Fall through on read so the UI keeps showing them
+    // until a one-shot backfill migrates the values into the column.
+    const avatar = agent.avatar || config.avatar || null;
     return {
         ...agent,
-        config: agent.config ? (typeof agent.config === 'string' ? JSON.parse(agent.config) : agent.config) : {},
+        avatar,
+        config,
         shared_groups: (() => { try { return JSON.parse(agent.shared_groups || '[]'); } catch (_) { return []; } })()
     };
 }

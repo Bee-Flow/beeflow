@@ -141,7 +141,21 @@ function summarise(note) {
 }
 
 async function executeNextcloudNotesTool(toolName, args, userId, session) {
-    const ctx = await ncClient.resolveAuth(session, userId);
+    // The Notes API's controller methods are #[CORS]-annotated, which forces
+    // Nextcloud to demand HTTP Basic auth even when an OAuth session is
+    // active (the CORS middleware logs the Bearer session out before checking
+    // creds — see CORSMiddleware::beforeController). So we must use the
+    // user's saved app password, never the Bearer token.
+    let ctx = await ncClient.resolveBasicAuthOrNull(userId);
+    if (!ctx) {
+        // No app password saved. If they're on OAuth, give them a CORS-specific
+        // hint; otherwise, fall through to the generic resolveAuth which will
+        // surface a "not connected" error.
+        if (ncClient.isNextcloudOAuthSession(session)) {
+            return { error: ncClient.CORS_AUTH_ERROR };
+        }
+        ctx = await ncClient.resolveAuth(session, userId);
+    }
     const { baseUrl, fetch: ncFetch, authError } = ctx;
     const api = notesApi(baseUrl);
 
@@ -168,19 +182,35 @@ async function executeNextcloudNotesTool(toolName, args, userId, session) {
             const q = String(args.query || '').toLowerCase().trim();
             if (!q) return { error: 'query is required' };
             const limit = Math.min(Math.max(args.limit || 25, 1), 100);
-            // Notes API has no native search; fetch full set and filter.
-            const res = await ncFetch(api, { headers: baseHeaders });
-            if (res.status === 401) return { error: authError };
-            if (!res.ok) return { error: `Notes search failed (${res.status})` };
-            const data = await readJsonSafe(res);
-            if (!Array.isArray(data)) return { error: 'Unexpected Notes response' };
+            // Notes API has no native search endpoint, but it supports chunked
+            // pagination (Notes app v1.2+) — page through with chunkSize=50 and
+            // break as soon as `limit` matches are found. Keeps any single
+            // response under ~2 MB even for accounts with thousands of notes.
             const matches = [];
-            for (const note of data) {
-                const haystack = `${note.title || ''}\n${note.content || ''}`.toLowerCase();
-                if (haystack.includes(q)) {
-                    matches.push(summarise(note));
-                    if (matches.length >= limit) break;
+            let cursor = null;
+            const MAX_CHUNKS = 40; // Safety net: scans up to 2000 notes if no match.
+            let chunks = 0;
+            while (chunks < MAX_CHUNKS && matches.length < limit) {
+                const params = new URLSearchParams();
+                params.set('chunkSize', '50');
+                if (cursor) params.set('chunkCursor', cursor);
+                const res = await ncFetch(`${api}?${params.toString()}`, { headers: baseHeaders });
+                if (res.status === 401) return { error: authError };
+                if (!res.ok) return { error: `Notes search failed (${res.status})` };
+                const data = await readJsonSafe(res);
+                if (!Array.isArray(data)) return { error: 'Unexpected Notes response' };
+                for (const note of data) {
+                    const haystack = `${note.title || ''}\n${note.content || ''}`.toLowerCase();
+                    if (haystack.includes(q)) {
+                        matches.push(summarise(note));
+                        if (matches.length >= limit) break;
+                    }
                 }
+                cursor = res.headers.get('X-Notes-Chunk-Cursor');
+                const pending = res.headers.get('X-Notes-Chunk-Pending');
+                chunks += 1;
+                // No cursor → server returned everything in one chunk (Notes < v1.2 or small store).
+                if (!cursor || pending === '0' || pending === null) break;
             }
             return { query: args.query, count: matches.length, notes: matches };
         }

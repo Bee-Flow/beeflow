@@ -46,6 +46,7 @@ const { NEXTCLOUD_NOTIFICATIONS_TOOLS } = require('../integrations/nextcloudNoti
 const { NEXTCLOUD_TALK_TOOLS } = require('../integrations/nextcloudTalkTools');
 const { NEXTCLOUD_TASKS_TOOLS } = require('../integrations/nextcloudTasksTools');
 const { NEXTCLOUD_NOTES_TOOLS } = require('../integrations/nextcloudNotesTools');
+const { NEXTCLOUD_MAIL_TOOLS } = require('../integrations/nextcloudMailTools');
 const { NEXTCLOUD_ACTIVITY_TOOLS } = require('../integrations/nextcloudActivityTools');
 const { NEXTCLOUD_STATUS_TOOLS } = require('../integrations/nextcloudStatusTools');
 
@@ -297,6 +298,7 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
                 if (isAppOn('nextcloud-talk')) addTools(NEXTCLOUD_TALK_TOOLS);
                 if (isAppOn('nextcloud-tasks')) addTools(NEXTCLOUD_TASKS_TOOLS);
                 if (isAppOn('nextcloud-notes')) addTools(NEXTCLOUD_NOTES_TOOLS);
+                if (isAppOn('nextcloud-mail')) addTools(NEXTCLOUD_MAIL_TOOLS);
                 if (isAppOn('nextcloud-activity')) addTools(NEXTCLOUD_ACTIVITY_TOOLS);
                 if (isAppOn('nextcloud-status')) addTools(NEXTCLOUD_STATUS_TOOLS);
             }

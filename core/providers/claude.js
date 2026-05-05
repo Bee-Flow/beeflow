@@ -9,6 +9,69 @@ const BaseProvider = require("./base");
 
 const DEFAULT_MAX_TOKENS = 8192;
 
+/**
+ * Drop orphan tool_use/tool_result blocks so Anthropic doesn't reject the
+ * request. After compaction or aggressive history pruning, the message array
+ * can contain a `tool_result` whose matching `tool_use` has been summarised
+ * away — Claude returns "unexpected tool_use_id found in tool_result blocks".
+ *
+ * Rules enforced (mirrors the API's contract):
+ *   1. tool_result.tool_use_id must reference a tool_use emitted in the
+ *      immediately previous assistant message.
+ *   2. Every tool_use must have a matching tool_result in the immediately
+ *      following user message.
+ *
+ * Anything that violates either rule is dropped. Messages that become empty
+ * after dropping orphans are removed from the array entirely.
+ */
+function repairToolPairs(messages) {
+    const out = [];
+    for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
+
+        // user/tool_result message — keep only tool_result blocks whose id
+        // appears in the previous assistant's tool_use blocks.
+        if (msg.role === 'user' && Array.isArray(msg.content) && msg.content.some(b => b?.type === 'tool_result')) {
+            const prev = out[out.length - 1];
+            const prevToolUseIds = new Set(
+                (prev?.role === 'assistant' && Array.isArray(prev.content)
+                    ? prev.content.filter(b => b?.type === 'tool_use').map(b => b.id)
+                    : [])
+            );
+            const cleaned = msg.content.filter(b => {
+                if (b?.type !== 'tool_result') return true; // keep non-tool blocks (rare but legal)
+                return prevToolUseIds.has(b.tool_use_id);
+            });
+            if (cleaned.length === 0) continue; // entire message was orphaned — drop
+            out.push({ ...msg, content: cleaned });
+            continue;
+        }
+
+        // assistant message with tool_use blocks — drop any tool_use whose
+        // matching tool_result isn't in the next message. If all tool_uses
+        // are orphaned and no other content remains, drop the message.
+        if (msg.role === 'assistant' && Array.isArray(msg.content) && msg.content.some(b => b?.type === 'tool_use')) {
+            const next = messages[i + 1];
+            const nextResultIds = new Set(
+                (next?.role === 'user' && Array.isArray(next.content)
+                    ? next.content.filter(b => b?.type === 'tool_result').map(b => b.tool_use_id)
+                    : [])
+            );
+            const cleaned = msg.content.filter(b => {
+                if (b?.type !== 'tool_use') return true;
+                return nextResultIds.has(b.id);
+            });
+            const hasMeaningful = cleaned.some(b => b?.type === 'text' || b?.type === 'tool_use' || b?.type === 'thinking');
+            if (!hasMeaningful) continue; // assistant turn was nothing but orphan tool_uses — drop
+            out.push({ ...msg, content: cleaned });
+            continue;
+        }
+
+        out.push(msg);
+    }
+    return out;
+}
+
 class ClaudeProvider extends BaseProvider {
     constructor() {
         super("claude");
@@ -174,7 +237,22 @@ class ClaudeProvider extends BaseProvider {
             }
         }
 
-        return normalized;
+        // ─── Drop orphan tool_use / tool_result pairs ───────────────────
+        // Anthropic rejects the request with `messages.N.content.0:
+        // unexpected tool_use_id` whenever a tool_result references a
+        // tool_use_id that doesn't appear in the immediately previous
+        // assistant message. This happens after compaction collapses an
+        // assistant(tool_use) into a summary while leaving its matching
+        // tool_result in the recent window, or when conversation persistence
+        // strips tool_calls but keeps the tool messages.
+        //
+        // We walk the array in order, tracking which tool_use ids the latest
+        // assistant message emitted, and drop any tool_result block that
+        // references an unknown id. Symmetrically, drop any tool_use block
+        // whose result isn't in the immediately following user message — an
+        // assistant turn ending in tool_use without a matching result is
+        // also rejected by the API. Empty messages get filtered out.
+        return repairToolPairs(normalized);
     }
 
     extractSystem(messages) {

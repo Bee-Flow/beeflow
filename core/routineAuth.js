@@ -56,6 +56,7 @@ const INTEGRATION_PROVIDER = {
     'nextcloud-talk':          'nextcloud',
     'nextcloud-tasks':         'nextcloud',
     'nextcloud-notes':         'nextcloud',
+    'nextcloud-mail':          'nextcloud',
     'nextcloud-activity':      'nextcloud',
     'nextcloud-status':        'nextcloud',
 };

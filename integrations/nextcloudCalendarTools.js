@@ -5,14 +5,22 @@
  * via Nextcloud OAuth, app-password Basic otherwise — exact same dual-mode
  * pattern as nextcloudTools.js).
  *
- * iCal serialisation is hand-written: events are simple enough that pulling
- * in a full RFC-5545 lib (ical.js, ical-generator) isn't justified. The
- * minimal VCALENDAR/VEVENT shape we emit round-trips through Nextcloud,
- * Outlook, Google Calendar, and Apple Calendar.
+ * iCal handling delegates to ical.js (RFC 5545 line folding, escaping,
+ * timezone resolution); WebDAV multistatus parsing uses fast-xml-parser.
  */
 
 const crypto = require('crypto');
+const ICAL = require('ical.js');
+const { XMLParser } = require('fast-xml-parser');
 const ncClient = require('./nextcloudClient');
+
+const xmlParser = new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: '@_',
+    removeNSPrefix: true,
+    parseTagValue: false,
+    trimValues: true,
+});
 
 const PROPFIND_CALENDARS = `<?xml version="1.0" encoding="utf-8" ?>
 <d:propfind xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:oc="http://owncloud.org/ns">
@@ -161,137 +169,110 @@ const NEXTCLOUD_CALENDAR_TOOLS = [
     }
 ];
 
-// ─── iCal helpers ──────────────────────────────────────────────────
+// ─── iCal helpers (ical.js-backed) ─────────────────────────────────
 
-function pad(n) { return String(n).padStart(2, '0'); }
-
-function toICalDateTime(iso, allDay) {
-    if (!iso) return null;
-    const d = new Date(iso);
+function toICalUtcStamp(iso) {
+    const d = iso ? new Date(iso) : new Date();
     if (isNaN(d.getTime())) throw new Error(`Invalid date: ${iso}`);
-    if (allDay) {
-        return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}`;
+    return ICAL.Time.fromJSDate(d, true).toICALString();
+}
+
+function icsTimeToISO(time) {
+    if (!time) return null;
+    if (time.isDate) {
+        // All-day: emit YYYY-MM-DD with no time component.
+        const pad = (n) => String(n).padStart(2, '0');
+        return `${time.year}-${pad(time.month)}-${pad(time.day)}`;
     }
-    return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
+    return time.toJSDate().toISOString();
 }
 
-function fromICalDateTime(value) {
-    if (!value) return null;
-    // Date-only (all-day): 20260501
-    const dateOnly = /^(\d{4})(\d{2})(\d{2})$/.exec(value);
-    if (dateOnly) return `${dateOnly[1]}-${dateOnly[2]}-${dateOnly[3]}`;
-    // UTC: 20260501T140000Z
-    const utc = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/.exec(value);
-    if (utc) return `${utc[1]}-${utc[2]}-${utc[3]}T${utc[4]}:${utc[5]}:${utc[6]}Z`;
-    // Floating local: 20260501T140000
-    const local = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})$/.exec(value);
-    if (local) return `${local[1]}-${local[2]}-${local[3]}T${local[4]}:${local[5]}:${local[6]}`;
-    return value;
-}
-
-function escapeICal(text) {
-    return String(text || '')
-        .replace(/\\/g, '\\\\')
-        .replace(/\n/g, '\\n')
-        .replace(/,/g, '\\,')
-        .replace(/;/g, '\\;');
-}
-
-function unescapeICal(text) {
-    return String(text || '')
-        .replace(/\\n/g, '\n')
-        .replace(/\\,/g, ',')
-        .replace(/\\;/g, ';')
-        .replace(/\\\\/g, '\\');
-}
-
-/**
- * Unfold RFC-5545 line continuations (any line beginning with a single space
- * or tab is appended to the previous line).
- */
-function unfoldICal(text) {
-    return text.replace(/\r\n[ \t]/g, '').replace(/\n[ \t]/g, '');
-}
-
-function parseVEvent(block) {
-    const lines = block.split(/\r?\n/);
-    const event = { uid: null, summary: null, description: null, location: null, attendees: [], dtstart: null, dtend: null, organizer: null, allDay: false, raw: block };
-    for (const line of lines) {
-        const colon = line.indexOf(':');
-        if (colon === -1) continue;
-        const left = line.slice(0, colon);
-        const value = line.slice(colon + 1);
-        const [name, ...params] = left.split(';');
-        switch (name) {
-            case 'UID': event.uid = value; break;
-            case 'SUMMARY': event.summary = unescapeICal(value); break;
-            case 'DESCRIPTION': event.description = unescapeICal(value); break;
-            case 'LOCATION': event.location = unescapeICal(value); break;
-            case 'DTSTART':
-                event.dtstart = fromICalDateTime(value);
-                if (params.some(p => p.startsWith('VALUE=DATE'))) event.allDay = true;
-                break;
-            case 'DTEND':
-                event.dtend = fromICalDateTime(value);
-                break;
-            case 'ORGANIZER': {
-                const cn = (params.find(p => p.startsWith('CN=')) || '').slice(3) || null;
-                event.organizer = { cn, email: value.replace(/^mailto:/i, '') };
-                break;
-            }
-            case 'ATTENDEE': {
-                const cn = (params.find(p => p.startsWith('CN=')) || '').slice(3) || null;
-                event.attendees.push({ cn, email: value.replace(/^mailto:/i, '') });
-                break;
-            }
-        }
+function eventFromIcal(vevent) {
+    const ev = new ICAL.Event(vevent);
+    const attendees = (ev.attendees || []).map((p) => {
+        const val = p.getFirstValue() || '';
+        return { cn: p.getParameter('cn') || null, email: String(val).replace(/^mailto:/i, '') };
+    });
+    let organizer = null;
+    if (ev.organizer) {
+        const orgProp = vevent.getFirstProperty('organizer');
+        const val = ev.organizer || '';
+        organizer = {
+            cn: orgProp ? (orgProp.getParameter('cn') || null) : null,
+            email: String(val).replace(/^mailto:/i, ''),
+        };
     }
-    return event;
+    return {
+        uid: ev.uid || null,
+        summary: ev.summary || null,
+        description: ev.description || null,
+        location: ev.location || null,
+        attendees,
+        dtstart: icsTimeToISO(ev.startDate),
+        dtend: icsTimeToISO(ev.endDate),
+        organizer,
+        allDay: !!(ev.startDate && ev.startDate.isDate),
+    };
 }
 
 function parseICal(text) {
-    const unfolded = unfoldICal(text);
-    const events = [];
-    const re = /BEGIN:VEVENT[\s\S]*?END:VEVENT/g;
-    let m;
-    while ((m = re.exec(unfolded)) !== null) events.push(parseVEvent(m[0]));
-    return events;
+    if (!text) return [];
+    let jcal;
+    try { jcal = ICAL.parse(text); } catch (_) { return []; }
+    const root = new ICAL.Component(jcal);
+    const vevents = root.getAllSubcomponents('vevent');
+    return vevents.map(eventFromIcal);
 }
 
-function buildVEvent({ uid, summary, start, end, description, location, attendees, allDay, dtstamp }) {
-    const lines = [
-        'BEGIN:VEVENT',
-        `UID:${uid}`,
-        `DTSTAMP:${dtstamp || toICalDateTime(new Date().toISOString())}`,
-    ];
+function buildVCalendarEvent({ uid, summary, start, end, description, location, attendees, allDay }) {
+    const cal = new ICAL.Component(['vcalendar', [], []]);
+    cal.updatePropertyWithValue('prodid', '-//Bee Flow//Nextcloud Calendar Tool//EN');
+    cal.updatePropertyWithValue('version', '2.0');
+    cal.updatePropertyWithValue('calscale', 'GREGORIAN');
+
+    const vevent = new ICAL.Component('vevent');
+    const event = new ICAL.Event(vevent);
+    event.uid = uid;
+    if (summary) event.summary = summary;
+    if (description) event.description = description;
+    if (location) event.location = location;
+
+    const startDate = new Date(start);
+    if (isNaN(startDate.getTime())) throw new Error(`Invalid start: ${start}`);
     if (allDay) {
-        lines.push(`DTSTART;VALUE=DATE:${toICalDateTime(start, true)}`);
-        if (end) lines.push(`DTEND;VALUE=DATE:${toICalDateTime(end, true)}`);
+        const sIso = startDate.toISOString().slice(0, 10).replace(/-/g, '');
+        const startTime = ICAL.Time.fromDateString(`${sIso.slice(0, 4)}-${sIso.slice(4, 6)}-${sIso.slice(6, 8)}`);
+        event.startDate = startTime;
+        if (end) {
+            const eDate = new Date(end);
+            const eIso = eDate.toISOString().slice(0, 10);
+            event.endDate = ICAL.Time.fromDateString(eIso);
+        }
     } else {
-        lines.push(`DTSTART:${toICalDateTime(start)}`);
-        if (end) lines.push(`DTEND:${toICalDateTime(end)}`);
-    }
-    if (summary) lines.push(`SUMMARY:${escapeICal(summary)}`);
-    if (description) lines.push(`DESCRIPTION:${escapeICal(description)}`);
-    if (location) lines.push(`LOCATION:${escapeICal(location)}`);
-    if (Array.isArray(attendees)) {
-        for (const a of attendees) {
-            if (a) lines.push(`ATTENDEE;CN=${escapeICal(a)};ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION:mailto:${a}`);
+        event.startDate = ICAL.Time.fromJSDate(startDate, true);
+        if (end) {
+            const eDate = new Date(end);
+            if (isNaN(eDate.getTime())) throw new Error(`Invalid end: ${end}`);
+            event.endDate = ICAL.Time.fromJSDate(eDate, true);
         }
     }
-    lines.push('END:VEVENT');
-    return lines.join('\r\n');
-}
 
-function wrapVCalendar(vevent) {
-    return [
-        'BEGIN:VCALENDAR',
-        'VERSION:2.0',
-        'PRODID:-//Bee Flow//Nextcloud Calendar Tool//EN',
-        'CALSCALE:GREGORIAN',
-        vevent,
-        'END:VCALENDAR',
-    ].join('\r\n');
+    vevent.updatePropertyWithValue('dtstamp', ICAL.Time.fromJSDate(new Date(), true));
+
+    if (Array.isArray(attendees)) {
+        for (const a of attendees) {
+            if (!a) continue;
+            const prop = new ICAL.Property('attendee', vevent);
+            prop.setParameter('cn', String(a));
+            prop.setParameter('role', 'REQ-PARTICIPANT');
+            prop.setParameter('partstat', 'NEEDS-ACTION');
+            prop.setValue(`mailto:${a}`);
+            vevent.addProperty(prop);
+        }
+    }
+
+    cal.addSubcomponent(vevent);
+    return cal.toString();
 }
 
 // ─── DAV helpers ──────────────────────────────────────────────────
@@ -304,45 +285,68 @@ function eventHref(baseUrl, uid, calendar, eventUid) {
     return `${calendarsRoot(baseUrl, uid)}/${encodeURIComponent(calendar)}/${encodeURIComponent(eventUid)}.ics`;
 }
 
+// Normalize a multistatus XML response into [{ href, props }] — only 2xx
+// propstat entries are merged. Reused for both PROPFIND and REPORT replies.
+function parseMultistatusResponses(xml) {
+    const parsed = xmlParser.parse(xml);
+    const ms = parsed?.multistatus;
+    if (!ms) return [];
+    const list = Array.isArray(ms.response) ? ms.response : (ms.response ? [ms.response] : []);
+    return list.map((r) => {
+        const propstats = Array.isArray(r.propstat) ? r.propstat : (r.propstat ? [r.propstat] : []);
+        const props = {};
+        for (const ps of propstats) {
+            const status = ps.status || '';
+            if (status && !/\b2\d\d\b/.test(status)) continue;
+            Object.assign(props, ps.prop || {});
+        }
+        return { href: r.href || '', props };
+    });
+}
+
+function supportsVEvent(props) {
+    const set = props['supported-calendar-component-set'];
+    if (!set || !set.comp) return false;
+    const comps = Array.isArray(set.comp) ? set.comp : [set.comp];
+    return comps.some((c) => c && (c['@_name'] === 'VEVENT' || c.name === 'VEVENT'));
+}
+
+function hasWritePrivilege(props) {
+    const ps = props['current-user-privilege-set'];
+    if (!ps) return false;
+    const privs = Array.isArray(ps.privilege) ? ps.privilege : (ps.privilege ? [ps.privilege] : []);
+    return privs.some((p) => p && (p.write !== undefined || p['write-content'] !== undefined));
+}
+
 function parsePropfindCalendars(xml, baseUrl, uid) {
-    const calendars = [];
-    const respRegex = /<d:response[\s>][\s\S]*?<\/d:response>/g;
-    const matches = xml.match(respRegex) || [];
     const root = `/remote.php/dav/calendars/${decodeURIComponent(uid)}`;
-    for (const block of matches) {
-        // Only entries that explicitly support VEVENT — drops trash + addressbook noise.
-        if (!/<c:supported-calendar-component-set>[\s\S]*?<c:comp\s+name="VEVENT"/.test(block)) continue;
-        const href = (block.match(/<d:href>([^<]+)<\/d:href>/) || [])[1];
-        if (!href) continue;
+    const calendars = [];
+    for (const { href, props } of parseMultistatusResponses(xml)) {
+        if (!href || !supportsVEvent(props)) continue;
         const decoded = decodeURIComponent(href);
-        // Skip the user root itself — it's not a calendar, just the container.
         if (decoded.replace(/\/+$/, '') === root) continue;
         const slug = decoded.replace(/\/+$/, '').split('/').pop();
-        const displayname = (block.match(/<d:displayname>([^<]*)<\/d:displayname>/) || [])[1] || slug;
-        const writable = /<d:privilege>\s*<d:write/i.test(block) || /<d:current-user-privilege-set>[\s\S]*<d:write/i.test(block);
-        calendars.push({ slug, displayName: unescapeICal(displayname), href, writable });
+        const displayname = props.displayname || slug;
+        calendars.push({
+            slug,
+            displayName: displayname,
+            href,
+            writable: hasWritePrivilege(props),
+        });
     }
     return calendars;
 }
 
 function parseMultiStatus(xml) {
     // Returns [{ href, etag, calendarData }] — used by REPORT calendar-query.
-    const responses = [];
-    const respRegex = /<d:response[\s>][\s\S]*?<\/d:response>/g;
-    const matches = xml.match(respRegex) || [];
-    for (const block of matches) {
-        const href = (block.match(/<d:href>([^<]+)<\/d:href>/) || [])[1];
-        const etag = (block.match(/<d:getetag>([^<]+)<\/d:getetag>/) || [])[1];
-        const cal = (block.match(/<c:calendar-data[^>]*>([\s\S]*?)<\/c:calendar-data>/) || [])[1];
-        if (href && cal) {
-            responses.push({
-                href: decodeURIComponent(href),
-                etag,
-                calendarData: cal.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&'),
-            });
-        }
-    }
-    return responses;
+    return parseMultistatusResponses(xml)
+        .filter(({ href, props }) => href && props['calendar-data'] !== undefined)
+        .map(({ href, props }) => ({
+            href: decodeURIComponent(href),
+            etag: props.getetag || null,
+            // fast-xml-parser already decoded entities; calendar-data is the inner ICS text.
+            calendarData: props['calendar-data'] || '',
+        }));
 }
 
 // ─── Tool execution ──────────────────────────────────────────────
@@ -369,10 +373,10 @@ async function executeNextcloudCalendarTool(toolName, args, userId, session) {
         case 'nextcloud_calendar_list_events': {
             const calendar = args.calendar || 'personal';
             const limit = Math.min(Math.max(args.limit || 100, 1), 500);
-            const start = args.start ? toICalDateTime(args.start) : toICalDateTime(new Date().toISOString());
+            const start = args.start ? toICalUtcStamp(args.start) : toICalUtcStamp(new Date().toISOString());
             const end = args.end
-                ? toICalDateTime(args.end)
-                : toICalDateTime(new Date(Date.now() + 30 * 86400_000).toISOString());
+                ? toICalUtcStamp(args.end)
+                : toICalUtcStamp(new Date(Date.now() + 30 * 86400_000).toISOString());
 
             const res = await ncFetch(`${calRoot}/${encodeURIComponent(calendar)}/`, {
                 method: 'REPORT',
@@ -412,8 +416,8 @@ async function executeNextcloudCalendarTool(toolName, args, userId, session) {
                 targetSlugs = parsePropfindCalendars(listXml, baseUrl, uid).map(c => c.slug);
             }
 
-            const start = args.start ? toICalDateTime(args.start) : null;
-            const end = args.end ? toICalDateTime(args.end) : null;
+            const start = args.start ? toICalUtcStamp(args.start) : null;
+            const end = args.end ? toICalUtcStamp(args.end) : null;
             const matches = [];
 
             for (const slug of targetSlugs) {
@@ -457,9 +461,9 @@ async function executeNextcloudCalendarTool(toolName, args, userId, session) {
             if (!args.calendar || !args.summary || !args.start) {
                 return { error: 'calendar, summary, and start are required' };
             }
-            const eventUid = `${crypto.randomBytes(8).toString('hex')}-${Date.now()}@beeflow`;
+            const eventUid = `${crypto.randomUUID()}@${new URL(baseUrl).hostname}`;
             const end = args.end || new Date(new Date(args.start).getTime() + 60 * 60_000).toISOString();
-            const ical = wrapVCalendar(buildVEvent({
+            const ical = buildVCalendarEvent({
                 uid: eventUid,
                 summary: args.summary,
                 start: args.start,
@@ -468,7 +472,7 @@ async function executeNextcloudCalendarTool(toolName, args, userId, session) {
                 location: args.location,
                 attendees: args.attendees,
                 allDay: !!args.allDay,
-            }));
+            });
             const res = await ncFetch(eventHref(baseUrl, uid, args.calendar, eventUid), {
                 method: 'PUT',
                 headers: { 'Content-Type': 'text/calendar; charset=utf-8', 'If-None-Match': '*' },
@@ -504,7 +508,7 @@ async function executeNextcloudCalendarTool(toolName, args, userId, session) {
                 attendees: args.attendees !== undefined ? args.attendees : (current.attendees || []).map(a => a.email),
                 allDay: current.allDay,
             };
-            const ical = wrapVCalendar(buildVEvent(merged));
+            const ical = buildVCalendarEvent(merged);
             const putRes = await ncFetch(eventHref(baseUrl, uid, args.calendar, args.uid), {
                 method: 'PUT',
                 headers: {

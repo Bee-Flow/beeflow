@@ -278,15 +278,34 @@ function compareDates(iso, opIso, op) {
 
 // ─── Tool execution ──────────────────────────────────────────────
 
+// Deck splits its surface across two URL families:
+//   - REST  /index.php/apps/deck/api/v1.0/...  → no OCS-APIRequest header
+//   - OCS   /ocs/v2.php/apps/deck/api/v1.0/... → OCS-APIRequest required
+// Sending OCS-APIRequest on the REST family triggers a 401 in some Nextcloud
+// versions because NC's framework switches to the OCS auth middleware mid-flight.
+const REST_HEADERS = { 'Accept': 'application/json' };
+const OCS_HEADERS  = { 'Accept': 'application/json', 'OCS-APIRequest': 'true' };
+
 async function executeNextcloudDeckTool(toolName, args, userId, session) {
-    const ctx = await ncClient.resolveAuth(session, userId);
+    // Deck's REST controllers (BoardApiController, StackApiController, etc.)
+    // are #[CORS]-annotated, so Nextcloud's CORS middleware rejects OAuth
+    // Bearer auth (logs the session out, demands HTTP Basic). Prefer the
+    // user's app password when available; fall back to OAuth only for
+    // environments where Bearer happens to work (some older NC versions).
+    let ctx = await ncClient.resolveBasicAuthOrNull(userId);
+    if (!ctx) {
+        if (ncClient.isNextcloudOAuthSession(session)) {
+            return { error: ncClient.CORS_AUTH_ERROR };
+        }
+        ctx = await ncClient.resolveAuth(session, userId);
+    }
     const { baseUrl, fetch: ncFetch, authError } = ctx;
     const api = deckRoot(baseUrl);
 
     switch (toolName) {
         case 'nextcloud_deck_list_boards': {
             const url = `${api}/boards${args.includeArchived ? '?details=true' : ''}`;
-            const res = await ncFetch(url, { headers: { 'Accept': 'application/json', 'OCS-APIRequest': 'true' } });
+            const res = await ncFetch(url, { headers: REST_HEADERS });
             if (res.status === 401) return { error: authError };
             if (!res.ok) return { error: `Deck boards list failed (${res.status})` };
             const boards = await readJsonSafe(res);
@@ -302,7 +321,7 @@ async function executeNextcloudDeckTool(toolName, args, userId, session) {
 
         case 'nextcloud_deck_get_board': {
             if (!args.boardId) return { error: 'boardId is required' };
-            const res = await ncFetch(`${api}/boards/${args.boardId}`, { headers: { 'Accept': 'application/json', 'OCS-APIRequest': 'true' } });
+            const res = await ncFetch(`${api}/boards/${args.boardId}`, { headers: REST_HEADERS });
             if (res.status === 401) return { error: authError };
             if (res.status === 404) return { error: `Board not found: ${args.boardId}` };
             if (!res.ok) return { error: `Deck board fetch failed (${res.status})` };
@@ -311,7 +330,7 @@ async function executeNextcloudDeckTool(toolName, args, userId, session) {
 
         case 'nextcloud_deck_list_stacks': {
             if (!args.boardId) return { error: 'boardId is required' };
-            const res = await ncFetch(`${api}/boards/${args.boardId}/stacks`, { headers: { 'Accept': 'application/json', 'OCS-APIRequest': 'true' } });
+            const res = await ncFetch(`${api}/boards/${args.boardId}/stacks`, { headers: REST_HEADERS });
             if (res.status === 401) return { error: authError };
             if (!res.ok) return { error: `Stack list failed (${res.status})` };
             const stacks = await readJsonSafe(res);
@@ -324,7 +343,7 @@ async function executeNextcloudDeckTool(toolName, args, userId, session) {
         case 'nextcloud_deck_search_cards': {
             if (!args.boardId) return { error: 'boardId is required' };
             const res = await ncFetch(`${api}/boards/${args.boardId}/stacks${args.includeArchived ? '/archived' : ''}`, {
-                headers: { 'Accept': 'application/json', 'OCS-APIRequest': 'true' },
+                headers: REST_HEADERS,
             });
             if (res.status === 401) return { error: authError };
             if (!res.ok) return { error: `Card list failed (${res.status})` };
@@ -361,7 +380,7 @@ async function executeNextcloudDeckTool(toolName, args, userId, session) {
         case 'nextcloud_deck_get_card': {
             if (!args.boardId || !args.stackId || !args.cardId) return { error: 'boardId, stackId, cardId required' };
             const res = await ncFetch(`${api}/boards/${args.boardId}/stacks/${args.stackId}/cards/${args.cardId}`, {
-                headers: { 'Accept': 'application/json', 'OCS-APIRequest': 'true' },
+                headers: REST_HEADERS,
             });
             if (res.status === 401) return { error: authError };
             if (res.status === 404) return { error: `Card not found: ${args.cardId}` };
@@ -373,7 +392,7 @@ async function executeNextcloudDeckTool(toolName, args, userId, session) {
             if (!args.boardId || !args.stackId || !args.title) return { error: 'boardId, stackId, title required' };
             const res = await deckJson(ncFetch, `${api}/boards/${args.boardId}/stacks/${args.stackId}/cards`, {
                 method: 'POST',
-                headers: { 'OCS-APIRequest': 'true' },
+                headers: REST_HEADERS,
                 body: {
                     title: args.title,
                     type: args.type || 'plain',
@@ -394,7 +413,7 @@ async function executeNextcloudDeckTool(toolName, args, userId, session) {
             if (!args.boardId || !args.stackId || !args.cardId) return { error: 'boardId, stackId, cardId required' };
             // Deck's PUT replaces the card — fetch first and merge.
             const cardRes = await ncFetch(`${api}/boards/${args.boardId}/stacks/${args.stackId}/cards/${args.cardId}`, {
-                headers: { 'Accept': 'application/json', 'OCS-APIRequest': 'true' },
+                headers: REST_HEADERS,
             });
             if (cardRes.status === 401) return { error: authError };
             if (cardRes.status === 404) return { error: `Card not found: ${args.cardId}` };
@@ -411,7 +430,7 @@ async function executeNextcloudDeckTool(toolName, args, userId, session) {
             };
             const putRes = await deckJson(ncFetch, `${api}/boards/${args.boardId}/stacks/${args.stackId}/cards/${args.cardId}`, {
                 method: 'PUT',
-                headers: { 'OCS-APIRequest': 'true' },
+                headers: REST_HEADERS,
                 body: merged,
             });
             if (putRes.status === 401) return { error: authError };
@@ -425,7 +444,7 @@ async function executeNextcloudDeckTool(toolName, args, userId, session) {
             if (args.targetStackId && args.targetStackId !== args.stackId) {
                 const moveRes = await deckJson(ncFetch, `${api}/boards/${args.boardId}/stacks/${args.stackId}/cards/${args.cardId}/reorder`, {
                     method: 'PUT',
-                    headers: { 'OCS-APIRequest': 'true' },
+                    headers: REST_HEADERS,
                     body: { order: args.order !== undefined ? args.order : 0, stackId: args.targetStackId },
                 });
                 if (!moveRes.ok) {
@@ -440,13 +459,13 @@ async function executeNextcloudDeckTool(toolName, args, userId, session) {
             if (!args.boardId || !args.stackId || !args.cardId) return { error: 'boardId, stackId, cardId required' };
             const archived = args.archived === false ? false : true;
             const cardRes = await ncFetch(`${api}/boards/${args.boardId}/stacks/${args.stackId}/cards/${args.cardId}`, {
-                headers: { 'Accept': 'application/json', 'OCS-APIRequest': 'true' },
+                headers: REST_HEADERS,
             });
             if (!cardRes.ok) return { error: `Could not load card (${cardRes.status})` };
             const current = await readJsonSafe(cardRes);
             const putRes = await deckJson(ncFetch, `${api}/boards/${args.boardId}/stacks/${args.stackId}/cards/${args.cardId}`, {
                 method: 'PUT',
-                headers: { 'OCS-APIRequest': 'true' },
+                headers: REST_HEADERS,
                 body: {
                     title: current.title,
                     description: current.description || '',
@@ -468,7 +487,7 @@ async function executeNextcloudDeckTool(toolName, args, userId, session) {
             if (!args.boardId || !args.stackId || !args.cardId) return { error: 'boardId, stackId, cardId required' };
             const res = await ncFetch(`${api}/boards/${args.boardId}/stacks/${args.stackId}/cards/${args.cardId}`, {
                 method: 'DELETE',
-                headers: { 'OCS-APIRequest': 'true', 'Accept': 'application/json' },
+                headers: REST_HEADERS,
             });
             if (res.status === 401) return { error: authError };
             if (res.status === 404) return { error: `Card not found: ${args.cardId}` };
@@ -482,7 +501,7 @@ async function executeNextcloudDeckTool(toolName, args, userId, session) {
             const op = toolName === 'nextcloud_deck_assign_label' ? 'assignLabel' : 'removeLabel';
             const res = await deckJson(ncFetch, `${api}/boards/${args.boardId}/stacks/${args.stackId}/cards/${args.cardId}/${op}`, {
                 method: 'PUT',
-                headers: { 'OCS-APIRequest': 'true' },
+                headers: REST_HEADERS,
                 body: { labelId: args.labelId },
             });
             if (res.status === 401) return { error: authError };
@@ -499,7 +518,7 @@ async function executeNextcloudDeckTool(toolName, args, userId, session) {
             const url = `${commentsRoot(baseUrl)}/cards/${args.cardId}/comments`;
             const res = await deckJson(ncFetch, url, {
                 method: 'POST',
-                headers: { 'OCS-APIRequest': 'true' },
+                headers: OCS_HEADERS,
                 body: {
                     message: args.message,
                     parentId: args.parentId || 0,
@@ -518,7 +537,7 @@ async function executeNextcloudDeckTool(toolName, args, userId, session) {
             if (!args.cardId) return { error: 'cardId is required' };
             const limit = Math.min(Math.max(args.limit || 50, 1), 200);
             const url = `${commentsRoot(baseUrl)}/cards/${args.cardId}/comments?limit=${limit}`;
-            const res = await ncFetch(url, { headers: { 'Accept': 'application/json', 'OCS-APIRequest': 'true' } });
+            const res = await ncFetch(url, { headers: OCS_HEADERS });
             if (res.status === 401) return { error: authError };
             if (!res.ok) return { error: `Comment list failed (${res.status})` };
             const data = await readJsonSafe(res);

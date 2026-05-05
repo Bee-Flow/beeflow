@@ -37,9 +37,21 @@ async function compactMessages(messages, options = {}) {
         return { messages: [...systemMessages, ...pruneToolResults(convMessages)], newSummary: null };
     }
 
-    // Split into old (to summarize) and recent (to keep verbatim)
-    const oldMessages = convMessages.slice(0, convMessages.length - RECENT_WINDOW);
-    const recentMessages = convMessages.slice(convMessages.length - RECENT_WINDOW);
+    // Split into old (to summarize) and recent (to keep verbatim).
+    // The naive boundary `length - RECENT_WINDOW` can land directly on an
+    // orphan `tool` message — its matching assistant(tool_use) is the last
+    // message in `old`, which gets collapsed into the summary. Anthropic
+    // then rejects the request with "unexpected tool_use_id found in
+    // tool_result blocks". Walk the boundary forward past every leading
+    // tool message so the recent window always starts on a normal turn.
+    // (An assistant(tool_use) at the boundary IS fine — its results follow
+    // in the recent window.)
+    let boundary = convMessages.length - RECENT_WINDOW;
+    while (boundary < convMessages.length && convMessages[boundary].role === 'tool') {
+        boundary++;
+    }
+    const oldMessages = convMessages.slice(0, boundary);
+    const recentMessages = convMessages.slice(boundary);
 
     // Hoist any image_url blocks from the summarised window so visual context
     // isn't lost when their text gets collapsed into a summary. Deduped by URL

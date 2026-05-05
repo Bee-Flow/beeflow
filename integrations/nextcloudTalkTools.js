@@ -220,7 +220,9 @@ async function executeNextcloudTalkTool(toolName, args, userId, session) {
 
     switch (toolName) {
         case 'nextcloud_talk_list_rooms': {
-            const url = `${v4(baseUrl)}/room${args.includeStatus ? '?includeStatus=true' : ''}&format=json`.replace(/\?$/, '').replace('?&', '?');
+            const params = new URLSearchParams({ format: 'json' });
+            if (args.includeStatus) params.set('includeStatus', 'true');
+            const url = `${v4(baseUrl)}/room?${params.toString()}`;
             const res = await ncFetch(url, { headers: COMMON_HEADERS });
             if (res.status === 401) return { error: authError };
             if (res.status === 404) return { error: 'Talk app is not installed/enabled on this Nextcloud server.' };

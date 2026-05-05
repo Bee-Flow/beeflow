@@ -47,6 +47,7 @@ const { isNextcloudNotificationsTool, executeNextcloudNotificationsTool } = requ
 const { isNextcloudTalkTool, executeNextcloudTalkTool } = require('../integrations/nextcloudTalkTools');
 const { isNextcloudTasksTool, executeNextcloudTasksTool } = require('../integrations/nextcloudTasksTools');
 const { isNextcloudNotesTool, executeNextcloudNotesTool } = require('../integrations/nextcloudNotesTools');
+const { isNextcloudMailTool, executeNextcloudMailTool } = require('../integrations/nextcloudMailTools');
 const { isNextcloudActivityTool, executeNextcloudActivityTool } = require('../integrations/nextcloudActivityTools');
 const { isNextcloudStatusTool, executeNextcloudStatusTool } = require('../integrations/nextcloudStatusTools');
 
@@ -378,6 +379,9 @@ async function executeTool(toolName, toolArgs, context = {}) {
     }
     if (isNextcloudNotesTool(toolName)) {
         return await executeNextcloudNotesTool(toolName, toolArgs, userId, session);
+    }
+    if (isNextcloudMailTool(toolName)) {
+        return await executeNextcloudMailTool(toolName, toolArgs, userId, session);
     }
     if (isNextcloudActivityTool(toolName)) {
         return await executeNextcloudActivityTool(toolName, toolArgs, userId, session);
