@@ -47,8 +47,18 @@ const OUTPUT_SCHEMAS = {
         },
     },
     gmail_compose: {
-        shape: { success: 'boolean', messageId: 'string', message: 'string' },
-        sample: { success: true, messageId: 'msg-sent-1', message: 'Email sent via Gmail' },
+        // Automation runtime sets autoSend=true, so the live result is the
+        // sent-email shape, not a draft envelope. Sample matches what the
+        // tool actually returns now (see integrations/gmailTools.js).
+        shape: {
+            sent: 'boolean', messageId: 'string', threadId: 'string',
+            to: 'string', subject: 'string', message: 'string',
+        },
+        sample: { sent: true, messageId: 'msg-sent-1', threadId: 'th-sent-1', to: 'recipient@example.com', subject: 'Sample subject', message: 'Email sent.' },
+    },
+    gmail_compose_reply: {
+        shape: { sent: 'boolean', messageId: 'string', threadId: 'string', message: 'string' },
+        sample: { sent: true, messageId: 'msg-reply-1', threadId: 'th-1', message: 'Reply sent.' },
     },
 
     // ── Google Calendar ───────────────────────────────────────────
@@ -146,6 +156,96 @@ const OUTPUT_SCHEMAS = {
         sample: { id: 'PROJ-1', summary: 'Sample issue', description: 'Issue body…', state: 'Open', assignee: 'someone', comments: [] },
     },
 
+    // ── Outlook / Microsoft 365 ───────────────────────────────────
+    outlook_send: {
+        shape: { sent: 'boolean', messageId: 'string', conversationId: 'string', message: 'string' },
+        sample: { sent: true, messageId: 'msg-sent-1', conversationId: 'conv-1', message: 'Email sent via Outlook.' },
+    },
+    outlook_compose: {
+        shape: { sent: 'boolean', messageId: 'string', message: 'string' },
+        sample: { sent: true, messageId: 'msg-sent-1', message: 'Email sent.' },
+    },
+    ms_calendar_create_event: {
+        shape: { id: 'string', subject: 'string', start: 'string', end: 'string', webLink: 'string' },
+        sample: { id: 'evt-new', subject: 'Created event', start: new Date().toISOString(), end: new Date(Date.now() + 3600_000).toISOString(), webLink: 'https://outlook.office.com/calendar/event/evt-new' },
+    },
+
+    // ── Calendar writes ───────────────────────────────────────────
+    calendar_update_event: {
+        shape: { id: 'string', summary: 'string', updated: 'boolean', htmlLink: 'string' },
+        sample: { id: 'evt-1', summary: 'Updated event', updated: true, htmlLink: 'https://calendar.google.com/event?eid=…' },
+    },
+    calendar_delete_event: {
+        shape: { id: 'string', deleted: 'boolean' },
+        sample: { id: 'evt-1', deleted: true },
+    },
+
+    // ── YouTrack ──────────────────────────────────────────────────
+    youtrack_create_issue: {
+        shape: { id: 'string', summary: 'string', url: 'string', project: 'string' },
+        sample: { id: 'PROJ-42', summary: 'Created issue', url: 'https://youtrack.example.com/issue/PROJ-42', project: 'PROJ' },
+    },
+    youtrack_update_issue: {
+        shape: { id: 'string', updated: 'boolean' },
+        sample: { id: 'PROJ-42', updated: true },
+    },
+    youtrack_add_comment: {
+        shape: { id: 'string', issueId: 'string', commentId: 'string', added: 'boolean' },
+        sample: { id: 'comment-1', issueId: 'PROJ-42', commentId: 'comment-1', added: true },
+    },
+
+    // ── Drive / Docs writes ───────────────────────────────────────
+    drive_create_folder: {
+        shape: { id: 'string', name: 'string', webViewLink: 'string' },
+        sample: { id: 'folder-1', name: 'New folder', webViewLink: 'https://drive.google.com/drive/folders/folder-1' },
+    },
+    drive_move_file: {
+        shape: { id: 'string', moved: 'boolean', newParentId: 'string' },
+        sample: { id: 'file-1', moved: true, newParentId: 'folder-1' },
+    },
+
+    // ── Contacts ──────────────────────────────────────────────────
+    contacts_create: {
+        shape: { resourceName: 'string', name: 'string', email: 'string' },
+        sample: { resourceName: 'people/c12345', name: 'Sample contact', email: 'sample@example.com' },
+    },
+
+    // ── LinkedIn ──────────────────────────────────────────────────
+    linkedin_create_post: {
+        shape: { id: 'string', url: 'string', published: 'boolean' },
+        sample: { id: 'urn:li:share:1', url: 'https://www.linkedin.com/feed/update/urn:li:share:1', published: true },
+    },
+
+    // ── SignRequest ───────────────────────────────────────────────
+    signrequest_send_document: {
+        shape: { id: 'string', uuid: 'string', url: 'string', signers: 'array of { email, status }' },
+        sample: { id: 'sr-1', uuid: 'doc-uuid-1', url: 'https://signrequest.com/d/doc-uuid-1', signers: [{ email: 'recipient@example.com', status: 'pending' }] },
+    },
+
+    // ── Nextcloud Mail / Talk / Calendar / Notifications ──────────
+    nextcloud_mail_send: {
+        shape: { sent: 'boolean', messageId: 'string', message: 'string' },
+        sample: { sent: true, messageId: 'nc-mail-1', message: 'Email sent via Nextcloud Mail.' },
+    },
+    nextcloud_talk_send_message: {
+        shape: { id: 'integer', token: 'string', message: 'string', sent: 'boolean' },
+        sample: { id: 1, token: 'room-token', message: 'Message text', sent: true },
+    },
+    nextcloud_calendar_create_event: {
+        shape: { id: 'string', uri: 'string', summary: 'string', start: 'string', end: 'string' },
+        sample: { id: 'nc-evt-1', uri: '/event/uri', summary: 'Created event', start: new Date().toISOString(), end: new Date(Date.now() + 3600_000).toISOString() },
+    },
+    nextcloud_notifications_send: {
+        shape: { sent: 'boolean', notificationId: 'integer' },
+        sample: { sent: true, notificationId: 1 },
+    },
+
+    // ── GitHub writes ─────────────────────────────────────────────
+    github_create_repo: {
+        shape: { id: 'integer', name: 'string', fullName: 'string', htmlUrl: 'string', private: 'boolean' },
+        sample: { id: 1, name: 'new-repo', fullName: 'org/new-repo', htmlUrl: 'https://github.com/org/new-repo', private: false },
+    },
+
     // ── Notification (built-in step) ──────────────────────────────
     // Not technically a tool, but exposed for symmetry.
 };
@@ -156,8 +256,9 @@ function getOutputSchema(toolName) {
 
 /**
  * Synthesize a typed placeholder output for dry-run when a tool has a
- * declared schema. Falls back to a sentinel object describing what
- * *would* have been called.
+ * declared schema. Falls back to a name-pattern guess (so unschema'd
+ * write tools still produce a plausible shape the AI can bind against),
+ * and a last-resort sentinel object.
  *
  * Returns a deep clone so callers can mutate freely.
  */
@@ -165,6 +266,39 @@ function synthesizeDryRunOutput(toolName, args) {
     const schema = OUTPUT_SCHEMAS[toolName];
     if (schema?.sample !== undefined) {
         return JSON.parse(JSON.stringify(schema.sample));
+    }
+    // Name-pattern fallback. Most write actions follow a verb suffix
+    // convention; we synthesise a shape that matches what those tools
+    // actually return at runtime so an automation built on top of an
+    // unschema'd tool still gets a workable bind target during dry-run.
+    return inferShapeFromName(toolName, args);
+}
+
+const VERB_SUFFIX_SHAPES = [
+    { match: /_send(_message)?$/,     sample: () => ({ sent: true, id: 'sample-id', message: 'Sent (dry-run preview).' }) },
+    { match: /_reply$/,                sample: () => ({ sent: true, id: 'sample-id', message: 'Reply sent (dry-run preview).' }) },
+    { match: /_compose$/,              sample: () => ({ sent: true, id: 'sample-id', message: 'Sent (dry-run preview).' }) },
+    { match: /_post$/,                 sample: () => ({ id: 'sample-id', published: true, url: 'https://example.com/sample-id' }) },
+    { match: /_create(_[a-z_]+)?$/,    sample: () => ({ id: 'sample-id', created: true, url: 'https://example.com/sample-id' }) },
+    { match: /_add(_[a-z_]+)?$/,       sample: () => ({ id: 'sample-id', added: true }) },
+    { match: /_update(_[a-z_]+)?$/,    sample: () => ({ id: 'sample-id', updated: true }) },
+    { match: /_set(_[a-z_]+)?$/,       sample: () => ({ id: 'sample-id', set: true }) },
+    { match: /_delete(_[a-z_]+)?$/,    sample: () => ({ id: 'sample-id', deleted: true }) },
+    { match: /_remove(_[a-z_]+)?$/,    sample: () => ({ id: 'sample-id', removed: true }) },
+    { match: /_move(_[a-z_]+)?$/,      sample: () => ({ id: 'sample-id', moved: true }) },
+    { match: /_share(_[a-z_]+)?$/,     sample: () => ({ id: 'sample-id', shared: true, url: 'https://example.com/share/sample-id' }) },
+    { match: /_write$/,                sample: () => ({ id: 'sample-id', written: true }) },
+    { match: /_attach$/,               sample: () => ({ id: 'sample-id', attached: true }) },
+];
+
+function inferShapeFromName(toolName, args) {
+    if (typeof toolName !== 'string') {
+        return { _dryRun: true, wouldHaveCalled: toolName, withArgs: args || {} };
+    }
+    for (const { match, sample } of VERB_SUFFIX_SHAPES) {
+        if (match.test(toolName)) {
+            return { ...sample(), _dryRun: true, _inferred: true, wouldHaveCalled: toolName };
+        }
     }
     return { _dryRun: true, wouldHaveCalled: toolName, withArgs: args || {} };
 }

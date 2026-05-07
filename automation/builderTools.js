@@ -426,7 +426,47 @@ async function applyInspectTool(args, draftWrap) {
  * report describing what changed (becomes the `tool` message back to the
  * LLM and feeds the SSE update to the frontend).
  */
+/**
+ * Build a tiny summary of the current draft's step IDs so every mutation
+ * result reminds the LLM of the exact ids it must use for downstream
+ * `afterStepId` / refs / template paths. Without this the model
+ * fabricated short ids like "step_1" that didn't exist in the draft —
+ * the dry-run then ran with broken bindings and the AI had to spend
+ * extra iterations un-tangling its own mistake.
+ */
+function summariseDraftSteps(draft) {
+    const list = [];
+    if (draft?.trigger?.id) list.push({ id: draft.trigger.id, type: 'trigger', kind: draft.trigger.kind });
+    for (const s of (draft?.steps || [])) {
+        list.push({
+            id: s.id,
+            type: s.type,
+            tool: s.tool || undefined,
+            label: s.label || undefined,
+        });
+    }
+    return list;
+}
+
+const MUTATING_TOOLS = new Set([
+    'builder_propose_trigger', 'builder_add_action', 'builder_add_ai_step',
+    'builder_add_condition', 'builder_add_loop', 'builder_add_code_step',
+    'builder_add_notification', 'builder_remove_step', 'builder_set_metadata',
+]);
+
 async function applyToolCall(name, args, draftWrap) {
+    const result = await _applyToolCallRaw(name, args, draftWrap);
+    // For every mutation, append a `_draftSteps` reminder so the LLM has
+    // the live id list in front of it on the next turn. Tools that read
+    // (summarise/inspect/dry_run/finalize) don't need this — their own
+    // result is already the relevant shape.
+    if (MUTATING_TOOLS.has(name) && result && typeof result === 'object' && !result.error) {
+        result._draftSteps = summariseDraftSteps(draftWrap.def);
+    }
+    return result;
+}
+
+async function _applyToolCallRaw(name, args, draftWrap) {
     const draft = draftWrap.def;
     switch (name) {
         case 'builder_propose_trigger':    return applyTrigger(draft, args);

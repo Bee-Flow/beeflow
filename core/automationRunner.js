@@ -70,6 +70,26 @@ async function resolveUserSession(userId) {
 
 // ── DAG traversal helpers ───────────────────────────────
 
+/**
+ * True when a tool result is "empty" by the conventions of our integration
+ * tools — used by the dry-run fallback so the AI gets a sample shape to
+ * bind against instead of binding to undefined keys on an empty object.
+ */
+function isEmptyToolResult(result) {
+    if (result == null) return true;
+    if (typeof result === 'string') return result.trim().length === 0;
+    if (Array.isArray(result)) return result.length === 0;
+    if (typeof result !== 'object') return false;
+    if (result.error) return false; // already an error path
+    const arrayKeys = ['results', 'items', 'events', 'messages', 'tasks', 'cards', 'notes', 'rows'];
+    for (const k of arrayKeys) {
+        if (Array.isArray(result[k]) && result[k].length === 0) return true;
+    }
+    if (typeof result.total === 'number' && result.total === 0) return true;
+    if (typeof result.count === 'number' && result.count === 0) return true;
+    return false;
+}
+
 function buildAdjacency(def) {
     const adj = new Map();
     const incoming = new Map();
@@ -132,15 +152,37 @@ async function execIntegrationAction(step, ctx, runState, mode) {
     }
 
     const { executeTool } = require('./toolDispatcher');
-    const result = await executeTool(step.tool, inputs, {
-        userId: ctx.userId,
-        session: ctx.session,
-        orgId: ctx.orgId,
-        // Tell email/ticket-style tools that there is NO user UI here to
-        // approve a draft — emit the side effect immediately. Only set
-        // for live mode (dry_run is handled above with synthesized output).
-        autoSend: mode === 'live',
-    });
+    let result;
+    try {
+        result = await executeTool(step.tool, inputs, {
+            userId: ctx.userId,
+            session: ctx.session,
+            orgId: ctx.orgId,
+            // Tell email/ticket-style tools that there is NO user UI here to
+            // approve a draft — emit the side effect immediately. Only set
+            // for live mode (dry_run is handled above with synthesized output).
+            autoSend: mode === 'live',
+        });
+    } catch (err) {
+        // Read-only tool fallback in dry-run: when a search/read tool fails
+        // (auth lapsed, query yielded nothing, transient API hiccup) the
+        // automation builder still needs a workable bind target downstream.
+        // Substitute the curated sample so the AI can keep planning.
+        if (mode === 'dry_run') {
+            const fallback = synthesizeDryRunOutput(step.tool, inputs);
+            console.warn(`[AutomationRunner] dry-run: live ${step.tool} failed, using sample (${err.message})`);
+            return { output: fallback, dryRunSynthesised: true, dryRunFallback: 'live_failed' };
+        }
+        throw err;
+    }
+    // Empty-result fallback: a live read-only call that returned no rows
+    // teaches the AI nothing about field shapes. In dry-run, swap in the
+    // sample so downstream binding decisions are made against realistic
+    // data. (Live mode keeps the empty result — the user wanted truth.)
+    if (mode === 'dry_run' && isEmptyToolResult(result)) {
+        const fallback = synthesizeDryRunOutput(step.tool, inputs);
+        return { output: fallback, dryRunSynthesised: true, dryRunFallback: 'live_empty' };
+    }
     // Cache the actual output shape so the Builder agent gets ground-truth
     // bindings on its next turn (no more guessing items vs results).
     // Only for real runs — dry-run synth output would pollute the cache.

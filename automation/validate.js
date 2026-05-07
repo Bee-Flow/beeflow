@@ -71,6 +71,45 @@ function rootOf(path) {
     return m ? m[1] : null;
 }
 
+/**
+ * Pick the closest candidate id to `target` by Levenshtein distance —
+ * used to suggest "did you mean" in validation errors when an LLM
+ * fabricates a step id like "step_1" that doesn't exist.
+ */
+function pickClosestId(target, candidates) {
+    if (!Array.isArray(candidates) || candidates.length === 0) return null;
+    let best = null;
+    let bestDist = Infinity;
+    for (const c of candidates) {
+        const d = levenshtein(String(target), String(c));
+        if (d < bestDist) { bestDist = d; best = c; }
+    }
+    // Only suggest when the distance is short enough that the suggestion
+    // is actually useful — otherwise return the first candidate as a hint
+    // so the LLM at least sees a real id.
+    if (bestDist <= Math.max(3, Math.floor(String(target).length / 2))) return best;
+    return candidates[0];
+}
+
+function levenshtein(a, b) {
+    if (a === b) return 0;
+    const al = a.length, bl = b.length;
+    if (al === 0) return bl;
+    if (bl === 0) return al;
+    const v0 = new Array(bl + 1);
+    const v1 = new Array(bl + 1);
+    for (let j = 0; j <= bl; j++) v0[j] = j;
+    for (let i = 0; i < al; i++) {
+        v1[0] = i + 1;
+        for (let j = 0; j < bl; j++) {
+            const cost = a[i] === b[j] ? 0 : 1;
+            v1[j + 1] = Math.min(v1[j] + 1, v0[j + 1] + 1, v0[j] + cost);
+        }
+        for (let j = 0; j <= bl; j++) v0[j] = v1[j];
+    }
+    return v1[bl];
+}
+
 function secondSegment(path) {
     const m = String(path).match(/^[A-Za-z_$][A-Za-z0-9_$]*\.([A-Za-z_$][A-Za-z0-9_$]*)/);
     return m ? m[1] : null;
@@ -225,6 +264,24 @@ function validateDefinition(def, { availableTools = null } = {}) {
             if (root === 'steps') {
                 const upstreamId = secondSegment(path);
                 if (!upstreamId) { pushW({ code: 'ref.no_step_id', severity: 'warning', path: at, message: `Step ${step.id}: ref must include a step id.`, hint: 'Use the form steps.<id>.output.<field>.' }); continue; }
+                if (!ids.has(upstreamId) && upstreamId !== step.id) {
+                    // Promote unknown-step refs to errors with a "did you mean"
+                    // suggestion so the LLM gets the actual id in its hint
+                    // and self-corrects on the next turn instead of repeating
+                    // the fabricated id.
+                    const candidates = Array.from(ids).filter(id => id !== trigger.id && id !== step.id);
+                    const suggestion = pickClosestId(upstreamId, candidates);
+                    pushE({
+                        code: 'ref.unknown_step',
+                        severity: 'error',
+                        path: at,
+                        message: `Step ${step.id}: refers to non-existent step "${upstreamId}".`,
+                        hint: suggestion
+                            ? `Did you mean "${suggestion}"? Available step ids: ${candidates.join(', ') || '(none yet)'}.`
+                            : `No matching step exists. Available step ids: ${candidates.join(', ') || '(none yet)'}.`,
+                    });
+                    continue;
+                }
                 if (!seenSoFar.has(upstreamId) && upstreamId !== step.id) {
                     pushW({ code: 'ref.forward', severity: 'warning', path: at, message: `Step ${step.id}: refers to step "${upstreamId}" — will resolve to undefined at runtime if it doesn't produce output by then.`, hint: `Wire an edge from "${upstreamId}" to "${step.id}" so the upstream output is available.` });
                 }

@@ -97,18 +97,37 @@ function trigger() {
     assert.ok(r.errors.find(e => e.code === 'step.unknown_type'));
 }
 
-// ── Forward ref still emits a warning, not an error ──────────────────────
+// ── Forward ref to a real step still warns (not error) ──────────────────
+// "future" step EXISTS in the def but appears after `n1` in topo order.
 {
     const def = {
         trigger: trigger(),
         steps: [
             { id: 'n1', type: 'notification', title: 'using {{steps.future.output.x}}' },
+            { id: 'future', type: 'notification', title: 'placeholder' },
         ],
-        edges: [{ from: 'trg', to: 'n1' }],
+        edges: [{ from: 'trg', to: 'n1' }, { from: 'n1', to: 'future' }],
     };
     const r = validateDefinition(def);
-    assert.strictEqual(r.ok, true, 'forward refs only warn');
-    assert.ok(r.warnings.find(w => w.code === 'ref.forward'));
+    assert.strictEqual(r.ok, true, 'forward refs to real steps only warn');
+    assert.ok(r.warnings.find(w => w.code === 'ref.forward'), 'expected ref.forward warning');
+}
+
+// ── Ref to a step that DOESN'T exist → error with did-you-mean hint ─────
+{
+    const def = {
+        trigger: trigger(),
+        steps: [
+            { id: 'a_4a3d50', type: 'notification', title: 'real step' },
+            { id: 'n1', type: 'notification', title: 'using {{steps.step_1.output.x}}' },
+        ],
+        edges: [{ from: 'trg', to: 'a_4a3d50' }, { from: 'a_4a3d50', to: 'n1' }],
+    };
+    const r = validateDefinition(def);
+    assert.strictEqual(r.ok, false, 'unknown-step ref must error');
+    const rec = r.errors.find(e => e.code === 'ref.unknown_step');
+    assert.ok(rec, 'expected ref.unknown_step record');
+    assert.ok(/a_4a3d50/.test(rec.hint), `hint must surface the real id, got: ${rec.hint}`);
 }
 
 console.log('validate.test.js — all checks passed');
