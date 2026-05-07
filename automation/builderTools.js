@@ -84,7 +84,25 @@ const TOOL_SCHEMAS = [
         type: 'function',
         function: {
             name: 'builder_propose_trigger',
-            description: 'Set or replace the automation trigger. ALWAYS call this first when starting a new draft. Cron uses standard 5-field syntax (minute hour dom month dow). EXAMPLES: weekly Monday 9am Europe/Amsterdam → {kind:"schedule",cron:"0 9 * * 1",tz:"Europe/Amsterdam"}. First Monday of the month → {kind:"schedule",cron:"0 9 1-7 * 1",tz:"Europe/Amsterdam"}. New Gmail event → {kind:"app_event",appProvider:"gmail",appEvent:"mail.new",filter:{label:"Invoices"}}.',
+            description: `Set or replace the automation trigger. ALWAYS call this first when starting a new draft.
+
+KIND OPTIONS:
+  - schedule     — fires on a cron timer (5-field cron, minute hour dom month dow).
+  - manual       — fires only when the user clicks "Run".
+  - webhook      — fires on inbound HTTPS POST to a signed URL.
+  - app_event    — fires when an external service emits an event (today: Gmail "new email").
+
+EXAMPLES:
+  - weekly Monday 9am Europe/Amsterdam → {kind:"schedule",cron:"0 9 * * 1",tz:"Europe/Amsterdam"}
+  - first Monday of the month at 9am  → {kind:"schedule",cron:"0 9 1-7 * 1",tz:"Europe/Amsterdam"}
+  - WHEN USER SAYS "when a new email arrives" / "every time I get an email" / "on incoming mail"
+    USE: {kind:"app_event",appProvider:"gmail",appEvent:"mail.new"}.
+    Optionally narrow with a filter, e.g. only emails labelled Invoices:
+    {kind:"app_event",appProvider:"gmail",appEvent:"mail.new",filter:{labelIds:["Label_3"]}}.
+    The trigger payload exposed to downstream steps is:
+    {messageId, threadId, from, to, cc, subject, date, snippet, labelIds}.
+    Bind via trigger.output.subject / trigger.output.from / etc. — DO NOT add a
+    leading gmail_search step just to look up the message that triggered the run.`,
             parameters: {
                 type: 'object',
                 properties: {

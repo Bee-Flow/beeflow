@@ -327,6 +327,15 @@ router.post('/:id/activate', async (req, res) => {
             updates.nextRunAt = cron.nextRunAt(a.scheduleCron, a.scheduleTz || 'Europe/Amsterdam', Date.now());
         }
         const u = await automationStore.updateAutomation(a.id, updates, userId);
+
+        // App-event triggers need a row in automation_event_subscriptions
+        // before the poller / inbound-event handler will see them. Without
+        // this the LLM happily declares `kind:'app_event',appProvider:'gmail'`
+        // but no email ever fires the automation. Done idempotently — we
+        // delete-then-create so re-activating after a definition change
+        // refreshes the filter / cursor.
+        await syncAppEventSubscription(a.id, userId, a.definition);
+
         res.json({ automation: u, warnings: v.warnings || [] });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -339,12 +348,52 @@ router.post('/:id/deactivate', async (req, res) => {
         const a = await automationStore.getAutomation(req.params.id);
         if (!a) return res.status(404).json({ error: 'Not found' });
         if (a.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
+        // Drop subscriptions immediately so the next poll tick stops
+        // firing this automation. Re-activation re-creates them.
+        await automationStore.deleteSubscriptionsForAutomation(a.id);
         const u = await automationStore.updateAutomation(a.id, { isActive: false }, userId);
         res.json({ automation: u });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
 });
+
+/**
+ * Reconcile app_event subscriptions for one automation. Reads the trigger
+ * from the persisted definition (not the row's `triggerType`/`scheduleCron`
+ * shorthand fields) so a single source of truth covers provider, event,
+ * and filter.
+ *
+ * Today only Gmail mail.new is supported end-to-end; other providers
+ * (google-calendar / msgraph / github) have polling/webhook handlers but
+ * we keep this helper provider-agnostic so adding them later is one
+ * dispatch table change.
+ */
+async function syncAppEventSubscription(automationId, userId, def) {
+    // Always wipe first — keeps the table consistent if the user changes
+    // the trigger between activations.
+    await automationStore.deleteSubscriptionsForAutomation(automationId);
+
+    const trig = def?.trigger;
+    if (!trig || trig.kind !== 'app_event') return;
+    const provider = trig.appEvent?.provider;
+    const event = trig.appEvent?.event;
+    if (!provider || !event) return;
+
+    // Mode: Gmail uses polling (Gmail Pub/Sub push exists at /events/gmail
+    // but we don't auto-provision the watch yet — polling is reliable and
+    // covers all users without admin-side cloud config). MS Graph + GitHub
+    // would use 'webhook'; not wired here.
+    const mode = provider === 'gmail' ? 'polling' : 'polling';
+    await automationStore.createSubscription({
+        automationId,
+        userId,
+        provider,
+        eventType: event,
+        mode,
+        filter: trig.appEvent?.filter || null,
+    });
+}
 
 router.post('/:id/run', async (req, res) => {
     try {

@@ -602,6 +602,36 @@ async function getSubscriptionsForProvider(provider, eventType) {
     }));
 }
 
+/**
+ * All subscriptions for one automation. Used by activate/deactivate to
+ * dedupe and clean up, and by an automation's settings panel to show
+ * which event sources are wired up.
+ */
+async function getSubscriptionsForAutomation(automationId) {
+    await initDB();
+    const rows = await getAll(
+        'SELECT * FROM automation_event_subscriptions WHERE automation_id = $1',
+        [automationId],
+    );
+    return rows.map(r => ({
+        id: r.id, automationId: r.automation_id, userId: r.user_id,
+        provider: r.provider, eventType: r.event_type, mode: r.mode,
+        externalRef: r.external_ref, expiresAt: r.expires_at,
+        lastCursor: r.last_cursor, lastPolledAt: r.last_polled_at,
+        filter: typeof r.filter_json === 'string' ? safeParse(r.filter_json, null) : r.filter_json,
+    }));
+}
+
+/**
+ * Delete every subscription for an automation. Called from /deactivate
+ * (and /delete) so the poller stops firing for paused / removed
+ * automations the moment the user toggles them off.
+ */
+async function deleteSubscriptionsForAutomation(automationId) {
+    await initDB();
+    await run('DELETE FROM automation_event_subscriptions WHERE automation_id = $1', [automationId]);
+}
+
 async function getPollingSubscriptions({ olderThanMs = 60_000 } = {}) {
     await initDB();
     const rows = await getAll(
@@ -690,6 +720,8 @@ module.exports = {
     createSubscription,
     getSubscription,
     getSubscriptionsForProvider,
+    getSubscriptionsForAutomation,
+    deleteSubscriptionsForAutomation,
     getPollingSubscriptions,
     getExpiringSubscriptions,
     updateSubscription,
