@@ -97,10 +97,39 @@ EXAMPLES:
   - first Monday of the month at 9am  → {kind:"schedule",cron:"0 9 1-7 * 1",tz:"Europe/Amsterdam"}
   - WHEN USER SAYS "when a new email arrives" / "every time I get an email" / "on incoming mail"
     USE: {kind:"app_event",appProvider:"gmail",appEvent:"mail.new"}.
-    Optionally narrow with a filter, e.g. only emails labelled Invoices:
-    {kind:"app_event",appProvider:"gmail",appEvent:"mail.new",filter:{labelIds:["Label_3"]}}.
+
+    GMAIL FILTER FIELDS (all optional; ALL specified fields must match):
+      from              substring (case-insensitive) on the From header.
+                        Use the email address: filter:{from:"boss@example.com"}.
+      to                substring on the To header.
+      cc                substring on the Cc header.
+      subjectContains   substring on Subject (case-insensitive).
+      subjectRegex      JS regex on Subject (case-insensitive).
+      labelIds          string[]; fires if message has ANY of these labels.
+                        Gmail label ids look like "Label_3" or system ids
+                        like "INBOX" / "IMPORTANT" / "STARRED".
+      excludeLabelIds   string[]; drops messages with any of these labels.
+      hasAttachment     boolean; fires only when the message has attachments.
+      excludeFromSelf   boolean; drops mail you sent yourself (SENT label).
+      maxAgeMinutes     number; freshness cap — drops messages older than N
+                        minutes. Useful so a long-paused poller doesn't flood
+                        with backlog on resume.
+
+    EXAMPLES:
+      - Only emails from your boss:
+        {kind:"app_event",appProvider:"gmail",appEvent:"mail.new",filter:{from:"boss@example.com",excludeFromSelf:true}}
+      - Invoice-labelled mail with attachments:
+        {kind:"app_event",appProvider:"gmail",appEvent:"mail.new",filter:{labelIds:["Label_3"],hasAttachment:true}}
+      - Subject matches "Order #123":
+        {kind:"app_event",appProvider:"gmail",appEvent:"mail.new",filter:{subjectRegex:"^Order #\\\\d+"}}
+
+    NOTE — "in the last 24 hours" is NOT a filter for this trigger because
+    mail.new fires on every newly-arrived message in real time. If the user
+    wants "every morning, summarise the last 24 hours of email" use a
+    schedule trigger + a gmail_search step with q:"newer_than:1d" instead.
+
     The trigger payload exposed to downstream steps is:
-    {messageId, threadId, from, to, cc, subject, date, snippet, labelIds}.
+    {messageId, threadId, from, to, cc, subject, date, snippet, labelIds, sizeEstimate, historyId}.
     Bind via trigger.output.subject / trigger.output.from / etc. — DO NOT add a
     leading gmail_search step just to look up the message that triggered the run.`,
             parameters: {

@@ -26,12 +26,99 @@ function matchFilter(payload, filter) {
     return true;
 }
 
+/**
+ * Gmail-aware mail.new filter. The shallow `matchFilter` above is fine
+ * for app events with stable scalar payloads (msgraph webhooks, GitHub
+ * push events) but Gmail's enriched payload — `from` is a header like
+ * `"Boss Smith <boss@example.com>"`, `labelIds` is an array, `subject`
+ * needs substring match — needs richer semantics.
+ *
+ * Supported filter fields (all optional; ALL specified fields must
+ * match — AND across keys, OR within an array on a single key):
+ *
+ *   from              string, substring (case-insensitive). Matches the
+ *                     raw From header so "boss@example.com" hits when
+ *                     the header is "Boss Smith <boss@example.com>".
+ *   to                same, against the To header.
+ *   cc                same, against the Cc header.
+ *   subjectContains   string, substring on Subject (case-insensitive).
+ *   subjectRegex      string, JS regex against Subject. Capped at 200
+ *                     chars; invalid patterns silently fail-closed (no
+ *                     match), so a typo can't fire on every email.
+ *   labelIds          string[]; match if the message has ANY of these.
+ *   excludeLabelIds   string[]; match only if the message has NONE.
+ *   hasAttachment     boolean; checks for HAS_ATTACHMENT system label.
+ *   excludeFromSelf   boolean; drops messages the user sent themselves
+ *                     (uses the SENT system label).
+ *   maxAgeMinutes     number; drops messages whose Date header is older
+ *                     than N minutes. Useful as a freshness cap so a
+ *                     paused poller doesn't flood the user with backlog
+ *                     when it resumes.
+ */
+function matchGmailMailFilter(payload, filter) {
+    if (!filter || typeof filter !== 'object') return true;
+    if (!payload || typeof payload !== 'object') return false;
+
+    const containsCI = (haystack, needle) => {
+        if (typeof haystack !== 'string' || typeof needle !== 'string') return false;
+        return haystack.toLowerCase().includes(needle.toLowerCase());
+    };
+
+    if (typeof filter.from === 'string' && filter.from && !containsCI(payload.from, filter.from)) return false;
+    if (typeof filter.to === 'string' && filter.to && !containsCI(payload.to, filter.to)) return false;
+    if (typeof filter.cc === 'string' && filter.cc && !containsCI(payload.cc, filter.cc)) return false;
+
+    if (typeof filter.subjectContains === 'string' && filter.subjectContains && !containsCI(payload.subject, filter.subjectContains)) return false;
+
+    if (typeof filter.subjectRegex === 'string' && filter.subjectRegex) {
+        const src = filter.subjectRegex.slice(0, 200);
+        try {
+            const re = new RegExp(src, 'i');
+            if (!re.test(String(payload.subject || ''))) return false;
+        } catch {
+            // Invalid pattern → fail-closed (don't fire) so a typo
+            // can't quietly match every email.
+            return false;
+        }
+    }
+
+    const labelIds = Array.isArray(payload.labelIds) ? payload.labelIds : [];
+    if (Array.isArray(filter.labelIds) && filter.labelIds.length > 0) {
+        if (!filter.labelIds.some(id => labelIds.includes(id))) return false;
+    }
+    if (Array.isArray(filter.excludeLabelIds) && filter.excludeLabelIds.length > 0) {
+        if (filter.excludeLabelIds.some(id => labelIds.includes(id))) return false;
+    }
+    if (filter.hasAttachment === true) {
+        if (!labelIds.includes('HAS_ATTACHMENT')) return false;
+    }
+    if (filter.excludeFromSelf === true) {
+        if (labelIds.includes('SENT')) return false;
+    }
+
+    if (typeof filter.maxAgeMinutes === 'number' && filter.maxAgeMinutes > 0 && payload.date) {
+        const t = Date.parse(payload.date);
+        if (!Number.isFinite(t)) return false;
+        const ageMin = (Date.now() - t) / 60_000;
+        if (ageMin > filter.maxAgeMinutes) return false;
+    }
+
+    return true;
+}
+
 async function dispatchEvent({ provider, event, payload = {}, userId = null }) {
     const subs = await automationStore.getSubscriptionsForProvider(provider, event);
     const runs = [];
+    const isGmailMailNew = provider === 'gmail' && event === 'mail.new';
     for (const sub of subs) {
         if (userId && sub.userId !== userId) continue;
-        if (!matchFilter(payload, sub.filter)) continue;
+        // Gmail mail.new gets a richer matcher; everything else keeps
+        // the shallow object-equality semantics that webhook providers
+        // rely on.
+        const ok = isGmailMailNew
+            ? matchGmailMailFilter(payload, sub.filter)
+            : matchFilter(payload, sub.filter);
+        if (!ok) continue;
         const automation = await automationStore.getAutomation(sub.automationId);
         if (!automation || !automation.isActive || automation.isDraft) continue;
         const runner = require('../core/automationRunner');
@@ -255,4 +342,4 @@ async function renewExpiringSubscriptions() {
     }
 }
 
-module.exports = { dispatchEvent, runPollingPass, renewExpiringSubscriptions };
+module.exports = { dispatchEvent, runPollingPass, renewExpiringSubscriptions, matchGmailMailFilter };
