@@ -48,6 +48,7 @@ const {
 } = require('../../core/webpageKnowledgeSearch');
 const terminationStore = require('../../stores/terminationStore');
 const { sanitizeError } = require('../../core/errorSanitizer');
+const { emitPhase, emitPhaseEnd, withPhase } = require('../../core/agentRuntime/phaseEvents');
 
 function requireAuth(req, res, next) {
     if (req.session && req.session.user) return next();
@@ -221,6 +222,10 @@ router.post('/chat/webpage/stream', requireAuth, async (req, res) => {
     if (modelTier === 'auto') {
         send('model_selected', { tier: resolvedTier, modelId });
     }
+    // Always emit a `model_resolved` phase so the UI can show the concrete
+    // model name (e.g. "Using gpt-4o-mini") regardless of tier mode.
+    emitPhase(send, 'model_resolved', modelId);
+    emitPhaseEnd(send, 'model_resolved');
 
     try {
         // KB search for grounding
@@ -228,6 +233,8 @@ router.post('/chat/webpage/stream', requireAuth, async (req, res) => {
         let citationSources = [];
         const kbIds = webpage.knowledgeBaseIds || [];
         if (kbIds.length > 0) {
+            emitPhase(send, 'kb_search');
+            const _kbT = Date.now();
             try {
                 const kbResult = await searchWebpageKB({
                     userId, kbIds, query: message,
@@ -240,6 +247,7 @@ router.post('/chat/webpage/stream', requireAuth, async (req, res) => {
             } catch (kbErr) {
                 console.warn('[WebpageChat] KB search failed:', kbErr.message);
             }
+            emitPhaseEnd(send, 'kb_search', Date.now() - _kbT);
         }
         if (citationSources.length > 0) {
             send('kb_sources', { sources: citationSources.map(s => ({ title: s.title, preview: s.content, score: s.score })) });
@@ -314,6 +322,8 @@ Just do the work — no approval step. The propose_webpage_plan tool is NOT avai
 3. Never stop to ask the user "should I proceed?" — they chose Auto specifically to skip that. After your edits land, briefly explain what you did.
 For very large changes you can still narrate your approach in a sentence or two before the first tool call so the user sees what's coming, but DO NOT pause for approval.`;
 
+        emitPhase(send, 'building_prompt');
+        const _spT = Date.now();
         const systemPrompt = `You are a precise, efficient webpage-building assistant. Today is ${today}.
 
 ────────────────────────────────────────
@@ -412,6 +422,7 @@ ${searchAvailable ? `\nWeb research:
 
 Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = new Date(); const _dp = _now.toLocaleString('sv-SE', { timeZone: _tz }); const _lp = new Date(_now.toLocaleString('en-US', { timeZone: _tz })); const _om = Math.round((_lp - _now) / 60000); const _s = _om >= 0 ? '+' : '-'; const _a = Math.abs(_om); return `${_dp} UTC${_s}${String(Math.floor(_a / 60)).padStart(2, '0')}:${String(_a % 60).padStart(2, '0')} (${_tz})`; } catch (_) { return new Date().toISOString(); } })()}`;
 
+        emitPhaseEnd(send, 'building_prompt', Date.now() - _spT);
         let messages = [{ role: 'system', content: systemPrompt }];
 
         // Plan-execution turn: the user clicked Approve & build on a previously
@@ -701,6 +712,12 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
                 tools: webpageTools,
                 toolChoice: 'auto',
             };
+
+            // Final pre-LLM phase marker — only on the first round, so the UI
+            // status placeholder fades out before the first token arrives.
+            if (toolCallRounds === 0) {
+                emitPhase(send, 'streaming_start', modelId);
+            }
 
             try {
                 await adapter.stream(apiKey, apiUrl, modelId, messages, streamOptions, streamCallback);

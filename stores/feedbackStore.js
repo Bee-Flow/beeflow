@@ -112,6 +112,10 @@ function buildFilters(filters) {
         conditions.push(`source = $${idx++}`);
         params.push(filters.source);
     }
+    if (filters?.organizationId) {
+        conditions.push(`organization_id = $${idx++}`);
+        params.push(filters.organizationId);
+    }
     const where = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
     return { where, params, nextIdx: idx };
 }

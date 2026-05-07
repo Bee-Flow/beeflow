@@ -20,6 +20,7 @@ const notebookStore = require('../../stores/notebookStore');
 const { NOTEBOOK_DOC_TOOLS, NOTEBOOK_ADD_SOURCE_TOOL, executeNotebookDocTool } = require('../../integrations/notebookDocTools');
 const { AGENT_SEARCH_TOOLS, executeAgentSearchTool, isAgentSearchTool } = require('../../integrations/agentSearchTools');
 const { searchNotebookKB, executeNotebookKBSearchTool, NOTEBOOK_KB_SEARCH_TOOL } = require('../../core/notebookKnowledgeSearch');
+const { emitPhase, emitPhaseEnd } = require('../../core/agentRuntime/phaseEvents');
 
 
 function requireAuth(req, res, next) {
@@ -138,6 +139,8 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
     if (modelTier === 'auto') {
         send('model_selected', { tier: resolvedTier, modelId });
     }
+    emitPhase(send, 'model_resolved', modelId);
+    emitPhaseEnd(send, 'model_resolved');
 
     try {
         // Search notebook knowledge base for relevant context
@@ -145,6 +148,8 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
         let citationSources = [];
         const kbIds = notebook.knowledgeBaseIds || [];
         if (kbIds.length > 0) {
+            emitPhase(send, 'kb_search');
+            const _kbT = Date.now();
             try {
                 const kbResult = await searchNotebookKB({
                     userId, kbIds, query: message,
@@ -179,6 +184,7 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
             } catch (kbErr) {
                 console.warn('[NotebookChat] KB search failed:', kbErr.message);
             }
+            emitPhaseEnd(send, 'kb_search', Date.now() - _kbT);
         }
 
         // Send citation sources to frontend
@@ -263,6 +269,8 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
         const searchAvailable = searchProvider !== 'disabled' && ((searchProvider === 'bing' && hasBingSearchKey) || hasAgentSearchUrl);
 
         // ── Build system prompt ──────────────────────────────────────
+        emitPhase(send, 'building_prompt');
+        const _spT = Date.now();
         let systemPrompt;
         {
             systemPrompt = `You are an intelligent notebook assistant. Today is ${today}.
@@ -392,6 +400,7 @@ ${searchAvailable ? `[WEB SEARCH & SOURCES]
 ` : ''}${kbContext}${documentContext}${selectionContext}
 Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = new Date(); const _dp = _now.toLocaleString('sv-SE', { timeZone: _tz }); const _lp = new Date(_now.toLocaleString('en-US', { timeZone: _tz })); const _om = Math.round((_lp - _now) / 60000); const _s = _om >= 0 ? '+' : '-'; const _a = Math.abs(_om); return `${_dp} UTC${_s}${String(Math.floor(_a/60)).padStart(2,'0')}:${String(_a%60).padStart(2,'0')} (${_tz})`; } catch(_) { return new Date().toISOString(); } })()}`;
         }
+        emitPhaseEnd(send, 'building_prompt', Date.now() - _spT);
 
         // Announce document truncation to the client now that we've finalised
         // the system prompt. One event per turn — the UI debounces banners.
@@ -621,6 +630,7 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             }
         };
 
+        emitPhase(send, 'streaming_start', modelId);
         await adapter.stream(apiKey, apiUrl, modelId, messages, streamOptions, streamCallback);
 
         // Handle tool calls that came through streaming (SDK-based providers like Google)

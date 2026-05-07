@@ -49,6 +49,7 @@ function compactToolResultForLLM(toolResult) {
     return toolResult;
 }
 const { getIntegrationTools, buildToolHint } = require('../../core/integrationTools');
+const { emitPhase, emitPhaseEnd, withPhase } = require('../../core/agentRuntime/phaseEvents');
 const { getUserAuth } = require('../../utils/routeHelpers');
 const { checkRegexPatterns } = require('../../core/guardrails');
 const { checkSubscriptionLimits, resolveOrgId } = require('../../core/limits');
@@ -461,6 +462,8 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
     if (modelTier === 'auto') {
         send('model_selected', { tier: resolvedTier, modelId });
     }
+    emitPhase(send, 'model_resolved', modelId);
+    emitPhaseEnd(send, 'model_resolved');
 
     // Per-turn webpage builder read-set — shared across every webpage_file_*
     // call this turn so the read-before-edit guard can warn when an edit is
@@ -510,7 +513,11 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                 };
             });
 
-        // Load integration tools via shared module
+        // Load integration tools via shared module. Wrapped in a phase so
+        // the UI shows "Loading tools…" instead of a silent stall when a
+        // user has many integrations and OAuth-token resolution is slow.
+        emitPhase(send, 'loading_tools');
+        const _toolsT = Date.now();
         const { tools: integrationToolsList, n8nOrgId } = await getIntegrationTools({
             userId,
             session: req.session,
@@ -673,7 +680,11 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
             }
         }
 
+        emitPhaseEnd(send, 'loading_tools', Date.now() - _toolsT);
+
         // Build messages array
+        emitPhase(send, 'building_prompt');
+        const _spT = Date.now();
         const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
         const customPrompt = await configStore.getConfig('direct_chat_system_prompt');
         let systemPromptText = customPrompt || DEFAULT_SYSTEM_PROMPT;
@@ -881,6 +892,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         // Providers that join system messages (Gemini, OpenAI Responses) still
         // see the same effective prompt; Claude's extractSystem emits per-
         // message blocks with the right cache_control on the stable one.
+        emitPhaseEnd(send, 'building_prompt', Date.now() - _spT);
         let messages = [
             { role: 'system', content: basePrompt + toolHint + memoryContext + notebookspaceContext + projectContext + skillsContext },
             { role: 'system', content: `Now: ${_nowStr}` },
@@ -2028,11 +2040,11 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         try {
             const { compactMessages } = require('../../core/compaction');
             const convMessageCount = messages.filter(m => m.role !== 'system').length;
-            const compactionResult = await compactMessages(messages, {
+            const compactionResult = await withPhase(send, 'compacting', null, () => compactMessages(messages, {
                 existingSummary: conversationSummary,
                 summaryModelId: 'tier:fast',
                 userOrgId: userOrgForTiers,
-            });
+            }));
             messages = compactionResult.messages;
             if (compactionResult.newSummary) {
                 conversationSummary = compactionResult.newSummary;
@@ -2706,6 +2718,12 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                 }
             }
         };
+
+        // Final pre-LLM phase marker — emit only on the first round so the UI
+        // status placeholder fades out before the first token arrives.
+        if (toolCallRounds === 0) {
+            emitPhase(send, 'streaming_start', modelId);
+        }
 
         try {
             await adapter.stream(apiKey, apiUrl, modelId, messages, streamOptions, streamCallback);

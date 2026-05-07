@@ -5,9 +5,34 @@
 const express = require('express');
 const feedbackStore = require('../stores/feedbackStore');
 const { resolveUserOrgIds } = require('../auth');
+const userStore = require('../stores/userStore');
 const { getAll } = require('../db');
 
 const router = express.Router();
+
+// Resolves the caller's own org id and rejects when the caller is not an
+// org admin for it. Super admins are also allowed (they can use the global
+// /api/feedback endpoints, but this lets them sanity-check the org view).
+async function requireOwnOrgAdmin(req, res, next) {
+    if (!req.session?.user) return res.status(401).json({ error: 'Unauthorized' });
+    const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
+
+    const orgIds = await resolveUserOrgIds(req);
+    const orgId = orgIds && orgIds.size > 0 ? Array.from(orgIds)[0] : null;
+    if (!orgId) return res.status(403).json({ error: 'No organisation context' });
+
+    if (isSuperAdmin) {
+        req.scopedOrgId = orgId;
+        return next();
+    }
+
+    const user = await userStore.getUser(req.session.user.id);
+    if (!user || user.orgRole !== 'org_admin') {
+        return res.status(403).json({ error: 'Organization admin access required' });
+    }
+    req.scopedOrgId = orgId;
+    next();
+}
 
 // Best-effort lookup of the concrete model + agent_name used for the most
 // recent assistant call in this conversation. Lets us surface the actual
@@ -101,6 +126,39 @@ router.get('/summary', async (req, res) => {
         res.json(data);
     } catch (e) {
         console.error('[Feedback API] summary error:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ── Org-scoped endpoints ───────────────────────────────────────────────────
+// These mirror GET / and GET /summary but force-inject the caller's own
+// organization_id into the filter, so org admins only see their org's data.
+
+// GET /org — list feedback for the caller's organisation
+router.get('/org', requireOwnOrgAdmin, async (req, res) => {
+    try {
+        const { startDate, endDate, rating, agentId, source, limit } = req.query;
+        const data = await feedbackStore.getFeedback(
+            { startDate, endDate, rating, agentId, source, organizationId: req.scopedOrgId },
+            limit ? parseInt(limit, 10) : 200
+        );
+        res.json(data);
+    } catch (e) {
+        console.error('[Feedback API] org GET error:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// GET /org/summary — aggregated stats for the caller's organisation
+router.get('/org/summary', requireOwnOrgAdmin, async (req, res) => {
+    try {
+        const { startDate, endDate } = req.query;
+        const data = await feedbackStore.getFeedbackSummary({
+            startDate, endDate, organizationId: req.scopedOrgId,
+        });
+        res.json(data);
+    } catch (e) {
+        console.error('[Feedback API] org summary error:', e);
         res.status(500).json({ error: e.message });
     }
 });

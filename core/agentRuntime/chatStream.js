@@ -483,10 +483,14 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     const effectiveTier = (messageMetadata?.modelTier && String(messageMetadata.modelTier))
         || (typeof agent.model === 'string' && agent.model.startsWith('tier:') ? agent.model.slice(5) : null);
     const isStandardTier = effectiveTier === 'standard';
-    let systemPrompt = await buildSystemPrompt({ agent, tools, userId, messageMetadata, memoryContext, isStrictKnowledge, forceDynamicSkills: isStandardTier });
+    let systemPrompt = await withPhase(onEvent, 'building_prompt', null, () =>
+        buildSystemPrompt({ agent, tools, userId, messageMetadata, memoryContext, isStrictKnowledge, forceDynamicSkills: isStandardTier })
+    );
 
     // ============ GUARDRAILS (before KB search — block early) ============
-    const guardrailsResult = await runInputGuardrails({ agent, messages, userMessage, globalConfig, onEvent, userId, conversationId: conversation?.id, source: 'agent_stream', model: modelToUse });
+    const guardrailsResult = await withPhase(onEvent, 'guardrails', null, () =>
+        runInputGuardrails({ agent, messages, userMessage, globalConfig, onEvent, userId, conversationId: conversation?.id, source: 'agent_stream', model: modelToUse })
+    );
     let moderationViolation = guardrailsResult.moderationViolation;
     let guardrailViolation = guardrailsResult.guardrailViolation;
     let processedUserMessage = guardrailsResult.processedUserMessage;
@@ -823,6 +827,8 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     const hasKbSearchTool = tools.some(t => t.function?.name === 'kb_search');
 
     if (!moderationViolation && !guardrailViolation && !hasKbSearchTool) {
+        emitPhase(onEvent, 'kb_search');
+        const _kbT = Date.now();
         try {
             const kbExtension = await performKnowledgeSearch({ agent, userId, userMessage, isStrictKnowledge, onEvent: (type, data) => {
                 // Intercept kb_sources to accumulate for persistence
@@ -837,6 +843,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         } catch (kErr) {
             console.error('[AgentRuntime] Knowledge retrieval failed:', kErr.message);
         }
+        emitPhaseEnd(onEvent, 'kb_search', Date.now() - _kbT);
     } else if (hasKbSearchTool) {
         console.log('[AgentRuntime] KB auto-inject skipped — kb_search tool available, LLM will decide');
     }
@@ -1000,10 +1007,23 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             const lastMsg = processedMessages[processedMessages.length - 1]; // This is the user message
             let attachmentContent = '';
 
-            // Handle attachments if present
+            // Handle attachments if present. Surface a `processing_attachments`
+            // phase on the first iteration only — that's the slow OCR/PDF
+            // extraction path; subsequent iterations are no-ops once content
+            // has been hydrated onto the message.
             if (messageMetadata?.attachments && messageMetadata.attachments.length > 0) {
                 console.log(`[Agent] Processing ${messageMetadata.attachments.length} attachments...`);
-                await processAttachments(messageMetadata.attachments, lastMsg, userId, { modelId: modelToUse });
+                if (iterations === 1) {
+                    const firstAtt = messageMetadata.attachments[0];
+                    const detail = messageMetadata.attachments.length === 1 && firstAtt?.name
+                        ? firstAtt.name
+                        : `${messageMetadata.attachments.length} files`;
+                    await withPhase(onEvent, 'processing_attachments', detail, () =>
+                        processAttachments(messageMetadata.attachments, lastMsg, userId, { modelId: modelToUse })
+                    );
+                } else {
+                    await processAttachments(messageMetadata.attachments, lastMsg, userId, { modelId: modelToUse });
+                }
             }
 
             // Inject guardrail violation context if detected
@@ -1049,6 +1069,13 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             // ─── Native SDK adapter streaming (Google, OpenAI, Claude, Mistral) ─────
             const providerAdapter = getAdapter(config.providerType, config.url);
             const useNativeAdapter = ['google', 'openai', 'claude', 'mistral', 'azure', 'google-vertex'].includes(config.providerType) && typeof providerAdapter?.stream === 'function';
+
+            // Final pre-LLM phase marker — only on the first iteration. This
+            // tells the UI "we're handing the request to the model now" so the
+            // status placeholder fades out before the first token arrives.
+            if (iterations === 1) {
+                emitPhase(onEvent, 'streaming_start', modelToUse);
+            }
 
             let currentToolCalls = [];
             let contentBuffer = '';
