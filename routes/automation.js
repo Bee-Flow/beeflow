@@ -492,6 +492,162 @@ router.post('/:id/run', async (req, res) => {
     }
 });
 
+/**
+ * Run a one-shot health check on the trigger pipeline for one automation.
+ *
+ * Without this endpoint, "the trigger doesn't fire" produces no actionable
+ * feedback for the user — the polling tick is silent unless something
+ * succeeds. This endpoint walks every link in the chain (subscription row →
+ * vault credentials → live Gmail call → filter match) and returns a
+ * structured result the UI can render.
+ *
+ * Tokens are NEVER returned — only booleans and high-level shape.
+ */
+router.post('/:id/diagnose-trigger', async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const a = await automationStore.getAutomation(req.params.id);
+        if (!a) return res.status(404).json({ error: 'Not found' });
+        if (a.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
+
+        const trig = a.definition?.trigger;
+        const provider = trig?.appEvent?.provider;
+        const event = trig?.appEvent?.event;
+        if (trig?.kind !== 'app_event' || provider !== 'gmail' || event !== 'mail.new') {
+            return res.json({
+                ok: true,
+                kind: trig?.kind || 'unknown',
+                checks: [{ name: 'trigger_type', status: 'skipped', message: 'This automation is not Gmail-triggered; nothing to diagnose.' }],
+            });
+        }
+
+        const checks = [];
+        const finish = (ok) => res.json({ ok, kind: 'gmail.mail.new', checks });
+
+        // 1) Subscription row
+        const subs = await automationStore.getSubscriptionsForAutomation(a.id);
+        const sub = subs.find(s => s.provider === 'gmail' && s.eventType === 'mail.new') || null;
+        if (!sub) {
+            checks.push({
+                name: 'subscription',
+                status: 'error',
+                message: 'No automation_event_subscriptions row exists. Click Activate to create one.',
+            });
+            return finish(false);
+        }
+        checks.push({
+            name: 'subscription',
+            status: 'ok',
+            message: `Subscription ${sub.id} found (mode=${sub.mode}).`,
+            detail: {
+                lastCursor: sub.lastCursor,
+                lastPolledAt: sub.lastPolledAt,
+                filter: sub.filter,
+            },
+        });
+
+        // 2) Vault credentials. Call routineAuth.buildUserAuth directly
+        // — same lookup loadSession() does, just without the legacy
+        // user_sessions fallback (we want the diagnostic to report the
+        // unhealthy vault state honestly).
+        let session = null;
+        try {
+            const routineAuth = require('../core/routineAuth');
+            const built = await routineAuth.buildUserAuth(userId, { enabledIntegrations: ['gmail'] });
+            if (built?.accessToken) session = built;
+        } catch (e) {
+            checks.push({ name: 'credentials', status: 'error', message: `Vault lookup threw: ${e.message}` });
+            return finish(false);
+        }
+        if (!session?.accessToken) {
+            checks.push({
+                name: 'credentials',
+                status: 'error',
+                message: 'No Gmail OAuth tokens in the routine-auth vault for this user. Re-connect Gmail in Integrations to fix.',
+            });
+            return finish(false);
+        }
+        checks.push({
+            name: 'credentials',
+            status: 'ok',
+            message: `Gmail tokens present (provider=${session.oauthProvider || 'google'}).`,
+            // Never echo the token itself; only confirm shape.
+            detail: { hasAccessToken: true, hasRefreshToken: !!session.refreshToken },
+        });
+
+        // 3) Live Gmail history call (or bootstrap)
+        try {
+            const { google } = require('googleapis');
+            const auth = new google.auth.OAuth2();
+            auth.setCredentials({ access_token: session.accessToken, refresh_token: session.refreshToken });
+            const gmail = google.gmail({ version: 'v1', auth });
+            if (sub.lastCursor) {
+                try {
+                    const r = await gmail.users.history.list({
+                        userId: 'me',
+                        startHistoryId: sub.lastCursor,
+                        historyTypes: ['messageAdded'],
+                    });
+                    const count = (r.data.history || []).reduce((acc, h) => acc + (h.messagesAdded?.length || 0), 0);
+                    checks.push({
+                        name: 'gmail_history',
+                        status: 'ok',
+                        message: `history.list succeeded; ${count} new message(s) since cursor.`,
+                        detail: { newCount: count, currentHistoryId: r.data.historyId || null },
+                    });
+                } catch (err) {
+                    const stale = err.code === 404 || /not found|invalid history id/i.test(err.message || '');
+                    checks.push({
+                        name: 'gmail_history',
+                        status: stale ? 'warn' : 'error',
+                        message: stale
+                            ? `Cursor ${sub.lastCursor} is stale (Gmail returned: ${err.message}). The poller will reset it on the next tick.`
+                            : `gmail.users.history.list failed: ${err.message}`,
+                    });
+                }
+            } else {
+                const profile = await gmail.users.getProfile({ userId: 'me' });
+                checks.push({
+                    name: 'gmail_history',
+                    status: 'warn',
+                    message: 'No cursor yet — bootstrap needed. The next poll tick will anchor the cursor.',
+                    detail: { profileHistoryId: profile.data.historyId || null },
+                });
+            }
+        } catch (e) {
+            checks.push({ name: 'gmail_history', status: 'error', message: `Gmail API not reachable: ${e.message}` });
+            return finish(false);
+        }
+
+        // 4) Latest matching message — same lookup the manual run uses
+        try {
+            const triggerBus = require('../automation/triggerBus');
+            const latest = await triggerBus.fetchLatestGmailMatch(userId, trig.appEvent.filter || null);
+            if (!latest) {
+                checks.push({
+                    name: 'recent_match',
+                    status: 'warn',
+                    message: 'No recent inbox messages match the filter. The trigger will fire as soon as a matching email arrives.',
+                });
+            } else {
+                checks.push({
+                    name: 'recent_match',
+                    status: 'ok',
+                    message: `Most recent matching email: "${latest.subject}" from ${latest.from}.`,
+                    detail: { subject: latest.subject, from: latest.from, date: latest.date, labelIds: latest.labelIds },
+                });
+            }
+        } catch (e) {
+            checks.push({ name: 'recent_match', status: 'error', message: `Filter probe failed: ${e.message}` });
+        }
+
+        return finish(checks.every(c => c.status !== 'error'));
+    } catch (e) {
+        console.error('[automation/diagnose-trigger] error:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 router.post('/:id/dry-run', async (req, res) => {
     try {
         const userId = req.session.user.id;

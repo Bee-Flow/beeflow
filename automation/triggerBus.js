@@ -118,11 +118,17 @@ async function dispatchEvent({ provider, event, payload = {}, userId = null }) {
         const ok = isGmailMailNew
             ? matchGmailMailFilter(payload, sub.filter)
             : matchFilter(payload, sub.filter);
-        if (!ok) continue;
+        if (!ok) {
+            console.log(`[TriggerBus] sub ${sub.id} filter rejected event (subject="${payload.subject || ''}" from="${payload.from || ''}")`);
+            continue;
+        }
         const automation = await automationStore.getAutomation(sub.automationId);
-        if (!automation || !automation.isActive || automation.isDraft) continue;
+        if (!automation) { console.warn(`[TriggerBus] sub ${sub.id} — automation ${sub.automationId} not found`); continue; }
+        if (!automation.isActive) { console.log(`[TriggerBus] sub ${sub.id} — automation ${automation.id} is inactive; skipping`); continue; }
+        if (automation.isDraft)   { console.log(`[TriggerBus] sub ${sub.id} — automation ${automation.id} is still a draft; skipping`); continue; }
         const runner = require('../core/automationRunner');
         try {
+            console.log(`[TriggerBus] dispatch automation=${automation.id} via sub ${sub.id} (subject="${payload.subject || ''}")`);
             const run = await runner.executeAutomation(automation, {
                 triggerKind: 'app_event',
                 triggerPayload: { provider, event, ...payload },
@@ -139,13 +145,29 @@ async function dispatchEvent({ provider, event, payload = {}, userId = null }) {
 
 async function runPollingPass() {
     const subs = await automationStore.getPollingSubscriptions({ olderThanMs: 60_000 });
+    if (subs.length > 0) {
+        console.log(`[TriggerBus] poll tick — ${subs.length} due subscription(s)`);
+    }
     for (const sub of subs) {
         try {
             const handler = POLLERS[sub.provider]?.[sub.eventType];
-            if (!handler) continue;
+            if (!handler) {
+                console.warn(`[TriggerBus] no handler for ${sub.provider}.${sub.eventType} (sub ${sub.id})`);
+                continue;
+            }
             const session = await loadSession(sub.userId);
-            if (!session) continue;
+            if (!session) {
+                // Silent skip used to be the failure mode that hid every
+                // missing-credential bug. Log it loudly so operators can
+                // spot a user who connected via session-only and never
+                // landed in the routine-auth vault.
+                console.warn(`[TriggerBus] no credentials for user ${sub.userId} (provider=${sub.provider}); skipping sub ${sub.id}`);
+                // Touch lastPolledAt so we don't hot-loop on this sub every tick.
+                await automationStore.updateSubscription(sub.id, { lastPolledAt: new Date().toISOString() });
+                continue;
+            }
             const events = await handler(sub, session);
+            console.log(`[TriggerBus] sub ${sub.id} (${sub.provider}.${sub.eventType}) cursor=${sub.lastCursor || 'none'} → ${events.length} event(s)`);
             for (const ev of events) {
                 await dispatchEvent({ provider: sub.provider, event: sub.eventType, payload: ev, userId: sub.userId });
             }
@@ -207,20 +229,33 @@ async function loadSession(userId) {
 const POLLERS = {
     gmail: {
         'mail.new': async (sub, session) => {
-            try {
-                const { google } = require('googleapis');
-                const auth = new google.auth.OAuth2();
-                auth.setCredentials({ access_token: session.accessToken, refresh_token: session.refreshToken });
-                const gmail = google.gmail({ version: 'v1', auth });
-                if (sub.lastCursor) {
+            const { google } = require('googleapis');
+            const auth = new google.auth.OAuth2();
+            auth.setCredentials({ access_token: session.accessToken, refresh_token: session.refreshToken });
+            const gmail = google.gmail({ version: 'v1', auth });
+
+            // Recoverable failure: history.list 404 / "Requested entity was
+            // not found" / "invalid" means the cursor has aged out of
+            // Gmail's ~7 day retention window. We drop the cursor and let
+            // the bootstrap branch run on the next tick (or this tick after
+            // re-entry). Without this the subscription was permanently
+            // broken once it crossed the retention boundary.
+            const isCursorStaleError = (err) => {
+                const code = err?.code || err?.response?.status;
+                const msg = String(err?.message || '').toLowerCase();
+                return code === 404
+                    || msg.includes('requested entity was not found')
+                    || msg.includes('invalid history id')
+                    || msg.includes('invalid_grant'); // expired refresh — surface but treat as stale
+            };
+
+            if (sub.lastCursor) {
+                try {
                     const r = await gmail.users.history.list({
                         userId: 'me',
                         startHistoryId: sub.lastCursor,
                         historyTypes: ['messageAdded'],
                     });
-                    // Collect new message ids first so we can de-duplicate
-                    // (Gmail's history endpoint can list the same message
-                    // under multiple history records during label changes).
                     const seen = new Set();
                     const ids = [];
                     for (const h of (r.data.history || [])) {
@@ -229,32 +264,62 @@ const POLLERS = {
                             if (id && !seen.has(id)) { seen.add(id); ids.push({ id, threadId: m.message?.threadId }); }
                         }
                     }
-                    // Enrich each new message with the headers / snippet /
-                    // labels that automations actually want to filter on.
-                    // Without this the trigger payload is just `{messageId}`
-                    // and downstream steps need a separate gmail_read call.
-                    // Capped at 20 per tick to avoid hammering the Gmail
-                    // API on a busy inbox; the rest will be picked up next tick.
                     const events = [];
                     for (const { id, threadId } of ids.slice(0, 20)) {
                         const enriched = await fetchGmailMessageMetadata(gmail, id).catch(() => null);
-                        events.push({
-                            messageId: id,
-                            threadId,
-                            ...(enriched || {}),
-                        });
+                        events.push({ messageId: id, threadId, ...(enriched || {}) });
                     }
                     if (r.data.historyId) await automationStore.updateSubscription(sub.id, { lastCursor: String(r.data.historyId) });
                     return events;
+                } catch (err) {
+                    if (isCursorStaleError(err)) {
+                        console.warn(`[TriggerBus] gmail cursor ${sub.lastCursor} stale for sub ${sub.id} — clearing and re-bootstrapping. (${err.message})`);
+                        await automationStore.updateSubscription(sub.id, { lastCursor: null });
+                        // Fall through to the bootstrap branch below.
+                    } else {
+                        console.warn('[TriggerBus] gmail poll error:', err.message);
+                        return [];
+                    }
                 }
-                // Bootstrap cursor — first poll just snapshots the current
-                // history id so we don't deliver a year of historic emails
-                // the moment a user activates the trigger.
+            }
+
+            // Bootstrap branch. Used on first poll AND after a cursor reset.
+            //
+            // Rather than `getProfile()` (which only returns the current
+            // historyId and gives the user a silent no-op on activate), we
+            // pull the most recent matching message via messages.list. That:
+            //   1. anchors the cursor at a definitely-fresh historyId, and
+            //   2. lets us optionally surface that message as the "first"
+            //      event so activation immediately produces a run.
+            //
+            // We do NOT auto-deliver the bootstrap message here, because
+            // that's already handled by the immediate-dispatch path in
+            // routes/automation.js POST /:id/activate. Returning it twice
+            // would double-fire the automation. So this branch only
+            // anchors the cursor.
+            try {
+                const list = await gmail.users.messages.list({ userId: 'me', maxResults: 1 });
+                const newest = list.data.messages?.[0];
+                if (newest?.id) {
+                    const meta = await gmail.users.messages.get({
+                        userId: 'me', id: newest.id, format: 'metadata', metadataHeaders: ['Date'],
+                    });
+                    const hid = meta.data.historyId;
+                    if (hid) {
+                        await automationStore.updateSubscription(sub.id, { lastCursor: String(hid) });
+                        console.log(`[TriggerBus] gmail bootstrap sub ${sub.id} anchored at historyId=${hid}`);
+                        return [];
+                    }
+                }
+                // Empty mailbox or no messages.list result — fall back to profile.
                 const profile = await gmail.users.getProfile({ userId: 'me' });
-                if (profile.data.historyId) await automationStore.updateSubscription(sub.id, { lastCursor: String(profile.data.historyId) });
+                if (profile.data.historyId) {
+                    await automationStore.updateSubscription(sub.id, { lastCursor: String(profile.data.historyId) });
+                    console.log(`[TriggerBus] gmail bootstrap sub ${sub.id} anchored at profile historyId=${profile.data.historyId}`);
+                }
                 return [];
             } catch (e) {
-                console.warn('[TriggerBus] gmail poll error:', e.message);
+                console.warn('[TriggerBus] gmail bootstrap error:', e.message);
                 return [];
             }
         },
