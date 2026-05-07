@@ -1211,6 +1211,16 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         // Add current message (with attachments if any)
         const persistedAttachments = []; // Track attachments for conversation persistence
         if (attachments && attachments.length > 0) {
+            // Surface attachment processing as a phase so the user sees
+            // "Reading attachment <filename>…" while OCR / PDF extraction
+            // runs (often the slowest step before the first token).
+            const _attDetail = attachments.length === 1 && attachments[0]?.name
+                ? attachments[0].name
+                : `${attachments.length} files`;
+            emitPhase(send, 'processing_attachments', _attDetail);
+        }
+        const _attT = (attachments && attachments.length > 0) ? Date.now() : null;
+        if (attachments && attachments.length > 0) {
             const contentParts = [];
             if (message) contentParts.push({ type: 'text', text: message });
             const storageStore = require('../../stores/storageStore');
@@ -1504,6 +1514,9 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             messages.push({ role: 'user', content: contentParts });
         } else {
             messages.push({ role: 'user', content: message });
+        }
+        if (_attT !== null) {
+            emitPhaseEnd(send, 'processing_attachments', Date.now() - _attT);
         }
 
         // Add terminal tools when integrations that handle attachments

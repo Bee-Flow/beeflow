@@ -10,6 +10,7 @@ const express = require('express');
 const router = express.Router();
 const terminationStore = require('../stores/terminationStore');
 const { resolveUserOrgIds } = require('../auth');
+const userStore = require('../stores/userStore');
 
 function getDateFilters(daysParam) {
     if (daysParam === 'all') return {};
@@ -47,6 +48,71 @@ async function attachOrgFilter(req, res, next) {
     next();
 }
 
+// ── Org-scoped routes (org admin only) ─────────────────────────────────────
+// Mounted before the generic attachOrgFilter so /org/* is gated explicitly to
+// the caller's own organisation and to org_admin role. Super admin also passes.
+async function requireOwnOrgAdminScope(req, res, next) {
+    if (!req.session?.user) return res.status(401).json({ error: 'Unauthorized' });
+    const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
+
+    const orgIds = await resolveUserOrgIds(req);
+    const orgId = orgIds && orgIds.size > 0 ? Array.from(orgIds)[0] : null;
+    if (!orgId) return res.status(403).json({ error: 'No organisation context' });
+
+    if (!isSuperAdmin) {
+        const user = await userStore.getUser(req.session.user.id);
+        if (!user || user.orgRole !== 'org_admin') {
+            return res.status(403).json({ error: 'Organization admin access required' });
+        }
+    }
+    req.termFilters = buildRequestFilters(req);
+    req.termFilters.organizationId = orgId;
+    next();
+}
+
+router.get('/org', requireOwnOrgAdminScope, async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+        const rows = await terminationStore.getList(req.termFilters, limit);
+        res.json({ rows });
+    } catch (e) {
+        console.error('[Terminations] org list error:', e.message);
+        res.status(500).json({ error: 'Failed to load terminations' });
+    }
+});
+
+router.get('/org/summary', requireOwnOrgAdminScope, async (req, res) => {
+    try {
+        const summary = await terminationStore.getSummary(req.termFilters);
+        res.json(summary);
+    } catch (e) {
+        console.error('[Terminations] org summary error:', e.message);
+        res.status(500).json({ error: 'Failed to load summary' });
+    }
+});
+
+router.get('/org/timeline', requireOwnOrgAdminScope, async (req, res) => {
+    try {
+        const interval = req.query.interval === 'hour' ? 'hour' : 'day';
+        const rows = await terminationStore.getTimeline(req.termFilters, interval);
+        res.json({ rows, interval });
+    } catch (e) {
+        console.error('[Terminations] org timeline error:', e.message);
+        res.status(500).json({ error: 'Failed to load timeline' });
+    }
+});
+
+router.get('/org/by-agent', requireOwnOrgAdminScope, async (req, res) => {
+    try {
+        const rows = await terminationStore.getByAgent(req.termFilters);
+        res.json({ rows });
+    } catch (e) {
+        console.error('[Terminations] org by-agent error:', e.message);
+        res.status(500).json({ error: 'Failed to load by-agent' });
+    }
+});
+
+// ── Default routes (admin / generic org-scoped) ────────────────────────────
 router.use(attachOrgFilter);
 
 router.get('/', async (req, res) => {
