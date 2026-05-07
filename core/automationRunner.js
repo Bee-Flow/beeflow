@@ -13,6 +13,7 @@
  * rows owned by orgs without the beta are skipped each tick.
  */
 
+const crypto = require('crypto');
 const automationStore = require('../stores/automationStore');
 const configStore = require('../stores/configStore');
 const notificationStore = require('../stores/notificationStore');
@@ -20,6 +21,7 @@ const { resolveModelForTier } = require('./modelResolver');
 const { getProviderForModel } = require('./aiAgent');
 const { getAdapter } = require('./providers');
 const { pool } = require('../db');
+const { sanitizeError } = require('./errorSanitizer');
 const { resolveValue, resolveDeep, resolveInputs } = require('../automation/bind');
 const { evaluate } = require('../automation/expr');
 const { isSideEffect } = require('../automation/sideEffectMap');
@@ -31,8 +33,18 @@ const sandbox = require('../automation/codeSandbox');
 
 const RUNNER_INTERVAL_MS = 60_000;
 const POLLING_INTERVAL_MS = 30_000;
+const REAPER_INTERVAL_MS = 60_000;
 const MAX_CONCURRENT = 5;
 const RUN_HARD_TIMEOUT_MS = 5 * 60_000; // 5 minutes per run, defensive
+// A row stuck in `running` for more than this is treated as crashed and
+// reset by the reaper. Kept slightly above RUN_HARD_TIMEOUT_MS so a normal
+// long run is never reaped while still executing.
+const REAPER_STALE_AFTER_MS = 6 * 60_000;
+const REAPER_MAX_ATTEMPTS = 5;
+
+// Stable per-process token. Identifies which runner instance currently
+// owns a claimed row — useful for diagnostics and for the reaper's logs.
+const INSTANCE_ID = `runner-${crypto.randomBytes(6).toString('hex')}`;
 
 let started = false;
 
@@ -322,7 +334,14 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
         mode: effectiveMode,
     });
     await automationStore.updateRun(run.id, { status: 'running', startedAt: new Date().toISOString() });
-    await automationStore.updateAutomation(automation.id, { lastStatus: 'running' }, automation.userId);
+    // For schedule-triggered runs the row was already claimed atomically
+    // by claimDueAutomations() and carries running_instance_id /
+    // running_started_at, so skip the redundant mark. For manual / event
+    // / dry-run paths the row needs the running stamps so the reaper can
+    // catch a crash mid-execution.
+    if (triggerKind !== 'schedule') {
+        await automationStore.markRunning(automation.id, INSTANCE_ID).catch(() => {});
+    }
 
     const runState = {
         trigger: { output: triggerPayload || {} },
@@ -412,7 +431,8 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
     };
 
     let runResult;
-    let runError = null;
+    let runErrorObj = null;
+    let runErrorMsg = null;
     let runStatus = 'success';
 
     const guard = new Promise((_, reject) => setTimeout(() => reject(new Error('Run hard timeout')), RUN_HARD_TIMEOUT_MS));
@@ -423,14 +443,23 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
             guard,
         ]);
     } catch (e) {
-        runError = e.message || String(e);
+        runErrorObj = e;
+        runErrorMsg = e.message || String(e);
         runStatus = 'error';
     }
+
+    // Sanitized error fields for any persisted message visible to users.
+    // The raw error stays in the run row's `error` column for diagnostics
+    // (server-only); user-facing notifications get the redacted line.
+    const sanitized = runErrorObj ? sanitizeError(runErrorObj) : null;
+    const userSafeError = sanitized
+        ? (sanitized.error_first_line || `Failed (${sanitized.error_code})`)
+        : runErrorMsg;
 
     const finishedAt = new Date().toISOString();
     const summary = (() => {
         if (firstRunNeedsConfirm) return 'Awaiting first-run confirmation. Review the dry-run output and approve to run live.';
-        if (runError) return `Failed: ${runError}`;
+        if (runErrorMsg) return `Failed: ${userSafeError}`;
         return summariseDefinition(automation.definition || {}).summary;
     })();
 
@@ -438,16 +467,28 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
         status: firstRunNeedsConfirm ? 'awaiting_confirm' : runStatus,
         finishedAt,
         durationMs: Date.now() - startedAt,
-        error: runError,
+        error: runErrorMsg,
         summary,
     });
 
-    await automationStore.updateAutomation(automation.id, {
-        lastStatus: firstRunNeedsConfirm ? 'awaiting_confirm' : runStatus,
-        lastRunAt: finishedAt,
-    }, automation.userId);
+    // Always release the running marker. Without this, a row stays
+    // `running` forever when the runner crashes — the reaper still
+    // catches that, but releasing here is the fast path.
+    try {
+        await automationStore.updateAutomation(automation.id, {
+            lastStatus: firstRunNeedsConfirm ? 'awaiting_confirm' : runStatus,
+            lastRunAt: finishedAt,
+        }, automation.userId);
+        await automationStore.releaseAutomation(automation.id);
+        if (runStatus === 'success') {
+            await automationStore.resetAttempts(automation.id);
+        }
+    } catch (e) {
+        console.warn(`[AutomationRunner] release/update failed for ${automation.id}: ${e.message}`);
+    }
 
-    // Notifications
+    // Notifications — error path uses the sanitized message so we never
+    // leak upstream API payloads or bearer tokens echoed in error bodies.
     try {
         if (firstRunNeedsConfirm) {
             await notificationStore.createNotification({
@@ -468,7 +509,7 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
                 userId: automation.userId,
                 category: 'urgent',
                 title: `⚠️ Automation failed: ${automation.title}`,
-                message: runError || 'Unknown error',
+                message: userSafeError || 'Unknown error',
             });
         }
     } catch (_) { /* notification failure is non-fatal */ }
@@ -494,21 +535,32 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
 
 async function processDueAutomations() {
     try {
-        const due = await automationStore.getDueAutomations();
+        // Atomic claim with `FOR UPDATE SKIP LOCKED`: each row is owned by
+        // exactly one runner instance, even when multiple workers share a
+        // DB. Replaces the old read-then-mark pattern that allowed double
+        // execution if a runner crashed between read and mark.
+        const due = await automationStore.claimDueAutomations(INSTANCE_ID, 20);
         if (due.length === 0) return;
 
         // Filter by per-org beta access. If an org loses the 'automations'
         // beta, their automations stop firing on schedule (but stay in the
-        // DB so re-enabling restores them instantly). User-initiated runs
-        // are gated at the route layer.
+        // DB so re-enabling restores them instantly). Skipped rows are
+        // released so the schedule advances on the next tick.
         const { userHasBetaFeature } = require('./betaFeatures');
         const allowed = [];
         for (const a of due) {
             try {
                 const ok = await userHasBetaFeature(a.userId, 'automations', null);
                 if (ok) allowed.push(a);
-                else console.log(`[AutomationRunner] Skipping ${a.id} — owner ${a.userId} no longer has automations beta`);
-            } catch (_) { /* on lookup failure, skip rather than fire incorrectly */ }
+                else {
+                    console.log(`[AutomationRunner] Skipping ${a.id} — owner ${a.userId} no longer has automations beta`);
+                    await automationStore.releaseAutomation(a.id);
+                    await automationStore.updateAutomation(a.id, { lastStatus: 'pending' }, a.userId).catch(() => {});
+                }
+            } catch (_) {
+                // On lookup failure, release rather than fire incorrectly.
+                await automationStore.releaseAutomation(a.id).catch(() => {});
+            }
         }
         if (allowed.length === 0) return;
 
@@ -518,6 +570,38 @@ async function processDueAutomations() {
         }
     } catch (e) {
         console.error('[AutomationRunner] processDueAutomations error:', e.message);
+    }
+}
+
+/**
+ * Reaper — finds rows stuck in `running` longer than REAPER_STALE_AFTER_MS
+ * (a runner crash / OOM / pod kill leaves them this way) and resets them
+ * so the next tick can re-claim. After REAPER_MAX_ATTEMPTS the row is
+ * left in `error` and the owner is notified.
+ */
+async function reapStuckAutomations() {
+    try {
+        const reaped = await automationStore.reapStuckAutomations({
+            staleAfterMs: REAPER_STALE_AFTER_MS,
+            maxAttempts: REAPER_MAX_ATTEMPTS,
+        });
+        if (reaped.length === 0) return;
+        for (const a of reaped) {
+            const giveUp = (a.attempts || 0) >= REAPER_MAX_ATTEMPTS;
+            console.warn(`[AutomationRunner] Reaper reset stuck row ${a.id} (attempts=${a.attempts}${giveUp ? ', giving up' : ''})`);
+            if (giveUp) {
+                try {
+                    await notificationStore.createNotification({
+                        userId: a.userId,
+                        category: 'urgent',
+                        title: `⚠️ Automation failed: ${a.title}`,
+                        message: `The automation could not complete after ${REAPER_MAX_ATTEMPTS} attempts and was paused. Open it to inspect the last run.`,
+                    });
+                } catch (_) { /* non-fatal */ }
+            }
+        }
+    } catch (e) {
+        console.error('[AutomationRunner] reapStuckAutomations error:', e.message);
     }
 }
 
@@ -543,12 +627,16 @@ async function start() {
     started = true;
     setInterval(processDueAutomations, RUNNER_INTERVAL_MS).unref();
     setInterval(processPollingAndRenewals, POLLING_INTERVAL_MS).unref();
+    setInterval(reapStuckAutomations, REAPER_INTERVAL_MS).unref();
     setTimeout(processDueAutomations, 10_000).unref?.();
-    console.log('[AutomationRunner] started (60s schedule tick, 30s polling tick) — per-org beta gating active');
+    setTimeout(reapStuckAutomations, 15_000).unref?.();
+    console.log(`[AutomationRunner] started (instance=${INSTANCE_ID}, 60s schedule, 30s polling, 60s reaper)`);
 }
 
 module.exports = {
     start,
     executeAutomation,
     processDueAutomations,
+    reapStuckAutomations,
+    INSTANCE_ID,
 };

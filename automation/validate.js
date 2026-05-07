@@ -77,7 +77,17 @@ function secondSegment(path) {
 }
 
 /**
- * Validate a definition. Returns { ok: true } or { ok: false, errors: [...] }.
+ * Validate a definition. Returns { ok, errors[], warnings[] } where each
+ * record is `{ code, severity, path, message, hint }`. The structured
+ * shape lets the SSE builder loop feed *specific* failures back to the
+ * LLM so it can self-correct instead of guessing what the free-text
+ * meant.
+ *
+ *   code        — short, stable identifier (e.g. 'condition.dead_branch')
+ *   severity    — 'error' | 'warning'
+ *   path        — JSON-pointer-ish path into the def (e.g. 'steps[3].expr')
+ *   message     — human-readable, for UI display
+ *   hint        — actionable next step, written for the LLM
  *
  * `availableTools` (optional) is a Set of tool names from the catalog. When
  * provided, integration_action.tool is checked against it.
@@ -85,46 +95,56 @@ function secondSegment(path) {
 function validateDefinition(def, { availableTools = null } = {}) {
     const errors = [];
     const warnings = [];
-    const push = (msg) => errors.push(msg);
-    const warn = (msg) => warnings.push(msg);
+    const pushE = (rec) => errors.push(rec);
+    const pushW = (rec) => warnings.push(rec);
 
-    if (!isObject(def)) return { ok: false, errors: ['Definition must be an object'] };
-    if (!isObject(def.trigger)) push('Missing or invalid `trigger`.');
-    if (!Array.isArray(def.steps)) push('`steps` must be an array.');
-    if (!Array.isArray(def.edges)) push('`edges` must be an array.');
-    if (errors.length) return { ok: false, errors };
+    if (!isObject(def)) {
+        return {
+            ok: false,
+            errors: [{ code: 'shape.not_object', severity: 'error', path: '', message: 'Definition must be an object.', hint: 'Pass a JSON object with trigger, steps, and edges keys.' }],
+            warnings: [],
+        };
+    }
+    if (!isObject(def.trigger)) pushE({ code: 'trigger.missing', severity: 'error', path: 'trigger', message: 'Missing or invalid `trigger`.', hint: 'Call builder_propose_trigger before adding any steps.' });
+    if (!Array.isArray(def.steps)) pushE({ code: 'steps.not_array', severity: 'error', path: 'steps', message: '`steps` must be an array.', hint: 'Initialise the draft via builder_propose_trigger so the shape is correct.' });
+    if (!Array.isArray(def.edges)) pushE({ code: 'edges.not_array', severity: 'error', path: 'edges', message: '`edges` must be an array.', hint: 'Initialise the draft via builder_propose_trigger so the shape is correct.' });
+    if (errors.length) return { ok: false, errors, warnings };
 
     // Trigger — ensure it has an id and a kind.
     const trigger = def.trigger;
-    if (!trigger.id || typeof trigger.id !== 'string') push('trigger.id is required.');
-    if (!trigger.kind || typeof trigger.kind !== 'string') push('trigger.kind is required.');
+    if (!trigger.id || typeof trigger.id !== 'string') pushE({ code: 'trigger.id_missing', severity: 'error', path: 'trigger.id', message: 'trigger.id is required.', hint: 'Re-run builder_propose_trigger; it generates a stable id.' });
+    if (!trigger.kind || typeof trigger.kind !== 'string') pushE({ code: 'trigger.kind_missing', severity: 'error', path: 'trigger.kind', message: 'trigger.kind is required.', hint: 'Use one of: schedule, manual, webhook, app_event.' });
 
     // Steps — unique ids, valid types.
     const ids = new Set([trigger.id]);
     const stepById = new Map();
     if (trigger.id) stepById.set(trigger.id, trigger);
-    for (const s of def.steps) {
-        if (!isObject(s)) { push('Each step must be an object.'); continue; }
-        if (!s.id || typeof s.id !== 'string') { push('Each step needs an `id`.'); continue; }
-        if (ids.has(s.id)) { push(`Duplicate step id: ${s.id}`); continue; }
-        if (!VALID_STEP_TYPES.has(s.type)) { push(`Step ${s.id}: unknown type "${s.type}".`); continue; }
+    for (let i = 0; i < def.steps.length; i++) {
+        const s = def.steps[i];
+        const at = `steps[${i}]`;
+        if (!isObject(s)) { pushE({ code: 'step.not_object', severity: 'error', path: at, message: 'Each step must be an object.', hint: 'Remove the malformed entry and add a fresh step via builder_add_*.' }); continue; }
+        if (!s.id || typeof s.id !== 'string') { pushE({ code: 'step.id_missing', severity: 'error', path: at + '.id', message: 'Each step needs an `id`.', hint: 'Use the id returned from the previous builder_add_* tool result.' }); continue; }
+        if (ids.has(s.id)) { pushE({ code: 'step.id_duplicate', severity: 'error', path: at + '.id', message: `Duplicate step id: ${s.id}`, hint: 'Remove the duplicate or call builder_remove_step on one of them.' }); continue; }
+        if (!VALID_STEP_TYPES.has(s.type)) { pushE({ code: 'step.unknown_type', severity: 'error', path: at + '.type', message: `Step ${s.id}: unknown type "${s.type}".`, hint: `Use one of: ${[...VALID_STEP_TYPES].join(', ')}.` }); continue; }
         ids.add(s.id);
         stepById.set(s.id, s);
     }
 
     // Edges — reference known nodes.
-    for (const e of def.edges) {
-        if (!isObject(e) || !e.from || !e.to) { push('Each edge needs `from` and `to`.'); continue; }
-        if (!ids.has(e.from)) push(`Edge from unknown node: ${e.from}`);
-        if (!ids.has(e.to)) push(`Edge to unknown node: ${e.to}`);
+    for (let i = 0; i < def.edges.length; i++) {
+        const e = def.edges[i];
+        const at = `edges[${i}]`;
+        if (!isObject(e) || !e.from || !e.to) { pushE({ code: 'edge.shape', severity: 'error', path: at, message: 'Each edge needs `from` and `to`.', hint: 'Re-add the edge via the relevant builder_add_* tool which fills both fields.' }); continue; }
+        if (!ids.has(e.from)) pushE({ code: 'edge.unknown_from', severity: 'error', path: at + '.from', message: `Edge from unknown node: ${e.from}`, hint: 'Either remove the edge or add the missing step.' });
+        if (!ids.has(e.to))   pushE({ code: 'edge.unknown_to',   severity: 'error', path: at + '.to',   message: `Edge to unknown node: ${e.to}`,   hint: 'Either remove the edge or add the missing step.' });
     }
-    if (errors.length) return { ok: false, errors };
+    if (errors.length) return { ok: false, errors, warnings };
 
     // DAG check.
     const nodes = Array.from(ids);
     const order = topoOrder(nodes, def.edges);
-    if (!order) push('Definition contains a cycle.');
-    if (errors.length) return { ok: false, errors };
+    if (!order) pushE({ code: 'graph.cycle', severity: 'error', path: 'edges', message: 'Definition contains a cycle.', hint: 'Inspect the edges array; remove the back-edge that closes the loop.' });
+    if (errors.length) return { ok: false, errors, warnings };
 
     // Per-step validation + reference scoping (top-level only; loop bodies
     // are validated within their own scope below).
@@ -133,46 +153,51 @@ function validateDefinition(def, { availableTools = null } = {}) {
         const step = stepById.get(id);
         if (!step) continue;
         if (step.id === trigger.id) continue;
+        const at = `steps[${id}]`;
 
         // Step-type-specific structural checks.
         if (step.type === 'integration_action') {
-            if (!step.tool || typeof step.tool !== 'string') push(`Step ${step.id}: integration_action requires \`tool\`.`);
-            else if (availableTools && !availableTools.has(step.tool)) push(`Step ${step.id}: tool "${step.tool}" not in user's catalog.`);
+            if (!step.tool || typeof step.tool !== 'string') pushE({ code: 'integration_action.tool_missing', severity: 'error', path: at + '.tool', message: `Step ${step.id}: integration_action requires \`tool\`.`, hint: 'Pick a tool from the catalog and pass it as a string.' });
+            else if (availableTools && !availableTools.has(step.tool)) pushE({ code: 'integration_action.tool_unknown', severity: 'error', path: at + '.tool', message: `Step ${step.id}: tool "${step.tool}" not in user\'s catalog.`, hint: 'Either pick a tool the user has connected or ask them to connect the integration.' });
         }
         if (step.type === 'ai_step') {
-            if (!step.prompt || typeof step.prompt !== 'string') push(`Step ${step.id}: ai_step requires \`prompt\`.`);
+            if (!step.prompt || typeof step.prompt !== 'string') pushE({ code: 'ai_step.prompt_missing', severity: 'error', path: at + '.prompt', message: `Step ${step.id}: ai_step requires \`prompt\`.`, hint: 'Provide a non-empty prompt string.' });
         }
         if (step.type === 'condition') {
-            if (!step.expr || typeof step.expr !== 'string') push(`Step ${step.id}: condition requires \`expr\`.`);
+            if (!step.expr || typeof step.expr !== 'string') pushE({ code: 'condition.expr_missing', severity: 'error', path: at + '.expr', message: `Step ${step.id}: condition requires \`expr\`.`, hint: 'Provide a restricted-grammar expression like `steps.x.output.count > 0`.' });
             else {
                 try { parseExpr(step.expr); }
-                catch (e) { push(`Step ${step.id}: condition expr parse error — ${e.message}`); }
+                catch (e) { pushE({ code: 'condition.expr_parse', severity: 'error', path: at + '.expr', message: `Step ${step.id}: condition expr parse error — ${e.message}`, hint: 'Restricted grammar only — no function calls, assignments, or templates.' }); }
             }
-            // 'then'/'else' edges are recommended but not required — when
-            // missing the runner just stops traversal on that branch.
+            // A condition with no `then` and no `else` outgoing edges
+            // dead-ends at runtime — promote from warning to error so
+            // the builder cannot finalize a definitionally broken graph.
             const out = def.edges.filter(e => e.from === step.id);
             const labels = new Set(out.map(e => e.label));
-            if (!labels.has('then') && !labels.has('else')) warn(`Step ${step.id}: condition has no 'then' or 'else' edges — branch will dead-end.`);
+            if (!labels.has('then') && !labels.has('else')) {
+                pushE({ code: 'condition.dead_branch', severity: 'error', path: at + '.edges', message: `Step ${step.id}: condition has no 'then' or 'else' edges — both branches dead-end.`, hint: 'Pass thenStepId and/or elseStepId on the condition, or use builder_add_* with afterStepId set to this condition id and an explicit edge label.' });
+            } else if (!labels.has('then') || !labels.has('else')) {
+                pushW({ code: 'condition.partial_branch', severity: 'warning', path: at + '.edges', message: `Step ${step.id}: condition has only one branch wired — the other will dead-end.`, hint: 'Wire both then and else, or remove the condition if a one-sided check is intended.' });
+            }
         }
         if (step.type === 'loop') {
-            if (!step.itemVar || typeof step.itemVar !== 'string') push(`Step ${step.id}: loop requires \`itemVar\`.`);
-            if (!step.overRef || typeof step.overRef !== 'string') push(`Step ${step.id}: loop requires \`overRef\`.`);
-            // Body is recursively validated as its own DAG.
+            if (!step.itemVar || typeof step.itemVar !== 'string') pushE({ code: 'loop.itemVar_missing', severity: 'error', path: at + '.itemVar', message: `Step ${step.id}: loop requires \`itemVar\`.`, hint: 'Choose a short variable name like `item` or `email`.' });
+            if (!step.overRef || typeof step.overRef !== 'string') pushE({ code: 'loop.overRef_missing', severity: 'error', path: at + '.overRef', message: `Step ${step.id}: loop requires \`overRef\`.`, hint: 'Bind to an upstream array, e.g. `steps.<id>.output.items`.' });
             if (Array.isArray(step.body)) {
                 for (const child of step.body) {
-                    if (!isObject(child) || !child.id) push(`Step ${step.id}: loop body item missing id.`);
+                    if (!isObject(child) || !child.id) pushE({ code: 'loop.body_item_id_missing', severity: 'error', path: at + '.body', message: `Step ${step.id}: loop body item missing id.`, hint: 'Re-add the body step via the relevant builder_add_* tool.' });
                 }
             }
             if (typeof step.maxIterations !== 'number' || step.maxIterations < 1 || step.maxIterations > 1000) {
-                push(`Step ${step.id}: loop maxIterations must be 1..1000.`);
+                pushE({ code: 'loop.max_iterations_range', severity: 'error', path: at + '.maxIterations', message: `Step ${step.id}: loop maxIterations must be 1..1000.`, hint: 'Pick a small integer; 100 is a sensible default.' });
             }
         }
         if (step.type === 'code') {
-            if (!step.code || typeof step.code !== 'string') push(`Step ${step.id}: code step requires \`code\`.`);
-            if (step.language && step.language !== 'javascript') push(`Step ${step.id}: only language: 'javascript' supported.`);
+            if (!step.code || typeof step.code !== 'string') pushE({ code: 'code.code_missing', severity: 'error', path: at + '.code', message: `Step ${step.id}: code step requires \`code\`.`, hint: 'Provide the JS source as a string.' });
+            if (step.language && step.language !== 'javascript') pushE({ code: 'code.language_unsupported', severity: 'error', path: at + '.language', message: `Step ${step.id}: only language: 'javascript' supported.`, hint: 'Either omit `language` or set it to "javascript".' });
         }
         if (step.type === 'notification') {
-            if (!step.title && !step.body) push(`Step ${step.id}: notification needs at least \`title\` or \`body\`.`);
+            if (!step.title && !step.body) pushE({ code: 'notification.empty', severity: 'error', path: at, message: `Step ${step.id}: notification needs at least \`title\` or \`body\`.`, hint: 'Provide one (or both) so the user has something to read.' });
         }
 
         // Reference scoping — collect all ref paths used in this step's
@@ -195,23 +220,22 @@ function validateDefinition(def, { availableTools = null } = {}) {
             // safely return undefined for unknown lookups.
             if (!path) continue;
             const root = rootOf(path);
-            if (!root) { warn(`Step ${step.id}: invalid ref "${path}".`); continue; }
+            if (!root) { pushW({ code: 'ref.invalid', severity: 'warning', path: at, message: `Step ${step.id}: invalid ref "${path}".`, hint: 'Refs must start with one of: trigger, steps, vars, secrets, loop.' }); continue; }
             if (root === 'trigger' || root === 'vars' || root === 'secrets' || root === 'loop') continue;
             if (root === 'steps') {
                 const upstreamId = secondSegment(path);
-                if (!upstreamId) { warn(`Step ${step.id}: ref must include a step id.`); continue; }
+                if (!upstreamId) { pushW({ code: 'ref.no_step_id', severity: 'warning', path: at, message: `Step ${step.id}: ref must include a step id.`, hint: 'Use the form steps.<id>.output.<field>.' }); continue; }
                 if (!seenSoFar.has(upstreamId) && upstreamId !== step.id) {
-                    warn(`Step ${step.id}: refers to step "${upstreamId}" — will resolve to undefined at runtime if it doesn't produce output by then.`);
+                    pushW({ code: 'ref.forward', severity: 'warning', path: at, message: `Step ${step.id}: refers to step "${upstreamId}" — will resolve to undefined at runtime if it doesn't produce output by then.`, hint: `Wire an edge from "${upstreamId}" to "${step.id}" so the upstream output is available.` });
                 }
                 continue;
             }
-            warn(`Step ${step.id}: unknown ref root "${root}".`);
+            pushW({ code: 'ref.unknown_root', severity: 'warning', path: at, message: `Step ${step.id}: unknown ref root "${root}".`, hint: 'Refs must start with one of: trigger, steps, vars, secrets, loop.' });
         }
         seenSoFar.add(step.id);
     }
 
-    if (errors.length) return { ok: false, errors, warnings };
-    return { ok: true, warnings };
+    return { ok: errors.length === 0, errors, warnings };
 }
 
 module.exports = { validateDefinition, topoOrder };

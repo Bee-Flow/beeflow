@@ -6,7 +6,7 @@
  */
 
 const crypto = require('crypto');
-const { run, getOne, getAll, exec, getClient } = require('../db');
+const { run, getOne, getAll, exec, getClient, pool } = require('../db');
 
 let initialized = false;
 
@@ -14,6 +14,7 @@ async function initDB() {
     if (initialized) return;
     const migration = require('../migrations/automation-builder-2026-05-init');
     await migration.up();
+    try { await require('../migrations/automation-locking-and-session-2026-05').up(); } catch (e) { /* tolerate */ }
     initialized = true;
     console.log('[AutomationStore] PostgreSQL initialized');
 }
@@ -124,6 +125,132 @@ async function getDueAutomations() {
          ORDER BY next_run_at ASC LIMIT 20`,
     );
     return rows.map(rowToAutomation);
+}
+
+/**
+ * Atomically claim due schedule-trigger automations for execution.
+ *
+ * Uses `FOR UPDATE SKIP LOCKED` so concurrent runner instances never claim
+ * the same row. The claim sets `last_status='running'`, stamps the
+ * instance/start time, and returns the rows so the caller can execute them.
+ * Replaces the old read-then-mark pattern that allowed double-execution if
+ * a runner crashed between read and mark.
+ */
+async function claimDueAutomations(instanceId, limit = 20) {
+    await initDB();
+    const client = await getClient();
+    try {
+        await client.query('BEGIN');
+        const sel = await client.query(
+            `SELECT id FROM automations
+             WHERE is_active = TRUE
+               AND is_draft = FALSE
+               AND trigger_type = 'schedule'
+               AND next_run_at IS NOT NULL
+               AND next_run_at <= NOW()
+               AND (last_status IS NULL OR last_status != 'running')
+             ORDER BY next_run_at ASC
+             LIMIT $1
+             FOR UPDATE SKIP LOCKED`,
+            [limit],
+        );
+        if (sel.rows.length === 0) {
+            await client.query('COMMIT');
+            return [];
+        }
+        const ids = sel.rows.map(r => r.id);
+        const upd = await client.query(
+            `UPDATE automations
+                SET last_status = 'running',
+                    running_instance_id = $1,
+                    running_started_at = NOW()
+              WHERE id = ANY($2::text[])
+              RETURNING *`,
+            [instanceId, ids],
+        );
+        await client.query('COMMIT');
+        return upd.rows.map(rowToAutomation);
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw e;
+    } finally {
+        client.release();
+    }
+}
+
+/**
+ * Mark an automation row as running for non-scheduled paths (manual run,
+ * event trigger). The schedule tick uses claimDueAutomations() instead;
+ * this is for paths that already know they want to run a specific row.
+ *
+ * Returns false if the row was already marked running (i.e. another path
+ * is mid-execution) so callers can decide whether to skip or queue.
+ */
+async function markRunning(id, instanceId) {
+    await initDB();
+    const { rows } = await pool.query(
+        `UPDATE automations
+            SET last_status = 'running',
+                running_instance_id = $1,
+                running_started_at = NOW()
+          WHERE id = $2
+            AND (last_status IS NULL OR last_status != 'running')
+          RETURNING id`,
+        [instanceId, id],
+    );
+    return rows.length > 0;
+}
+
+/**
+ * Clear the running marker on an automation. Called from the runner's
+ * finally block so a crash mid-execution leaves running_started_at set
+ * for the reaper to find.
+ */
+async function releaseAutomation(id) {
+    await initDB();
+    await run(
+        `UPDATE automations
+            SET running_instance_id = NULL,
+                running_started_at = NULL
+          WHERE id = $1`,
+        [id],
+    );
+}
+
+/**
+ * Reset rows stuck in `running` for longer than `staleAfterMs` (a runner
+ * crash, OOM, or process kill leaves them this way). The reset bumps
+ * `attempts`; the caller decides what status to leave them in.
+ *
+ * Returns the rows that were reset so the runner can decide whether to
+ * retry now, schedule a backoff, or notify the owner.
+ */
+async function reapStuckAutomations({ staleAfterMs = 10 * 60_000, maxAttempts = 5 } = {}) {
+    await initDB();
+    const { rows } = await pool.query(
+        `UPDATE automations
+            SET last_status = CASE
+                    WHEN attempts + 1 >= $2 THEN 'error'
+                    ELSE 'pending'
+                END,
+                running_instance_id = NULL,
+                running_started_at = NULL,
+                attempts = attempts + 1
+          WHERE last_status = 'running'
+            AND running_started_at IS NOT NULL
+            AND running_started_at < NOW() - ($1 * INTERVAL '1 millisecond')
+          RETURNING *`,
+        [staleAfterMs, maxAttempts],
+    );
+    return rows.map(rowToAutomation);
+}
+
+/**
+ * Reset the attempts counter after a successful run.
+ */
+async function resetAttempts(id) {
+    await initDB();
+    await run(`UPDATE automations SET attempts = 0 WHERE id = $1`, [id]);
 }
 
 async function updateAutomation(id, updates, savedByUserId) {
@@ -432,6 +559,11 @@ module.exports = {
     getAutomation,
     getAutomationsForUser,
     getDueAutomations,
+    claimDueAutomations,
+    markRunning,
+    releaseAutomation,
+    reapStuckAutomations,
+    resetAttempts,
     updateAutomation,
     deleteAutomation,
     listVersions,
