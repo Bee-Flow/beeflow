@@ -342,4 +342,63 @@ async function renewExpiringSubscriptions() {
     }
 }
 
-module.exports = { dispatchEvent, runPollingPass, renewExpiringSubscriptions, matchGmailMailFilter };
+/**
+ * Find the most recent Gmail message that matches a mail.new filter and
+ * return it shaped like a regular trigger payload. Used by:
+ *   - manual run of a Gmail-triggered automation, so the user gets a
+ *     real test against actual inbox content instead of a null payload.
+ *   - activate, so flipping the toggle immediately processes the latest
+ *     matching email rather than only firing on subsequent arrivals.
+ *
+ * Returns null if no message matches (or if the user has no Gmail tokens).
+ * The caller decides what to do with that — typically: skip dispatch and
+ * let the run record an explanatory error.
+ *
+ * Filter is applied client-side via matchGmailMailFilter so the semantics
+ * are identical to the polling path (case-insensitive, system-label aware,
+ * fail-closed regex). Server-side `q` is used only as a coarse pre-filter
+ * to keep the API call cheap.
+ */
+async function fetchLatestGmailMatch(userId, filter) {
+    try {
+        const session = await loadSession(userId);
+        if (!session?.accessToken) return null;
+        const { google } = require('googleapis');
+        const auth = new google.auth.OAuth2();
+        auth.setCredentials({ access_token: session.accessToken, refresh_token: session.refreshToken });
+        const gmail = google.gmail({ version: 'v1', auth });
+
+        // Coarse server-side narrowing. Only fields Gmail's `q` understands
+        // get pre-filtered; the rest (regex, exclude labels, freshness, ...)
+        // are caught by the client-side matcher.
+        const q = [];
+        if (filter?.from) q.push(`from:${filter.from}`);
+        if (filter?.to) q.push(`to:${filter.to}`);
+        if (filter?.subjectContains) q.push(`subject:${JSON.stringify(filter.subjectContains)}`);
+        if (filter?.hasAttachment === true) q.push('has:attachment');
+        if (filter?.excludeFromSelf === true) q.push('-in:sent');
+        // We sort by recency by default; cap to 10 candidates so a popular
+        // sender can't make us page through hundreds of messages just to
+        // find one that passes the regex/freshness filter.
+        const list = await gmail.users.messages.list({
+            userId: 'me',
+            q: q.join(' ') || undefined,
+            maxResults: 10,
+        });
+        const ids = (list.data.messages || []).map(m => m.id).filter(Boolean);
+        if (ids.length === 0) return null;
+
+        for (const id of ids) {
+            const meta = await fetchGmailMessageMetadata(gmail, id).catch(() => null);
+            if (!meta) continue;
+            const payload = { messageId: id, threadId: list.data.messages.find(m => m.id === id)?.threadId || null, ...meta };
+            if (matchGmailMailFilter(payload, filter || null)) return payload;
+        }
+        return null;
+    } catch (e) {
+        console.warn(`[TriggerBus] fetchLatestGmailMatch failed for user ${userId}: ${e.message}`);
+        return null;
+    }
+}
+
+module.exports = { dispatchEvent, runPollingPass, renewExpiringSubscriptions, matchGmailMailFilter, fetchLatestGmailMatch };

@@ -339,6 +339,33 @@ router.post('/:id/activate', async (req, res) => {
         // refreshes the filter / cursor.
         await syncAppEventSubscription(a.id, userId, a.definition);
 
+        // Immediate Gmail check on activate: if the trigger is mail.new,
+        // pull the most recent matching email and dispatch it once. Without
+        // this the user has to wait for the next genuinely-new email to see
+        // the automation fire — confusing on activate. Run async so the
+        // HTTP response stays snappy.
+        const trig = a.definition?.trigger;
+        if (trig?.kind === 'app_event'
+            && trig?.appEvent?.provider === 'gmail'
+            && trig?.appEvent?.event === 'mail.new') {
+            (async () => {
+                try {
+                    const triggerBus = require('../automation/triggerBus');
+                    const latest = await triggerBus.fetchLatestGmailMatch(userId, trig.appEvent.filter || null);
+                    if (latest) {
+                        await triggerBus.dispatchEvent({
+                            provider: 'gmail',
+                            event: 'mail.new',
+                            payload: latest,
+                            userId,
+                        });
+                    }
+                } catch (e) {
+                    console.warn(`[automation/activate] immediate Gmail dispatch failed for ${a.id}: ${e.message}`);
+                }
+            })();
+        }
+
         res.json({ automation: u, warnings: v.warnings || [] });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -414,9 +441,34 @@ router.post('/:id/run', async (req, res) => {
         let timedOut = false;
         const guard = new Promise((resolve) => setTimeout(() => { timedOut = true; resolve(null); }, RESPONSE_TIMEOUT_MS));
 
+        // For Gmail-triggered automations the manual run is meaningless
+        // without a real email payload (every binding resolves to undefined,
+        // gmail_compose then errors with "to is required" etc.). Synthesize
+        // a payload from the user's most recent matching inbox message so
+        // the test mirrors a real fire of the trigger.
+        let triggerPayload = req.body?.triggerPayload || null;
+        const trig = a.definition?.trigger;
+        const isGmailTrig = trig?.kind === 'app_event'
+            && trig?.appEvent?.provider === 'gmail'
+            && trig?.appEvent?.event === 'mail.new';
+        if (isGmailTrig && !triggerPayload) {
+            const triggerBus = require('../automation/triggerBus');
+            const latest = await triggerBus.fetchLatestGmailMatch(userId, trig.appEvent.filter || null);
+            if (latest) {
+                triggerPayload = { provider: 'gmail', event: 'mail.new', ...latest };
+            } else {
+                return res.status(200).json({
+                    accepted: true,
+                    pending: false,
+                    skipped: true,
+                    message: 'No matching email found in your inbox to test against. The automation is ready — it will fire when a new matching email arrives.',
+                });
+            }
+        }
+
         const runPromise = runner.executeAutomation(a, {
             triggerKind: 'manual',
-            triggerPayload: req.body?.triggerPayload || null,
+            triggerPayload,
             mode: 'live',
         }).catch(e => { console.error('[automation/run] error:', e.message); return null; });
 
