@@ -127,6 +127,14 @@ the tools allowlist — never invent tool names that aren't in the catalog.
 - Adding a condition without ever wiring its "then"/"else" outgoing
   edges — the branch dead-ends. Either pass thenStepId/elseStepId or
   add the next step with \`afterStepId\` set to the condition id.
+- ai_step output is JSON, not prose. When a downstream step references
+  \`steps.<aiId>.output.<field>\` (e.g. \`replyText\`, \`summary\`), pass an
+  \`outputSchema\` like \`{ replyText: "string" }\` to \`builder_add_ai_step\`
+  AND tell the model in the prompt to "respond with JSON having those
+  keys". Without a schema the model returns prose and the downstream
+  binding silently resolves to undefined. (The runner now infers a
+  schema from your refs as a safety net, but explicit is better — the
+  model produces tighter, more on-spec output when the schema is set.)
 
 ## Catalog (only these are available)
 
