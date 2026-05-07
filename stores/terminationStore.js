@@ -36,9 +36,14 @@ async function initDB() {
             duration_ms INTEGER DEFAULT 0,
             prompt_tokens INTEGER DEFAULT 0,
             completion_tokens INTEGER DEFAULT 0,
-            total_tokens INTEGER DEFAULT 0
+            total_tokens INTEGER DEFAULT 0,
+            attachment_count INTEGER DEFAULT 0,
+            attachment_bytes BIGINT DEFAULT 0
         )
     `);
+    // Idempotent column adds for upgraded installs.
+    try { await exec(`ALTER TABLE ai_task_termination_log ADD COLUMN IF NOT EXISTS attachment_count INTEGER DEFAULT 0`); } catch (e) { /* ignore */ }
+    try { await exec(`ALTER TABLE ai_task_termination_log ADD COLUMN IF NOT EXISTS attachment_bytes BIGINT DEFAULT 0`); } catch (e) { /* ignore */ }
     await exec(`CREATE INDEX IF NOT EXISTS idx_term_timestamp ON ai_task_termination_log(timestamp DESC)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_term_type ON ai_task_termination_log(termination_type)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_term_org ON ai_task_termination_log(organization_id)`);
@@ -74,7 +79,8 @@ async function logTermination(entry) {
                 agent_id, agent_name, model, source,
                 conversation_id, swarm_run_id, parent_call_id,
                 iteration_count, duration_ms,
-                prompt_tokens, completion_tokens, total_tokens
+                prompt_tokens, completion_tokens, total_tokens,
+                attachment_count, attachment_bytes
             )
             VALUES (
                 $1, $2,
@@ -83,7 +89,8 @@ async function logTermination(entry) {
                 $9, $10, $11, $12,
                 $13, $14, $15,
                 $16, $17,
-                $18, $19, $20
+                $18, $19, $20,
+                $21, $22
             )
         `, [
             entry.timestamp || new Date().toISOString(),
@@ -106,6 +113,8 @@ async function logTermination(entry) {
             Number.isFinite(entry.prompt_tokens) ? entry.prompt_tokens : 0,
             Number.isFinite(entry.completion_tokens) ? entry.completion_tokens : 0,
             Number.isFinite(entry.total_tokens) ? entry.total_tokens : 0,
+            Number.isFinite(entry.attachment_count) ? entry.attachment_count : 0,
+            Number.isFinite(entry.attachment_bytes) ? entry.attachment_bytes : 0,
         ]);
     } catch (e) {
         console.error('[TerminationStore] Failed to log termination:', e.message);

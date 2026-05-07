@@ -15,6 +15,9 @@ async function initDB() {
             conversation_id TEXT,
             message_id TEXT,
             agent_id TEXT,
+            agent_name TEXT,
+            model TEXT,
+            model_tier TEXT,
             user_id TEXT,
             organization_id TEXT,
             rating TEXT NOT NULL CHECK(rating IN ('up', 'down')),
@@ -24,6 +27,10 @@ async function initDB() {
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     `);
+    // Backfill columns on existing installs (idempotent).
+    try { await exec(`ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS agent_name TEXT`); } catch (e) { /* ignore */ }
+    try { await exec(`ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS model TEXT`); } catch (e) { /* ignore */ }
+    try { await exec(`ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS model_tier TEXT`); } catch (e) { /* ignore */ }
     // Indexes
     await exec(`CREATE INDEX IF NOT EXISTS idx_feedback_created ON message_feedback(created_at)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_feedback_rating ON message_feedback(rating)`);
@@ -38,26 +45,32 @@ console.log('[FeedbackStore] Initialized (PostgreSQL)');
 
 // ============ Write ============
 
-async function saveFeedback({ conversationId, messageId, agentId, userId, organizationId, rating, comment, source, conversationSnapshot }) {
+async function saveFeedback({ conversationId, messageId, agentId, agentName, model, modelTier, userId, organizationId, rating, comment, source, conversationSnapshot }) {
     await initDB();
     try {
         const id = `${conversationId || 'none'}_${messageId || 'none'}_${userId || 'anon'}`;
         const now = new Date().toISOString();
         const snapshot = conversationSnapshot ? JSON.stringify(conversationSnapshot) : null;
         await run(`
-            INSERT INTO message_feedback (id, conversation_id, message_id, agent_id, user_id, organization_id, rating, comment, source, conversation_snapshot, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            INSERT INTO message_feedback (id, conversation_id, message_id, agent_id, agent_name, model, model_tier, user_id, organization_id, rating, comment, source, conversation_snapshot, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT(id) DO UPDATE SET
                 rating = EXCLUDED.rating,
                 comment = EXCLUDED.comment,
                 conversation_snapshot = EXCLUDED.conversation_snapshot,
                 organization_id = EXCLUDED.organization_id,
+                agent_name = COALESCE(EXCLUDED.agent_name, message_feedback.agent_name),
+                model = COALESCE(EXCLUDED.model, message_feedback.model),
+                model_tier = COALESCE(EXCLUDED.model_tier, message_feedback.model_tier),
                 created_at = EXCLUDED.created_at
         `, [
             id,
             conversationId || null,
             messageId || null,
             agentId || null,
+            agentName || null,
+            model || null,
+            modelTier || null,
             userId || null,
             organizationId || null,
             rating,

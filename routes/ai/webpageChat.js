@@ -502,6 +502,26 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
         let _termPromptTokens = 0;
         let _termCompletionTokens = 0;
         let _termLastStopReason = null;
+        // Attachment metadata — counts + total bytes only, no filenames or
+        // content. Helps explain max_tokens stops where the user uploaded a
+        // big file and the LLM ran out of room before a useful answer.
+        const _termAttachmentCount = Array.isArray(attachments) ? attachments.length : 0;
+        const _termAttachmentBytes = (() => {
+            if (!Array.isArray(attachments)) return 0;
+            let total = 0;
+            for (const att of attachments) {
+                if (!att?.content || typeof att.content !== 'string') continue;
+                if (att.content.startsWith('data:')) {
+                    // base64 — actual bytes are ~3/4 of the base64 length.
+                    const comma = att.content.indexOf(',');
+                    const b64 = comma >= 0 ? att.content.slice(comma + 1) : att.content;
+                    total += Math.floor(b64.length * 0.75);
+                } else {
+                    total += Buffer.byteLength(att.content, 'utf8');
+                }
+            }
+            return total;
+        })();
         const _terminationBase = () => ({
             user_id: userId || null,
             organization_id: userOrgForTiers || null,
@@ -515,6 +535,8 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             prompt_tokens: _termPromptTokens,
             completion_tokens: _termCompletionTokens,
             total_tokens: _termPromptTokens + _termCompletionTokens,
+            attachment_count: _termAttachmentCount,
+            attachment_bytes: _termAttachmentBytes,
         });
 
         async function dispatchToolCall(toolCall) {

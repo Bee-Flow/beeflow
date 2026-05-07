@@ -907,6 +907,27 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     const _chatStartTime = Date.now();
     let _termPromptTokens = 0;
     let _termCompletionTokens = 0;
+    // Attachment metadata — counts + bytes only, helps explain large-input
+    // terminations (e.g. user uploads a big PDF and the model runs out of
+    // output tokens before producing anything useful).
+    const _termAttachmentCount = Array.isArray(messageMetadata?.attachments) ? messageMetadata.attachments.length : 0;
+    const _termAttachmentBytes = (() => {
+        const list = messageMetadata?.attachments;
+        if (!Array.isArray(list)) return 0;
+        let total = 0;
+        for (const att of list) {
+            if (att?.size && Number.isFinite(att.size)) { total += att.size; continue; }
+            if (typeof att?.content !== 'string') continue;
+            if (att.content.startsWith('data:')) {
+                const comma = att.content.indexOf(',');
+                const b64 = comma >= 0 ? att.content.slice(comma + 1) : att.content;
+                total += Math.floor(b64.length * 0.75);
+            } else {
+                total += Buffer.byteLength(att.content, 'utf8');
+            }
+        }
+        return total;
+    })();
     const _terminationBase = () => ({
         user_id: userId || null,
         organization_id: agent?.organization_id || messageMetadata?.userOrgId || null,
@@ -921,6 +942,8 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         prompt_tokens: _termPromptTokens,
         completion_tokens: _termCompletionTokens,
         total_tokens: _termPromptTokens + _termCompletionTokens,
+        attachment_count: _termAttachmentCount,
+        attachment_bytes: _termAttachmentBytes,
     });
     let _emailDrafts = [];
     let _calendarDrafts = [];
