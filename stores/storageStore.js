@@ -1,18 +1,54 @@
 /**
- * Storage Store — S3-compatible client for RustFS object storage
- * 
- * Provides file upload, download (presigned URLs), and deletion.
- * Uses per-user key prefixes for file isolation.
+ * Storage Store — S3-compatible client for RustFS object storage,
+ * with a local-disk fallback for dev environments without S3 infra.
+ *
+ * Two modes:
+ *   's3'    — full feature set (presigned URLs, bucket listing, copy)
+ *   'local' — uploadFile / streamFile / deleteFile only. Suitable for
+ *             dev / single-host installs. Files land under
+ *             server/data/storage/<key>; content types are persisted
+ *             in a sidecar .meta file so streamFile can return the
+ *             right MIME without re-guessing.
  */
 
 const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, HeadBucketCommand, CreateBucketCommand } = require('@aws-sdk/client-s3');
 const { Readable } = require('stream');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const fs = require('fs');
+const path = require('path');
 
 const BUCKET = 'beeflow-media';
 const DEFAULT_EXPIRY = 3600; // 1 hour
 
 let s3 = null;
+let mode = null;          // null until init() runs; then 's3' | 'local'
+let localRoot = null;     // absolute path to server/data/storage when mode==='local'
+
+// Resolve a storage key to its on-disk path while guarding against
+// path-traversal. Throws if the resolved path escapes localRoot.
+function localPathFor(key) {
+    if (!localRoot) throw new Error('StorageStore: local mode not initialized');
+    if (typeof key !== 'string' || !key) throw new Error('StorageStore: invalid key');
+    const resolved = path.resolve(localRoot, key);
+    const rootWithSep = localRoot.endsWith(path.sep) ? localRoot : localRoot + path.sep;
+    if (resolved !== localRoot && !resolved.startsWith(rootWithSep)) {
+        throw new Error('StorageStore: key escapes storage root');
+    }
+    return resolved;
+}
+
+// Minimal extension → MIME map for fallback when no sidecar is present.
+// Covers the common image types used by the CMS upload flow.
+const MIME_BY_EXT = {
+    '.png':  'image/png',
+    '.jpg':  'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif':  'image/gif',
+    '.webp': 'image/webp',
+    '.svg':  'image/svg+xml',
+    '.ico':  'image/x-icon',
+    '.avif': 'image/avif',
+};
 
 /**
  * Initialize the S3 client and ensure the bucket exists.
@@ -24,8 +60,22 @@ async function init() {
     const secretKey = process.env.RUSTFS_SECRET_KEY;
 
     if (!endpoint || !accessKey || !secretKey) {
-        console.warn('[StorageStore] RustFS not configured — file storage will fall back to local disk.');
-        return false;
+        // Local-disk fallback. Enables uploadFile / streamFile / deleteFile
+        // for dev environments where setting up RustFS / S3 isn't worth it.
+        // Other features that require presigned URLs or bucket listing stay
+        // gated and will throw "local mode doesn't support …" on use.
+        try {
+            localRoot = path.resolve(__dirname, '..', 'data', 'storage');
+            fs.mkdirSync(localRoot, { recursive: true });
+            mode = 'local';
+            console.warn(`[StorageStore] RustFS not configured — using local-disk fallback at ${localRoot}`);
+            return true;
+        } catch (err) {
+            console.error(`[StorageStore] Local fallback init failed: ${err.message}`);
+            localRoot = null;
+            mode = null;
+            return false;
+        }
     }
 
     s3 = new S3Client({
@@ -55,15 +105,18 @@ async function init() {
         }
     }
 
+    mode = 's3';
     console.log(`[StorageStore] Connected to RustFS at ${endpoint}`);
     return true;
 }
 
 /**
- * Check if RustFS storage is available.
+ * Check if storage is available — true when EITHER S3 is connected OR the
+ * local-disk fallback is set up. Callers (e.g. /api/cms/admin/upload) gate
+ * on this before accepting uploads.
  */
 function isAvailable() {
-    return s3 !== null;
+    return mode !== null;
 }
 
 /**
@@ -150,6 +203,19 @@ async function copyObject(sourceKey, destKey) {
  * @returns {{ key: string }} Uploaded object key
  */
 async function uploadFile(key, buffer, contentType) {
+    if (mode === 'local') {
+        const filePath = localPathFor(key);
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        fs.writeFileSync(filePath, buffer);
+        // Sidecar holds the content type so streamFile can return the right
+        // MIME without re-guessing from the extension.
+        if (contentType) {
+            try { fs.writeFileSync(filePath + '.meta', String(contentType), 'utf8'); }
+            catch (_) { /* non-fatal — extension fallback covers this */ }
+        }
+        console.log(`[StorageStore:local] Uploaded: ${key} (${(buffer.length / 1024).toFixed(1)} KB)`);
+        return { key };
+    }
     if (!s3) throw new Error('StorageStore not initialized');
 
     await s3.send(new PutObjectCommand({
@@ -170,6 +236,12 @@ async function uploadFile(key, buffer, contentType) {
  * @returns {string} Presigned URL
  */
 async function getPresignedUrl(key, expiresIn = DEFAULT_EXPIRY) {
+    if (mode === 'local') {
+        // No signing in local mode — return the proxy URL. Callers that
+        // truly need short-lived signed URLs (private buckets, etc.) need
+        // S3 mode and should treat this as a soft fallback.
+        return buildProxyUrl(key);
+    }
     if (!s3) throw new Error('StorageStore not initialized');
 
     const url = await getSignedUrl(s3, new GetObjectCommand({
@@ -185,6 +257,13 @@ async function getPresignedUrl(key, expiresIn = DEFAULT_EXPIRY) {
  * @param {string} key - S3 object key
  */
 async function deleteFile(key) {
+    if (mode === 'local') {
+        const filePath = localPathFor(key);
+        try { fs.unlinkSync(filePath); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+        try { fs.unlinkSync(filePath + '.meta'); } catch (_) { /* ignore */ }
+        console.log(`[StorageStore:local] Deleted: ${key}`);
+        return;
+    }
     if (!s3) throw new Error('StorageStore not initialized');
 
     await s3.send(new DeleteObjectCommand({
@@ -201,6 +280,37 @@ async function deleteFile(key) {
  * @returns {{ stream: Readable, contentType: string, contentLength: number }}
  */
 async function streamFile(key) {
+    if (mode === 'local') {
+        const filePath = localPathFor(key);
+        let stat;
+        try {
+            stat = fs.statSync(filePath);
+        } catch (err) {
+            if (err.code === 'ENOENT') {
+                // Surface the same shape S3 throws on miss so the asset
+                // route's existing 404 branch catches it.
+                const e = new Error(`Object not found: ${key}`);
+                e.name = 'NoSuchKey';
+                throw e;
+            }
+            throw err;
+        }
+        // Sidecar wins; fall back to extension lookup; finally octet-stream.
+        let contentType = 'application/octet-stream';
+        try {
+            const meta = fs.readFileSync(filePath + '.meta', 'utf8').trim();
+            if (meta) contentType = meta;
+        } catch (_) { /* no sidecar */ }
+        if (contentType === 'application/octet-stream') {
+            const ext = path.extname(filePath).toLowerCase();
+            if (MIME_BY_EXT[ext]) contentType = MIME_BY_EXT[ext];
+        }
+        return {
+            stream: fs.createReadStream(filePath),
+            contentType,
+            contentLength: stat.size,
+        };
+    }
     if (!s3) throw new Error('StorageStore not initialized');
 
     const response = await s3.send(new GetObjectCommand({
