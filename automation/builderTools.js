@@ -120,7 +120,7 @@ const TOOL_SCHEMAS = [
         type: 'function',
         function: {
             name: 'builder_add_ai_step',
-            description: `Append an AI reasoning step that transforms or summarises upstream data. No tool calls allowed inside an ai_step. Use this for: extracting structured fields from text, summarising, classifying, drafting reply text, etc. ${BINDING_HINT} EXAMPLE — extract invoice fields: {prompt:"Extract amount, currency, vendor, dueDate from this invoice email.",inputs:{emailBody:{kind:"ref",path:"loop.email.body"},emailSubject:{kind:"ref",path:"loop.email.subject"}},outputSchema:{type:"object",properties:{amount:{type:"number"},currency:{type:"string"},vendor:{type:"string"},dueDate:{type:"string"}}},modelTier:"fast"}.`,
+            description: `Append an AI reasoning step that transforms or summarises upstream data. By default no tool calls — set allowTools:true (and optionally a tools allowlist) when this step needs to fetch data on its own (web search, Gmail lookup, etc.). The user's per-org integration permissions are still enforced at runtime. Use this for: extracting structured fields from text, summarising, classifying, drafting reply text, OR (with allowTools) free-form research that doesn't fit a static integration_action. ${BINDING_HINT} EXAMPLE — extract invoice fields: {prompt:"Extract amount, currency, vendor, dueDate from this invoice email.",inputs:{emailBody:{kind:"ref",path:"loop.email.body"}},outputSchema:{type:"object",properties:{amount:{type:"number"},currency:{type:"string"},vendor:{type:"string"},dueDate:{type:"string"}}},modelTier:"fast"}.`,
             parameters: {
                 type: 'object',
                 properties: {
@@ -128,7 +128,9 @@ const TOOL_SCHEMAS = [
                     prompt: { type: 'string', description: 'The instruction for the AI. Reference the inputs by name.' },
                     inputs: { type: 'object', description: `Map of binding-name to a binding object. ${BINDING_HINT}` },
                     outputSchema: { type: 'object', description: 'JSON schema describing the desired structured output. Strongly recommended so downstream steps can reference fields.' },
-                    modelTier: { type: 'string', enum: ['auto', 'fast', 'standard', 'thinking'], description: 'Default: fast. Use "thinking" only for complex multi-step reasoning.' },
+                    modelTier: { type: 'string', enum: ['auto', 'fast', 'standard', 'thinking'], description: 'Default: auto (mirrors direct chat — classifier picks fast/standard/thinking based on prompt complexity).' },
+                    allowTools: { type: 'boolean', description: 'Default false. When true the AI step can call the user\'s integration tools (web search, gmail_search, etc.). Use sparingly — most steps should bind upstream integration_action output instead.' },
+                    tools: { type: 'array', items: { type: 'string' }, description: 'Optional allowlist of tool names the AI step may call. Empty / omitted = whatever allowTools dictates.' },
                     label: { type: 'string' },
                 },
                 required: ['prompt'],
@@ -300,9 +302,12 @@ function applyAddAi(draft, args) {
         prompt: args.prompt,
         inputs: canonicalizeInputs(args.inputs || {}),
         outputSchema: args.outputSchema || null,
-        modelTier: args.modelTier || 'fast',
+        // Default to 'auto' so the AI step honours the org's tier classifier
+        // — same default as direct chat. Builder can override per step.
+        modelTier: args.modelTier || 'auto',
         label: args.label || 'AI step',
-        allowTools: false,
+        allowTools: !!args.allowTools,
+        tools: Array.isArray(args.tools) ? args.tools.filter(t => typeof t === 'string') : null,
     };
     appendAfter(draft, args.afterStepId, step);
     return { added: step };
