@@ -63,6 +63,87 @@ function canonicalizeBinding(v) {
     return { kind: 'literal', value: v };
 }
 
+const VALID_REF_ROOTS = new Set(['trigger', 'steps', 'vars', 'secrets', 'loop']);
+
+// Trigger output fields the LLM commonly mis-roots — when a ref path is bare
+// ("from", "subject", …) we can confidently prepend `trigger.output.` instead
+// of bouncing the call back to the model. Keyed by `<provider>.<event>`.
+const TRIGGER_FIELDS_BY_EVENT = {
+    'gmail.mail.new': ['messageId', 'threadId', 'from', 'to', 'cc', 'subject', 'snippet', 'labelIds', 'date', 'sizeEstimate', 'historyId'],
+    'google-calendar.event.changed': ['eventId', 'summary', 'start', 'end', 'status'],
+};
+
+function triggerFieldsFor(draft) {
+    const t = draft?.trigger;
+    if (!t || t.kind !== 'app_event') return [];
+    const key = `${t.appEvent?.provider}.${t.appEvent?.event}`;
+    return TRIGGER_FIELDS_BY_EVENT[key] || [];
+}
+
+/**
+ * Inspect every binding inside a freshly-supplied `inputs` map (and any
+ * `template` strings within them). Returns `{ inputs, error }`:
+ *   - `inputs`: the canonicalised map, with safe auto-fixes applied
+ *     (bare path "from" → "trigger.output.from" when the trigger exposes it,
+ *     leading dots stripped).
+ *   - `error`: a human-readable message for the LLM if any binding is still
+ *     invalid after auto-fixes — caller should surface this as the tool
+ *     result so the model corrects on its NEXT turn instead of running
+ *     through a dry-run failure cycle.
+ */
+function validateAndFixBindings(rawInputs, draft) {
+    const fixed = canonicalizeInputs(rawInputs || {});
+    const triggerFields = new Set(triggerFieldsFor(draft));
+    const errors = [];
+
+    for (const [k, v] of Object.entries(fixed)) {
+        if (!v || typeof v !== 'object') continue;
+
+        if (v.kind === 'ref' && typeof v.path === 'string') {
+            const cleaned = v.path.replace(/^\.+/, '').trim();
+            const root = cleaned.split('.')[0];
+            if (VALID_REF_ROOTS.has(root)) {
+                if (cleaned !== v.path) v.path = cleaned;
+                continue;
+            }
+            if (triggerFields.has(cleaned)) {
+                v.path = `trigger.output.${cleaned}`;
+                continue;
+            }
+            errors.push(
+                `inputs.${k}: ref path "${v.path}" has unknown root "${root}". `
+                + `Valid roots: trigger, steps, vars, secrets, loop. `
+                + (triggerFields.size
+                    ? `For this Gmail trigger use trigger.output.<field>, e.g. trigger.output.${triggerFields.has(cleaned) ? cleaned : 'subject'}.`
+                    : 'Use e.g. trigger.output.<field> or steps.<id>.output.<field>.')
+            );
+        }
+
+        if (v.kind === 'template' && typeof v.value === 'string') {
+            // Re-write {{ from }} → {{ trigger.output.from }} when the bare
+            // identifier matches a known trigger field. Reject anything else
+            // that has an unknown root.
+            const bad = [];
+            v.value = v.value.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (full, expr) => {
+                const cleaned = expr.replace(/^\.+/, '').trim();
+                const root = cleaned.split('.')[0];
+                if (VALID_REF_ROOTS.has(root)) return `{{${cleaned}}}`;
+                if (triggerFields.has(cleaned)) return `{{trigger.output.${cleaned}}}`;
+                bad.push(expr);
+                return full;
+            });
+            if (bad.length) {
+                errors.push(
+                    `inputs.${k}: template references ${bad.map(s => `"${s}"`).join(', ')} which has unknown root. `
+                    + `Use {{trigger.output.<field>}} or {{steps.<id>.output.<field>}}.`
+                );
+            }
+        }
+    }
+
+    return { inputs: fixed, error: errors.length ? errors.join(' ') : null };
+}
+
 function lastStepId(def) {
     if (def.steps.length === 0) return def.trigger.id;
     return def.steps[def.steps.length - 1].id;
@@ -330,11 +411,13 @@ function appendAfter(draft, afterStepId, step) {
 }
 
 function applyAddAction(draft, args) {
+    const { inputs, error } = validateAndFixBindings(args.inputs || {}, draft);
+    if (error) return { error };
     const step = {
         id: newId('a'),
         type: 'integration_action',
         tool: args.tool,
-        inputs: canonicalizeInputs(args.inputs || {}),
+        inputs,
         label: args.label || args.tool,
         sideEffect: isSideEffect(args.tool),
     };
@@ -343,11 +426,13 @@ function applyAddAction(draft, args) {
 }
 
 function applyAddAi(draft, args) {
+    const { inputs, error } = validateAndFixBindings(args.inputs || {}, draft);
+    if (error) return { error };
     const step = {
         id: newId('ai'),
         type: 'ai_step',
         prompt: args.prompt,
-        inputs: canonicalizeInputs(args.inputs || {}),
+        inputs,
         outputSchema: args.outputSchema || null,
         // Default to 'auto' so the AI step honours the org's tier classifier
         // — same default as direct chat. Builder can override per step.
@@ -375,14 +460,20 @@ function applyAddLoop(draft, args) {
     // type-specific required fields. Missing ids would crash the runner with
     // a null step_id DB constraint.
     const rawBody = Array.isArray(args.body) ? args.body : [];
-    const body = rawBody.map((child) => {
+    const childErrors = [];
+    const body = rawBody.map((child, idx) => {
         if (!child || typeof child !== 'object') return null;
         const fixed = { ...child };
         if (!fixed.id || typeof fixed.id !== 'string') fixed.id = newId('lb');
         if (!fixed.type || typeof fixed.type !== 'string') fixed.type = 'ai_step';
-        if (fixed.inputs) fixed.inputs = canonicalizeInputs(fixed.inputs);
+        if (fixed.inputs) {
+            const v = validateAndFixBindings(fixed.inputs, draft);
+            if (v.error) childErrors.push(`body[${idx}] (${fixed.id}): ${v.error}`);
+            fixed.inputs = v.inputs;
+        }
         return fixed;
     }).filter(Boolean);
+    if (childErrors.length) return { error: childErrors.join(' ') };
 
     const step = {
         id: newId('loop'),
@@ -398,13 +489,15 @@ function applyAddLoop(draft, args) {
 }
 
 function applyAddCode(draft, args) {
+    const { inputs, error } = validateAndFixBindings(args.inputs || {}, draft);
+    if (error) return { error };
     const step = {
         id: newId('code'),
         type: 'code',
         language: 'javascript',
         code: args.code,
         codeHash: crypto.createHash('sha256').update(args.code || '').digest('hex'),
-        inputs: canonicalizeInputs(args.inputs || {}),
+        inputs,
         outputSchema: args.outputSchema || null,
         allowedTools: Array.isArray(args.allowedTools) ? args.allowedTools : [],
         limits: { cpuMs: 1000, memoryMb: 64, wallMs: 5000 },
@@ -515,6 +608,14 @@ async function applyToolCall(name, args, draftWrap) {
     if (MUTATING_TOOLS.has(name) && result && typeof result === 'object' && !result.error) {
         result._draftSteps = summariseDraftSteps(draftWrap.def);
     }
+    // When a mutator rejected the call due to bad bindings, prefix the
+    // error with a structured marker so the system prompt's "common
+    // pitfalls" section catches the model's attention. Without this the
+    // model sometimes ignores the error entirely and re-tries the same
+    // call.
+    if (result && typeof result === 'object' && result.error && !result._fixHint) {
+        result._fixHint = 'Reject reason: invalid input binding. Fix the path/value and call the tool again. Refs MUST start with: trigger, steps, vars, secrets, loop.';
+    }
     return result;
 }
 
@@ -613,4 +714,4 @@ async function persistDraft(draftWrap, { finalize = false } = {}) {
     return u;
 }
 
-module.exports = { TOOL_SCHEMAS, applyToolCall, persistDraft, emptyDefinition };
+module.exports = { TOOL_SCHEMAS, applyToolCall, persistDraft, emptyDefinition, _test_validateAndFixBindings: validateAndFixBindings };

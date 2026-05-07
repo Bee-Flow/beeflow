@@ -57,9 +57,18 @@ draft is a typed DAG of steps:
    - Inputs MUST use binding objects. NEVER pass a bare string as an input value.
      Wrong:  \`{ query: "label:Invoices" }\`
      Right:  \`{ query: { kind: "literal", value: "label:Invoices" } }\`
-   - Reference upstream data with the "ref" or "template" binding kinds:
-     \`{ kind: "ref", path: "steps.<id>.output.<field>" }\`
-     \`{ kind: "template", value: "Found {{steps.x.output.count}} items" }\`
+   - Reference upstream data with the "ref" or "template" binding kinds.
+     **Every ref path MUST start with one of: \`trigger\`, \`steps\`, \`vars\`,
+     \`secrets\`, \`loop\`.** Field names alone are NOT valid paths.
+       Wrong:  \`{ kind: "ref", path: "from" }\`             — missing root
+       Wrong:  \`{ kind: "ref", path: "subject" }\`          — missing root
+       Wrong:  \`{ kind: "ref", path: "output.from" }\`      — missing trigger/steps prefix
+       Right:  \`{ kind: "ref", path: "trigger.output.from" }\`
+       Right:  \`{ kind: "ref", path: "steps.ai_47.output.replyText" }\`
+       Right:  \`{ kind: "template", value: "Re: {{trigger.output.subject}}" }\`
+   - For a Gmail \`mail.new\` trigger, the available output fields are:
+     \`messageId, threadId, from, to, cc, subject, snippet, labelIds, date\`.
+     Always reference them as \`trigger.output.<field>\`.
    - Inside a loop body, refer to the current item as \`loop.<itemVar>\`.
 4. **Summarise**. After each batch of mutations call \`builder_summarise\`
    so the user can read the current plan in plain English.
