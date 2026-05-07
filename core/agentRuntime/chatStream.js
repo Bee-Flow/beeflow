@@ -11,6 +11,8 @@ const { sanitizeToolResult } = require('../../utils/sanitize');
 const fs = require('fs');
 const path = require('path');
 const usageStore = require('../../stores/usageStore');
+const terminationStore = require('../../stores/terminationStore');
+const { sanitizeError } = require('../errorSanitizer');
 const integrationActivityStore = require('../../stores/integrationActivityStore');
 const { resolveIntegration } = require('../integrationToolMap');
 
@@ -902,6 +904,24 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     const maxIterations = 10;
     let toolCalls = [];
     let fullResponse = '';
+    const _chatStartTime = Date.now();
+    let _termPromptTokens = 0;
+    let _termCompletionTokens = 0;
+    const _terminationBase = () => ({
+        user_id: userId || null,
+        organization_id: agent?.organization_id || messageMetadata?.userOrgId || null,
+        agent_id: agentId || null,
+        agent_name: agent?.name || null,
+        model: modelToUse || null,
+        source: 'agent_stream',
+        conversation_id: conversation?.id || null,
+        parent_call_id: messageMetadata?.parentCallId || null,
+        iteration_count: iterations,
+        duration_ms: Date.now() - _chatStartTime,
+        prompt_tokens: _termPromptTokens,
+        completion_tokens: _termCompletionTokens,
+        total_tokens: _termPromptTokens + _termCompletionTokens,
+    });
     let _emailDrafts = [];
     let _calendarDrafts = [];
     let _linkedInDrafts = [];
@@ -928,6 +948,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         // Check if client disconnected
         if (signal?.aborted) {
             console.log('[AgentRuntime] Aborting — client disconnected');
+            terminationStore.logTermination({ ..._terminationBase(), termination_type: 'aborted' }).catch(() => {});
             break;
         }
         iterations++;
@@ -1160,6 +1181,11 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         conversation_id: conversation?.id || null
                     });
                 } catch (e) { /* ignore usage errors */ }
+                _termPromptTokens += _adapterStreamUsage?.prompt_tokens || 0;
+                _termCompletionTokens += _adapterStreamUsage?.completion_tokens || 0;
+                if (_adapterStreamUsage?.stop_reason === 'max_tokens') {
+                    terminationStore.logTermination({ ..._terminationBase(), termination_type: 'max_tokens' }).catch(() => {});
+                }
 
             } else {
                 // ─── Raw fetch SSE streaming (OpenAI-compatible) ──────────────
@@ -1351,6 +1377,11 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         });
                     } catch (e) { /* ignore usage errors */ }
                 }
+                _termPromptTokens += _sseStreamUsage?.prompt_tokens || 0;
+                _termCompletionTokens += _sseStreamUsage?.completion_tokens || 0;
+                if (_sseFinishReason === 'length' || _sseFinishReason === 'max_tokens') {
+                    terminationStore.logTermination({ ..._terminationBase(), termination_type: 'max_tokens' }).catch(() => {});
+                }
             } // end else (raw fetch SSE)
 
             // Check if we have tool calls to execute
@@ -1377,6 +1408,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 // Check abort before tool execution
                 if (signal?.aborted) {
                     console.log('[AgentRuntime] Aborting before tool execution — client disconnected');
+                    terminationStore.logTermination({ ..._terminationBase(), termination_type: 'aborted' }).catch(() => {});
                     break;
                 }
 
@@ -1917,6 +1949,12 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             // Classify the error for better logging and user-facing messages
             const classified = error._classified || classifyStreamError(error);
             console.error(`[Agent Stream] Error (${classified.errorType}):`, error.message);
+            terminationStore.logTermination({
+                ..._terminationBase(),
+                termination_type: 'error',
+                ...sanitizeError(error),
+            }).catch(() => {});
+            error._terminationLogged = true;
             // Attach classification so the route handler can send a descriptive error
             error._classified = classified;
             error.message = classified.userMessage;
@@ -1964,7 +2002,10 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         };
     }
 
-    throw new Error('Agent exceeded maximum tool call iterations');
+    terminationStore.logTermination({ ..._terminationBase(), termination_type: 'max_iterations' }).catch(() => {});
+    const _maxIterErr = new Error('Agent exceeded maximum tool call iterations');
+    _maxIterErr._terminationLogged = true;
+    throw _maxIterErr;
 }
 
 module.exports = { chatWithAgentStream };

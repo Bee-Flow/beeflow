@@ -170,6 +170,22 @@ async function executeAgentSearchTool(toolName, args) {
 
         console.log(`[AgentSearch] Found ${results.length} results (mode=${data.mode_used})`);
 
+        // Empty-results path: don't return a "successful" markdown wrapper
+        // with 0 results — the model reads that as "search worked, nothing
+        // exists" and writes a polished apology to the user. Surface it as a
+        // recoverable error instead so the model retries with different
+        // keywords or surfaces the failure honestly.
+        if (results.length === 0) {
+            const responseShapeKeys = Object.keys(data || {}).join(',');
+            console.warn(`[AgentSearch] Empty results for "${query}" (mode=${searchMode}). Upstream response keys: [${responseShapeKeys}]. Possible causes: search service returned no hits, Serper quota exhausted, or response shape mismatch.`);
+            return {
+                error: `Search returned 0 results for "${query}". The web search service is reachable but produced no hits — this is usually transient (rate limit, upstream service issue, or overly narrow query). Try: (1) a shorter or differently-worded query, (2) searching in English instead of the user's language, or (3) reporting that current news could not be retrieved if multiple retries fail. Do NOT fabricate sources or article content.`,
+                results_count: 0,
+                query,
+                mode_used: data.mode_used || searchMode,
+            };
+        }
+
         // Format results as markdown for the LLM — much easier to read than JSON
         const sections = results.map((r, i) => {
             const title = r.title || 'Untitled';

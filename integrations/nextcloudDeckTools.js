@@ -57,6 +57,54 @@ const NEXTCLOUD_DECK_TOOLS = [
     {
         type: 'function',
         function: {
+            name: 'nextcloud_deck_create_stack',
+            description: 'Create a new column ("stack") on a Deck board. Use this to set up board structure (e.g. "New", "In Progress", "Done") before adding cards. The user has approved this — go ahead.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    boardId: { type: 'integer', description: 'Board id from nextcloud_deck_list_boards.' },
+                    title: { type: 'string', description: 'Column title (e.g. "In Wait", "To Verify").' },
+                    order: { type: 'integer', description: 'Optional sort order. Lower numbers appear first; defaults to 999 (rightmost).' }
+                },
+                required: ['boardId', 'title']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_deck_update_stack',
+            description: 'Rename a stack or change its order. Only provided fields change. The user has approved this update.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    boardId: { type: 'integer' },
+                    stackId: { type: 'integer' },
+                    title: { type: 'string' },
+                    order: { type: 'integer' }
+                },
+                required: ['boardId', 'stackId']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_deck_delete_stack',
+            description: 'Delete a stack (column) from a Deck board. This also removes the stack\'s cards. Always confirm with the user before calling — deletion cannot be undone via the API.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    boardId: { type: 'integer' },
+                    stackId: { type: 'integer' }
+                },
+                required: ['boardId', 'stackId']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
             name: 'nextcloud_deck_list_cards',
             description: 'List cards on a board, optionally filtered by stack, label, due date, or assigned user. Combine multiple filters to narrow the result.',
             parameters: {
@@ -337,6 +385,70 @@ async function executeNextcloudDeckTool(toolName, args, userId, session) {
             return Array.isArray(stacks)
                 ? { count: stacks.length, stacks: stacks.map(s => ({ id: s.id, title: s.title, order: s.order, cardCount: (s.cards || []).length })) }
                 : stacks;
+        }
+
+        case 'nextcloud_deck_create_stack': {
+            if (!args.boardId || !args.title) return { error: 'boardId and title are required' };
+            const res = await deckJson(ncFetch, `${api}/boards/${args.boardId}/stacks`, {
+                method: 'POST',
+                headers: REST_HEADERS,
+                body: {
+                    title: String(args.title),
+                    order: args.order !== undefined ? Number(args.order) : 999,
+                },
+            });
+            if (res.status === 401) return { error: authError };
+            if (res.status === 404) return { error: `Board not found: ${args.boardId}` };
+            if (!res.ok) {
+                const detail = await readJsonSafe(res);
+                return { error: `Stack create failed (${res.status})`, detail };
+            }
+            const stack = await readJsonSafe(res);
+            return {
+                success: true,
+                stack: { id: stack.id, title: stack.title, order: stack.order, boardId: args.boardId },
+            };
+        }
+
+        case 'nextcloud_deck_update_stack': {
+            if (!args.boardId || !args.stackId) return { error: 'boardId and stackId are required' };
+            // Deck's PUT is a replace — fetch current then merge.
+            const listRes = await ncFetch(`${api}/boards/${args.boardId}/stacks`, { headers: REST_HEADERS });
+            if (listRes.status === 401) return { error: authError };
+            if (!listRes.ok) return { error: `Could not load stacks for update (${listRes.status})` };
+            const stacks = await readJsonSafe(listRes);
+            const current = Array.isArray(stacks) ? stacks.find(s => s.id === Number(args.stackId)) : null;
+            if (!current) return { error: `Stack not found: ${args.stackId}` };
+
+            const merged = {
+                title: args.title !== undefined ? String(args.title) : current.title,
+                order: args.order !== undefined ? Number(args.order) : current.order,
+            };
+            const putRes = await deckJson(ncFetch, `${api}/boards/${args.boardId}/stacks/${args.stackId}`, {
+                method: 'PUT',
+                headers: REST_HEADERS,
+                body: merged,
+            });
+            if (!putRes.ok) {
+                const detail = await readJsonSafe(putRes);
+                return { error: `Stack update failed (${putRes.status})`, detail };
+            }
+            const updated = await readJsonSafe(putRes);
+            return { success: true, stack: { id: updated.id, title: updated.title, order: updated.order } };
+        }
+
+        case 'nextcloud_deck_delete_stack': {
+            if (!args.boardId || !args.stackId) return { error: 'boardId and stackId are required' };
+            const res = await ncFetch(`${api}/boards/${args.boardId}/stacks/${args.stackId}`, {
+                method: 'DELETE',
+                headers: REST_HEADERS,
+            });
+            if (res.status === 401) return { error: authError };
+            if (res.status === 404) return { error: `Stack not found: ${args.stackId}` };
+            if (!res.ok && res.status !== 200 && res.status !== 204) {
+                return { error: `Stack delete failed (${res.status})` };
+            }
+            return { success: true, stackId: args.stackId };
         }
 
         case 'nextcloud_deck_list_cards':

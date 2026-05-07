@@ -145,6 +145,12 @@ app.use(session({
     }
 }));
 
+// Nextcloud Connector JWT auth — handles requests from the Bee Flow ExApp
+// connector. Tagged with `X-Beeflow-Source: nextcloud-connector`; falls
+// through to patAuth for everything else. Populates req.session the same
+// way patAuth does so downstream handlers see no difference.
+app.use(require('./auth/connectorJwt'));
+
 // Personal Access Token auth — runs after session, populates session if Bearer token is valid
 app.use(require('./auth/patAuth'));
 
@@ -246,6 +252,7 @@ app.use('/apps', appsRouter);
 
 app.use('/versions', require('./routes/versions'));
 app.use('/api/usage', require('./routes/usage'));
+app.use('/api/terminations', require('./routes/terminations'));
 app.use('/api/feedback', require('./routes/feedback'));
 app.use('/api/client-errors', require('./routes/clientErrors'));
 app.use('/api/org-privacy-shield', require('./routes/orgPrivacyShield'));
