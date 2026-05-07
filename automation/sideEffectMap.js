@@ -38,8 +38,12 @@ const READ_ONLY = new Set([
     'nextcloud_list', 'nextcloud_read',
     'nextcloud_calendar_list_events',
     'nextcloud_contacts_list', 'nextcloud_contacts_search',
-    'nextcloud_deck_list', 'nextcloud_tasks_list', 'nextcloud_notes_list',
+    'nextcloud_deck_list', 'nextcloud_deck_list_boards', 'nextcloud_deck_list_stacks', 'nextcloud_deck_list_cards', 'nextcloud_deck_list_comments',
+    'nextcloud_tasks_list', 'nextcloud_notes_list',
     'nextcloud_activity_list', 'nextcloud_status_get',
+    // Nextcloud Mail (read-only)
+    'nextcloud_mail_list_accounts', 'nextcloud_mail_list_mailboxes',
+    'nextcloud_mail_search', 'nextcloud_mail_read', 'nextcloud_mail_read_attachment',
 ]);
 
 /**

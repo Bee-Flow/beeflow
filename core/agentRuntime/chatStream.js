@@ -11,6 +11,9 @@ const { sanitizeToolResult } = require('../../utils/sanitize');
 const fs = require('fs');
 const path = require('path');
 const usageStore = require('../../stores/usageStore');
+const terminationStore = require('../../stores/terminationStore');
+const { sanitizeError } = require('../errorSanitizer');
+const { emitPhase, emitPhaseEnd, withPhase } = require('./phaseEvents');
 const integrationActivityStore = require('../../stores/integrationActivityStore');
 const { resolveIntegration } = require('../integrationToolMap');
 
@@ -385,7 +388,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     // the LLM, and refreshes any stale RustFS temp URLs (900 s TTL).
     // The current (last) user message is skipped — processAttachments() below
     // handles it with live upload data.
-    await hydrateHistoryAttachments(messages, { userId });
+    await withPhase(onEvent, 'processed_history', null, () => hydrateHistoryAttachments(messages, { userId }));
 
     // ============ COMPACTION ============
     // Once the hydrated history exceeds COMPACTION_THRESHOLD messages, collapse
@@ -398,11 +401,13 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         // Key name (`conversationSummary`) matches the direct-chat convention so
         // any future shared helper can read both paths the same way.
         const existingSummary = conversation?.meta?.conversationSummary || null;
-        const { messages: compactedMessages, newSummary } = await compactMessages(messages, {
-            existingSummary,
-            summaryModelId: 'tier:fast',
-            userOrgId: messageMetadata?.userOrgId || agent?.organization_id || null,
-        });
+        const { messages: compactedMessages, newSummary } = await withPhase(onEvent, 'compacting', null, () =>
+            compactMessages(messages, {
+                existingSummary,
+                summaryModelId: 'tier:fast',
+                userOrgId: messageMetadata?.userOrgId || agent?.organization_id || null,
+            })
+        );
         messages = compactedMessages;
         if (newSummary && newSummary !== existingSummary && conversation?.id) {
             // Fire-and-forget — the next turn picks it up even if this write
@@ -420,6 +425,8 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     if (agent.embed_enabled) {
         console.log(`[AgentRuntime] Skipping memory for embed-enabled agent ${agentId}`);
     } else {
+        emitPhase(onEvent, 'memory_lookup');
+        const _memT = Date.now();
         try {
             const memoryStore = require('../../stores/memoryStore');
             console.log(`[AgentRuntime] Memory lookup - userId: ${userId}, agentId: ${agentId}`);
@@ -464,6 +471,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         } catch (memErr) {
             console.error('[AgentRuntime] Memory retrieval failed:', memErr.message);
         }
+        emitPhaseEnd(onEvent, 'memory_lookup', Date.now() - _memT);
     }
 
     const isStrictKnowledge = agent.config?.strictKnowledge === true;
@@ -475,10 +483,14 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     const effectiveTier = (messageMetadata?.modelTier && String(messageMetadata.modelTier))
         || (typeof agent.model === 'string' && agent.model.startsWith('tier:') ? agent.model.slice(5) : null);
     const isStandardTier = effectiveTier === 'standard';
-    let systemPrompt = await buildSystemPrompt({ agent, tools, userId, messageMetadata, memoryContext, isStrictKnowledge, forceDynamicSkills: isStandardTier });
+    let systemPrompt = await withPhase(onEvent, 'building_prompt', null, () =>
+        buildSystemPrompt({ agent, tools, userId, messageMetadata, memoryContext, isStrictKnowledge, forceDynamicSkills: isStandardTier })
+    );
 
     // ============ GUARDRAILS (before KB search — block early) ============
-    const guardrailsResult = await runInputGuardrails({ agent, messages, userMessage, globalConfig, onEvent, userId, conversationId: conversation?.id, source: 'agent_stream', model: modelToUse });
+    const guardrailsResult = await withPhase(onEvent, 'guardrails', null, () =>
+        runInputGuardrails({ agent, messages, userMessage, globalConfig, onEvent, userId, conversationId: conversation?.id, source: 'agent_stream', model: modelToUse })
+    );
     let moderationViolation = guardrailsResult.moderationViolation;
     let guardrailViolation = guardrailsResult.guardrailViolation;
     let processedUserMessage = guardrailsResult.processedUserMessage;
@@ -815,6 +827,8 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     const hasKbSearchTool = tools.some(t => t.function?.name === 'kb_search');
 
     if (!moderationViolation && !guardrailViolation && !hasKbSearchTool) {
+        emitPhase(onEvent, 'kb_search');
+        const _kbT = Date.now();
         try {
             const kbExtension = await performKnowledgeSearch({ agent, userId, userMessage, isStrictKnowledge, onEvent: (type, data) => {
                 // Intercept kb_sources to accumulate for persistence
@@ -829,6 +843,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         } catch (kErr) {
             console.error('[AgentRuntime] Knowledge retrieval failed:', kErr.message);
         }
+        emitPhaseEnd(onEvent, 'kb_search', Date.now() - _kbT);
     } else if (hasKbSearchTool) {
         console.log('[AgentRuntime] KB auto-inject skipped — kb_search tool available, LLM will decide');
     }
@@ -902,6 +917,47 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     const maxIterations = 10;
     let toolCalls = [];
     let fullResponse = '';
+    const _chatStartTime = Date.now();
+    let _termPromptTokens = 0;
+    let _termCompletionTokens = 0;
+    // Attachment metadata — counts + bytes only, helps explain large-input
+    // terminations (e.g. user uploads a big PDF and the model runs out of
+    // output tokens before producing anything useful).
+    const _termAttachmentCount = Array.isArray(messageMetadata?.attachments) ? messageMetadata.attachments.length : 0;
+    const _termAttachmentBytes = (() => {
+        const list = messageMetadata?.attachments;
+        if (!Array.isArray(list)) return 0;
+        let total = 0;
+        for (const att of list) {
+            if (att?.size && Number.isFinite(att.size)) { total += att.size; continue; }
+            if (typeof att?.content !== 'string') continue;
+            if (att.content.startsWith('data:')) {
+                const comma = att.content.indexOf(',');
+                const b64 = comma >= 0 ? att.content.slice(comma + 1) : att.content;
+                total += Math.floor(b64.length * 0.75);
+            } else {
+                total += Buffer.byteLength(att.content, 'utf8');
+            }
+        }
+        return total;
+    })();
+    const _terminationBase = () => ({
+        user_id: userId || null,
+        organization_id: agent?.organization_id || messageMetadata?.userOrgId || null,
+        agent_id: agentId || null,
+        agent_name: agent?.name || null,
+        model: modelToUse || null,
+        source: 'agent_stream',
+        conversation_id: conversation?.id || null,
+        parent_call_id: messageMetadata?.parentCallId || null,
+        iteration_count: iterations,
+        duration_ms: Date.now() - _chatStartTime,
+        prompt_tokens: _termPromptTokens,
+        completion_tokens: _termCompletionTokens,
+        total_tokens: _termPromptTokens + _termCompletionTokens,
+        attachment_count: _termAttachmentCount,
+        attachment_bytes: _termAttachmentBytes,
+    });
     let _emailDrafts = [];
     let _calendarDrafts = [];
     let _linkedInDrafts = [];
@@ -928,6 +984,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         // Check if client disconnected
         if (signal?.aborted) {
             console.log('[AgentRuntime] Aborting — client disconnected');
+            terminationStore.logTermination({ ..._terminationBase(), termination_type: 'aborted' }).catch(() => {});
             break;
         }
         iterations++;
@@ -950,10 +1007,23 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             const lastMsg = processedMessages[processedMessages.length - 1]; // This is the user message
             let attachmentContent = '';
 
-            // Handle attachments if present
+            // Handle attachments if present. Surface a `processing_attachments`
+            // phase on the first iteration only — that's the slow OCR/PDF
+            // extraction path; subsequent iterations are no-ops once content
+            // has been hydrated onto the message.
             if (messageMetadata?.attachments && messageMetadata.attachments.length > 0) {
                 console.log(`[Agent] Processing ${messageMetadata.attachments.length} attachments...`);
-                await processAttachments(messageMetadata.attachments, lastMsg, userId, { modelId: modelToUse });
+                if (iterations === 1) {
+                    const firstAtt = messageMetadata.attachments[0];
+                    const detail = messageMetadata.attachments.length === 1 && firstAtt?.name
+                        ? firstAtt.name
+                        : `${messageMetadata.attachments.length} files`;
+                    await withPhase(onEvent, 'processing_attachments', detail, () =>
+                        processAttachments(messageMetadata.attachments, lastMsg, userId, { modelId: modelToUse })
+                    );
+                } else {
+                    await processAttachments(messageMetadata.attachments, lastMsg, userId, { modelId: modelToUse });
+                }
             }
 
             // Inject guardrail violation context if detected
@@ -999,6 +1069,13 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             // ─── Native SDK adapter streaming (Google, OpenAI, Claude, Mistral) ─────
             const providerAdapter = getAdapter(config.providerType, config.url);
             const useNativeAdapter = ['google', 'openai', 'claude', 'mistral', 'azure', 'google-vertex'].includes(config.providerType) && typeof providerAdapter?.stream === 'function';
+
+            // Final pre-LLM phase marker — only on the first iteration. This
+            // tells the UI "we're handing the request to the model now" so the
+            // status placeholder fades out before the first token arrives.
+            if (iterations === 1) {
+                emitPhase(onEvent, 'streaming_start', modelToUse);
+            }
 
             let currentToolCalls = [];
             let contentBuffer = '';
@@ -1160,6 +1237,11 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         conversation_id: conversation?.id || null
                     });
                 } catch (e) { /* ignore usage errors */ }
+                _termPromptTokens += _adapterStreamUsage?.prompt_tokens || 0;
+                _termCompletionTokens += _adapterStreamUsage?.completion_tokens || 0;
+                if (_adapterStreamUsage?.stop_reason === 'max_tokens') {
+                    terminationStore.logTermination({ ..._terminationBase(), termination_type: 'max_tokens' }).catch(() => {});
+                }
 
             } else {
                 // ─── Raw fetch SSE streaming (OpenAI-compatible) ──────────────
@@ -1351,6 +1433,11 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         });
                     } catch (e) { /* ignore usage errors */ }
                 }
+                _termPromptTokens += _sseStreamUsage?.prompt_tokens || 0;
+                _termCompletionTokens += _sseStreamUsage?.completion_tokens || 0;
+                if (_sseFinishReason === 'length' || _sseFinishReason === 'max_tokens') {
+                    terminationStore.logTermination({ ..._terminationBase(), termination_type: 'max_tokens' }).catch(() => {});
+                }
             } // end else (raw fetch SSE)
 
             // Check if we have tool calls to execute
@@ -1377,6 +1464,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 // Check abort before tool execution
                 if (signal?.aborted) {
                     console.log('[AgentRuntime] Aborting before tool execution — client disconnected');
+                    terminationStore.logTermination({ ..._terminationBase(), termination_type: 'aborted' }).catch(() => {});
                     break;
                 }
 
@@ -1917,6 +2005,12 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             // Classify the error for better logging and user-facing messages
             const classified = error._classified || classifyStreamError(error);
             console.error(`[Agent Stream] Error (${classified.errorType}):`, error.message);
+            terminationStore.logTermination({
+                ..._terminationBase(),
+                termination_type: 'error',
+                ...sanitizeError(error),
+            }).catch(() => {});
+            error._terminationLogged = true;
             // Attach classification so the route handler can send a descriptive error
             error._classified = classified;
             error.message = classified.userMessage;
@@ -1964,7 +2058,10 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         };
     }
 
-    throw new Error('Agent exceeded maximum tool call iterations');
+    terminationStore.logTermination({ ..._terminationBase(), termination_type: 'max_iterations' }).catch(() => {});
+    const _maxIterErr = new Error('Agent exceeded maximum tool call iterations');
+    _maxIterErr._terminationLogged = true;
+    throw _maxIterErr;
 }
 
 module.exports = { chatWithAgentStream };

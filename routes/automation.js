@@ -321,12 +321,51 @@ router.post('/:id/activate', async (req, res) => {
         const updates = {
             isActive: true,
             isDraft: false,
-            needsFirstRunConfirm: !!summary.hasSideEffects,
+            // First-run confirmation gate removed — activation runs live
+            // immediately. The dry-run during build still gives the user a
+            // preview before they activate.
+            needsFirstRunConfirm: false,
         };
         if (a.triggerType === 'schedule' && a.scheduleCron) {
             updates.nextRunAt = cron.nextRunAt(a.scheduleCron, a.scheduleTz || 'Europe/Amsterdam', Date.now());
         }
         const u = await automationStore.updateAutomation(a.id, updates, userId);
+
+        // App-event triggers need a row in automation_event_subscriptions
+        // before the poller / inbound-event handler will see them. Without
+        // this the LLM happily declares `kind:'app_event',appProvider:'gmail'`
+        // but no email ever fires the automation. Done idempotently — we
+        // delete-then-create so re-activating after a definition change
+        // refreshes the filter / cursor.
+        await syncAppEventSubscription(a.id, userId, a.definition);
+
+        // Immediate Gmail check on activate: if the trigger is mail.new,
+        // pull the most recent matching email and dispatch it once. Without
+        // this the user has to wait for the next genuinely-new email to see
+        // the automation fire — confusing on activate. Run async so the
+        // HTTP response stays snappy.
+        const trig = a.definition?.trigger;
+        if (trig?.kind === 'app_event'
+            && trig?.appEvent?.provider === 'gmail'
+            && trig?.appEvent?.event === 'mail.new') {
+            (async () => {
+                try {
+                    const triggerBus = require('../automation/triggerBus');
+                    const latest = await triggerBus.fetchLatestGmailMatch(userId, trig.appEvent.filter || null);
+                    if (latest) {
+                        await triggerBus.dispatchEvent({
+                            provider: 'gmail',
+                            event: 'mail.new',
+                            payload: latest,
+                            userId,
+                        });
+                    }
+                } catch (e) {
+                    console.warn(`[automation/activate] immediate Gmail dispatch failed for ${a.id}: ${e.message}`);
+                }
+            })();
+        }
+
         res.json({ automation: u, warnings: v.warnings || [] });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -339,12 +378,52 @@ router.post('/:id/deactivate', async (req, res) => {
         const a = await automationStore.getAutomation(req.params.id);
         if (!a) return res.status(404).json({ error: 'Not found' });
         if (a.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
+        // Drop subscriptions immediately so the next poll tick stops
+        // firing this automation. Re-activation re-creates them.
+        await automationStore.deleteSubscriptionsForAutomation(a.id);
         const u = await automationStore.updateAutomation(a.id, { isActive: false }, userId);
         res.json({ automation: u });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
 });
+
+/**
+ * Reconcile app_event subscriptions for one automation. Reads the trigger
+ * from the persisted definition (not the row's `triggerType`/`scheduleCron`
+ * shorthand fields) so a single source of truth covers provider, event,
+ * and filter.
+ *
+ * Today only Gmail mail.new is supported end-to-end; other providers
+ * (google-calendar / msgraph / github) have polling/webhook handlers but
+ * we keep this helper provider-agnostic so adding them later is one
+ * dispatch table change.
+ */
+async function syncAppEventSubscription(automationId, userId, def) {
+    // Always wipe first — keeps the table consistent if the user changes
+    // the trigger between activations.
+    await automationStore.deleteSubscriptionsForAutomation(automationId);
+
+    const trig = def?.trigger;
+    if (!trig || trig.kind !== 'app_event') return;
+    const provider = trig.appEvent?.provider;
+    const event = trig.appEvent?.event;
+    if (!provider || !event) return;
+
+    // Mode: Gmail uses polling (Gmail Pub/Sub push exists at /events/gmail
+    // but we don't auto-provision the watch yet — polling is reliable and
+    // covers all users without admin-side cloud config). MS Graph + GitHub
+    // would use 'webhook'; not wired here.
+    const mode = provider === 'gmail' ? 'polling' : 'polling';
+    await automationStore.createSubscription({
+        automationId,
+        userId,
+        provider,
+        eventType: event,
+        mode,
+        filter: trig.appEvent?.filter || null,
+    });
+}
 
 router.post('/:id/run', async (req, res) => {
     try {
@@ -362,9 +441,34 @@ router.post('/:id/run', async (req, res) => {
         let timedOut = false;
         const guard = new Promise((resolve) => setTimeout(() => { timedOut = true; resolve(null); }, RESPONSE_TIMEOUT_MS));
 
+        // For Gmail-triggered automations the manual run is meaningless
+        // without a real email payload (every binding resolves to undefined,
+        // gmail_compose then errors with "to is required" etc.). Synthesize
+        // a payload from the user's most recent matching inbox message so
+        // the test mirrors a real fire of the trigger.
+        let triggerPayload = req.body?.triggerPayload || null;
+        const trig = a.definition?.trigger;
+        const isGmailTrig = trig?.kind === 'app_event'
+            && trig?.appEvent?.provider === 'gmail'
+            && trig?.appEvent?.event === 'mail.new';
+        if (isGmailTrig && !triggerPayload) {
+            const triggerBus = require('../automation/triggerBus');
+            const latest = await triggerBus.fetchLatestGmailMatch(userId, trig.appEvent.filter || null);
+            if (latest) {
+                triggerPayload = { provider: 'gmail', event: 'mail.new', ...latest };
+            } else {
+                return res.status(200).json({
+                    accepted: true,
+                    pending: false,
+                    skipped: true,
+                    message: 'No matching email found in your inbox to test against. The automation is ready — it will fire when a new matching email arrives.',
+                });
+            }
+        }
+
         const runPromise = runner.executeAutomation(a, {
             triggerKind: 'manual',
-            triggerPayload: req.body?.triggerPayload || null,
+            triggerPayload,
             mode: 'live',
         }).catch(e => { console.error('[automation/run] error:', e.message); return null; });
 
@@ -384,6 +488,164 @@ router.post('/:id/run', async (req, res) => {
             steps,
         });
     } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * Run a one-shot health check on the trigger pipeline for one automation.
+ *
+ * Without this endpoint, "the trigger doesn't fire" produces no actionable
+ * feedback for the user — the polling tick is silent unless something
+ * succeeds. This endpoint walks every link in the chain (subscription row →
+ * vault credentials → live Gmail call → filter match) and returns a
+ * structured result the UI can render.
+ *
+ * Tokens are NEVER returned — only booleans and high-level shape.
+ */
+router.post('/:id/diagnose-trigger', async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const a = await automationStore.getAutomation(req.params.id);
+        if (!a) return res.status(404).json({ error: 'Not found' });
+        if (a.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
+
+        const trig = a.definition?.trigger;
+        const provider = trig?.appEvent?.provider;
+        const event = trig?.appEvent?.event;
+        if (trig?.kind !== 'app_event' || provider !== 'gmail' || event !== 'mail.new') {
+            return res.json({
+                ok: true,
+                kind: trig?.kind || 'unknown',
+                checks: [{ name: 'trigger_type', status: 'skipped', message: 'This automation is not Gmail-triggered; nothing to diagnose.' }],
+            });
+        }
+
+        const checks = [];
+        const finish = (ok) => res.json({ ok, kind: 'gmail.mail.new', checks });
+
+        // 1) Subscription row
+        const subs = await automationStore.getSubscriptionsForAutomation(a.id);
+        const sub = subs.find(s => s.provider === 'gmail' && s.eventType === 'mail.new') || null;
+        if (!sub) {
+            checks.push({
+                name: 'subscription',
+                status: 'error',
+                message: 'No automation_event_subscriptions row exists. Click Activate to create one.',
+            });
+            return finish(false);
+        }
+        checks.push({
+            name: 'subscription',
+            status: 'ok',
+            message: `Subscription ${sub.id} found (mode=${sub.mode}).`,
+            detail: {
+                lastCursor: sub.lastCursor,
+                lastPolledAt: sub.lastPolledAt,
+                filter: sub.filter,
+            },
+        });
+
+        // 2) Credentials. Use the same loadSession the polling pass uses —
+        // tries the vault first, then falls back to user_sessions (where
+        // the chat-side OAuth flow puts tokens for users who connected
+        // before the vault existed). Reporting the source helps the user
+        // understand whether they're on a stable long-lived vault entry or
+        // depending on their browser session staying alive.
+        let session = null;
+        try {
+            const triggerBus = require('../automation/triggerBus');
+            session = await triggerBus.loadSession(userId);
+        } catch (e) {
+            checks.push({ name: 'credentials', status: 'error', message: `Credential lookup threw: ${e.message}` });
+            return finish(false);
+        }
+        if (!session?.accessToken) {
+            checks.push({
+                name: 'credentials',
+                status: 'error',
+                message: 'No Gmail OAuth tokens found in either the routine vault or the active browser session. Sign in to Bee Flow and re-connect Gmail in Integrations.',
+            });
+            return finish(false);
+        }
+        checks.push({
+            name: 'credentials',
+            status: session._source === 'vault' ? 'ok' : 'warn',
+            message: session._source === 'vault'
+                ? `Gmail tokens loaded from the routine vault (long-lived, auto-refresh).`
+                : `Gmail tokens loaded from your browser session. The trigger will keep firing while you stay signed in; re-connect Gmail in Integrations to upgrade to a long-lived vault entry.`,
+            detail: { source: session._source, hasAccessToken: true, hasRefreshToken: !!session.refreshToken, oauthProvider: session.oauthProvider || null },
+        });
+
+        // 3) Live Gmail history call (or bootstrap)
+        try {
+            const { google } = require('googleapis');
+            const auth = new google.auth.OAuth2();
+            auth.setCredentials({ access_token: session.accessToken, refresh_token: session.refreshToken });
+            const gmail = google.gmail({ version: 'v1', auth });
+            if (sub.lastCursor) {
+                try {
+                    const r = await gmail.users.history.list({
+                        userId: 'me',
+                        startHistoryId: sub.lastCursor,
+                        historyTypes: ['messageAdded'],
+                    });
+                    const count = (r.data.history || []).reduce((acc, h) => acc + (h.messagesAdded?.length || 0), 0);
+                    checks.push({
+                        name: 'gmail_history',
+                        status: 'ok',
+                        message: `history.list succeeded; ${count} new message(s) since cursor.`,
+                        detail: { newCount: count, currentHistoryId: r.data.historyId || null },
+                    });
+                } catch (err) {
+                    const stale = err.code === 404 || /not found|invalid history id/i.test(err.message || '');
+                    checks.push({
+                        name: 'gmail_history',
+                        status: stale ? 'warn' : 'error',
+                        message: stale
+                            ? `Cursor ${sub.lastCursor} is stale (Gmail returned: ${err.message}). The poller will reset it on the next tick.`
+                            : `gmail.users.history.list failed: ${err.message}`,
+                    });
+                }
+            } else {
+                const profile = await gmail.users.getProfile({ userId: 'me' });
+                checks.push({
+                    name: 'gmail_history',
+                    status: 'warn',
+                    message: 'No cursor yet — bootstrap needed. The next poll tick will anchor the cursor.',
+                    detail: { profileHistoryId: profile.data.historyId || null },
+                });
+            }
+        } catch (e) {
+            checks.push({ name: 'gmail_history', status: 'error', message: `Gmail API not reachable: ${e.message}` });
+            return finish(false);
+        }
+
+        // 4) Latest matching message — same lookup the manual run uses
+        try {
+            const triggerBus = require('../automation/triggerBus');
+            const latest = await triggerBus.fetchLatestGmailMatch(userId, trig.appEvent.filter || null);
+            if (!latest) {
+                checks.push({
+                    name: 'recent_match',
+                    status: 'warn',
+                    message: 'No recent inbox messages match the filter. The trigger will fire as soon as a matching email arrives.',
+                });
+            } else {
+                checks.push({
+                    name: 'recent_match',
+                    status: 'ok',
+                    message: `Most recent matching email: "${latest.subject}" from ${latest.from}.`,
+                    detail: { subject: latest.subject, from: latest.from, date: latest.date, labelIds: latest.labelIds },
+                });
+            }
+        } catch (e) {
+            checks.push({ name: 'recent_match', status: 'error', message: `Filter probe failed: ${e.message}` });
+        }
+
+        return finish(checks.every(c => c.status !== 'error'));
+    } catch (e) {
+        console.error('[automation/diagnose-trigger] error:', e);
         res.status(500).json({ error: e.message });
     }
 });

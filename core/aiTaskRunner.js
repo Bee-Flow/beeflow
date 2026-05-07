@@ -13,10 +13,16 @@ const { resolveModelForTier } = require('./modelResolver');
 const { getProviderForModel } = require('./aiAgent');
 const { getAdapter } = require('./providers');
 const { pool } = require('../db');
+const terminationStore = require('../stores/terminationStore');
+const { sanitizeError } = require('./errorSanitizer');
 
 const RUNNER_INTERVAL_MS = 60_000; // 60 seconds
 const MAX_CONCURRENT = 5;
-const MAX_TOOL_ITERATIONS = 5;
+// Routines that fan out across several topics (news digests, multi-source
+// research) routinely chain 6-8 tool calls before producing a final answer.
+// Capping at 5 used to silently truncate them — the loop would exit with no
+// final assistant text and the user got a blank notification.
+const MAX_TOOL_ITERATIONS = 10;
 
 /**
  * R3: cheap, deterministic topic extraction from a routine result. Looks for
@@ -199,15 +205,48 @@ async function executeTask(task, { manual = false } = {}) {
         ];
 
         let finalResponse = '';
+        let lastAssistantContent = ''; // tracks any non-empty assistant text seen across iterations
+        let hitIterationCap = true;    // flipped to false if the loop exits via `break`
+        let lastIter = 0;
+        let promptTokensTotal = 0;
+        let completionTokensTotal = 0;
+
+        const terminationBase = () => ({
+            user_id: task.userId || null,
+            agent_id: task.agentId || null,
+            agent_name: task.title || null,
+            model: modelId,
+            source: 'routine',
+            conversation_id: task.id || null,
+            iteration_count: lastIter,
+            duration_ms: Date.now() - startTime,
+            prompt_tokens: promptTokensTotal,
+            completion_tokens: completionTokensTotal,
+            total_tokens: promptTokensTotal + completionTokensTotal,
+        });
 
         // Tool-calling loop (max iterations)
         for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
+            lastIter = iter + 1;
             const response = await adapter.chat(config.apiKey, config.url, modelId, messages, {
                 maxTokens: 16384,
                 temperature: 0.7,
                 tools: tools.length > 0 ? tools : undefined,
                 toolChoice: tools.length > 0 ? 'auto' : undefined,
             });
+            promptTokensTotal += response?.usage?.prompt_tokens || 0;
+            completionTokensTotal += response?.usage?.completion_tokens || 0;
+
+            // Track any assistant text the model produced alongside tool
+            // calls — if we later exhaust iterations without a clean break,
+            // this is the best outcome we can surface to the user.
+            if (response.content && response.content.trim()) {
+                lastAssistantContent = response.content;
+            }
+
+            if (response.stop_reason === 'max_tokens' || response.stopReason === 'max_tokens' || response.finish_reason === 'length') {
+                terminationStore.logTermination({ ...terminationBase(), termination_type: 'max_tokens' }).catch(() => {});
+            }
 
             // Handle tool calls if present
             if (response.toolCalls && response.toolCalls.length > 0) {
@@ -267,7 +306,28 @@ async function executeTask(task, { manual = false } = {}) {
 
             // No tool calls — this is the final response
             finalResponse = response.content || '';
+            hitIterationCap = false;
             break;
+        }
+
+        // If we exited via the iteration cap, the model kept calling tools
+        // without ever producing a final answer. Do NOT fall back to interim
+        // assistant text — that text is usually a thinking-aloud sentence
+        // ("Ik zoek tegelijkertijd het laatste nieuws…") and surfacing it as
+        // the result is more misleading than a clear failure message.
+        if (hitIterationCap) {
+            terminationStore.logTermination({ ...terminationBase(), termination_type: 'max_iterations', iteration_count: MAX_TOOL_ITERATIONS }).catch(() => {});
+        }
+
+        if (!finalResponse || !finalResponse.trim()) {
+            console.warn(`[AITaskRunner] Routine "${task.title}" (${task.id}) produced no outcome text. ` +
+                `hitIterationCap=${hitIterationCap}, ` +
+                `messages=${messages.length}, ` +
+                `tools=${tools.length}, ` +
+                `lastInterim=${lastAssistantContent.length} chars`);
+            finalResponse = hitIterationCap
+                ? `_(De routine bereikte de limiet van ${MAX_TOOL_ITERATIONS} tool-aanroepen voordat een eindresultaat werd geproduceerd. Splits de prompt op of koppel een agent met grotere context.)_`
+                : '_(De routine is uitgevoerd, maar er is geen tekstresultaat geproduceerd.)_';
         }
 
         // Truncate if needed (safety net — ignore task.maxResultLength since DB defaults to 2000)
@@ -301,6 +361,16 @@ async function executeTask(task, { manual = false } = {}) {
         }
     } catch (err) {
         console.error(`[AITaskRunner] ❌ Task "${task.title}" failed:`, err.message);
+        terminationStore.logTermination({
+            user_id: task.userId || null,
+            agent_id: task.agentId || null,
+            agent_name: task.title || null,
+            source: 'routine',
+            conversation_id: task.id || null,
+            duration_ms: Date.now() - startTime,
+            termination_type: 'error',
+            ...sanitizeError(err),
+        }).catch(() => {});
         await aiTaskStore.markError(task.id, err);
 
         // Still advance schedule on error (don't let errors block future runs) — but not for manual runs
@@ -405,22 +475,66 @@ async function executeAgentRoutine(task, { manual = false } = {}) {
             ephemeral: false,
         };
 
-        const collectedChunks = [];
+        // Capture both the streaming token deltas AND any post-stream content
+        // replacements (the runtime emits `content_replace` after stripping
+        // tool-call XML or after content moderation rewrites the response —
+        // missing those events used to leave routines with an empty outcome).
+        let collected = '';
+        let replaced = null;
         const result = await chatWithAgentStream(
             task.agentId,
             task.userId,
             task.prompt,
             userAuth,
             (type, data) => {
-                if (type === 'content' && data?.text) collectedChunks.push(data.text);
+                if (type === 'content' && data?.text) collected += data.text;
+                else if (type === 'content_replace' && typeof data?.text === 'string') replaced = data.text;
             },
             null,
             messageMetadata,
         );
 
-        const finalResponse = (result?.message && result.message.length > 0)
+        let finalResponse = (result?.message && result.message.length > 0)
             ? result.message
-            : collectedChunks.join('');
+            : (replaced && replaced.trim() ? replaced : collected);
+
+        // Fallback: if the runtime returned no assistant text (e.g. the model
+        // ended on a tool call, hit max iterations, or content moderation
+        // emptied the buffer), recover the last assistant message from the
+        // conversation that the routine just wrote to. Without this, the
+        // notification card renders blank and the user has no way to see the
+        // outcome of the run.
+        if (!finalResponse || !finalResponse.trim()) {
+            try {
+                const convoId = result?.conversationId || task.conversationId;
+                if (convoId) {
+                    const convo = await agentStore.getConversationById(convoId, userAuth.encryptionKey);
+                    const msgs = Array.isArray(convo?.messages) ? convo.messages : [];
+                    for (let i = msgs.length - 1; i >= 0; i--) {
+                        const m = msgs[i];
+                        if (m?.role === 'assistant' && typeof m.content === 'string' && m.content.trim()) {
+                            finalResponse = m.content;
+                            console.log(`[AITaskRunner] Recovered routine outcome from conversation ${convoId} (${finalResponse.length} chars)`);
+                            break;
+                        }
+                    }
+                }
+            } catch (recoverErr) {
+                console.warn(`[AITaskRunner] Outcome recovery failed: ${recoverErr.message}`);
+            }
+        }
+
+        if (!finalResponse || !finalResponse.trim()) {
+            console.warn(`[AITaskRunner] Routine "${task.title}" (${task.id}) produced no outcome text. ` +
+                `result.message=${result?.message?.length || 0} chars, ` +
+                `streamed=${collected.length} chars, ` +
+                `replaced=${replaced?.length || 0} chars, ` +
+                `convoId=${result?.conversationId || task.conversationId || 'none'}, ` +
+                `guardrailViolation=${result?.guardrailViolation || 'none'}, ` +
+                `toolCalls=${result?.toolCalls?.length || 0}`);
+            finalResponse = '_(De routine is uitgevoerd, maar er is geen tekstresultaat geproduceerd. Open de chat om de uitvoering te bekijken.)_';
+        }
+
         const truncated = finalResponse.length > 50000
             ? finalResponse.substring(0, 50000) + '\n\n… (truncated)'
             : finalResponse;
@@ -482,6 +596,18 @@ async function executeAgentRoutine(task, { manual = false } = {}) {
         }
     } catch (err) {
         console.error(`[AITaskRunner] ❌ Routine "${task.title}" failed:`, err.message);
+        if (!err?._terminationLogged) {
+            terminationStore.logTermination({
+                user_id: task.userId || null,
+                agent_id: task.agentId || null,
+                agent_name: task.title || null,
+                source: 'routine',
+                conversation_id: task.conversationId || task.id || null,
+                duration_ms: Date.now() - startTime,
+                termination_type: 'error',
+                ...sanitizeError(err),
+            }).catch(() => {});
+        }
         await aiTaskStore.markError(task.id, err);
         if ((task.repeatInterval || (Array.isArray(task.daysOfWeek) && task.daysOfWeek.length > 0)) && !manual) {
             await aiTaskStore.advanceSchedule(task.id, task.nextRunAt, task.repeatInterval, task.daysOfWeek);

@@ -46,6 +46,9 @@ const {
     executeWebpageKBSearchTool,
     WEBPAGE_KB_SEARCH_TOOL,
 } = require('../../core/webpageKnowledgeSearch');
+const terminationStore = require('../../stores/terminationStore');
+const { sanitizeError } = require('../../core/errorSanitizer');
+const { emitPhase, emitPhaseEnd, withPhase } = require('../../core/agentRuntime/phaseEvents');
 
 function requireAuth(req, res, next) {
     if (req.session && req.session.user) return next();
@@ -219,6 +222,10 @@ router.post('/chat/webpage/stream', requireAuth, async (req, res) => {
     if (modelTier === 'auto') {
         send('model_selected', { tier: resolvedTier, modelId });
     }
+    // Always emit a `model_resolved` phase so the UI can show the concrete
+    // model name (e.g. "Using gpt-4o-mini") regardless of tier mode.
+    emitPhase(send, 'model_resolved', modelId);
+    emitPhaseEnd(send, 'model_resolved');
 
     try {
         // KB search for grounding
@@ -226,6 +233,8 @@ router.post('/chat/webpage/stream', requireAuth, async (req, res) => {
         let citationSources = [];
         const kbIds = webpage.knowledgeBaseIds || [];
         if (kbIds.length > 0) {
+            emitPhase(send, 'kb_search');
+            const _kbT = Date.now();
             try {
                 const kbResult = await searchWebpageKB({
                     userId, kbIds, query: message,
@@ -238,6 +247,7 @@ router.post('/chat/webpage/stream', requireAuth, async (req, res) => {
             } catch (kbErr) {
                 console.warn('[WebpageChat] KB search failed:', kbErr.message);
             }
+            emitPhaseEnd(send, 'kb_search', Date.now() - _kbT);
         }
         if (citationSources.length > 0) {
             send('kb_sources', { sources: citationSources.map(s => ({ title: s.title, preview: s.content, score: s.score })) });
@@ -312,6 +322,8 @@ Just do the work — no approval step. The propose_webpage_plan tool is NOT avai
 3. Never stop to ask the user "should I proceed?" — they chose Auto specifically to skip that. After your edits land, briefly explain what you did.
 For very large changes you can still narrate your approach in a sentence or two before the first tool call so the user sees what's coming, but DO NOT pause for approval.`;
 
+        emitPhase(send, 'building_prompt');
+        const _spT = Date.now();
         const systemPrompt = `You are a precise, efficient webpage-building assistant. Today is ${today}.
 
 ────────────────────────────────────────
@@ -410,6 +422,7 @@ ${searchAvailable ? `\nWeb research:
 
 Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = new Date(); const _dp = _now.toLocaleString('sv-SE', { timeZone: _tz }); const _lp = new Date(_now.toLocaleString('en-US', { timeZone: _tz })); const _om = Math.round((_lp - _now) / 60000); const _s = _om >= 0 ? '+' : '-'; const _a = Math.abs(_om); return `${_dp} UTC${_s}${String(Math.floor(_a / 60)).padStart(2, '0')}:${String(_a % 60).padStart(2, '0')} (${_tz})`; } catch (_) { return new Date().toISOString(); } })()}`;
 
+        emitPhaseEnd(send, 'building_prompt', Date.now() - _spT);
         let messages = [{ role: 'system', content: systemPrompt }];
 
         // Plan-execution turn: the user clicked Approve & build on a previously
@@ -491,6 +504,51 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
         // handler exits the streaming/tool loop after the current round so the
         // user gets a chance to approve before any files are touched.
         let planProposedThisTurn = false;
+
+        // ── Termination monitor bookkeeping ───────────────────────────────
+        // Tracks tokens, latency and the most recent stop_reason so we can
+        // log abnormal terminations (max_tokens / max_iterations / error)
+        // without persisting any message content.
+        const _termStart = Date.now();
+        let _termPromptTokens = 0;
+        let _termCompletionTokens = 0;
+        let _termLastStopReason = null;
+        // Attachment metadata — counts + total bytes only, no filenames or
+        // content. Helps explain max_tokens stops where the user uploaded a
+        // big file and the LLM ran out of room before a useful answer.
+        const _termAttachmentCount = Array.isArray(attachments) ? attachments.length : 0;
+        const _termAttachmentBytes = (() => {
+            if (!Array.isArray(attachments)) return 0;
+            let total = 0;
+            for (const att of attachments) {
+                if (!att?.content || typeof att.content !== 'string') continue;
+                if (att.content.startsWith('data:')) {
+                    // base64 — actual bytes are ~3/4 of the base64 length.
+                    const comma = att.content.indexOf(',');
+                    const b64 = comma >= 0 ? att.content.slice(comma + 1) : att.content;
+                    total += Math.floor(b64.length * 0.75);
+                } else {
+                    total += Buffer.byteLength(att.content, 'utf8');
+                }
+            }
+            return total;
+        })();
+        const _terminationBase = () => ({
+            user_id: userId || null,
+            organization_id: userOrgForTiers || null,
+            agent_id: webpageId || null,
+            agent_name: webpage?.title ? `Webpage: ${webpage.title}` : 'Webpage chat',
+            model: modelId || null,
+            source: 'webpage_chat',
+            conversation_id: webpageId || null,
+            iteration_count: toolCallRounds,
+            duration_ms: Date.now() - _termStart,
+            prompt_tokens: _termPromptTokens,
+            completion_tokens: _termCompletionTokens,
+            total_tokens: _termPromptTokens + _termCompletionTokens,
+            attachment_count: _termAttachmentCount,
+            attachment_bytes: _termAttachmentBytes,
+        });
 
         async function dispatchToolCall(toolCall) {
             const toolName = toolCall.function?.name || toolCall.name;
@@ -632,6 +690,13 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
                             : (data.function?.arguments || '{}'),
                     },
                 });
+            } else if (type === 'done') {
+                // Adapter signals end-of-stream with usage + stop_reason.
+                // Track tokens for the termination monitor and remember the
+                // last stop_reason so we can detect max_tokens truncations.
+                _termPromptTokens += data?.prompt_tokens || 0;
+                _termCompletionTokens += data?.completion_tokens || 0;
+                _termLastStopReason = data?.stop_reason || data?.finish_reason || null;
             } else if (type === 'error') {
                 send('error', data);
             }
@@ -648,12 +713,27 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
                 toolChoice: 'auto',
             };
 
+            // Final pre-LLM phase marker — only on the first round, so the UI
+            // status placeholder fades out before the first token arrives.
+            if (toolCallRounds === 0) {
+                emitPhase(send, 'streaming_start', modelId);
+            }
+
             try {
                 await adapter.stream(apiKey, apiUrl, modelId, messages, streamOptions, streamCallback);
             } catch (err) {
                 console.error('[WebpageChat] Stream error:', err.message);
+                terminationStore.logTermination({
+                    ..._terminationBase(),
+                    termination_type: 'error',
+                    ...sanitizeError(err),
+                }).catch(() => {});
                 send('error', { error: `Chat error: ${err.message}` });
                 break;
+            }
+
+            if (_termLastStopReason === 'max_tokens' || _termLastStopReason === 'length') {
+                terminationStore.logTermination({ ..._terminationBase(), termination_type: 'max_tokens' }).catch(() => {});
             }
 
             if (streamToolCalls.length === 0) break;
@@ -677,6 +757,11 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
                     await adapter.stream(apiKey, apiUrl, modelId, messages, chatOptions, streamCallback);
                 } catch (err) {
                     console.error('[WebpageChat] Plan wrap-up stream error:', err.message);
+                    terminationStore.logTermination({
+                        ..._terminationBase(),
+                        termination_type: 'error',
+                        ...sanitizeError(err),
+                    }).catch(() => {});
                 }
                 break;
             }
@@ -685,10 +770,16 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
         // Hit MAX_TOOL_ROUNDS with tool calls still pending — give the model
         // one chance to summarise without offering more tools.
         if (toolCallRounds >= MAX_TOOL_ROUNDS && streamToolCalls.length > 0) {
+            terminationStore.logTermination({ ..._terminationBase(), termination_type: 'max_iterations' }).catch(() => {});
             try {
                 await adapter.stream(apiKey, apiUrl, modelId, messages, chatOptions, streamCallback);
             } catch (err) {
                 console.error('[WebpageChat] Final wrap-up stream error:', err.message);
+                terminationStore.logTermination({
+                    ..._terminationBase(),
+                    termination_type: 'error',
+                    ...sanitizeError(err),
+                }).catch(() => {});
             }
         }
 
@@ -728,6 +819,17 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
         res.end();
     } catch (err) {
         console.error('[WebpageChat] Error:', err);
+        try {
+            terminationStore.logTermination({
+                user_id: req.session?.user?.id || null,
+                agent_id: req.body?.webpageId || null,
+                agent_name: 'Webpage chat',
+                source: 'webpage_chat',
+                conversation_id: req.body?.webpageId || null,
+                termination_type: 'error',
+                ...sanitizeError(err),
+            }).catch(() => {});
+        } catch (_) { /* ignore logging failures */ }
         send('error', { error: `Chat error: ${err.message}` });
         res.end();
     }

@@ -6,7 +6,7 @@
  */
 
 const crypto = require('crypto');
-const { run, getOne, getAll, exec, getClient } = require('../db');
+const { run, getOne, getAll, exec, getClient, pool } = require('../db');
 
 let initialized = false;
 
@@ -14,6 +14,8 @@ async function initDB() {
     if (initialized) return;
     const migration = require('../migrations/automation-builder-2026-05-init');
     await migration.up();
+    try { await require('../migrations/automation-locking-and-session-2026-05').up(); } catch (e) { /* tolerate */ }
+    try { await require('../migrations/automation-clear-first-run-confirm-2026-05').up(); } catch (e) { /* tolerate */ }
     initialized = true;
     console.log('[AutomationStore] PostgreSQL initialized');
 }
@@ -39,6 +41,11 @@ function rowToAutomation(r) {
         nextRunAt: r.next_run_at ? new Date(r.next_run_at).toISOString() : null,
         lastRunAt: r.last_run_at ? new Date(r.last_run_at).toISOString() : null,
         lastStatus: r.last_status,
+        // Lock + retry columns added by automation-locking-and-session-2026-05.
+        runningInstanceId: r.running_instance_id ?? null,
+        runningStartedAt: r.running_started_at ? new Date(r.running_started_at).toISOString() : null,
+        attempts: r.attempts ?? 0,
+        builderSession: typeof r.builder_session === 'string' ? safeParse(r.builder_session, null) : (r.builder_session ?? null),
         createdFromChatId: r.created_from_chat_id,
         createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
         updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : null,
@@ -124,6 +131,233 @@ async function getDueAutomations() {
          ORDER BY next_run_at ASC LIMIT 20`,
     );
     return rows.map(rowToAutomation);
+}
+
+/**
+ * Atomically claim due schedule-trigger automations for execution.
+ *
+ * Uses `FOR UPDATE SKIP LOCKED` so concurrent runner instances never claim
+ * the same row. The claim sets `last_status='running'`, stamps the
+ * instance/start time, and returns the rows so the caller can execute them.
+ * Replaces the old read-then-mark pattern that allowed double-execution if
+ * a runner crashed between read and mark.
+ */
+async function claimDueAutomations(instanceId, limit = 20) {
+    await initDB();
+    const client = await getClient();
+    try {
+        await client.query('BEGIN');
+        const sel = await client.query(
+            `SELECT id FROM automations
+             WHERE is_active = TRUE
+               AND is_draft = FALSE
+               AND trigger_type = 'schedule'
+               AND next_run_at IS NOT NULL
+               AND next_run_at <= NOW()
+               AND (last_status IS NULL OR last_status != 'running')
+             ORDER BY next_run_at ASC
+             LIMIT $1
+             FOR UPDATE SKIP LOCKED`,
+            [limit],
+        );
+        if (sel.rows.length === 0) {
+            await client.query('COMMIT');
+            return [];
+        }
+        const ids = sel.rows.map(r => r.id);
+        const upd = await client.query(
+            `UPDATE automations
+                SET last_status = 'running',
+                    running_instance_id = $1,
+                    running_started_at = NOW()
+              WHERE id = ANY($2::text[])
+              RETURNING *`,
+            [instanceId, ids],
+        );
+        await client.query('COMMIT');
+        return upd.rows.map(rowToAutomation);
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw e;
+    } finally {
+        client.release();
+    }
+}
+
+/**
+ * Mark an automation row as running for non-scheduled paths (manual run,
+ * event trigger). The schedule tick uses claimDueAutomations() instead;
+ * this is for paths that already know they want to run a specific row.
+ *
+ * Returns false if the row was already marked running (i.e. another path
+ * is mid-execution) so callers can decide whether to skip or queue.
+ */
+async function markRunning(id, instanceId) {
+    await initDB();
+    const { rows } = await pool.query(
+        `UPDATE automations
+            SET last_status = 'running',
+                running_instance_id = $1,
+                running_started_at = NOW()
+          WHERE id = $2
+            AND (last_status IS NULL OR last_status != 'running')
+          RETURNING id`,
+        [instanceId, id],
+    );
+    return rows.length > 0;
+}
+
+/**
+ * Clear the running marker on an automation. Called from the runner's
+ * finally block so a crash mid-execution leaves running_started_at set
+ * for the reaper to find.
+ */
+async function releaseAutomation(id) {
+    await initDB();
+    await run(
+        `UPDATE automations
+            SET running_instance_id = NULL,
+                running_started_at = NULL
+          WHERE id = $1`,
+        [id],
+    );
+}
+
+/**
+ * Reset rows stuck in `running` for longer than `staleAfterMs` (a runner
+ * crash, OOM, or process kill leaves them this way). The reset bumps
+ * `attempts`; the caller decides what status to leave them in.
+ *
+ * Returns the rows that were reset so the runner can decide whether to
+ * retry now, schedule a backoff, or notify the owner.
+ */
+async function reapStuckAutomations({ staleAfterMs = 10 * 60_000, maxAttempts = 5 } = {}) {
+    await initDB();
+    const { rows } = await pool.query(
+        `UPDATE automations
+            SET last_status = CASE
+                    WHEN attempts + 1 >= $2 THEN 'error'
+                    ELSE 'pending'
+                END,
+                running_instance_id = NULL,
+                running_started_at = NULL,
+                attempts = attempts + 1
+          WHERE last_status = 'running'
+            AND running_started_at IS NOT NULL
+            AND running_started_at < NOW() - ($1 * INTERVAL '1 millisecond')
+          RETURNING *`,
+        [staleAfterMs, maxAttempts],
+    );
+    return rows.map(rowToAutomation);
+}
+
+/**
+ * Reset the attempts counter after a successful run.
+ */
+async function resetAttempts(id) {
+    await initDB();
+    await run(`UPDATE automations SET attempts = 0 WHERE id = $1`, [id]);
+}
+
+// ── Builder session snapshot ───────────────────────────────────────────
+//
+// The builder loop persists a small snapshot {sessionId, version, messages,
+// draft, lastValidation} into automations.builder_session after every
+// mutation. On SSE reconnect the client rehydrates from the latest snapshot
+// so the chat history isn't lost when the connection drops.
+//
+// `version` is a monotonically-increasing integer used for optimistic
+// locking: setBuilderSession only succeeds when the caller's expected
+// version matches the persisted one. Two-tab edits get a 409 on the second
+// write so the loser can refresh instead of clobbering.
+
+const SNAPSHOT_MAX_BYTES = 64 * 1024;
+
+function trimSnapshot(snapshot) {
+    if (!snapshot) return null;
+    let payload = JSON.stringify(snapshot);
+    if (payload.length <= SNAPSHOT_MAX_BYTES) return snapshot;
+    // Drop oldest non-trigger messages until we fit. Keep the most recent
+    // assistant turn intact so resume always shows the user the latest
+    // model output.
+    const trimmed = { ...snapshot, messages: Array.isArray(snapshot.messages) ? [...snapshot.messages] : [] };
+    while (trimmed.messages.length > 2) {
+        trimmed.messages.shift();
+        payload = JSON.stringify(trimmed);
+        if (payload.length <= SNAPSHOT_MAX_BYTES) break;
+    }
+    return trimmed;
+}
+
+async function getBuilderSession(automationId, userId) {
+    await initDB();
+    const r = await getOne(
+        'SELECT builder_session, user_id FROM automations WHERE id = $1',
+        [automationId],
+    );
+    if (!r) return null;
+    if (userId && r.user_id !== userId) return null;
+    const raw = typeof r.builder_session === 'string' ? safeParse(r.builder_session, null) : (r.builder_session ?? null);
+    return raw;
+}
+
+/**
+ * Persist a builder-session snapshot. When `expectedVersion` is provided,
+ * the write only succeeds if the persisted snapshot's version matches —
+ * mismatches return { ok: false, conflict: true, current }. When omitted,
+ * the write is unconditional and the version increments by 1.
+ */
+async function setBuilderSession(automationId, userId, snapshot, { expectedVersion = null } = {}) {
+    await initDB();
+    const trimmed = trimSnapshot(snapshot) || {};
+    const client = await getClient();
+    try {
+        await client.query('BEGIN');
+        const cur = await client.query(
+            'SELECT user_id, builder_session FROM automations WHERE id = $1 FOR UPDATE',
+            [automationId],
+        );
+        if (cur.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return { ok: false, notFound: true };
+        }
+        if (userId && cur.rows[0].user_id !== userId) {
+            await client.query('ROLLBACK');
+            return { ok: false, forbidden: true };
+        }
+        const currentSnap = (typeof cur.rows[0].builder_session === 'string'
+            ? safeParse(cur.rows[0].builder_session, null)
+            : (cur.rows[0].builder_session ?? null)) || {};
+        const currentVersion = Number.isFinite(currentSnap.version) ? currentSnap.version : 0;
+        if (expectedVersion != null && currentVersion !== expectedVersion) {
+            await client.query('ROLLBACK');
+            return { ok: false, conflict: true, current: currentSnap };
+        }
+        const next = { ...trimmed, version: currentVersion + 1 };
+        await client.query(
+            `UPDATE automations SET builder_session = $1::jsonb, updated_at = NOW() WHERE id = $2`,
+            [JSON.stringify(next), automationId],
+        );
+        await client.query('COMMIT');
+        return { ok: true, snapshot: next };
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw e;
+    } finally {
+        client.release();
+    }
+}
+
+async function clearBuilderSession(automationId, userId) {
+    await initDB();
+    if (userId) {
+        await run(
+            `UPDATE automations SET builder_session = NULL WHERE id = $1 AND user_id = $2`,
+            [automationId, userId],
+        );
+    } else {
+        await run(`UPDATE automations SET builder_session = NULL WHERE id = $1`, [automationId]);
+    }
 }
 
 async function updateAutomation(id, updates, savedByUserId) {
@@ -369,6 +603,36 @@ async function getSubscriptionsForProvider(provider, eventType) {
     }));
 }
 
+/**
+ * All subscriptions for one automation. Used by activate/deactivate to
+ * dedupe and clean up, and by an automation's settings panel to show
+ * which event sources are wired up.
+ */
+async function getSubscriptionsForAutomation(automationId) {
+    await initDB();
+    const rows = await getAll(
+        'SELECT * FROM automation_event_subscriptions WHERE automation_id = $1',
+        [automationId],
+    );
+    return rows.map(r => ({
+        id: r.id, automationId: r.automation_id, userId: r.user_id,
+        provider: r.provider, eventType: r.event_type, mode: r.mode,
+        externalRef: r.external_ref, expiresAt: r.expires_at,
+        lastCursor: r.last_cursor, lastPolledAt: r.last_polled_at,
+        filter: typeof r.filter_json === 'string' ? safeParse(r.filter_json, null) : r.filter_json,
+    }));
+}
+
+/**
+ * Delete every subscription for an automation. Called from /deactivate
+ * (and /delete) so the poller stops firing for paused / removed
+ * automations the moment the user toggles them off.
+ */
+async function deleteSubscriptionsForAutomation(automationId) {
+    await initDB();
+    await run('DELETE FROM automation_event_subscriptions WHERE automation_id = $1', [automationId]);
+}
+
 async function getPollingSubscriptions({ olderThanMs = 60_000 } = {}) {
     await initDB();
     const rows = await getAll(
@@ -432,6 +696,14 @@ module.exports = {
     getAutomation,
     getAutomationsForUser,
     getDueAutomations,
+    claimDueAutomations,
+    markRunning,
+    releaseAutomation,
+    reapStuckAutomations,
+    resetAttempts,
+    getBuilderSession,
+    setBuilderSession,
+    clearBuilderSession,
     updateAutomation,
     deleteAutomation,
     listVersions,
@@ -449,6 +721,8 @@ module.exports = {
     createSubscription,
     getSubscription,
     getSubscriptionsForProvider,
+    getSubscriptionsForAutomation,
+    deleteSubscriptionsForAutomation,
     getPollingSubscriptions,
     getExpiringSubscriptions,
     updateSubscription,

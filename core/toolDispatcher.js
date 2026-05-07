@@ -47,6 +47,7 @@ const { isNextcloudNotificationsTool, executeNextcloudNotificationsTool } = requ
 const { isNextcloudTalkTool, executeNextcloudTalkTool } = require('../integrations/nextcloudTalkTools');
 const { isNextcloudTasksTool, executeNextcloudTasksTool } = require('../integrations/nextcloudTasksTools');
 const { isNextcloudNotesTool, executeNextcloudNotesTool } = require('../integrations/nextcloudNotesTools');
+const { isNextcloudMailTool, executeNextcloudMailTool } = require('../integrations/nextcloudMailTools');
 const { isNextcloudActivityTool, executeNextcloudActivityTool } = require('../integrations/nextcloudActivityTools');
 const { isNextcloudStatusTool, executeNextcloudStatusTool } = require('../integrations/nextcloudStatusTools');
 
@@ -209,7 +210,10 @@ async function executeTool(toolName, toolArgs, context = {}) {
         return await executeGammaTool(toolName, toolArgs, userId);
     }
     if (isGmailTool(toolName)) {
-        return await executeGmailTool(toolName, toolArgs, session);
+        // `autoSend` is opt-in per-call: only the automation runner sets it
+        // (no user is present to confirm a draft). Direct chat / agent chat
+        // leave it false so the email_draft → user approves → send flow stays.
+        return await executeGmailTool(toolName, toolArgs, session, { autoSend: !!context.autoSend });
     }
     if (isCalendarTool(toolName)) {
         return await executeCalendarTool(toolName, toolArgs, session);
@@ -378,6 +382,9 @@ async function executeTool(toolName, toolArgs, context = {}) {
     }
     if (isNextcloudNotesTool(toolName)) {
         return await executeNextcloudNotesTool(toolName, toolArgs, userId, session);
+    }
+    if (isNextcloudMailTool(toolName)) {
+        return await executeNextcloudMailTool(toolName, toolArgs, userId, session);
     }
     if (isNextcloudActivityTool(toolName)) {
         return await executeNextcloudActivityTool(toolName, toolArgs, userId, session);

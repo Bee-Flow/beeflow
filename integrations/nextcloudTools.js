@@ -16,9 +16,49 @@
  */
 
 const ncClient = require('./nextcloudClient');
+const { XMLParser } = require('fast-xml-parser');
 
 const MAX_TEXT_BYTES = 200 * 1024;          // 200 KB cap on file reads
 const REQUEST_TIMEOUT_MS = ncClient.REQUEST_TIMEOUT_MS;
+
+// Shared parser. removeNSPrefix collapses d:/oc:/nc:/s: namespace prefixes so
+// <d:response> → response, <oc:fileid> → fileid. Tag values stay as strings;
+// callers parseInt where needed.
+const xmlParser = new XMLParser({
+    ignoreAttributes: false,
+    removeNSPrefix: true,
+    parseTagValue: false,
+    trimValues: true,
+});
+
+// Normalize a WebDAV multistatus response into [{ href, props, status }] where
+// props is the merged successful prop bag. Sabre/DAV returns either an array
+// or a single object for response/propstat depending on cardinality, so this
+// flattens both shapes.
+function parseMultistatus(xml) {
+    const parsed = xmlParser.parse(xml);
+    const ms = parsed?.multistatus;
+    if (!ms) return [];
+    const responses = Array.isArray(ms.response) ? ms.response : (ms.response ? [ms.response] : []);
+    return responses.map((r) => {
+        const propstats = Array.isArray(r.propstat) ? r.propstat : (r.propstat ? [r.propstat] : []);
+        const props = {};
+        for (const ps of propstats) {
+            // Only merge 2xx propstat blocks; 404s carry empty placeholders.
+            const status = ps.status || '';
+            if (status && !/\b2\d\d\b/.test(status)) continue;
+            Object.assign(props, ps.prop || {});
+        }
+        return { href: r.href || '', props, status: r.status || '' };
+    });
+}
+
+function isCollectionProp(props) {
+    const rt = props.resourcetype;
+    if (!rt) return false;
+    // <d:resourcetype><d:collection/></d:resourcetype> → { collection: '' }
+    return rt.collection !== undefined;
+}
 const PROPFIND_BODY = `<?xml version="1.0"?>
 <d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">
   <d:prop>
@@ -117,6 +157,38 @@ const NEXTCLOUD_TOOLS = [
                     path: { type: 'string', description: 'Path of the file or folder to delete.' }
                 },
                 required: ['path']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_move',
+            description: 'Move or rename a file or folder in Nextcloud (server-side WebDAV MOVE — no download/re-upload). Works for both files and folders. Renaming is just moving to the same parent with a new filename. The user has approved this — go ahead.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    source: { type: 'string', description: 'Current path (e.g. "/Invoices/foo.pdf").' },
+                    destination: { type: 'string', description: 'Target path (e.g. "/Invoices/2026-01/foo.pdf"). Parent folders must already exist.' },
+                    overwrite: { type: 'boolean', description: 'If true, overwrite an existing file at the destination. Default false (fails with 412 if target exists).' }
+                },
+                required: ['source', 'destination']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_copy',
+            description: 'Copy a file or folder in Nextcloud (server-side WebDAV COPY — no download/re-upload). Works for both files and folders. The user has approved this — go ahead.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    source: { type: 'string', description: 'Source path (e.g. "/Documents/template.docx").' },
+                    destination: { type: 'string', description: 'Target path. Parent folders must already exist.' },
+                    overwrite: { type: 'boolean', description: 'If true, overwrite an existing file at the destination. Default false.' }
+                },
+                required: ['source', 'destination']
             }
         }
     },
@@ -431,23 +503,17 @@ function relativeFromRoot(href, baseUrl, uid) {
     }
 }
 
-// Minimal PROPFIND XML parser — extracts <d:response> blocks. Avoids pulling
-// in a heavy XML dep; the response shape is well-defined and stable.
 function parsePropfind(xml, baseUrl, uid) {
-    const responses = [];
-    const respRegex = /<d:response[\s>][\s\S]*?<\/d:response>/g;
-    const matches = xml.match(respRegex) || [];
-    for (const block of matches) {
-        const href = (block.match(/<d:href>([^<]+)<\/d:href>/) || [])[1];
-        if (!href) continue;
-        const isCollection = /<d:resourcetype>\s*<d:collection\s*\/>\s*<\/d:resourcetype>/.test(block);
-        const size = parseInt((block.match(/<d:getcontentlength>(\d+)<\/d:getcontentlength>/) || [])[1] || '0', 10);
-        const contentType = (block.match(/<d:getcontenttype>([^<]*)<\/d:getcontenttype>/) || [])[1] || null;
-        const lastMod = (block.match(/<d:getlastmodified>([^<]+)<\/d:getlastmodified>/) || [])[1] || null;
-        const fileId = (block.match(/<oc:fileid>([^<]+)<\/oc:fileid>/) || [])[1] || null;
+    return parseMultistatus(xml).map(({ href, props }) => {
+        if (!href) return null;
+        const isCollection = isCollectionProp(props);
+        const size = parseInt(props.getcontentlength || '0', 10);
+        const contentType = props.getcontenttype || null;
+        const lastMod = props.getlastmodified || null;
+        const fileId = props.fileid || null;
         const path = relativeFromRoot(href, baseUrl, uid);
         const name = path.replace(/\/$/, '').split('/').pop() || '/';
-        responses.push({
+        return {
             name,
             path: path.replace(/\/$/, '') || '/',
             type: isCollection ? 'folder' : 'file',
@@ -455,9 +521,8 @@ function parsePropfind(xml, baseUrl, uid) {
             contentType: isCollection ? undefined : contentType,
             modified: lastMod,
             fileId,
-        });
-    }
-    return responses;
+        };
+    }).filter(Boolean);
 }
 
 // ─── Tool Execution ───────────────────────────────────────────────
@@ -623,6 +688,36 @@ async function executeNextcloudTool(toolName, args, userId, session) {
             if (res.status === 401) return { error: authError };
             if (!res.ok && res.status !== 204) return { error: `Delete failed (${res.status})` };
             return { success: true, path: args.path };
+        }
+
+        case 'nextcloud_move':
+        case 'nextcloud_copy': {
+            if (!args.source || !args.destination) return { error: 'source and destination are required' };
+            const method = toolName === 'nextcloud_move' ? 'MOVE' : 'COPY';
+            const sourceUrl = joinDavPath(root, args.source);
+            const destinationUrl = joinDavPath(root, args.destination);
+            const res = await ncFetch(sourceUrl, {
+                method,
+                headers: {
+                    'Destination': destinationUrl,
+                    'Overwrite': args.overwrite ? 'T' : 'F',
+                },
+            });
+            if (res.status === 401) return { error: authError };
+            if (res.status === 404) return { error: `Source not found: ${args.source}` };
+            if (res.status === 409) return { error: `Destination parent folder doesn't exist: ${args.destination}. Create it first.` };
+            if (res.status === 412) return { error: `Destination already exists: ${args.destination}. Pass overwrite=true to replace it.` };
+            if (!res.ok && res.status !== 201 && res.status !== 204) {
+                const text = await res.text().catch(() => '');
+                return { error: `${method} failed (${res.status}): ${text.slice(0, 200)}` };
+            }
+            return {
+                success: true,
+                operation: method.toLowerCase(),
+                source: args.source,
+                destination: args.destination,
+                overwritten: res.status === 204,
+            };
         }
 
         case 'nextcloud_create_share': {
@@ -798,18 +893,15 @@ async function executeNextcloudTool(toolName, args, userId, session) {
             if (!res.ok) return { error: `Comments fetch failed (${res.status})` };
             const xml = await res.text();
             const comments = [];
-            const respRegex = /<d:response[\s>][\s\S]*?<\/d:response>/g;
-            const matches = xml.match(respRegex) || [];
-            for (const block of matches) {
-                const id = (block.match(/<d:href>[^<]*\/(\d+)<\/d:href>/) || [])[1];
-                const message = (block.match(/<oc:message>([\s\S]*?)<\/oc:message>/) || [])[1];
-                const actor = (block.match(/<oc:actorDisplayName>([^<]+)<\/oc:actorDisplayName>/) || [])[1];
-                const actorId = (block.match(/<oc:actorId>([^<]+)<\/oc:actorId>/) || [])[1];
-                const created = (block.match(/<oc:creationDateTime>([^<]+)<\/oc:creationDateTime>/) || [])[1];
-                if (id) comments.push({
-                    id: parseInt(id, 10),
-                    message: (message || '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&'),
-                    actor, actorId, created,
+            for (const { href, props } of parseMultistatus(xml)) {
+                const idMatch = (href || '').match(/\/(\d+)\/?$/);
+                if (!idMatch) continue;
+                comments.push({
+                    id: parseInt(idMatch[1], 10),
+                    message: props.message || '',
+                    actor: props.actorDisplayName || null,
+                    actorId: props.actorId || null,
+                    created: props.creationDateTime || null,
                 });
             }
             return { fileId: args.fileId, count: comments.length, comments };
@@ -851,15 +943,15 @@ async function executeNextcloudTool(toolName, args, userId, session) {
             if (!res.ok) return { error: `Tags list failed (${res.status})` };
             const xml = await res.text();
             const tags = [];
-            const respRegex = /<d:response[\s>][\s\S]*?<\/d:response>/g;
-            const matches = xml.match(respRegex) || [];
-            for (const block of matches) {
-                const id = (block.match(/<oc:id>(\d+)<\/oc:id>/) || [])[1];
-                if (!id) continue;
-                const name = (block.match(/<oc:display-name>([^<]+)<\/oc:display-name>/) || [])[1];
-                const visible = /<oc:user-visible>(?:true|1)<\/oc:user-visible>/.test(block);
-                const assignable = /<oc:user-assignable>(?:true|1)<\/oc:user-assignable>/.test(block);
-                tags.push({ id: parseInt(id, 10), name, userVisible: visible, userAssignable: assignable });
+            const isTrue = (v) => v === 'true' || v === '1' || v === true || v === 1;
+            for (const { props } of parseMultistatus(xml)) {
+                if (props.id === undefined || props.id === null || props.id === '') continue;
+                tags.push({
+                    id: parseInt(props.id, 10),
+                    name: props['display-name'] || null,
+                    userVisible: isTrue(props['user-visible']),
+                    userAssignable: isTrue(props['user-assignable']),
+                });
             }
             return { count: tags.length, tags };
         }
@@ -968,26 +1060,20 @@ async function executeNextcloudTool(toolName, args, userId, session) {
             if (!res.ok) return { error: `Trash list failed (${res.status})` };
             const xml = await res.text();
             const responses = [];
-            const respRegex = /<d:response[\s>][\s\S]*?<\/d:response>/g;
-            const matches = xml.match(respRegex) || [];
-            for (const block of matches) {
-                const href = (block.match(/<d:href>([^<]+)<\/d:href>/) || [])[1];
+            for (const { href, props } of parseMultistatus(xml)) {
                 if (!href) continue;
-                const name = (block.match(/<d:displayname>([^<]*)<\/d:displayname>/) || [])[1] || '';
-                const isCollection = /<d:resourcetype>\s*<d:collection\s*\/>\s*<\/d:resourcetype>/.test(block);
-                const size = parseInt((block.match(/<d:getcontentlength>(\d+)<\/d:getcontentlength>/) || [])[1] || '0', 10);
-                const fileId = (block.match(/<oc:fileid>([^<]+)<\/oc:fileid>/) || [])[1] || null;
-                const originalLocation = (block.match(/<nc:trashbin-original-location>([^<]+)<\/nc:trashbin-original-location>/) || [])[1] || null;
-                const deletionTime = (block.match(/<nc:trashbin-deletion-time>([^<]+)<\/nc:trashbin-deletion-time>/) || [])[1] || null;
                 const trashPath = decodeURIComponent(href).replace(`/remote.php/dav/trashbin/${decodeURIComponent(uid)}/`, '/');
                 if (trashPath.replace(/\/$/, '') === '/trash') continue;
+                const isCollection = isCollectionProp(props);
+                const size = parseInt(props.getcontentlength || '0', 10);
+                const deletionTime = props['trashbin-deletion-time'] || null;
                 responses.push({
-                    name,
+                    name: props.displayname || '',
                     trashPath,
                     type: isCollection ? 'folder' : 'file',
                     size: isCollection ? undefined : size,
-                    fileId,
-                    originalLocation,
+                    fileId: props.fileid || null,
+                    originalLocation: props['trashbin-original-location'] || null,
                     deletionTime: deletionTime ? new Date(parseInt(deletionTime, 10) * 1000).toISOString() : null,
                 });
                 if (responses.length >= limit) break;
@@ -1046,19 +1132,20 @@ async function executeNextcloudTool(toolName, args, userId, session) {
             if (!res.ok) return { error: `Version list failed (${res.status})` };
             const xml = await res.text();
             const versions = [];
-            const respRegex = /<d:response[\s>][\s\S]*?<\/d:response>/g;
-            const matches = xml.match(respRegex) || [];
-            for (const block of matches) {
-                const href = (block.match(/<d:href>([^<]+)<\/d:href>/) || [])[1];
+            for (const { href, props } of parseMultistatus(xml)) {
                 if (!href) continue;
                 // The first response is the version container itself — skip.
-                const segments = decodeURIComponent(href).split('/').filter(Boolean);
+                const decodedHref = decodeURIComponent(href);
+                const segments = decodedHref.split('/').filter(Boolean);
                 const versionId = segments[segments.length - 1];
                 if (versionId === String(args.fileId)) continue;
-                const size = parseInt((block.match(/<d:getcontentlength>(\d+)<\/d:getcontentlength>/) || [])[1] || '0', 10);
-                const modified = (block.match(/<d:getlastmodified>([^<]+)<\/d:getlastmodified>/) || [])[1] || null;
-                const contentType = (block.match(/<d:getcontenttype>([^<]+)<\/d:getcontenttype>/) || [])[1] || null;
-                versions.push({ versionId, size, modified, contentType, href: decodeURIComponent(href) });
+                versions.push({
+                    versionId,
+                    size: parseInt(props.getcontentlength || '0', 10),
+                    modified: props.getlastmodified || null,
+                    contentType: props.getcontenttype || null,
+                    href: decodedHref,
+                });
             }
             return { fileId: args.fileId, count: versions.length, versions };
         }

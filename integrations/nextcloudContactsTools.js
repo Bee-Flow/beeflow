@@ -4,13 +4,22 @@
  * Auth + base-URL handled by ./nextcloudClient (Bearer when the user logged in
  * via Nextcloud OAuth, app-password Basic otherwise).
  *
- * Hand-written vCard 3.0 serialiser/parser. Same rationale as the calendar
- * module: contacts are simple enough that pulling in a full RFC-6350 lib
- * isn't justified for the field set we expose.
+ * vCard handling delegates to the `vcf` library (RFC 6350 line folding,
+ * escaping, parameter parsing); WebDAV multistatus parsing uses fast-xml-parser.
  */
 
 const crypto = require('crypto');
+const vCard = require('vcf');
+const { XMLParser } = require('fast-xml-parser');
 const ncClient = require('./nextcloudClient');
+
+const xmlParser = new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: '@_',
+    removeNSPrefix: true,
+    parseTagValue: false,
+    trimValues: true,
+});
 
 const PROPFIND_ADDRESSBOOKS = `<?xml version="1.0" encoding="utf-8" ?>
 <d:propfind xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/" xmlns:card="urn:ietf:params:xml:ns:carddav">
@@ -146,75 +155,115 @@ const NEXTCLOUD_CONTACTS_TOOLS = [
     }
 ];
 
-// ─── vCard helpers ──────────────────────────────────────────────────
+// ─── vCard helpers (vcf for line folding + parameter parsing, with manual
+// RFC 6350 escape/unescape since vcf does not transform text values) ───
 
-function escapeVCard(text) {
-    return String(text || '')
+// Escape a free-text field per RFC 6350 §3.4: backslash → \\, newline → \n,
+// comma → \,, semicolon → \;.
+function escapeText(s) {
+    return String(s == null ? '' : s)
         .replace(/\\/g, '\\\\')
-        .replace(/\n/g, '\\n')
+        .replace(/\r\n|\n|\r/g, '\\n')
         .replace(/,/g, '\\,')
         .replace(/;/g, '\\;');
 }
 
-function unescapeVCard(text) {
-    return String(text || '')
-        .replace(/\\n/g, '\n')
+function unescapeText(s) {
+    if (s == null) return null;
+    return String(s)
+        .replace(/\\n/gi, '\n')
         .replace(/\\,/g, ',')
         .replace(/\\;/g, ';')
         .replace(/\\\\/g, '\\');
 }
 
-function unfoldVCard(text) {
-    return text.replace(/\r\n[ \t]/g, '').replace(/\n[ \t]/g, '');
+// Split a structured value (N, ORG) on unescaped semicolons.
+function splitStructured(s) {
+    const parts = [];
+    let cur = '';
+    let escaped = false;
+    for (const ch of String(s)) {
+        if (escaped) { cur += '\\' + ch; escaped = false; continue; }
+        if (ch === '\\') { escaped = true; continue; }
+        if (ch === ';') { parts.push(cur); cur = ''; continue; }
+        cur += ch;
+    }
+    parts.push(cur);
+    return parts;
 }
 
-function parseVCard(block) {
-    const lines = unfoldVCard(block).split(/\r?\n/);
-    const contact = {
-        uid: null, fullName: null, firstName: null, lastName: null,
-        emails: [], phones: [], organization: null, title: null, notes: null, raw: block,
-    };
-    for (const line of lines) {
-        const colon = line.indexOf(':');
-        if (colon === -1) continue;
-        const left = line.slice(0, colon);
-        const value = line.slice(colon + 1);
-        const [name] = left.split(';');
-        switch (name.toUpperCase()) {
-            case 'UID': contact.uid = value; break;
-            case 'FN': contact.fullName = unescapeVCard(value); break;
-            case 'N': {
-                const parts = value.split(';');
-                contact.lastName = unescapeVCard(parts[0] || '');
-                contact.firstName = unescapeVCard(parts[1] || '');
-                break;
-            }
-            case 'EMAIL': contact.emails.push(unescapeVCard(value)); break;
-            case 'TEL': contact.phones.push(unescapeVCard(value)); break;
-            case 'ORG': contact.organization = unescapeVCard((value.split(';')[0] || '')); break;
-            case 'TITLE': contact.title = unescapeVCard(value); break;
-            case 'NOTE': contact.notes = unescapeVCard(value); break;
-        }
+function valueOfFirst(card, key) {
+    const v = card.get(key);
+    if (!v) return null;
+    const p = Array.isArray(v) ? v[0] : v;
+    return p == null ? null : String(p.valueOf());
+}
+
+function valuesOf(card, key) {
+    const v = card.get(key);
+    if (!v) return [];
+    const list = Array.isArray(v) ? v : [v];
+    return list.map((p) => String(p.valueOf()));
+}
+
+function contactFromVCard(text) {
+    if (!text) return null;
+    let card;
+    try { card = new vCard().parse(text); } catch (_) { return null; }
+
+    const nRaw = valueOfFirst(card, 'n');
+    let firstName = null;
+    let lastName = null;
+    if (nRaw) {
+        const parts = splitStructured(nRaw);
+        lastName = unescapeText(parts[0] || '') || null;
+        firstName = unescapeText(parts[1] || '') || null;
     }
-    return contact;
+    const orgRaw = valueOfFirst(card, 'org');
+    const orgFirst = orgRaw ? splitStructured(orgRaw)[0] : null;
+
+    return {
+        uid: valueOfFirst(card, 'uid'),
+        fullName: unescapeText(valueOfFirst(card, 'fn')),
+        firstName,
+        lastName,
+        emails: valuesOf(card, 'email').map(unescapeText),
+        phones: valuesOf(card, 'tel').map(unescapeText),
+        organization: unescapeText(orgFirst),
+        title: unescapeText(valueOfFirst(card, 'title')),
+        notes: unescapeText(valueOfFirst(card, 'note')),
+    };
 }
 
 function buildVCard(c) {
-    const lines = ['BEGIN:VCARD', 'VERSION:3.0'];
-    lines.push(`UID:${c.uid}`);
-    lines.push(`FN:${escapeVCard(c.fullName)}`);
-    lines.push(`N:${escapeVCard(c.lastName || '')};${escapeVCard(c.firstName || '')};;;`);
+    const card = new vCard();
+    card.set('version', '3.0');
+    if (c.uid) card.set('uid', c.uid);
+    card.set('fn', escapeText(c.fullName));
+    // N is the structured family;given;additional;prefix;suffix — semicolons
+    // here are field separators, not literals, so we escape per-segment only.
+    card.set('n', `${escapeText(c.lastName)};${escapeText(c.firstName)};;;`);
     if (Array.isArray(c.emails)) {
-        c.emails.filter(Boolean).forEach((e, i) => lines.push(`EMAIL;TYPE=INTERNET${i === 0 ? ',PREF' : ''}:${escapeVCard(e)}`));
+        c.emails.filter(Boolean).forEach((e, i) => {
+            card.add('email', escapeText(e), i === 0 ? { type: ['INTERNET', 'PREF'] } : { type: 'INTERNET' });
+        });
     }
     if (Array.isArray(c.phones)) {
-        c.phones.filter(Boolean).forEach((p, i) => lines.push(`TEL;TYPE=CELL${i === 0 ? ',PREF' : ''}:${escapeVCard(p)}`));
+        c.phones.filter(Boolean).forEach((p, i) => {
+            card.add('tel', escapeText(p), i === 0 ? { type: ['CELL', 'PREF'] } : { type: 'CELL' });
+        });
     }
-    if (c.organization) lines.push(`ORG:${escapeVCard(c.organization)}`);
-    if (c.title) lines.push(`TITLE:${escapeVCard(c.title)}`);
-    if (c.notes) lines.push(`NOTE:${escapeVCard(c.notes)}`);
-    lines.push('END:VCARD');
-    return lines.join('\r\n');
+    if (c.organization) card.set('org', escapeText(c.organization));
+    if (c.title) card.set('title', escapeText(c.title));
+    if (c.notes) card.set('note', escapeText(c.notes));
+    return card.toString('3.0');
+}
+
+function parseVCard(text) {
+    return contactFromVCard(text) || {
+        uid: null, fullName: null, firstName: null, lastName: null,
+        emails: [], phones: [], organization: null, title: null, notes: null,
+    };
 }
 
 // ─── DAV helpers ──────────────────────────────────────────────────
@@ -227,42 +276,50 @@ function contactHref(baseUrl, uid, book, contactUid) {
     return `${addressbooksRoot(baseUrl, uid)}/${encodeURIComponent(book)}/${encodeURIComponent(contactUid)}.vcf`;
 }
 
+function parseMultistatusResponses(xml) {
+    const parsed = xmlParser.parse(xml);
+    const ms = parsed?.multistatus;
+    if (!ms) return [];
+    const list = Array.isArray(ms.response) ? ms.response : (ms.response ? [ms.response] : []);
+    return list.map((r) => {
+        const propstats = Array.isArray(r.propstat) ? r.propstat : (r.propstat ? [r.propstat] : []);
+        const props = {};
+        for (const ps of propstats) {
+            const status = ps.status || '';
+            if (status && !/\b2\d\d\b/.test(status)) continue;
+            Object.assign(props, ps.prop || {});
+        }
+        return { href: r.href || '', props };
+    });
+}
+
+function isAddressbook(props) {
+    const rt = props.resourcetype;
+    if (!rt) return false;
+    return rt.addressbook !== undefined;
+}
+
 function parsePropfindAddressbooks(xml, uid) {
-    const books = [];
-    const respRegex = /<d:response[\s>][\s\S]*?<\/d:response>/g;
-    const matches = xml.match(respRegex) || [];
     const root = `/remote.php/dav/addressbooks/users/${decodeURIComponent(uid)}`;
-    for (const block of matches) {
-        // Only entries that say so via card:addressbook resourcetype.
-        if (!/<card:addressbook\s*\/?>/i.test(block)) continue;
-        const href = (block.match(/<d:href>([^<]+)<\/d:href>/) || [])[1];
-        if (!href) continue;
+    const books = [];
+    for (const { href, props } of parseMultistatusResponses(xml)) {
+        if (!href || !isAddressbook(props)) continue;
         const decoded = decodeURIComponent(href);
         if (decoded.replace(/\/+$/, '') === root) continue;
         const slug = decoded.replace(/\/+$/, '').split('/').pop();
-        const displayname = (block.match(/<d:displayname>([^<]*)<\/d:displayname>/) || [])[1] || slug;
-        books.push({ slug, displayName: unescapeVCard(displayname), href });
+        books.push({ slug, displayName: props.displayname || slug, href });
     }
     return books;
 }
 
 function parseAddressbookMultiStatus(xml) {
-    const out = [];
-    const respRegex = /<d:response[\s>][\s\S]*?<\/d:response>/g;
-    const matches = xml.match(respRegex) || [];
-    for (const block of matches) {
-        const href = (block.match(/<d:href>([^<]+)<\/d:href>/) || [])[1];
-        const etag = (block.match(/<d:getetag>([^<]+)<\/d:getetag>/) || [])[1];
-        const card = (block.match(/<card:address-data[^>]*>([\s\S]*?)<\/card:address-data>/) || [])[1];
-        if (href && card) {
-            out.push({
-                href: decodeURIComponent(href),
-                etag,
-                cardData: card.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&'),
-            });
-        }
-    }
-    return out;
+    return parseMultistatusResponses(xml)
+        .filter(({ href, props }) => href && props['address-data'] !== undefined)
+        .map(({ href, props }) => ({
+            href: decodeURIComponent(href),
+            etag: props.getetag || null,
+            cardData: props['address-data'] || '',
+        }));
 }
 
 // ─── Tool execution ──────────────────────────────────────────────
@@ -358,7 +415,7 @@ async function executeNextcloudContactsTool(toolName, args, userId, session) {
 
         case 'nextcloud_contacts_create': {
             if (!args.addressbook || !args.fullName) return { error: 'addressbook and fullName are required' };
-            const contactUid = `${crypto.randomBytes(8).toString('hex')}-${Date.now()}@beeflow`;
+            const contactUid = `${crypto.randomUUID()}@${new URL(baseUrl).hostname}`;
             const vcard = buildVCard({ uid: contactUid, ...args });
             const res = await ncFetch(contactHref(baseUrl, uid, args.addressbook, contactUid), {
                 method: 'PUT',

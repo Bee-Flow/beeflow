@@ -214,23 +214,57 @@ async function resolveModelWithGlobalFallback(rawModel, opts = {}) {
 }
 
 /**
+ * Returns true when the model id is a known reasoning model that emits
+ * thinking / reasoning summary deltas. Used to auto-enable reasoning UX so
+ * users see the model's thought process appear before the final answer.
+ */
+function isReasoningModel(modelId) {
+    if (!modelId || typeof modelId !== 'string') return false;
+    return /^o\d|^gpt-5|magistral|claude-(opus-4|sonnet-4)|gemini-(2\.5|3)/i.test(modelId);
+}
+
+/**
+ * Apply reasoning-model defaults: when the resolved model supports thinking
+ * summaries, turn them on unless the user explicitly disabled them. We only
+ * upgrade `undefined` → enabled — explicit `false` from the admin or custom
+ * tier config is respected.
+ */
+function applyReasoningDefaults(merged, userConfig) {
+    if (!merged?.modelId || !isReasoningModel(merged.modelId)) return merged;
+    const userSetSummary  = Object.prototype.hasOwnProperty.call(userConfig || {}, 'reasoningSummary');
+    const userSetEffort   = Object.prototype.hasOwnProperty.call(userConfig || {}, 'reasoningEffort');
+    if (!userSetSummary && (merged.reasoningSummary === undefined || merged.reasoningSummary === false)) {
+        merged.reasoningSummary = true;
+    }
+    if (!userSetEffort && (merged.reasoningEffort === undefined || merged.reasoningEffort === null)) {
+        merged.reasoningEffort = 'medium';
+    }
+    return merged;
+}
+
+/**
  * Get the full tier config object (for endpoints that need maxTokens, temperature, etc.)
  *
  * Merges: TIER_DEFAULTS (baseline) ← user config (admin UI overrides).
  * User-set values always win; TIER_DEFAULTS fill in anything the user hasn't configured.
+ *
+ * Reasoning-capable models auto-enable `reasoningSummary` + a `medium`
+ * reasoningEffort so users see the model's thought process stream before
+ * the final answer (parallel to the typing-dots/phase indicator).
  */
 async function getTierConfig(tierName, { userOrgId = null, userId = null } = {}) {
     // Custom tiers carry their own full config — no TIER_DEFAULTS fallback needed.
     if (tierName && tierName.startsWith('custom:')) {
         const custom = await getCustomTierById(tierName, { userOrgId, userId });
         if (custom) {
-            return {
+            const merged = {
                 maxTokens: custom.maxTokens,
                 temperature: custom.temperature,
                 reasoningEffort: custom.reasoningEffort,
                 reasoningSummary: custom.reasoningSummary,
                 modelId: custom.modelId,
             };
+            return applyReasoningDefaults(merged, custom);
         }
         // Fall through to fast defaults if the id is unknown
     }
@@ -239,7 +273,8 @@ async function getTierConfig(tierName, { userOrgId = null, userId = null } = {})
     const userConfig = tiers[tierName] || tiers['fast'] || {};
     const defaults = TIER_DEFAULTS[tierName] || TIER_DEFAULTS['fast'];
     // Merge: defaults provide baselines, user config overrides
-    return { ...defaults, ...userConfig };
+    const merged = { ...defaults, ...userConfig };
+    return applyReasoningDefaults(merged, userConfig);
 }
 
 /**
@@ -281,4 +316,5 @@ module.exports = {
     getEUAwareTiers,
     isEUModeActive,
     getCustomTierById,
+    isReasoningModel,
 };

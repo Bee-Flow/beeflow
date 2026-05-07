@@ -7,7 +7,17 @@
  */
 
 const crypto = require('crypto');
+const ICAL = require('ical.js');
+const { XMLParser } = require('fast-xml-parser');
 const ncClient = require('./nextcloudClient');
+
+const xmlParser = new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: '@_',
+    removeNSPrefix: true,
+    parseTagValue: false,
+    trimValues: true,
+});
 
 const PROPFIND_LISTS = `<?xml version="1.0" encoding="utf-8" ?>
 <d:propfind xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:oc="http://owncloud.org/ns">
@@ -168,90 +178,86 @@ const NEXTCLOUD_TASKS_TOOLS = [
     }
 ];
 
-// ─── iCal helpers (mirrors calendar tools' subset) ────────────────
+// ─── iCal helpers (ical.js-backed) ────────────────────────────────
 
-function pad(n) { return String(n).padStart(2, '0'); }
-
-function toICalDateTime(iso) {
-    if (!iso) return null;
-    const d = new Date(iso);
-    if (isNaN(d.getTime())) throw new Error(`Invalid date: ${iso}`);
-    return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
-}
-
-function fromICalDateTime(value) {
-    if (!value) return null;
-    const utc = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/.exec(value);
-    if (utc) return `${utc[1]}-${utc[2]}-${utc[3]}T${utc[4]}:${utc[5]}:${utc[6]}Z`;
-    const dateOnly = /^(\d{4})(\d{2})(\d{2})$/.exec(value);
-    if (dateOnly) return `${dateOnly[1]}-${dateOnly[2]}-${dateOnly[3]}`;
-    return value;
-}
-
-function escapeICal(t) {
-    return String(t || '').replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/,/g, '\\,').replace(/;/g, '\\;');
-}
-
-function unescapeICal(t) {
-    return String(t || '').replace(/\\n/g, '\n').replace(/\\,/g, ',').replace(/\\;/g, ';').replace(/\\\\/g, '\\');
-}
-
-function unfoldICal(text) { return text.replace(/\r\n[ \t]/g, '').replace(/\n[ \t]/g, ''); }
-
-function parseVTodo(block) {
-    const lines = block.split(/\r?\n/);
-    const t = { uid: null, summary: null, description: null, due: null, priority: 0, status: 'NEEDS-ACTION', percentComplete: 0, completed: null, categories: [], raw: block };
-    for (const line of lines) {
-        const colon = line.indexOf(':');
-        if (colon === -1) continue;
-        const left = line.slice(0, colon);
-        const value = line.slice(colon + 1);
-        const [name] = left.split(';');
-        switch (name.toUpperCase()) {
-            case 'UID': t.uid = value; break;
-            case 'SUMMARY': t.summary = unescapeICal(value); break;
-            case 'DESCRIPTION': t.description = unescapeICal(value); break;
-            case 'DUE': t.due = fromICalDateTime(value); break;
-            case 'PRIORITY': t.priority = parseInt(value, 10) || 0; break;
-            case 'STATUS': t.status = value; break;
-            case 'PERCENT-COMPLETE': t.percentComplete = parseInt(value, 10) || 0; break;
-            case 'COMPLETED': t.completed = fromICalDateTime(value); break;
-            case 'CATEGORIES': t.categories = unescapeICal(value).split(',').map(s => s.trim()).filter(Boolean); break;
-        }
+function icsTimeToISO(time) {
+    if (!time) return null;
+    if (time.isDate) {
+        const pad = (n) => String(n).padStart(2, '0');
+        return `${time.year}-${pad(time.month)}-${pad(time.day)}`;
     }
-    return t;
+    return time.toJSDate().toISOString();
+}
+
+function todoFromIcal(vtodo) {
+    const get = (n) => {
+        const p = vtodo.getFirstProperty(n);
+        return p ? p.getFirstValue() : null;
+    };
+    const dueProp = vtodo.getFirstPropertyValue('due');
+    const completedProp = vtodo.getFirstPropertyValue('completed');
+    const categoriesProp = vtodo.getFirstProperty('categories');
+    let categories = [];
+    if (categoriesProp) {
+        const vals = categoriesProp.getValues();
+        // CATEGORIES is comma-separated list — ical.js returns array of strings.
+        categories = (Array.isArray(vals) ? vals : [vals]).filter(Boolean).map(String);
+    }
+    return {
+        uid: get('uid') || null,
+        summary: get('summary') || null,
+        description: get('description') || null,
+        due: dueProp ? icsTimeToISO(dueProp) : null,
+        priority: parseInt(get('priority') || '0', 10) || 0,
+        status: get('status') || 'NEEDS-ACTION',
+        percentComplete: parseInt(get('percent-complete') || '0', 10) || 0,
+        completed: completedProp ? icsTimeToISO(completedProp) : null,
+        categories,
+    };
 }
 
 function parseICalTodos(text) {
-    const unfolded = unfoldICal(text);
-    const todos = [];
-    const re = /BEGIN:VTODO[\s\S]*?END:VTODO/g;
-    let m;
-    while ((m = re.exec(unfolded)) !== null) todos.push(parseVTodo(m[0]));
-    return todos;
+    if (!text) return [];
+    let jcal;
+    try { jcal = ICAL.parse(text); } catch (_) { return []; }
+    const root = new ICAL.Component(jcal);
+    return root.getAllSubcomponents('vtodo').map(todoFromIcal);
 }
 
-function buildVTodo({ uid, summary, description, due, priority, status, percentComplete, completed, categories }) {
-    const lines = [
-        'BEGIN:VTODO',
-        `UID:${uid}`,
-        `DTSTAMP:${toICalDateTime(new Date().toISOString())}`,
-        `CREATED:${toICalDateTime(new Date().toISOString())}`,
-    ];
-    if (summary) lines.push(`SUMMARY:${escapeICal(summary)}`);
-    if (description) lines.push(`DESCRIPTION:${escapeICal(description)}`);
-    if (due) lines.push(`DUE:${toICalDateTime(due)}`);
-    if (priority !== undefined && priority !== null) lines.push(`PRIORITY:${priority}`);
-    if (status) lines.push(`STATUS:${status}`);
-    if (percentComplete !== undefined && percentComplete !== null) lines.push(`PERCENT-COMPLETE:${percentComplete}`);
-    if (completed) lines.push(`COMPLETED:${toICalDateTime(completed)}`);
-    if (Array.isArray(categories) && categories.length) lines.push(`CATEGORIES:${categories.map(escapeICal).join(',')}`);
-    lines.push('END:VTODO');
-    return lines.join('\r\n');
-}
+function buildVCalendarTodo({ uid, summary, description, due, priority, status, percentComplete, completed, categories }) {
+    const cal = new ICAL.Component(['vcalendar', [], []]);
+    cal.updatePropertyWithValue('prodid', '-//Bee Flow//Nextcloud Tasks Tool//EN');
+    cal.updatePropertyWithValue('version', '2.0');
+    cal.updatePropertyWithValue('calscale', 'GREGORIAN');
 
-function wrapVCalendar(vtodo) {
-    return ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Bee Flow//Nextcloud Tasks Tool//EN', 'CALSCALE:GREGORIAN', vtodo, 'END:VCALENDAR'].join('\r\n');
+    const vtodo = new ICAL.Component('vtodo');
+    vtodo.updatePropertyWithValue('uid', uid);
+    const now = ICAL.Time.fromJSDate(new Date(), true);
+    vtodo.updatePropertyWithValue('dtstamp', now);
+    vtodo.updatePropertyWithValue('created', now);
+    if (summary) vtodo.updatePropertyWithValue('summary', summary);
+    if (description) vtodo.updatePropertyWithValue('description', description);
+    if (due) {
+        const d = new Date(due);
+        if (!isNaN(d.getTime())) vtodo.updatePropertyWithValue('due', ICAL.Time.fromJSDate(d, true));
+    }
+    if (priority !== undefined && priority !== null) vtodo.updatePropertyWithValue('priority', Number(priority));
+    if (status) vtodo.updatePropertyWithValue('status', status);
+    if (percentComplete !== undefined && percentComplete !== null) {
+        vtodo.updatePropertyWithValue('percent-complete', Number(percentComplete));
+    }
+    if (completed) {
+        const c = new Date(completed);
+        if (!isNaN(c.getTime())) vtodo.updatePropertyWithValue('completed', ICAL.Time.fromJSDate(c, true));
+    }
+    if (Array.isArray(categories) && categories.length) {
+        const prop = new ICAL.Property('categories', vtodo);
+        prop.setValues(categories.map(String));
+        vtodo.addProperty(prop);
+    }
+
+    cal.addSubcomponent(vtodo);
+    return cal.toString();
 }
 
 // ─── DAV helpers ──────────────────────────────────────────────────
@@ -264,42 +270,51 @@ function todoHref(baseUrl, uid, list, todoUid) {
     return `${calendarsRoot(baseUrl, uid)}/${encodeURIComponent(list)}/${encodeURIComponent(todoUid)}.ics`;
 }
 
+function parseMultistatusResponses(xml) {
+    const parsed = xmlParser.parse(xml);
+    const ms = parsed?.multistatus;
+    if (!ms) return [];
+    const list = Array.isArray(ms.response) ? ms.response : (ms.response ? [ms.response] : []);
+    return list.map((r) => {
+        const propstats = Array.isArray(r.propstat) ? r.propstat : (r.propstat ? [r.propstat] : []);
+        const props = {};
+        for (const ps of propstats) {
+            const status = ps.status || '';
+            if (status && !/\b2\d\d\b/.test(status)) continue;
+            Object.assign(props, ps.prop || {});
+        }
+        return { href: r.href || '', props };
+    });
+}
+
+function supportsVTodo(props) {
+    const set = props['supported-calendar-component-set'];
+    if (!set || !set.comp) return false;
+    const comps = Array.isArray(set.comp) ? set.comp : [set.comp];
+    return comps.some((c) => c && (c['@_name'] === 'VTODO' || c.name === 'VTODO'));
+}
+
 function parsePropfindLists(xml, uid) {
-    const lists = [];
-    const respRegex = /<d:response[\s>][\s\S]*?<\/d:response>/g;
-    const matches = xml.match(respRegex) || [];
     const root = `/remote.php/dav/calendars/${decodeURIComponent(uid)}`;
-    for (const block of matches) {
-        // Lists support VTODO (not VEVENT-only calendars).
-        if (!/<c:supported-calendar-component-set>[\s\S]*?<c:comp\s+name="VTODO"/.test(block)) continue;
-        const href = (block.match(/<d:href>([^<]+)<\/d:href>/) || [])[1];
-        if (!href) continue;
+    const lists = [];
+    for (const { href, props } of parseMultistatusResponses(xml)) {
+        if (!href || !supportsVTodo(props)) continue;
         const decoded = decodeURIComponent(href);
         if (decoded.replace(/\/+$/, '') === root) continue;
         const slug = decoded.replace(/\/+$/, '').split('/').pop();
-        const displayname = (block.match(/<d:displayname>([^<]*)<\/d:displayname>/) || [])[1] || slug;
-        lists.push({ slug, displayName: unescapeICal(displayname), href });
+        lists.push({ slug, displayName: props.displayname || slug, href });
     }
     return lists;
 }
 
 function parseTodoMultiStatus(xml) {
-    const out = [];
-    const respRegex = /<d:response[\s>][\s\S]*?<\/d:response>/g;
-    const matches = xml.match(respRegex) || [];
-    for (const block of matches) {
-        const href = (block.match(/<d:href>([^<]+)<\/d:href>/) || [])[1];
-        const etag = (block.match(/<d:getetag>([^<]+)<\/d:getetag>/) || [])[1];
-        const cal = (block.match(/<c:calendar-data[^>]*>([\s\S]*?)<\/c:calendar-data>/) || [])[1];
-        if (href && cal) {
-            out.push({
-                href: decodeURIComponent(href),
-                etag,
-                calendarData: cal.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&'),
-            });
-        }
-    }
-    return out;
+    return parseMultistatusResponses(xml)
+        .filter(({ href, props }) => href && props['calendar-data'] !== undefined)
+        .map(({ href, props }) => ({
+            href: decodeURIComponent(href),
+            etag: props.getetag || null,
+            calendarData: props['calendar-data'] || '',
+        }));
 }
 
 // ─── Tool execution ──────────────────────────────────────────────
@@ -403,8 +418,8 @@ async function executeNextcloudTasksTool(toolName, args, userId, session) {
 
         case 'nextcloud_tasks_create': {
             if (!args.list || !args.summary) return { error: 'list and summary are required' };
-            const todoUid = `${crypto.randomBytes(8).toString('hex')}-${Date.now()}@beeflow`;
-            const ical = wrapVCalendar(buildVTodo({
+            const todoUid = `${crypto.randomUUID()}@${new URL(baseUrl).hostname}`;
+            const ical = buildVCalendarTodo({
                 uid: todoUid,
                 summary: args.summary,
                 description: args.description,
@@ -413,7 +428,7 @@ async function executeNextcloudTasksTool(toolName, args, userId, session) {
                 status: 'NEEDS-ACTION',
                 percentComplete: 0,
                 categories: args.categories,
-            }));
+            });
             const res = await ncFetch(todoHref(baseUrl, uid, args.list, todoUid), {
                 method: 'PUT',
                 headers: { 'Content-Type': 'text/calendar; charset=utf-8', 'If-None-Match': '*' },
@@ -466,7 +481,7 @@ async function executeNextcloudTasksTool(toolName, args, userId, session) {
                 };
             }
 
-            const ical = wrapVCalendar(buildVTodo(merged));
+            const ical = buildVCalendarTodo(merged);
             const putRes = await ncFetch(todoHref(baseUrl, uid, args.list, args.uid), {
                 method: 'PUT',
                 headers: {

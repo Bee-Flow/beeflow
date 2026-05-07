@@ -63,6 +63,87 @@ function canonicalizeBinding(v) {
     return { kind: 'literal', value: v };
 }
 
+const VALID_REF_ROOTS = new Set(['trigger', 'steps', 'vars', 'secrets', 'loop']);
+
+// Trigger output fields the LLM commonly mis-roots — when a ref path is bare
+// ("from", "subject", …) we can confidently prepend `trigger.output.` instead
+// of bouncing the call back to the model. Keyed by `<provider>.<event>`.
+const TRIGGER_FIELDS_BY_EVENT = {
+    'gmail.mail.new': ['messageId', 'threadId', 'from', 'to', 'cc', 'subject', 'snippet', 'labelIds', 'date', 'sizeEstimate', 'historyId'],
+    'google-calendar.event.changed': ['eventId', 'summary', 'start', 'end', 'status'],
+};
+
+function triggerFieldsFor(draft) {
+    const t = draft?.trigger;
+    if (!t || t.kind !== 'app_event') return [];
+    const key = `${t.appEvent?.provider}.${t.appEvent?.event}`;
+    return TRIGGER_FIELDS_BY_EVENT[key] || [];
+}
+
+/**
+ * Inspect every binding inside a freshly-supplied `inputs` map (and any
+ * `template` strings within them). Returns `{ inputs, error }`:
+ *   - `inputs`: the canonicalised map, with safe auto-fixes applied
+ *     (bare path "from" → "trigger.output.from" when the trigger exposes it,
+ *     leading dots stripped).
+ *   - `error`: a human-readable message for the LLM if any binding is still
+ *     invalid after auto-fixes — caller should surface this as the tool
+ *     result so the model corrects on its NEXT turn instead of running
+ *     through a dry-run failure cycle.
+ */
+function validateAndFixBindings(rawInputs, draft) {
+    const fixed = canonicalizeInputs(rawInputs || {});
+    const triggerFields = new Set(triggerFieldsFor(draft));
+    const errors = [];
+
+    for (const [k, v] of Object.entries(fixed)) {
+        if (!v || typeof v !== 'object') continue;
+
+        if (v.kind === 'ref' && typeof v.path === 'string') {
+            const cleaned = v.path.replace(/^\.+/, '').trim();
+            const root = cleaned.split('.')[0];
+            if (VALID_REF_ROOTS.has(root)) {
+                if (cleaned !== v.path) v.path = cleaned;
+                continue;
+            }
+            if (triggerFields.has(cleaned)) {
+                v.path = `trigger.output.${cleaned}`;
+                continue;
+            }
+            errors.push(
+                `inputs.${k}: ref path "${v.path}" has unknown root "${root}". `
+                + `Valid roots: trigger, steps, vars, secrets, loop. `
+                + (triggerFields.size
+                    ? `For this Gmail trigger use trigger.output.<field>, e.g. trigger.output.${triggerFields.has(cleaned) ? cleaned : 'subject'}.`
+                    : 'Use e.g. trigger.output.<field> or steps.<id>.output.<field>.')
+            );
+        }
+
+        if (v.kind === 'template' && typeof v.value === 'string') {
+            // Re-write {{ from }} → {{ trigger.output.from }} when the bare
+            // identifier matches a known trigger field. Reject anything else
+            // that has an unknown root.
+            const bad = [];
+            v.value = v.value.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (full, expr) => {
+                const cleaned = expr.replace(/^\.+/, '').trim();
+                const root = cleaned.split('.')[0];
+                if (VALID_REF_ROOTS.has(root)) return `{{${cleaned}}}`;
+                if (triggerFields.has(cleaned)) return `{{trigger.output.${cleaned}}}`;
+                bad.push(expr);
+                return full;
+            });
+            if (bad.length) {
+                errors.push(
+                    `inputs.${k}: template references ${bad.map(s => `"${s}"`).join(', ')} which has unknown root. `
+                    + `Use {{trigger.output.<field>}} or {{steps.<id>.output.<field>}}.`
+                );
+            }
+        }
+    }
+
+    return { inputs: fixed, error: errors.length ? errors.join(' ') : null };
+}
+
 function lastStepId(def) {
     if (def.steps.length === 0) return def.trigger.id;
     return def.steps[def.steps.length - 1].id;
@@ -84,7 +165,54 @@ const TOOL_SCHEMAS = [
         type: 'function',
         function: {
             name: 'builder_propose_trigger',
-            description: 'Set or replace the automation trigger. ALWAYS call this first when starting a new draft. Cron uses standard 5-field syntax (minute hour dom month dow). EXAMPLES: weekly Monday 9am Europe/Amsterdam → {kind:"schedule",cron:"0 9 * * 1",tz:"Europe/Amsterdam"}. First Monday of the month → {kind:"schedule",cron:"0 9 1-7 * 1",tz:"Europe/Amsterdam"}. New Gmail event → {kind:"app_event",appProvider:"gmail",appEvent:"mail.new",filter:{label:"Invoices"}}.',
+            description: `Set or replace the automation trigger. ALWAYS call this first when starting a new draft.
+
+KIND OPTIONS:
+  - schedule     — fires on a cron timer (5-field cron, minute hour dom month dow).
+  - manual       — fires only when the user clicks "Run".
+  - webhook      — fires on inbound HTTPS POST to a signed URL.
+  - app_event    — fires when an external service emits an event (today: Gmail "new email").
+
+EXAMPLES:
+  - weekly Monday 9am Europe/Amsterdam → {kind:"schedule",cron:"0 9 * * 1",tz:"Europe/Amsterdam"}
+  - first Monday of the month at 9am  → {kind:"schedule",cron:"0 9 1-7 * 1",tz:"Europe/Amsterdam"}
+  - WHEN USER SAYS "when a new email arrives" / "every time I get an email" / "on incoming mail"
+    USE: {kind:"app_event",appProvider:"gmail",appEvent:"mail.new"}.
+
+    GMAIL FILTER FIELDS (all optional; ALL specified fields must match):
+      from              substring (case-insensitive) on the From header.
+                        Use the email address: filter:{from:"boss@example.com"}.
+      to                substring on the To header.
+      cc                substring on the Cc header.
+      subjectContains   substring on Subject (case-insensitive).
+      subjectRegex      JS regex on Subject (case-insensitive).
+      labelIds          string[]; fires if message has ANY of these labels.
+                        Gmail label ids look like "Label_3" or system ids
+                        like "INBOX" / "IMPORTANT" / "STARRED".
+      excludeLabelIds   string[]; drops messages with any of these labels.
+      hasAttachment     boolean; fires only when the message has attachments.
+      excludeFromSelf   boolean; drops mail you sent yourself (SENT label).
+      maxAgeMinutes     number; freshness cap — drops messages older than N
+                        minutes. Useful so a long-paused poller doesn't flood
+                        with backlog on resume.
+
+    EXAMPLES:
+      - Only emails from your boss:
+        {kind:"app_event",appProvider:"gmail",appEvent:"mail.new",filter:{from:"boss@example.com",excludeFromSelf:true}}
+      - Invoice-labelled mail with attachments:
+        {kind:"app_event",appProvider:"gmail",appEvent:"mail.new",filter:{labelIds:["Label_3"],hasAttachment:true}}
+      - Subject matches "Order #123":
+        {kind:"app_event",appProvider:"gmail",appEvent:"mail.new",filter:{subjectRegex:"^Order #\\\\d+"}}
+
+    NOTE — "in the last 24 hours" is NOT a filter for this trigger because
+    mail.new fires on every newly-arrived message in real time. If the user
+    wants "every morning, summarise the last 24 hours of email" use a
+    schedule trigger + a gmail_search step with q:"newer_than:1d" instead.
+
+    The trigger payload exposed to downstream steps is:
+    {messageId, threadId, from, to, cc, subject, date, snippet, labelIds, sizeEstimate, historyId}.
+    Bind via trigger.output.subject / trigger.output.from / etc. — DO NOT add a
+    leading gmail_search step just to look up the message that triggered the run.`,
             parameters: {
                 type: 'object',
                 properties: {
@@ -120,7 +248,7 @@ const TOOL_SCHEMAS = [
         type: 'function',
         function: {
             name: 'builder_add_ai_step',
-            description: `Append an AI reasoning step that transforms or summarises upstream data. No tool calls allowed inside an ai_step. Use this for: extracting structured fields from text, summarising, classifying, drafting reply text, etc. ${BINDING_HINT} EXAMPLE — extract invoice fields: {prompt:"Extract amount, currency, vendor, dueDate from this invoice email.",inputs:{emailBody:{kind:"ref",path:"loop.email.body"},emailSubject:{kind:"ref",path:"loop.email.subject"}},outputSchema:{type:"object",properties:{amount:{type:"number"},currency:{type:"string"},vendor:{type:"string"},dueDate:{type:"string"}}},modelTier:"fast"}.`,
+            description: `Append an AI reasoning step that transforms or summarises upstream data. By default no tool calls — set allowTools:true (and optionally a tools allowlist) when this step needs to fetch data on its own (web search, Gmail lookup, etc.). The user's per-org integration permissions are still enforced at runtime. Use this for: extracting structured fields from text, summarising, classifying, drafting reply text, OR (with allowTools) free-form research that doesn't fit a static integration_action. ${BINDING_HINT} EXAMPLE — extract invoice fields: {prompt:"Extract amount, currency, vendor, dueDate from this invoice email.",inputs:{emailBody:{kind:"ref",path:"loop.email.body"}},outputSchema:{type:"object",properties:{amount:{type:"number"},currency:{type:"string"},vendor:{type:"string"},dueDate:{type:"string"}}},modelTier:"fast"}.`,
             parameters: {
                 type: 'object',
                 properties: {
@@ -128,7 +256,9 @@ const TOOL_SCHEMAS = [
                     prompt: { type: 'string', description: 'The instruction for the AI. Reference the inputs by name.' },
                     inputs: { type: 'object', description: `Map of binding-name to a binding object. ${BINDING_HINT}` },
                     outputSchema: { type: 'object', description: 'JSON schema describing the desired structured output. Strongly recommended so downstream steps can reference fields.' },
-                    modelTier: { type: 'string', enum: ['auto', 'fast', 'standard', 'thinking'], description: 'Default: fast. Use "thinking" only for complex multi-step reasoning.' },
+                    modelTier: { type: 'string', enum: ['auto', 'fast', 'standard', 'thinking'], description: 'Default: auto (mirrors direct chat — classifier picks fast/standard/thinking based on prompt complexity).' },
+                    allowTools: { type: 'boolean', description: 'Default false. When true the AI step can call the user\'s integration tools (web search, gmail_search, etc.). Use sparingly — most steps should bind upstream integration_action output instead.' },
+                    tools: { type: 'array', items: { type: 'string' }, description: 'Optional allowlist of tool names the AI step may call. Empty / omitted = whatever allowTools dictates.' },
                     label: { type: 'string' },
                 },
                 required: ['prompt'],
@@ -281,11 +411,13 @@ function appendAfter(draft, afterStepId, step) {
 }
 
 function applyAddAction(draft, args) {
+    const { inputs, error } = validateAndFixBindings(args.inputs || {}, draft);
+    if (error) return { error };
     const step = {
         id: newId('a'),
         type: 'integration_action',
         tool: args.tool,
-        inputs: canonicalizeInputs(args.inputs || {}),
+        inputs,
         label: args.label || args.tool,
         sideEffect: isSideEffect(args.tool),
     };
@@ -294,15 +426,25 @@ function applyAddAction(draft, args) {
 }
 
 function applyAddAi(draft, args) {
+    const { inputs, error } = validateAndFixBindings(args.inputs || {}, draft);
+    if (error) return { error };
     const step = {
         id: newId('ai'),
         type: 'ai_step',
         prompt: args.prompt,
-        inputs: canonicalizeInputs(args.inputs || {}),
+        // Optional override of the runner's default system prompt. When
+        // omitted we use the safe baseline ("You are a step inside a
+        // no-code automation..."). The user can edit this from the
+        // inspector's Settings tab to set a tone or role.
+        systemPrompt: typeof args.systemPrompt === 'string' && args.systemPrompt.trim() ? args.systemPrompt.trim() : null,
+        inputs,
         outputSchema: args.outputSchema || null,
-        modelTier: args.modelTier || 'fast',
+        // Default to 'auto' so the AI step honours the org's tier classifier
+        // — same default as direct chat. Builder can override per step.
+        modelTier: args.modelTier || 'auto',
         label: args.label || 'AI step',
-        allowTools: false,
+        allowTools: !!args.allowTools,
+        tools: Array.isArray(args.tools) ? args.tools.filter(t => typeof t === 'string') : null,
     };
     appendAfter(draft, args.afterStepId, step);
     return { added: step };
@@ -323,14 +465,20 @@ function applyAddLoop(draft, args) {
     // type-specific required fields. Missing ids would crash the runner with
     // a null step_id DB constraint.
     const rawBody = Array.isArray(args.body) ? args.body : [];
-    const body = rawBody.map((child) => {
+    const childErrors = [];
+    const body = rawBody.map((child, idx) => {
         if (!child || typeof child !== 'object') return null;
         const fixed = { ...child };
         if (!fixed.id || typeof fixed.id !== 'string') fixed.id = newId('lb');
         if (!fixed.type || typeof fixed.type !== 'string') fixed.type = 'ai_step';
-        if (fixed.inputs) fixed.inputs = canonicalizeInputs(fixed.inputs);
+        if (fixed.inputs) {
+            const v = validateAndFixBindings(fixed.inputs, draft);
+            if (v.error) childErrors.push(`body[${idx}] (${fixed.id}): ${v.error}`);
+            fixed.inputs = v.inputs;
+        }
         return fixed;
     }).filter(Boolean);
+    if (childErrors.length) return { error: childErrors.join(' ') };
 
     const step = {
         id: newId('loop'),
@@ -346,13 +494,15 @@ function applyAddLoop(draft, args) {
 }
 
 function applyAddCode(draft, args) {
+    const { inputs, error } = validateAndFixBindings(args.inputs || {}, draft);
+    if (error) return { error };
     const step = {
         id: newId('code'),
         type: 'code',
         language: 'javascript',
         code: args.code,
         codeHash: crypto.createHash('sha256').update(args.code || '').digest('hex'),
-        inputs: canonicalizeInputs(args.inputs || {}),
+        inputs,
         outputSchema: args.outputSchema || null,
         allowedTools: Array.isArray(args.allowedTools) ? args.allowedTools : [],
         limits: { cpuMs: 1000, memoryMb: 64, wallMs: 5000 },
@@ -426,7 +576,55 @@ async function applyInspectTool(args, draftWrap) {
  * report describing what changed (becomes the `tool` message back to the
  * LLM and feeds the SSE update to the frontend).
  */
+/**
+ * Build a tiny summary of the current draft's step IDs so every mutation
+ * result reminds the LLM of the exact ids it must use for downstream
+ * `afterStepId` / refs / template paths. Without this the model
+ * fabricated short ids like "step_1" that didn't exist in the draft —
+ * the dry-run then ran with broken bindings and the AI had to spend
+ * extra iterations un-tangling its own mistake.
+ */
+function summariseDraftSteps(draft) {
+    const list = [];
+    if (draft?.trigger?.id) list.push({ id: draft.trigger.id, type: 'trigger', kind: draft.trigger.kind });
+    for (const s of (draft?.steps || [])) {
+        list.push({
+            id: s.id,
+            type: s.type,
+            tool: s.tool || undefined,
+            label: s.label || undefined,
+        });
+    }
+    return list;
+}
+
+const MUTATING_TOOLS = new Set([
+    'builder_propose_trigger', 'builder_add_action', 'builder_add_ai_step',
+    'builder_add_condition', 'builder_add_loop', 'builder_add_code_step',
+    'builder_add_notification', 'builder_remove_step', 'builder_set_metadata',
+]);
+
 async function applyToolCall(name, args, draftWrap) {
+    const result = await _applyToolCallRaw(name, args, draftWrap);
+    // For every mutation, append a `_draftSteps` reminder so the LLM has
+    // the live id list in front of it on the next turn. Tools that read
+    // (summarise/inspect/dry_run/finalize) don't need this — their own
+    // result is already the relevant shape.
+    if (MUTATING_TOOLS.has(name) && result && typeof result === 'object' && !result.error) {
+        result._draftSteps = summariseDraftSteps(draftWrap.def);
+    }
+    // When a mutator rejected the call due to bad bindings, prefix the
+    // error with a structured marker so the system prompt's "common
+    // pitfalls" section catches the model's attention. Without this the
+    // model sometimes ignores the error entirely and re-tries the same
+    // call.
+    if (result && typeof result === 'object' && result.error && !result._fixHint) {
+        result._fixHint = 'Reject reason: invalid input binding. Fix the path/value and call the tool again. Refs MUST start with: trigger, steps, vars, secrets, loop.';
+    }
+    return result;
+}
+
+async function _applyToolCallRaw(name, args, draftWrap) {
     const draft = draftWrap.def;
     switch (name) {
         case 'builder_propose_trigger':    return applyTrigger(draft, args);
@@ -521,4 +719,4 @@ async function persistDraft(draftWrap, { finalize = false } = {}) {
     return u;
 }
 
-module.exports = { TOOL_SCHEMAS, applyToolCall, persistDraft, emptyDefinition };
+module.exports = { TOOL_SCHEMAS, applyToolCall, persistDraft, emptyDefinition, _test_validateAndFixBindings: validateAndFixBindings };
