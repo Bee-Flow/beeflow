@@ -546,33 +546,35 @@ router.post('/:id/diagnose-trigger', async (req, res) => {
             },
         });
 
-        // 2) Vault credentials. Call routineAuth.buildUserAuth directly
-        // — same lookup loadSession() does, just without the legacy
-        // user_sessions fallback (we want the diagnostic to report the
-        // unhealthy vault state honestly).
+        // 2) Credentials. Use the same loadSession the polling pass uses —
+        // tries the vault first, then falls back to user_sessions (where
+        // the chat-side OAuth flow puts tokens for users who connected
+        // before the vault existed). Reporting the source helps the user
+        // understand whether they're on a stable long-lived vault entry or
+        // depending on their browser session staying alive.
         let session = null;
         try {
-            const routineAuth = require('../core/routineAuth');
-            const built = await routineAuth.buildUserAuth(userId, { enabledIntegrations: ['gmail'] });
-            if (built?.accessToken) session = built;
+            const triggerBus = require('../automation/triggerBus');
+            session = await triggerBus.loadSession(userId);
         } catch (e) {
-            checks.push({ name: 'credentials', status: 'error', message: `Vault lookup threw: ${e.message}` });
+            checks.push({ name: 'credentials', status: 'error', message: `Credential lookup threw: ${e.message}` });
             return finish(false);
         }
         if (!session?.accessToken) {
             checks.push({
                 name: 'credentials',
                 status: 'error',
-                message: 'No Gmail OAuth tokens in the routine-auth vault for this user. Re-connect Gmail in Integrations to fix.',
+                message: 'No Gmail OAuth tokens found in either the routine vault or the active browser session. Sign in to Bee Flow and re-connect Gmail in Integrations.',
             });
             return finish(false);
         }
         checks.push({
             name: 'credentials',
-            status: 'ok',
-            message: `Gmail tokens present (provider=${session.oauthProvider || 'google'}).`,
-            // Never echo the token itself; only confirm shape.
-            detail: { hasAccessToken: true, hasRefreshToken: !!session.refreshToken },
+            status: session._source === 'vault' ? 'ok' : 'warn',
+            message: session._source === 'vault'
+                ? `Gmail tokens loaded from the routine vault (long-lived, auto-refresh).`
+                : `Gmail tokens loaded from your browser session. The trigger will keep firing while you stay signed in; re-connect Gmail in Integrations to upgrade to a long-lived vault entry.`,
+            detail: { source: session._source, hasAccessToken: true, hasRefreshToken: !!session.refreshToken, oauthProvider: session.oauthProvider || null },
         });
 
         // 3) Live Gmail history call (or bootstrap)

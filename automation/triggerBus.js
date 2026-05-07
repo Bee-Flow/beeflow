@@ -181,22 +181,31 @@ async function runPollingPass() {
 /**
  * Resolve the session-shaped credentials a polling handler needs.
  *
- * Source order matches automationRunner.resolveUserSession():
- *   1. routineAuth vault — long-lived per-user OAuth tokens (works without
- *      an active browser session). This is what makes the Gmail "new
- *      email" trigger fire even when the user is signed out.
- *   2. user_sessions row — last-resort fallback for installs that haven't
- *      been migrated to the vault yet, gated by ROUTINE_AUTH_LEGACY.
+ * Source order:
+ *   1. routineAuth vault (`routine_credentials` table) — long-lived,
+ *      auto-refreshing tokens. Works for users who connected after the
+ *      vault feature shipped.
+ *   2. user_sessions row — same store the chat path uses via `req.session`.
+ *      This is the canonical source for users who connected before the
+ *      vault existed; their tokens never landed in routine_credentials.
  *
- * Returns `{ accessToken, refreshToken, oauthProvider, routineProviders }`
- * so the existing googleapis client setup keeps working unchanged.
+ * Both paths return the same shape: `{ accessToken, refreshToken,
+ *   oauthProvider, routineProviders, _source }`. The `_source` tag lets
+ * the diagnose endpoint show the user where their credentials came from
+ * ("vault" / "session") so they understand whether the Integrations page
+ * needs a re-connect.
+ *
+ * Note: the user_sessions fallback used to be gated by ROUTINE_AUTH_LEGACY.
+ * That gate is removed — when a user has working chat-side Gmail tokens
+ * but an empty vault, we should ALWAYS use them rather than silently
+ * failing the trigger. The trade-off: when their browser session expires,
+ * the poller goes dark until they sign in again. Opportunistic vault
+ * migration is a separate, future cleanup.
  */
 async function loadSession(userId) {
+    // 1) Vault first.
     try {
         const routineAuth = require('../core/routineAuth');
-        // We don't know which integrations this particular automation uses
-        // here, so ask for ALL providers the user has connected. The vault
-        // helper returns a primary + per-provider map.
         const built = await routineAuth.buildUserAuth(userId, {
             enabledIntegrations: ['gmail', 'google-calendar', 'google-drive', 'google-docs', 'google-contacts', 'google-keep', 'google-groups', 'outlook', 'ms-calendar', 'onedrive', 'ms-contacts', 'nextcloud', 'nextcloud-calendar', 'nextcloud-contacts'],
         });
@@ -206,24 +215,36 @@ async function loadSession(userId) {
                 refreshToken: built.refreshToken,
                 oauthProvider: built.oauthProvider,
                 routineProviders: built.routineProviders || {},
+                _source: 'vault',
             };
         }
     } catch (err) {
         console.warn(`[TriggerBus] vault session lookup failed for user ${userId}: ${err.message}`);
     }
 
-    if (process.env.ROUTINE_AUTH_LEGACY !== '0') {
-        const { pool } = require('../db');
-        try {
-            const { rows } = await pool.query(
-                `SELECT sess FROM user_sessions
-                 WHERE sess::jsonb -> 'user' ->> 'id' = $1 AND expire > NOW()
-                 ORDER BY expire DESC LIMIT 1`, [userId],
-            );
-            return rows[0] ? (typeof rows[0].sess === 'string' ? JSON.parse(rows[0].sess) : rows[0].sess) : null;
-        } catch { return null; }
+    // 2) user_sessions fallback. Same shape as req.session for the chat path:
+    //    { user: { id, ... }, accessToken, refreshToken, oauthProvider, ... }
+    const { pool } = require('../db');
+    try {
+        const { rows } = await pool.query(
+            `SELECT sess FROM user_sessions
+             WHERE sess::jsonb -> 'user' ->> 'id' = $1 AND expire > NOW()
+             ORDER BY expire DESC LIMIT 1`, [userId],
+        );
+        if (!rows[0]) return null;
+        const sess = typeof rows[0].sess === 'string' ? JSON.parse(rows[0].sess) : rows[0].sess;
+        if (!sess?.accessToken) return null;
+        return {
+            accessToken: sess.accessToken,
+            refreshToken: sess.refreshToken || null,
+            oauthProvider: sess.oauthProvider || null,
+            routineProviders: sess.routineProviders || {},
+            _source: 'session',
+        };
+    } catch (e) {
+        console.warn(`[TriggerBus] user_sessions fallback failed for user ${userId}: ${e.message}`);
+        return null;
     }
-    return null;
 }
 
 const POLLERS = {
@@ -466,4 +487,4 @@ async function fetchLatestGmailMatch(userId, filter) {
     }
 }
 
-module.exports = { dispatchEvent, runPollingPass, renewExpiringSubscriptions, matchGmailMailFilter, fetchLatestGmailMatch };
+module.exports = { dispatchEvent, runPollingPass, renewExpiringSubscriptions, matchGmailMailFilter, fetchLatestGmailMatch, loadSession };
