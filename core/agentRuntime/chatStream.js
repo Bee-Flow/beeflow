@@ -13,6 +13,7 @@ const path = require('path');
 const usageStore = require('../../stores/usageStore');
 const terminationStore = require('../../stores/terminationStore');
 const { sanitizeError } = require('../errorSanitizer');
+const { emitPhase, emitPhaseEnd, withPhase } = require('./phaseEvents');
 const integrationActivityStore = require('../../stores/integrationActivityStore');
 const { resolveIntegration } = require('../integrationToolMap');
 
@@ -387,7 +388,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     // the LLM, and refreshes any stale RustFS temp URLs (900 s TTL).
     // The current (last) user message is skipped — processAttachments() below
     // handles it with live upload data.
-    await hydrateHistoryAttachments(messages, { userId });
+    await withPhase(onEvent, 'processed_history', null, () => hydrateHistoryAttachments(messages, { userId }));
 
     // ============ COMPACTION ============
     // Once the hydrated history exceeds COMPACTION_THRESHOLD messages, collapse
@@ -400,11 +401,13 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         // Key name (`conversationSummary`) matches the direct-chat convention so
         // any future shared helper can read both paths the same way.
         const existingSummary = conversation?.meta?.conversationSummary || null;
-        const { messages: compactedMessages, newSummary } = await compactMessages(messages, {
-            existingSummary,
-            summaryModelId: 'tier:fast',
-            userOrgId: messageMetadata?.userOrgId || agent?.organization_id || null,
-        });
+        const { messages: compactedMessages, newSummary } = await withPhase(onEvent, 'compacting', null, () =>
+            compactMessages(messages, {
+                existingSummary,
+                summaryModelId: 'tier:fast',
+                userOrgId: messageMetadata?.userOrgId || agent?.organization_id || null,
+            })
+        );
         messages = compactedMessages;
         if (newSummary && newSummary !== existingSummary && conversation?.id) {
             // Fire-and-forget — the next turn picks it up even if this write
@@ -422,6 +425,8 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     if (agent.embed_enabled) {
         console.log(`[AgentRuntime] Skipping memory for embed-enabled agent ${agentId}`);
     } else {
+        emitPhase(onEvent, 'memory_lookup');
+        const _memT = Date.now();
         try {
             const memoryStore = require('../../stores/memoryStore');
             console.log(`[AgentRuntime] Memory lookup - userId: ${userId}, agentId: ${agentId}`);
@@ -466,6 +471,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         } catch (memErr) {
             console.error('[AgentRuntime] Memory retrieval failed:', memErr.message);
         }
+        emitPhaseEnd(onEvent, 'memory_lookup', Date.now() - _memT);
     }
 
     const isStrictKnowledge = agent.config?.strictKnowledge === true;
