@@ -134,6 +134,67 @@ router.get('/summary', async (req, res) => {
 // These mirror GET / and GET /summary but force-inject the caller's own
 // organization_id into the filter, so org admins only see their org's data.
 
+// Enriches a feedback row's conversation_snapshot with per-assistant-message
+// duration_ms and model, sourced from ai_usage_log. Pairing is by position:
+// the Nth non-tool ai_usage_log row for the conversation maps to the Nth
+// assistant message in the snapshot. This is fragile if rows are missing on
+// either side, so we only annotate when counts align — otherwise we leave
+// snapshot messages untouched.
+async function enrichSnapshotsWithUsage(rows) {
+    const conversationIds = Array.from(new Set(
+        rows.map(r => r.conversation_id).filter(Boolean)
+    ));
+    if (conversationIds.length === 0) return rows;
+
+    let usageRows = [];
+    try {
+        usageRows = await getAll(
+            `SELECT conversation_id, model, duration_ms, timestamp
+             FROM ai_usage_log
+             WHERE conversation_id = ANY($1::text[]) AND tool_name IS NULL
+             ORDER BY conversation_id, timestamp ASC`,
+            [conversationIds]
+        );
+    } catch (e) {
+        // Best-effort: if usage log lookup fails, return raw rows.
+        console.error('[Feedback API] enrich lookup failed:', e.message);
+        return rows;
+    }
+
+    const byConv = new Map();
+    for (const u of usageRows) {
+        if (!byConv.has(u.conversation_id)) byConv.set(u.conversation_id, []);
+        byConv.get(u.conversation_id).push(u);
+    }
+
+    return rows.map(r => {
+        if (!r.conversation_snapshot) return r;
+        let snap;
+        try {
+            snap = typeof r.conversation_snapshot === 'string'
+                ? JSON.parse(r.conversation_snapshot)
+                : r.conversation_snapshot;
+        } catch {
+            return r;
+        }
+        if (!Array.isArray(snap)) return r;
+
+        const usage = byConv.get(r.conversation_id) || [];
+        let assistantIdx = 0;
+        const annotated = snap.map(msg => {
+            if (msg.role !== 'assistant') return msg;
+            const u = usage[assistantIdx++];
+            if (!u) return msg;
+            return {
+                ...msg,
+                duration_ms: msg.duration_ms ?? u.duration_ms ?? null,
+                model: msg.model || u.model || null,
+            };
+        });
+        return { ...r, conversation_snapshot: JSON.stringify(annotated) };
+    });
+}
+
 // GET /org — list feedback for the caller's organisation
 router.get('/org', requireOwnOrgAdmin, async (req, res) => {
     try {
@@ -142,7 +203,8 @@ router.get('/org', requireOwnOrgAdmin, async (req, res) => {
             { startDate, endDate, rating, agentId, source, organizationId: req.scopedOrgId },
             limit ? parseInt(limit, 10) : 200
         );
-        res.json(data);
+        const enriched = await enrichSnapshotsWithUsage(Array.isArray(data) ? data : []);
+        res.json(enriched);
     } catch (e) {
         console.error('[Feedback API] org GET error:', e);
         res.status(500).json({ error: e.message });

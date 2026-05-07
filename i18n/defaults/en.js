@@ -458,6 +458,8 @@ const GUI_DEFAULTS = {
     'org.feedback_no_conversation': 'No conversation shared',
     'org.feedback_role_user': 'User',
     'org.feedback_role_ai': 'AI',
+    'org.feedback_response_time': 'Response time',
+    'org.feedback_model_switched': 'Model switched from previous turn',
     'usage.ai_calls': 'AI Calls',
     'usage.total_tokens': 'Total Tokens',
     'usage.est_cost': 'Est. Cost',
