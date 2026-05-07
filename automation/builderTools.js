@@ -432,6 +432,11 @@ function applyAddAi(draft, args) {
         id: newId('ai'),
         type: 'ai_step',
         prompt: args.prompt,
+        // Optional override of the runner's default system prompt. When
+        // omitted we use the safe baseline ("You are a step inside a
+        // no-code automation..."). The user can edit this from the
+        // inspector's Settings tab to set a tone or role.
+        systemPrompt: typeof args.systemPrompt === 'string' && args.systemPrompt.trim() ? args.systemPrompt.trim() : null,
         inputs,
         outputSchema: args.outputSchema || null,
         // Default to 'auto' so the AI step honours the org's tier classifier
