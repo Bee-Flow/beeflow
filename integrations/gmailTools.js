@@ -107,7 +107,11 @@ const GMAIL_TOOLS = [
                     },
                     replyToMessageId: {
                         type: 'string',
-                        description: 'REQUIRED for replies: Gmail message ID of the email being replied to (from gmail_search or gmail_read results). This ensures the reply appears in the same thread. Omit only for new emails and forwards.'
+                        description: 'REQUIRED for replies: Gmail message ID of the email being replied to (from gmail_search or gmail_read results, or trigger.output.messageId for a Gmail-triggered automation). This makes Gmail render the reply inline in the original conversation. Omit only for new emails and forwards.'
+                    },
+                    threadId: {
+                        type: 'string',
+                        description: 'Optional: Gmail thread ID. Pass this when you have only the threadId (e.g. trigger.output.threadId) and not a specific messageId — the tool will look up the latest message in the thread to derive the reply headers. Prefer replyToMessageId when both are available.'
                     }
                 },
                 required: ['body']
@@ -380,16 +384,27 @@ async function executeGmailTool(toolName, args, session, opts = {}) {
         };
 
     } else if (toolName === 'gmail_compose') {
-        let { to, cc, bcc, subject, body, replyToMessageId } = args;
+        let { to, cc, bcc, subject, body, replyToMessageId, threadId: argThreadId } = args;
         if (!body) throw new Error('body is required');
 
-        // When replying, fetch the original email's headers — both for threading
-        // (In-Reply-To / References) and to fill in to/subject if the model
-        // didn't provide them. This is the common case for the Gmail side-panel
-        // extension, where the thread is already attached as context.
+        // Threading requires THREE things together: the threadId on the API
+        // request, the In-Reply-To header pointing at the original Message-ID,
+        // and a References header. Gmail will silently drop a reply into a
+        // *new* visible conversation if the In-Reply-To header is missing,
+        // even when threadId is set — that's what users see when their
+        // automation reply shows up as a fresh email instead of inline in
+        // the original thread.
+        //
+        // Three call shapes are supported (most → least specific):
+        //   1) replyToMessageId given     — fetch headers from THAT message.
+        //   2) only threadId given        — fetch the latest message in the
+        //                                   thread and use its Message-ID.
+        //   3) neither                    — send as a fresh email.
         let inReplyTo = null;
         let references = null;
-        let threadId = null;
+        let threadId = argThreadId || null;
+        let originalHeaderSource = null; // for to/subject fallback below
+
         if (replyToMessageId) {
             try {
                 const original = await gmail.users.messages.get({
@@ -399,17 +414,43 @@ async function executeGmailTool(toolName, args, session, opts = {}) {
                     metadataHeaders: ['Message-ID', 'References', 'From', 'Reply-To', 'Subject'],
                 });
                 threadId = original.data.threadId;
-                const headers = original.data.payload?.headers || [];
-                inReplyTo = getHeader(headers, 'Message-ID');
-                references = getHeader(headers, 'References');
-
-                if (!to) to = getHeader(headers, 'Reply-To') || getHeader(headers, 'From') || null;
-                if (!subject) {
-                    const origSubject = getHeader(headers, 'Subject') || '';
-                    subject = /^re:/i.test(origSubject) ? origSubject : `Re: ${origSubject}`.trim();
-                }
+                originalHeaderSource = original.data.payload?.headers || [];
+                inReplyTo = getHeader(originalHeaderSource, 'Message-ID');
+                references = getHeader(originalHeaderSource, 'References');
             } catch (err) {
                 console.log('[Gmail] Could not fetch reply headers:', err.message);
+            }
+        } else if (argThreadId) {
+            // Automation case: trigger payload gave us the threadId but the
+            // builder didn't bind replyToMessageId. Walk the thread, pick
+            // the latest message, and pull its Message-ID for In-Reply-To.
+            try {
+                const thread = await gmail.users.threads.get({
+                    userId: 'me',
+                    id: argThreadId,
+                    format: 'metadata',
+                    metadataHeaders: ['Message-ID', 'References', 'From', 'Reply-To', 'Subject'],
+                });
+                const msgs = thread.data.messages || [];
+                const latest = msgs[msgs.length - 1];
+                if (latest) {
+                    originalHeaderSource = latest.payload?.headers || [];
+                    inReplyTo = getHeader(originalHeaderSource, 'Message-ID');
+                    references = getHeader(originalHeaderSource, 'References');
+                }
+            } catch (err) {
+                console.log('[Gmail] Could not fetch thread headers:', err.message);
+            }
+        }
+
+        // Fill in to/subject from the original headers when the caller
+        // didn't pass them — same convenience the side-panel extension
+        // gets, now also benefits automations that bind only body+threadId.
+        if (originalHeaderSource) {
+            if (!to) to = getHeader(originalHeaderSource, 'Reply-To') || getHeader(originalHeaderSource, 'From') || null;
+            if (!subject) {
+                const origSubject = getHeader(originalHeaderSource, 'Subject') || '';
+                subject = /^re:/i.test(origSubject) ? origSubject : `Re: ${origSubject}`.trim();
             }
         }
 

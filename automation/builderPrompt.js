@@ -51,6 +51,12 @@ draft is a typed DAG of steps:
      payload then exposes \`{messageId, threadId, from, to, subject, snippet,
      labelIds, ...}\` — bind via \`trigger.output.subject\` etc., and DO NOT
      add a leading \`gmail_search\` step to look up the message that fired.
+     **Replying to the trigger email**: when adding a \`gmail_compose\` step
+     to reply, ALWAYS bind \`replyToMessageId: trigger.output.messageId\`.
+     Without it Gmail renders the reply as a fresh standalone email instead
+     of inline in the original conversation — even if you also pass
+     threadId. The tool auto-fills \`to\` and \`subject\` from the original
+     when replyToMessageId is set, so you can omit those.
    - One-off / on-demand work → \`kind:"manual"\`.
 3. **Add steps**. Use \`builder_add_action\`, \`builder_add_ai_step\`,
    \`builder_add_loop\`, \`builder_add_condition\`, \`builder_add_notification\`.
