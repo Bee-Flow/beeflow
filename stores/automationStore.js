@@ -15,6 +15,7 @@ async function initDB() {
     const migration = require('../migrations/automation-builder-2026-05-init');
     await migration.up();
     try { await require('../migrations/automation-locking-and-session-2026-05').up(); } catch (e) { /* tolerate */ }
+    try { await require('../migrations/automation-clear-first-run-confirm-2026-05').up(); } catch (e) { /* tolerate */ }
     initialized = true;
     console.log('[AutomationStore] PostgreSQL initialized');
 }

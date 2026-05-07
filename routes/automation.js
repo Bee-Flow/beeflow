@@ -321,7 +321,10 @@ router.post('/:id/activate', async (req, res) => {
         const updates = {
             isActive: true,
             isDraft: false,
-            needsFirstRunConfirm: !!summary.hasSideEffects,
+            // First-run confirmation gate removed — activation runs live
+            // immediately. The dry-run during build still gives the user a
+            // preview before they activate.
+            needsFirstRunConfirm: false,
         };
         if (a.triggerType === 'schedule' && a.scheduleCron) {
             updates.nextRunAt = cron.nextRunAt(a.scheduleCron, a.scheduleTz || 'Europe/Amsterdam', Date.now());
