@@ -210,7 +210,10 @@ async function executeTool(toolName, toolArgs, context = {}) {
         return await executeGammaTool(toolName, toolArgs, userId);
     }
     if (isGmailTool(toolName)) {
-        return await executeGmailTool(toolName, toolArgs, session);
+        // `autoSend` is opt-in per-call: only the automation runner sets it
+        // (no user is present to confirm a draft). Direct chat / agent chat
+        // leave it false so the email_draft → user approves → send flow stays.
+        return await executeGmailTool(toolName, toolArgs, session, { autoSend: !!context.autoSend });
     }
     if (isCalendarTool(toolName)) {
         return await executeCalendarTool(toolName, toolArgs, session);

@@ -242,12 +242,18 @@ async function createGmailClient(session) {
 
 /**
  * Execute a Gmail tool call.
- * @param {string} toolName - 'gmail_search' or 'gmail_read'
+ * @param {string} toolName - 'gmail_search' / 'gmail_read' / 'gmail_compose' / etc.
  * @param {object} args - Tool arguments
  * @param {object} session - Express session with OAuth tokens
+ * @param {object} [opts]
+ * @param {boolean} [opts.autoSend=false] - For gmail_compose: when true the tool
+ *   actually sends the email (no UI handshake). Set by the automation runner
+ *   because there is no user present to confirm a draft. Direct-chat / agent
+ *   chat leave this false so the existing email_draft → user-approves → send
+ *   flow stays in place as a safety net.
  * @returns {object} Tool result
  */
-async function executeGmailTool(toolName, args, session) {
+async function executeGmailTool(toolName, args, session, opts = {}) {
     const gmail = await createGmailClient(session);
 
     if (toolName === 'gmail_search') {
@@ -410,6 +416,29 @@ async function executeGmailTool(toolName, args, session) {
         if (!to) throw new Error('to is required (include replyToMessageId for replies, or pass to explicitly)');
         if (!subject) throw new Error('subject is required (include replyToMessageId for replies, or pass subject explicitly)');
 
+        // Automation / non-interactive callers: send immediately. There is
+        // no UI here to render an email_draft preview, so returning one
+        // would leave the email permanently stuck (which is the bug users
+        // hit when an automation called gmail_compose and never sent).
+        if (opts.autoSend) {
+            const userEmail = session?.user?.email || '';
+            const sendResult = await sendGmailMessage(gmail, {
+                to, cc, bcc, subject, body,
+                userEmail,
+                threadId,
+                inReplyTo,
+                references,
+            });
+            return {
+                sent: true,
+                messageId: sendResult.id,
+                threadId: sendResult.threadId,
+                to,
+                subject,
+                message: `Email sent to ${to}.`,
+            };
+        }
+
         return {
             _action: 'email_draft',
             draft: {
@@ -429,6 +458,48 @@ async function executeGmailTool(toolName, args, session) {
     } else {
         throw new Error(`Unknown Gmail tool: ${toolName}`);
     }
+}
+
+/**
+ * Send a Gmail message directly through the Gmail API. Mirrors the route
+ * handler in routes/integrations/gmail.js so the chat path (which uses the
+ * route after user approval) and the automation path (which calls this
+ * helper) produce identical wire output.
+ */
+async function sendGmailMessage(gmail, { to, cc, bcc, subject, body, userEmail = '', threadId = null, inReplyTo = null, references = null }) {
+    const hasNonAscii = /[^\x00-\x7F]/.test(subject || '');
+    const encodedSubject = hasNonAscii
+        ? `=?UTF-8?B?${Buffer.from(subject || '', 'utf-8').toString('base64')}?=`
+        : (subject || '');
+
+    const headers = [
+        `To: ${to}`,
+        `From: ${userEmail}`,
+        `Subject: ${encodedSubject}`,
+        'MIME-Version: 1.0',
+        'Content-Type: text/plain; charset=UTF-8',
+        'Content-Transfer-Encoding: base64',
+    ];
+    if (cc) headers.push(`Cc: ${cc}`);
+    if (bcc) headers.push(`Bcc: ${bcc}`);
+    if (inReplyTo) headers.push(`In-Reply-To: ${inReplyTo}`);
+    if (references) headers.push(`References: ${references} ${inReplyTo || ''}`);
+
+    const encodedBody = Buffer.from(body || '', 'utf-8').toString('base64');
+    const rawMessage = headers.join('\r\n') + '\r\n\r\n' + encodedBody;
+
+    const encodedMessage = Buffer.from(rawMessage)
+        .toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+
+    const sendParams = { userId: 'me', requestBody: { raw: encodedMessage } };
+    if (threadId) sendParams.requestBody.threadId = threadId;
+
+    const result = await gmail.users.messages.send(sendParams);
+    console.log(`[Gmail] (autoSend) Email sent: ${result.data.id} to ${to}`);
+    return { id: result.data.id, threadId: result.data.threadId };
 }
 
 /**

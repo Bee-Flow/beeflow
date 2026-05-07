@@ -103,11 +103,43 @@ async function execIntegrationAction(step, ctx, runState, mode) {
         // First-run confirmation guard — handled at run-level, but defensive here.
         return { output: synthesizeDryRunOutput(step.tool, inputs), confirmRequired: true, dryRunSynthesised: true };
     }
+
+    // Defense-in-depth permission check. The catalog filter that the
+    // builder used at design-time may be out of date by the time a
+    // scheduled automation fires (org admin disabled the integration,
+    // user got removed from a group, etc.). Re-resolve the user's
+    // *current* allowed tool set and refuse if `step.tool` is no longer
+    // in it. Mirrors the n8nWorkflow pattern in toolDispatcher.js.
+    if (!ctx.allowedToolNames) {
+        try {
+            const { getIntegrationTools } = require('./integrationTools');
+            const r = await getIntegrationTools({
+                userId: ctx.userId,
+                session: ctx.session,
+                isAdmin: !!ctx.session?.isAdmin || ctx.session?.user?.role === 'admin',
+            });
+            ctx.allowedToolNames = new Set((r.tools || []).map(t => t?.function?.name).filter(Boolean));
+        } catch (e) {
+            // If we can't resolve the catalog, fail closed for side-effects
+            // and pass-through for read-only tools.
+            console.warn(`[AutomationRunner] Permission catalog lookup failed: ${e.message}`);
+            if (sideEffect) throw new Error('Could not verify your permission for this tool. The automation has been paused — please re-open it after refreshing your permissions.');
+            ctx.allowedToolNames = null; // sentinel — skip subsequent checks this run
+        }
+    }
+    if (ctx.allowedToolNames && !ctx.allowedToolNames.has(step.tool)) {
+        throw new Error(`You no longer have permission to use "${step.tool}". Ask your organisation admin to re-enable this integration, or remove the step from the automation.`);
+    }
+
     const { executeTool } = require('./toolDispatcher');
     const result = await executeTool(step.tool, inputs, {
         userId: ctx.userId,
         session: ctx.session,
         orgId: ctx.orgId,
+        // Tell email/ticket-style tools that there is NO user UI here to
+        // approve a draft — emit the side effect immediately. Only set
+        // for live mode (dry_run is handled above with synthesized output).
+        autoSend: mode === 'live',
     });
     // Cache the actual output shape so the Builder agent gets ground-truth
     // bindings on its next turn (no more guessing items vs results).
