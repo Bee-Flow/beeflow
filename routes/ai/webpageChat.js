@@ -46,6 +46,8 @@ const {
     executeWebpageKBSearchTool,
     WEBPAGE_KB_SEARCH_TOOL,
 } = require('../../core/webpageKnowledgeSearch');
+const terminationStore = require('../../stores/terminationStore');
+const { sanitizeError } = require('../../core/errorSanitizer');
 
 function requireAuth(req, res, next) {
     if (req.session && req.session.user) return next();
@@ -492,6 +494,29 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
         // user gets a chance to approve before any files are touched.
         let planProposedThisTurn = false;
 
+        // ── Termination monitor bookkeeping ───────────────────────────────
+        // Tracks tokens, latency and the most recent stop_reason so we can
+        // log abnormal terminations (max_tokens / max_iterations / error)
+        // without persisting any message content.
+        const _termStart = Date.now();
+        let _termPromptTokens = 0;
+        let _termCompletionTokens = 0;
+        let _termLastStopReason = null;
+        const _terminationBase = () => ({
+            user_id: userId || null,
+            organization_id: userOrgForTiers || null,
+            agent_id: webpageId || null,
+            agent_name: webpage?.title ? `Webpage: ${webpage.title}` : 'Webpage chat',
+            model: modelId || null,
+            source: 'webpage_chat',
+            conversation_id: webpageId || null,
+            iteration_count: toolCallRounds,
+            duration_ms: Date.now() - _termStart,
+            prompt_tokens: _termPromptTokens,
+            completion_tokens: _termCompletionTokens,
+            total_tokens: _termPromptTokens + _termCompletionTokens,
+        });
+
         async function dispatchToolCall(toolCall) {
             const toolName = toolCall.function?.name || toolCall.name;
             let toolArgs = {};
@@ -632,6 +657,13 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
                             : (data.function?.arguments || '{}'),
                     },
                 });
+            } else if (type === 'done') {
+                // Adapter signals end-of-stream with usage + stop_reason.
+                // Track tokens for the termination monitor and remember the
+                // last stop_reason so we can detect max_tokens truncations.
+                _termPromptTokens += data?.prompt_tokens || 0;
+                _termCompletionTokens += data?.completion_tokens || 0;
+                _termLastStopReason = data?.stop_reason || data?.finish_reason || null;
             } else if (type === 'error') {
                 send('error', data);
             }
@@ -652,8 +684,17 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
                 await adapter.stream(apiKey, apiUrl, modelId, messages, streamOptions, streamCallback);
             } catch (err) {
                 console.error('[WebpageChat] Stream error:', err.message);
+                terminationStore.logTermination({
+                    ..._terminationBase(),
+                    termination_type: 'error',
+                    ...sanitizeError(err),
+                }).catch(() => {});
                 send('error', { error: `Chat error: ${err.message}` });
                 break;
+            }
+
+            if (_termLastStopReason === 'max_tokens' || _termLastStopReason === 'length') {
+                terminationStore.logTermination({ ..._terminationBase(), termination_type: 'max_tokens' }).catch(() => {});
             }
 
             if (streamToolCalls.length === 0) break;
@@ -677,6 +718,11 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
                     await adapter.stream(apiKey, apiUrl, modelId, messages, chatOptions, streamCallback);
                 } catch (err) {
                     console.error('[WebpageChat] Plan wrap-up stream error:', err.message);
+                    terminationStore.logTermination({
+                        ..._terminationBase(),
+                        termination_type: 'error',
+                        ...sanitizeError(err),
+                    }).catch(() => {});
                 }
                 break;
             }
@@ -685,10 +731,16 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
         // Hit MAX_TOOL_ROUNDS with tool calls still pending — give the model
         // one chance to summarise without offering more tools.
         if (toolCallRounds >= MAX_TOOL_ROUNDS && streamToolCalls.length > 0) {
+            terminationStore.logTermination({ ..._terminationBase(), termination_type: 'max_iterations' }).catch(() => {});
             try {
                 await adapter.stream(apiKey, apiUrl, modelId, messages, chatOptions, streamCallback);
             } catch (err) {
                 console.error('[WebpageChat] Final wrap-up stream error:', err.message);
+                terminationStore.logTermination({
+                    ..._terminationBase(),
+                    termination_type: 'error',
+                    ...sanitizeError(err),
+                }).catch(() => {});
             }
         }
 
@@ -728,6 +780,17 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
         res.end();
     } catch (err) {
         console.error('[WebpageChat] Error:', err);
+        try {
+            terminationStore.logTermination({
+                user_id: req.session?.user?.id || null,
+                agent_id: req.body?.webpageId || null,
+                agent_name: 'Webpage chat',
+                source: 'webpage_chat',
+                conversation_id: req.body?.webpageId || null,
+                termination_type: 'error',
+                ...sanitizeError(err),
+            }).catch(() => {});
+        } catch (_) { /* ignore logging failures */ }
         send('error', { error: `Chat error: ${err.message}` });
         res.end();
     }
