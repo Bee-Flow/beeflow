@@ -27,12 +27,14 @@ const router = express.Router();
 
 const automationStore = require('../../stores/automationStore');
 const configStore = require('../../stores/configStore');
-const { getProviderForModel } = require('../../core/aiAgent');
+const { getProviderForModel, getAIConfig } = require('../../core/aiAgent');
 const { getAdapter } = require('../../core/providers');
-const { resolveModelForTier } = require('../../core/modelResolver');
+const { getEUAwareTiers, isEUModeActive } = require('../../core/modelResolver');
 const { TOOL_SCHEMAS, applyToolCall, emptyDefinition } = require('../../automation/builderTools');
 const { buildSystemPrompt } = require('../../automation/builderPrompt');
 const { summariseDefinition } = require('../../automation/summarise');
+const { validateDefinition } = require('../../automation/validate');
+const { perUserRateLimit } = require('../../utils/perUserRateLimit');
 
 function requireAuth(req, res, next) {
     if (req.session?.user?.id) return next();
@@ -43,7 +45,26 @@ function requireAuth(req, res, next) {
 // → fix → dry_run → finalize. Bumped so the auto-test loop has room.
 const MAX_ITERATIONS = 16;
 
-router.post('/stream', requireAuth, async (req, res) => {
+// Each builder turn is a multi-iteration LLM conversation that can chain
+// many tool calls and a dry-run — i.e. expensive. Cap to 12/min/user so a
+// runaway client (or a malicious script) can't burn through tokens.
+const builderRateLimit = perUserRateLimit({ windowMs: 60_000, max: 12 });
+
+// GET the persisted builder-session snapshot for an automation. Used by
+// the client on mount to rehydrate chat history + draft + last validation
+// after a refresh or SSE drop. Mirror to the SSE `resume` event payload.
+router.get('/session/:automationId', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const snapshot = await automationStore.getBuilderSession(req.params.automationId, userId);
+        if (!snapshot) return res.status(404).json({ error: 'No builder session for this automation' });
+        res.json({ snapshot });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+router.post('/stream', requireAuth, builderRateLimit, async (req, res) => {
     const userId = req.session.user.id;
     const {
         message,
@@ -56,6 +77,10 @@ router.post('/stream', requireAuth, async (req, res) => {
         disabledMedia = {},
         timezone,
     } = req.body || {};
+    // ?resume=1 — caller is reconnecting and wants the latest snapshot
+    // re-emitted before the new message is processed. Additive: the regular
+    // SSE flow continues exactly as before once the resume event lands.
+    const wantsResume = req.query?.resume === '1' || req.query?.resume === 'true';
 
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
@@ -84,6 +109,17 @@ router.post('/stream', requireAuth, async (req, res) => {
         let draftWrap = await loadOrCreateDraft({ userId, builderSessionId: clientSession, automationId });
         send('builder_session', { builderSessionId: draftWrap.builderSessionId, automationId: draftWrap.automationId });
 
+        // Resume support — when the client asks (?resume=1), re-emit the
+        // last persisted snapshot before processing the new turn. The
+        // client uses this to rehydrate any chat history + draft +
+        // validation state that was lost on a dropped SSE.
+        if (wantsResume && draftWrap.automationId) {
+            try {
+                const snapshot = await automationStore.getBuilderSession(draftWrap.automationId, userId);
+                if (snapshot) send('resume', { snapshot });
+            } catch (_) { /* non-fatal */ }
+        }
+
         // Build catalog for the prompt.
         const catalog = await buildCatalogForUser(userId, req.session);
 
@@ -97,14 +133,68 @@ router.post('/stream', requireAuth, async (req, res) => {
             disabledMedia: disabledMedia || {},
         });
 
-        // Resolve model.
-        const modelId = await resolveModelForTier(`tier:${modelTier}`, { userId });
+        // Resolve model — mirrors the direct-chat flow (server/routes/ai/directChat.js)
+        // so the builder honours the same tier dropdown, EU overrides, custom
+        // tiers, and 'auto' classification the user sees in direct chat.
+        const userOrgForTiers = req.session?.user?.organizationId || null;
+        let tiers = await getEUAwareTiers({ userOrgId: userOrgForTiers, userId });
+        try {
+            const { isEU } = await isEUModeActive({ userOrgId: userOrgForTiers, userId });
+            const globalCustom = (await configStore.getConfig('custom_chat_model_tiers')) || [];
+            const orgCustom = userOrgForTiers
+                ? ((await configStore.getConfig(`custom_chat_model_tiers_org_${userOrgForTiers}`)) || [])
+                : [];
+            const byId = new Map();
+            for (const t of (Array.isArray(globalCustom) ? globalCustom : [])) if (t?.id) byId.set(t.id, t);
+            for (const t of (Array.isArray(orgCustom)    ? orgCustom    : [])) if (t?.id) byId.set(t.id, t);
+            for (const t of byId.values()) {
+                tiers[t.id] = {
+                    modelId: isEU && t.euModelId ? t.euModelId : t.modelId,
+                    label: t.label, icon: t.icon, description: t.description,
+                    maxTokens: t.maxTokens, temperature: t.temperature,
+                    reasoningEffort: t.reasoningEffort, reasoningSummary: t.reasoningSummary,
+                    custom: true,
+                };
+            }
+        } catch (_) { /* fall through without custom tiers */ }
+
+        let resolvedTier = modelTier || 'fast';
+        if (resolvedTier === 'auto') {
+            try {
+                const { classifyWithLLM } = require('../../core/promptClassifier');
+                // Same exclusions direct chat applies: custom tiers and swarm
+                // require explicit user choice and must never win auto.
+                const classifyTiers = Object.fromEntries(
+                    Object.entries(tiers).filter(([k]) => !k.startsWith('custom:') && k !== 'swarm'),
+                );
+                const result = await classifyWithLLM(message || '', classifyTiers, { userOrgId: userOrgForTiers, userId });
+                resolvedTier = result.tier;
+                console.log(`[AutomationBuilder] Auto: tier="${resolvedTier}" (${result.method}: ${result.reason})`);
+            } catch (err) {
+                console.log(`[AutomationBuilder] Auto classification failed: ${err.message}, using fast`);
+                resolvedTier = 'fast';
+            }
+        }
+
+        const tier = tiers[resolvedTier] || {};
+        let modelId = tier.modelId;
         if (!modelId) {
-            send('error', { error: `No model configured for tier ${modelTier}` });
+            const globalConfig = await getAIConfig();
+            modelId = globalConfig?.model || null;
+        }
+        if (!modelId) {
+            send('error', { error: `No model configured for tier ${resolvedTier}` });
             return res.end();
         }
+
         const cfg = await getProviderForModel(modelId);
         const adapter = getAdapter(cfg.providerType, cfg.url);
+
+        // Mirror direct chat: only emit model_selected when the *user* picked
+        // 'auto', so the message bubble can render "Auto → <real tier>".
+        if (modelTier === 'auto') {
+            send('model_selected', { tier: resolvedTier, modelId });
+        }
 
         // Filter the tool schema set by feature flag.
         const tools = TOOL_SCHEMAS.filter(t => codeStepEnabled || t.function.name !== 'builder_add_code_step');
@@ -123,7 +213,10 @@ router.post('/stream', requireAuth, async (req, res) => {
         ];
 
         let lastFinalized = false;
-        for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
+        let lastValidation = null;
+        let lastSummary = summary || null;
+        let iter = 0;
+        for (iter = 0; iter < MAX_ITERATIONS; iter++) {
             const response = await adapter.chat(cfg.apiKey, cfg.url, modelId, messages, {
                 maxTokens: 4096,
                 temperature: 0.2,
@@ -147,6 +240,7 @@ router.post('/stream', requireAuth, async (req, res) => {
                         },
                     })),
                 });
+                let mutatedThisIter = false;
                 for (const tc of response.toolCalls) {
                     const name = tc.function.name;
                     let args = {};
@@ -161,16 +255,36 @@ router.post('/stream', requireAuth, async (req, res) => {
                     if (mutates(name)) {
                         await persistDraftWrap(draftWrap);
                         send('draft', { definition: draftWrap.def, automationId: draftWrap.automationId });
+                        mutatedThisIter = true;
                     }
                     if (name === 'builder_summarise') {
                         send('summary', toolResult);
+                        if (toolResult && typeof toolResult.summary === 'string') {
+                            lastSummary = toolResult.summary;
+                        }
                     }
                     if (name === 'builder_request_dry_run' && toolResult?.run) {
                         send('dryrun', { run: toolResult.run, steps: toolResult.steps || [] });
                     }
                     if (name === 'builder_finalize' && toolResult?.automation) {
-                        send('finalized', { automationId: toolResult.automation.id });
-                        lastFinalized = true;
+                        // Block finalization when the current draft has any
+                        // structural errors. This keeps a half-formed graph
+                        // from being saved as "ready" — the LLM gets the
+                        // structured errors back and self-corrects.
+                        const finalCheck = validateDefinition(draftWrap.def);
+                        if (!finalCheck.ok) {
+                            lastValidation = finalCheck;
+                            send('validation_errors', { errors: finalCheck.errors, warnings: finalCheck.warnings });
+                            // Replace the success result with a diagnostic so
+                            // the LLM sees this attempt failed.
+                            toolResult = {
+                                error: 'Cannot finalize: definition has validation errors. Address the errors below and try again.',
+                                validation: finalCheck,
+                            };
+                        } else {
+                            send('finalized', { automationId: toolResult.automation.id });
+                            lastFinalized = true;
+                        }
                     }
 
                     messages.push({
@@ -179,6 +293,23 @@ router.post('/stream', requireAuth, async (req, res) => {
                         content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult).slice(0, 30_000),
                     });
                 }
+
+                // Validation feedback loop: after any mutation, validate the
+                // draft and feed the structured records back to the LLM as
+                // a synthetic system note. This is what lets the model
+                // self-correct on specific failures (e.g. "you wired a
+                // condition with no edges") instead of looping on prose.
+                if (mutatedThisIter) {
+                    lastValidation = validateDefinition(draftWrap.def);
+                    send('validation_errors', { errors: lastValidation.errors, warnings: lastValidation.warnings });
+                    if (lastValidation.errors.length || lastValidation.warnings.length) {
+                        messages.push({
+                            role: 'system',
+                            content: `Draft validation results (machine-readable). Address every \`error\` before calling builder_finalize. Each record has {code, severity, path, message, hint}; the hint tells you what to do next.\n\n${JSON.stringify({ errors: lastValidation.errors, warnings: lastValidation.warnings })}`,
+                        });
+                    }
+                }
+
                 if (lastFinalized) break;
                 continue;
             }
@@ -187,7 +318,43 @@ router.post('/stream', requireAuth, async (req, res) => {
             break;
         }
 
-        send('done', { automationId: draftWrap.automationId });
+        // If the model exhausted its iteration budget without finalizing,
+        // surface that explicitly so the UI can prompt the user (rather
+        // than silently giving up after a no-op final response).
+        if (!lastFinalized && iter >= MAX_ITERATIONS) {
+            send('builder_aborted', {
+                reason: 'max_iterations',
+                iterations: MAX_ITERATIONS,
+                lastValidation: lastValidation || null,
+            });
+        }
+
+        // Snapshot for SSE-resume. Captures just enough state to hydrate
+        // the UI on reconnect: the message that opened this turn, the
+        // assistant's reply with its tool calls, the latest draft, the
+        // structured validation, and any summary. The store trims
+        // oldest assistant turns past 64KB.
+        if (draftWrap.automationId) {
+            try {
+                const lastUserMessage = { role: 'user', content: message || '' };
+                const assistantOut = collectAssistantTurn(messages);
+                const conversationTail = [
+                    ...sanitizeHistory(history),
+                    lastUserMessage,
+                    ...(assistantOut ? [assistantOut] : []),
+                ];
+                await automationStore.setBuilderSession(draftWrap.automationId, userId, {
+                    sessionId: draftWrap.builderSessionId,
+                    draft: draftWrap.def,
+                    lastValidation: lastValidation || null,
+                    summary: lastSummary || null,
+                    conversation: conversationTail,
+                    updatedAt: new Date().toISOString(),
+                });
+            } catch (_) { /* non-fatal */ }
+        }
+
+        send('done', { automationId: draftWrap.automationId, finalized: lastFinalized, iterations: iter });
         res.end();
     } catch (e) {
         console.error('[automationBuilder/stream] error:', e);
@@ -213,6 +380,40 @@ function sanitizeHistory(history) {
         .filter(m => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
         .map(m => ({ role: m.role, content: m.content }))
         .slice(-20);
+}
+
+/**
+ * Collapse the LLM-loop messages array down to the latest assistant turn
+ * for snapshot persistence: pulls the most recent assistant entry and
+ * resolves its tool_calls/results so a resume can rebuild the chat bubble.
+ */
+function collectAssistantTurn(loopMessages) {
+    if (!Array.isArray(loopMessages)) return null;
+    // Walk back to the last assistant message.
+    let assistantIdx = -1;
+    for (let i = loopMessages.length - 1; i >= 0; i--) {
+        if (loopMessages[i]?.role === 'assistant') { assistantIdx = i; break; }
+    }
+    if (assistantIdx < 0) return null;
+    const a = loopMessages[assistantIdx];
+    const toolCalls = Array.isArray(a.tool_calls)
+        ? a.tool_calls.map(tc => {
+            // Pair with its tool result (next 'tool' message with matching id).
+            const result = loopMessages.slice(assistantIdx + 1).find(m => m.role === 'tool' && m.tool_call_id === tc.id);
+            let parsedResult = null;
+            try { parsedResult = result?.content ? JSON.parse(result.content) : null; }
+            catch { parsedResult = result?.content || null; }
+            let parsedArgs = {};
+            try { parsedArgs = typeof tc.function?.arguments === 'string' ? JSON.parse(tc.function.arguments) : (tc.function?.arguments || {}); }
+            catch { parsedArgs = {}; }
+            return { name: tc.function?.name, arguments: parsedArgs, result: parsedResult };
+        })
+        : [];
+    return {
+        role: 'assistant',
+        content: typeof a.content === 'string' ? a.content : '',
+        toolCalls,
+    };
 }
 
 async function loadOrCreateDraft({ userId, builderSessionId, automationId }) {
