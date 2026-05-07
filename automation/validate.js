@@ -245,7 +245,13 @@ function validateDefinition(def, { availableTools = null } = {}) {
         // a step that has run before this one.
         const refs = [];
         collectRefPaths(step.inputs, refs);
-        if (step.type === 'ai_step') collectRefPaths({ kind: 'template', value: step.prompt || '' }, refs);
+        // NOTE: ai_step.prompt is NOT a runtime template — the runner passes
+        // it to the model as literal instruction text alongside a separate
+        // JSON `inputs` section. So `{{from}}` in a prompt is a placeholder
+        // referring to that step's `inputs.from` key, not a cross-step ref.
+        // Treating it as a ref produced spurious "unknown ref root" warnings
+        // for every well-formed automation that paraphrased its inputs in
+        // the prompt body.
         if (step.type === 'notification') {
             collectRefPaths({ kind: 'template', value: step.title || '' }, refs);
             collectRefPaths({ kind: 'template', value: step.body || '' }, refs);
