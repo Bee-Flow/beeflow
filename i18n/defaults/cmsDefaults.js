@@ -27,10 +27,31 @@
 const SITE_DEFAULTS = {
     header: {
         enabled: true,
+        // logoText is the legacy field; new sites also expose `logo` so
+        // the editor's Logo & brand panel has somewhere to land its
+        // edits. Header.jsx prefers logo.text when present.
         logoText: 'My Website',
+        logo: {
+            src: '',           // empty = letter-avatar fallback
+            text: 'My Website',
+            textColor: '',     // empty = inherit from CSS
+            fontSize: 'medium',// 'small' | 'medium' | 'large'
+        },
+        // Legacy single-CTA fields kept so old sites' lazy migration can
+        // read them when seeding `ctas`. New sites just use `ctas` below.
         loginLabel: '',
         ctaLabel: '',
         ctaLink: { kind: 'anchor', anchor: '' },
+        // Multi-CTA — one filled "Get started" button by default. Users
+        // add Log in / Sign up / etc. via Site chrome → Header buttons.
+        ctas: [
+            {
+                id: 'cta_default',
+                label: 'Get started',
+                link: { kind: 'app', path: '/app' },
+                style: 'primary',
+            },
+        ],
         nav: [],
     },
     footer: {
@@ -71,19 +92,31 @@ const BLOCK_DEFAULTS = {
         logos: [],
     },
 
-    // Generic flexible section. Every optional element (subheading, image,
-    // cta) defaults to null and is toggled on by the editor when the user
-    // adds it. CTA uses the Link union for page-picker support — same shape
-    // as Hero/CTA blocks.
+    // Flexible Content block — column + elements system. Each column holds
+    // a stack of typed elements (text / image / video / iframe / cta). The
+    // renderer and editor accept the legacy flat shape via
+    // migrateLegacyContent() in agent-hub/src/marketing/sections/
+    // contentMigration.js, so existing blocks keep working until they're
+    // saved (the next save persists the new shape).
     content: {
-        heading:           'Your heading here',
-        subheading:        null,
-        body:              'Add your content here.',
-        image:             null,                       // { src, alt }
-        cta:               null,                       // { label, link: { kind, ... } }
-        imagePosition:     'below',                    // 'above' | 'below' | 'left' | 'right'
-        textAlign:         'left',                     // 'left' | 'center' | 'right'
-        backgroundVariant: 'default',                  // 'default' | 'surface' | 'primary' | 'dark'
+        columnLayout: '1',
+        verticalAlign: 'top',
+        background: 'none',
+        columns: [
+            {
+                id: 'col_default',
+                elements: [
+                    {
+                        id: 'el_default',
+                        kind: 'text',
+                        heading: 'Your heading here',
+                        subheading: '',
+                        body: 'Add your content here.',
+                        align: 'left',
+                    },
+                ],
+            },
+        ],
     },
 
     // Media + Text — side-by-side layout with image OR video on one side

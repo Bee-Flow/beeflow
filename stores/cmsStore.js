@@ -42,11 +42,22 @@ const KEY_PROJECTS_INDEX  = 'cms_projects_index';
 const KEY_PROJECT_PFX     = 'cms_project_';                  // cms_project_{siteId}
 const KEY_LOCALE_INFIX    = '_locale_';                      // ..._locale_{xx}
 const KEY_PAGE_INFIX      = '_page_';                        // cms_project_{siteId}_page_{pageId}
+const KEY_PUBLISHED_PFX   = 'cms_published_';                // cms_published_{siteId} — last-published snapshot
 
-const SITE_VERSION = 1;
+// SITE_VERSION 3: header now supports a `ctas` array (multiple action
+// buttons with style: primary/secondary/ghost/link) instead of a single
+// ctaLink+ctaLabel pair, and a `logo` block (image src + text + style).
+// The lazy migration in getProject seeds header.ctas once from the old
+// ctaLabel/ctaLink (+ loginLabel as a ghost button) so existing live
+// sites don't lose their header buttons.
+//
+// SITE_VERSION 2: pages no longer auto-merge into header.nav at render
+// time; nav is fully owned by the user via Site chrome.
+const SITE_VERSION = 3;
 const PAGE_VERSION = 1;
 const LOCALE_OVERRIDE_VERSION = 1;
 const INDEX_VERSION = 1;
+const PUBLISHED_VERSION = 1;
 
 // ── Small helpers ────────────────────────────────────────────────────
 
@@ -132,6 +143,7 @@ function projectKey(siteId)                        { return `${KEY_PROJECT_PFX}$
 function projectLocaleKey(siteId, locale)          { return `${KEY_PROJECT_PFX}${siteId}${KEY_LOCALE_INFIX}${locale}`; }
 function pageKey(siteId, pageId)                   { return `${KEY_PROJECT_PFX}${siteId}${KEY_PAGE_INFIX}${pageId}`; }
 function pageLocaleKey(siteId, pageId, locale)     { return `${KEY_PROJECT_PFX}${siteId}${KEY_PAGE_INFIX}${pageId}${KEY_LOCALE_INFIX}${locale}`; }
+function publishedKey(siteId)                      { return `${KEY_PUBLISHED_PFX}${siteId}`; }
 
 // ── Locale settings (org-wide) ───────────────────────────────────────
 
@@ -223,21 +235,74 @@ async function getProject(siteId) {
     assertSiteId(siteId);
     const v = await configStore.getConfig(projectKey(siteId));
     if (!isPlainObject(v)) return null;
-    // Lazy migration — fill defaults for nav fields on pages stored
-    // before showInNav / navOrder existed. Non-destructive: we don't
-    // write back here. The next setProject call (any save through the
-    // sanitizer) will persist the defaults to disk.
-    if (Array.isArray(v.pages)) {
-        v.pages = v.pages.map((p, i) => {
-            if (!isPlainObject(p)) return p;
-            const next = { ...p };
-            if (next.showInNav === undefined) next.showInNav = true;
-            if (typeof next.navOrder !== 'number' || !Number.isFinite(next.navOrder)) {
-                next.navOrder = i;          // preserve current display order
-            }
-            return next;
-        });
+
+    // Lazy v1 → v2 migration: pages used to auto-merge into the header
+    // nav at render time. That merge was removed; without a one-shot
+    // seed, existing live sites would lose their visible nav after the
+    // deploy. Seed header.nav from the current page list — but only when
+    // the user hasn't customised nav already (empty array or unset). Once
+    // setProject persists the bumped version field this branch is inert
+    // for that site, so opting back into "no nav at all" by clearing the
+    // list later is preserved.
+    const storedVersion = typeof v.version === 'number' ? v.version : 1;
+    if (storedVersion < SITE_VERSION) {
+        const header = isPlainObject(v.header) ? v.header : clone(SITE_DEFAULTS.header);
+        const navEmpty = !Array.isArray(header.nav) || header.nav.length === 0;
+        const pages = Array.isArray(v.pages) ? v.pages : [];
+        if (navEmpty && pages.length > 0) {
+            header.nav = pages
+                .filter(p => isPlainObject(p) && !p.isHomepage)
+                // Preserve the old auto-nav filtering so users who'd
+                // already toggled "Show in nav" off don't suddenly see
+                // those pages re-appear post-migration.
+                .filter(p => p.showInNav !== false)
+                .slice()
+                .sort((a, b) => (a.navOrder ?? 0) - (b.navOrder ?? 0))
+                .map(p => ({
+                    id: newId('nav'),
+                    label: p.title || p.slug,
+                    link: { kind: 'page', pageId: p.id },
+                }));
+            v.header = header;
+        }
+
+        // v2 → v3: header now supports a `ctas` array. Seed it from the
+        // legacy single-CTA fields once so existing sites keep rendering
+        // both their Log in + Get started buttons exactly as before.
+        // Order: Log in (ghost) first, primary CTA last — matches the old
+        // Header.jsx layout. Skipped if the user already has ctas set
+        // (idempotent: re-running the migration is a no-op).
+        const ctasEmpty = !Array.isArray(header.ctas) || header.ctas.length === 0;
+        if (ctasEmpty) {
+            header.ctas = [
+                // The old Header always rendered a Log in button with a
+                // hard-coded `/app` href, falling back to the literal
+                // "Log in" when loginLabel was empty. Match that exactly.
+                {
+                    id: newId('cta'),
+                    label: (typeof header.loginLabel === 'string' && header.loginLabel.trim())
+                        ? header.loginLabel
+                        : 'Log in',
+                    link: { kind: 'app', path: '/app' },
+                    style: 'ghost',
+                },
+                // Primary CTA — derived from ctaLabel + ctaLink. Falls
+                // back to a sensible default so a site with no legacy
+                // CTA at all gets a starter "Get started" button rather
+                // than a blank header.
+                {
+                    id: newId('cta'),
+                    label: header.ctaLabel || 'Get started',
+                    link: isPlainObject(header.ctaLink)
+                        ? header.ctaLink
+                        : { kind: 'app', path: '/app' },
+                    style: 'primary',
+                },
+            ];
+            v.header = header;
+        }
     }
+
     return v;
 }
 
@@ -288,6 +353,8 @@ async function deleteProject(siteId) {
         [projectKey(siteId), `${projectKey(siteId)}_%`]
     );
     for (const r of rows) await configStore.deleteConfig(r.key);
+    // Published snapshot uses a separate prefix — clean it up explicitly.
+    await configStore.deleteConfig(publishedKey(siteId));
 
     const index = await getProjectsIndex();
     index.projects = index.projects.filter(p => p.id !== siteId);
@@ -303,6 +370,10 @@ async function renameProject(siteId, name) {
 
 function sanitizePageIndexEntry(entry) {
     if (!isPlainObject(entry) || !entry.id) return null;
+    // showInNav / navOrder were used by the old auto-merge of pages into
+    // the header nav. Pages no longer drive the nav, so those fields are
+    // intentionally omitted here — old persisted values are dropped on
+    // the next save (lazy cleanup, no migration script needed).
     return {
         id: String(entry.id),
         slug: normalizeSlug(entry.slug || ''),
@@ -311,12 +382,6 @@ function sanitizePageIndexEntry(entry) {
         hideHeader: !!entry.hideHeader,
         hideFooter: !!entry.hideFooter,
         isNotFound: !!entry.isNotFound,
-        // Nav controls — every page is in the nav by default. navOrder
-        // lets the user reorder nav items independently of array order.
-        showInNav: entry.showInNav === undefined ? true : !!entry.showInNav,
-        navOrder:  typeof entry.navOrder === 'number' && Number.isFinite(entry.navOrder)
-            ? Math.round(entry.navOrder)
-            : 0,
     };
 }
 
@@ -395,6 +460,9 @@ async function setPage(siteId, page) {
             : [],
     };
     await configStore.setConfig(pageKey(siteId, sanitized.id), sanitized);
+    // Short-lived diagnostic so we can confirm block saves are landing in
+    // the DB. Drop alongside the publish/site logs once verified.
+    console.log(`[CMS] setPage siteId=${siteId} pageId=${sanitized.id} blocks=${sanitized.blocks.length}`);
     return sanitized;
 }
 
@@ -467,15 +535,12 @@ async function createPage(siteId, { slug, title, copyFromId } = {}) {
     }
     await setPage(siteId, page);
 
+    // New pages are NOT auto-added to the header nav. The user adds nav
+    // items explicitly via Site chrome → Nav links and picks "Internal
+    // page" if they want this page to appear there.
     site.pages.push({
         id, slug: finalSlug, title: page.title,
         isHomepage: false, hideHeader: false, hideFooter: false, isNotFound: false,
-        // Nav defaults: every new page is in the nav. navOrder is the
-        // current array length so new pages append to the end of the
-        // nav. The first page created (which becomes the homepage when
-        // homepageId is still null) lands at index 0.
-        showInNav: true,
-        navOrder: site.pages.length,
     });
     if (!site.homepageId) site.homepageId = id;
     await setProject(siteId, site);
@@ -507,10 +572,7 @@ async function updatePageMeta(siteId, pageId, patch = {}) {
     if (typeof patch.hideHeader === 'boolean') current.hideHeader = patch.hideHeader;
     if (typeof patch.hideFooter === 'boolean') current.hideFooter = patch.hideFooter;
     if (typeof patch.isNotFound === 'boolean') current.isNotFound = patch.isNotFound;
-    if (typeof patch.showInNav  === 'boolean') current.showInNav  = patch.showInNav;
-    if (typeof patch.navOrder   === 'number' && Number.isFinite(patch.navOrder)) {
-        current.navOrder = Math.round(patch.navOrder);
-    }
+    // showInNav / navOrder removed — pages don't drive the nav anymore.
 
     site.pages[idx] = current;
 
@@ -585,11 +647,10 @@ function resolveLink(link, pages) {
     if (link.kind === 'page') {
         const page = pages.find(p => p.id === link.pageId);
         if (!page) return { href: '#', broken: true };
-        // The public site is served at `/` (RootPathGate in App.jsx). To stay
-        // inside the product-website renderer, non-homepage pages route via
-        // `/?slug=<slug>` so the browser keeps `pathname === '/'` and the
-        // BeeFlow app router doesn't intercept the path.
-        const base = page.isHomepage ? '/' : `/?slug=${encodeURIComponent(page.slug)}`;
+        // The public site uses path-based routing: `/` for the homepage,
+        // `/<slug>` for everything else. AppRoot in App.jsx routes any
+        // non-reserved single-segment path into the marketing renderer.
+        const base = page.isHomepage ? '/' : `/${encodeURIComponent(page.slug)}`;
         return { href: link.anchor ? `${base}#${link.anchor}` : base };
     }
     return { href: '#' };
@@ -617,7 +678,36 @@ function resolveLinksInTree(node, pages) {
  * or null when no match. `pages` is the public sitemap (id+slug+title).
  */
 async function getEffective(siteId, slug, locale) {
-    const site = await getProject(siteId);
+    return resolveEffective(siteId, slug, locale, {
+        getSite:                () => getProject(siteId),
+        getPage:                (pageId) => getPage(siteId, pageId),
+        getSiteLocaleOverride:  (loc) => getSiteLocaleOverride(siteId, loc),
+        getPageLocaleOverride:  (pageId, loc) => getPageLocaleOverride(siteId, pageId, loc),
+    });
+}
+
+/**
+ * Same as getEffective, but reads from the last-published snapshot
+ * (cms_published_{siteId}). Returns null when no snapshot exists yet so
+ * the caller can fall back to draft content (preserves the pre-publish
+ * behavior for sites that have never been published).
+ */
+async function getEffectivePublished(siteId, slug, locale) {
+    const snap = await getPublishedSnapshot(siteId);
+    if (!snap || !isPlainObject(snap.site)) return null;
+    const pages = isPlainObject(snap.pages) ? snap.pages : {};
+    const siteOv = isPlainObject(snap.siteLocaleOverrides) ? snap.siteLocaleOverrides : {};
+    const pageOv = isPlainObject(snap.pageLocaleOverrides) ? snap.pageLocaleOverrides : {};
+    return resolveEffective(siteId, slug, locale, {
+        getSite:                async () => snap.site,
+        getPage:                async (pageId) => pages[pageId] || null,
+        getSiteLocaleOverride:  async (loc) => siteOv[loc] || null,
+        getPageLocaleOverride:  async (pageId, loc) => pageOv[pageId]?.[loc] || null,
+    });
+}
+
+async function resolveEffective(siteId, slug, locale, ctx) {
+    const site = await ctx.getSite();
     if (!site) return { found: false, page: null, header: null, footer: null, pages: [], design: clone(DESIGN_DEFAULTS) };
 
     const defaultLocale = await getDefaultLocale();
@@ -630,8 +720,6 @@ async function getEffective(siteId, slug, locale) {
 
     const publicPages = site.pages.map(p => ({
         id: p.id, slug: p.slug, title: p.title, isHomepage: !!p.isHomepage,
-        showInNav: p.showInNav !== false,
-        navOrder:  typeof p.navOrder === 'number' ? p.navOrder : 0,
     }));
 
     let entry = null;
@@ -652,7 +740,7 @@ async function getEffective(siteId, slug, locale) {
     }
 
     const siteOverride = reqLocale && reqLocale !== defaultLocale
-        ? await getSiteLocaleOverride(siteId, reqLocale)
+        ? await ctx.getSiteLocaleOverride(reqLocale)
         : null;
     let header = deepMerge(clone(SITE_DEFAULTS.header), site.header);
     let footer = deepMerge(clone(SITE_DEFAULTS.footer), site.footer);
@@ -667,14 +755,14 @@ async function getEffective(siteId, slug, locale) {
         return { found: false, page: null, header, footer, pages: publicPages, design };
     }
 
-    const pageDoc = await getPage(siteId, entry.id);
+    const pageDoc = await ctx.getPage(entry.id);
     if (!pageDoc) {
         return { found: false, page: null, header, footer, pages: publicPages, design };
     }
 
     let blocks = pageDoc.blocks.map(b => clone(b));
     if (reqLocale !== defaultLocale) {
-        const override = await getPageLocaleOverride(siteId, entry.id, reqLocale);
+        const override = await ctx.getPageLocaleOverride(entry.id, reqLocale);
         if (override?.blocks) {
             blocks = blocks.map(b => {
                 const ov = override.blocks[b.id];
@@ -701,6 +789,74 @@ async function getEffective(siteId, slug, locale) {
         blocks,
     };
     return { found: true, page, header, footer, pages: publicPages, design };
+}
+
+// ── Publishing ───────────────────────────────────────────────────────
+//
+// Publishing snapshots the entire current state of a project (SiteDoc +
+// every PageDoc + every locale override) into a single key:
+//   cms_published_{siteId}
+// The public /site route reads the snapshot when one exists, so admin
+// edits stay invisible to visitors until the user clicks Publish again.
+// Sites that have never been published serve their draft as before
+// (caller falls back to getEffective).
+
+async function getPublishedSnapshot(siteId) {
+    assertSiteId(siteId);
+    const v = await configStore.getConfig(publishedKey(siteId));
+    return isPlainObject(v) ? v : null;
+}
+
+async function publishSite(siteId) {
+    assertSiteId(siteId);
+    const site = await getProject(siteId);
+    if (!site) throw new Error('Project not found');
+
+    const pages = {};
+    for (const entry of site.pages) {
+        const page = await getPage(siteId, entry.id);
+        if (page) pages[entry.id] = page;
+    }
+
+    const allLocaleKeys = await getAll(
+        `SELECT key FROM config WHERE key LIKE $1`,
+        [`${projectKey(siteId)}%${KEY_LOCALE_INFIX}%`]
+    );
+    const siteLocaleOverrides = {};
+    const pageLocaleOverrides = {};
+    for (const r of allLocaleKeys) {
+        const tail = r.key.substring(projectKey(siteId).length);
+        if (tail.startsWith(KEY_PAGE_INFIX)) {
+            const inner = tail.substring(KEY_PAGE_INFIX.length);
+            const splitAt = inner.indexOf(KEY_LOCALE_INFIX);
+            if (splitAt < 0) continue;
+            const pageId = inner.substring(0, splitAt);
+            const locale = inner.substring(splitAt + KEY_LOCALE_INFIX.length);
+            pageLocaleOverrides[pageId] = pageLocaleOverrides[pageId] || {};
+            pageLocaleOverrides[pageId][locale] = await configStore.getConfig(r.key);
+        } else if (tail.startsWith(KEY_LOCALE_INFIX)) {
+            const locale = tail.substring(KEY_LOCALE_INFIX.length);
+            siteLocaleOverrides[locale] = await configStore.getConfig(r.key);
+        }
+    }
+
+    const snapshot = {
+        version: PUBLISHED_VERSION,
+        publishedAt: new Date().toISOString(),
+        site,
+        pages,
+        siteLocaleOverrides,
+        pageLocaleOverrides,
+    };
+    await configStore.setConfig(publishedKey(siteId), snapshot);
+    // Short-lived diagnostic so we can confirm publish is capturing the
+    // latest blocks (not a stale read). Drop once draft/published parity
+    // is verified end-to-end.
+    const blockCounts = Object.entries(pages).map(
+        ([id, p]) => `${id}:${(p.blocks || []).length}`
+    ).join(', ');
+    console.log(`[CMS] publish siteId=${siteId} pages=${Object.keys(pages).length} blocks={${blockCounts}}`);
+    return { publishedAt: snapshot.publishedAt };
 }
 
 /**
@@ -798,11 +954,14 @@ async function getAdminPayload(siteId) {
         }
     }
 
+    const snap = await getPublishedSnapshot(siteId);
+
     return {
         defaultLocale,
         site,
         pages,
         localeOverrides: { siteByLocale, pagesByLocale },
+        publishedAt: snap?.publishedAt || null,
     };
 }
 
@@ -818,7 +977,9 @@ module.exports = {
     getPageLocaleOverride, setPageLocaleOverride, deletePageLocaleOverride,
     createPage, removePage, updatePageMeta, setHomepage, reorderPages,
     // preview / graph
-    getEffective, getSiteGraph,
+    getEffective, getEffectivePublished, getSiteGraph,
+    // publishing
+    publishSite, getPublishedSnapshot,
     // admin
     getAdminPayload,
     // helpers / constants for tests

@@ -20,12 +20,13 @@
  *     GET  /api/cms/asset/:key(*)              streams a CMS asset
  *
  *   ADMIN — site management (super-admin only):
- *     GET    /api/cms/sites                                    list sites
+ *     GET    /api/cms/sites                                    list sites + liveSiteId
  *     POST   /api/cms/sites                                    create site
  *     GET    /api/cms/sites/:siteId                            full editor payload
  *     PUT    /api/cms/sites/:siteId                            replace SiteDoc
  *     PATCH  /api/cms/sites/:siteId                            { name } — rename
  *     DELETE /api/cms/sites/:siteId                            delete site + cascade
+ *     PUT    /api/cms/sites/:siteId/live                       { live } — set/clear live
  *
  *   ADMIN — per-site content (mounted on both /admin and /sites/:siteId):
  *     GET    .../site                                          full editor payload (legacy)
@@ -44,9 +45,15 @@
  *     DELETE .../pages/:id/locale/:locale
  *
  *   ADMIN — org-wide (only at /admin/*, not per-site):
- *     PUT    /api/cms/admin/enabled                            { enabled }
+ *     PUT    /api/cms/admin/enabled                            { enabled, siteId? } — legacy
  *     PUT    /api/cms/admin/default-locale                     { locale }
  *     POST   /api/cms/admin/upload                             multipart file → { key, url }
+ *
+ *   "Live" model: at most one project can be live at a time. The public
+ *   /api/cms/site reads the live siteId from cms_live_site_id; admins
+ *   toggle it per-site via /sites/:siteId/live. The legacy
+ *   /admin/enabled route reinterprets boolean toggles as "clear / set
+ *   live to first project" so older clients keep working.
  */
 
 const express = require('express');
@@ -60,22 +67,59 @@ const languageStore = require('../stores/languageStore');
 const storageStore = require('../stores/storageStore');
 const { hasPermission } = require('../auth/permissions');
 
-// ── Org-wide enabled flag ────────────────────────────────────────
+// ── Live-site selection ──────────────────────────────────────────
 //
-// The store has no enabled concept (it's a per-project doc). The "Live"
-// toggle in the admin panel is org-wide for now, so we keep it as a
-// standalone config key managed here. Move into the SiteDoc once the UI
-// supports per-project publishing.
+// "Live" used to be a global on/off flag (cms_enabled). Now it's per-
+// project and mutually exclusive: at most one project can be live at a
+// time, and the live URL serves *that* project. Other projects stay
+// editable in the admin without affecting the public site.
+//
+// Storage:
+//   cms_live_site_id : string | null   the live project's siteId, or null
+//                                      when nothing is live (public site
+//                                      is dark and "/" redirects to /app).
+//
+// Migration: legacy cms_enabled === true with no live id set → adopt
+// projects[0] as live (preserves prior behavior). Done lazily inside
+// getLiveSiteId so we don't add a startup ordering surprise.
 
-const KEY_CMS_ENABLED = 'cms_enabled';
+const KEY_CMS_LIVE_SITE_ID = 'cms_live_site_id';
+const KEY_CMS_ENABLED      = 'cms_enabled';   // legacy, read-only after migration
 
-async function getCmsEnabled() {
-    const v = await configStore.getConfig(KEY_CMS_ENABLED);
-    return v === true;
+async function getLiveSiteId() {
+    const stored = await configStore.getConfig(KEY_CMS_LIVE_SITE_ID);
+    if (typeof stored === 'string' && SITE_ID_RE.test(stored)) {
+        // Validate the project still exists; clear stale ids defensively.
+        const project = await cmsStore.getProject(stored).catch(() => null);
+        if (project) return stored;
+        await configStore.setConfig(KEY_CMS_LIVE_SITE_ID, null);
+        return null;
+    }
+    if (stored !== undefined && stored !== null) return null;
+
+    // Lazy migration: legacy cms_enabled flag → adopt projects[0] if true.
+    const legacyEnabled = await configStore.getConfig(KEY_CMS_ENABLED);
+    if (legacyEnabled === true) {
+        const projects = await cmsStore.listProjects();
+        const adopted = projects[0]?.id || null;
+        await configStore.setConfig(KEY_CMS_LIVE_SITE_ID, adopted);
+        return adopted;
+    }
+    return null;
 }
 
-async function setCmsEnabled(enabled) {
-    await configStore.setConfig(KEY_CMS_ENABLED, !!enabled);
+async function setLiveSiteId(siteId) {
+    if (siteId === null) {
+        await configStore.setConfig(KEY_CMS_LIVE_SITE_ID, null);
+        return null;
+    }
+    if (typeof siteId !== 'string' || !SITE_ID_RE.test(siteId)) {
+        throw new Error('Invalid siteId');
+    }
+    const project = await cmsStore.getProject(siteId);
+    if (!project) throw new Error('Site not found');
+    await configStore.setConfig(KEY_CMS_LIVE_SITE_ID, siteId);
+    return siteId;
 }
 
 // ── Single-project bridge ────────────────────────────────────────
@@ -155,25 +199,73 @@ const upload = multer({
 function synthesizeLegacyContent(eff) {
     const out = {};
     if (eff.header) {
-        // Attach the page list + active-page slug so Header.jsx's auto-nav
-        // fallback works on the public site too (it already gets the same
-        // shape from buildPreviewContent in the admin preview).
+        // navLinks / ctaHref: Header.jsx reads flat `{label, href}` and
+        // `data.ctaHref`, but resolveLinksInTree leaves the storage shape
+        // (`link: {href, target?, rel?}`) on each entry. Flatten here so
+        // the public site sees the same shape the admin preview produces
+        // via buildPreviewContent — otherwise every nav link would be
+        // silently dropped and the CTA would fall back to '/app'.
+        //
+        // The page list is no longer attached: nav is fully owned by the
+        // user via Site chrome → Nav links, so Header.jsx never reads
+        // data.pages anymore.
         out.header = {
             ...eff.header,
-            pages: (eff.pages || []).map(p => ({
-                slug: p.slug,
-                title: p.title,
-                isHomepage: !!p.isHomepage,
-                showInNav: p.showInNav !== false,
-                navOrder:  typeof p.navOrder === 'number' ? p.navOrder : 0,
+            // logo passes through via the spread; Header.jsx prefers
+            // logo.text and logo.src when present, falling back to the
+            // legacy logoText / letter-avatar otherwise.
+            navLinks: (eff.header.nav || []).map(n => ({
+                label: n.label,
+                href:  n.link?.href || '#',
+                ...(n.link?.target ? { target: n.link.target } : {}),
+                ...(n.link?.rel    ? { rel:    n.link.rel    } : {}),
+                // Dropdown children get the same flat shape; their
+                // `link.href` was already resolved by resolveLinksInTree
+                // when getEffective walked the header tree.
+                children: (n.children || []).map(c => ({
+                    label: c.label,
+                    href:  c.link?.href || '#',
+                    ...(c.link?.target ? { target: c.link.target } : {}),
+                    ...(c.link?.rel    ? { rel:    c.link.rel    } : {}),
+                })),
+            })),
+            // Header buttons (multi-CTA) — same flat {label, href, style,
+            // target?, rel?} shape Header.jsx renders.
+            ctas: (eff.header.ctas || []).map(cta => ({
+                id: cta.id,
+                label: cta.label,
+                href:  cta.link?.href || '/app',
+                style: cta.style || 'primary',
+                ...(cta.link?.target ? { target: cta.link.target } : {}),
+                ...(cta.link?.rel    ? { rel:    cta.link.rel    } : {}),
             })),
             activeSlug: eff.page?.isHomepage ? '' : (eff.page?.slug || ''),
         };
     }
     if (eff.footer) {
+        // Flatten column links + socials the same way buildPreviewContent
+        // does for the admin preview — Footer.jsx reads `link.href` and
+        // `social.href` directly. Without this, every footer link would
+        // ship to live with `href` undefined and render as a non-clickable
+        // <a>.
         out.footer = {
             ...eff.footer,
             brand: { logoText: eff.footer.brandText, blurb: eff.footer.blurb },
+            columns: (eff.footer.columns || []).map(c => ({
+                heading: c.heading,
+                links: (c.links || []).map(l => ({
+                    label: l.label,
+                    href:  l.link?.href || '#',
+                    ...(l.link?.target ? { target: l.link.target } : {}),
+                    ...(l.link?.rel    ? { rel:    l.link.rel    } : {}),
+                })),
+            })),
+            socials: (eff.footer.socials || []).map(s => ({
+                platform: s.platform,
+                href:     s.link?.href || '#',
+                ...(s.link?.target ? { target: s.link.target } : {}),
+                ...(s.link?.rel    ? { rel:    s.link.rel    } : {}),
+            })),
         };
     }
     // Embed design inside content so the public-site renderer at "/" picks
@@ -203,12 +295,20 @@ function synthesizeLegacyContent(eff) {
 
 async function getSitePayload(req, res) {
     try {
-        const [payload, locales, enabled] = await Promise.all([
+        const [payload, locales, liveSiteId] = await Promise.all([
             cmsStore.getAdminPayload(req.siteId),
             languageStore.getAvailableLocales(),
-            getCmsEnabled(),
+            getLiveSiteId(),
         ]);
-        res.json({ ...payload, locales, enabled });
+        // `enabled` is derived (true iff some site is live). Kept for any
+        // legacy panel code still reading it; new code should branch on
+        // liveSiteId === activeSiteId to know if *this* site is live.
+        res.json({
+            ...payload,
+            locales,
+            enabled: liveSiteId !== null,
+            liveSiteId,
+        });
     } catch (err) {
         console.error('[CMS] getSitePayload error:', err.message);
         res.status(500).json({ error: err.message });
@@ -327,8 +427,11 @@ async function deletePageLocale(req, res) {
 
 async function listSitesHandler(req, res) {
     try {
-        const sites = await cmsStore.listProjects();
-        res.json({ sites });
+        const [sites, liveSiteId] = await Promise.all([
+            cmsStore.listProjects(),
+            getLiveSiteId(),
+        ]);
+        res.json({ sites, liveSiteId });
     } catch (err) { res.status(500).json({ error: err.message }); }
 }
 
@@ -354,7 +457,44 @@ async function renameSiteHandler(req, res) {
 async function deleteSiteHandler(req, res) {
     try {
         await cmsStore.deleteProject(req.siteId);
+        // If the deleted project was the live one, take the public site
+        // dark rather than letting getLiveSiteId silently lazy-clear later.
+        const liveSiteId = await configStore.getConfig(KEY_CMS_LIVE_SITE_ID);
+        if (liveSiteId === req.siteId) {
+            await configStore.setConfig(KEY_CMS_LIVE_SITE_ID, null);
+        }
         res.json({ success: true });
+    } catch (err) { res.status(400).json({ error: err.message }); }
+}
+
+async function postSitePublish(req, res) {
+    try {
+        const result = await cmsStore.publishSite(req.siteId);
+        res.json({ success: true, ...result });
+    } catch (err) { res.status(400).json({ error: err.message }); }
+}
+
+async function putSiteLive(req, res) {
+    try {
+        const { live } = req.body || {};
+        if (typeof live !== 'boolean') {
+            return res.status(400).json({ error: 'live must be a boolean' });
+        }
+        if (live) {
+            // Setting this site live implicitly takes any other live site
+            // offline — only one project can be live at a time.
+            await setLiveSiteId(req.siteId);
+            return res.json({ success: true, liveSiteId: req.siteId });
+        }
+        // Clearing only matters when *this* site is the currently-live
+        // one; otherwise toggling it off is a no-op (avoids accidentally
+        // dark-ing the public site from an inactive editor tab).
+        const current = await getLiveSiteId();
+        if (current === req.siteId) {
+            await setLiveSiteId(null);
+            return res.json({ success: true, liveSiteId: null });
+        }
+        res.json({ success: true, liveSiteId: current });
     } catch (err) { res.status(400).json({ error: err.message }); }
 }
 
@@ -362,10 +502,27 @@ async function deleteSiteHandler(req, res) {
 
 async function putEnabled(req, res) {
     try {
-        const { enabled } = req.body || {};
+        const { enabled, siteId } = req.body || {};
         if (typeof enabled !== 'boolean') return res.status(400).json({ error: 'enabled must be a boolean' });
-        await setCmsEnabled(enabled);
-        res.json({ success: true, enabled });
+        if (!enabled) {
+            // Org-wide off: clear the live id so the public site goes dark.
+            await setLiveSiteId(null);
+            return res.json({ success: true, enabled: false, liveSiteId: null });
+        }
+        // Org-wide on: callers may name a specific siteId to make live, or
+        // omit it to keep the currently-live one (or fall back to the
+        // first project if none has ever been live before).
+        if (siteId) {
+            const next = await setLiveSiteId(siteId);
+            return res.json({ success: true, enabled: true, liveSiteId: next });
+        }
+        let next = await getLiveSiteId();
+        if (!next) {
+            const projects = await cmsStore.listProjects();
+            next = projects[0]?.id || null;
+            if (next) await setLiveSiteId(next);
+        }
+        res.json({ success: true, enabled: next !== null, liveSiteId: next });
     } catch (err) { res.status(500).json({ error: err.message }); }
 }
 
@@ -409,25 +566,25 @@ async function handleUpload(req, res) {
  *   v=2 → { enabled, defaultLocale, locale, found, page, header, footer, pages }
  *   no v → legacy shape: { enabled, defaultLocale, locale, content }
  *
- * `?slug=…` selects a page (only honored with v=2). When omitted the homepage
- * is returned. `?locale=…` picks a locale; falls back to default.
+ * `?slug=…` selects a page. When omitted the homepage is returned.
+ * `?locale=…` picks a locale; falls back to default.
  *
- * Reads from the org's default site (the bridge target). Multi-site public
- * routing (per-domain or path-prefix) is a future phase.
+ * Reads from whichever project is currently marked Live (cms_live_site_id).
+ * When nothing is live the response is `{ enabled: false }` and the front-end
+ * redirects "/" to /app.
  */
 router.get('/site', async (req, res) => {
     try {
-        const enabled = await getCmsEnabled();
-        if (!enabled) {
-            res.setHeader('Cache-Control', 'public, max-age=60');
-            return res.json({ enabled: false });
-        }
-
-        const siteId = await getDefaultSiteId();
+        // Public site serves whatever project is marked Live. If nothing is
+        // live the public URL stays dark (RootPathGate redirects to /app).
+        // Note: this is decoupled from the admin's active project — admins
+        // can edit a different site without affecting what the public sees.
+        const siteId = await getLiveSiteId();
+        // Disable caching here — content updates from the admin should
+        // appear immediately. Re-introduce a short TTL once edits push a
+        // version bump or cache key.
+        res.setHeader('Cache-Control', 'no-store');
         if (!siteId) {
-            // Enabled but no project provisioned yet (admin hasn't visited
-            // the panel). Return enabled:false so the public site stays dark.
-            res.setHeader('Cache-Control', 'public, max-age=60');
             return res.json({ enabled: false });
         }
 
@@ -436,15 +593,33 @@ router.get('/site', async (req, res) => {
         const v2 = req.query.v === '2';
         const slug = (req.query.slug || '').toString();
 
-        const eff = await cmsStore.getEffective(siteId, slug || null, locale);
+        // Prefer the last-published snapshot. Sites that have never been
+        // published fall through to the draft so existing live sites don't
+        // suddenly go blank when this code ships.
+        const eff = await cmsStore.getEffectivePublished(siteId, slug || null, locale)
+                 || await cmsStore.getEffective(siteId, slug || null, locale);
 
-        res.setHeader('Cache-Control', 'public, max-age=60');
+        // Canonical URL for the served page: '' for the homepage, otherwise
+        // its slug. The client uses this to redirect e.g. `/home` → `/` so
+        // every page has exactly one URL.
+        const canonicalSlug = eff.page?.isHomepage
+            ? ''
+            : (eff.page?.slug || '');
+
+        // Diagnostic: short-lived log so we can see which site/slug was
+        // resolved when the public site looks empty. Drop once stable.
+        // `source` distinguishes published-snapshot reads from the draft
+        // fallback used for sites that have never been published.
+        const source = await cmsStore.getPublishedSnapshot(siteId).then(s => s ? 'published' : 'draft').catch(() => 'unknown');
+        console.log(`[CMS] /site siteId=${siteId} slug="${slug}" source=${source} found=${eff.found} blocks=${eff.page?.blocks?.length ?? 0}`);
+
         if (v2) {
             return res.json({
                 enabled: true,
                 defaultLocale,
                 locale,
                 found: eff.found,
+                canonicalSlug,
                 page: eff.page,
                 header: eff.header,
                 footer: eff.footer,
@@ -454,6 +629,11 @@ router.get('/site', async (req, res) => {
         }
         return res.json({
             enabled: true,
+            // `found` lets the front-end distinguish "slug exists but has no
+            // blocks" (render anyway) from "slug doesn't match any page"
+            // (fall through to the BeeFlow app router) when path-routing.
+            found: eff.found,
+            canonicalSlug,
             defaultLocale,
             locale,
             content: synthesizeLegacyContent(eff),
@@ -510,6 +690,10 @@ router.delete('/admin/pages/:id', deletePageHandler);
 router.get('/admin/pages/:id', getPageById);
 router.put('/admin/pages/:id', putPage);
 
+// Publish — same handler as the multi-site route, scoped to the bridge's
+// default site.
+router.post('/admin/publish', postSitePublish);
+
 // Org-wide flags (not per-site — only available here).
 router.put('/admin/enabled', putEnabled);
 router.put('/admin/default-locale', putDefaultLocale);
@@ -547,6 +731,15 @@ router.delete('/sites/:siteId/site/locale/:locale', deleteSiteLocale);
 
 // Page graph for the sitemap diagram.
 router.get('/sites/:siteId/graph', getGraph);
+
+// Per-site Live toggle — mutually exclusive across projects (only one
+// can be live at a time; setting one live takes the previous one offline).
+router.put('/sites/:siteId/live', putSiteLive);
+
+// Publish — snapshot the current draft into cms_published_{siteId}. The
+// public /api/cms/site route reads from this snapshot, so visitors only
+// see content the user has explicitly published.
+router.post('/sites/:siteId/publish', postSitePublish);
 
 // Site-level operations on the SiteDoc itself.
 router.get('/sites/:siteId', getSitePayload);
