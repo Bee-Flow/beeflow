@@ -106,20 +106,177 @@ function matchGmailMailFilter(payload, filter) {
     return true;
 }
 
+// ── Per-trigger matchers ───────────────────────────────────────────────
+//
+// Each matcher is a pure function `(payload, filter) → boolean`. They share
+// these conventions with `matchGmailMailFilter`:
+//   - undefined/empty filter → always pass.
+//   - unknown filter keys are ignored (forward-compatible).
+//   - regex fields are capped at 200 chars and fail-closed on parse error.
+//   - case-insensitive substring is the default for free-text fields.
+
+function containsCI(haystack, needle) {
+    if (typeof haystack !== 'string' || typeof needle !== 'string') return false;
+    return haystack.toLowerCase().includes(needle.toLowerCase());
+}
+
+/**
+ * gmail.label.added — fires when a label is applied to a message.
+ * Filter: { labelId (required), from?, subjectContains?, excludeLabelIds? }.
+ */
+function matchGmailLabelFilter(payload, filter) {
+    if (!filter || typeof filter !== 'object') return true;
+    if (!payload) return false;
+    const added = Array.isArray(payload.addedLabelIds) ? payload.addedLabelIds : [];
+    if (filter.labelId && !added.includes(filter.labelId)) return false;
+    if (filter.from && !containsCI(payload.from, filter.from)) return false;
+    if (filter.subjectContains && !containsCI(payload.subject, filter.subjectContains)) return false;
+    if (Array.isArray(filter.excludeLabelIds) && filter.excludeLabelIds.length) {
+        const all = Array.isArray(payload.labelIds) ? payload.labelIds : [];
+        if (filter.excludeLabelIds.some(id => all.includes(id))) return false;
+    }
+    return true;
+}
+
+/**
+ * google-calendar.event.changed — fires when the syncToken poller surfaces
+ * an event mutation. Filter: { calendarId?, statusEquals?, attendeeEmailContains? }.
+ */
+function matchCalendarChangedFilter(payload, filter) {
+    if (!filter || typeof filter !== 'object') return true;
+    if (!payload) return false;
+    if (filter.calendarId && payload.calendarId && payload.calendarId !== filter.calendarId) return false;
+    if (filter.statusEquals && payload.status !== filter.statusEquals) return false;
+    if (filter.attendeeEmailContains) {
+        const ats = Array.isArray(payload.attendees) ? payload.attendees : [];
+        if (!ats.some(a => containsCI(a?.email || '', filter.attendeeEmailContains))) return false;
+    }
+    return true;
+}
+
+/**
+ * google-calendar.event.upcoming — server-side already filtered to the
+ * leadMinutes window so the matcher is effectively a passthrough; we still
+ * honour calendarId / attendee filters for users whose `events.list` query
+ * spans multiple calendars (calendarId='primary' default).
+ */
+function matchCalendarUpcomingFilter(payload, filter) {
+    return matchCalendarChangedFilter(payload, filter);
+}
+
+/**
+ * google-drive.file.new — fires when a new file appears in changes.list.
+ * Filter: { folderId?, mimeType?, nameContains?, excludeOwnUploads? }.
+ */
+function matchDriveFileNewFilter(payload, filter) {
+    if (!filter || typeof filter !== 'object') return true;
+    if (!payload) return false;
+    if (filter.folderId) {
+        const parents = Array.isArray(payload.parents) ? payload.parents : [];
+        if (!parents.includes(filter.folderId)) return false;
+    }
+    if (filter.mimeType && payload.mimeType !== filter.mimeType) return false;
+    if (filter.nameContains && !containsCI(payload.name, filter.nameContains)) return false;
+    if (filter.excludeOwnUploads === true) {
+        const owners = Array.isArray(payload.owners) ? payload.owners : [];
+        if (owners.some(o => o?.me === true)) return false;
+    }
+    return true;
+}
+
+/**
+ * nextcloud.file.new / nextcloud.file.changed — shared filter shape.
+ * Filter: { inFolder?, extension?, nameContains?, excludeOwnUploads? }.
+ */
+function matchNextcloudFileFilter(payload, filter) {
+    if (!filter || typeof filter !== 'object') return true;
+    if (!payload) return false;
+    const path = String(payload.path || payload.objectName || '');
+    if (filter.inFolder) {
+        const prefix = String(filter.inFolder).replace(/\/+$/, '');
+        if (prefix && !path.startsWith(prefix.startsWith('/') ? prefix : `/${prefix}`)) {
+            // Allow caller to omit leading slash.
+            const alt = `/${prefix.replace(/^\/+/, '')}`;
+            if (!path.startsWith(alt)) return false;
+        }
+    }
+    if (filter.extension) {
+        const want = String(filter.extension).replace(/^\./, '').toLowerCase();
+        const got = path.split('.').pop()?.toLowerCase();
+        if (want && got !== want) return false;
+    }
+    if (filter.nameContains && !containsCI(payload.name || path.split('/').pop() || '', filter.nameContains)) return false;
+    if (filter.excludeOwnUploads === true) {
+        // Activity feed actor is the user who performed the action; the
+        // poller stamps `payload.isOwnAction` based on the session uid.
+        if (payload.isOwnAction === true) return false;
+    }
+    return true;
+}
+
+/**
+ * nextcloud.share.received — Filter: { actorEquals?, nameContains?, kindEquals? }.
+ */
+function matchNextcloudShareFilter(payload, filter) {
+    if (!filter || typeof filter !== 'object') return true;
+    if (!payload) return false;
+    if (filter.actorEquals && payload.actor !== filter.actorEquals) return false;
+    if (filter.nameContains && !containsCI(payload.name || payload.objectName || '', filter.nameContains)) return false;
+    if (filter.kindEquals && payload.kind !== filter.kindEquals) return false;
+    return true;
+}
+
+/**
+ * nextcloud.activity.new — power-user catch-all.
+ * Filter: { type?, objectNameContains?, actorEquals? }.
+ */
+function matchNextcloudActivityFilter(payload, filter) {
+    if (!filter || typeof filter !== 'object') return true;
+    if (!payload) return false;
+    if (filter.type && payload.type !== filter.type) return false;
+    if (filter.objectNameContains && !containsCI(payload.objectName || '', filter.objectNameContains)) return false;
+    if (filter.actorEquals && payload.actor !== filter.actorEquals) return false;
+    return true;
+}
+
+/**
+ * nextcloud.notification.new — Filter: { app?, subjectContains? }.
+ */
+function matchNextcloudNotificationFilter(payload, filter) {
+    if (!filter || typeof filter !== 'object') return true;
+    if (!payload) return false;
+    if (filter.app && payload.app !== filter.app) return false;
+    if (filter.subjectContains && !containsCI(payload.subject || '', filter.subjectContains)) return false;
+    return true;
+}
+
+/**
+ * Picks the right matcher for a (provider, event) pair. Falls back to the
+ * shallow `matchFilter` for anything we haven't taught explicit semantics
+ * — keeps webhook providers (msgraph, github) working unchanged.
+ */
+function pickMatcher(provider, event) {
+    if (provider === 'gmail' && event === 'mail.new') return matchGmailMailFilter;
+    if (provider === 'gmail' && event === 'label.added') return matchGmailLabelFilter;
+    if (provider === 'google-calendar' && event === 'event.changed')  return matchCalendarChangedFilter;
+    if (provider === 'google-calendar' && event === 'event.upcoming') return matchCalendarUpcomingFilter;
+    if (provider === 'google-drive' && event === 'file.new')          return matchDriveFileNewFilter;
+    if (provider === 'nextcloud' && (event === 'file.new' || event === 'file.changed')) return matchNextcloudFileFilter;
+    if (provider === 'nextcloud' && event === 'share.received')       return matchNextcloudShareFilter;
+    if (provider === 'nextcloud' && event === 'activity.new')         return matchNextcloudActivityFilter;
+    if (provider === 'nextcloud' && event === 'notification.new')     return matchNextcloudNotificationFilter;
+    return matchFilter;
+}
+
 async function dispatchEvent({ provider, event, payload = {}, userId = null }) {
     const subs = await automationStore.getSubscriptionsForProvider(provider, event);
     const runs = [];
-    const isGmailMailNew = provider === 'gmail' && event === 'mail.new';
+    const matcher = pickMatcher(provider, event);
     for (const sub of subs) {
         if (userId && sub.userId !== userId) continue;
-        // Gmail mail.new gets a richer matcher; everything else keeps
-        // the shallow object-equality semantics that webhook providers
-        // rely on.
-        const ok = isGmailMailNew
-            ? matchGmailMailFilter(payload, sub.filter)
-            : matchFilter(payload, sub.filter);
+        const ok = matcher(payload, sub.filter);
         if (!ok) {
-            console.log(`[TriggerBus] sub ${sub.id} filter rejected event (subject="${payload.subject || ''}" from="${payload.from || ''}")`);
+            console.log(`[TriggerBus] sub ${sub.id} filter rejected event (subject="${payload.subject || payload.objectName || ''}" from="${payload.from || payload.actor || ''}")`);
             continue;
         }
         const automation = await automationStore.getAutomation(sub.automationId);
@@ -247,6 +404,117 @@ async function loadSession(userId) {
     }
 }
 
+// Module-scoped cache of the Nextcloud activity feed per-user. Five
+// triggers (file.new / file.changed / share.received / activity.new /
+// notification.new) can subscribe at once for the same user; without a
+// cache they would each issue an HTTP request inside a single polling
+// tick. Cache is short-lived (a few seconds) — long enough to coalesce
+// the in-pass calls, short enough that the next tick still fetches fresh
+// rows.
+const _ncActivityCache = new Map(); // userId → { ts, rows[] }
+const NC_ACTIVITY_CACHE_TTL_MS = 5_000;
+
+async function _ncFetchActivityRows(userId, session) {
+    const cached = _ncActivityCache.get(userId);
+    if (cached && Date.now() - cached.ts < NC_ACTIVITY_CACHE_TTL_MS) return cached.rows;
+    let rows = [];
+    try {
+        const tools = require('../integrations/nextcloudActivityTools');
+        const result = await tools.executeNextcloudActivityTool(
+            'nextcloud_activity_list',
+            { filter: 'all', limit: 200 },
+            userId, session,
+        );
+        if (result?.activities) rows = result.activities;
+        else if (result?.error) console.warn(`[TriggerBus] nextcloud activity fetch failed for user ${userId}: ${result.error}`);
+    } catch (e) {
+        console.warn(`[TriggerBus] nextcloud activity fetch threw for user ${userId}: ${e.message}`);
+    }
+    rows.sort((a, b) => (a.id || 0) - (b.id || 0));
+    _ncActivityCache.set(userId, { ts: Date.now(), rows });
+    return rows;
+}
+
+/**
+ * Map a raw activity row to the normalised payload our triggers emit, plus
+ * `_kind` flags the per-trigger filter uses to route. Activity API type
+ * slugs vary by Nextcloud version, so we look at both the `type` field
+ * and the human-readable subject as a fallback (documented in the plan).
+ */
+function _ncNormaliseActivity(row, session) {
+    const t = String(row.type || '').toLowerCase();
+    const subj = String(row.subject || '').toLowerCase();
+    const isFileCreated = t === 'file_created' || (t === 'files' && subj.includes('created'));
+    const isFileChanged = t === 'file_changed' || t === 'file_updated' || (t === 'files' && (subj.includes('changed') || subj.includes('updated')));
+    const isShareReceived = t === 'shared_with_you' || t === 'remote_share_received'
+        || ((t === 'shares' || t === 'shared') && subj.includes('shared'));
+
+    const path = row.objectName || '';
+    const name = path.split('/').filter(Boolean).pop() || path;
+    const extension = name.includes('.') ? name.split('.').pop().toLowerCase() : null;
+
+    const sessionUid = session?.nextcloudUid
+        || session?.routineProviders?.nextcloud?.nextcloudUid
+        || null;
+    const isOwnAction = !!(sessionUid && row.actor === sessionUid);
+
+    return {
+        activityId: row.id,
+        type: row.type,
+        subject: row.subject,
+        message: row.message,
+        actor: row.actor,
+        objectName: row.objectName,
+        objectType: row.objectType,
+        path,
+        name,
+        extension,
+        // Folder vs file is fuzzy in the activity feed — Nextcloud only
+        // sends `objectType:'files'` for both. Best-effort: treat trailing
+        // slash or absent extension on the path as folder.
+        kind: (path.endsWith('/') || !extension) ? 'folder' : 'file',
+        link: row.link,
+        datetime: row.datetime,
+        isOwnAction,
+        raw: row,
+        _isFileCreated: isFileCreated,
+        _isFileChanged: isFileChanged,
+        _isShareReceived: isShareReceived,
+    };
+}
+
+/** Generic Nextcloud poller body — every Nextcloud channel uses this
+ *  with a different `predicate` to pick which rows to emit. */
+async function _ncPollChannel({ sub, session, predicate }) {
+    const rows = await _ncFetchActivityRows(sub.userId, session);
+    const cursorId = sub.lastCursor ? Number(sub.lastCursor) : 0;
+    const fresh = rows.filter(r => Number(r.id || 0) > cursorId);
+
+    // Bootstrap: first poll only anchors the cursor; we don't deliver
+    // historic rows the moment the user activates the trigger (mirrors
+    // the Gmail bootstrap convention).
+    if (!sub.lastCursor) {
+        const maxId = rows.length ? rows[rows.length - 1].id : null;
+        if (maxId != null) {
+            await automationStore.updateSubscription(sub.id, { lastCursor: String(maxId) });
+            console.log(`[TriggerBus] nextcloud bootstrap sub ${sub.id} anchored at activity_id=${maxId}`);
+        }
+        return [];
+    }
+
+    const events = [];
+    let highest = cursorId;
+    for (const row of fresh) {
+        const normalised = _ncNormaliseActivity(row, session);
+        if (predicate(normalised)) events.push(normalised);
+        if (Number(row.id || 0) > highest) highest = Number(row.id);
+    }
+    if (highest > cursorId) {
+        await automationStore.updateSubscription(sub.id, { lastCursor: String(highest) });
+    }
+    return events;
+}
+
 const POLLERS = {
     gmail: {
         'mail.new': async (sub, session) => {
@@ -344,6 +612,91 @@ const POLLERS = {
                 return [];
             }
         },
+
+        /**
+         * label.added — fires when a label is applied to a message. Reuses
+         * the same Gmail history machinery as mail.new but watches a
+         * different `historyType`. Bootstrap path is identical.
+         */
+        'label.added': async (sub, session) => {
+            const { google } = require('googleapis');
+            const auth = new google.auth.OAuth2();
+            auth.setCredentials({ access_token: session.accessToken, refresh_token: session.refreshToken });
+            const gmail = google.gmail({ version: 'v1', auth });
+
+            const isCursorStaleError = (err) => {
+                const code = err?.code || err?.response?.status;
+                const msg = String(err?.message || '').toLowerCase();
+                return code === 404
+                    || msg.includes('requested entity was not found')
+                    || msg.includes('invalid history id')
+                    || msg.includes('invalid_grant');
+            };
+
+            if (sub.lastCursor) {
+                try {
+                    const r = await gmail.users.history.list({
+                        userId: 'me',
+                        startHistoryId: sub.lastCursor,
+                        historyTypes: ['labelAdded'],
+                    });
+                    // Group label-added rows by messageId so a single
+                    // message that picked up multiple labels in one batch
+                    // fires once with all addedLabelIds aggregated.
+                    const byMsg = new Map();
+                    for (const h of (r.data.history || [])) {
+                        for (const la of (h.labelsAdded || [])) {
+                            const id = la.message?.id;
+                            if (!id) continue;
+                            const existing = byMsg.get(id) || { messageId: id, threadId: la.message?.threadId, addedLabelIds: [] };
+                            for (const lid of (la.labelIds || [])) {
+                                if (!existing.addedLabelIds.includes(lid)) existing.addedLabelIds.push(lid);
+                            }
+                            byMsg.set(id, existing);
+                        }
+                    }
+                    const events = [];
+                    for (const ev of [...byMsg.values()].slice(0, 20)) {
+                        const enriched = await fetchGmailMessageMetadata(gmail, ev.messageId).catch(() => null);
+                        events.push({ ...ev, ...(enriched || {}) });
+                    }
+                    if (r.data.historyId) await automationStore.updateSubscription(sub.id, { lastCursor: String(r.data.historyId) });
+                    return events;
+                } catch (err) {
+                    if (isCursorStaleError(err)) {
+                        console.warn(`[TriggerBus] gmail label cursor ${sub.lastCursor} stale for sub ${sub.id} — clearing.`);
+                        await automationStore.updateSubscription(sub.id, { lastCursor: null });
+                    } else {
+                        console.warn('[TriggerBus] gmail label poll error:', err.message);
+                        return [];
+                    }
+                }
+            }
+
+            // Bootstrap — anchor at the current historyId without delivering historic events.
+            try {
+                const list = await gmail.users.messages.list({ userId: 'me', maxResults: 1 });
+                const newest = list.data.messages?.[0];
+                if (newest?.id) {
+                    const meta = await gmail.users.messages.get({
+                        userId: 'me', id: newest.id, format: 'metadata', metadataHeaders: ['Date'],
+                    });
+                    if (meta.data.historyId) {
+                        await automationStore.updateSubscription(sub.id, { lastCursor: String(meta.data.historyId) });
+                        console.log(`[TriggerBus] gmail.label.added bootstrap sub ${sub.id} anchored at historyId=${meta.data.historyId}`);
+                        return [];
+                    }
+                }
+                const profile = await gmail.users.getProfile({ userId: 'me' });
+                if (profile.data.historyId) {
+                    await automationStore.updateSubscription(sub.id, { lastCursor: String(profile.data.historyId) });
+                }
+                return [];
+            } catch (e) {
+                console.warn('[TriggerBus] gmail label bootstrap error:', e.message);
+                return [];
+            }
+        },
     },
     'google-calendar': {
         'event.changed': async (sub, session) => {
@@ -352,17 +705,248 @@ const POLLERS = {
                 const auth = new google.auth.OAuth2();
                 auth.setCredentials({ access_token: session.accessToken, refresh_token: session.refreshToken });
                 const cal = google.calendar({ version: 'v3', auth });
-                const res = await cal.events.list({
-                    calendarId: 'primary',
-                    syncToken: sub.lastCursor || undefined,
-                    maxResults: 50,
-                });
-                if (res.data.nextSyncToken) await automationStore.updateSubscription(sub.id, { lastCursor: res.data.nextSyncToken });
-                return (res.data.items || []).map(ev => ({
-                    eventId: ev.id, summary: ev.summary, start: ev.start, end: ev.end, status: ev.status,
-                }));
+                // Calendar's syncToken expires after ~1 month of disuse and
+                // returns 410 Gone — same recoverable shape as Gmail's 404.
+                // Drop the cursor and let the next tick re-bootstrap.
+                try {
+                    const res = await cal.events.list({
+                        calendarId: 'primary',
+                        syncToken: sub.lastCursor || undefined,
+                        maxResults: 50,
+                    });
+                    if (res.data.nextSyncToken) await automationStore.updateSubscription(sub.id, { lastCursor: res.data.nextSyncToken });
+                    return (res.data.items || []).map(ev => ({
+                        eventId: ev.id,
+                        summary: ev.summary || '',
+                        description: ev.description || null,
+                        start: ev.start || null,
+                        end: ev.end || null,
+                        status: ev.status || null,
+                        calendarId: 'primary',
+                        organizer: ev.organizer || null,
+                        attendees: ev.attendees || [],
+                        htmlLink: ev.htmlLink || null,
+                    }));
+                } catch (err) {
+                    const code = err?.code || err?.response?.status;
+                    if (code === 410 || /sync token/i.test(err?.message || '')) {
+                        console.warn(`[TriggerBus] calendar syncToken stale for sub ${sub.id} — clearing.`);
+                        await automationStore.updateSubscription(sub.id, { lastCursor: null });
+                        // Bootstrap on the next tick — return [] so we don't
+                        // dump a year of historic events into the user's lap.
+                        return [];
+                    }
+                    throw err;
+                }
             } catch (e) {
                 console.warn('[TriggerBus] calendar poll error:', e.message);
+                return [];
+            }
+        },
+
+        /**
+         * event.upcoming — fire N minutes before the start of an event.
+         * Cursor JSON: { firedIds:[…last 200] }.
+         */
+        'event.upcoming': async (sub, session) => {
+            try {
+                const { google } = require('googleapis');
+                const auth = new google.auth.OAuth2();
+                auth.setCredentials({ access_token: session.accessToken, refresh_token: session.refreshToken });
+                const cal = google.calendar({ version: 'v3', auth });
+
+                const filter = sub.filter || {};
+                const leadMinutes = Math.max(1, Math.min(Number(filter.leadMinutes) || 15, 240));
+                const calendarId = filter.calendarId || 'primary';
+                const includeAllDay = filter.includeAllDay === true;
+
+                const now = Date.now();
+                // Query a slightly wider window than leadMinutes so a slow
+                // tick doesn't miss the boundary.
+                const SAFETY_MIN = 5;
+                const timeMin = new Date(now).toISOString();
+                const timeMax = new Date(now + (leadMinutes + SAFETY_MIN) * 60_000).toISOString();
+
+                const res = await cal.events.list({
+                    calendarId,
+                    timeMin, timeMax,
+                    singleEvents: true,
+                    orderBy: 'startTime',
+                    maxResults: 50,
+                });
+
+                let cursor = { firedIds: [] };
+                try { if (sub.lastCursor) cursor = JSON.parse(sub.lastCursor) || cursor; } catch { /* ignore */ }
+                const fired = new Set(Array.isArray(cursor.firedIds) ? cursor.firedIds : []);
+
+                const events = [];
+                const newlyFired = [];
+                for (const ev of (res.data.items || [])) {
+                    if (!ev.id || fired.has(ev.id)) continue;
+                    if (!includeAllDay && !ev.start?.dateTime) continue; // skip all-day unless asked
+                    const startMs = ev.start?.dateTime ? Date.parse(ev.start.dateTime) : NaN;
+                    if (!Number.isFinite(startMs)) continue;
+                    const minutesUntilStart = Math.round((startMs - now) / 60_000);
+                    if (minutesUntilStart > leadMinutes) continue; // not yet within window
+                    if (minutesUntilStart < -SAFETY_MIN) continue; // already started > safety ago
+                    events.push({
+                        eventId: ev.id,
+                        summary: ev.summary || '',
+                        description: ev.description || null,
+                        start: ev.start, end: ev.end,
+                        status: ev.status || null,
+                        calendarId,
+                        organizer: ev.organizer || null,
+                        attendees: ev.attendees || [],
+                        htmlLink: ev.htmlLink || null,
+                        minutesUntilStart,
+                    });
+                    newlyFired.push(ev.id);
+                }
+
+                if (newlyFired.length > 0) {
+                    const all = [...fired, ...newlyFired].slice(-200);
+                    await automationStore.updateSubscription(sub.id, {
+                        lastCursor: JSON.stringify({ firedIds: all }),
+                    });
+                } else if (!sub.lastCursor) {
+                    // Initialise an empty cursor so we don't keep hitting
+                    // the bootstrap branch.
+                    await automationStore.updateSubscription(sub.id, {
+                        lastCursor: JSON.stringify({ firedIds: [] }),
+                    });
+                }
+                return events;
+            } catch (e) {
+                console.warn('[TriggerBus] calendar upcoming poll error:', e.message);
+                return [];
+            }
+        },
+    },
+
+    'google-drive': {
+        /**
+         * file.new — fires when a file is created in the user's Drive.
+         * Bootstraps with `getStartPageToken`; subsequent ticks use
+         * `changes.list({pageToken})` and emit creates only.
+         */
+        'file.new': async (sub, session) => {
+            const { google } = require('googleapis');
+            const auth = new google.auth.OAuth2();
+            auth.setCredentials({ access_token: session.accessToken, refresh_token: session.refreshToken });
+            const drive = google.drive({ version: 'v3', auth });
+
+            const isStaleCursor = (err) => {
+                const code = err?.code || err?.response?.status;
+                const msg = String(err?.message || '').toLowerCase();
+                return code === 404 || msg.includes('invalid_grant') || msg.includes('start page token');
+            };
+
+            if (!sub.lastCursor) {
+                try {
+                    const r = await drive.changes.getStartPageToken();
+                    if (r.data?.startPageToken) {
+                        await automationStore.updateSubscription(sub.id, { lastCursor: String(r.data.startPageToken) });
+                        console.log(`[TriggerBus] drive bootstrap sub ${sub.id} anchored at pageToken=${r.data.startPageToken}`);
+                    }
+                } catch (e) {
+                    console.warn('[TriggerBus] drive bootstrap error:', e.message);
+                }
+                return [];
+            }
+
+            try {
+                const r = await drive.changes.list({
+                    pageToken: sub.lastCursor,
+                    includeRemoved: false,
+                    spaces: 'drive',
+                    fields: 'changes(time,removed,fileId,file(id,name,mimeType,parents,createdTime,modifiedTime,owners(emailAddress,me),webViewLink,trashed)),newStartPageToken,nextPageToken',
+                    pageSize: 100,
+                });
+                const events = [];
+                for (const ch of (r.data.changes || [])) {
+                    const f = ch.file;
+                    if (!f || ch.removed || f.trashed) continue;
+                    // Treat as "new" when createdTime is recent (within the
+                    // last 24h relative to the change time). Modifications
+                    // of older files have createdTime predating the change
+                    // and are skipped.
+                    const created = Date.parse(f.createdTime || '') || 0;
+                    const changeT = Date.parse(ch.time || '') || Date.now();
+                    if (changeT - created > 24 * 60 * 60_000) continue;
+                    events.push({
+                        fileId: f.id,
+                        name: f.name || '',
+                        mimeType: f.mimeType || '',
+                        parents: f.parents || [],
+                        createdTime: f.createdTime || null,
+                        owners: f.owners || [],
+                        webViewLink: f.webViewLink || null,
+                    });
+                }
+                const next = r.data.newStartPageToken || r.data.nextPageToken;
+                if (next) await automationStore.updateSubscription(sub.id, { lastCursor: String(next) });
+                return events;
+            } catch (err) {
+                if (isStaleCursor(err)) {
+                    console.warn(`[TriggerBus] drive cursor ${sub.lastCursor} stale for sub ${sub.id} — clearing.`);
+                    await automationStore.updateSubscription(sub.id, { lastCursor: null });
+                    return [];
+                }
+                console.warn('[TriggerBus] drive poll error:', err.message);
+                return [];
+            }
+        },
+    },
+
+    nextcloud: {
+        'file.new':       (sub, session) => _ncPollChannel({ sub, session, predicate: r => r._isFileCreated }),
+        'file.changed':   (sub, session) => _ncPollChannel({ sub, session, predicate: r => r._isFileChanged }),
+        'share.received': (sub, session) => _ncPollChannel({ sub, session, predicate: r => r._isShareReceived }),
+        'activity.new':   (sub, session) => _ncPollChannel({ sub, session, predicate: () => true }),
+
+        /**
+         * notification.new — separate Notifications API, not the activity
+         * feed. Cursor = highest seen notification id.
+         */
+        'notification.new': async (sub, session) => {
+            try {
+                const tools = require('../integrations/nextcloudNotificationsTools');
+                const result = await tools.executeNextcloudNotificationsTool(
+                    'nextcloud_notifications_list', { limit: 100 }, sub.userId, session,
+                );
+                if (result?.error) {
+                    console.warn(`[TriggerBus] nextcloud notifications fetch failed for sub ${sub.id}: ${result.error}`);
+                    return [];
+                }
+                const items = Array.isArray(result?.notifications) ? result.notifications.slice() : [];
+                items.sort((a, b) => (a.id || 0) - (b.id || 0));
+                const cursorId = sub.lastCursor ? Number(sub.lastCursor) : 0;
+
+                if (!sub.lastCursor) {
+                    const maxId = items.length ? items[items.length - 1].id : 0;
+                    await automationStore.updateSubscription(sub.id, { lastCursor: String(maxId || 0) });
+                    return [];
+                }
+
+                const fresh = items.filter(n => Number(n.id || 0) > cursorId);
+                let highest = cursorId;
+                const events = [];
+                for (const n of fresh) {
+                    if (Number(n.id || 0) > highest) highest = Number(n.id);
+                    events.push({
+                        notificationId: n.id,
+                        app: n.app || null,
+                        subject: n.subject || '',
+                        message: n.message || '',
+                        link: n.link || null,
+                        datetime: n.datetime || null,
+                    });
+                }
+                if (highest > cursorId) await automationStore.updateSubscription(sub.id, { lastCursor: String(highest) });
+                return events;
+            } catch (e) {
+                console.warn('[TriggerBus] nextcloud notifications poll error:', e.message);
                 return [];
             }
         },
@@ -487,4 +1071,22 @@ async function fetchLatestGmailMatch(userId, filter) {
     }
 }
 
-module.exports = { dispatchEvent, runPollingPass, renewExpiringSubscriptions, matchGmailMailFilter, fetchLatestGmailMatch, loadSession };
+module.exports = {
+    dispatchEvent,
+    runPollingPass,
+    renewExpiringSubscriptions,
+    fetchLatestGmailMatch,
+    loadSession,
+    // Matchers — exported for unit testing + so other server code can
+    // re-use them (e.g. a future Diagnose endpoint that wants to show
+    // "would this filter match this sample payload?").
+    matchGmailMailFilter,
+    matchGmailLabelFilter,
+    matchCalendarChangedFilter,
+    matchCalendarUpcomingFilter,
+    matchDriveFileNewFilter,
+    matchNextcloudFileFilter,
+    matchNextcloudShareFilter,
+    matchNextcloudActivityFilter,
+    matchNextcloudNotificationFilter,
+};

@@ -679,6 +679,23 @@ router.get('/:id/runs', async (req, res) => {
     }
 });
 
+/**
+ * Cross-automation recent runs for the current user. Powers the unified
+ * activity view in the studio's empty-pane state so users can spot
+ * failures across all of their automations without drilling in one by
+ * one. Always scoped to the requesting user — no admin-wide endpoint.
+ */
+router.get('/_runs/recent', async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+        const runs = await automationStore.getRecentRunsForUser(userId, { limit });
+        res.json({ runs });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 router.get('/:id/versions', async (req, res) => {
     try {
         const userId = req.session.user.id;

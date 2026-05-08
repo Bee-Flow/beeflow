@@ -69,8 +69,16 @@ const VALID_REF_ROOTS = new Set(['trigger', 'steps', 'vars', 'secrets', 'loop'])
 // ("from", "subject", …) we can confidently prepend `trigger.output.` instead
 // of bouncing the call back to the model. Keyed by `<provider>.<event>`.
 const TRIGGER_FIELDS_BY_EVENT = {
-    'gmail.mail.new': ['messageId', 'threadId', 'from', 'to', 'cc', 'subject', 'snippet', 'labelIds', 'date', 'sizeEstimate', 'historyId'],
-    'google-calendar.event.changed': ['eventId', 'summary', 'start', 'end', 'status'],
+    'gmail.mail.new':                 ['messageId', 'threadId', 'from', 'to', 'cc', 'subject', 'snippet', 'labelIds', 'date', 'sizeEstimate', 'historyId'],
+    'gmail.label.added':              ['messageId', 'threadId', 'addedLabelIds', 'from', 'to', 'subject', 'snippet', 'labelIds', 'date'],
+    'google-calendar.event.changed':  ['eventId', 'summary', 'description', 'start', 'end', 'status', 'calendarId', 'organizer', 'attendees', 'htmlLink'],
+    'google-calendar.event.upcoming': ['eventId', 'summary', 'description', 'start', 'end', 'status', 'calendarId', 'organizer', 'attendees', 'htmlLink', 'minutesUntilStart'],
+    'google-drive.file.new':          ['fileId', 'name', 'mimeType', 'parents', 'createdTime', 'owners', 'webViewLink'],
+    'nextcloud.file.new':             ['activityId', 'path', 'name', 'extension', 'kind', 'actor', 'datetime', 'link'],
+    'nextcloud.file.changed':         ['activityId', 'path', 'name', 'extension', 'kind', 'actor', 'datetime', 'link'],
+    'nextcloud.share.received':       ['activityId', 'path', 'name', 'kind', 'actor', 'datetime', 'link'],
+    'nextcloud.activity.new':         ['activityId', 'type', 'subject', 'message', 'actor', 'objectName', 'link', 'datetime'],
+    'nextcloud.notification.new':     ['notificationId', 'app', 'subject', 'message', 'link', 'datetime'],
 };
 
 function triggerFieldsFor(draft) {
@@ -171,56 +179,99 @@ KIND OPTIONS:
   - schedule     — fires on a cron timer (5-field cron, minute hour dom month dow).
   - manual       — fires only when the user clicks "Run".
   - webhook      — fires on inbound HTTPS POST to a signed URL.
-  - app_event    — fires when an external service emits an event (today: Gmail "new email").
+  - app_event    — fires when a connected service (Gmail / Calendar / Drive / Nextcloud) emits an event.
 
-EXAMPLES:
+SCHEDULE EXAMPLES:
   - weekly Monday 9am Europe/Amsterdam → {kind:"schedule",cron:"0 9 * * 1",tz:"Europe/Amsterdam"}
   - first Monday of the month at 9am  → {kind:"schedule",cron:"0 9 1-7 * 1",tz:"Europe/Amsterdam"}
-  - WHEN USER SAYS "when a new email arrives" / "every time I get an email" / "on incoming mail"
-    USE: {kind:"app_event",appProvider:"gmail",appEvent:"mail.new"}.
 
-    GMAIL FILTER FIELDS (all optional; ALL specified fields must match):
-      from              substring (case-insensitive) on the From header.
-                        Use the email address: filter:{from:"boss@example.com"}.
-      to                substring on the To header.
-      cc                substring on the Cc header.
-      subjectContains   substring on Subject (case-insensitive).
-      subjectRegex      JS regex on Subject (case-insensitive).
-      labelIds          string[]; fires if message has ANY of these labels.
-                        Gmail label ids look like "Label_3" or system ids
-                        like "INBOX" / "IMPORTANT" / "STARRED".
-      excludeLabelIds   string[]; drops messages with any of these labels.
-      hasAttachment     boolean; fires only when the message has attachments.
-      excludeFromSelf   boolean; drops mail you sent yourself (SENT label).
-      maxAgeMinutes     number; freshness cap — drops messages older than N
-                        minutes. Useful so a long-paused poller doesn't flood
-                        with backlog on resume.
+APP_EVENT TRIGGERS (pick the most specific; use filters to narrow):
 
-    EXAMPLES:
-      - Only emails from your boss:
-        {kind:"app_event",appProvider:"gmail",appEvent:"mail.new",filter:{from:"boss@example.com",excludeFromSelf:true}}
-      - Invoice-labelled mail with attachments:
-        {kind:"app_event",appProvider:"gmail",appEvent:"mail.new",filter:{labelIds:["Label_3"],hasAttachment:true}}
-      - Subject matches "Order #123":
-        {kind:"app_event",appProvider:"gmail",appEvent:"mail.new",filter:{subjectRegex:"^Order #\\\\d+"}}
+  ── Gmail ──
+  • mail.new — fires on every new email. Most-asked Gmail trigger.
+    Filters: from, to, cc, subjectContains, subjectRegex, labelIds[],
+             excludeLabelIds[], hasAttachment, excludeFromSelf, maxAgeMinutes.
+    Payload: {messageId, threadId, from, to, cc, subject, date, snippet,
+             labelIds, sizeEstimate, historyId}.
+    EXAMPLE — only emails from your boss:
+      {kind:"app_event",appProvider:"gmail",appEvent:"mail.new",
+       filter:{from:"boss@example.com",excludeFromSelf:true}}
+    **Replying**: when adding a gmail_compose step to reply, ALWAYS bind
+    replyToMessageId: trigger.output.messageId. Without it Gmail renders
+    the reply as a fresh standalone email instead of inline in the
+    original conversation — even if you also pass threadId.
+    NOTE — "in the last 24 hours" is NOT a filter for mail.new because it
+    fires on every newly-arrived message in real time. For "every morning
+    summarise yesterday's email", use a schedule trigger + a gmail_search
+    step with q:"newer_than:1d" instead.
 
-    NOTE — "in the last 24 hours" is NOT a filter for this trigger because
-    mail.new fires on every newly-arrived message in real time. If the user
-    wants "every morning, summarise the last 24 hours of email" use a
-    schedule trigger + a gmail_search step with q:"newer_than:1d" instead.
+  • label.added — fires when a label is applied (manually or by a Gmail
+    filter rule). Useful for "when I label something 'urgent', do X".
+    Filters: labelId (REQUIRED), from, subjectContains, excludeLabelIds[].
+    Payload: {messageId, threadId, addedLabelIds, from, to, subject,
+             snippet, labelIds, date}.
+    EXAMPLE: {kind:"app_event",appProvider:"gmail",appEvent:"label.added",
+             filter:{labelId:"Label_3"}}
 
-    The trigger payload exposed to downstream steps is:
-    {messageId, threadId, from, to, cc, subject, date, snippet, labelIds, sizeEstimate, historyId}.
-    Bind via trigger.output.subject / trigger.output.from / etc. — DO NOT add a
-    leading gmail_search step just to look up the message that triggered the run.`,
+  ── Google Calendar ──
+  • event.changed — fires when any event in the user's primary calendar
+    is created, updated, or cancelled.
+    Filters: calendarId, statusEquals ("confirmed"/"cancelled"),
+             attendeeEmailContains.
+    Payload: {eventId, summary, description, start, end, status,
+             calendarId, organizer, attendees, htmlLink}.
+
+  • event.upcoming — fires N minutes BEFORE an event starts. Best for
+    "remind me 15 min before any meeting" workflows.
+    Filters: leadMinutes (default 15), calendarId, includeAllDay (default
+             false), attendeeEmailContains.
+    Payload: same as event.changed plus {minutesUntilStart}.
+    EXAMPLE: {kind:"app_event",appProvider:"google-calendar",
+             appEvent:"event.upcoming",filter:{leadMinutes:15}}
+
+  ── Google Drive ──
+  • file.new — fires when a file is created (not modified) in the user's
+    Drive.
+    Filters: folderId, mimeType, nameContains, excludeOwnUploads.
+    Payload: {fileId, name, mimeType, parents, createdTime, owners,
+             webViewLink}.
+    EXAMPLE — PDFs landing in /Invoices folder:
+      {kind:"app_event",appProvider:"google-drive",appEvent:"file.new",
+       filter:{folderId:"<drive-folder-id>",mimeType:"application/pdf"}}
+
+  ── Nextcloud ──
+  • file.new — fires when a file is uploaded/created.
+    Filters: inFolder (path prefix like "/Invoices"), extension ("pdf"),
+             nameContains, excludeOwnUploads.
+    Payload: {activityId, path, name, extension, kind, actor, datetime, link}.
+
+  • file.changed — fires when a file is modified. Same filter shape as file.new.
+
+  • share.received — fires when a file or folder is shared with the user.
+    Filters: actorEquals (the sharer's username), nameContains,
+             kindEquals ("file"/"folder").
+    Payload: {activityId, path, name, kind, actor, datetime, link}.
+
+  • activity.new — power-user catch-all; covers comments, mentions, tags,
+    Deck moves, calendar invites, and anything else in the Nextcloud
+    activity feed. Prefer the specific triggers above when applicable.
+    Filters: type (raw activity slug), objectNameContains, actorEquals.
+
+  • notification.new — fires on Nextcloud system notifications (Talk
+    pings, share invitations, app announcements).
+    Filters: app ("spreed", "files_sharing", …), subjectContains.
+    Payload: {notificationId, app, subject, message, link, datetime}.
+
+GENERAL: bind the trigger payload via trigger.output.<field>. DO NOT add a
+leading search step just to look up data that's already in the payload.`,
             parameters: {
                 type: 'object',
                 properties: {
                     kind: { type: 'string', enum: ['schedule', 'manual', 'webhook', 'app_event'] },
                     cron: { type: 'string', description: 'Standard 5-field cron, REQUIRED when kind=schedule. Use exact format: minute hour day-of-month month day-of-week. Example: "0 9 * * 1" = every Monday at 9:00.' },
                     tz: { type: 'string', description: 'IANA timezone, e.g. Europe/Amsterdam (when kind=schedule).' },
-                    appProvider: { type: 'string', description: 'Provider id (when kind=app_event): gmail | google-calendar | msgraph | github' },
-                    appEvent: { type: 'string', description: 'Event name (when kind=app_event), e.g. mail.new for Gmail.' },
+                    appProvider: { type: 'string', description: 'Provider id (when kind=app_event): gmail | google-calendar | google-drive | nextcloud' },
+                    appEvent: { type: 'string', description: 'Event name (when kind=app_event). Allowed: gmail.{mail.new, label.added}; google-calendar.{event.changed, event.upcoming}; google-drive.file.new; nextcloud.{file.new, file.changed, share.received, activity.new, notification.new}.' },
                     filter: { type: 'object', description: 'Optional filter object that must shallowly match the event payload.' },
                 },
                 required: ['kind'],

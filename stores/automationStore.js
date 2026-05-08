@@ -469,6 +469,33 @@ async function getRunsForAutomation(automationId, { limit = 50 } = {}) {
     return rows.map(rowToRun);
 }
 
+/**
+ * Cross-automation recent runs for one user. Powers the "All runs" view
+ * shown when no specific automation is selected — gives the user a single
+ * timeline of recent activity instead of forcing them to click into each
+ * automation to find a fresh failure.
+ *
+ * Joins back to `automations` so the caller can render the title /
+ * trigger type without a second round-trip.
+ */
+async function getRecentRunsForUser(userId, { limit = 50 } = {}) {
+    await initDB();
+    const rows = await getAll(
+        `SELECT r.*, a.title AS automation_title, a.trigger_type AS automation_trigger_type
+           FROM automation_runs r
+           JOIN automations a ON a.id = r.automation_id
+          WHERE r.user_id = $1
+          ORDER BY r.started_at DESC NULLS LAST
+          LIMIT $2`,
+        [userId, limit],
+    );
+    return rows.map(r => ({
+        ...rowToRun(r),
+        automationTitle: r.automation_title || null,
+        automationTriggerType: r.automation_trigger_type || null,
+    }));
+}
+
 async function updateRun(id, updates) {
     await initDB();
     const map = { status: 'status', startedAt: 'started_at', finishedAt: 'finished_at', durationMs: 'duration_ms', error: 'error', summary: 'summary' };
@@ -710,6 +737,7 @@ module.exports = {
     createRun,
     getRun,
     getRunsForAutomation,
+    getRecentRunsForUser,
     updateRun,
     recordRunStep,
     getRunSteps,
