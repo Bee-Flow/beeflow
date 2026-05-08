@@ -49,6 +49,7 @@ const { NEXTCLOUD_NOTES_TOOLS } = require('../integrations/nextcloudNotesTools')
 const { NEXTCLOUD_MAIL_TOOLS } = require('../integrations/nextcloudMailTools');
 const { NEXTCLOUD_ACTIVITY_TOOLS } = require('../integrations/nextcloudActivityTools');
 const { NEXTCLOUD_STATUS_TOOLS } = require('../integrations/nextcloudStatusTools');
+const { TICKET_ASSISTANT_TOOLS } = require('../integrations/ticketAssistantTools');
 
 // IDs that are exempt from org-level gating (admin-only tools, internal utilities)
 const ORG_EXEMPT_APPS = ['workspace', 'regex-gen'];
@@ -304,6 +305,24 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
             }
         }
     } catch (e) { /* ignore — credentials missing or store unavailable */ }
+
+    // Ticket Assistant — gated only by the per-app toggle. The tools check
+    // org membership at execute-time so we don't need to enforce it here;
+    // the surface is org-scoped, not OAuth-token-gated. Non-admin users get
+    // the read/AI tools but the create/delete connection tools are filtered
+    // out so the LLM doesn't propose actions that will return Forbidden.
+    if (isAppOn('ticket-assistant')) {
+        const taTools = TICKET_ASSISTANT_TOOLS;
+        if (isAdmin) {
+            addTools(taTools);
+        } else {
+            const safe = taTools.filter(t => {
+                const n = t?.function?.name || '';
+                return n !== 'ticket_assistant_create_connection' && n !== 'ticket_assistant_delete_connection';
+            });
+            addTools(safe);
+        }
+    }
 
     // Transcription — requires existing Mistral API key
     const hasMistralKey = !!(await configStore.getSecret('mistral_api_key'));

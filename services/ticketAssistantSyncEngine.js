@@ -1371,6 +1371,33 @@ async function syncConnection(connection) {
                     );
                     categoryDocsCreated++;
                     recordOutcome(results, 'ingested', { messageId, subject: processed.title });
+
+                    // Fan out to the automation trigger bus so routines can
+                    // react to each ingested ticket. Wrapped in try/catch so
+                    // a triggerBus failure NEVER blocks the sync engine —
+                    // the SSE stream + DB state stay correct even if the
+                    // trigger dispatch hiccups.
+                    try {
+                        const triggerBus = require('../automation/triggerBus');
+                        triggerBus.dispatchTicketAssistantEvent('ticket.new', {
+                            ticketId: em.source_id || em.messageId || messageId,
+                            connectionId: connection.id,
+                            provider: connection.provider,
+                            subject: processed.title,
+                            body: processed.article,
+                            status: em.status || null,
+                            status_bucket: em.status_bucket || null,
+                            priority: em.priority || null,
+                            category: em.category || processed.category || null,
+                            sourceUri,
+                            attachments: (em.attachments || []).map(a => ({ filename: a.filename, mime: a.mime, size: a.size })),
+                            ingestedAt: new Date().toISOString(),
+                        }, connection.organization_id).catch(e => {
+                            console.warn('[TicketAssistantSync] triggerBus dispatch (ticket.new) failed:', e.message);
+                        });
+                    } catch (e) {
+                        console.warn('[TicketAssistantSync] triggerBus require/dispatch (ticket.new) failed:', e.message);
+                    }
                 } catch (ingestErr) {
                     if (ingestErr.code === 'DUPLICATE' || ingestErr.code === 'NEAR_DUPLICATE') {
                         results.skipped++;
@@ -1477,6 +1504,26 @@ async function syncConnection(connection) {
             outcomes: results.outcomes,
         });
 
+        // Fire the automation `sync.completed` event alongside the SSE one.
+        try {
+            const triggerBus = require('../automation/triggerBus');
+            triggerBus.dispatchTicketAssistantEvent('sync.completed', {
+                connectionId: connection.id,
+                provider: connection.provider,
+                outcome: results.errors > 0 ? 'partial' : 'success',
+                stats: {
+                    emailsFetched: results.fetched,
+                    articlesCreated: categoryDocsCreated,
+                    articlesSkipped: results.skipped,
+                    errors: results.errors,
+                },
+            }, connection.organization_id).catch(e => {
+                console.warn('[TicketAssistantSync] triggerBus dispatch (sync.completed/success) failed:', e.message);
+            });
+        } catch (e) {
+            console.warn('[TicketAssistantSync] triggerBus dispatch (sync.completed/success) require failed:', e.message);
+        }
+
         console.log(`[TicketAssistantSync] ✅ ${connection.provider} ${connection.email_address}: ${processedArticles.length} emails → ${categoryDocsCreated} category docs, ${results.skipped} skipped, ${results.errors} errors`);
 
     } catch (err) {
@@ -1511,6 +1558,26 @@ async function syncConnection(connection) {
             },
             outcomes: fatalOutcomes,
         });
+
+        try {
+            const triggerBus = require('../automation/triggerBus');
+            triggerBus.dispatchTicketAssistantEvent('sync.completed', {
+                connectionId: connection.id,
+                provider: connection.provider,
+                outcome: 'error',
+                error: err.message,
+                stats: {
+                    emailsFetched: results?.fetched || 0,
+                    articlesCreated: 0,
+                    articlesSkipped: results?.skipped || 0,
+                    errors: (results?.errors || 0) + 1,
+                },
+            }, connection.organization_id).catch(e => {
+                console.warn('[TicketAssistantSync] triggerBus dispatch (sync.completed/error) failed:', e.message);
+            });
+        } catch (e) {
+            console.warn('[TicketAssistantSync] triggerBus dispatch (sync.completed/error) require failed:', e.message);
+        }
     } finally {
         metrics.recordSyncDuration(connection.provider || 'unknown', (Date.now() - syncStartedAt) / 1000);
         // Release the sync lock so the next tick/manual sync can run.

@@ -79,6 +79,8 @@ const TRIGGER_FIELDS_BY_EVENT = {
     'nextcloud.share.received':       ['activityId', 'path', 'name', 'kind', 'actor', 'datetime', 'link'],
     'nextcloud.activity.new':         ['activityId', 'type', 'subject', 'message', 'actor', 'objectName', 'link', 'datetime'],
     'nextcloud.notification.new':     ['notificationId', 'app', 'subject', 'message', 'link', 'datetime'],
+    'ticket-assistant.ticket.new':    ['ticketId', 'connectionId', 'provider', 'subject', 'body', 'status', 'status_bucket', 'priority', 'category', 'sourceUri', 'attachments', 'ingestedAt'],
+    'ticket-assistant.sync.completed':['connectionId', 'provider', 'outcome', 'stats'],
 };
 
 function triggerFieldsFor(draft) {
@@ -262,6 +264,28 @@ APP_EVENT TRIGGERS (pick the most specific; use filters to narrow):
     Filters: app ("spreed", "files_sharing", …), subjectContains.
     Payload: {notificationId, app, subject, message, link, datetime}.
 
+  ── Ticket Assistant (ITIL ticket sync — gmail/outlook/jira/servicenow/
+                       zendesk/freshservice/topdesk) ──
+  • ticket.new — fires when the Ticket Assistant ingests a new email or
+    ticket. Org-scoped: every user in the org sees events for any of the
+    org's connections. Pair with the ticket_assistant_* tools to rebuild
+    or extend the standalone TA pipeline (clean → redact → summarise →
+    classify) inside a routine.
+    Filters: connectionId, provider ("gmail"/"outlook"/"jira"/"zendesk"/…),
+             subjectContains, bodyContains, categoryEquals (post-AI),
+             priorityEquals, statusEquals.
+    Payload: {ticketId, connectionId, provider, subject, body, status,
+             status_bucket, priority, category, sourceUri, attachments,
+             ingestedAt}.
+    EXAMPLE — high-priority Jira tickets only:
+      {kind:"app_event",appProvider:"ticket-assistant",
+       appEvent:"ticket.new",filter:{provider:"jira",priorityEquals:"high"}}
+
+  • sync.completed — fires when a TA connection's sync run finishes.
+    Filters: connectionId, provider, outcomeEquals ("success"/"error"/
+             "partial").
+    Payload: {connectionId, provider, outcome, stats}.
+
 GENERAL: bind the trigger payload via trigger.output.<field>. DO NOT add a
 leading search step just to look up data that's already in the payload.`,
             parameters: {
@@ -270,8 +294,8 @@ leading search step just to look up data that's already in the payload.`,
                     kind: { type: 'string', enum: ['schedule', 'manual', 'webhook', 'app_event'] },
                     cron: { type: 'string', description: 'Standard 5-field cron, REQUIRED when kind=schedule. Use exact format: minute hour day-of-month month day-of-week. Example: "0 9 * * 1" = every Monday at 9:00.' },
                     tz: { type: 'string', description: 'IANA timezone, e.g. Europe/Amsterdam (when kind=schedule).' },
-                    appProvider: { type: 'string', description: 'Provider id (when kind=app_event): gmail | google-calendar | google-drive | nextcloud' },
-                    appEvent: { type: 'string', description: 'Event name (when kind=app_event). Allowed: gmail.{mail.new, label.added}; google-calendar.{event.changed, event.upcoming}; google-drive.file.new; nextcloud.{file.new, file.changed, share.received, activity.new, notification.new}.' },
+                    appProvider: { type: 'string', description: 'Provider id (when kind=app_event): gmail | google-calendar | google-drive | nextcloud | ticket-assistant' },
+                    appEvent: { type: 'string', description: 'Event name (when kind=app_event). Allowed: gmail.{mail.new, label.added}; google-calendar.{event.changed, event.upcoming}; google-drive.file.new; nextcloud.{file.new, file.changed, share.received, activity.new, notification.new}; ticket-assistant.{ticket.new, sync.completed}.' },
                     filter: { type: 'object', description: 'Optional filter object that must shallowly match the event payload.' },
                 },
                 required: ['kind'],

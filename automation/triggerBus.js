@@ -251,6 +251,38 @@ function matchNextcloudNotificationFilter(payload, filter) {
 }
 
 /**
+ * ticket-assistant.ticket.new — fires when the SyncEngine ingests a new
+ * ticket (gmail / outlook email body or jira/zendesk/etc. ticket).
+ * Filter: { connectionId?, provider?, subjectContains?, bodyContains?,
+ *           categoryEquals?, priorityEquals?, statusEquals? }.
+ */
+function matchTicketAssistantTicketNewFilter(payload, filter) {
+    if (!filter || typeof filter !== 'object') return true;
+    if (!payload) return false;
+    if (filter.connectionId && payload.connectionId !== filter.connectionId) return false;
+    if (filter.provider && payload.provider !== filter.provider) return false;
+    if (filter.subjectContains && !containsCI(payload.subject || '', filter.subjectContains)) return false;
+    if (filter.bodyContains && !containsCI(payload.body || '', filter.bodyContains)) return false;
+    if (filter.categoryEquals && payload.category !== filter.categoryEquals) return false;
+    if (filter.priorityEquals && payload.priority !== filter.priorityEquals) return false;
+    if (filter.statusEquals && payload.status !== filter.statusEquals && payload.status_bucket !== filter.statusEquals) return false;
+    return true;
+}
+
+/**
+ * ticket-assistant.sync.completed — fires after a sync run finishes.
+ * Filter: { connectionId?, provider?, outcomeEquals? (`success`/`error`/`partial`) }.
+ */
+function matchTicketAssistantSyncFilter(payload, filter) {
+    if (!filter || typeof filter !== 'object') return true;
+    if (!payload) return false;
+    if (filter.connectionId && payload.connectionId !== filter.connectionId) return false;
+    if (filter.provider && payload.provider !== filter.provider) return false;
+    if (filter.outcomeEquals && payload.outcome !== filter.outcomeEquals) return false;
+    return true;
+}
+
+/**
  * Picks the right matcher for a (provider, event) pair. Falls back to the
  * shallow `matchFilter` for anything we haven't taught explicit semantics
  * — keeps webhook providers (msgraph, github) working unchanged.
@@ -265,6 +297,8 @@ function pickMatcher(provider, event) {
     if (provider === 'nextcloud' && event === 'share.received')       return matchNextcloudShareFilter;
     if (provider === 'nextcloud' && event === 'activity.new')         return matchNextcloudActivityFilter;
     if (provider === 'nextcloud' && event === 'notification.new')     return matchNextcloudNotificationFilter;
+    if (provider === 'ticket-assistant' && event === 'ticket.new')    return matchTicketAssistantTicketNewFilter;
+    if (provider === 'ticket-assistant' && event === 'sync.completed') return matchTicketAssistantSyncFilter;
     return matchFilter;
 }
 
@@ -293,6 +327,56 @@ async function dispatchEvent({ provider, event, payload = {}, userId = null }) {
             runs.push({ subId: sub.id, runId: run?.id });
         } catch (e) {
             console.error('[TriggerBus] dispatch error:', e.message);
+        }
+    }
+    return runs;
+}
+
+/**
+ * Org-scoped dispatch for the Ticket Assistant. Tickets / sync events live
+ * at the organisation level (not user level), so we route to every
+ * subscription whose subscriber belongs to `orgId`. Anyone outside that
+ * org never sees the event — the regular `dispatchEvent` would have
+ * required us to fan out one call per user, which is wasteful.
+ *
+ * Per-call cache keyed by userId avoids repeated `userStore.getUser`
+ * lookups when many subscriptions share a subscriber.
+ */
+async function dispatchTicketAssistantEvent(event, payload = {}, orgId = null) {
+    if (!event) return [];
+    const subs = await automationStore.getSubscriptionsForProvider('ticket-assistant', event);
+    if (subs.length === 0) return [];
+
+    const userStore = require('../stores/userStore');
+    const orgCache = new Map(); // userId → orgId
+    const lookupOrg = async (uid) => {
+        if (orgCache.has(uid)) return orgCache.get(uid);
+        const u = await userStore.getUser(uid).catch(() => null);
+        const o = u?.organizationId || null;
+        orgCache.set(uid, o);
+        return o;
+    };
+
+    const runs = [];
+    const matcher = pickMatcher('ticket-assistant', event);
+    for (const sub of subs) {
+        if (orgId) {
+            const subOrg = await lookupOrg(sub.userId);
+            if (subOrg !== orgId) continue;
+        }
+        if (!matcher(payload, sub.filter)) continue;
+        const automation = await automationStore.getAutomation(sub.automationId);
+        if (!automation || !automation.isActive || automation.isDraft) continue;
+        const runner = require('../core/automationRunner');
+        try {
+            console.log(`[TriggerBus] dispatch automation=${automation.id} via TA sub ${sub.id} (event=${event})`);
+            const run = await runner.executeAutomation(automation, {
+                triggerKind: 'app_event',
+                triggerPayload: { provider: 'ticket-assistant', event, ...payload },
+            });
+            runs.push({ subId: sub.id, runId: run?.id });
+        } catch (e) {
+            console.error('[TriggerBus] TA dispatch error:', e.message);
         }
     }
     return runs;
@@ -1073,6 +1157,7 @@ async function fetchLatestGmailMatch(userId, filter) {
 
 module.exports = {
     dispatchEvent,
+    dispatchTicketAssistantEvent,
     runPollingPass,
     renewExpiringSubscriptions,
     fetchLatestGmailMatch,
@@ -1089,4 +1174,6 @@ module.exports = {
     matchNextcloudShareFilter,
     matchNextcloudActivityFilter,
     matchNextcloudNotificationFilter,
+    matchTicketAssistantTicketNewFilter,
+    matchTicketAssistantSyncFilter,
 };

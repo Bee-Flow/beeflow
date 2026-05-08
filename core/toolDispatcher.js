@@ -50,6 +50,7 @@ const { isNextcloudNotesTool, executeNextcloudNotesTool } = require('../integrat
 const { isNextcloudMailTool, executeNextcloudMailTool } = require('../integrations/nextcloudMailTools');
 const { isNextcloudActivityTool, executeNextcloudActivityTool } = require('../integrations/nextcloudActivityTools');
 const { isNextcloudStatusTool, executeNextcloudStatusTool } = require('../integrations/nextcloudStatusTools');
+const { isTicketAssistantTool, executeTicketAssistantTool } = require('../integrations/ticketAssistantTools');
 
 /**
  * Execute a tool by name.
@@ -391,6 +392,9 @@ async function executeTool(toolName, toolArgs, context = {}) {
     }
     if (isNextcloudStatusTool(toolName)) {
         return await executeNextcloudStatusTool(toolName, toolArgs, userId, session);
+    }
+    if (isTicketAssistantTool(toolName)) {
+        return await executeTicketAssistantTool(toolName, toolArgs, userId, session);
     }
     if (isNextcloudTool(toolName)) {
         return await executeNextcloudTool(toolName, toolArgs, userId, session);

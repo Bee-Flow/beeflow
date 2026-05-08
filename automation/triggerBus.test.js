@@ -35,6 +35,8 @@ const {
     matchNextcloudShareFilter,
     matchNextcloudActivityFilter,
     matchNextcloudNotificationFilter,
+    matchTicketAssistantTicketNewFilter,
+    matchTicketAssistantSyncFilter,
 } = require('./triggerBus');
 
 const baseMsg = {
@@ -176,5 +178,52 @@ assert.strictEqual(matchNextcloudNotificationFilter(ncNotif, { app: 'spreed' }),
 assert.strictEqual(matchNextcloudNotificationFilter(ncNotif, { app: 'files_sharing' }), false);
 assert.strictEqual(matchNextcloudNotificationFilter(ncNotif, { subjectContains: 'office room' }), true, 'case-insensitive');
 assert.strictEqual(matchNextcloudNotificationFilter(ncNotif, { subjectContains: 'invoice' }), false);
+
+// ── matchTicketAssistantTicketNewFilter ────────────────────────────────
+const taTicket = {
+    ticketId: 'JIRA-123',
+    connectionId: 'conn-1',
+    provider: 'jira',
+    subject: 'Outage in production',
+    body: 'Customers cannot reach the api endpoint.',
+    status: 'Open',
+    status_bucket: 'open',
+    priority: 'high',
+    category: 'incident',
+    sourceUri: 'https://example.atlassian.net/browse/JIRA-123',
+};
+assert.strictEqual(matchTicketAssistantTicketNewFilter(taTicket, {}), true, 'empty filter passes');
+assert.strictEqual(matchTicketAssistantTicketNewFilter(taTicket, { provider: 'jira' }), true);
+assert.strictEqual(matchTicketAssistantTicketNewFilter(taTicket, { provider: 'zendesk' }), false);
+assert.strictEqual(matchTicketAssistantTicketNewFilter(taTicket, { connectionId: 'conn-1' }), true);
+assert.strictEqual(matchTicketAssistantTicketNewFilter(taTicket, { connectionId: 'conn-2' }), false);
+assert.strictEqual(matchTicketAssistantTicketNewFilter(taTicket, { priorityEquals: 'high' }), true);
+assert.strictEqual(matchTicketAssistantTicketNewFilter(taTicket, { priorityEquals: 'low' }), false);
+assert.strictEqual(matchTicketAssistantTicketNewFilter(taTicket, { categoryEquals: 'incident' }), true);
+assert.strictEqual(matchTicketAssistantTicketNewFilter(taTicket, { subjectContains: 'outage' }), true, 'subject case-insensitive');
+assert.strictEqual(matchTicketAssistantTicketNewFilter(taTicket, { subjectContains: 'release notes' }), false);
+assert.strictEqual(matchTicketAssistantTicketNewFilter(taTicket, { bodyContains: 'api endpoint' }), true);
+assert.strictEqual(matchTicketAssistantTicketNewFilter(taTicket, { bodyContains: 'database' }), false);
+assert.strictEqual(matchTicketAssistantTicketNewFilter(taTicket, { statusEquals: 'open' }), true, 'status_bucket fallback');
+assert.strictEqual(matchTicketAssistantTicketNewFilter(taTicket, { statusEquals: 'Open' }), true, 'native status field');
+assert.strictEqual(matchTicketAssistantTicketNewFilter(taTicket, { statusEquals: 'Closed' }), false);
+// Combined: AND across keys.
+assert.strictEqual(matchTicketAssistantTicketNewFilter(taTicket, {
+    provider: 'jira', priorityEquals: 'high', subjectContains: 'outage',
+}), true);
+assert.strictEqual(matchTicketAssistantTicketNewFilter(taTicket, {
+    provider: 'jira', priorityEquals: 'high', subjectContains: 'release',
+}), false, 'one mismatch fails the whole filter');
+
+// ── matchTicketAssistantSyncFilter ─────────────────────────────────────
+const taSync = { connectionId: 'conn-1', provider: 'zendesk', outcome: 'success', stats: {} };
+assert.strictEqual(matchTicketAssistantSyncFilter(taSync, {}), true);
+assert.strictEqual(matchTicketAssistantSyncFilter(taSync, { connectionId: 'conn-1' }), true);
+assert.strictEqual(matchTicketAssistantSyncFilter(taSync, { connectionId: 'conn-2' }), false);
+assert.strictEqual(matchTicketAssistantSyncFilter(taSync, { provider: 'zendesk' }), true);
+assert.strictEqual(matchTicketAssistantSyncFilter(taSync, { provider: 'jira' }), false);
+assert.strictEqual(matchTicketAssistantSyncFilter(taSync, { outcomeEquals: 'success' }), true);
+assert.strictEqual(matchTicketAssistantSyncFilter(taSync, { outcomeEquals: 'error' }), false);
+assert.strictEqual(matchTicketAssistantSyncFilter(taSync, { provider: 'zendesk', outcomeEquals: 'success' }), true);
 
 console.log('triggerBus.test.js — all checks passed');
