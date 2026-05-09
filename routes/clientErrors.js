@@ -7,6 +7,7 @@
  */
 
 const express = require('express');
+const { requireAuth } = require('../auth/permissions');
 
 const router = express.Router();
 
@@ -15,7 +16,7 @@ function truncate(s, max) {
     return s.length > max ? s.slice(0, max) + '…[truncated]' : s;
 }
 
-router.post('/', (req, res) => {
+router.post('/', requireAuth, (req, res) => {
     try {
         const body = req.body || {};
         const entry = {

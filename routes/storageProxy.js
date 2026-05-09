@@ -19,7 +19,10 @@ const storageStore = require('../stores/storageStore');
 
 // ── Temporary public download (for Azure Whisper batch) ────────────────────
 
-const HMAC_SECRET = process.env.SESSION_SECRET || 'beeflow-tmp-download';
+const HMAC_SECRET = process.env.SESSION_SECRET;
+if (!HMAC_SECRET || HMAC_SECRET.length < 32) {
+    throw new Error('[storageProxy] SESSION_SECRET must be set (≥32 chars) — used as HMAC key for time-limited download URLs.');
+}
 
 /**
  * Generate a time-limited, HMAC-signed public URL for a RustFS key.

@@ -1327,7 +1327,10 @@ function getPublicBaseUrl() {
 }
 
 function buildClientState(userId, automationId) {
-    const secret = process.env.MSGRAPH_CLIENT_STATE_SECRET || process.env.SESSION_SECRET || 'beeflow-msgraph-state';
+    const secret = process.env.MSGRAPH_CLIENT_STATE_SECRET || process.env.SESSION_SECRET;
+    if (!secret || secret.length < 32) {
+        throw new Error('MSGRAPH_CLIENT_STATE_SECRET or SESSION_SECRET must be set (≥32 chars) for OAuth-state CSRF protection.');
+    }
     return require('crypto')
         .createHmac('sha256', secret)
         .update(`${userId}|${automationId}`)

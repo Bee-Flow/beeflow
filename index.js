@@ -133,11 +133,17 @@ sessionStore = pgStore;
 app.use(session({
     store: sessionStore,
     name: process.env.COOKIE_NAME || 'connect.sid',
-    secret: process.env.SESSION_SECRET || 'beeflow-dev-secret',
+    secret: (() => {
+        const s = process.env.SESSION_SECRET;
+        if (!s || s.length < 32) {
+            throw new Error('SESSION_SECRET must be set to a random value of at least 32 characters. See .env.example. Generate with: node -e "console.log(require(\'crypto\').randomBytes(48).toString(\'hex\'))"');
+        }
+        return s;
+    })(),
     resave: false,
     saveUninitialized: false,
     cookie: {
-        secure: process.env.COOKIE_SECURE === 'true',
+        secure: process.env.COOKIE_SECURE === 'false' ? false : (process.env.NODE_ENV === 'production' || process.env.COOKIE_SECURE === 'true'),
         httpOnly: true,
         maxAge: 30 * 24 * 60 * 60 * 1000,
         sameSite: process.env.COOKIE_SAMESITE || 'lax',

@@ -1,0 +1,67 @@
+# ── Dependencies ────────────────────────────────────────────────
+node_modules/
+__pycache__/
+*.pyc
+
+# ── Environment / Secrets ───────────────────────────────────────
+.env
+.env.local
+.env.development
+.env.production
+.env.staging
+.env.services
+.env.portainer*
+
+# ── SSH Keys & Credentials ──────────────────────────────────────
+*.ppk
+*.pem
+*.key
+ssh-key-*
+*-vpn-key*
+config.json
+
+# Seed/test users — must NEVER be committed (bcrypt hashes are offline-crackable)
+config/users.json
+config/users.*.json
+data/users.json
+
+# ── Databases ───────────────────────────────────────────────────
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite3
+data/
+
+# ── Backups & Archives ──────────────────────────────────────────
+backups/
+*.zip
+*.tar.gz
+*.tgz
+
+# ── Build Artifacts ─────────────────────────────────────────────
+dist/
+
+# ── Logs ────────────────────────────────────────────────────────
+*.log
+npm-debug.log*
+
+# ── OS / Editor ─────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Docker runtime data (not compose files) ─────────────────────
+docker-data/
+pgdata/
+
+# ── Tests / coverage ────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+tmp/

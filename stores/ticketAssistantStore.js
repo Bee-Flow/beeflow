@@ -13,7 +13,10 @@
 const { run, getOne, getAll, exec } = require('../db');
 const crypto = require('crypto');
 
-const ENCRYPTION_KEY_SOURCE = process.env.SESSION_SECRET || 'beeflow-default-key';
+const ENCRYPTION_KEY_SOURCE = process.env.SESSION_SECRET;
+if (!ENCRYPTION_KEY_SOURCE || ENCRYPTION_KEY_SOURCE.length < 32) {
+    throw new Error('[TicketAssistantStore] SESSION_SECRET must be set (≥32 chars) — it derives the AES-256 key for OAuth-token encryption. See .env.example.');
+}
 
 let initialized = false;
 
