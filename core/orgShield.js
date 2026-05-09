@@ -68,6 +68,9 @@ async function resolveOrgShield(orgId) {
         action: shield.action || 'delete',
         // PII detection settings
         azurePiiEnabled: !!shield.azurePiiEnabled,
+        // In-process Transformers.js fallback (Apache-2.0 OpenAI Privacy Filter).
+        // Default true so a fresh server with no Azure config still detects PII.
+        localPiiEnabled: shield.localPiiEnabled !== false,
         piiDetectionCategories: shield.piiDetectionCategories || [],
         piiDetectionConfidenceThreshold: shield.piiDetectionConfidenceThreshold,
         piiDetectionAction: shield.piiDetectionAction || globalConfig.piiDetectionAction || 'block',

@@ -1,8 +1,8 @@
 /**
  * Login, Session & Setup Routes
- * 
+ *
  * Handles: /my-permissions, /setup-status, /setup, /admin-login,
- * /demo-login, /settings, /user, /logout
+ * /settings, /user, /logout
  */
 
 const express = require('express');
@@ -12,7 +12,7 @@ const router = express.Router();
 const userStore = require('../stores/userStore');
 const configStore = require('../stores/configStore');
 const { loadConfig, saveConfig, requireAuth, requireAdmin, getUserPermissions } = require('./permissions');
-const { getOrCreateUserDEKCompat, getFallbackEncryptionKey, setupSSOUserDEK, unlockSSOUserDEK, unlockWithRecoveryKey, secureClear } = require('./encryption');
+const { getOrCreateUserDEKCompat, setupSSOUserDEK, unlockSSOUserDEK, unlockWithRecoveryKey, secureClear } = require('./encryption');
 
 /**
  * Check if encryption is enabled for a user based on their org's subscription plan.
@@ -305,37 +305,6 @@ router.post('/admin-login', async (req, res) => {
     }
 });
 
-// Demo login - instant access without credentials for demo purposes
-router.post('/demo-login', async (req, res) => {
-    const demoEnabled = process.env.DEMO_MODE_ENABLED !== 'false';
-
-    if (!demoEnabled) {
-        return res.status(403).json({
-            error: 'Demo mode is disabled',
-            demoDisabled: true
-        });
-    }
-
-    req.session.isAuthenticated = true;
-    req.session.isAdmin = true;
-    req.session.isDemo = true;
-    req.session.user = {
-        id: 'demo-user',
-        displayName: 'Demo User',
-        isAdmin: true,
-        isDemo: true
-    };
-    req.session.encryptionKey = getFallbackEncryptionKey('demo-user');
-
-    req.session.save((err) => {
-        if (err) {
-            console.error('Session save error:', err);
-            return res.status(500).json({ error: 'Failed to save session' });
-        }
-        res.json({ success: true, user: req.session.user });
-    });
-});
-
 // Get settings (admin only)
 router.get('/settings', requireAdmin, async (req, res) => {
     const config = await loadConfig();
@@ -395,7 +364,6 @@ router.get('/user', async (req, res) => {
                 lastName: freshUser?.lastName || req.session.user.lastName || '',
                 email: freshUser?.email || req.session.user.email,
                 isAdmin: req.session.isAdmin || freshUser?.role === 'admin' || false,
-                isDemo: req.session.isDemo || false,
                 role: freshUser?.role || req.session.user.role || 'user',
                 avatar: freshUser?.avatar || req.session.user.avatar || req.session.user.picture || null,
                 avatarType: freshUser?.avatarType || req.session.user.avatarType || (req.session.user.picture ? 'url' : null),
@@ -412,6 +380,37 @@ router.get('/user', async (req, res) => {
             noOrganization: req.session.noOrganization || false,
             isConsumerAccount: !freshUser?.organizationId && !req.session.noOrganization && process.env.DEPLOYMENT_MODE === 'cloud',
             pendingApproval: req.session.pendingApproval || false,
+            // NC App Store onboarding wizard gate. When the connector has
+            // bootstrapped a fresh org but the admin hasn't completed the
+            // 4-step setup wizard yet, we surface that to the SPA so it
+            // renders <NcOnboardingWizard/> for the admin and a "Setup in
+            // progress" screen for everyone else in that org.
+            ...(await (async () => {
+                if (!freshUser?.organizationId) return {};
+                const org = await userStore.getOrganization(freshUser.organizationId);
+                if (!org?.nc_instance_id) return {};
+                const isOrgAdmin = (freshUser?.orgRole === 'org_admin') || (freshUser?.role === 'admin') || !!req.session.isAdmin;
+                const onboardingDone = !!org.nc_onboarding_completed_at;
+                // ncOrg is the org-level binding info — present iff the org
+                // was provisioned through Nextcloud. SPA uses this to gate
+                // settings sections that don't apply when identity is
+                // delegated to NC (sign-in method, allowed domains, etc.).
+                return {
+                    ncOnboardingNeeded: !onboardingDone && isOrgAdmin,
+                    ncOnboardingPending: !onboardingDone && !isOrgAdmin,
+                    isOrgAdmin,
+                    organizationName: org.name || null,
+                    ncOrg: {
+                        instanceId: org.nc_instance_id,
+                        baseUrl: org.nc_base_url || null,
+                        adminUid: org.nc_admin_uid || null,
+                        syncMode: org.nc_sync_mode || 'mirror_all',
+                        lastSyncAt: org.nc_last_sync_at || null,
+                        provisionedAt: org.nc_provisioned_at || null,
+                        onboardingCompletedAt: org.nc_onboarding_completed_at || null,
+                    },
+                };
+            })()),
             // Feature flags from env + configStore
             featureFlags: await (async () => {
                 const configStore = require('../stores/configStore');

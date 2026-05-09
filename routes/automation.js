@@ -103,6 +103,93 @@ router.post('/events/gmail', express.json({ limit: '128kb' }), async (req, res) 
     }
 });
 
+// Nextcloud events forwarded by the connector (Phase 1 push pipeline).
+//
+// The connector subscribes to NC AppAPI events_listener for Files /
+// Sharing / Calendar / Deck / Talk events; on receipt it signs the body
+// with the tenant key and POSTs here. We verify the signature against
+// the org's stored connector_tenant_key, map the connector's stable
+// event name to a subscription, and dispatch through triggerBus.
+//
+// Auth model (mirrors /webhook/nc-user-sync exactly):
+//   X-Beeflow-NC-Instance-Id  identifies the org
+//   X-Beeflow-Sig             ts.hmac(tenantKey, "ts\nMETHOD\nurl\nbody")
+//   ±5 min skew, constant-time compare.
+//
+// On success we mark `last_push_at` on the matching subscriptions so the
+// poller can downgrade subs that haven't seen a push lately back into
+// polling mode without losing events.
+const captureRawNc = express.json({
+    limit: '512kb',
+    verify: (req, _res, buf) => { req.rawBody = buf.toString('utf8'); },
+});
+
+async function verifyNcConnectorSig(req) {
+    const instanceId = String(req.headers['x-beeflow-nc-instance-id'] || '');
+    if (!instanceId) return null;
+    const userStore = require('../stores/userStore');
+    const org = await userStore.getOrganizationByNcInstanceId(instanceId).catch(() => null);
+    if (!org) return null;
+    const tenantKey = await configStore.getSecret(`connector_tenant_key_${org.id}`);
+    if (!tenantKey) return null;
+
+    const sigHeader = String(req.headers['x-beeflow-sig'] || '');
+    const dot = sigHeader.indexOf('.');
+    if (dot === -1) return null;
+    const ts = parseInt(sigHeader.slice(0, dot), 10);
+    const sig = sigHeader.slice(dot + 1);
+    if (!Number.isFinite(ts) || Math.abs(Math.floor(Date.now() / 1000) - ts) > 300) return null;
+
+    const message = `${ts}\n${req.method}\n${req.originalUrl}\n${req.rawBody || ''}`;
+    const expected = crypto.createHmac('sha256', tenantKey).update(message).digest('hex');
+    if (expected.length !== sig.length) return null;
+    try {
+        if (!crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(sig, 'hex'))) return null;
+    } catch { return null; }
+    return org;
+}
+
+router.post('/events/nextcloud', captureRawNc, async (req, res) => {
+    const org = await verifyNcConnectorSig(req);
+    if (!org) return res.status(401).json({ error: 'Invalid or missing signature' });
+
+    const { event, ncUid, payload } = req.body || {};
+    if (!event) return res.status(400).json({ error: 'Missing event' });
+
+    try {
+        // Resolve the Bee Flow user from the NC uid via the user store —
+        // the same mapping `ncUserGroupSync` maintains. If the uid hasn't
+        // been provisioned yet, the event can't reach an automation; ack
+        // so the connector doesn't retry.
+        const userStore = require('../stores/userStore');
+        const user = ncUid
+            ? await userStore.getUserByNcUid(org.id, ncUid).catch(() => null)
+            : null;
+
+        await triggerBus.dispatchEvent({
+            provider: 'nextcloud',
+            event,
+            payload: payload || {},
+            userId: user?.id || null,
+        });
+        // Stamp last_push_at on every nextcloud subscription this user
+        // owns for this event so the polling-fallback detector knows the
+        // push pipeline is healthy.
+        if (user?.id) {
+            try {
+                const subs = await automationStore.getSubscriptionsForUserAndEvent(user.id, 'nextcloud', event);
+                for (const sub of subs) {
+                    await automationStore.updateSubscription(sub.id, { lastPushAt: new Date().toISOString() }).catch(() => {});
+                }
+            } catch (_) { /* best-effort */ }
+        }
+        return res.status(202).end();
+    } catch (e) {
+        console.error('[automation/events/nextcloud] dispatch error:', e.message);
+        return res.status(500).json({ error: e.message });
+    }
+});
+
 // MS Graph notifications — handles validation handshake + notifications.
 router.post('/events/msgraph', express.json({ limit: '128kb' }), async (req, res) => {
     if (req.query.validationToken) {
@@ -113,11 +200,31 @@ router.post('/events/msgraph', express.json({ limit: '128kb' }), async (req, res
     try {
         const notifications = req.body?.value || [];
         for (const n of notifications) {
-            await triggerBus.dispatchEvent({
-                provider: 'msgraph',
-                event: n.changeType ? `${n.resource?.split('/')[0]}.${n.changeType}` : 'change',
-                payload: n,
-            });
+            // Validate clientState. Each notification carries the value the
+            // subscription was created with; we look up the matching row and
+            // reject mismatches so a leaked notificationUrl can't be used to
+            // forge events on behalf of another tenant.
+            //
+            // We can't do this for every event upfront (subscriptions are
+            // keyed by externalRef which only the provisioning step has), so
+            // we fan out per-notification.
+            try {
+                const sub = n.subscriptionId
+                    ? await automationStore.getSubscriptionByExternalRef('msgraph', n.subscriptionId).catch(() => null)
+                    : null;
+                if (sub && sub.clientState && sub.clientState !== n.clientState) {
+                    console.warn(`[automation/events/msgraph] clientState mismatch for sub ${sub.id} — dropping`);
+                    continue;
+                }
+                await triggerBus.dispatchEvent({
+                    provider: 'msgraph',
+                    event: n.changeType ? `${n.resource?.split('/')[0]}.${n.changeType}` : 'change',
+                    payload: n,
+                    userId: sub?.userId,
+                });
+            } catch (perItemErr) {
+                console.warn('[automation/events/msgraph] dispatch item error:', perItemErr.message);
+            }
         }
         return res.status(202).end();
     } catch (e) {
@@ -378,8 +485,23 @@ router.post('/:id/deactivate', async (req, res) => {
         const a = await automationStore.getAutomation(req.params.id);
         if (!a) return res.status(404).json({ error: 'Not found' });
         if (a.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
-        // Drop subscriptions immediately so the next poll tick stops
-        // firing this automation. Re-activation re-creates them.
+
+        // Revoke remote subscriptions BEFORE deleting the local rows. If we
+        // delete first we lose the externalRef and leak orphan subscriptions
+        // at MS Graph that keep firing into the void until they expire.
+        try {
+            const existing = await automationStore.getSubscriptionsForAutomation(a.id);
+            const msgraphSubs = existing.filter(s => s.provider === 'msgraph' && s.externalRef);
+            if (msgraphSubs.length > 0) {
+                const session = await triggerBus.loadSession(userId).catch(() => null);
+                for (const sub of msgraphSubs) {
+                    await triggerBus.revokeSubscription(sub, session);
+                }
+            }
+        } catch (e) {
+            console.warn(`[automation/deactivate] revoke pass failed for ${a.id}: ${e.message}`);
+        }
+
         await automationStore.deleteSubscriptionsForAutomation(a.id);
         const u = await automationStore.updateAutomation(a.id, { isActive: false }, userId);
         res.json({ automation: u });
@@ -400,8 +522,21 @@ router.post('/:id/deactivate', async (req, res) => {
  * dispatch table change.
  */
 async function syncAppEventSubscription(automationId, userId, def) {
-    // Always wipe first — keeps the table consistent if the user changes
-    // the trigger between activations.
+    // Revoke any existing remote subscriptions BEFORE wiping the rows so we
+    // don't leak orphaned MS Graph subscriptions when the user changes the
+    // trigger.
+    try {
+        const existing = await automationStore.getSubscriptionsForAutomation(automationId);
+        const msgraphSubs = existing.filter(s => s.provider === 'msgraph' && s.externalRef);
+        if (msgraphSubs.length > 0) {
+            const session = await triggerBus.loadSession(userId).catch(() => null);
+            for (const sub of msgraphSubs) {
+                await triggerBus.revokeSubscription(sub, session);
+            }
+        }
+    } catch (e) {
+        console.warn(`[automation/syncAppEventSubscription] revoke pass failed for ${automationId}: ${e.message}`);
+    }
     await automationStore.deleteSubscriptionsForAutomation(automationId);
 
     const trig = def?.trigger;
@@ -410,12 +545,36 @@ async function syncAppEventSubscription(automationId, userId, def) {
     const event = trig.appEvent?.event;
     if (!provider || !event) return;
 
-    // Mode: Gmail uses polling (Gmail Pub/Sub push exists at /events/gmail
-    // but we don't auto-provision the watch yet — polling is reliable and
-    // covers all users without admin-side cloud config). MS Graph + GitHub
-    // would use 'webhook'; not wired here.
-    const mode = provider === 'gmail' ? 'polling' : 'polling';
-    await automationStore.createSubscription({
+    // Mode resolution:
+    //   - Gmail: polling (Pub/Sub push at /events/gmail exists but we don't
+    //     auto-provision the watch yet).
+    //   - MS Graph: webhook when PUBLIC_BASE_URL is set; falls back to
+    //     polling-mode otherwise (which has no handler today, so the user
+    //     gets a deactivated trigger — acceptable on local/dev installs).
+    //   - GitHub: webhook (handled by /events/github inbound route).
+    //   - Nextcloud: webhook when the user is connector-bound (the ExApp
+    //     event-bridge pushes to /events/nextcloud); polling otherwise. The
+    //     polling tick still runs as crash-recovery backstop when
+    //     last_push_at goes stale.
+    //   - Others: polling.
+    let mode;
+    if (provider === 'msgraph') {
+        mode = triggerBus.getPublicBaseUrl() ? 'webhook' : 'polling';
+    } else if (provider === 'github') {
+        mode = 'webhook';
+    } else if (provider === 'nextcloud') {
+        try {
+            const userStore = require('../stores/userStore');
+            const u = await userStore.getUser(userId).catch(() => null);
+            mode = u?.ncUid ? 'webhook' : 'polling';
+        } catch {
+            mode = 'polling';
+        }
+    } else {
+        mode = 'polling';
+    }
+
+    const sub = await automationStore.createSubscription({
         automationId,
         userId,
         provider,
@@ -423,6 +582,30 @@ async function syncAppEventSubscription(automationId, userId, def) {
         mode,
         filter: trig.appEvent?.filter || null,
     });
+
+    // For MS Graph webhook subscriptions, register at MS Graph itself and
+    // store the externalRef so the renewal pass can refresh and the
+    // notification handler can validate clientState.
+    if (provider === 'msgraph' && mode === 'webhook') {
+        try {
+            const session = await triggerBus.loadSession(userId).catch(() => null);
+            const result = await triggerBus.provisionSubscription(sub, session);
+            if (result) {
+                await automationStore.updateSubscription(sub.id, {
+                    externalRef: result.externalRef,
+                    expiresAt: result.expiresAt,
+                    clientState: result.clientState,
+                });
+            } else {
+                // Provisioning failed — leave the row in the DB so the user
+                // sees the trigger but warn so the diagnose endpoint can
+                // surface it.
+                console.warn(`[automation/syncAppEventSubscription] MS Graph provisioning failed for sub ${sub.id}; trigger will not fire until re-activated`);
+            }
+        } catch (e) {
+            console.warn(`[automation/syncAppEventSubscription] MS Graph provisioning threw for sub ${sub.id}: ${e.message}`);
+        }
+    }
 }
 
 router.post('/:id/run', async (req, res) => {
@@ -709,6 +892,52 @@ router.get('/:id/versions', async (req, res) => {
     }
 });
 
+/**
+ * Read one version's full definition. Used by the version-history UI to
+ * render a diff against the current row before the user commits a restore.
+ * Listed metadata-only on /:id/versions; this endpoint loads the body.
+ */
+router.get('/:id/versions/:versionId', async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const a = await automationStore.getAutomation(req.params.id);
+        if (!a) return res.status(404).json({ error: 'Not found' });
+        if (a.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
+        const version = await automationStore.getVersion(req.params.versionId);
+        if (!version) return res.status(404).json({ error: 'Version not found' });
+        if (version.automationId !== a.id) return res.status(400).json({ error: 'Version does not belong to this automation' });
+        res.json({ version });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * Restore a historical version. Loads the version row, validates the
+ * historical definition (could fail if step types or tool names have been
+ * removed since), then writes it back through the regular updateAutomation
+ * path so a new version row gets stamped with this user as the author.
+ */
+router.post('/:id/versions/:versionId/restore', async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const a = await automationStore.getAutomation(req.params.id);
+        if (!a) return res.status(404).json({ error: 'Not found' });
+        if (a.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
+        const version = await automationStore.getVersion(req.params.versionId);
+        if (!version) return res.status(404).json({ error: 'Version not found' });
+        if (version.automationId !== a.id) return res.status(400).json({ error: 'Version does not belong to this automation' });
+
+        const v = validateDefinition(version.definition || {});
+        if (!v.ok) return res.status(400).json({ error: 'Stored version no longer validates', details: v.errors });
+
+        const updated = await automationStore.updateAutomation(a.id, { definition: version.definition }, userId);
+        res.json({ automation: updated, restoredFromVersion: version.version });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 router.post('/:id/webhook', async (req, res) => {
     try {
         const userId = req.session.user.id;
@@ -735,6 +964,40 @@ router.get('/:id/webhooks', async (req, res) => {
     }
 });
 
+/**
+ * Rotate a webhook's HMAC secret. The slug (URL) stays the same; any caller
+ * still using the old secret immediately receives 401. The new secret is
+ * returned ONCE so the user can copy it before navigating away — we don't
+ * store it in plaintext anywhere the UI can re-read.
+ */
+router.post('/:id/webhook/:slug/rotate', async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const a = await automationStore.getAutomation(req.params.id);
+        if (!a) return res.status(404).json({ error: 'Not found' });
+        if (a.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
+        const rotated = await automationStore.rotateWebhookSecret(req.params.slug, a.id);
+        if (!rotated) return res.status(404).json({ error: 'Webhook not found' });
+        res.json({ webhook: rotated });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+router.delete('/:id/webhook/:slug', async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const a = await automationStore.getAutomation(req.params.id);
+        if (!a) return res.status(404).json({ error: 'Not found' });
+        if (a.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
+        const ok = await automationStore.deleteWebhook(req.params.slug, a.id);
+        if (!ok) return res.status(404).json({ error: 'Webhook not found' });
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 router.get('/runs/:id', async (req, res) => {
     try {
         const userId = req.session.user.id;
@@ -755,6 +1018,72 @@ router.get('/runs/:id/steps', async (req, res) => {
         if (run.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
         const steps = await automationStore.getRunSteps(run.id);
         res.json({ steps });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * Retry a previously failed run. Re-fires `executeAutomation` with the
+ * original triggerKind+payload, links the new run to the old via
+ * `parent_run_id` so the history shows the lineage. Manual user action;
+ * synchronous wait capped at 60s to mirror /run.
+ */
+router.post('/:id/runs/:runId/retry', async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const a = await automationStore.getAutomation(req.params.id);
+        if (!a) return res.status(404).json({ error: 'Not found' });
+        if (a.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
+        const original = await automationStore.getRun(req.params.runId);
+        if (!original) return res.status(404).json({ error: 'Run not found' });
+        if (original.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
+        if (original.automationId !== a.id) return res.status(400).json({ error: 'Run does not belong to this automation' });
+
+        const runner = require('../core/automationRunner');
+        const RESPONSE_TIMEOUT_MS = 60_000;
+        let timedOut = false;
+        const guard = new Promise((resolve) => setTimeout(() => { timedOut = true; resolve(null); }, RESPONSE_TIMEOUT_MS));
+        const runPromise = runner.executeAutomation(a, {
+            triggerKind: original.triggerKind || 'manual',
+            triggerPayload: original.triggerPayload || null,
+            mode: 'live',
+            parentRunId: original.id,
+        }).catch(e => { console.error('[automation/retry] error:', e.message); return null; });
+
+        const run = await Promise.race([runPromise, guard]);
+        if (timedOut || !run) {
+            return res.status(202).json({
+                accepted: true,
+                pending: true,
+                message: 'Retry is still in progress. Check the run history shortly.',
+            });
+        }
+        const steps = await automationStore.getRunSteps(run.id).catch(() => []);
+        return res.status(200).json({ accepted: true, run, steps });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * Request cancellation of an in-flight run. Honoured at the next "between
+ * steps" check on whichever runner pod is executing the run, so cancel
+ * latency is bounded by step duration. Acknowledges immediately; the UI
+ * polls run status to confirm the cancellation took effect.
+ */
+router.post('/runs/:runId/cancel', async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const original = await automationStore.getRun(req.params.runId);
+        if (!original) return res.status(404).json({ error: 'Not found' });
+        if (original.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
+        if (!['queued', 'running'].includes(original.status)) {
+            return res.status(409).json({ error: `Run is in ${original.status} state and cannot be cancelled` });
+        }
+        const runner = require('../core/automationRunner');
+        const updated = await runner.requestCancel(original.id);
+        return res.status(202).json({ accepted: true, run: updated || original });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }

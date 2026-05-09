@@ -84,7 +84,9 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
     const aiConfigForPii = await getAIConfig();
     let piiTokenMap = null;
     const orgShield = await resolveOrgShield(agent.organization_id);
-    const orgPiiEnabled = !!(orgShield?.enabled && orgShield?.azurePiiEnabled);
+    // PII gate: either Azure (cloud) or Local Transformers.js (in-process)
+    // satisfies it. detectPii() in azurePiiDetection.js handles the routing.
+    const orgPiiEnabled = !!(orgShield?.enabled && (orgShield?.azurePiiEnabled || orgShield?.localPiiEnabled !== false));
     if (aiConfigForPii?.piiDetectionEnabled || orgPiiEnabled) {
         try {
             const piiResult = await validateInputForPii(messages.slice(-3), orgPiiEnabled, orgShield);

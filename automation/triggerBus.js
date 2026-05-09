@@ -282,6 +282,163 @@ function matchTicketAssistantSyncFilter(payload, filter) {
     return true;
 }
 
+// ── Rich filter DSL (Phase 1.4) ──────────────────────────────────────
+//
+// Power-Automate-style filter combinators that work on top of any
+// per-provider matcher. The structured fields (filter.from / filter.path
+// / filter.calendarId / …) keep their existing semantics; the DSL keys
+// add boolean composition + expressions:
+//
+//   filter: {
+//     any:  [{ pathPrefix: "/Invoices/" }, { pathPrefix: "/Receipts/" }],
+//     none: [{ extension: "tmp" }],
+//     expr: "trigger.size > 1024 * 1024",
+//     age:  { olderThanMinutes: 60, newerThanMinutes: 5 },
+//     ...rest of structured fields evaluated by the per-event matcher
+//   }
+//
+// any[]   → at least ONE sub-filter matches (OR)
+// none[]  → NO sub-filter matches (NOT-OR)
+// expr    → boolean expression evaluated via expr.js against payload root
+// age     → time window relative to NOW based on payload.datetime/timestamp
+// All combinators are AND-ed with the structured per-event match.
+function applyDslFilter(payload, filter, perEventMatcher) {
+    if (!filter || typeof filter !== 'object') return perEventMatcher(payload, filter);
+
+    if (Array.isArray(filter.any) && filter.any.length > 0) {
+        const ok = filter.any.some(sub => perEventMatcher(payload, sub));
+        if (!ok) return false;
+    }
+    if (Array.isArray(filter.none) && filter.none.length > 0) {
+        const hit = filter.none.some(sub => perEventMatcher(payload, sub));
+        if (hit) return false;
+    }
+    if (typeof filter.expr === 'string' && filter.expr.trim()) {
+        try {
+            const { evaluate } = require('./expr');
+            // Single-arg evaluator: payload accessible as `trigger`. Restricted
+            // grammar already forbids function calls, so this is safe to run
+            // on tenant-supplied strings.
+            const result = evaluate(filter.expr, { trigger: payload });
+            if (!result) return false;
+        } catch (_) {
+            // Invalid expression fails closed — same as Gmail subjectRegex.
+            return false;
+        }
+    }
+    if (filter.age && typeof filter.age === 'object') {
+        const ts = payload?.datetime || payload?.timestamp || payload?.date;
+        const t = ts ? Date.parse(ts) : NaN;
+        if (Number.isFinite(t)) {
+            const ageMin = (Date.now() - t) / 60_000;
+            if (typeof filter.age.olderThanMinutes === 'number' && ageMin < filter.age.olderThanMinutes) return false;
+            if (typeof filter.age.newerThanMinutes === 'number' && ageMin > filter.age.newerThanMinutes) return false;
+        }
+    }
+
+    // Strip DSL keys before delegating; otherwise the per-event matcher
+    // would see them as unknown structured fields. We don't mutate the
+    // caller's filter object.
+    const stripped = { ...filter };
+    delete stripped.any;
+    delete stripped.none;
+    delete stripped.expr;
+    delete stripped.age;
+    return perEventMatcher(payload, stripped);
+}
+
+// ── Phase 1.3 matchers — new Nextcloud trigger types ─────────────────
+
+function matchNextcloudCommentFilter(payload, filter) {
+    if (!filter) return true;
+    if (filter.pathPrefix && !(payload.path || '').startsWith(filter.pathPrefix)) return false;
+    if (filter.actorEquals && payload.actor !== filter.actorEquals) return false;
+    if (filter.messageContains && !containsCI(payload.comment, filter.messageContains)) return false;
+    return true;
+}
+
+function matchNextcloudTagFilter(payload, filter) {
+    if (!filter) return true;
+    if (filter.tagName && payload.tagName !== filter.tagName) return false;
+    if (filter.tagAction && payload.tagAction !== filter.tagAction) return false;
+    if (filter.pathPrefix && !(payload.path || '').startsWith(filter.pathPrefix)) return false;
+    return true;
+}
+
+function matchNextcloudShareGenericFilter(payload, filter) {
+    if (!filter) return true;
+    if (filter.actorEquals && payload.actor !== filter.actorEquals) return false;
+    if (filter.nameContains && !containsCI(payload.name, filter.nameContains)) return false;
+    if (filter.kindEquals && payload.kind !== filter.kindEquals) return false;
+    if (filter.shareType && payload.shareType !== filter.shareType) return false;
+    return true;
+}
+
+function matchNextcloudCalendarFilter(payload, filter) {
+    if (!filter) return true;
+    if (filter.calendarId && payload.calendarId !== filter.calendarId) return false;
+    if (filter.summaryContains && !containsCI(payload.summary, filter.summaryContains)) return false;
+    if (filter.attendeeContains) {
+        const attendees = Array.isArray(payload.attendees) ? payload.attendees.join(' ') : (payload.attendees || '');
+        if (!containsCI(attendees, filter.attendeeContains)) return false;
+    }
+    return true;
+}
+
+function matchNextcloudCalendarUpcomingFilter(payload, filter) {
+    if (!matchNextcloudCalendarFilter(payload, filter)) return false;
+    if (filter && typeof filter.leadMinutes === 'number') {
+        const start = payload?.startsAt ? Date.parse(payload.startsAt) : NaN;
+        if (Number.isFinite(start)) {
+            const minutesUntil = (start - Date.now()) / 60_000;
+            // Trigger fires when minutesUntil ≤ leadMinutes (and still future)
+            if (minutesUntil < 0 || minutesUntil > filter.leadMinutes) return false;
+        }
+    }
+    return true;
+}
+
+function matchNextcloudDeckCardFilter(payload, filter) {
+    if (!filter) return true;
+    if (filter.boardId && String(payload.boardId) !== String(filter.boardId)) return false;
+    if (filter.stackId && String(payload.stackId) !== String(filter.stackId)) return false;
+    if (filter.titleContains && !containsCI(payload.title, filter.titleContains)) return false;
+    if (typeof filter.archived === 'boolean' && !!payload.archived !== filter.archived) return false;
+    return true;
+}
+
+function matchNextcloudDeckCardMovedFilter(payload, filter) {
+    if (!matchNextcloudDeckCardFilter(payload, filter)) return false;
+    if (filter && filter.fromStackId && String(payload.fromStackId) !== String(filter.fromStackId)) return false;
+    if (filter && filter.toStackId && String(payload.toStackId) !== String(filter.toStackId)) return false;
+    return true;
+}
+
+function matchNextcloudTalkMessageFilter(payload, filter) {
+    if (!filter) return true;
+    if (filter.roomToken && payload.roomToken !== filter.roomToken) return false;
+    if (filter.roomNameContains && !containsCI(payload.roomName, filter.roomNameContains)) return false;
+    if (filter.actorEquals && payload.actor !== filter.actorEquals) return false;
+    if (filter.messageContains && !containsCI(payload.message, filter.messageContains)) return false;
+    if (filter.excludeOwnMessages && payload.isOwn === true) return false;
+    return true;
+}
+
+function matchNextcloudTaskFilter(payload, filter) {
+    if (!filter) return true;
+    if (filter.listId && String(payload.listId) !== String(filter.listId)) return false;
+    if (filter.titleContains && !containsCI(payload.title, filter.titleContains)) return false;
+    if (filter.priorityEquals && payload.priority !== filter.priorityEquals) return false;
+    return true;
+}
+
+function matchNextcloudUserStatusFilter(payload, filter) {
+    if (!filter) return true;
+    if (filter.status && payload.status !== filter.status) return false;
+    if (filter.userIdEquals && payload.userId !== filter.userIdEquals) return false;
+    return true;
+}
+
 /**
  * Picks the right matcher for a (provider, event) pair. Falls back to the
  * shallow `matchFilter` for anything we haven't taught explicit semantics
@@ -293,10 +450,34 @@ function pickMatcher(provider, event) {
     if (provider === 'google-calendar' && event === 'event.changed')  return matchCalendarChangedFilter;
     if (provider === 'google-calendar' && event === 'event.upcoming') return matchCalendarUpcomingFilter;
     if (provider === 'google-drive' && event === 'file.new')          return matchDriveFileNewFilter;
-    if (provider === 'nextcloud' && (event === 'file.new' || event === 'file.changed')) return matchNextcloudFileFilter;
-    if (provider === 'nextcloud' && event === 'share.received')       return matchNextcloudShareFilter;
-    if (provider === 'nextcloud' && event === 'activity.new')         return matchNextcloudActivityFilter;
-    if (provider === 'nextcloud' && event === 'notification.new')     return matchNextcloudNotificationFilter;
+    if (provider === 'nextcloud') {
+        // File family — share semantics same shape but slightly different fields.
+        if (event === 'file.new' || event === 'file.changed' || event === 'file.deleted' || event === 'file.renamed') return matchNextcloudFileFilter;
+        if (event === 'file.commented')   return matchNextcloudCommentFilter;
+        if (event === 'file.tagged')      return matchNextcloudTagFilter;
+        // Share family — share.received is the legacy "you got shared" event.
+        if (event === 'share.received')   return matchNextcloudShareFilter;
+        if (event === 'share.created' || event === 'share.accepted' || event === 'share.deleted')
+            return matchNextcloudShareGenericFilter;
+        // Calendar
+        if (event === 'calendar.event.upcoming') return matchNextcloudCalendarUpcomingFilter;
+        if (event === 'calendar.event.created' || event === 'calendar.event.changed' || event === 'calendar.event.deleted')
+            return matchNextcloudCalendarFilter;
+        // Deck
+        if (event === 'deck.card.moved')   return matchNextcloudDeckCardMovedFilter;
+        if (event === 'deck.card.created' || event === 'deck.card.changed' || event === 'deck.card.deleted' || event === 'deck.card.completed')
+            return matchNextcloudDeckCardFilter;
+        // Talk
+        if (event === 'talk.message.received' || event === 'talk.mention.received')
+            return matchNextcloudTalkMessageFilter;
+        // Tasks
+        if (event === 'task.created' || event === 'task.completed' || event === 'task.due')
+            return matchNextcloudTaskFilter;
+        // Generic
+        if (event === 'activity.new')      return matchNextcloudActivityFilter;
+        if (event === 'notification.new')  return matchNextcloudNotificationFilter;
+        if (event === 'user.status.changed') return matchNextcloudUserStatusFilter;
+    }
     if (provider === 'ticket-assistant' && event === 'ticket.new')    return matchTicketAssistantTicketNewFilter;
     if (provider === 'ticket-assistant' && event === 'sync.completed') return matchTicketAssistantSyncFilter;
     return matchFilter;
@@ -305,7 +486,11 @@ function pickMatcher(provider, event) {
 async function dispatchEvent({ provider, event, payload = {}, userId = null }) {
     const subs = await automationStore.getSubscriptionsForProvider(provider, event);
     const runs = [];
-    const matcher = pickMatcher(provider, event);
+    const baseMatcher = pickMatcher(provider, event);
+    // Wrap baseMatcher with the rich-filter DSL so any/none/expr/age work
+    // for every matcher consistently (Phase 1.4). The DSL is no-op when
+    // the filter has no DSL keys, so existing flows are unchanged.
+    const matcher = (p, f) => applyDslFilter(p, f, baseMatcher);
     for (const sub of subs) {
         if (userId && sub.userId !== userId) continue;
         const ok = matcher(payload, sub.filter);
@@ -399,12 +584,12 @@ async function runPollingPass() {
             const session = await loadSession(sub.userId);
             if (!session) {
                 // Silent skip used to be the failure mode that hid every
-                // missing-credential bug. Log it loudly so operators can
-                // spot a user who connected via session-only and never
-                // landed in the routine-auth vault.
+                // missing-credential bug. Log it loudly and escalate after
+                // the threshold so the user sees a notification instead of
+                // an automation that quietly stops firing.
                 console.warn(`[TriggerBus] no credentials for user ${sub.userId} (provider=${sub.provider}); skipping sub ${sub.id}`);
-                // Touch lastPolledAt so we don't hot-loop on this sub every tick.
                 await automationStore.updateSubscription(sub.id, { lastPolledAt: new Date().toISOString() });
+                await escalateSubscriptionFailure(sub, POLL_FAILURE_THRESHOLD, 'no credentials');
                 continue;
             }
             const events = await handler(sub, session);
@@ -413,8 +598,10 @@ async function runPollingPass() {
                 await dispatchEvent({ provider: sub.provider, event: sub.eventType, payload: ev, userId: sub.userId });
             }
             await automationStore.updateSubscription(sub.id, { lastPolledAt: new Date().toISOString() });
+            await automationStore.resetSubscriptionFailures(sub.id);
         } catch (e) {
             console.warn(`[TriggerBus] polling failed for sub ${sub.id}: ${e.message}`);
+            await escalateSubscriptionFailure(sub, POLL_FAILURE_THRESHOLD, e.message);
         }
     }
 }
@@ -1069,6 +1256,171 @@ async function fetchGmailMessageMetadata(gmail, messageId) {
     };
 }
 
+// ── MS Graph subscription provisioning ──────────────────
+//
+// Until now the inbound `/events/msgraph` route existed but no code created
+// the corresponding subscriptions at MS Graph itself, so events never
+// arrived. provisionSubscription POSTs to /v1.0/subscriptions on activate;
+// revokeSubscription DELETEs it on deactivate so we don't leak orphan
+// subscriptions when an automation is paused or removed.
+//
+// Both helpers are best-effort: a provisioning failure is logged and the
+// row is left without an externalRef so the caller can fall back to polling
+// (or, if the eventType has no polling handler, raise it as an activation
+// warning). Throws are converted to return values to keep callers simple.
+
+const MSGRAPH_RESOURCE_MAP = {
+    'mail.new':       { resource: "me/mailFolders('Inbox')/messages", changeType: 'created' },
+    'mail.flagged':   { resource: "me/mailFolders('Inbox')/messages", changeType: 'updated' },
+    'event.created':  { resource: 'me/events',                        changeType: 'created' },
+    'event.updated':  { resource: 'me/events',                        changeType: 'updated' },
+    'event.changed':  { resource: 'me/events',                        changeType: 'updated' },
+    'file.changed':   { resource: 'me/drive/root',                    changeType: 'updated' },
+    'file.new':       { resource: 'me/drive/root',                    changeType: 'created' },
+};
+
+// MS Graph subscriptions live for at most ~71h for mail/events and 2h for
+// drive resources. Renewing every 50 minutes keeps the renewal pass simple
+// and works for every resource type.
+const MSGRAPH_LIFETIME_MS = 50 * 60_000;
+
+function getPublicBaseUrl() {
+    return process.env.PUBLIC_BASE_URL || process.env.SERVER_PUBLIC_URL || null;
+}
+
+function buildClientState(userId, automationId) {
+    const secret = process.env.MSGRAPH_CLIENT_STATE_SECRET || process.env.SESSION_SECRET || 'beeflow-msgraph-state';
+    return require('crypto')
+        .createHmac('sha256', secret)
+        .update(`${userId}|${automationId}`)
+        .digest('hex');
+}
+
+/**
+ * Provision an MS Graph subscription for a webhook-mode subscription row.
+ * Returns `{ externalRef, expiresAt, clientState }` on success, or null on
+ * failure (caller should log and proceed without webhook delivery).
+ *
+ * Skipped (returns null) when no PUBLIC_BASE_URL is configured — without a
+ * publicly-reachable HTTPS endpoint MS Graph cannot validate the
+ * notificationUrl and the POST would fail with 400.
+ */
+async function provisionSubscription(sub, session) {
+    if (sub.provider !== 'msgraph') return null;
+    const baseUrl = getPublicBaseUrl();
+    if (!baseUrl) {
+        console.warn(`[TriggerBus] MS Graph subscription skipped for ${sub.id} — PUBLIC_BASE_URL not set`);
+        return null;
+    }
+    if (!session?.accessToken) {
+        console.warn(`[TriggerBus] MS Graph subscription skipped for ${sub.id} — no access token`);
+        return null;
+    }
+    const map = MSGRAPH_RESOURCE_MAP[sub.eventType];
+    if (!map) {
+        console.warn(`[TriggerBus] MS Graph subscription skipped for ${sub.id} — unsupported eventType ${sub.eventType}`);
+        return null;
+    }
+    const expiresAt = new Date(Date.now() + MSGRAPH_LIFETIME_MS).toISOString();
+    const clientState = buildClientState(sub.userId, sub.automationId);
+    const body = {
+        changeType: map.changeType,
+        notificationUrl: `${baseUrl.replace(/\/+$/, '')}/api/automation/events/msgraph`,
+        resource: map.resource,
+        expirationDateTime: expiresAt,
+        clientState,
+    };
+    try {
+        const r = await fetch('https://graph.microsoft.com/v1.0/subscriptions', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${session.accessToken}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        if (!r.ok) {
+            const text = await r.text().catch(() => '');
+            console.warn(`[TriggerBus] MS Graph subscribe failed for ${sub.id}: ${r.status} ${text.slice(0, 200)}`);
+            return null;
+        }
+        const data = await r.json().catch(() => ({}));
+        if (!data?.id) {
+            console.warn(`[TriggerBus] MS Graph subscribe returned no id for ${sub.id}`);
+            return null;
+        }
+        return { externalRef: data.id, expiresAt: data.expirationDateTime || expiresAt, clientState };
+    } catch (e) {
+        console.warn(`[TriggerBus] MS Graph subscribe threw for ${sub.id}: ${e.message}`);
+        return null;
+    }
+}
+
+/**
+ * Best-effort revoke. We don't surface failures to the caller because
+ * deactivation must succeed even if MS Graph rejects the DELETE — the next
+ * renewal tick will simply not refresh the subscription, and it expires
+ * naturally within ~50min.
+ */
+async function revokeSubscription(sub, session) {
+    if (sub.provider !== 'msgraph') return false;
+    if (!sub.externalRef) return false;
+    if (!session?.accessToken) return false;
+    try {
+        const r = await fetch(`https://graph.microsoft.com/v1.0/subscriptions/${sub.externalRef}`, {
+            method: 'DELETE',
+            headers: { 'Authorization': `Bearer ${session.accessToken}` },
+        });
+        // 404 = already gone, treat as success.
+        return r.ok || r.status === 404;
+    } catch (e) {
+        console.warn(`[TriggerBus] MS Graph unsubscribe threw for ${sub.id}: ${e.message}`);
+        return false;
+    }
+}
+
+// ── Failure escalation ──────────────────────────────────
+//
+// Polling and renewal both used to silently skip on error. That hid token
+// expiry and provider outages — users only noticed when they checked the
+// run log and saw no activity. The escalation flow:
+//
+//   - Each fault increments consecutive_failures.
+//   - On crossing the threshold we send ONE notification, recording
+//     error_notified_at to debounce subsequent firings for 24h.
+//   - Any successful poll/renew resets the counter and clears the timestamp.
+//
+// Polling threshold is 5 (≈5 minutes of bad polls) because providers can
+// intermittently rate-limit. Renewal is 2 (≈2 minutes of bad PATCHes)
+// because a missed renewal silently kills the subscription within the hour.
+
+const POLL_FAILURE_THRESHOLD = 5;
+const RENEW_FAILURE_THRESHOLD = 2;
+const FAILURE_NOTIFY_DEBOUNCE_MS = 24 * 60 * 60_000;
+
+async function escalateSubscriptionFailure(sub, threshold, errorMsg) {
+    try {
+        const { consecutiveFailures, errorNotifiedAt } = await automationStore.incrementSubscriptionFailures(sub.id);
+        if (consecutiveFailures < threshold) return;
+        const lastNotified = errorNotifiedAt ? Date.parse(errorNotifiedAt) : 0;
+        if (Number.isFinite(lastNotified) && Date.now() - lastNotified < FAILURE_NOTIFY_DEBOUNCE_MS) return;
+
+        const automation = await automationStore.getAutomation(sub.automationId).catch(() => null);
+        if (!automation) return;
+        try {
+            const notificationStore = require('../stores/notificationStore');
+            await notificationStore.createNotification({
+                userId: sub.userId,
+                category: 'urgent',
+                title: `⚠️ Trigger niet bereikbaar: ${automation.title}`,
+                message: `Automation "${automation.title}" trigger (${sub.provider} ${sub.eventType}) faalt herhaaldelijk: ${errorMsg || 'onbekende fout'}. Controleer je integratie of activeer de automation opnieuw.`,
+            });
+        } catch (e) {
+            console.warn(`[TriggerBus] notify failure for sub ${sub.id} failed: ${e.message}`);
+        }
+        await automationStore.updateSubscription(sub.id, { errorNotifiedAt: new Date().toISOString() }).catch(() => {});
+    } catch (e) {
+        console.warn(`[TriggerBus] escalateSubscriptionFailure error: ${e.message}`);
+    }
+}
+
 // ── Subscription renewal (MS Graph) ─────────────────────
 
 async function renewExpiringSubscriptions() {
@@ -1076,19 +1428,29 @@ async function renewExpiringSubscriptions() {
         const subs = await automationStore.getExpiringSubscriptions({ withinMs: 5 * 60_000 });
         for (const sub of subs) {
             if (sub.provider !== 'msgraph') continue;
-            // Best-effort PATCH with new expirationDateTime; silently no-op on failure.
             try {
                 const session = await loadSession(sub.userId);
-                if (!session?.accessToken) continue;
-                const newExpiry = new Date(Date.now() + 50 * 60_000).toISOString();
-                await fetch(`https://graph.microsoft.com/v1.0/subscriptions/${sub.externalRef}`, {
+                if (!session?.accessToken) {
+                    await escalateSubscriptionFailure(sub, RENEW_FAILURE_THRESHOLD, 'no access token');
+                    continue;
+                }
+                const newExpiry = new Date(Date.now() + MSGRAPH_LIFETIME_MS).toISOString();
+                const r = await fetch(`https://graph.microsoft.com/v1.0/subscriptions/${sub.externalRef}`, {
                     method: 'PATCH',
                     headers: { 'Authorization': `Bearer ${session.accessToken}`, 'Content-Type': 'application/json' },
                     body: JSON.stringify({ expirationDateTime: newExpiry }),
                 });
+                if (!r.ok) {
+                    const text = await r.text().catch(() => '');
+                    console.warn(`[TriggerBus] msgraph sub renewal failed: ${r.status} ${text.slice(0, 200)}`);
+                    await escalateSubscriptionFailure(sub, RENEW_FAILURE_THRESHOLD, `${r.status}`);
+                    continue;
+                }
                 await automationStore.updateSubscription(sub.id, { expiresAt: newExpiry });
+                await automationStore.resetSubscriptionFailures(sub.id);
             } catch (e) {
                 console.warn(`[TriggerBus] msgraph sub renewal failed: ${e.message}`);
+                await escalateSubscriptionFailure(sub, RENEW_FAILURE_THRESHOLD, e.message);
             }
         }
     } catch (e) {
@@ -1160,6 +1522,10 @@ module.exports = {
     dispatchTicketAssistantEvent,
     runPollingPass,
     renewExpiringSubscriptions,
+    provisionSubscription,
+    revokeSubscription,
+    buildClientState,
+    getPublicBaseUrl,
     fetchLatestGmailMatch,
     loadSession,
     // Matchers — exported for unit testing + so other server code can
@@ -1172,8 +1538,19 @@ module.exports = {
     matchDriveFileNewFilter,
     matchNextcloudFileFilter,
     matchNextcloudShareFilter,
+    matchNextcloudShareGenericFilter,
     matchNextcloudActivityFilter,
     matchNextcloudNotificationFilter,
+    matchNextcloudCommentFilter,
+    matchNextcloudTagFilter,
+    matchNextcloudCalendarFilter,
+    matchNextcloudCalendarUpcomingFilter,
+    matchNextcloudDeckCardFilter,
+    matchNextcloudDeckCardMovedFilter,
+    matchNextcloudTalkMessageFilter,
+    matchNextcloudTaskFilter,
+    matchNextcloudUserStatusFilter,
+    applyDslFilter,
     matchTicketAssistantTicketNewFilter,
     matchTicketAssistantSyncFilter,
 };

@@ -159,28 +159,39 @@ async function generateMeetingSummary(transcript, language, userOrgId = null) {
         const modelId = await resolveSmartModel(userOrgId);
         const langName = { nl: 'Dutch', en: 'English', de: 'German', fr: 'French', es: 'Spanish', it: 'Italian', pt: 'Portuguese' }[language] || language;
 
+        // Native-language section headers for the most-used locales. For
+        // unknown languages we fall back to English headers and let the LLM
+        // translate the body into `langName`.
+        const HEADERS = {
+            nl: { summary: '📋 Samenvatting', topics: '🔑 Belangrijkste onderwerpen', decisions: '✅ Besluiten', actions: '📌 Actiepunten', insights: '💡 Inzichten' },
+            en: { summary: '📋 Summary',      topics: '🔑 Key Topics',                decisions: '✅ Decisions Made', actions: '📌 Action Items', insights: '💡 Key Insights' },
+            de: { summary: '📋 Zusammenfassung', topics: '🔑 Hauptthemen', decisions: '✅ Entscheidungen', actions: '📌 Aufgaben', insights: '💡 Erkenntnisse' },
+            fr: { summary: '📋 Résumé',       topics: '🔑 Sujets clés',  decisions: '✅ Décisions',     actions: '📌 Actions',      insights: '💡 Points clés' },
+        };
+        const h = HEADERS[language] || HEADERS.en;
+
         const result = await llmClient.chat(modelId, [
             {
                 role: 'system',
-                content: `You are a meeting assistant. Create a concise, well-structured summary of the meeting transcript. Write the summary in ${langName}.
+                content: `You are a meeting assistant. Create a concise, well-structured summary of the meeting transcript. Write the entire summary in ${langName} — do not mix languages.
 
-Format the summary with these sections (use markdown):
-## 📋 Summary
+Format with these markdown sections (use these EXACT section headings, in this order):
+## ${h.summary}
 A brief 2-3 sentence overview of what the meeting was about.
 
-## 🔑 Key Topics
+## ${h.topics}
 - Bullet points of main topics discussed
 
-## ✅ Decisions Made
-- Any decisions that were agreed upon (skip if none)
+## ${h.decisions}
+- Decisions that were agreed upon (skip the section entirely if there are none)
 
-## 📌 Action Items
+## ${h.actions}
 - Specific tasks assigned to people (skip if none)
 
-## 💡 Key Insights
+## ${h.insights}
 - Notable ideas, suggestions, or observations
 
-Keep it concise and actionable. Skip empty sections.`,
+Keep it concise and actionable. Skip empty sections rather than writing "none".`,
             },
             { role: 'user', content: transcript },
         ], { maxTokens: 4096, temperature: 0.3 });
@@ -226,6 +237,12 @@ async function extractActionItems(transcript, language, userOrgId = null) {
         const modelId = await resolveSmartModel(userOrgId);
         const langName = { nl: 'Dutch', en: 'English', de: 'German', fr: 'French', es: 'Spanish', it: 'Italian', pt: 'Portuguese' }[language] || language;
 
+        const nlExample = language === 'nl' ? `
+
+Voorbeelden van Nederlandse actiepunten:
+- "Tom belt klant volgende week maandag" → text: "Klant bellen", assignee: "Tom", timestamp: "12:30"
+- "Sandra stuurt het rapport voor vrijdag op" → text: "Rapport opsturen", assignee: "Sandra", timestamp: "08:15"` : '';
+
         const result = await llmClient.chat(modelId, [
             {
                 role: 'system',
@@ -233,11 +250,10 @@ async function extractActionItems(transcript, language, userOrgId = null) {
 
 Return ONLY a JSON array of objects. Each object must have:
 - "text": the action item description (in ${langName})
-- "assignee": the person responsible (first name or "Unassigned" if unclear)
+- "assignee": the person responsible (first name or "${language === 'nl' ? 'Niet toegewezen' : 'Unassigned'}" if unclear)
 - "timestamp": the approximate timestamp in the transcript where this was discussed (format: "MM:SS" or "HH:MM:SS")
 
-If there are no action items, return an empty array [].
-Return ONLY valid JSON, no other text.`,
+If there are no action items, return an empty array []. Return ONLY valid JSON, no other text.${nlExample}`,
             },
             { role: 'user', content: transcript.substring(0, 80000) },
         ], { maxTokens: 2048, temperature: 0 });
@@ -485,14 +501,50 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
             userName = userRecord?.firstName || userRecord?.displayName || null;
         } catch (_) {}
 
-        // Always read the active provider from admin config — never trust the client
-        const provider = await configStore.getConfig('transcription_provider') || 'voxtral';
+        // Provider precedence:
+        //   1. Per-upload `provider` form field (only honoured for 'local',
+        //      and only when local transcription is admin-enabled). Picks
+        //      from the upload modal in the UI.
+        //   2. Server-side default `transcription_provider` config.
+        const requestedProvider = String(req.body.provider || '').trim().toLowerCase();
+        const localEnabled = (await configStore.getConfig('local_whisper_enabled')) !== false;
+        let provider = await configStore.getConfig('transcription_provider') || 'voxtral';
+        if (requestedProvider === 'local' && localEnabled) {
+            provider = 'local';
+        } else if (['voxtral', 'whisperx', 'azure', 'whisper_azure'].includes(requestedProvider)) {
+            // Allow the UI to also pick a specific cloud provider explicitly.
+            provider = requestedProvider;
+        }
 
         console.log(`[Transcriptions] Transcribing "${fileName}" (${(fileContent.length / (1024 * 1024)).toFixed(1)} MB) via ${provider} for user ${userId} (${userName || 'unknown'})`);
 
         let response;
 
-        if (provider === 'whisperx') {
+        if (provider === 'local') {
+            // ── In-process Whisper-base on CPU (privacy / no-cloud path) ──
+            const { transcribeLocally } = require('../core/voice/localWhisper');
+            try {
+                const local = await transcribeLocally(req.file.path, { language });
+                if (!local) {
+                    try { fs.unlinkSync(req.file.path); } catch (_) {}
+                    return res.status(503).json({
+                        error: 'Local transcription model is not available. Try again, or pick a cloud provider.',
+                        code: 'local_whisper_unavailable',
+                    });
+                }
+                response = { text: local.text, segments: local.segments };
+            } catch (err) {
+                if (err.code === 'local_whisper_too_long') {
+                    try { fs.unlinkSync(req.file.path); } catch (_) {}
+                    return res.status(400).json({
+                        error: err.message + '. Use a cloud provider for longer recordings.',
+                        code: err.code,
+                    });
+                }
+                throw err;
+            }
+
+        } else if (provider === 'whisperx') {
             // ── WhisperX (self-hosted) ───────────────────────
             response = await transcribeWithWhisperX(req.file.path, fileName, language, contextTerms);
 
@@ -1171,6 +1223,241 @@ router.post('/:id/unshare', requireAuth, async (req, res) => {
     } catch (err) {
         console.error('[Transcriptions] Unshare error:', err.message);
         res.status(500).json({ error: 'Failed to unshare' });
+    }
+});
+
+// ── Nextcloud audio ingest ───────────────────────────────
+//
+// Two endpoints that let the user pull a recording from their Nextcloud
+// Files into the meeting-notes pipeline without first downloading it
+// manually. Notes themselves stay in Bee Flow — there is no writeback
+// to NC. Auth uses the existing `nextcloudClient.resolveAuth` so OAuth,
+// app-password and ExApp-connector sessions all work transparently.
+
+const AUDIO_EXTS = ['.mp3', '.wav', '.m4a', '.ogg', '.webm', '.flac', '.mp4', '.mpeg', '.aac'];
+
+router.get('/nextcloud-audio-files', requireAuth, async (req, res) => {
+    const userId = req.session.user.id;
+    const folder = (req.query.folder || '/Recordings').toString();
+    try {
+        const ncClient = require('../integrations/nextcloudClient');
+        const ctx = await ncClient.resolveAuth(req.session, userId);
+        const root = ncClient.webdavRoot(ctx.baseUrl, ctx.uid);
+        // Encode each path segment so spaces / unicode survive WebDAV.
+        const segs = folder.split('/').filter(Boolean).map(encodeURIComponent);
+        const url = `${root}/${segs.join('/')}${segs.length ? '/' : ''}`;
+        const propfind = `<?xml version="1.0"?>
+<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+  <d:prop><d:displayname/><d:getcontentlength/><d:getcontenttype/><d:getlastmodified/><d:resourcetype/><oc:fileid/></d:prop>
+</d:propfind>`;
+        const r = await ctx.fetch(url, {
+            method: 'PROPFIND',
+            headers: { 'Depth': '1', 'Content-Type': 'application/xml; charset=utf-8' },
+            body: propfind,
+        });
+        if (r.status === 404) return res.status(404).json({ error: `Folder not found: ${folder}` });
+        if (r.status === 401) return res.status(401).json({ error: ctx.authError || 'Nextcloud auth failed' });
+        if (!r.ok) return res.status(502).json({ error: `Nextcloud PROPFIND failed (${r.status})` });
+
+        const xml = await r.text();
+        // Naive but sufficient parse — pull <d:response> blocks and extract href + props.
+        const items = [];
+        const blocks = xml.split(/<d:response[^>]*>/i).slice(1);
+        for (const block of blocks) {
+            const hrefMatch = block.match(/<d:href>([^<]+)<\/d:href>/i);
+            if (!hrefMatch) continue;
+            const href = decodeURIComponent(hrefMatch[1]);
+            // Skip the folder itself (its href ends with the folder path)
+            const folderHrefSuffix = (`/${segs.join('/')}/`).replace(/\/+$/, '/');
+            if (href.endsWith(folderHrefSuffix)) continue;
+            // Drop folders
+            if (/<d:resourcetype>\s*<d:collection\s*\/>\s*<\/d:resourcetype>/i.test(block)) continue;
+
+            const name = decodeURIComponent(href.split('/').filter(Boolean).pop() || '');
+            const ext = path.extname(name).toLowerCase();
+            if (!AUDIO_EXTS.includes(ext)) continue;
+
+            const sizeMatch = block.match(/<d:getcontentlength>(\d+)<\/d:getcontentlength>/i);
+            const ctMatch   = block.match(/<d:getcontenttype>([^<]+)<\/d:getcontenttype>/i);
+            const lmMatch   = block.match(/<d:getlastmodified>([^<]+)<\/d:getlastmodified>/i);
+
+            // Reconstruct the path within the user's Files root from the href.
+            // href example: /remote.php/dav/files/<uid>/Recordings/foo.mp3
+            const filesRoot = `/remote.php/dav/files/${ctx.uid}/`;
+            const idx = href.indexOf(filesRoot);
+            const filePath = idx !== -1 ? '/' + href.slice(idx + filesRoot.length) : href;
+
+            items.push({
+                name,
+                path: filePath,
+                size: sizeMatch ? Number(sizeMatch[1]) : null,
+                contentType: ctMatch ? ctMatch[1] : null,
+                lastModified: lmMatch ? lmMatch[1] : null,
+            });
+        }
+        items.sort((a, b) => (b.lastModified || '').localeCompare(a.lastModified || ''));
+        res.json({ folder, count: items.length, items });
+    } catch (err) {
+        console.error('[Transcriptions] NC list error:', err.message);
+        if (err.message === 'NOT_CONNECTED') {
+            return res.status(400).json({ error: 'Nextcloud not connected for this account' });
+        }
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.post('/from-nextcloud', requireAuth, async (req, res) => {
+    const userId = req.session.user.id;
+    const userOrgId = await resolveUserOrgFromReq(req);
+    const { nextcloud_path, language = 'nl', provider: requestedProvider, title: titleHint, context_terms } = req.body || {};
+
+    if (!nextcloud_path || typeof nextcloud_path !== 'string') {
+        return res.status(400).json({ error: 'nextcloud_path is required' });
+    }
+    const ext = path.extname(nextcloud_path).toLowerCase();
+    if (!AUDIO_EXTS.includes(ext)) {
+        return res.status(400).json({ error: 'Unsupported audio extension' });
+    }
+
+    // Stream the file from NC into a temp upload location so the existing
+    // pipeline can take over.
+    const tmpName = `${Date.now()}-${userId}${ext}`;
+    const tmpPath = path.join(uploadsDir, tmpName);
+    let downloadInfo;
+    try {
+        const ncClient = require('../integrations/nextcloudClient');
+        downloadInfo = await ncClient.downloadBinary(req.session, userId, nextcloud_path, tmpPath);
+    } catch (err) {
+        try { fs.unlinkSync(tmpPath); } catch (_) {}
+        console.error('[Transcriptions] NC download failed:', err.message);
+        return res.status(502).json({ error: `Could not fetch from Nextcloud: ${err.message}` });
+    }
+
+    // Forge a multer-compatible req.file so we can call the same pipeline.
+    // We do that by extracting the body of the upload route into a helper —
+    // but that's invasive. Instead we mimic the smaller subset we need:
+    //   read provider + dispatch + summary + DB save.
+    // Below is a focused mirror (no diarization speaker-name remapping is
+    // skipped here — we keep that to avoid a giant code dup; cloud results
+    // still flow through the main route's pipeline if used here).
+    req.setTimeout(600000); res.setTimeout(600000);
+
+    try {
+        const fileName = path.basename(nextcloud_path);
+        let userName = null;
+        try {
+            const { getUser } = require('../stores/userStore');
+            const userRecord = await getUser(userId);
+            userName = userRecord?.firstName || userRecord?.displayName || null;
+        } catch (_) {}
+
+        const localEnabled = (await configStore.getConfig('local_whisper_enabled')) !== false;
+        let provider = await configStore.getConfig('transcription_provider') || 'voxtral';
+        const reqP = String(requestedProvider || '').trim().toLowerCase();
+        if (reqP === 'local' && localEnabled) provider = 'local';
+        else if (['voxtral', 'whisperx', 'azure', 'whisper_azure'].includes(reqP)) provider = reqP;
+
+        let response;
+        if (provider === 'local') {
+            const { transcribeLocally } = require('../core/voice/localWhisper');
+            const local = await transcribeLocally(tmpPath, { language });
+            if (!local) {
+                try { fs.unlinkSync(tmpPath); } catch (_) {}
+                return res.status(503).json({ error: 'Local transcription unavailable. Pick a cloud provider.', code: 'local_whisper_unavailable' });
+            }
+            response = { text: local.text, segments: local.segments };
+        } else if (provider === 'whisperx') {
+            response = await transcribeWithWhisperX(tmpPath, fileName, language, context_terms || '');
+        } else {
+            // Voxtral default — keep this branch lean. Other cloud providers
+            // are reachable via the regular upload route; users picking those
+            // can still upload manually.
+            const apiKey = await configStore.getSecret('mistral_api_key');
+            if (!apiKey) {
+                try { fs.unlinkSync(tmpPath); } catch (_) {}
+                return res.status(400).json({ error: 'Mistral API key not configured.' });
+            }
+            const { Mistral } = require('@mistralai/mistralai');
+            const client = new Mistral({ apiKey, timeout: 300000 });
+            const fileContent = fs.readFileSync(tmpPath);
+            response = await client.audio.transcriptions.complete({
+                model: 'voxtral-mini-2602',
+                file: { fileName, content: fileContent },
+                diarize: true, language,
+                timestampGranularities: ['segment'],
+                ...(context_terms ? { prompt: context_terms } : {}),
+            });
+        }
+
+        // Merge segments (mirrors main upload route logic, simplified).
+        const segments = response.segments || [];
+        const merged = [];
+        for (const seg of segments) {
+            const last = merged[merged.length - 1];
+            if (last && seg.speakerId === last.speakerId) {
+                last.end = seg.end;
+                last.text += ' ' + (seg.text || '').trim();
+            } else {
+                merged.push({ speaker: seg.speakerId || 'Unknown', start: seg.start, end: seg.end, text: (seg.text || '').trim() });
+            }
+        }
+        const totalDuration = segments.length ? Math.max(...segments.map(s => s.end || 0)) : 0;
+        const formatTime = (s) => {
+            if (s == null) return '00:00';
+            const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), ss = Math.floor(s%60);
+            return h > 0 ? `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`
+                         : `${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`;
+        };
+        const transcript = merged.map(s => `[${s.speaker}] ${formatTime(s.start)} - ${formatTime(s.end)}: ${s.text}`).join('\n');
+
+        const speakerMap = {};
+        for (const s of merged) {
+            if (!speakerMap[s.speaker]) speakerMap[s.speaker] = { duration: 0, segments: 0 };
+            speakerMap[s.speaker].duration += (s.end || 0) - (s.start || 0);
+            speakerMap[s.speaker].segments += 1;
+        }
+        const speakers = Object.entries(speakerMap).map(([id, d]) => ({
+            id, speakingTime: formatTime(d.duration), speakingSeconds: Math.round(d.duration), segments: d.segments,
+        }));
+
+        const summary = await generateMeetingSummary(transcript, language, userOrgId);
+        let title = titleHint || fileName.replace(/\.[^/.]+$/, '');
+        if (summary) {
+            const aiTitle = await generateMeetingTitle(summary, language, userOrgId);
+            if (aiTitle) title = aiTitle;
+        }
+        const actionItems = await extractActionItems(transcript, language, userOrgId);
+
+        // Move temp file to permanent saved-recordings location.
+        const audioDir = path.resolve(__dirname, '../data/uploads/saved-recordings');
+        if (!fs.existsSync(audioDir)) fs.mkdirSync(audioDir, { recursive: true });
+        const audioName = `${Date.now()}-${userId}${ext}`;
+        const audioPath = path.join(audioDir, audioName);
+        try { fs.copyFileSync(tmpPath, audioPath); fs.unlinkSync(tmpPath); }
+        catch (_) { try { fs.unlinkSync(tmpPath); } catch (_) {} }
+
+        const saved = await transcriptionStore.createTranscription({
+            userId, title, fileName, language,
+            durationSeconds: Math.round(totalDuration),
+            speakerCount: speakers.length, segmentCount: merged.length,
+            fullText: response.text || '', transcript, segments: merged, speakers,
+            summary, audioPath: fs.existsSync(audioPath) ? audioPath : '',
+            provider, actionItems,
+            sourceUri: `nextcloud://${userId}${nextcloud_path}`,
+        });
+
+        res.json({
+            id: saved.id, title, fileName, language,
+            duration: formatTime(totalDuration), durationSeconds: Math.round(totalDuration),
+            speakerCount: speakers.length, segmentCount: merged.length,
+            speakers, fullText: response.text || '',
+            transcript, segments: merged, summary, actionItems,
+            sourceUri: `nextcloud://${userId}${nextcloud_path}`,
+        });
+    } catch (err) {
+        try { fs.unlinkSync(tmpPath); } catch (_) {}
+        console.error('[Transcriptions] from-nextcloud failed:', err.message);
+        res.status(500).json({ error: err.message });
     }
 });
 

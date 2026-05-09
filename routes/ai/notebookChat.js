@@ -446,6 +446,38 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             messages.push({ role: 'user', content: message });
         }
 
+        // ── PII detection / tokenization (Privacy Shield) ──────────────
+        // Mirrors directChat: if the org's Privacy Shield has either Azure
+        // PII or Local Transformers.js PII enabled, run validateInputForPii
+        // on the last user message and apply tokenize/block actions.
+        let piiTokenMap = null;
+        try {
+            const orgShield = userOrgForTiers ? await configStore.getConfig(`org_privacy_shield_${userOrgForTiers}`) : null;
+            const orgPiiEnabled = !!(orgShield?.enabled && (orgShield?.azurePiiEnabled || orgShield?.localPiiEnabled !== false));
+            if (orgPiiEnabled) {
+                const { validateInputForPii } = require('../../core/azurePiiDetection');
+                const piiResult = await validateInputForPii(messages.slice(-3), orgPiiEnabled, orgShield);
+                if (piiResult && piiResult.tokenizedText) {
+                    const lastMsg = messages[messages.length - 1];
+                    if (typeof lastMsg.content === 'string') {
+                        lastMsg.content = piiResult.tokenizedText;
+                    } else if (Array.isArray(lastMsg.content)) {
+                        const textPart = lastMsg.content.find(p => p.type === 'text');
+                        if (textPart) textPart.text = piiResult.tokenizedText;
+                    }
+                    piiTokenMap = piiResult.tokenMap;
+                    try { require('../../core/dlp/dlpRunner').mergeTokenMap(notebookId, piiResult.tokenMap); } catch (_) { /* non-fatal */ }
+                    console.warn(`[NotebookChat] 🔒 PII tokenized (${Object.keys(piiTokenMap).length} tokens)`);
+                }
+            }
+        } catch (piiError) {
+            if (piiError?.message?.includes('PII Detected')) {
+                send('error', { error: piiError.message, violationCodes: piiError.violationCodes });
+                return res.end();
+            }
+            // Service unavailable → fail-open
+        }
+
         // ── Build tool list ──────────────────────────────────────────
         const notebookTools = [...NOTEBOOK_DOC_TOOLS, NOTEBOOK_ADD_SOURCE_TOOL];
 

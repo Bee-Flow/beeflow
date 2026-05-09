@@ -141,9 +141,8 @@ const requireAuth = async (req, res, next) => {
     }
 
     // Verify user still exists in DB (cached for 5s to avoid DB spam)
-    // Skip for demo sessions — demo users don't exist in the DB
     const userId = req.session.user?.id;
-    if (userId && !req.session.isDemo) {
+    if (userId) {
         let exists = null;
         const r = getRedis();
         const cacheKey = `bf:uex:${userId}`;
@@ -207,8 +206,8 @@ const requireAuth = async (req, res, next) => {
 // Helper function to get user's current permissions dynamically
 // Results are cached in Redis (or in-memory fallback) for PERM_CACHE_TTL seconds.
 async function getUserPermissions(userId, session = null) {
-    // Demo users or admin-flagged sessions get full access
-    if (session?.isDemo || session?.isAdmin) return ['all'];
+    // Admin-flagged sessions get full access
+    if (session?.isAdmin) return ['all'];
 
     // ── Check permission cache ──
     const r = getRedis();
@@ -374,7 +373,7 @@ const requireAdmin = async (req, res, next) => {
     const userId = req.session.user?.id;
 
     // Check dynamically if user has admin/manage_users permission
-    // Pass session for backwards compatibility with isAdmin/isDemo flags
+    // Pass session for backwards compatibility with isAdmin flag
     if (await hasPermission(userId, 'manage_users', req.session) || await hasPermission(userId, 'all', req.session)) {
         next();
     } else {

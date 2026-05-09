@@ -200,7 +200,6 @@ app.get('/api/health', (req, res) => {
     res.json({
         status: 'ok',
         timestamp: new Date().toISOString(),
-        demoEnabled: process.env.DEMO_MODE_ENABLED !== 'false',
         appVersion: process.env.APP_BUILD_SHA || '',
     });
 });
@@ -260,6 +259,11 @@ app.use('/api/org-azure-config', require('./routes/orgAzureConfig'));
 app.use('/api/compliance', require('./routes/compliance'));
 app.use('/api/chat/dlp-decision', require('./routes/dlpDecision'));
 app.use('/api/cms', require('./routes/cms'));
+// Nextcloud webhook + admin sync — mounted under /auth so they share the
+// auth router's session middleware (admin endpoints require requireAuth).
+// The webhook itself uses HMAC over the body, so it sits BEFORE auth gates.
+app.use('/auth', require('./routes/webhooks/ncEvents'));
+app.use('/auth', require('./routes/admin/ncSync'));
 app.get('/api/guard/health', async (req, res) => {
     try {
         const guardUrl = process.env.GUARD_SERVICE_URL || 'http://guard-service:8100';
@@ -274,6 +278,7 @@ app.get('/api/guard/health', async (req, res) => {
 });
 app.use('/api/subscriptions', require('./routes/subscriptions'));
 app.use('/api/stripe', require('./routes/stripe'));
+app.use('/api/license', require('./routes/license'));
 app.use('/api/documents', require('./routes/documents'));
 app.use('/api/notifications', require('./routes/notifications'));
 // Project feature gate middleware
@@ -374,6 +379,21 @@ app.listen(PORT, '0.0.0.0', () => {
     const { selfCheckOrgShields } = require('./core/orgShield');
     selfCheckOrgShields().catch(err => console.warn('[OrgShieldSelfCheck] Error:', err.message));
 
+    // Background-warm the in-process PII model so the first user request
+    // doesn't pay model-download latency. Safe to call unconditionally;
+    // the loader fails open if the runtime can't reach HuggingFace.
+    if (process.env.LOCAL_PII_PREWARM !== 'false') {
+        const { warmLocalPii } = require('./core/localPiiDetection');
+        warmLocalPii();
+    }
+
+    // Pre-warm the in-process Whisper-base CPU transcription model. Same
+    // fail-open semantics; first upload doesn't pay the download tax.
+    if (process.env.LOCAL_WHISPER_PREWARM !== 'false') {
+        const { warmLocalWhisper } = require('./core/voice/localWhisper');
+        warmLocalWhisper();
+    }
+
     // Register and schedule AI Act + GDPR compliance checks (6-hour interval).
     require('./compliance/checks');
     require('./compliance/scheduler').start();
@@ -413,6 +433,12 @@ app.listen(PORT, '0.0.0.0', () => {
         startTicketAssistantSync();
     } catch (err) {
         console.warn('[Server] Ticket Assistant sync engine load failed:', err.message);
+    }
+    // NC user/group sync backstop — covers gaps when real-time webhooks miss
+    try {
+        require('./jobs/ncSyncBackstop').start();
+    } catch (err) {
+        console.warn('[Server] NC sync backstop load failed:', err.message);
     }
     // Purge orphaned KB chunks (non-blocking, delayed to let DB pool warm up)
     setTimeout(() => {

@@ -216,6 +216,14 @@ async function executeKbSearchTool(toolName, args, context = {}) {
         } else {
             // ── Search-service path ────────────────────────────────
             const searchUrl = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
+            // Resolve the admin's Web-Search Inference Routing config so the
+            // search-service knows which backend to use per task. Falls back
+            // to the service's own env defaults when unresolved.
+            let inferenceRouting = null;
+            try {
+                const { resolveInferenceTargetsWithSecrets } = require('../core/webSearchInferenceResolver');
+                inferenceRouting = await resolveInferenceTargetsWithSecrets();
+            } catch (_) { /* non-fatal */ }
             const searchRes = await fetch(`${searchUrl}/tools/kb-search`, {
                 method: 'POST',
                 headers: getServiceHeaders(),
@@ -224,7 +232,8 @@ async function executeKbSearchTool(toolName, args, context = {}) {
                     kb_ids: kbIds,
                     query,
                     top_k: topK,
-                    rerank: true
+                    rerank: true,
+                    inference_routing: inferenceRouting,
                 }),
                 signal: AbortSignal.timeout(15000)
             });

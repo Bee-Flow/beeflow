@@ -118,10 +118,12 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
     // ── PII Detection ─────────────────────────────────────────────────
     // Runs independently of Llama Guard / Azure moderation.
     // Uses Azure Text Analytics when configured, falls back to CPU model via guard service.
-    const orgPiiEnabled = !!(orgShield?.enabled && orgShield?.azurePiiEnabled);
-    // If the org shield is active and explicitly disables PII detection, respect that
+    // Org-level PII gate: either Azure or Local (Transformers.js) satisfies
+    // it. detectPii() routes between them in azurePiiDetection.js.
+    const orgPiiEnabled = !!(orgShield?.enabled && (orgShield?.azurePiiEnabled || orgShield?.localPiiEnabled !== false));
+    // If the org shield is active and explicitly disables BOTH PII detectors, respect that
     // over the global setting (mirrors the moderation "orgExplicitlyDisabled" pattern).
-    const orgExplicitlyDisabledPii = orgShield?.enabled && orgShield?.azurePiiEnabled === false;
+    const orgExplicitlyDisabledPii = orgShield?.enabled && orgShield?.azurePiiEnabled === false && orgShield?.localPiiEnabled === false;
     // When the org has the interactive DLP gate enabled, skip the auto-tokenising
     // path here — the downstream dlpRunner call in chatStream.js will do the scan
     // and apply the user's chosen action (ask/redact/block). Running both leads to

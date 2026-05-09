@@ -71,6 +71,7 @@ router.get('/:orgId', requireAuth, async (req, res) => {
             moderationEnabled: false,
             euModeEnabled: false,
             azurePiiEnabled: false,
+            localPiiEnabled: true,
             azureSeverityThreshold: 2,
             azureEnabledCategories: ['Hate', 'Violence', 'Sexual', 'SelfHarm'],
             piiDetectionCategories: [],
@@ -124,7 +125,7 @@ router.put('/:orgId', requireAuth, async (req, res) => {
             return res.status(403).json({ error: 'Only organization admins can manage the privacy shield' });
         }
 
-        const { enabled, collectionIds, scope, action, moderationEnabled, moderationProvider, moderationCategories, euModeEnabled, webSearchGuardEnabled, disableSearchOnUpload, azurePiiEnabled, azureSeverityThreshold, azureEnabledCategories, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionAction, webSearchGuardPiiCategories, monitorIntegrations,
+        const { enabled, collectionIds, scope, action, moderationEnabled, moderationProvider, moderationCategories, euModeEnabled, webSearchGuardEnabled, disableSearchOnUpload, azurePiiEnabled, localPiiEnabled, azureSeverityThreshold, azureEnabledCategories, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionAction, webSearchGuardPiiCategories, monitorIntegrations,
             // DLP
             dlpEnabled, dlpScope, dlpMode, dlpFailureMode, dlpAllowlistedHosts, customSensitiveTerms,
             // Transparency
@@ -181,6 +182,9 @@ router.put('/:orgId', requireAuth, async (req, res) => {
             webSearchGuardEnabled: !!webSearchGuardEnabled,
             disableSearchOnUpload: !!disableSearchOnUpload,
             azurePiiEnabled: !!azurePiiEnabled,
+            // In-process Transformers.js detector. Default true (opt-out) so
+            // a fresh server with no Azure creds still detects PII out of the box.
+            localPiiEnabled: localPiiEnabled !== false,
             azureSeverityThreshold: typeof azureSeverityThreshold === 'number' ? azureSeverityThreshold : 2,
             azureEnabledCategories: Array.isArray(azureEnabledCategories) ? azureEnabledCategories : ['Hate', 'Violence', 'Sexual', 'SelfHarm'],
             piiDetectionCategories: Array.isArray(piiDetectionCategories) ? piiDetectionCategories : [],

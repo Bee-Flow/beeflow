@@ -452,7 +452,14 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         ? await configStore.getConfig(`org_privacy_shield_${agent.organization_id}`)
                         : null;
                     const aiCfg = await getAIConfig();
-                    const scrubEnabled = !!(orgShieldForScrub?.enabled && orgShieldForScrub?.azurePiiEnabled) || !!aiCfg?.piiDetectionEnabled;
+                    // Scrub fires when EITHER PII detector is on. The detectPii()
+                    // routing in azurePiiDetection.js falls back from Azure to
+                    // the in-process Transformers.js model when only local is
+                    // enabled, so the scrub path itself doesn't care which one
+                    // ultimately runs — it just needs to know PII is being
+                    // detected at all.
+                    const piiOn = orgShieldForScrub?.azurePiiEnabled || (orgShieldForScrub?.localPiiEnabled !== false);
+                    const scrubEnabled = !!(orgShieldForScrub?.enabled && piiOn) || !!aiCfg?.piiDetectionEnabled;
                     if (scrubEnabled) {
                         const { scrubMemoryContext } = require('../memory/scrubMemoryContext');
                         const { scrubbed, replacedCategories } = await scrubMemoryContext(memoryContext, orgShieldForScrub);

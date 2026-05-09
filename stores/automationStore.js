@@ -16,6 +16,9 @@ async function initDB() {
     await migration.up();
     try { await require('../migrations/automation-locking-and-session-2026-05').up(); } catch (e) { /* tolerate */ }
     try { await require('../migrations/automation-clear-first-run-confirm-2026-05').up(); } catch (e) { /* tolerate */ }
+    try { await require('../migrations/automation-timeout-and-subs-2026-05').up(); } catch (e) { /* tolerate */ }
+    try { await require('../migrations/automation-event-mode-2026-05').up(); } catch (e) { /* tolerate */ }
+    try { await require('../migrations/automation-approval-and-parallel-2026-06').up(); } catch (e) { /* tolerate */ }
     initialized = true;
     console.log('[AutomationStore] PostgreSQL initialized');
 }
@@ -45,6 +48,9 @@ function rowToAutomation(r) {
         runningInstanceId: r.running_instance_id ?? null,
         runningStartedAt: r.running_started_at ? new Date(r.running_started_at).toISOString() : null,
         attempts: r.attempts ?? 0,
+        // Per-automation timeout override (added by automation-timeout-and-subs-2026-05).
+        // NULL means "use the runner's default".
+        runTimeoutMs: r.run_timeout_ms ?? null,
         builderSession: typeof r.builder_session === 'string' ? safeParse(r.builder_session, null) : (r.builder_session ?? null),
         createdFromChatId: r.created_from_chat_id,
         createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
@@ -68,6 +74,14 @@ function rowToRun(r) {
         durationMs: r.duration_ms,
         error: r.error,
         summary: r.summary,
+        // Cancel + retry plumbing (added by automation-timeout-and-subs-2026-05).
+        // parentRunId is the run a retry replays. cancelRequested is flipped
+        // by the cancel endpoint and read by the runner between steps.
+        parentRunId: r.parent_run_id ?? null,
+        cancelRequested: !!r.cancel_requested,
+        // Approval / resume plumbing (added by automation-approval-and-parallel-2026-06).
+        awaitingStepId: r.awaiting_step_id ?? null,
+        approvalToken: r.approval_token ?? null,
     };
 }
 
@@ -231,8 +245,12 @@ async function releaseAutomation(id) {
  * Returns the rows that were reset so the runner can decide whether to
  * retry now, schedule a backoff, or notify the owner.
  */
-async function reapStuckAutomations({ staleAfterMs = 10 * 60_000, maxAttempts = 5 } = {}) {
+async function reapStuckAutomations({ staleAfterMs = 10 * 60_000, maxAttempts = 5, bufferMs = 60_000 } = {}) {
     await initDB();
+    // Per-row stale window: max(floor, run_timeout_ms + buffer). A row with
+    // a custom 30-min timeout gets a 31-min reaper window; rows with no
+    // override fall back to the floor. This keeps short defaults reaping
+    // fast while still leaving room for legitimately long automations.
     const { rows } = await pool.query(
         `UPDATE automations
             SET last_status = CASE
@@ -244,9 +262,15 @@ async function reapStuckAutomations({ staleAfterMs = 10 * 60_000, maxAttempts = 
                 attempts = attempts + 1
           WHERE last_status = 'running'
             AND running_started_at IS NOT NULL
-            AND running_started_at < NOW() - ($1 * INTERVAL '1 millisecond')
+            AND running_started_at < NOW() - (
+                GREATEST($1::int, COALESCE(run_timeout_ms, 0) + $3::int) * INTERVAL '1 millisecond'
+            )
+            -- Approval-paused runs are tracked on the automation_runs row,
+            -- not the automation row, so they don't appear here. The
+            -- automation row should NOT be 'running' while an approval
+            -- waits — runner sets last_status='pending' before pausing.
           RETURNING *`,
-        [staleAfterMs, maxAttempts],
+        [staleAfterMs, maxAttempts, bufferMs],
     );
     return rows.map(rowToAutomation);
 }
@@ -375,6 +399,7 @@ async function updateAutomation(id, updates, savedByUserId) {
         nextRunAt: 'next_run_at',
         lastRunAt: 'last_run_at',
         lastStatus: 'last_status',
+        runTimeoutMs: 'run_timeout_ms',
     };
     const setClauses = ['updated_at = NOW()'];
     const params = [];
@@ -441,17 +466,58 @@ async function listVersions(automationId) {
     }));
 }
 
+/**
+ * Fetch one version by id (the version row contains a JSONB definition).
+ * Used by the restore endpoint to load the historical definition before
+ * we apply it through the regular updateAutomation path (which also
+ * validates and bumps the version counter).
+ */
+async function getVersion(versionId) {
+    await initDB();
+    const r = await getOne(
+        'SELECT id, automation_id, version, definition_json, saved_by_user_id, saved_at FROM automation_versions WHERE id = $1',
+        [versionId],
+    );
+    if (!r) return null;
+    return {
+        id: r.id,
+        automationId: r.automation_id,
+        version: r.version,
+        definition: typeof r.definition_json === 'string' ? safeParse(r.definition_json, {}) : (r.definition_json || {}),
+        savedByUserId: r.saved_by_user_id,
+        savedAt: r.saved_at,
+    };
+}
+
 // ── Runs ───────────────────────────────────────────────
 
-async function createRun({ automationId, version, userId, triggerKind, triggerPayload = null, mode = 'live' }) {
+async function createRun({ automationId, version, userId, triggerKind, triggerPayload = null, mode = 'live', parentRunId = null }) {
     await initDB();
     const id = crypto.randomUUID();
     await run(
-        `INSERT INTO automation_runs (id, automation_id, version, user_id, trigger_kind, trigger_payload, mode, status, started_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'queued',NOW())`,
-        [id, automationId, version, userId, triggerKind, triggerPayload ? JSON.stringify(triggerPayload) : null, mode],
+        `INSERT INTO automation_runs (id, automation_id, version, user_id, trigger_kind, trigger_payload, mode, status, started_at, parent_run_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'queued',NOW(),$8)`,
+        [id, automationId, version, userId, triggerKind, triggerPayload ? JSON.stringify(triggerPayload) : null, mode, parentRunId],
     );
     return getRun(id);
+}
+
+/**
+ * Mark a run as cancel-requested. The runner reads this flag between steps
+ * and short-circuits with status='cancelled'. Returns the updated row, or
+ * null if no row matched.
+ */
+async function requestCancelRun(runId) {
+    await initDB();
+    const { rows } = await pool.query(
+        `UPDATE automation_runs
+            SET cancel_requested = TRUE
+          WHERE id = $1
+            AND status IN ('queued', 'running')
+          RETURNING *`,
+        [runId],
+    );
+    return rowToRun(rows[0]);
 }
 
 async function getRun(id) {
@@ -498,7 +564,13 @@ async function getRecentRunsForUser(userId, { limit = 50 } = {}) {
 
 async function updateRun(id, updates) {
     await initDB();
-    const map = { status: 'status', startedAt: 'started_at', finishedAt: 'finished_at', durationMs: 'duration_ms', error: 'error', summary: 'summary' };
+    const map = {
+        status: 'status', startedAt: 'started_at', finishedAt: 'finished_at',
+        durationMs: 'duration_ms', error: 'error', summary: 'summary',
+        // Phase 2 approval flow
+        awaitingStepId: 'awaiting_step_id',
+        approvalToken: 'approval_token',
+    };
     const setClauses = []; const params = []; let idx = 1;
     for (const [jsKey, dbCol] of Object.entries(map)) {
         if (updates[jsKey] === undefined) continue;
@@ -576,6 +648,34 @@ async function touchWebhook(id) {
     await run(`UPDATE automation_webhooks SET last_seen_at = NOW() WHERE id = $1`, [id]);
 }
 
+/**
+ * Rotate the HMAC secret for a webhook. The webhook's URL stays the same;
+ * only the secret used for signature verification changes — so any caller
+ * still using the old secret immediately starts getting 401s, while a
+ * newly-issued secret takes effect on the next inbound request.
+ */
+async function rotateWebhookSecret(webhookId, automationId) {
+    await initDB();
+    const newSecret = crypto.randomBytes(32).toString('hex');
+    const { rowCount } = await run(
+        `UPDATE automation_webhooks
+            SET secret = $1
+          WHERE id = $2 AND automation_id = $3`,
+        [newSecret, webhookId, automationId],
+    );
+    if (rowCount === 0) return null;
+    return { id: webhookId, automationId, secret: newSecret };
+}
+
+async function deleteWebhook(webhookId, automationId) {
+    await initDB();
+    const { rowCount } = await run(
+        `DELETE FROM automation_webhooks WHERE id = $1 AND automation_id = $2`,
+        [webhookId, automationId],
+    );
+    return rowCount > 0;
+}
+
 async function checkAndStoreNonce(nonce) {
     await initDB();
     // Garbage-collect old nonces (> 24h) opportunistically.
@@ -590,21 +690,19 @@ async function checkAndStoreNonce(nonce) {
 
 // ── Event subscriptions ───────────────────────────────
 
-async function createSubscription({ automationId, userId, provider, eventType, mode = 'webhook', externalRef = null, expiresAt = null, lastCursor = null, filter = null }) {
+async function createSubscription({ automationId, userId, provider, eventType, mode = 'webhook', externalRef = null, expiresAt = null, lastCursor = null, filter = null, clientState = null }) {
     await initDB();
     const id = crypto.randomUUID();
     await run(
         `INSERT INTO automation_event_subscriptions
-            (id, automation_id, user_id, provider, event_type, mode, external_ref, expires_at, last_cursor, filter_json)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-        [id, automationId, userId, provider, eventType, mode, externalRef, expiresAt, lastCursor, filter ? JSON.stringify(filter) : null],
+            (id, automation_id, user_id, provider, event_type, mode, external_ref, expires_at, last_cursor, filter_json, client_state)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+        [id, automationId, userId, provider, eventType, mode, externalRef, expiresAt, lastCursor, filter ? JSON.stringify(filter) : null, clientState],
     );
     return getSubscription(id);
 }
 
-async function getSubscription(id) {
-    await initDB();
-    const r = await getOne('SELECT * FROM automation_event_subscriptions WHERE id = $1', [id]);
+function rowToSubscription(r) {
     if (!r) return null;
     return {
         id: r.id, automationId: r.automation_id, userId: r.user_id,
@@ -612,7 +710,39 @@ async function getSubscription(id) {
         externalRef: r.external_ref, expiresAt: r.expires_at,
         lastCursor: r.last_cursor, lastPolledAt: r.last_polled_at,
         filter: typeof r.filter_json === 'string' ? safeParse(r.filter_json, null) : r.filter_json,
+        // Failure tracking + MS Graph clientState (added by automation-timeout-and-subs-2026-05).
+        consecutiveFailures: r.consecutive_failures ?? 0,
+        errorNotifiedAt: r.error_notified_at ? new Date(r.error_notified_at).toISOString() : null,
+        clientState: r.client_state ?? null,
+        // Push/poll preference (added by automation-event-mode-2026-05).
+        // 'hybrid' = push when connector available, polling as backstop;
+        // 'webhook' = push only (used by msgraph + nextcloud connector);
+        // 'polling' = legacy polling-only path.
+        modePreference: r.mode_preference ?? 'hybrid',
+        lastPushAt: r.last_push_at ? new Date(r.last_push_at).toISOString() : null,
     };
+}
+
+async function getSubscription(id) {
+    await initDB();
+    const r = await getOne('SELECT * FROM automation_event_subscriptions WHERE id = $1', [id]);
+    return rowToSubscription(r);
+}
+
+/**
+ * Look up a subscription by provider + externalRef. Used by the MS Graph
+ * notification handler to validate clientState against the row that owns
+ * this subscriptionId — without it, anyone who learns the notificationUrl
+ * can forge events on behalf of another tenant.
+ */
+async function getSubscriptionByExternalRef(provider, externalRef) {
+    await initDB();
+    if (!externalRef) return null;
+    const r = await getOne(
+        'SELECT * FROM automation_event_subscriptions WHERE provider = $1 AND external_ref = $2 LIMIT 1',
+        [provider, externalRef],
+    );
+    return rowToSubscription(r);
 }
 
 async function getSubscriptionsForProvider(provider, eventType) {
@@ -621,13 +751,7 @@ async function getSubscriptionsForProvider(provider, eventType) {
         'SELECT * FROM automation_event_subscriptions WHERE provider = $1 AND event_type = $2',
         [provider, eventType],
     );
-    return rows.map(r => ({
-        id: r.id, automationId: r.automation_id, userId: r.user_id,
-        provider: r.provider, eventType: r.event_type, mode: r.mode,
-        externalRef: r.external_ref, expiresAt: r.expires_at,
-        lastCursor: r.last_cursor, lastPolledAt: r.last_polled_at,
-        filter: typeof r.filter_json === 'string' ? safeParse(r.filter_json, null) : r.filter_json,
-    }));
+    return rows.map(rowToSubscription);
 }
 
 /**
@@ -635,19 +759,27 @@ async function getSubscriptionsForProvider(provider, eventType) {
  * dedupe and clean up, and by an automation's settings panel to show
  * which event sources are wired up.
  */
+/**
+ * Subscriptions for one user + provider + event. Used by the push-event
+ * webhook handler to find every automation listening for this NC event
+ * for this user, so it can dispatch and stamp last_push_at on each row.
+ */
+async function getSubscriptionsForUserAndEvent(userId, provider, eventType) {
+    await initDB();
+    const rows = await getAll(
+        'SELECT * FROM automation_event_subscriptions WHERE user_id = $1 AND provider = $2 AND event_type = $3',
+        [userId, provider, eventType],
+    );
+    return rows.map(rowToSubscription);
+}
+
 async function getSubscriptionsForAutomation(automationId) {
     await initDB();
     const rows = await getAll(
         'SELECT * FROM automation_event_subscriptions WHERE automation_id = $1',
         [automationId],
     );
-    return rows.map(r => ({
-        id: r.id, automationId: r.automation_id, userId: r.user_id,
-        provider: r.provider, eventType: r.event_type, mode: r.mode,
-        externalRef: r.external_ref, expiresAt: r.expires_at,
-        lastCursor: r.last_cursor, lastPolledAt: r.last_polled_at,
-        filter: typeof r.filter_json === 'string' ? safeParse(r.filter_json, null) : r.filter_json,
-    }));
+    return rows.map(rowToSubscription);
 }
 
 /**
@@ -660,22 +792,30 @@ async function deleteSubscriptionsForAutomation(automationId) {
     await run('DELETE FROM automation_event_subscriptions WHERE automation_id = $1', [automationId]);
 }
 
-async function getPollingSubscriptions({ olderThanMs = 60_000 } = {}) {
+async function getPollingSubscriptions({ olderThanMs = 60_000, webhookStaleMs = 15 * 60_000 } = {}) {
     await initDB();
+    // Two cases:
+    //  1. mode='polling'  → poll on every tick where last_polled_at is old enough
+    //  2. mode='webhook'  → poll as crash-recovery when last_push_at is stale
+    //                       (push pipeline may be down — connector crashed,
+    //                        AppAPI events_listener silently dropped, etc.).
+    //     Healthy webhook subs are skipped entirely; this only kicks in
+    //     after `webhookStaleMs` of silence.
     const rows = await getAll(
         `SELECT * FROM automation_event_subscriptions
-         WHERE mode = 'polling'
-           AND (last_polled_at IS NULL OR last_polled_at < NOW() - ($1 * INTERVAL '1 millisecond'))
+         WHERE (
+                  mode = 'polling'
+                  AND (last_polled_at IS NULL OR last_polled_at < NOW() - ($1 * INTERVAL '1 millisecond'))
+              )
+            OR (
+                  mode = 'webhook'
+                  AND (last_push_at IS NULL OR last_push_at < NOW() - ($2 * INTERVAL '1 millisecond'))
+                  AND (last_polled_at IS NULL OR last_polled_at < NOW() - ($1 * INTERVAL '1 millisecond'))
+              )
          LIMIT 50`,
-        [olderThanMs],
+        [olderThanMs, webhookStaleMs],
     );
-    return rows.map(r => ({
-        id: r.id, automationId: r.automation_id, userId: r.user_id,
-        provider: r.provider, eventType: r.event_type, mode: r.mode,
-        externalRef: r.external_ref, expiresAt: r.expires_at,
-        lastCursor: r.last_cursor, lastPolledAt: r.last_polled_at,
-        filter: typeof r.filter_json === 'string' ? safeParse(r.filter_json, null) : r.filter_json,
-    }));
+    return rows.map(rowToSubscription);
 }
 
 async function getExpiringSubscriptions({ withinMs = 5 * 60_000 } = {}) {
@@ -687,18 +827,22 @@ async function getExpiringSubscriptions({ withinMs = 5 * 60_000 } = {}) {
            AND expires_at < NOW() + ($1 * INTERVAL '1 millisecond')`,
         [withinMs],
     );
-    return rows.map(r => ({
-        id: r.id, automationId: r.automation_id, userId: r.user_id,
-        provider: r.provider, eventType: r.event_type, mode: r.mode,
-        externalRef: r.external_ref, expiresAt: r.expires_at,
-        lastCursor: r.last_cursor, lastPolledAt: r.last_polled_at,
-        filter: typeof r.filter_json === 'string' ? safeParse(r.filter_json, null) : r.filter_json,
-    }));
+    return rows.map(rowToSubscription);
 }
 
 async function updateSubscription(id, updates) {
     await initDB();
-    const map = { externalRef: 'external_ref', expiresAt: 'expires_at', lastCursor: 'last_cursor', lastPolledAt: 'last_polled_at' };
+    const map = {
+        externalRef: 'external_ref',
+        expiresAt: 'expires_at',
+        lastCursor: 'last_cursor',
+        lastPolledAt: 'last_polled_at',
+        consecutiveFailures: 'consecutive_failures',
+        errorNotifiedAt: 'error_notified_at',
+        clientState: 'client_state',
+        modePreference: 'mode_preference',
+        lastPushAt: 'last_push_at',
+    };
     const setClauses = []; const params = []; let idx = 1;
     for (const [jsKey, dbCol] of Object.entries(map)) {
         if (updates[jsKey] === undefined) continue;
@@ -709,6 +853,40 @@ async function updateSubscription(id, updates) {
     params.push(id);
     const { rowCount } = await run(`UPDATE automation_event_subscriptions SET ${setClauses.join(', ')} WHERE id = $${idx}`, params);
     return rowCount > 0;
+}
+
+/**
+ * Atomically increment `consecutive_failures` and return the new value.
+ * Used by the polling/renewal paths to drive the failure-escalation
+ * notification: callers compare the returned count to the threshold
+ * (5 for polling, 2 for renewal) and notify once when it crosses.
+ */
+async function incrementSubscriptionFailures(id) {
+    await initDB();
+    const { rows } = await pool.query(
+        `UPDATE automation_event_subscriptions
+            SET consecutive_failures = consecutive_failures + 1
+          WHERE id = $1
+          RETURNING consecutive_failures, error_notified_at`,
+        [id],
+    );
+    if (!rows[0]) return { consecutiveFailures: 0, errorNotifiedAt: null };
+    return {
+        consecutiveFailures: rows[0].consecutive_failures,
+        errorNotifiedAt: rows[0].error_notified_at ? new Date(rows[0].error_notified_at).toISOString() : null,
+    };
+}
+
+async function resetSubscriptionFailures(id) {
+    await initDB();
+    await run(
+        `UPDATE automation_event_subscriptions
+            SET consecutive_failures = 0,
+                error_notified_at = NULL
+          WHERE id = $1
+            AND (consecutive_failures > 0 OR error_notified_at IS NOT NULL)`,
+        [id],
+    );
 }
 
 async function deleteSubscription(id) {
@@ -734,25 +912,33 @@ module.exports = {
     updateAutomation,
     deleteAutomation,
     listVersions,
+    getVersion,
     createRun,
     getRun,
     getRunsForAutomation,
     getRecentRunsForUser,
     updateRun,
+    requestCancelRun,
     recordRunStep,
     getRunSteps,
     createWebhook,
     getWebhook,
     getWebhooksForAutomation,
     touchWebhook,
+    rotateWebhookSecret,
+    deleteWebhook,
     checkAndStoreNonce,
     createSubscription,
     getSubscription,
+    getSubscriptionByExternalRef,
     getSubscriptionsForProvider,
+    getSubscriptionsForUserAndEvent,
     getSubscriptionsForAutomation,
     deleteSubscriptionsForAutomation,
     getPollingSubscriptions,
     getExpiringSubscriptions,
     updateSubscription,
+    incrementSubscriptionFailures,
+    resetSubscriptionFailures,
     deleteSubscription,
 };

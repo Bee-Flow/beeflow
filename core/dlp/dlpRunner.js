@@ -218,7 +218,9 @@ async function scan({ messages, orgShieldConfig, orgId, conversationId, provider
     }
 
     // Scan both sources in parallel.
-    const piiEnabled = !!orgShieldConfig.azurePiiEnabled;
+    // Either Azure or Local Transformers.js detector counts as "PII enabled"
+    // — detectPii() picks the right backend. localPiiEnabled defaults true.
+    const piiEnabled = !!(orgShieldConfig.azurePiiEnabled || orgShieldConfig.localPiiEnabled !== false);
     const piiCategories = Array.isArray(orgShieldConfig.piiDetectionCategories) && orgShieldConfig.piiDetectionCategories.length > 0
         ? orgShieldConfig.piiDetectionCategories
         : null;

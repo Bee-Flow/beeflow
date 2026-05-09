@@ -158,6 +158,32 @@ async function initDB() {
     try { await exec(`ALTER TABLE groups ADD COLUMN IF NOT EXISTS "allowedTiers" TEXT DEFAULT '[]'`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS "azureUserId" TEXT`); } catch (e) { /* column already exists */ }
 
+    // ── Nextcloud connector binding (instance ↔ org, NC uid ↔ user) ──
+    // Each NC instance maps 1-op-1 to an org via ocs/v2.php/cloud/capabilities `instanceid`.
+    // Auto-provisioned users carry `nc_uid` for sync + dedup; `provider` distinguishes
+    // 'nextcloud_connector' from 'oauth_google' / 'local' for downstream auth flows.
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "nc_instance_id" TEXT`); } catch (e) { }
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "nc_base_url" TEXT`); } catch (e) { }
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "nc_admin_uid" TEXT`); } catch (e) { }
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "nc_provisioned_at" TIMESTAMPTZ`); } catch (e) { }
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "connector_callback_url" TEXT`); } catch (e) { }
+    try { await exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_orgs_nc_instance_id ON organizations ("nc_instance_id") WHERE "nc_instance_id" IS NOT NULL`); } catch (e) { }
+    try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS "nc_uid" TEXT`); } catch (e) { }
+    try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS "provider" TEXT`); } catch (e) { }
+    try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS "auto_provisioned" BOOLEAN DEFAULT FALSE`); } catch (e) { }
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_users_nc_uid_org ON users ("organizationId", "nc_uid") WHERE "nc_uid" IS NOT NULL`); } catch (e) { }
+
+    // ── NC user/group sync configuration (per org) ──
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "nc_sync_mode" TEXT DEFAULT 'mirror_all'`); } catch (e) { }
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "nc_sync_groups" TEXT DEFAULT '[]'`); } catch (e) { }
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "nc_sync_excluded_groups" TEXT DEFAULT '[]'`); } catch (e) { }
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "nc_new_user_default_status" TEXT DEFAULT 'active'`); } catch (e) { }
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "nc_last_sync_at" TIMESTAMPTZ`); } catch (e) { }
+    // First-run wizard flag — null until org-admin completes the App Store
+    // onboarding. connectorJwt.js gates auto-provision on this so other NC
+    // users wait at a "Setup in progress" screen until the admin is done.
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "nc_onboarding_completed_at" TIMESTAMPTZ`); } catch (e) { }
+
     // ── Subscription schema migrations ──
     try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS price REAL`); } catch (e) { }
     try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'EUR'`); } catch (e) { }
@@ -198,6 +224,32 @@ async function initDB() {
     try { await exec(`CREATE INDEX IF NOT EXISTS idx_users_org ON users("organizationId") WHERE "organizationId" IS NOT NULL AND "organizationId" != ''`); } catch (e) { /* ok */ }
     // Audit log index
     try { await exec(`CREATE INDEX IF NOT EXISTS idx_audit_target ON subscription_audit_log(target_type, target_id)`); } catch (e) { }
+
+    // ── License keys (signed JWT activations) ──
+    try {
+        await exec(`CREATE TABLE IF NOT EXISTS license_keys (
+            id TEXT PRIMARY KEY,
+            organization_id TEXT REFERENCES organizations(id) ON DELETE CASCADE,
+            user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+            scope TEXT NOT NULL DEFAULT 'organization',
+            raw_token TEXT NOT NULL,
+            tier TEXT NOT NULL,
+            issuer TEXT,
+            issued_at TIMESTAMPTZ NOT NULL,
+            expires_at TIMESTAMPTZ NOT NULL,
+            billing_interval TEXT NOT NULL DEFAULT 'monthly',
+            last_refresh_at TIMESTAMPTZ,
+            refresh_status TEXT DEFAULT 'pending',
+            revoked_at TIMESTAMPTZ,
+            activated_by TEXT,
+            metadata TEXT DEFAULT '{}',
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        )`);
+    } catch (e) { /* table already exists */ }
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_license_keys_org ON license_keys(organization_id) WHERE organization_id IS NOT NULL`); } catch (e) { }
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_license_keys_user ON license_keys(user_id) WHERE user_id IS NOT NULL`); } catch (e) { }
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_license_keys_status ON license_keys(refresh_status)`); } catch (e) { }
 
     initialized = true;
 }
@@ -369,20 +421,32 @@ async function getUserByEmail(email) {
 
 async function createUser(userData) {
     await initDB();
-    const { id, username, passwordHash, displayName, firstName, lastName, email, phone, avatar, avatarType, role, groups, orgRole, organizationId } = userData;
+    const { id, username, passwordHash, displayName, firstName, lastName, email, phone, avatar, avatarType, role, groups, orgRole, organizationId, ncUid, provider, autoProvisioned } = userData;
     const existing = await getOne('SELECT id FROM users WHERE id = $1', [id]);
     if (existing) return false;
     try {
         const mwDek = userData.masterWrappedDEK ? (typeof userData.masterWrappedDEK === 'string' ? userData.masterWrappedDEK : JSON.stringify(userData.masterWrappedDEK)) : null;
         const wDek = userData.wrappedDEK ? (typeof userData.wrappedDEK === 'string' ? userData.wrappedDEK : JSON.stringify(userData.wrappedDEK)) : null;
-        await run(`INSERT INTO users (id, username, "displayName", "firstName", "lastName", email, phone, avatar, "avatarType", "passwordHash", role, groups, "masterWrappedDEK", "wrappedDEK", "orgRole", "organizationId", "createdAt", status, "azureUserId")
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+        await run(`INSERT INTO users (id, username, "displayName", "firstName", "lastName", email, phone, avatar, "avatarType", "passwordHash", role, groups, "masterWrappedDEK", "wrappedDEK", "orgRole", "organizationId", "createdAt", status, "azureUserId", "nc_uid", "provider", "auto_provisioned")
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
             [id, username, displayName || username, firstName || null, lastName || null, email || null, phone || null,
                 avatar || null, avatarType || null, passwordHash, role || 'user',
                 JSON.stringify(groups || []), mwDek, wDek, orgRole || '', organizationId || '',
-                new Date().toISOString().split('T')[0], userData.status || 'active', userData.azureUserId || null]);
+                new Date().toISOString().split('T')[0], userData.status || 'active', userData.azureUserId || null,
+                ncUid || null, provider || null, autoProvisioned ? true : false]);
         return true;
     } catch (e) { console.error(e); return false; }
+}
+
+async function getUserByNcUid(organizationId, ncUid) {
+    if (!organizationId || !ncUid) return null;
+    await initDB();
+    const u = await getOne('SELECT * FROM users WHERE "organizationId" = $1 AND "nc_uid" = $2', [organizationId, ncUid]);
+    if (!u) return null;
+    // Match the shape produced by getUser/getUserByEmail — JSON columns are
+    // parsed so callers can rely on `groups` being an array. Without this
+    // ncUserGroupSync's group-diff comparisons silently rewrite every sync.
+    return { ...u, groups: parseJSON(u.groups, []), appPassword: parseJSON(u.appPassword, u.appPassword) };
 }
 
 async function deleteUser(userId) {
@@ -437,6 +501,7 @@ async function updateUser(userId, updates) {
         passwordResetRequired: 'passwordResetRequired', dekUnwrapFailures: 'dekUnwrapFailures',
         dekLockoutUntil: 'dekLockoutUntil', opaqueRecord: 'opaqueRecord', kdfMode: 'kdfMode',
         status: 'status', activeIconPackId: 'activeIconPackId', azureUserId: 'azureUserId',
+        ncUid: 'nc_uid', provider: 'provider', autoProvisioned: 'auto_provisioned',
     };
 
     for (const [jsKey, dbCol] of Object.entries(colMap)) {
@@ -465,7 +530,16 @@ function parseOrg(o) {
         allowSignup: o.allowSignup === '1' || o.allowSignup === true,
         autoApproveSSO: o.autoApproveSSO === '1' || o.autoApproveSSO === true,
         allowedDomains: parseJSON(o.allowed_domains, []),
+        ncSyncGroups: parseJSON(o.nc_sync_groups, []),
+        ncSyncExcludedGroups: parseJSON(o.nc_sync_excluded_groups, []),
     };
+}
+
+async function getOrganizationByNcInstanceId(ncInstanceId) {
+    if (!ncInstanceId) return null;
+    await initDB();
+    const o = await getOne('SELECT * FROM organizations WHERE nc_instance_id = $1', [ncInstanceId]);
+    return o ? parseOrg(o) : null;
 }
 
 async function getAllOrganizations() {
@@ -483,13 +557,13 @@ async function getOrganization(id) {
 
 async function createOrganization(orgData) {
     await initDB();
-    const { id, name, description, tagline, address, email, phone, website, kvk, vat, logo, footerText, defaultGroups, allowSignup, authMethod, autoApproveSSO, enabledIntegrations, allowedDomains } = orgData;
+    const { id, name, description, tagline, address, email, phone, website, kvk, vat, logo, footerText, defaultGroups, allowSignup, authMethod, autoApproveSSO, enabledIntegrations, allowedDomains, ncInstanceId, ncBaseUrl, ncAdminUid, ncProvisionedAt, connectorCallbackUrl } = orgData;
     const ex = await getOne('SELECT id FROM organizations WHERE id = $1', [id]);
     if (ex) return false;
     try {
-        await run(`INSERT INTO organizations (id, name, description, tagline, address, email, phone, website, kvk, vat, logo, "footerText", "defaultGroups", "allowSignup", "authMethod", "autoApproveSSO", "enabledIntegrations", "allowed_domains")
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
-            [id, name, description || '', tagline || '', address || '', email || '', phone || '', website || '', kvk || '', vat || '', logo || '', footerText || '', JSON.stringify(defaultGroups || []), allowSignup ? '1' : '0', authMethod || null, autoApproveSSO ? '1' : '0', enabledIntegrations ? JSON.stringify(enabledIntegrations) : null, allowedDomains ? JSON.stringify(allowedDomains) : null]);
+        await run(`INSERT INTO organizations (id, name, description, tagline, address, email, phone, website, kvk, vat, logo, "footerText", "defaultGroups", "allowSignup", "authMethod", "autoApproveSSO", "enabledIntegrations", "allowed_domains", "nc_instance_id", "nc_base_url", "nc_admin_uid", "nc_provisioned_at", "connector_callback_url")
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+            [id, name, description || '', tagline || '', address || '', email || '', phone || '', website || '', kvk || '', vat || '', logo || '', footerText || '', JSON.stringify(defaultGroups || []), allowSignup ? '1' : '0', authMethod || null, autoApproveSSO ? '1' : '0', enabledIntegrations ? JSON.stringify(enabledIntegrations) : null, allowedDomains ? JSON.stringify(allowedDomains) : null, ncInstanceId || null, ncBaseUrl || null, ncAdminUid || null, ncProvisionedAt || null, connectorCallbackUrl || null]);
         // Auto-assign default subscription plan if one exists
         try {
             const defaultPlan = await getOne('SELECT id FROM subscription_plans WHERE is_default = TRUE LIMIT 1');
@@ -506,7 +580,7 @@ async function updateOrganization(orgId, updates) {
     await initDB();
     const ex = await getOne('SELECT id FROM organizations WHERE id = $1', [orgId]);
     if (!ex) return false;
-    const colMap = { name: 'name', description: 'description', tagline: 'tagline', address: 'address', email: 'email', phone: 'phone', website: 'website', kvk: 'kvk', vat: 'vat', logo: 'logo', footerText: 'footerText', authMethod: 'authMethod' };
+    const colMap = { name: 'name', description: 'description', tagline: 'tagline', address: 'address', email: 'email', phone: 'phone', website: 'website', kvk: 'kvk', vat: 'vat', logo: 'logo', footerText: 'footerText', authMethod: 'authMethod', connectorCallbackUrl: 'connector_callback_url', ncSyncMode: 'nc_sync_mode', ncNewUserDefaultStatus: 'nc_new_user_default_status', ncLastSyncAt: 'nc_last_sync_at', ncInstanceId: 'nc_instance_id', ncBaseUrl: 'nc_base_url', ncAdminUid: 'nc_admin_uid', ncProvisionedAt: 'nc_provisioned_at', ncOnboardingCompletedAt: 'nc_onboarding_completed_at' };
     const updateMap = {};
     for (const [k, v] of Object.entries(colMap)) { if (updates[k] !== undefined) updateMap[k] = updates[k]; }
     if (updates.defaultGroups !== undefined) updateMap.defaultGroups = JSON.stringify(updates.defaultGroups);
@@ -514,7 +588,9 @@ async function updateOrganization(orgId, updates) {
     if (updates.autoApproveSSO !== undefined) updateMap.autoApproveSSO = updates.autoApproveSSO ? '1' : '0';
     if (updates.enabledIntegrations !== undefined) updateMap.enabledIntegrations = updates.enabledIntegrations === null ? null : JSON.stringify(updates.enabledIntegrations);
     if (updates.allowedDomains !== undefined) updateMap.allowed_domains = updates.allowedDomains === null ? null : JSON.stringify(updates.allowedDomains);
-    const fullColMap = { ...colMap, defaultGroups: 'defaultGroups', allowSignup: 'allowSignup', autoApproveSSO: 'autoApproveSSO', enabledIntegrations: 'enabledIntegrations', allowed_domains: 'allowed_domains' };
+    if (updates.ncSyncGroups !== undefined) updateMap.nc_sync_groups = JSON.stringify(updates.ncSyncGroups);
+    if (updates.ncSyncExcludedGroups !== undefined) updateMap.nc_sync_excluded_groups = JSON.stringify(updates.ncSyncExcludedGroups);
+    const fullColMap = { ...colMap, defaultGroups: 'defaultGroups', allowSignup: 'allowSignup', autoApproveSSO: 'autoApproveSSO', enabledIntegrations: 'enabledIntegrations', allowed_domains: 'allowed_domains', nc_sync_groups: 'nc_sync_groups', nc_sync_excluded_groups: 'nc_sync_excluded_groups' };
     try {
         const q = dynamicUpdate('organizations', orgId, updateMap, fullColMap);
         if (q) await run(q.sql, q.params);
@@ -577,12 +653,16 @@ async function getAllGroups() {
 
 async function createGroup(groupData) {
     await initDB();
-    const { id, organizationId, name, description, permissions, roles, allowedAgentTypes, azureGroupId, source, lastSyncedAt } = groupData;
+    const { id, organizationId, name, description, permissions, roles, allowedAgentTypes, azureGroupId, source, lastSyncedAt, orgRole } = groupData;
     const ex = await getOne('SELECT id FROM groups WHERE id = $1', [id]);
     if (ex) return false;
     try {
-        await run('INSERT INTO groups (id, "organizationId", name, description, permissions, roles, "userCount", "allowedAgentTypes", "azureGroupId", "source", "lastSyncedAt") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)',
-            [id, organizationId || null, name, description || '', JSON.stringify(permissions || []), JSON.stringify(roles || []), 0, JSON.stringify(allowedAgentTypes || []), azureGroupId || null, source || 'manual', lastSyncedAt || null]);
+        // Default groups to orgRole='member' so freshly-mirrored groups
+        // immediately have a sensible role baseline. The legacy default of
+        // '' meant org-admins had to manually pick a role for every synced
+        // group before users in those groups could do anything.
+        await run('INSERT INTO groups (id, "organizationId", name, description, permissions, roles, "userCount", "allowedAgentTypes", "azureGroupId", "source", "lastSyncedAt", "orgRole") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)',
+            [id, organizationId || null, name, description || '', JSON.stringify(permissions || []), JSON.stringify(roles || []), 0, JSON.stringify(allowedAgentTypes || []), azureGroupId || null, source || 'manual', lastSyncedAt || null, orgRole || 'member']);
         return true;
     } catch (e) { console.error(e); return false; }
 }
@@ -1040,7 +1120,8 @@ async function getAuditLog(opts = {}) {
 
 module.exports = {
     getAllUsers, getAllUserAvatars, getUser, getUserByEmail, createUser, updateUser, deleteUser,
-    getAllOrganizations, getOrganization, createOrganization, updateOrganization, deleteOrganization,
+    getAllOrganizations, getOrganization, getOrganizationByNcInstanceId, createOrganization, updateOrganization, deleteOrganization,
+    getUserByNcUid,
     getAllGroups, createGroup, updateGroup, deleteGroup, getGroupByAzureId, getUserByAzureId,
     storeAppPassword, getAppPassword, hasAppPassword, deleteAppPassword,
     getAllRoles, createRole, updateRole, deleteRole,

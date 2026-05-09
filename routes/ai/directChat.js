@@ -805,10 +805,21 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                 // tokeniser. We replace with generic labels (non-reversible)
                 // so the AI can't reconstruct the underlying data.
                 try {
-                    const orgShieldForScrub = userOrgId
-                        ? await configStore.getConfig(`org_privacy_shield_${userOrgId}`)
+                    // Resolve the user's org locally — the outer-scope
+                    // `userOrgId` const is only declared further down (≈line
+                    // 1560), so referencing it here would hit the TDZ.
+                    let scrubOrgId = null;
+                    try {
+                        const userStoreLocal = require('../../stores/userStore');
+                        const localUser = await userStoreLocal.getUser(userId).catch(() => null);
+                        scrubOrgId = localUser?.organizationId || null;
+                    } catch { /* best-effort */ }
+                    const orgShieldForScrub = scrubOrgId
+                        ? await configStore.getConfig(`org_privacy_shield_${scrubOrgId}`)
                         : null;
-                    const scrubEnabled = !!(orgShieldForScrub?.enabled && orgShieldForScrub?.azurePiiEnabled)
+                    // Either Azure or Local Transformers.js PII detector counts.
+                    const piiOn = orgShieldForScrub?.azurePiiEnabled || (orgShieldForScrub?.localPiiEnabled !== false);
+                    const scrubEnabled = !!(orgShieldForScrub?.enabled && piiOn)
                         || !!(await getAIConfig())?.piiDetectionEnabled;
                     if (scrubEnabled) {
                         const { scrubMemoryContext } = require('../../core/memory/scrubMemoryContext');
@@ -1554,7 +1565,13 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         // ─── AI Content Moderation (org shield) ─────────────────────
         const { resolveUserOrgIds } = require('../../auth');
         const userOrgIds = await resolveUserOrgIds(req);
-        const userOrgId = userOrgIds && userOrgIds.size > 0 ? Array.from(userOrgIds)[0] : null;
+        // Super-admins get `null` from resolveUserOrgIds (intentional — it
+        // bypasses org-scoped filtering for read queries). For shield/PII
+        // resolution we still want their actual org binding so the shield
+        // is loaded; fall back to session.user.organizationId.
+        const userOrgId = (userOrgIds && userOrgIds.size > 0)
+            ? Array.from(userOrgIds)[0]
+            : (req.session?.user?.organizationId || null);
 
         // Deferred log for unicode smuggling (needed userOrgId)
         if (unicodeResult.smugglingDetected) {
@@ -1659,7 +1676,10 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         try {
             if (dlpWillHandleHere) throw { __skip: true };
             const { validateInputForPii } = require('../../core/azurePiiDetection');
-            const orgPiiEnabled = !!(orgShield?.enabled && orgShield?.azurePiiEnabled);
+            // Either Azure or Local Transformers.js PII detector satisfies
+            // the PII gate. detectPii() in azurePiiDetection.js routes
+            // between them automatically.
+            const orgPiiEnabled = !!(orgShield?.enabled && (orgShield?.azurePiiEnabled || orgShield?.localPiiEnabled !== false));
             const piiResult = await validateInputForPii(messages.slice(-3), orgPiiEnabled, orgShield);
 
             if (piiResult && piiResult.tokenizedText) {

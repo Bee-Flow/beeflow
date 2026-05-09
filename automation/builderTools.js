@@ -242,27 +242,77 @@ APP_EVENT TRIGGERS (pick the most specific; use filters to narrow):
        filter:{folderId:"<drive-folder-id>",mimeType:"application/pdf"}}
 
   ── Nextcloud ──
-  • file.new — fires when a file is uploaded/created.
-    Filters: inFolder (path prefix like "/Invoices"), extension ("pdf"),
-             nameContains, excludeOwnUploads.
-    Payload: {activityId, path, name, extension, kind, actor, datetime, link}.
+  Connector-bound users get sub-second push delivery via the Bee Flow
+  Nextcloud ExApp; everyone else falls back to 60s polling for the
+  events that have a poller (file.new, file.changed, share.received,
+  activity.new, notification.new). The other triggers below require the
+  connector — activate fails with an explanatory error otherwise.
 
-  • file.changed — fires when a file is modified. Same filter shape as file.new.
+  ── Files ──
+  • file.new / file.changed / file.deleted / file.renamed
+    Filters: inFolder (path prefix), extension, nameContains,
+             excludeOwnUploads, any[]/none[]/expr/age (rich filter DSL).
+    Payload: {id, path, name, extension, kind, actor, datetime, link}.
 
-  • share.received — fires when a file or folder is shared with the user.
-    Filters: actorEquals (the sharer's username), nameContains,
-             kindEquals ("file"/"folder").
-    Payload: {activityId, path, name, kind, actor, datetime, link}.
+  • file.commented — fires when a comment is added to a file.
+    Filters: pathPrefix, actorEquals, messageContains.
+    Payload: {fileId, path, name, comment, actor, datetime}.
 
-  • activity.new — power-user catch-all; covers comments, mentions, tags,
-    Deck moves, calendar invites, and anything else in the Nextcloud
-    activity feed. Prefer the specific triggers above when applicable.
-    Filters: type (raw activity slug), objectNameContains, actorEquals.
+  • file.tagged — fires when a system tag is added or removed from a file.
+    Filters: tagName, tagAction ("added"/"removed"), pathPrefix.
+    Payload: {fileId, path, tagName, tagAction, actor, datetime}.
 
-  • notification.new — fires on Nextcloud system notifications (Talk
-    pings, share invitations, app announcements).
-    Filters: app ("spreed", "files_sharing", …), subjectContains.
+  ── Sharing ──
+  • share.created / share.received / share.accepted / share.deleted
+    Filters: actorEquals, nameContains, kindEquals ("file"/"folder"),
+             shareType ("link"/"user"/"group"/"federated").
+    Payload: {shareId, path, name, kind, shareType, actor, datetime, link}.
+
+  ── Calendar ──
+  • calendar.event.created / calendar.event.changed / calendar.event.deleted
+    Filters: calendarId, summaryContains, attendeeContains.
+    Payload: {uid, calendarId, summary, startsAt, endsAt, actor, datetime}.
+
+  • calendar.event.upcoming — schedule-driven (poll-only); fires N minutes
+    before an event starts.
+    Filters: leadMinutes (default 15), calendarId, summaryContains.
+
+  ── Deck (kanban) ──
+  • deck.card.created / deck.card.changed / deck.card.deleted
+    Filters: boardId, stackId, titleContains, archived (true/false).
+    Payload: {cardId, boardId, stackId, title, archived, actor, datetime}.
+
+  • deck.card.moved — fires when a card moves between stacks (a special
+    case of deck.card.changed).
+    Filters: boardId, fromStackId, toStackId.
+
+  • deck.card.completed — fires when "Done"/"Closed" stack receives a card
+    (heuristic: stack title matches /done|closed|complete/i).
+
+  ── Talk (chat) ──
+  • talk.message.received — fires for new chat messages.
+    Filters: roomToken, roomNameContains, actorEquals, messageContains,
+             excludeOwnMessages.
+    Payload: {messageId, roomToken, roomName, actor, message, datetime}.
+
+  • talk.mention.received — fires only when the message @-mentions the user.
+    Filters: roomToken, actorEquals.
+
+  ── Tasks ──
+  • task.created / task.completed / task.due
+    Filters: listId, titleContains, priorityEquals.
+    Payload: {taskId, listId, title, completed, priority, due, actor, datetime}.
+
+  ── Generic ──
+  • activity.new — power-user catch-all over the activity feed.
+    Filters: type, objectNameContains, actorEquals.
+
+  • notification.new — fires on Nextcloud system notifications.
+    Filters: app, subjectContains.
     Payload: {notificationId, app, subject, message, link, datetime}.
+
+  • user.status.changed — fires on user status updates (online/away/dnd).
+    Filters: status ("online"/"away"/"dnd"/"invisible"), userIdEquals.
 
   ── Ticket Assistant (ITIL ticket sync — gmail/outlook/jira/servicenow/
                        zendesk/freshservice/topdesk) ──
@@ -295,7 +345,7 @@ leading search step just to look up data that's already in the payload.`,
                     cron: { type: 'string', description: 'Standard 5-field cron, REQUIRED when kind=schedule. Use exact format: minute hour day-of-month month day-of-week. Example: "0 9 * * 1" = every Monday at 9:00.' },
                     tz: { type: 'string', description: 'IANA timezone, e.g. Europe/Amsterdam (when kind=schedule).' },
                     appProvider: { type: 'string', description: 'Provider id (when kind=app_event): gmail | google-calendar | google-drive | nextcloud | ticket-assistant' },
-                    appEvent: { type: 'string', description: 'Event name (when kind=app_event). Allowed: gmail.{mail.new, label.added}; google-calendar.{event.changed, event.upcoming}; google-drive.file.new; nextcloud.{file.new, file.changed, share.received, activity.new, notification.new}; ticket-assistant.{ticket.new, sync.completed}.' },
+                    appEvent: { type: 'string', description: 'Event name (when kind=app_event). Allowed: gmail.{mail.new, label.added}; google-calendar.{event.changed, event.upcoming}; google-drive.file.new; nextcloud.{file.new, file.changed, file.deleted, file.renamed, file.commented, file.tagged, share.created, share.received, share.accepted, share.deleted, calendar.event.created, calendar.event.changed, calendar.event.deleted, calendar.event.upcoming, deck.card.created, deck.card.changed, deck.card.deleted, deck.card.moved, deck.card.completed, talk.message.received, talk.mention.received, task.created, task.completed, task.due, activity.new, notification.new, user.status.changed}; ticket-assistant.{ticket.new, sync.completed}.' },
                     filter: { type: 'object', description: 'Optional filter object that must shallowly match the event payload.' },
                 },
                 required: ['kind'],

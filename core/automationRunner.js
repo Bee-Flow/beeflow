@@ -36,12 +36,78 @@ const RUNNER_INTERVAL_MS = 60_000;
 const POLLING_INTERVAL_MS = 30_000;
 const REAPER_INTERVAL_MS = 60_000;
 const MAX_CONCURRENT = 5;
-const RUN_HARD_TIMEOUT_MS = 5 * 60_000; // 5 minutes per run, defensive
-// A row stuck in `running` for more than this is treated as crashed and
-// reset by the reaper. Kept slightly above RUN_HARD_TIMEOUT_MS so a normal
-// long run is never reaped while still executing.
-const REAPER_STALE_AFTER_MS = 6 * 60_000;
+// Default per-run timeout. Automations can override per-row via
+// `automations.run_timeout_ms` (capped at MAX_RUN_TIMEOUT_MS). A long-
+// running automation that legitimately needs more than five minutes can
+// raise its own ceiling without bumping the global default.
+const RUN_HARD_TIMEOUT_MS = 5 * 60_000;
+const MAX_RUN_TIMEOUT_MS = 60 * 60_000;
+// Reaper window is computed per-row in SQL: max(floor, run_timeout_ms + buffer).
+// Floor protects rows with no timeout override; buffer keeps the runner's
+// own timeout from racing the reaper for the same row.
+const REAPER_FLOOR_MS = 6 * 60_000;
+const REAPER_BUFFER_MS = 60_000;
 const REAPER_MAX_ATTEMPTS = 5;
+
+function clampRunTimeout(automation) {
+    const ms = automation?.runTimeoutMs;
+    if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return RUN_HARD_TIMEOUT_MS;
+    return Math.min(ms, MAX_RUN_TIMEOUT_MS);
+}
+
+// ── Run cancellation registry ───────────────────────────
+//
+// Maps runId → AbortController so the cancel endpoint can signal an
+// in-flight run. The runner registers a controller on start, checks
+// `signal.aborted` between dispatched steps, and cleans up on completion.
+//
+// Note: we still set `cancel_requested = TRUE` in the DB so a cancel
+// issued against a run owned by a different runner pod is honoured on the
+// next "between-steps" check (the DB flag is the cross-process signal,
+// the AbortController is the in-process one).
+
+const ACTIVE_RUNS = new Map();
+
+function registerRunCancellation(runId) {
+    const controller = new AbortController();
+    ACTIVE_RUNS.set(runId, controller);
+    return controller;
+}
+
+function clearRunCancellation(runId) {
+    ACTIVE_RUNS.delete(runId);
+}
+
+/**
+ * Request cancellation of an in-flight run. Returns the updated run row,
+ * or null if no active row matched. The DB flag is the cross-process
+ * signal; the AbortController short-circuits when the run is local.
+ */
+async function requestCancel(runId) {
+    const updated = await automationStore.requestCancelRun(runId).catch(() => null);
+    const ctrl = ACTIVE_RUNS.get(runId);
+    if (ctrl) {
+        try { ctrl.abort(); } catch {}
+    }
+    return updated;
+}
+
+/**
+ * Cross-process cancellation check. Reads the cancel_requested flag from
+ * the run row so a cancel issued against a different runner pod is still
+ * honoured — at worst on the next "between steps" check.
+ *
+ * Best-effort: a DB hiccup falls through (returns false) so a flaky
+ * connection doesn't kill in-progress work.
+ */
+async function isCancelRequested(runId) {
+    try {
+        const r = await automationStore.getRun(runId);
+        return !!r?.cancelRequested;
+    } catch {
+        return false;
+    }
+}
 
 // Stable per-process token. Identifies which runner instance currently
 // owns a claimed row — useful for diagnostics and for the reaper's logs.
@@ -644,7 +710,7 @@ async function runDag(def, ctx, runStateInit, mode, dispatchStep, { recordSteps 
 
 // ── Top-level executeAutomation ─────────────────────────
 
-async function executeAutomation(automation, { triggerKind = 'manual', triggerPayload = null, mode = 'live', confirmFirstRun = false } = {}) {
+async function executeAutomation(automation, { triggerKind = 'manual', triggerPayload = null, mode = 'live', confirmFirstRun = false, parentRunId = null } = {}) {
     const startedAt = Date.now();
     const session = await resolveUserSession(automation.userId);
 
@@ -664,7 +730,14 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
         triggerKind: firstRunNeedsConfirm ? 'first_run_confirm' : triggerKind,
         triggerPayload,
         mode: effectiveMode,
+        parentRunId,
     });
+
+    // Register a cancellation controller for this run. The cancel endpoint
+    // sets cancel_requested=TRUE in the DB and aborts this controller so
+    // both in-process and cross-process cancellations are honoured.
+    const cancelController = registerRunCancellation(run.id);
+    const cancelSignal = cancelController.signal;
     await automationStore.updateRun(run.id, { status: 'running', startedAt: new Date().toISOString() });
     // For schedule-triggered runs the row was already claimed atomically
     // by claimDueAutomations() and carries running_instance_id /
@@ -702,6 +775,13 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
     };
 
     const dispatchStep = async (step, ctx_, state_, mode_) => {
+        // Cancellation is checked between every step. We honour both the
+        // in-process AbortSignal (fast path for local cancels) and the
+        // cross-process DB flag (handles cancels issued against a different
+        // runner pod).
+        if (cancelSignal.aborted) throw new Error('Run cancelled');
+        if (await isCancelRequested(run.id)) throw new Error('Run cancelled');
+
         const stepStartedAt = new Date().toISOString();
         // Defensive: a step missing `id` would crash recordRunStep
         // (step_id is NOT NULL). Synthesize one so we never write null
@@ -774,18 +854,36 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
     let runErrorObj = null;
     let runErrorMsg = null;
     let runStatus = 'success';
+    let wasCancelled = false;
 
-    const guard = new Promise((_, reject) => setTimeout(() => reject(new Error('Run hard timeout')), RUN_HARD_TIMEOUT_MS));
+    const effectiveTimeoutMs = clampRunTimeout(automation);
+    let timeoutTimer = null;
+    const guard = new Promise((_, reject) => {
+        timeoutTimer = setTimeout(() => reject(new Error('Run hard timeout')), effectiveTimeoutMs);
+        if (timeoutTimer.unref) timeoutTimer.unref();
+    });
+    // Abort signal also rejects the race, so the cancel endpoint can stop
+    // the run even when the runDag promise is awaiting a long upstream call.
+    const cancelGuard = new Promise((_, reject) => {
+        const onAbort = () => reject(new Error('Run cancelled'));
+        if (cancelSignal.aborted) onAbort();
+        else cancelSignal.addEventListener('abort', onAbort, { once: true });
+    });
 
     try {
         runResult = await Promise.race([
             runDag(automation.definition || {}, ctx, runState, effectiveMode, dispatchStep),
             guard,
+            cancelGuard,
         ]);
     } catch (e) {
         runErrorObj = e;
         runErrorMsg = e.message || String(e);
-        runStatus = 'error';
+        wasCancelled = cancelSignal.aborted || e.message === 'Run cancelled';
+        runStatus = wasCancelled ? 'cancelled' : 'error';
+    } finally {
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+        clearRunCancellation(run.id);
     }
 
     // Sanitized error fields for any persisted message visible to users.
@@ -852,6 +950,8 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
                 message: userSafeError || 'Unknown error',
             });
         }
+        // No notification for cancelled runs — the user initiated the cancel
+        // so they already know. The run history shows the status.
     } catch (_) { /* notification failure is non-fatal */ }
 
     // Schedule advancement (unless this was a manual run or first-run confirm)
@@ -922,8 +1022,9 @@ async function processDueAutomations() {
 async function reapStuckAutomations() {
     try {
         const reaped = await automationStore.reapStuckAutomations({
-            staleAfterMs: REAPER_STALE_AFTER_MS,
+            staleAfterMs: REAPER_FLOOR_MS,
             maxAttempts: REAPER_MAX_ATTEMPTS,
+            bufferMs: REAPER_BUFFER_MS,
         });
         if (reaped.length === 0) return;
         for (const a of reaped) {
@@ -946,14 +1047,45 @@ async function reapStuckAutomations() {
 }
 
 // ── Polling / renewal tick ──────────────────────────────
+//
+// Multi-pod safety: polling and renewal both write to the
+// `automation_event_subscriptions` table and dispatch event runs. With
+// multiple pods all running the same setInterval, two pods would race for
+// the same subscriptions and could double-fire events. We guard the tick
+// with a Postgres advisory lock — at most one pod runs polling at any
+// instant. If the lock-holder crashes Postgres releases it on session end
+// (the next tick on any pod re-acquires).
+//
+// We don't lock schedule processing (that uses FOR UPDATE SKIP LOCKED so
+// it's already safe), and we don't lock per-subscription (one global lock
+// keeps the implementation trivial; polling work is small enough that a
+// single pod can handle it for the foreseeable future).
+
+const POLLING_LOCK_KEY = 0xBEEF105; // arbitrary stable int for pg_try_advisory_lock
 
 async function processPollingAndRenewals() {
+    let acquired = false;
+    let client;
     try {
+        client = await pool.connect();
+        const lockRes = await client.query('SELECT pg_try_advisory_lock($1) AS locked', [POLLING_LOCK_KEY]);
+        acquired = !!lockRes.rows[0]?.locked;
+        if (!acquired) {
+            // Another pod owns the lock for this tick; back off cleanly.
+            return;
+        }
         const triggerBus = require('../automation/triggerBus');
         await triggerBus.runPollingPass();
         await triggerBus.renewExpiringSubscriptions();
     } catch (e) {
         console.error('[AutomationRunner] polling/renewal error:', e.message);
+    } finally {
+        if (client) {
+            try {
+                if (acquired) await client.query('SELECT pg_advisory_unlock($1)', [POLLING_LOCK_KEY]);
+            } catch (_) { /* lock release is best-effort */ }
+            client.release();
+        }
     }
 }
 
@@ -978,5 +1110,6 @@ module.exports = {
     executeAutomation,
     processDueAutomations,
     reapStuckAutomations,
+    requestCancel,
     INSTANCE_ID,
 };

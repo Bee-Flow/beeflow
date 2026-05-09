@@ -100,11 +100,11 @@ async function setOrgBetaFeatures(orgId, features) {
  * Super admins get ALL features.
  *
  * @param {string} userId
- * @param {object|null} session — express session (for isAdmin/isDemo flags)
+ * @param {object|null} session — express session (for isAdmin flag)
  * @returns {Promise<string[]>} array of feature IDs
  */
 async function getUserBetaFeatures(userId, session = null) {
-    if (session?.isDemo || session?.isAdmin) {
+    if (session?.isAdmin) {
         return BETA_FEATURES.map(f => f.id);
     }
 

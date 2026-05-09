@@ -109,6 +109,63 @@ const crypto = require('crypto');
         assert.strictEqual(post.attempts, 5);
     });
 
+    // ── Test 5: reaper window respects per-row run_timeout_ms ───────────
+    // A row with a 30-min override should NOT be reaped at 20 min stale,
+    // even though the floor (60s) was exceeded long ago.
+    await withRow(async ({ id }) => {
+        await pool.query(
+            `UPDATE automations
+                SET last_status = 'running',
+                    running_started_at = NOW() - INTERVAL '20 minutes',
+                    run_timeout_ms = 1800000
+              WHERE id = $1`,
+            [id],
+        );
+        const reaped = await store.reapStuckAutomations({
+            staleAfterMs: 60_000,
+            maxAttempts: 5,
+            bufferMs: 60_000,
+        });
+        assert.ok(!reaped.find(r => r.id === id), 'row with 30-min override survives 20-min stale');
+        const post = (await pool.query('SELECT last_status FROM automations WHERE id = $1', [id])).rows[0];
+        assert.strictEqual(post.last_status, 'running', 'still running, not reaped');
+    });
+
+    // ── Test 6: requestCancelRun flips cancel_requested ─────────────────
+    await withRow(async ({ id }) => {
+        const runId = crypto.randomUUID();
+        await pool.query(
+            `INSERT INTO automation_runs (id, automation_id, version, user_id, trigger_kind, mode, status)
+             VALUES ($1, $2, 1, 'test-user', 'manual', 'live', 'running')`,
+            [runId, id],
+        );
+        try {
+            const updated = await store.requestCancelRun(runId);
+            assert.ok(updated, 'returns updated row');
+            assert.strictEqual(updated.cancelRequested, true, 'flag flipped');
+
+            const ignored = await store.requestCancelRun(runId);
+            // Already running state → row matches but flag stays true;
+            // for runs in terminal state the WHERE clause excludes them.
+            assert.ok(ignored, 'idempotent for already-running');
+        } finally {
+            await pool.query('DELETE FROM automation_runs WHERE id = $1', [runId]).catch(() => {});
+        }
+
+        const terminalRunId = crypto.randomUUID();
+        await pool.query(
+            `INSERT INTO automation_runs (id, automation_id, version, user_id, trigger_kind, mode, status)
+             VALUES ($1, $2, 1, 'test-user', 'manual', 'live', 'success')`,
+            [terminalRunId, id],
+        );
+        try {
+            const noop = await store.requestCancelRun(terminalRunId);
+            assert.strictEqual(noop, null, 'terminal-state runs cannot be cancelled');
+        } finally {
+            await pool.query('DELETE FROM automation_runs WHERE id = $1', [terminalRunId]).catch(() => {});
+        }
+    });
+
     console.log('automationStore.claim.test.js — all checks passed');
     await pool.end();
 })().catch(err => {

@@ -302,7 +302,7 @@ async function runTests() {
 
     await test('getFallbackEncryptionKey differs per userId', async () => {
         const k1 = encryption.getFallbackEncryptionKey('admin');
-        const k2 = encryption.getFallbackEncryptionKey('demo-user');
+        const k2 = encryption.getFallbackEncryptionKey('other-admin');
         assert.notStrictEqual(k1, k2, 'should differ for different users');
     });
 

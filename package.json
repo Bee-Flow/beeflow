@@ -26,6 +26,7 @@
     "@elevenlabs/elevenlabs-js": "^2.38.0",
     "@ffmpeg-installer/ffmpeg": "^1.1.0",
     "@google/genai": "^1.43.0",
+    "@huggingface/transformers": "^4.2.0",
     "@mistralai/mistralai": "^1.14.1",
     "@modelcontextprotocol/sdk": "^1.27.1",
     "@napi-rs/canvas": "^0.1.98",

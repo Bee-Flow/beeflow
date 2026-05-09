@@ -31,6 +31,7 @@ router.use('/', require('./loginRoutes'));
 router.use('/', require('./oauthRoutes'));
 router.use('/', require('./adminRoutes'));
 router.use('/', require('./connectorAdminRoutes'));
+router.use('/', require('./connectorBootstrap'));
 router.use('/opaque', require('./opaqueRoutes'));
 
 module.exports = {

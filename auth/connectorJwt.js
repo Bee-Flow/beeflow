@@ -29,6 +29,7 @@
 const crypto = require('crypto');
 const userStore = require('../stores/userStore');
 const configStore = require('../stores/configStore');
+const encryption = require('./encryption');
 
 const TENANT_KEY_PREFIX = 'connector_tenant_key_';
 
@@ -37,6 +38,13 @@ const TENANT_KEY_PREFIX = 'connector_tenant_key_';
 // invalidateTenantKeyCache().
 const _keyCache = new Map();
 const KEY_CACHE_TTL_MS = 60_000;
+
+// Cache derived encryption keys per userId. The fallback key uses PBKDF2 with
+// 210k iterations (~50-100ms each) — running that on every request is
+// noticeable in chat latency. The derived key is fully determined by
+// userId + MASTER_ENCRYPTION_KEY, both stable, so we cache forever (process
+// lifetime). Cleared on server restart.
+const _encKeyCache = new Map();
 
 function _cacheGet(orgId) {
     const entry = _keyCache.get(orgId);
@@ -129,8 +137,12 @@ async function _resolveTenant(token) {
  * so a full scan via getAllConfigs is acceptable.
  */
 async function _listOrgIdsFallback() {
-    if (typeof configStore.getAllConfigs !== 'function') return [];
-    const all = await configStore.getAllConfigs();
+    // configStore exports `getAllConfig` (singular) — match that. The earlier
+    // typo caused this to silently return [] and reject every connector JWT
+    // with "no matching tenant key" even when the tenant key was present.
+    const fn = configStore.getAllConfig || configStore.getAllConfigs;
+    if (typeof fn !== 'function') return [];
+    const all = await fn();
     return Object.keys(all || {})
         .filter(k => k.startsWith(TENANT_KEY_PREFIX))
         .map(k => k.slice(TENANT_KEY_PREFIX.length));
@@ -171,20 +183,83 @@ async function connectorJwtMiddleware(req, res, next) {
             return res.status(400).json({ error: 'Connector token missing email claim' });
         }
 
-        const user = await userStore.getUserByEmail(payload.email);
+        let user = await userStore.getUserByEmail(payload.email);
         if (!user) {
-            return res.status(403).json({
-                error: 'Your Nextcloud account is not provisioned in Bee Flow yet. Ask your Bee Flow administrator to add you.',
+            // Auto-provision: org's sync_mode determines whether we silently
+            // create the user (active vs pending) or reject. This is the path
+            // every NC user takes on their first click of the Bee Flow icon
+            // after the org is bootstrapped — see plan/connector docs.
+            const org = await userStore.getOrganization(orgId);
+            if (!org) {
+                return res.status(403).json({ error: 'Connector tenant has no organization' });
+            }
+            // Hold auto-provision until the org-admin has finished the App
+            // Store onboarding wizard. Otherwise users would land here with
+            // pre-wizard defaults (mirror_all + active) which the admin may
+            // be about to switch to pending-approval / selective_groups.
+            // The SPA-side render gate translates this 403 into a friendly
+            // "Setup in progress" screen.
+            if (org.nc_instance_id && !org.nc_onboarding_completed_at) {
+                return res.status(403).json({
+                    error: 'Setup in progress — your organization administrator is finalising the Bee Flow setup. Please refresh in a few minutes.',
+                    code: 'NC_ONBOARDING_PENDING',
+                });
+            }
+            const mode = org.nc_sync_mode || 'mirror_all';
+            if (mode === 'manual') {
+                return res.status(403).json({
+                    error: 'Your Nextcloud account is not provisioned in Bee Flow yet. Ask your Bee Flow administrator to invite you.',
+                });
+            }
+            const ncUid = String(req.headers['x-beeflow-nc-uid'] || payload.sub || '').trim();
+            const status = (org.nc_new_user_default_status === 'pending') ? 'pending' : 'active';
+            const userId = `nc_${orgId}_${(ncUid || payload.email).replace(/[^a-zA-Z0-9]+/g, '-').slice(0, 40)}`;
+            await userStore.createUser({
+                id: userId,
+                username: payload.email,
+                email: payload.email,
+                displayName: payload.name || ncUid || payload.email,
+                role: 'user',
+                orgRole: '',
+                organizationId: orgId,
+                ncUid: ncUid || null,
+                provider: 'nextcloud_connector',
+                autoProvisioned: true,
+                status,
             });
-        }
-        // Defence in depth: the JWT was signed with org X's key, so the user
-        // it identifies must belong to org X. Refusing here prevents a stolen
-        // tenant key from being used to act on users in other tenants.
-        if (user.organizationId && user.organizationId !== orgId) {
+            user = await userStore.getUser(userId);
+            console.log(`[ConnectorJWT] Auto-provisioned user ${userId} (org=${orgId}, status=${status})`);
+            if (status === 'pending') {
+                return res.status(403).json({
+                    error: 'Your account has been created in Bee Flow but requires admin approval. Please contact your organization administrator.',
+                });
+            }
+        } else if (user.organizationId && user.organizationId !== orgId) {
+            // Defence in depth: the JWT was signed with org X's key, so the user
+            // it identifies must belong to org X. Refusing here prevents a stolen
+            // tenant key from being used to act on users in other tenants.
             console.warn(`[ConnectorJWT] Cross-tenant rejection: user ${user.id} (org=${user.organizationId}) presented org=${orgId}'s key`);
             return res.status(403).json({ error: 'Token does not match user tenant' });
         }
+        if (user.status === 'pending') {
+            return res.status(403).json({ error: 'Account is pending admin approval' });
+        }
 
+        // Observability: surface data-corruption — a user marked as connector-
+        // sourced should always live under an NC-bound org. If we ever see
+        // provider=nextcloud_connector under an org without nc_instance_id,
+        // that's a sign of broken state (manual edit, failed migration, or a
+        // standalone-tenant data leak). Pure log; behaviour unchanged. Only
+        // resolves the org for connector-sourced users so non-NC traffic
+        // doesn't pay an extra DB roundtrip.
+        if (user.provider === 'nextcloud_connector') {
+            const orgForCheck = await userStore.getOrganization(user.organizationId || orgId).catch(() => null);
+            if (orgForCheck && !orgForCheck.nc_instance_id) {
+                console.warn(`[ConnectorJWT] Data anomaly: user ${user.id} has provider=nextcloud_connector but org ${orgForCheck.id} has no nc_instance_id`);
+            }
+        }
+
+        const ncUid = user.nc_uid || req.headers['x-beeflow-nc-uid'] || payload.sub || null;
         req.session.isAuthenticated = true;
         req.session.user = {
             id: user.id,
@@ -192,18 +267,61 @@ async function connectorJwtMiddleware(req, res, next) {
             displayName: user.displayName || user.id,
             role: user.role || 'user',
             organizationId: user.organizationId || orgId,
+            ncUid,
+            provider: user.provider || 'nextcloud_connector',
         };
         req.session.isAdmin = user.role === 'admin';
-        req.connectorAuth = {
-            orgId,
-            ncUid: req.headers['x-beeflow-nc-uid'] || payload.sub || null,
-        };
+        // Populate the connector binding so server/integrations/nextcloudClient.js
+        // resolveConnectorAuth() can route NC calls through the connector's
+        // /nc/* proxy without per-request DB lookups.
+        req.session.connectorOrgId = orgId;
+        req.session.connectorNcUid = ncUid;
+        req.connectorAuth = { orgId, ncUid };
+
+        // Inject encryptionKey for endpoints that read encrypted user state
+        // (chat history, agent conversations). The connector path acts like
+        // an SSO provider — we trust the upstream Nextcloud session, so we
+        // try SSO-recovery first (matches oauthRoutes.js:262 / adminRoutes.js:366),
+        // and fall back to the deterministic master-key derivation. Without
+        // this, chat.js:239 reads `req.session?.encryptionKey === undefined`
+        // and fails on encrypted-conversation lookup.
+        //
+        // Cached: PBKDF2 with 210k iterations is too expensive to do on
+        // every request. Both the SSO-recovery DEK and the deterministic
+        // fallback are stable for the user's lifetime (until they explicitly
+        // rotate via the encryption-pin flow), so first computation wins.
+        try {
+            let cachedEnc = _encKeyCache.get(user.id);
+            if (!cachedEnc) {
+                const sso = await encryption.getOrCreateSSOUserDEKCompat(user.id, true);
+                if (sso?.encryptionKey) {
+                    cachedEnc = sso.encryptionKey;
+                } else if (process.env.MASTER_ENCRYPTION_KEY) {
+                    cachedEnc = encryption.getFallbackEncryptionKey(user.id);
+                }
+                if (cachedEnc) _encKeyCache.set(user.id, cachedEnc);
+            }
+            if (cachedEnc) req.session.encryptionKey = cachedEnc;
+        } catch (e) {
+            console.warn(`[ConnectorJWT] EncryptionKey derivation failed for user ${user.id}: ${e.message}`);
+        }
+
+        // Persist the session row to PostgreSQL before continuing. Without
+        // this, express-session (saveUninitialized: false) drops the
+        // populated session and every subsequent SPA request from the
+        // iframe arrives unauthenticated → 401 storm.
+        req.session.save((saveErr) => {
+            if (saveErr) {
+                console.error('[ConnectorJWT] Session save failed:', saveErr.message);
+                return res.status(500).json({ error: 'Session persistence failed' });
+            }
+            next();
+        });
+        return;
     } catch (err) {
         console.warn(`[ConnectorJWT] Auth failed for ${req.method} ${req.url}: ${err.message}`);
         return res.status(401).json({ error: 'Invalid connector token' });
     }
-
-    next();
 }
 
 module.exports = connectorJwtMiddleware;

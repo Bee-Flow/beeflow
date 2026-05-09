@@ -90,6 +90,7 @@ router.get('/config', async (req, res) => {
         hasAzureSpeechKey: !!(await configStore.getSecret('azure_speech_key')),
         azureSpeechRegion: await configStore.getConfig('azure_speech_region') || '',
         transcriptionProvider: await configStore.getConfig('transcription_provider') || 'voxtral',
+        localWhisperEnabled: (await configStore.getConfig('local_whisper_enabled')) !== false,
         // WhisperX self-hosted
         hasWhisperxUrl: !!(await configStore.getSecret('whisperx_url')),
         hasWhisperxToken: !!(await configStore.getSecret('whisperx_token')),
@@ -231,11 +232,17 @@ router.post('/config', requireAuth, async (req, res) => {
         await configStore.setSecret('whisperx_token', req.body.whisperxToken || '');
     }
     if (transcriptionProvider !== undefined) {
-        const allowed = ['voxtral', 'azure', 'whisperx', 'whisper_azure'];
+        const allowed = ['voxtral', 'azure', 'whisperx', 'whisper_azure', 'local'];
         if (transcriptionProvider && !allowed.includes(transcriptionProvider)) {
             return res.status(400).json({ error: `Invalid transcription provider. Allowed: ${allowed.join(', ')}` });
         }
         await configStore.setConfig('transcription_provider', transcriptionProvider || 'voxtral');
+    }
+    // In-process Whisper-base CPU transcription — admin opt-out toggle.
+    // When false, the per-upload "Local CPU" picker disappears and any
+    // request with provider='local' falls back to the configured cloud one.
+    if (req.body.localWhisperEnabled !== undefined) {
+        await configStore.setConfig('local_whisper_enabled', !!req.body.localWhisperEnabled);
     }
     // Service Email (Gmail SMTP)
     if (serviceEmailAddress !== undefined) {
@@ -998,6 +1005,58 @@ router.post('/config/ticket-assistant-tiers', requireAuth, handlePostTiers);
 // Legacy aliases — remove after one release.
 router.get('/config/email-kb-tiers', requireAuth, handleGetTiers);
 router.post('/config/email-kb-tiers', requireAuth, handlePostTiers);
+
+// ─── Web-Search Inference Routing ────────────────────────────────
+// Controls how the search-service handles its 3 inference tasks:
+//   - embed   → inherits the global Embeddings settings
+//   - rerank  → cosine / local / disabled (provider-agnostic)
+//   - cleanup → admin picks any chat model from a configured provider
+const {
+    readWebSearchInferenceConfig,
+    writeWebSearchInferenceConfig,
+    readEmbedSummary,
+    resolveInferenceTargets,
+    DEFAULTS: WEB_SEARCH_INFERENCE_DEFAULTS,
+} = require('../../core/webSearchInferenceResolver');
+
+router.get('/config/web-search-inference', requireAuth, async (req, res) => {
+    if (!(await isAdminUser(req))) return res.status(403).json({ error: 'Admin access required' });
+    try {
+        const [config, embedSummary] = await Promise.all([
+            readWebSearchInferenceConfig(),
+            readEmbedSummary(),
+        ]);
+        res.json({ config, defaults: WEB_SEARCH_INFERENCE_DEFAULTS, embedSummary });
+    } catch (e) {
+        console.error('Failed to load web-search inference config:', e);
+        res.status(500).json({ error: 'Failed to load config' });
+    }
+});
+
+router.post('/config/web-search-inference', requireAuth, async (req, res) => {
+    if (!(await isAdminUser(req))) return res.status(403).json({ error: 'Admin access required' });
+    try {
+        const saved = await writeWebSearchInferenceConfig(req.body || {});
+        res.json({ success: true, config: saved });
+    } catch (e) {
+        console.error('Failed to save web-search inference config:', e);
+        res.status(500).json({ error: 'Failed to save config' });
+    }
+});
+
+// Read-only debugging view — what backend each task will actually hit.
+// Flags `unresolved` when something the admin selected can't be resolved
+// (e.g. provider deleted after cleanup selection was saved).
+router.get('/config/web-search-inference/effective', requireAuth, async (req, res) => {
+    if (!(await isAdminUser(req))) return res.status(403).json({ error: 'Admin access required' });
+    try {
+        const resolved = await resolveInferenceTargets();
+        res.json({ resolved });
+    } catch (e) {
+        console.error('Failed to resolve web-search inference targets:', e);
+        res.status(500).json({ error: 'Failed to resolve targets' });
+    }
+});
 
 // ─── Direct Chat System Prompt ───────────────────────────────────
 

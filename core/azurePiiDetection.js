@@ -2,7 +2,7 @@
  * PII Detection — detect personally identifiable information in text
  *
  * PRIMARY:  Azure AI Text Analytics (when endpoint + key are configured)
- * FALLBACK: guard-service /pii endpoint (betterdataai/PII_DETECTION_MODEL, CPU)
+ * FALLBACK: guard-service /pii endpoint (GLiNER multi PII v1, CPU)
  *
  *   createClient() → Azure creds exist?
  *       YES → Azure Text Analytics (cloud)
@@ -17,9 +17,10 @@ const { getAIConfig } = require('./aiAgent');
 const configStore = require('../stores/configStore');
 const { computePiiDetectionCost } = require('./azureServiceCosts');
 const azureServiceUsageStore = require('../stores/azureServiceUsageStore');
+const { detectPiiLocal } = require('./localPiiDetection');
 
-// ── PII service — standalone service running betterdataai/PII_DETECTION_MODEL
-// Set PII_SERVICE_URL in .env to point at the running pii-service instance.
+// ── PII service — guard-service running GLiNER multi PII v1 (Apache 2.0)
+// Set PII_SERVICE_URL in .env to point at the running guard-service instance.
 // Defaults to localhost:8200 (the pii-service default port).
 // Set PII_SERVICE_API_KEY if the remote service requires API key auth.
 const PII_SERVICE_URL = process.env.PII_SERVICE_URL || 'http://localhost:8200';
@@ -69,7 +70,7 @@ function httpPost(url, body) {
 }
 
 /**
- * Detect PII using the CPU model via the PII service (betterdataai/PII_DETECTION_MODEL).
+ * Detect PII using the CPU model via the PII service (GLiNER multi PII v1).
  * Maps response shapes back to the same format as detectPii().
  */
 async function detectPiiViaCpuModel(text, enabledCategories, confidenceThreshold) {
@@ -356,24 +357,58 @@ async function detectPiiViaRestApi(text, endpoint, apiKey, enabledCategories, co
  *
  * Routing:
  *   - Azure Content Safety endpoint + key configured → REST API /language/:analyze-text
- *   - No Azure creds → CPU guard-service /pii endpoint (local NER model)
+ *   - No Azure creds, `localPiiEnabled` on shield → in-process Transformers.js detector
+ *   - No Azure creds, local disabled → CPU guard-service /pii endpoint (HTTP)
  */
 async function detectPii(text, enabledCategories = null, confidenceThreshold = DEFAULT_PII_CONFIDENCE_THRESHOLD) {
     const endpoint = await configStore.getConfig('azure_content_safety_endpoint');
     const apiKey = await configStore.getSecret('azure_content_safety_key');
 
-    if (!endpoint || !apiKey) {
-        console.log('[PiiDetection] No Azure creds — using CPU model via guard-service');
+    if (endpoint && apiKey) {
+        return await detectPiiViaRestApi(text, endpoint, apiKey, enabledCategories, confidenceThreshold);
+    }
+
+    // No Azure creds — pick a CPU backend. Default to in-process Transformers.js
+    // unless an admin has explicitly disabled it on the org Privacy Shield.
+    const localEnabled = await isLocalPiiEnabled();
+
+    if (localEnabled) {
         try {
-            return await detectPiiViaCpuModel(text, enabledCategories, confidenceThreshold);
-        } catch (cpuErr) {
-            console.warn('[PiiDetection] CPU model unavailable:', cpuErr.message);
-            return null; // fail-open
+            const result = await detectPiiLocal(text, enabledCategories, confidenceThreshold);
+            if (result) return result;
+            // Model unavailable → fall through to guard-service HTTP path.
+            console.log('[PiiDetection] Local model unavailable, trying guard-service');
+        } catch (localErr) {
+            console.warn('[PiiDetection] Local model error:', localErr.message);
         }
     }
 
-    // Use Azure AI Language REST API (works with AI Foundry multi-service endpoints)
-    return await detectPiiViaRestApi(text, endpoint, apiKey, enabledCategories, confidenceThreshold);
+    try {
+        return await detectPiiViaCpuModel(text, enabledCategories, confidenceThreshold);
+    } catch (cpuErr) {
+        console.warn('[PiiDetection] guard-service unavailable:', cpuErr.message);
+        return null; // fail-open
+    }
+}
+
+/**
+ * Resolve the `localPiiEnabled` flag from any stored org Privacy Shield.
+ * Returns true by default so a fresh install with no Azure config still
+ * gets working PII detection out of the box. Admins disable via the
+ * Privacy Shield panel.
+ */
+async function isLocalPiiEnabled() {
+    try {
+        const all = await configStore.getAllConfig() || {};
+        for (const key of Object.keys(all)) {
+            if (!key.startsWith('org_privacy_shield_')) continue;
+            const shield = all[key];
+            if (shield && typeof shield.localPiiEnabled === 'boolean') {
+                return shield.localPiiEnabled;
+            }
+        }
+    } catch (_) { /* fail open */ }
+    return true;
 }
 
 /**
@@ -393,21 +428,33 @@ async function detectPii(text, enabledCategories = null, confidenceThreshold = D
 async function validateInputForPii(messages, agentPiiEnabled = false, orgShieldConfig = null) {
     const aiConfig = await getAIConfig();
 
+    // Loud entry trace so admins can see PII gates firing in logs.
+    console.log(`[PiiDetection] validateInputForPii called: agentPiiEnabled=${agentPiiEnabled} aiCfgEnabled=${!!aiConfig.piiDetectionEnabled} shield={enabled:${!!orgShieldConfig?.enabled}, azurePii:${!!orgShieldConfig?.azurePiiEnabled}, localPii:${orgShieldConfig?.localPiiEnabled !== false}, action:${orgShieldConfig?.piiDetectionAction || 'default'}}`);
+
     // Check if PII detection is enabled
     const piiEnabled = aiConfig.piiDetectionEnabled || agentPiiEnabled;
-    if (!piiEnabled) return null;
+    if (!piiEnabled) {
+        console.log('[PiiDetection] gate=DISABLED (neither aiConfig nor agentPiiEnabled true)');
+        return null;
+    }
 
     const piiAction = orgShieldConfig?.piiDetectionAction || aiConfig.piiDetectionAction || 'block';
 
     const lastUserMessage = messages.slice().reverse().find(m => m.role === 'user');
-    if (!lastUserMessage) return null;
+    if (!lastUserMessage) {
+        console.log('[PiiDetection] no user message in batch');
+        return null;
+    }
 
     let inputText = lastUserMessage.content;
     if (Array.isArray(inputText)) {
         const textBlock = inputText.find(b => b.type === 'text');
         inputText = textBlock ? textBlock.text : '';
     }
-    if (!inputText || inputText.length < 3) return null;
+    if (!inputText || inputText.length < 3) {
+        console.log(`[PiiDetection] input too short (${inputText?.length || 0} chars), skipping`);
+        return null;
+    }
 
     // Check cache
     const key = cacheKey('user_input', inputText);

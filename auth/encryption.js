@@ -762,10 +762,10 @@ function getLegacyMasterKey() {
 }
 
 /**
- * Fallback encryption key for admin/demo users.
+ * Fallback encryption key for admin users.
  * NOT zero-knowledge — server can derive these keys.
- * Restricted to non-production or explicitly admin/demo contexts.
- * 
+ * Restricted to non-production or explicitly admin contexts.
+ *
  * @param {string} userId
  * @returns {string} Base64-encoded 32-byte key
  */

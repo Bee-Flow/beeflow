@@ -281,9 +281,16 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
     // own per-app toggle so admins can disable individual surfaces.
     try {
         const oauthCfg = (await configStore.getConfig('oauth')) || {};
-        if (oauthCfg.nextcloudUrl) {
+        // Connector-bound user: NC tools route through the connector's /nc/*
+        // proxy with AppAPI shared-secret + impersonation. No OAuth URL or
+        // app password is required; the org's nc_base_url is the binding.
+        const isConnectorUser = session?.user?.provider === 'nextcloud_connector'
+            || !!session?.connectorOrgId;
+        if (oauthCfg.nextcloudUrl || isConnectorUser) {
             let nextcloudConnected = false;
-            if (session?.oauthProvider === 'nextcloud' && session?.accessToken) {
+            if (isConnectorUser) {
+                nextcloudConnected = true;
+            } else if (session?.oauthProvider === 'nextcloud' && session?.accessToken) {
                 nextcloudConnected = true;
             } else {
                 const userStoreLocal = require('../stores/userStore');

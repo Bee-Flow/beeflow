@@ -237,7 +237,76 @@ async function ncFetch(url, session, options = {}) {
  * In both modes `uid` is the Nextcloud user identifier needed to construct
  * /remote.php/dav/{calendars,addressbooks,files}/<uid>/... paths.
  */
+// Connector-proxied auth: the user logged in via the Nextcloud ExApp
+// connector, so we don't have OAuth tokens or an app password — but we do
+// have an instance binding (session.connectorOrgId, session.connectorNcUid).
+// Route every NC call through the connector's /nc/* reverse proxy. The
+// connector signs with AppAPI shared-secret + impersonates the user — no
+// credentials ever touch this process.
+async function resolveConnectorAuth(session) {
+    const orgId = session?.connectorOrgId || session?.user?.organizationId;
+    const ncUid = session?.connectorNcUid || session?.user?.ncUid;
+    if (!orgId || !ncUid) return null;
+
+    const userStore = require('../stores/userStore');
+    const org = await userStore.getOrganization(orgId);
+    const callbackUrl = org?.connector_callback_url;
+    if (!callbackUrl) return null;
+
+    const tenantKey = await configStore.getSecret(`connector_tenant_key_${orgId}`);
+    if (!tenantKey) return null;
+
+    const crypto = require('crypto');
+    const baseUrl = `${callbackUrl.replace(/\/+$/, '')}/nc`;
+    const connectorFetch = async (url, options = {}) => {
+        // url may be absolute (full <baseUrl>/...) or a path. Normalise to
+        // the path-and-query the connector will see, since that's what we
+        // sign over.
+        let pathOnly;
+        if (url.startsWith(baseUrl)) {
+            pathOnly = '/nc' + url.slice(baseUrl.length);
+        } else if (url.startsWith('/nc')) {
+            pathOnly = url;
+        } else {
+            pathOnly = url; // best-effort: caller already passed correct path
+        }
+        const ts = Math.floor(Date.now() / 1000);
+        const method = (options.method || 'GET').toUpperCase();
+        const message = `${ts}\n${method}\n${pathOnly}\n${ncUid}`;
+        const sig = crypto.createHmac('sha256', tenantKey).update(message).digest('hex');
+        const headers = {
+            ...(options.headers || {}),
+            'X-Beeflow-Sig': `${ts}.${sig}`,
+            'X-Beeflow-NC-Uid': ncUid,
+        };
+        const doOnce = () => fetch(url, {
+            ...options,
+            headers,
+            signal: options.signal || AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        });
+        const first = await doOnce();
+        return retryOnThrottle(first, doOnce);
+    };
+    return {
+        mode: 'connector',
+        baseUrl,
+        uid: ncUid,
+        session,
+        fetch: connectorFetch,
+        authError: 'Bee Flow connector could not reach Nextcloud — please ensure the ExApp is enabled.',
+    };
+}
+
 async function resolveAuth(session, userId) {
+    // Connector path takes priority: if the user came in via the Nextcloud
+    // ExApp connector, we have an instance binding and zero credentials —
+    // routing through /nc/* is the only way to reach NC.
+    if (session?.user?.provider === 'nextcloud_connector' || session?.connectorOrgId) {
+        const connector = await resolveConnectorAuth(session);
+        if (connector) return connector;
+        // fall through to legacy paths if connector binding incomplete
+    }
+
     const baseUrl = await getBaseUrl();
 
     if (isNextcloudOAuthSession(session)) {
@@ -317,6 +386,55 @@ async function resolveBasicAuthOrNull(userId) {
 
 const CORS_AUTH_ERROR = 'Nextcloud\'s Notes/Deck APIs use CORS protection that requires HTTP Basic auth — your OAuth login alone won\'t work for these. Please add a Nextcloud app password in Settings → Integrations.';
 
+/**
+ * Stream a binary file from Nextcloud Files (WebDAV) to disk.
+ *
+ * Used for audio/video imports where loading the whole file into memory
+ * would be wasteful — meeting recordings can easily exceed 100 MB.
+ *
+ * @param {object} session  Express session (used to resolve auth).
+ * @param {string} userId   For app-password fallback.
+ * @param {string} ncPath   Path within the user's Files root, e.g. "/Recordings/2026-05-08.mp3".
+ * @param {string} destPath Local filesystem path to write to.
+ * @returns {Promise<{ size, contentType }>}
+ */
+async function downloadBinary(session, userId, ncPath, destPath) {
+    const ctx = await resolveAuth(session, userId);
+    const root = webdavRoot(ctx.baseUrl, ctx.uid);
+    // Build the WebDAV URL — encode each segment so spaces and unicode
+    // characters survive the round-trip.
+    const segments = String(ncPath || '').split('/').filter(Boolean).map(encodeURIComponent);
+    const url = `${root}/${segments.join('/')}`;
+
+    const res = await ctx.fetch(url, {
+        method: 'GET',
+        // Allow larger downloads; the connection itself stays bounded by ncFetch's timeout.
+        signal: AbortSignal.timeout(15 * 60 * 1000),
+    });
+
+    if (res.status === 404) throw new Error(`File not found: ${ncPath}`);
+    if (res.status === 401) throw new Error(ctx.authError || 'Nextcloud auth failed');
+    if (!res.ok) throw new Error(`Nextcloud download failed (${res.status})`);
+
+    const fs = require('fs');
+    const { Readable } = require('stream');
+    const { pipeline } = require('stream/promises');
+
+    // Node's fetch returns a Web ReadableStream — convert to a Node stream
+    // so .pipe() works and we don't keep the entire body in memory.
+    const nodeStream = res.body && typeof Readable.fromWeb === 'function'
+        ? Readable.fromWeb(res.body)
+        : res.body;
+    const out = fs.createWriteStream(destPath);
+    await pipeline(nodeStream, out);
+
+    const stat = fs.statSync(destPath);
+    return {
+        size: stat.size,
+        contentType: res.headers.get('content-type') || 'application/octet-stream',
+    };
+}
+
 module.exports = {
     isNextcloudOAuthSession,
     getBaseUrl,
@@ -326,6 +444,7 @@ module.exports = {
     resolveAuth,
     resolveBasicAuthOrNull,
     ncFetch,
+    downloadBinary,
     REQUEST_TIMEOUT_MS,
     CORS_AUTH_ERROR,
 };

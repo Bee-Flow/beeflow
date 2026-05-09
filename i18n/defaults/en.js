@@ -950,7 +950,6 @@ const GUI_DEFAULTS = {
     // ── Login Form ──────────────────────────────────────────────
     'login.sign_in_btn': 'Sign In',
     'login.create_account_btn': 'Create Account',
-    'login.demo_mode': 'Demo Mode',
     'login.sign_in_with_google': 'Sign in with Google',
     'login.sign_in_with_microsoft': 'Sign in with Microsoft',
     'login.sign_in_with_nextcloud': 'Sign in with Nextcloud',
@@ -972,6 +971,14 @@ const GUI_DEFAULTS = {
     'notifications.mark_all_read': 'Mark All as Read',
     'notifications.no_notifications': 'No notifications',
     'notifications.reminder': 'Reminder',
+    // Trigger-bus failure escalation. The {provider}/{event}/{title}
+    // placeholders are filled in by the runner — keep the {curly} markers
+    // intact when translating.
+    'notification.automation_subscription_failing.title': '⚠️ Trigger unreachable: {title}',
+    'notification.automation_subscription_failing.body': 'Automation "{title}" trigger ({provider} {event}) keeps failing: {error}. Check your integration or re-activate the automation.',
+    'notification.automation_paused_max_attempts.title': '⚠️ Automation failed: {title}',
+    'notification.automation_paused_max_attempts.body': 'The automation could not complete after {attempts} attempts and was paused. Open it to inspect the last run.',
+    'error.automation_run_timeout_exceeded_max': 'Run exceeded the configured timeout. Increase the per-automation timeout in expert settings, or split the work into smaller steps.',
 
     // ── Errors ───────────────────────────────────────────────────
     'error.network': 'Network error. Please check your connection.',
