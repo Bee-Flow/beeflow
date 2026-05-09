@@ -39,12 +39,19 @@ const MAX_PENDING_PER_ORG = 5;
 // pending-binding queue or fish for org-emails. The numbers below are
 // generous enough for a real fleet rollout (multiple NC instances behind
 // the same NAT) but tight enough to make brute-force/DoS impractical.
+// `validate: { trustProxy: false }` silences express-rate-limit's strict
+// trust-proxy validator. The server runs behind Nginx Proxy Manager which
+// sets X-Forwarded-For; Express resolves req.ip via app.set('trust proxy').
+// We accept that a determined attacker could spoof XFF to evade per-IP
+// limiting — bootstrap is also gated by the NC capabilities round-trip,
+// and the limiter's main job is slowing down org-email enumeration.
 const bootstrapLimiter = rateLimit({
     windowMs: 15 * 60_000,        // 15 minutes
     max: 20,                       // 20 bootstrap attempts per IP per window
     standardHeaders: true,
     legacyHeaders: false,
     message: { error: 'Too many bootstrap attempts; try again later.' },
+    validate: { trustProxy: false },
 });
 
 const pendingPollLimiter = rateLimit({
@@ -53,6 +60,7 @@ const pendingPollLimiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     message: { error: 'Too many poll requests.' },
+    validate: { trustProxy: false },
 });
 
 // All NC integrations Bee Flow ships with — auto-enabled on connector
