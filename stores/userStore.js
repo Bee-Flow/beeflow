@@ -188,6 +188,37 @@ async function initDB() {
     // users wait at a "Setup in progress" screen until the admin is done.
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "nc_onboarding_completed_at" TIMESTAMPTZ`); } catch (e) { }
 
+    // ── Pending NC bindings (deferred adoption) ──
+    // When a connector bootstraps and the NC admin's email maps to an
+    // existing Bee Flow org without nc_instance_id, we DO NOT bind
+    // automatically — that would let an attacker hosting a fake NC adopt
+    // someone else's org. Instead a pending row is created here and the
+    // org-admin must explicitly approve the binding from the authenticated
+    // SaaS UI.
+    try {
+        await exec(`CREATE TABLE IF NOT EXISTS pending_nc_bindings (
+            id              TEXT PRIMARY KEY,
+            org_id          TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+            nc_instance_id  TEXT NOT NULL,
+            nc_base_url     TEXT NOT NULL,
+            nc_admin_uid    TEXT NOT NULL,
+            nc_admin_email  TEXT NOT NULL,
+            nc_admin_display_name TEXT,
+            connector_callback_url TEXT,
+            theming_name    TEXT,
+            nc_version      TEXT,
+            status          TEXT NOT NULL DEFAULT 'pending',
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            expires_at      TIMESTAMPTZ NOT NULL,
+            approved_at     TIMESTAMPTZ,
+            approved_by_user_id TEXT
+        )`);
+    } catch (e) { }
+    try { await exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_nc_bindings_active
+        ON pending_nc_bindings (org_id, nc_instance_id) WHERE status = 'pending'`); } catch (e) { }
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_pending_nc_bindings_org_status
+        ON pending_nc_bindings (org_id, status)`); } catch (e) { }
+
     // ── Subscription schema migrations ──
     try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS price REAL`); } catch (e) { }
     try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'EUR'`); } catch (e) { }
@@ -649,6 +680,126 @@ async function deleteOrganization(orgId) {
 }
 
 // ── Groups ─────────────────────────────
+// ── Pending NC bindings ───────────────────────────────────────────────────
+
+function parsePendingBinding(row) {
+    if (!row) return null;
+    return {
+        id: row.id,
+        orgId: row.org_id,
+        ncInstanceId: row.nc_instance_id,
+        ncBaseUrl: row.nc_base_url,
+        ncAdminUid: row.nc_admin_uid,
+        ncAdminEmail: row.nc_admin_email,
+        ncAdminDisplayName: row.nc_admin_display_name,
+        connectorCallbackUrl: row.connector_callback_url,
+        themingName: row.theming_name,
+        ncVersion: row.nc_version,
+        status: row.status,
+        createdAt: row.created_at,
+        expiresAt: row.expires_at,
+        approvedAt: row.approved_at,
+        approvedByUserId: row.approved_by_user_id,
+    };
+}
+
+async function createPendingNcBinding(data, ttlSeconds = 1800) {
+    await initDB();
+    const id = crypto.randomBytes(16).toString('hex');
+    const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+    // ON CONFLICT on the partial unique index (org_id, nc_instance_id) WHERE status='pending'.
+    // PG requires repeating the index predicate for index inference.
+    const sql = `
+        INSERT INTO pending_nc_bindings
+            (id, org_id, nc_instance_id, nc_base_url, nc_admin_uid, nc_admin_email,
+             nc_admin_display_name, connector_callback_url, theming_name, nc_version, expires_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        ON CONFLICT (org_id, nc_instance_id) WHERE status = 'pending'
+        DO UPDATE SET
+            nc_base_url = EXCLUDED.nc_base_url,
+            nc_admin_uid = EXCLUDED.nc_admin_uid,
+            nc_admin_email = EXCLUDED.nc_admin_email,
+            nc_admin_display_name = EXCLUDED.nc_admin_display_name,
+            connector_callback_url = EXCLUDED.connector_callback_url,
+            theming_name = EXCLUDED.theming_name,
+            nc_version = EXCLUDED.nc_version,
+            expires_at = GREATEST(pending_nc_bindings.expires_at, EXCLUDED.expires_at)
+        RETURNING *
+    `;
+    const row = await getOne(sql, [
+        id,
+        data.orgId,
+        data.ncInstanceId,
+        data.ncBaseUrl,
+        data.ncAdminUid,
+        data.ncAdminEmail,
+        data.ncAdminDisplayName || null,
+        data.connectorCallbackUrl || null,
+        data.themingName || null,
+        data.ncVersion || null,
+        expiresAt,
+    ]);
+    return parsePendingBinding(row);
+}
+
+async function getPendingNcBinding(id) {
+    if (!id) return null;
+    await initDB();
+    const row = await getOne(`SELECT * FROM pending_nc_bindings WHERE id = $1`, [id]);
+    return parsePendingBinding(row);
+}
+
+async function getPendingNcBindingForOrg(orgId) {
+    if (!orgId) return null;
+    await initDB();
+    // Newest non-expired pending row.
+    const row = await getOne(
+        `SELECT * FROM pending_nc_bindings
+         WHERE org_id = $1 AND status = 'pending' AND expires_at > NOW()
+         ORDER BY created_at DESC LIMIT 1`,
+        [orgId]
+    );
+    return parsePendingBinding(row);
+}
+
+async function countActivePendingNcBindingsForOrg(orgId) {
+    if (!orgId) return 0;
+    await initDB();
+    const row = await getOne(
+        `SELECT COUNT(*)::int AS n FROM pending_nc_bindings
+         WHERE org_id = $1 AND status = 'pending' AND expires_at > NOW()`,
+        [orgId]
+    );
+    return row?.n || 0;
+}
+
+async function markPendingNcBindingApproved(id, userId) {
+    await initDB();
+    await run(
+        `UPDATE pending_nc_bindings SET status = 'approved', approved_at = NOW(), approved_by_user_id = $2
+         WHERE id = $1 AND status = 'pending'`,
+        [id, userId || null]
+    );
+}
+
+async function markPendingNcBindingDenied(id, userId) {
+    await initDB();
+    await run(
+        `UPDATE pending_nc_bindings SET status = 'denied', approved_at = NOW(), approved_by_user_id = $2
+         WHERE id = $1 AND status = 'pending'`,
+        [id, userId || null]
+    );
+}
+
+async function expirePendingNcBindings() {
+    await initDB();
+    const res = await run(
+        `UPDATE pending_nc_bindings SET status = 'expired'
+         WHERE status = 'pending' AND expires_at <= NOW()`
+    );
+    return res?.rowCount || 0;
+}
+
 async function getAllGroups() {
     await initDB();
     const rows = await getAll('SELECT * FROM groups');
@@ -1134,6 +1285,9 @@ module.exports = {
     getAllUsers, getAllUserAvatars, getUser, getUserByEmail, createUser, updateUser, deleteUser,
     getAllOrganizations, getOrganization, getOrganizationByNcInstanceId, createOrganization, updateOrganization, deleteOrganization,
     getUserByNcUid,
+    createPendingNcBinding, getPendingNcBinding, getPendingNcBindingForOrg,
+    countActivePendingNcBindingsForOrg, markPendingNcBindingApproved,
+    markPendingNcBindingDenied, expirePendingNcBindings,
     getAllGroups, createGroup, updateGroup, deleteGroup, getGroupByAzureId, getUserByAzureId,
     storeAppPassword, getAppPassword, hasAppPassword, deleteAppPassword,
     getAllRoles, createRole, updateRole, deleteRole,

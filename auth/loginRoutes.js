@@ -387,9 +387,33 @@ router.get('/user', async (req, res) => {
             // progress" screen for everyone else in that org.
             ...(await (async () => {
                 if (!freshUser?.organizationId) return {};
-                const org = await userStore.getOrganization(freshUser.organizationId);
-                if (!org?.nc_instance_id) return {};
                 const isOrgAdmin = (freshUser?.orgRole === 'org_admin') || (freshUser?.role === 'admin') || !!req.session.isAdmin;
+                // Pending NC binding — shown to org-admins so they can
+                // approve a connector that's waiting to bind to this org.
+                // Surfaced even when nc_instance_id is null because that's
+                // exactly the state where adoption is pending.
+                let pendingNcBinding = null;
+                if (isOrgAdmin) {
+                    try {
+                        const row = await userStore.getPendingNcBindingForOrg(freshUser.organizationId);
+                        if (row) {
+                            pendingNcBinding = {
+                                id: row.id,
+                                ncBaseUrl: row.ncBaseUrl,
+                                ncInstanceId: row.ncInstanceId,
+                                ncAdminUid: row.ncAdminUid,
+                                ncAdminEmail: row.ncAdminEmail,
+                                themingName: row.themingName,
+                                ncVersion: row.ncVersion,
+                                expiresAt: row.expiresAt,
+                            };
+                        }
+                    } catch (e) { console.warn('[auth/user] pendingNcBinding lookup failed:', e.message); }
+                }
+                const org = await userStore.getOrganization(freshUser.organizationId);
+                if (!org?.nc_instance_id) {
+                    return pendingNcBinding ? { pendingNcBinding } : {};
+                }
                 const onboardingDone = !!org.nc_onboarding_completed_at;
                 // ncOrg is the org-level binding info — present iff the org
                 // was provisioned through Nextcloud. SPA uses this to gate
@@ -400,6 +424,7 @@ router.get('/user', async (req, res) => {
                     ncOnboardingPending: !onboardingDone && !isOrgAdmin,
                     isOrgAdmin,
                     organizationName: org.name || null,
+                    pendingNcBinding,
                     ncOrg: {
                         instanceId: org.nc_instance_id,
                         baseUrl: org.nc_base_url || null,

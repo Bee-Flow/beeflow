@@ -32,6 +32,7 @@ router.use('/', require('./oauthRoutes'));
 router.use('/', require('./adminRoutes'));
 router.use('/', require('./connectorAdminRoutes'));
 router.use('/', require('./connectorBootstrap'));
+router.use('/', require('./ncBindingRoutes'));
 router.use('/opaque', require('./opaqueRoutes'));
 
 module.exports = {
