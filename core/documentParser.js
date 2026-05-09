@@ -6,7 +6,7 @@
  */
 
 const mammoth = require('mammoth');
-const XLSX = require('xlsx');
+const XLSX = require('@e965/xlsx');
 
 /**
  * Parse a document buffer into plain text based on its MIME type.
