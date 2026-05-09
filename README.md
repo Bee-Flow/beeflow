@@ -111,7 +111,7 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md). Run `npm test` before sending a PR.
 
 ## Security
 
-Disclose responsibly via **security@beeflow.ai**. See [SECURITY.md](./SECURITY.md).
+Disclose responsibly via **tomkooy@beeflow.nl**. See [SECURITY.md](./SECURITY.md).
 
 ## Trademarks
 
@@ -120,6 +120,4 @@ under fair-code; please don't ship a fork under the Bee Flow name.
 
 ## Questions
 
-- Self-hosting: [docs.beeflow.ai/self-hosting](https://docs.beeflow.ai/self-hosting)
-- License model: [docs.beeflow.ai/license-model](https://docs.beeflow.ai/license-model)
-- Commercial: **licensing@beeflow.ai**
+- Commercial: **tomkooy@beeflow.nl**

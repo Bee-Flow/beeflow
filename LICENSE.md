@@ -120,4 +120,4 @@ licenses.
 ---
 
 Need a different licence (e.g. to host Bee Flow as a paid service for third
-parties)? **licensing@beeflow.ai**
+parties)? **tomkooy@beeflow.nl**
