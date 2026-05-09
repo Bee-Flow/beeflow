@@ -45,6 +45,7 @@
     "docxtemplater": "^3.68.3",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
+    "express-rate-limit": "^8.5.1",
     "express-session": "^1.18.2",
     "fast-xml-parser": "^5.7.2",
     "fluent-ffmpeg": "^2.1.3",

@@ -1,0 +1,82 @@
+# ── Dependencies ────────────────────────────────────────────────
+node_modules/
+__pycache__/
+*.pyc
+
+# ── Environment / Secrets ───────────────────────────────────────
+.env
+.env.local
+.env.development
+.env.production
+.env.staging
+.env.services
+.env.portainer*
+.install-env*
+.install-config*
+.install-log*
+
+# ── SSH Keys & Credentials ──────────────────────────────────────
+*.ppk
+*.pem
+*.key
+ssh-key-*
+*-vpn-key*
+config.json
+
+# Seed/test users — bcrypt hashes are offline-crackable, never commit
+config/users.json
+config/users.*.json
+data/users.json
+
+# Benchmark / scratch files at root — typically contain real-looking PII
+test-bench-*.js
+test-huge*.js
+retry-test*.js
+bench-*.js
+scratch-*.js
+
+# ── Databases ───────────────────────────────────────────────────
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite3
+data/
+
+# ── Backups & Archives ──────────────────────────────────────────
+backups/
+*.zip
+*.tar.gz
+*.tgz
+
+# ── Build Artifacts ─────────────────────────────────────────────
+dist/
+
+# ── Logs ────────────────────────────────────────────────────────
+*.log
+npm-debug.log*
+
+# ── OS / Editor ─────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Docker runtime data ─────────────────────────────────────────
+docker-data/
+pgdata/
+
+# ── Tests / coverage ────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+tmp/
+
+# ── Deploy scripts (operator-specific, often contain creds) ─────
+deploy-*.sh
+deploy/
+test-services.sh

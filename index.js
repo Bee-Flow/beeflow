@@ -61,23 +61,32 @@ const ALLOWED_ORIGINS = (process.env.CORS_ORIGIN || 'https://dev.beeflow.ai,http
     .map(s => s.trim())
     .filter(Boolean);
 
+// Browser-extension origins are opt-in. When ALLOW_BROWSER_EXTENSIONS=true
+// the operator accepts the trade-off: any installed Chrome/Firefox extension
+// can issue authenticated cross-origin XHRs riding the user's session cookie.
+// Default off — extensions must use Bearer (PAT) auth on a same-origin
+// content-script, which doesn't go through this CORS check.
+const ALLOW_BROWSER_EXTENSIONS = process.env.ALLOW_BROWSER_EXTENSIONS === 'true';
+
 app.use(cors({
     origin: (origin, cb) => {
-        // Allow requests with no origin
+        // Same-origin / curl / server-to-server (no Origin header)
         if (!origin) return cb(null, true);
-        // Allow Chrome extensions (PAT-authenticated, no cookies)
-        if (origin.startsWith('chrome-extension://') || origin.startsWith('moz-extension://')) {
-            return cb(null, true);
-        }
-        const normalizedOrigin = origin.endsWith('/') ? origin.slice(0, -1) : origin;
-        const isAllowed = ALLOWED_ORIGINS.some(o => (o.endsWith('/') ? o.slice(0, -1) : o) === normalizedOrigin);
-        if (isAllowed) {
+
+        if (ALLOW_BROWSER_EXTENSIONS &&
+            (origin.startsWith('chrome-extension://') || origin.startsWith('moz-extension://'))) {
             return cb(null, true);
         }
 
+        const normalizedOrigin = origin.endsWith('/') ? origin.slice(0, -1) : origin;
+        const isAllowed = ALLOWED_ORIGINS.some(o => (o.endsWith('/') ? o.slice(0, -1) : o) === normalizedOrigin);
+        if (isAllowed) return cb(null, true);
+
+        // Fail-closed: previously this returned `cb(null, origin)` which
+        // reflects ANY origin and — combined with credentials:true — let
+        // arbitrary websites issue authenticated XHRs against this API.
         console.warn(`[CORS] Rejected origin: ${origin}. Allowed:`, ALLOWED_ORIGINS);
-        // Return the origin anyway for dev mode flexibility or just 'true' to reflect:
-        cb(null, origin);
+        return cb(new Error(`CORS: origin not allowed: ${origin}`));
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],

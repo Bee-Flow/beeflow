@@ -23,6 +23,7 @@
 
 const express = require('express');
 const crypto = require('crypto');
+const rateLimit = require('express-rate-limit');
 const router = express.Router();
 
 const userStore = require('../stores/userStore');
@@ -32,6 +33,27 @@ const { invalidateTenantKeyCache } = require('./connectorJwt');
 const TENANT_KEY_PREFIX = 'connector_tenant_key_';
 const PENDING_TTL_SECONDS = 1800;
 const MAX_PENDING_PER_ORG = 5;
+
+// Bootstrap is unauthenticated by design (the connector has no SaaS creds
+// at this point). Rate-limit per source IP so an attacker can't flood the
+// pending-binding queue or fish for org-emails. The numbers below are
+// generous enough for a real fleet rollout (multiple NC instances behind
+// the same NAT) but tight enough to make brute-force/DoS impractical.
+const bootstrapLimiter = rateLimit({
+    windowMs: 15 * 60_000,        // 15 minutes
+    max: 20,                       // 20 bootstrap attempts per IP per window
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many bootstrap attempts; try again later.' },
+});
+
+const pendingPollLimiter = rateLimit({
+    windowMs: 60_000,              // 1 minute
+    max: 60,                       // 1 poll/sec average — connector polls every ~5s
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many poll requests.' },
+});
 
 // All NC integrations Bee Flow ships with — auto-enabled on connector
 // bootstrap so the agent can immediately reach Files, Calendar, Mail, etc.
@@ -182,7 +204,7 @@ async function bindOrgToNcInstance(org, params) {
     return await userStore.getOrganizationByNcInstanceId(ncInstanceId);
 }
 
-router.post('/connector/bootstrap', async (req, res) => {
+router.post('/connector/bootstrap', bootstrapLimiter, async (req, res) => {
     const { ncInstanceId, ncBaseUrl, ncAdminUid, ncAdminEmail, ncAdminDisplayName, connectorCallbackUrl } = readBootstrapHeaders(req);
     if (!ncInstanceId || !ncBaseUrl || !ncAdminUid || !ncAdminEmail) {
         return res.status(400).json({ error: 'Missing required X-Beeflow-NC-* headers' });
@@ -302,7 +324,7 @@ router.post('/connector/bootstrap', async (req, res) => {
 // approval. Possession of the random `id` lets the caller read status only —
 // no privileges are granted by the token alone. The tenantKey is only
 // returned once an authenticated org-admin has approved the binding.
-router.get('/connector/bootstrap/pending/:id', async (req, res) => {
+router.get('/connector/bootstrap/pending/:id', pendingPollLimiter, async (req, res) => {
     const id = String(req.params.id || '').trim();
     if (!id) return res.status(400).json({ error: 'Missing id' });
 
