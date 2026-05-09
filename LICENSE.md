@@ -119,8 +119,5 @@ licenses.
 
 ---
 
-This license is based on the **n8n Sustainable Use License**. Adapted for
-Bee Flow B.V.
-
 Need a different licence (e.g. to host Bee Flow as a paid service for third
 parties)? **licensing@beeflow.ai**
