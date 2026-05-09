@@ -94,20 +94,24 @@ async function upsertLicense({
         );
     }
 
-    // Upsert by primary key
+    // Upsert by primary key. Newly activated licenses start as 'active' —
+    // the RS256 signature is the proof of validity. The refresh scheduler
+    // exists to *catch* later revocations on monthly subs, not to gate
+    // initial trust. Status flips to 'grace'/'expired' only on refresh
+    // failures, and to 'revoked' when the license server says so.
     await run(
         `INSERT INTO license_keys
             (id, organization_id, user_id, scope, raw_token, tier, issuer,
              issued_at, expires_at, billing_interval, refresh_status,
              activated_by, metadata, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, $12, NOW(), NOW())
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'active', $11, $12, NOW(), NOW())
          ON CONFLICT (id) DO UPDATE SET
             raw_token = EXCLUDED.raw_token,
             tier = EXCLUDED.tier,
             issuer = EXCLUDED.issuer,
             expires_at = EXCLUDED.expires_at,
             billing_interval = EXCLUDED.billing_interval,
-            refresh_status = 'pending',
+            refresh_status = 'active',
             activated_by = EXCLUDED.activated_by,
             metadata = EXCLUDED.metadata,
             revoked_at = NULL,

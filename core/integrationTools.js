@@ -73,6 +73,10 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
     // Load org-level enabled integrations
     let orgEnabledIntegrations = null;
     let userOrgId = null;
+    // Per-group NC opt-out (Fase G). Resolved per-user: only the groups the
+    // current user belongs to are loaded, with their disabled_integrations
+    // arrays. Used by isAppOn() with "enable wins" semantics — see below.
+    let userGroupDisableLists = null;
     try {
         const userStore = require('../stores/userStore');
         const currentUser = await userStore.getUser(userId);
@@ -94,6 +98,23 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
                         : globalDefaults;
                 }
                 // null globalDefaults = all enabled (no defaults configured yet)
+            }
+            // Collect disabled_integrations arrays from each group the user
+            // belongs to. Skip when user is not in any groups; isAppOn then
+            // bypasses the group-deny path entirely.
+            const userGroupIds = Array.isArray(currentUser.groups)
+                ? currentUser.groups
+                : (() => { try { return JSON.parse(currentUser.groups || '[]'); } catch { return []; } })();
+            if (userGroupIds.length > 0) {
+                const allGroups = await userStore.getAllGroups();
+                const groupById = new Map(allGroups.map(g => [g.id, g]));
+                userGroupDisableLists = userGroupIds
+                    .map(gid => groupById.get(gid))
+                    .filter(Boolean)
+                    .map(g => Array.isArray(g.disabled_integrations) ? g.disabled_integrations : []);
+                // If every group's list is empty there's no constraint — drop
+                // the array so isAppOn can short-circuit.
+                if (userGroupDisableLists.every(lst => lst.length === 0)) userGroupDisableLists = null;
             }
         } else if (isSuperAdmin) {
             // Super admins without an org use the '__system__' config scope
@@ -119,6 +140,13 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
         }
         // Org-level gating applies to all integrations except exempt ones
         if (!ORG_EXEMPT_APPS.includes(appId) && orgEnabledIntegrations && !orgEnabledIntegrations.includes(appId)) return false;
+        // Per-group NC opt-out with "enable wins". Only kicks in for the NC
+        // prefix and only when the user has at least one group with a non-
+        // empty disabled list. The tool is denied only if EVERY user group
+        // disables it — a single permissive group is enough to allow it.
+        if (userGroupDisableLists && appId.startsWith('nextcloud') && userGroupDisableLists.every(lst => lst.includes(appId))) {
+            return false;
+        }
         return true;
     };
 

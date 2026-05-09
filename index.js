@@ -256,7 +256,8 @@ app.use('/api/feedback', require('./routes/feedback'));
 app.use('/api/client-errors', require('./routes/clientErrors'));
 app.use('/api/org-privacy-shield', require('./routes/orgPrivacyShield'));
 app.use('/api/org-azure-config', require('./routes/orgAzureConfig'));
-app.use('/api/compliance', require('./routes/compliance'));
+// Compliance Hub — Enterprise-tier feature.
+app.use('/api/compliance', (req, res, next) => require('./license/middleware').requireFeature('compliance_hub_gdpr')(req, res, next), require('./routes/compliance'));
 app.use('/api/chat/dlp-decision', require('./routes/dlpDecision'));
 app.use('/api/cms', require('./routes/cms'));
 // Nextcloud webhook + admin sync — mounted under /auth so they share the
@@ -264,6 +265,7 @@ app.use('/api/cms', require('./routes/cms'));
 // The webhook itself uses HMAC over the body, so it sits BEFORE auth gates.
 app.use('/auth', require('./routes/webhooks/ncEvents'));
 app.use('/auth', require('./routes/admin/ncSync'));
+app.use('/auth', require('./routes/admin/ncIntegrations'));
 app.get('/api/guard/health', async (req, res) => {
     try {
         const guardUrl = process.env.GUARD_SERVICE_URL || 'http://guard-service:8100';
@@ -279,6 +281,7 @@ app.get('/api/guard/health', async (req, res) => {
 app.use('/api/subscriptions', require('./routes/subscriptions'));
 app.use('/api/stripe', require('./routes/stripe'));
 app.use('/api/license', require('./routes/license'));
+const { requireFeature: requireLicenseFeature, requireTier: requireLicenseTier } = require('./license/middleware');
 app.use('/api/documents', require('./routes/documents'));
 app.use('/api/notifications', require('./routes/notifications'));
 // Project feature gate middleware
@@ -295,8 +298,8 @@ const projectFeatureGate = async (req, res, next) => {
 app.use('/api/projects', projectFeatureGate, require('./routes/projects'));
 app.use('/api/reminders', require('./routes/reminders'));
 app.use('/api/ai-tasks', require('./routes/aiTasks'));
-app.use('/api/automation/builder', require('./routes/ai/automationBuilder'));
-app.use('/api/automation', require('./routes/automation'));
+app.use('/api/automation/builder', requireLicenseFeature('automations'), require('./routes/ai/automationBuilder'));
+app.use('/api/automation', requireLicenseFeature('automations'), require('./routes/automation'));
 app.use('/api/integrations/gdrive', require('./routes/integrations/googleDrive'));
 app.use('/api/integrations/gmail', require('./routes/integrations/gmail'));
 app.use('/api/integrations/calendar', require('./routes/integrations/calendar'));
@@ -326,26 +329,26 @@ app.use('/api/notebooks', notebookFeatureGate, require('./routes/notebooks'));
 app.use('/api/notebooks', notebookFeatureGate, require('./routes/notebookExport'));
 // Webpages — gated per-organization via the beta-feature registry.
 const { requireBetaFeature: requireWebpagesBeta } = require('./core/betaFeatures');
-app.use('/api/webpages', requireWebpagesBeta('webpages'), require('./routes/webpages'));
-app.use('/api/webpages', requireWebpagesBeta('webpages'), require('./routes/webpageExport'));
+app.use('/api/webpages', requireLicenseFeature('webpages'), requireWebpagesBeta('webpages'), require('./routes/webpages'));
+app.use('/api/webpages', requireLicenseFeature('webpages'), requireWebpagesBeta('webpages'), require('./routes/webpageExport'));
 // Cross-origin endpoints called from the sandboxed preview iframe — guarded
 // by HMAC bearer tokens (issued by the session-authenticated route above),
 // not by the session itself, since the iframe has no cookies.
 app.use('/api/webpages-preview', require('./routes/webpagesPreview'));
 // Meeting Notes beta feature gate
 const { requireBetaFeature } = require('./core/betaFeatures');
-app.use('/api/transcriptions', requireBetaFeature('meeting_notes'), require('./routes/transcriptions'));
-app.use('/api/meet-bot', requireBetaFeature('meeting_notes'), require('./routes/meetBot'));
-app.use('/api/skills', requireBetaFeature('skills'), require('./routes/skills'));
+app.use('/api/transcriptions', requireLicenseFeature('meeting_notes'), requireBetaFeature('meeting_notes'), require('./routes/transcriptions'));
+app.use('/api/meet-bot', requireLicenseFeature('meeting_notes'), requireBetaFeature('meeting_notes'), require('./routes/meetBot'));
+app.use('/api/skills', requireLicenseFeature('skills'), requireBetaFeature('skills'), require('./routes/skills'));
 // ITIL Ticket Assistant (formerly Email Knowledge Base). Both mount paths point
 // to the same router while the `email_knowledge_base` beta-flag alias is live;
 // remove the `/api/email-kb` alias and the alias entry in betaFeatures.js in
 // the release after this one lands.
 const ticketAssistantRouter = require('./routes/ticketAssistant');
-app.use('/api/ticket-assistant', requireBetaFeature('itil_ticket_assistant'), ticketAssistantRouter);
-app.use('/api/email-kb',        requireBetaFeature('itil_ticket_assistant'), ticketAssistantRouter);
+app.use('/api/ticket-assistant', requireLicenseFeature('ticket_assistant'), requireBetaFeature('itil_ticket_assistant'), ticketAssistantRouter);
+app.use('/api/email-kb',        requireLicenseFeature('ticket_assistant'), requireBetaFeature('itil_ticket_assistant'), ticketAssistantRouter);
 app.use('/api/browser-agent', require('./routes/browserAgent'));
-app.use('/api/pat', require('./routes/personalAccessTokens'));
+app.use('/api/pat', requireBetaFeature('personal_access_tokens'), require('./routes/personalAccessTokens'));
 
 app.use('/', require('./routes/knowledge'));
 app.use('/api/kb', require('./routes/knowledgeBases'));
@@ -372,6 +375,13 @@ app.listen(PORT, '0.0.0.0', () => {
     // Run first-boot setup from INIT_* env vars (set by install wizard)
     const { runBootInit } = require('./boot-init');
     runBootInit().catch(err => console.error('[boot-init] Fatal:', err));
+
+    // License refresh scheduler — periodic ping to license.beeflow.ai for
+    // monthly licenses. Yearly/lifetime licenses are validated by JWT exp
+    // and skip this loop. Disable with LICENSE_REFRESH_DISABLED=true.
+    try { require('./license/refresh').start(); } catch (e) {
+        console.warn('[License Refresh] Failed to start scheduler:', e.message);
+    }
 
     // Non-invasive self-check of every org Privacy Shield blob. Logs warnings
     // for legacy shapes, orphaned regex collections, and invalid custom terms

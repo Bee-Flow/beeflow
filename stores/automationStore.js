@@ -583,7 +583,7 @@ async function updateRun(id, updates) {
     return rowCount > 0;
 }
 
-async function recordRunStep({ runId, stepId, stepType, attempts = 1, status, startedAt, finishedAt, input, output, error }) {
+async function recordRunStep({ runId, stepId, stepType, attempts = 1, status, startedAt, finishedAt, input, output, error, branchIndex = null }) {
     await initDB();
     if (!runId || !stepId) {
         // Defensive: NOT NULL columns; skip rather than crash the whole run.
@@ -591,19 +591,21 @@ async function recordRunStep({ runId, stepId, stepType, attempts = 1, status, st
         return;
     }
     await run(
-        `INSERT INTO automation_run_steps (run_id, step_id, step_type, attempts, status, started_at, finished_at, input_json, output_json, error)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        `INSERT INTO automation_run_steps (run_id, step_id, step_type, attempts, status, started_at, finished_at, input_json, output_json, error, branch_index)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
          ON CONFLICT (run_id, step_id, attempts) DO UPDATE SET
             status = EXCLUDED.status,
             finished_at = EXCLUDED.finished_at,
             output_json = EXCLUDED.output_json,
-            error = EXCLUDED.error`,
+            error = EXCLUDED.error,
+            branch_index = EXCLUDED.branch_index`,
         [
             runId, stepId, stepType, attempts, status,
             startedAt || null, finishedAt || null,
             input != null ? JSON.stringify(input) : null,
             output != null ? JSON.stringify(output) : null,
             error || null,
+            branchIndex,
         ],
     );
 }

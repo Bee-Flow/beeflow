@@ -93,6 +93,57 @@ async function requestCancel(runId) {
 }
 
 /**
+ * Resume a paused or failed run from a specific step. Loads the original
+ * run + automation, rebuilds runState by replaying the persisted
+ * automation_run_steps rows, then invokes runDag with `skipUntilStepId`
+ * pointing at the resumption boundary. Used by:
+ *   - approval-step approve/reject endpoint (skip past the paused step)
+ *   - retry-from-step UI button (skip everything that already ran cleanly)
+ *
+ * The new execution is recorded as a CHILD run linked via parent_run_id
+ * so the original lineage stays intact in the history.
+ *
+ * `decision` is the synthetic output assigned to the skipped step. For
+ * approval steps that's typically `{approved: true, by: <userId>}`.
+ */
+async function resumeFromStep(runId, fromStepId, { decision = null, userId = null } = {}) {
+    const original = await automationStore.getRun(runId);
+    if (!original) throw new Error(`Run ${runId} not found`);
+    const automation = await automationStore.getAutomation(original.automationId);
+    if (!automation) throw new Error(`Automation ${original.automationId} not found`);
+
+    // Replay state from previously-recorded step rows so binding
+    // expressions like {{steps.stepX.output.field}} resolve to what they
+    // resolved to in the original run.
+    const previousSteps = await automationStore.getRunSteps(runId);
+    const replayedStepState = {};
+    for (const s of previousSteps) {
+        if (!s.stepId || s.status === 'awaiting_approval') continue;
+        if (s.status === 'success' && s.output != null) {
+            replayedStepState[s.stepId] = { output: s.output, status: 'success' };
+        }
+    }
+    // Inject the synthetic decision output for the resumption-boundary step.
+    if (fromStepId) {
+        replayedStepState[fromStepId] = {
+            output: decision || { approved: true, resumedAt: new Date().toISOString(), by: userId },
+            status: 'success',
+        };
+    }
+
+    return await executeAutomation({
+        ...automation,
+    }, {
+        triggerKind: original.triggerKind || 'manual',
+        triggerPayload: original.triggerPayload || null,
+        mode: 'live',
+        parentRunId: runId,
+        replayState: replayedStepState,
+        skipUntilStepId: fromStepId,
+    });
+}
+
+/**
  * Cross-process cancellation check. Reads the cancel_requested flag from
  * the run row so a cancel issued against a different runner pod is still
  * honoured — at worst on the next "between steps" check.
@@ -628,6 +679,73 @@ async function execCode(step, ctx, runState, mode) {
     return { output: { result, logs, httpCalls: http.calls } };
 }
 
+// ── Approval step ───────────────────────────────────────
+//
+// Pauses the run by throwing a sentinel that executeAutomation catches.
+// The caller persists the awaiting state + a single-use approval token,
+// then finalises the run row in 'awaiting_approval'. A subsequent
+// POST /runs/:runId/approve-step starts a fresh executeAutomation that
+// uses resumeFromStep to skip everything up to and including the
+// approval step.
+
+class ApprovalRequiredError extends Error {
+    constructor(stepId, prompt) {
+        super(`Approval required at step ${stepId}`);
+        this.name = 'ApprovalRequiredError';
+        this.stepId = stepId;
+        this.prompt = prompt;
+    }
+}
+
+async function execApproval(step, ctx, runState, mode) {
+    if (mode === 'dry_run') {
+        // In dry-run we synthesise auto-approve so the rest of the flow
+        // can preview without a human in the loop.
+        return { output: { approved: true, _dryRun: true, prompt: step.prompt || step.title || 'Approval' } };
+    }
+    // Notify the owner. Approval-link signing happens in the catch path
+    // (we don't yet have run.id at this layer for the token), so the
+    // notification with the live link is sent there.
+    throw new ApprovalRequiredError(step.id, step.prompt || step.title || 'Approval requested');
+}
+
+// ── Parallel branches ───────────────────────────────────
+//
+// step.branches: Step[][] — each entry is a list of steps to run in
+// sequence. Branches run concurrently with Promise.allSettled; output
+// is { branches: [{ status, output, error? }, ...] }.
+//
+// Per-branch failures don't fail the whole step by default; set
+// `step.failOnAnyBranchError: true` to flip that semantics. This matches
+// Power Automate's "Run after" behaviour where parallel branches default
+// to soft-fail unless explicitly chained.
+async function execParallel(step, ctx, runState, mode, dispatchSubStep) {
+    const branches = Array.isArray(step.branches) ? step.branches : [];
+    if (branches.length === 0) {
+        return { output: { branches: [] } };
+    }
+    const results = await Promise.allSettled(branches.map((branchSteps, branchIndex) => {
+        const subState = { ...runState, parallel: { ...(runState.parallel || {}), _branchIndex: branchIndex } };
+        const subDef = {
+            steps: branchSteps || [],
+            edges: buildLinearEdges(branchSteps || []),
+            trigger: { id: '__parallel_root__' },
+        };
+        return runDag(subDef, { ...ctx, _branchIndex: branchIndex }, subState, mode, dispatchSubStep, { recordSteps: true, branchIndex });
+    }));
+    const branchOutputs = results.map((r, idx) => {
+        if (r.status === 'fulfilled') {
+            return { branchIndex: idx, status: 'success', output: r.value?.lastOutput ?? null };
+        }
+        return { branchIndex: idx, status: 'error', error: r.reason?.message || String(r.reason) };
+    });
+    if (step.failOnAnyBranchError && branchOutputs.some(b => b.status === 'error')) {
+        const firstError = branchOutputs.find(b => b.status === 'error');
+        throw new Error(`Parallel branch ${firstError.branchIndex} failed: ${firstError.error}`);
+    }
+    return { output: { branches: branchOutputs } };
+}
+
 async function execLoop(step, ctx, runState, mode, dispatchSubStep) {
     const list = require('../automation/bind').walkPath(step.overRef, runState) || [];
     if (!Array.isArray(list)) {
@@ -655,7 +773,7 @@ function buildLinearEdges(steps) {
 
 // ── Core DAG run ────────────────────────────────────────
 
-async function runDag(def, ctx, runStateInit, mode, dispatchStep, { recordSteps = true } = {}) {
+async function runDag(def, ctx, runStateInit, mode, dispatchStep, { recordSteps = true, branchIndex = null, skipUntilStepId = null } = {}) {
     const { adj, stepById } = buildAdjacency(def);
     const runState = runStateInit;
     const triggerId = def.trigger?.id;
@@ -664,6 +782,12 @@ async function runDag(def, ctx, runStateInit, mode, dispatchStep, { recordSteps 
     const visited = new Set();
     let queue = [triggerId];
     let lastOutput = null;
+
+    // Resume-from-step: when set, skip dispatch+record for every step up to
+    // and INCLUDING `skipUntilStepId`. Their outputs must already be in
+    // runState.steps from the resume bootstrap. This lets us replay a
+    // failed/approval-paused run from the next step onwards.
+    let stillSkipping = !!skipUntilStepId;
 
     while (queue.length > 0) {
         const id = queue.shift();
@@ -676,6 +800,13 @@ async function runDag(def, ctx, runStateInit, mode, dispatchStep, { recordSteps 
         if (id === triggerId) {
             // Trigger output is already in runState.trigger.output
             nextLabel = null;
+        } else if (stillSkipping) {
+            // Replay path — outputs already in runState.steps; honour
+            // condition branching so the resumed traversal follows the
+            // same edge that the original run did.
+            const replayed = runState.steps?.[step.id]?.output;
+            if (step.type === 'condition' && replayed?.branch) nextLabel = replayed.branch;
+            if (step.id === skipUntilStepId) stillSkipping = false;
         } else {
             const dispatched = await dispatchStep(step, ctx, runState, mode);
             // Save into runState
@@ -694,6 +825,7 @@ async function runDag(def, ctx, runStateInit, mode, dispatchStep, { recordSteps 
                     input: dispatched.inputSnapshot ?? null,
                     output: dispatched.output ?? null,
                     error: null,
+                    branchIndex,
                 });
             }
             if (step.type === 'condition' && dispatched.output?.branch) {
@@ -710,7 +842,7 @@ async function runDag(def, ctx, runStateInit, mode, dispatchStep, { recordSteps 
 
 // ── Top-level executeAutomation ─────────────────────────
 
-async function executeAutomation(automation, { triggerKind = 'manual', triggerPayload = null, mode = 'live', confirmFirstRun = false, parentRunId = null } = {}) {
+async function executeAutomation(automation, { triggerKind = 'manual', triggerPayload = null, mode = 'live', confirmFirstRun = false, parentRunId = null, replayState = null, skipUntilStepId = null } = {}) {
     const startedAt = Date.now();
     const session = await resolveUserSession(automation.userId);
 
@@ -750,7 +882,10 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
 
     const runState = {
         trigger: { output: triggerPayload || {} },
-        steps: {},
+        // Hydrate from a previous run's recorded outputs when resuming —
+        // bindings like {{steps.stepA.output.field}} need the values the
+        // original run produced.
+        steps: replayState ? { ...replayState } : {},
         vars: automation.definition?.vars || {},
         secrets: {}, // populated by sandbox/secret bridges only; never echoed
         loop: {},
@@ -799,6 +934,8 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
                 case 'loop':               result = await execLoop(step, ctx_, state_, mode_, dispatchStep); break;
                 case 'code':               result = await execCode(step, ctx_, state_, mode_); break;
                 case 'notification':       result = await execNotification(step, ctx_, state_, mode_); break;
+                case 'approval':           result = await execApproval(step, ctx_, state_, mode_); break;
+                case 'parallel':           result = await execParallel(step, ctx_, state_, mode_, dispatchStep); break;
                 default: throw new Error(`Unknown step type: ${step.type}`);
             }
             result.startedAt = stepStartedAt;
@@ -818,6 +955,13 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
                             loop:               () => execLoop(step, ctx_, state_, mode_, dispatchStep),
                             code:               () => execCode(step, ctx_, state_, mode_),
                             notification:       () => execNotification(step, ctx_, state_, mode_),
+                            // Approval throws on every call to pause; retrying it
+                            // would just re-throw without sending the user new
+                            // notifications. The enclosing executeAutomation
+                            // handles the pause path before any retry kicks in
+                            // (the retry block here only fires for actual errors).
+                            approval:           () => execApproval(step, ctx_, state_, mode_),
+                            parallel:           () => execParallel(step, ctx_, state_, mode_, dispatchStep),
                         }[step.type]();
                         await automationStore.recordRunStep({
                             runId: ctx_.runId, stepId: step.id, stepType: step.type, attempts: i + 1,
@@ -838,6 +982,18 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
                         }
                     }
                 }
+            }
+            // Approval pauses are not errors — record the step as
+            // 'awaiting_approval' so run history shows the pause point and
+            // the resume path can find it.
+            if (err instanceof ApprovalRequiredError) {
+                await automationStore.recordRunStep({
+                    runId: ctx_.runId, stepId: step.id, stepType: step.type, attempts: 1,
+                    status: 'awaiting_approval', startedAt: stepStartedAt, finishedAt: new Date().toISOString(),
+                    input: step.inputs ? resolveDeep(step.inputs, state_, { allowSecrets: false }) : null,
+                    output: { prompt: err.prompt }, error: null,
+                });
+                throw err;
             }
             // Record error and rethrow so outer catch terminates the run (unless catch.goto).
             await automationStore.recordRunStep({
@@ -872,7 +1028,7 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
 
     try {
         runResult = await Promise.race([
-            runDag(automation.definition || {}, ctx, runState, effectiveMode, dispatchStep),
+            runDag(automation.definition || {}, ctx, runState, effectiveMode, dispatchStep, { recordSteps: true, skipUntilStepId }),
             guard,
             cancelGuard,
         ]);
@@ -880,7 +1036,13 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
         runErrorObj = e;
         runErrorMsg = e.message || String(e);
         wasCancelled = cancelSignal.aborted || e.message === 'Run cancelled';
-        runStatus = wasCancelled ? 'cancelled' : 'error';
+        if (e instanceof ApprovalRequiredError) {
+            runStatus = 'awaiting_approval';
+        } else if (wasCancelled) {
+            runStatus = 'cancelled';
+        } else {
+            runStatus = 'error';
+        }
     } finally {
         if (timeoutTimer) clearTimeout(timeoutTimer);
         clearRunCancellation(run.id);
@@ -901,12 +1063,22 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
         return summariseDefinition(automation.definition || {}).summary;
     })();
 
+    // For awaiting_approval, persist the approval token + the step id so
+    // the resume endpoint can validate and continue.
+    let approvalToken = null;
+    if (runStatus === 'awaiting_approval' && runErrorObj instanceof ApprovalRequiredError) {
+        approvalToken = crypto.randomBytes(24).toString('hex');
+    }
+
     await automationStore.updateRun(run.id, {
         status: firstRunNeedsConfirm ? 'awaiting_confirm' : runStatus,
         finishedAt,
         durationMs: Date.now() - startedAt,
         error: runErrorMsg,
         summary,
+        ...(runStatus === 'awaiting_approval'
+            ? { awaitingStepId: runErrorObj?.stepId || null, approvalToken }
+            : {}),
     });
 
     // Always release the running marker. Without this, a row stays
@@ -948,6 +1120,13 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
                 category: 'urgent',
                 title: `⚠️ Automation failed: ${automation.title}`,
                 message: userSafeError || 'Unknown error',
+            });
+        } else if (runStatus === 'awaiting_approval' && runErrorObj instanceof ApprovalRequiredError) {
+            await notificationStore.createNotification({
+                userId: automation.userId,
+                category: 'heads_up',
+                title: `🛂 Approval needed: ${automation.title}`,
+                message: `${runErrorObj.prompt || 'Approval requested'} — open the run history to approve.`,
             });
         }
         // No notification for cancelled runs — the user initiated the cancel
@@ -1111,5 +1290,7 @@ module.exports = {
     processDueAutomations,
     reapStuckAutomations,
     requestCancel,
+    resumeFromStep,
+    ApprovalRequiredError,
     INSTANCE_ID,
 };

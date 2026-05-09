@@ -309,6 +309,7 @@ async function handleCheckoutCompleted(session) {
         if (success) {
             await userStore.logSubscriptionAudit('assign_subscription', 'consumer', userId, 'stripe_webhook', null, { plan_id: planId, stripe_subscription_id: session.subscription, payment_status: 'paid' });
             console.log(`[Stripe Webhook] ✓ Consumer subscription assigned to user ${userId}`);
+            await issueLicenseFromPlan({ scope: 'consumer', userId, planId, session });
         } else {
             console.error(`[Stripe Webhook] ✗ Failed to assign consumer subscription to user ${userId}`);
         }
@@ -323,9 +324,40 @@ async function handleCheckoutCompleted(session) {
         if (success) {
             await userStore.logSubscriptionAudit('assign_subscription', 'organization', orgId, 'stripe_webhook', null, { plan_id: planId, stripe_subscription_id: session.subscription, payment_status: 'paid' });
             console.log(`[Stripe Webhook] ✓ Subscription assigned to org ${orgId}`);
+            await issueLicenseFromPlan({ scope: 'organization', organizationId: orgId, planId, session });
         } else {
             console.error(`[Stripe Webhook] ✗ Failed to assign subscription to org ${orgId}`);
         }
+    }
+}
+
+/**
+ * Resolve plan → tier and call the Beeflow license server to mint a JWT.
+ * Failures are non-fatal — the Stripe sub is already saved.
+ */
+async function issueLicenseFromPlan({ scope, organizationId, userId, planId, session }) {
+    try {
+        const { issueLicenseFromCheckout, tierFromPlanName } = require('../license/issuance');
+        let tier = null;
+        if (planId) {
+            const plan = await userStore.getPlan(planId);
+            tier = tierFromPlanName(plan?.name) || tierFromPlanName(plan?.description);
+        }
+        if (!tier) {
+            console.log('[Stripe Webhook] No tier could be derived from plan; skipping license issuance');
+            return;
+        }
+        await issueLicenseFromCheckout({
+            scope,
+            organizationId,
+            userId,
+            planId,
+            tier,
+            stripeCustomerId: session.customer,
+            stripeSubscriptionId: session.subscription,
+        });
+    } catch (e) {
+        console.error('[Stripe Webhook] license issuance error:', e.message);
     }
 }
 

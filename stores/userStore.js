@@ -156,6 +156,10 @@ async function initDB() {
     try { await exec(`ALTER TABLE groups ADD COLUMN IF NOT EXISTS "lastSyncedAt" TEXT`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE groups ADD COLUMN IF NOT EXISTS "orgRole" TEXT DEFAULT ''`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE groups ADD COLUMN IF NOT EXISTS "allowedTiers" TEXT DEFAULT '[]'`); } catch (e) { /* column already exists */ }
+    // Per-group NC integration opt-out (Fase G). Org-admin uses this to
+    // disable specific Nextcloud tools for members of a group. Empty array
+    // means "inherit org-wide setting".
+    try { await exec(`ALTER TABLE groups ADD COLUMN IF NOT EXISTS "disabled_integrations" TEXT DEFAULT '[]'`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS "azureUserId" TEXT`); } catch (e) { /* column already exists */ }
 
     // ── Nextcloud connector binding (instance ↔ org, NC uid ↔ user) ──
@@ -648,7 +652,14 @@ async function deleteOrganization(orgId) {
 async function getAllGroups() {
     await initDB();
     const rows = await getAll('SELECT * FROM groups');
-    return rows.map(g => ({ ...g, permissions: parseJSON(g.permissions, []), roles: parseJSON(g.roles, []), allowedAgentTypes: parseJSON(g.allowedAgentTypes, []), allowedTiers: parseJSON(g.allowedTiers, []) }));
+    return rows.map(g => ({
+        ...g,
+        permissions: parseJSON(g.permissions, []),
+        roles: parseJSON(g.roles, []),
+        allowedAgentTypes: parseJSON(g.allowedAgentTypes, []),
+        allowedTiers: parseJSON(g.allowedTiers, []),
+        disabled_integrations: parseJSON(g.disabled_integrations, []),
+    }));
 }
 
 async function createGroup(groupData) {
@@ -679,7 +690,8 @@ async function updateGroup(groupId, updates) {
     if (updates.roles !== undefined) updateMap.roles = JSON.stringify(updates.roles);
     if (updates.allowedAgentTypes !== undefined) updateMap.allowedAgentTypes = JSON.stringify(updates.allowedAgentTypes);
     if (updates.allowedTiers !== undefined) updateMap.allowedTiers = JSON.stringify(updates.allowedTiers);
-    const fullColMap = { ...colMap, organizationId: 'organizationId', permissions: 'permissions', roles: 'roles', allowedAgentTypes: 'allowedAgentTypes', allowedTiers: 'allowedTiers' };
+    if (updates.disabledIntegrations !== undefined) updateMap.disabledIntegrations = JSON.stringify(updates.disabledIntegrations);
+    const fullColMap = { ...colMap, organizationId: 'organizationId', permissions: 'permissions', roles: 'roles', allowedAgentTypes: 'allowedAgentTypes', allowedTiers: 'allowedTiers', disabledIntegrations: 'disabled_integrations' };
     try {
         const q = dynamicUpdate('groups', groupId, updateMap, fullColMap);
         if (q) await run(q.sql, q.params);

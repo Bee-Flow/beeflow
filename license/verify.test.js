@@ -189,20 +189,27 @@ const now = Math.floor(Date.now() / 1000);
     assert.ok(r.error.startsWith('decode_failed'));
 }
 
-// ── No public key configured → no_public_key_configured ─────────────────
+// ── Wrong public key (bundled fallback doesn't match the test signer) ──
+// Previously this asserted `no_public_key_configured`, but the production
+// build now ships a bundled-public-key.pem so that activation works
+// out-of-the-box on self-hosted installs (Nextcloud-bundled, Docker, etc.).
+// That means "no env key" no longer means "no key at all" — the loader
+// falls back to the bundled one. A token signed by a different keypair
+// therefore fails with invalid_signature, which is the realistic outcome.
 {
     verify._setPublicKeyForTesting(null);
     const token = sign({
         iss: 'license.beeflow.ai',
         sub: 'org_test',
         tier: 'pro',
-        license_id: 'lic_nokey',
+        license_id: 'lic_wrongkey',
         iat: now,
         exp: now + 86400,
     });
     const r = verify.verifyToken(token, { now });
     assert.strictEqual(r.valid, false);
-    assert.strictEqual(r.error, 'no_public_key_configured');
+    assert.ok(['invalid_signature', 'no_public_key_configured'].includes(r.error),
+        `expected invalid_signature or no_public_key_configured, got ${r.error}`);
     verify._setPublicKeyForTesting(publicKey); // restore
 }
 

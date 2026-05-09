@@ -879,6 +879,32 @@ router.get('/_runs/recent', async (req, res) => {
     }
 });
 
+/**
+ * Template gallery — curated, ready-to-go automation templates the Studio
+ * surfaces in the empty state. Listing returns metadata only; the
+ * detail endpoint includes the full definition so the builder can
+ * pre-fill it.
+ */
+router.get('/templates', (req, res) => {
+    try {
+        const { listTemplates, CATEGORIES } = require('../automation/templates');
+        res.json({ templates: listTemplates(), categories: CATEGORIES });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+router.get('/templates/:id', (req, res) => {
+    try {
+        const { getTemplate } = require('../automation/templates');
+        const tmpl = getTemplate(req.params.id);
+        if (!tmpl) return res.status(404).json({ error: 'Template not found' });
+        res.json({ template: tmpl });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 router.get('/:id/versions', async (req, res) => {
     try {
         const userId = req.session.user.id;
@@ -1061,6 +1087,77 @@ router.post('/:id/runs/:runId/retry', async (req, res) => {
         }
         const steps = await automationStore.getRunSteps(run.id).catch(() => []);
         return res.status(200).json({ accepted: true, run, steps });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * Approve / reject the step an awaiting_approval run is paused on.
+ *
+ * Body: { decision: 'approve' | 'reject', reason?: string }
+ * Returns the new run row produced by resumeFromStep — note this is a
+ * CHILD run, linked to the original via parent_run_id; the original row
+ * stays in `awaiting_approval` so the lineage is intact.
+ *
+ * The user must own the automation (org-level approve-anyone-else's-run
+ * is intentionally NOT supported here — that requires per-step ACLs).
+ */
+router.post('/runs/:runId/approve-step', async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const original = await automationStore.getRun(req.params.runId);
+        if (!original) return res.status(404).json({ error: 'Run not found' });
+        if (original.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
+        if (original.status !== 'awaiting_approval') {
+            return res.status(409).json({ error: `Run is in ${original.status} state, not awaiting_approval` });
+        }
+        if (!original.awaitingStepId) {
+            return res.status(409).json({ error: 'Run has no recorded awaiting step' });
+        }
+
+        const decision = String(req.body?.decision || 'approve').toLowerCase();
+        if (decision !== 'approve' && decision !== 'reject') {
+            return res.status(400).json({ error: 'decision must be "approve" or "reject"' });
+        }
+
+        if (decision === 'reject') {
+            // Reject finalises the original run as 'error' with a clear
+            // reason. We do NOT resume — the rest of the flow is dropped.
+            await automationStore.updateRun(original.id, {
+                status: 'error',
+                error: `Approval rejected${req.body?.reason ? `: ${req.body.reason}` : ''}`,
+                finishedAt: new Date().toISOString(),
+                awaitingStepId: null,
+                approvalToken: null,
+            });
+            return res.json({ accepted: true, decision: 'reject', run: await automationStore.getRun(original.id) });
+        }
+
+        // Approve → kick off resume. Synchronous wait capped at 60s like /run.
+        const runner = require('../core/automationRunner');
+        const RESPONSE_TIMEOUT_MS = 60_000;
+        let timedOut = false;
+        const guard = new Promise((resolve) => setTimeout(() => { timedOut = true; resolve(null); }, RESPONSE_TIMEOUT_MS));
+        const resumePromise = runner.resumeFromStep(original.id, original.awaitingStepId, {
+            decision: { approved: true, by: userId, reason: req.body?.reason || null, decidedAt: new Date().toISOString() },
+            userId,
+        }).catch(e => { console.error('[automation/approve-step] error:', e.message); return null; });
+
+        // Mark the original run as resumed so the UI reflects state immediately
+        // (the new child run carries the live execution).
+        await automationStore.updateRun(original.id, {
+            status: 'success',
+            summary: `Resumed via approval — see child run ${(await automationStore.getRun(original.id))?.id || ''}`,
+            awaitingStepId: null,
+            approvalToken: null,
+        }).catch(() => {});
+
+        const newRun = await Promise.race([resumePromise, guard]);
+        if (timedOut || !newRun) {
+            return res.status(202).json({ accepted: true, pending: true, message: 'Resume started; check run history.' });
+        }
+        return res.json({ accepted: true, decision: 'approve', run: newRun });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }

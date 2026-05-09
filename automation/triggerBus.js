@@ -652,6 +652,21 @@ async function loadSession(userId) {
 
     // 2) user_sessions fallback. Same shape as req.session for the chat path:
     //    { user: { id, ... }, accessToken, refreshToken, oauthProvider, ... }
+    //
+    // Phase 4.2: detect connector-bound users so the silent fallback to
+    // legacy OAuth/app-password isn't invisible. The connector path uses
+    // HMAC-signed reverse-proxy requests, NOT a bearer token, so reaching
+    // here for a connector-bound user means either (a) the org's tenant
+    // key is missing or (b) the user's ncUid was wiped — neither is
+    // recoverable via session tokens. Log loud so operators see it.
+    try {
+        const userStore = require('../stores/userStore');
+        const u = await userStore.getUser(userId).catch(() => null);
+        if (u?.ncUid) {
+            console.warn(`[TriggerBus] connector-bound user ${userId} (ncUid=${u.ncUid}) reached legacy auth fallback — connector tenant key may be missing or vault empty`);
+        }
+    } catch (_) { /* non-fatal */ }
+
     const { pool } = require('../db');
     try {
         const { rows } = await pool.query(
@@ -682,28 +697,51 @@ async function loadSession(userId) {
 // tick. Cache is short-lived (a few seconds) — long enough to coalesce
 // the in-pass calls, short enough that the next tick still fetches fresh
 // rows.
-const _ncActivityCache = new Map(); // userId → { ts, rows[] }
+//
+// Phase 4 fix: in-flight dedup. Two concurrent ticks (multi-pod, or a
+// reaper-triggered re-poll) used to issue duplicate fetches because each
+// only saw the empty resolved cache. We now park the in-flight Promise
+// alongside the cached rows; concurrent callers await the same Promise
+// instead of firing their own request.
+const _ncActivityCache = new Map(); // userId → { ts, rows[], inflight? }
 const NC_ACTIVITY_CACHE_TTL_MS = 5_000;
 
 async function _ncFetchActivityRows(userId, session) {
     const cached = _ncActivityCache.get(userId);
-    if (cached && Date.now() - cached.ts < NC_ACTIVITY_CACHE_TTL_MS) return cached.rows;
-    let rows = [];
-    try {
-        const tools = require('../integrations/nextcloudActivityTools');
-        const result = await tools.executeNextcloudActivityTool(
-            'nextcloud_activity_list',
-            { filter: 'all', limit: 200 },
-            userId, session,
-        );
-        if (result?.activities) rows = result.activities;
-        else if (result?.error) console.warn(`[TriggerBus] nextcloud activity fetch failed for user ${userId}: ${result.error}`);
-    } catch (e) {
-        console.warn(`[TriggerBus] nextcloud activity fetch threw for user ${userId}: ${e.message}`);
+    if (cached) {
+        if (cached.inflight) {
+            // Someone else is fetching; piggyback on their result.
+            return cached.inflight;
+        }
+        if (Date.now() - cached.ts < NC_ACTIVITY_CACHE_TTL_MS) return cached.rows;
     }
-    rows.sort((a, b) => (a.id || 0) - (b.id || 0));
-    _ncActivityCache.set(userId, { ts: Date.now(), rows });
-    return rows;
+    const promise = (async () => {
+        let rows = [];
+        try {
+            const tools = require('../integrations/nextcloudActivityTools');
+            const result = await tools.executeNextcloudActivityTool(
+                'nextcloud_activity_list',
+                { filter: 'all', limit: 200 },
+                userId, session,
+            );
+            if (result?.activities) rows = result.activities;
+            return rows;
+        } catch (e) {
+            console.warn(`[TriggerBus] nextcloud activity fetch threw for user ${userId}: ${e.message}`);
+            return rows;
+        }
+    })().then((rows) => {
+        rows.sort((a, b) => (a.id || 0) - (b.id || 0));
+        _ncActivityCache.set(userId, { ts: Date.now(), rows, inflight: null });
+        return rows;
+    }).catch((e) => {
+        // Clear the inflight slot so the next tick can retry.
+        _ncActivityCache.set(userId, { ts: 0, rows: [], inflight: null });
+        throw e;
+    });
+
+    _ncActivityCache.set(userId, { ts: cached?.ts || 0, rows: cached?.rows || [], inflight: promise });
+    return promise;
 }
 
 /**

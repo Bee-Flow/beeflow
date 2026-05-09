@@ -21,15 +21,33 @@
 
 const crypto = require('crypto');
 const fs = require('fs');
+const path = require('path');
 const { isValidTier, TIER_HIERARCHY } = require('./tiers');
 
 const EXPECTED_ISSUER = 'license.beeflow.ai';
 const FULL_TIER_ISSUER = 'license.beeflow.ai/internal';
 const ALG = 'RS256';
 
+const BUNDLED_KEY_PATH = path.join(__dirname, 'bundled-public-key.pem');
+
 let _cachedKey = null;
 let _cachedKeySource = null;
 
+/**
+ * Resolve the public key in this precedence:
+ *   1. LICENSE_PUBLIC_KEY env var (inline PEM, supports literal \n)
+ *   2. LICENSE_PUBLIC_KEY_FILE env var (path to PEM file)
+ *   3. ./bundled-public-key.pem shipped alongside this module
+ *
+ * Step 3 is what makes activation work out-of-the-box for self-hosted
+ * installs (Nextcloud-bundled, Docker, bare-metal). Operators only need
+ * to override via env var when they want to validate against a custom
+ * license server (e.g. white-label deployments).
+ *
+ * Beeflow replaces bundled-public-key.pem with the production key before
+ * cutting a release; the dev key in this repo only validates dev-signed
+ * test JWTs.
+ */
 function loadPublicKey() {
     if (_cachedKey) return { key: _cachedKey, source: _cachedKeySource };
 
@@ -50,6 +68,14 @@ function loadPublicKey() {
             console.error('[License Verify] Could not read LICENSE_PUBLIC_KEY_FILE:', e.message);
         }
     }
+
+    try {
+        if (fs.existsSync(BUNDLED_KEY_PATH)) {
+            _cachedKey = fs.readFileSync(BUNDLED_KEY_PATH, 'utf8');
+            _cachedKeySource = 'bundled';
+            return { key: _cachedKey, source: _cachedKeySource };
+        }
+    } catch (e) { /* unreadable bundled key — treat as missing */ }
 
     return { key: null, source: null };
 }

@@ -18,6 +18,8 @@ const { parseExpr } = require('./expr');
 
 const VALID_STEP_TYPES = new Set([
     'trigger', 'integration_action', 'ai_step', 'condition', 'loop', 'code', 'notification',
+    // Phase 2 flow primitives
+    'approval', 'parallel',
 ]);
 
 function isObject(x) { return x && typeof x === 'object' && !Array.isArray(x); }
