@@ -10,7 +10,7 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "SEE LICENSE IN LICENSE.md",
   "type": "commonjs",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",
@@ -81,5 +81,13 @@
     "vcf": "^2.1.2",
     "xlsx": "^0.18.5",
     "xml2js": "^0.6.2"
+  },
+  "homepage": "https://beeflow.ai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Bee-Flow/beeflow.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Bee-Flow/beeflow/issues"
   }
 }
