@@ -205,11 +205,12 @@ async function executeKbSearchTool(toolName, args, context = {}) {
     console.log(`[KBSearch] Searching ${kbIds.length} KBs: "${query}" (top_k=${topK}, agent=${agentId})`);
 
     try {
-        const useAzure = !!(await configStore.getConfig('use_azure_doc_processing'));
+        const { resolveKbProvider } = require('../core/kb/resolveProvider');
+        const kbProvider = await resolveKbProvider();
         let chunks = [];
 
-        if (useAzure) {
-            // ── Local search path (Azure) ─────────────────────────
+        if (kbProvider === 'local') {
+            // ── Local search path (in-process pgvector + RRF + reranker) ──
             const { searchLocally } = require('../core/localKBIngest');
             const localResults = await searchLocally(userId, kbIds, query, { topK });
             chunks = localResults;

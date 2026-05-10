@@ -41,8 +41,12 @@ function preprocessQuery(query) {
 // ── Azure Embedding Resolution ─────────────────────────────────────
 
 async function getAzureSearchParams() {
-    const useAzure = !!(await configStore.getConfig('use_azure_doc_processing'));
-    if (!useAzure) return {};
+    // The legacy `use_azure_doc_processing` flag is treated as a synonym
+    // for "use the local KB path" (which embeds via Azure OR any other
+    // configured provider). The new `kb_provider` toggle takes precedence.
+    const { resolveKbProvider } = require('./kb/resolveProvider');
+    const kbProvider = await resolveKbProvider();
+    if (kbProvider !== 'local') return {};
     return {
         use_azure: true,
         azure_endpoint: await configStore.getConfig('azure_openai_embedding_endpoint') || '',

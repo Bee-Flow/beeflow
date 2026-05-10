@@ -224,9 +224,25 @@ async function rerankProviderLLM(rerankTarget, query, results) {
     }
 }
 
+async function rerankCpuLocal(query, results) {
+    try {
+        const { rerankCpu } = require('../core/rerank/cpuCrossEncoder');
+        const docs = results.map(r => `${r.title}\n${r.snippet}\n${(r.content || '').slice(0, 1500)}`);
+        const scored = await rerankCpu(query, docs);
+        if (scored.length === 0) return results;
+        return scored.map(s => ({ ...results[s.index], score: s.relevance_score }));
+    } catch (err) {
+        console.warn(`[NodeSearch] CPU rerank failed (${err.message}); returning original order`);
+        return results;
+    }
+}
+
 async function applyRerank(targets, query, results) {
     const method = targets.rerank?.method || 'cosine';
     if (method === 'disabled' || results.length <= 1) return results;
+    if (method === 'cpu') {
+        return rerankCpuLocal(query, results);
+    }
     if (method === 'local') {
         console.warn('[NodeSearch] rerank.method=local is not supported by node-search; falling back to cosine');
         return rerankCosine(targets, query, results);

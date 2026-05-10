@@ -79,6 +79,10 @@ router.get('/config', async (req, res) => {
         directChatRegexGuardrails: await configStore.getConfig('direct_chat_regex_guardrails') || null,
         // Tool-call rounds limit for chat surfaces (direct/notebook/webpage/native loop). null -> per-surface defaults.
         maxToolRoundsChat: await configStore.getConfig('max_tool_rounds_chat') || null,
+        // KB provider — 'local' (in-process pgvector) or 'remote' (search-service). null -> auto.
+        kbProvider: await configStore.getConfig('kb_provider') || null,
+        // CPU cross-encoder reranker toggle (default on for fresh installs).
+        cpuRerankerEnabled: (await configStore.getConfig('cpu_reranker_enabled')) !== false,
         // Azure Document Intelligence
         hasAzureDocIntelligenceEndpoint: !!(await configStore.getConfig('azure_doc_intelligence_endpoint')),
         hasAzureDocIntelligenceKey: !!(await configStore.getSecret('azure_doc_intelligence_key')),
@@ -183,6 +187,14 @@ router.post('/config', requireAuth, async (req, res) => {
                 await configStore.setConfig('max_tool_rounds_chat', clamped);
             }
         }
+    }
+    if (req.body.kbProvider !== undefined) {
+        const allowed = new Set(['local', 'remote']);
+        const value = allowed.has(req.body.kbProvider) ? req.body.kbProvider : null;
+        await configStore.setConfig('kb_provider', value);
+    }
+    if (req.body.cpuRerankerEnabled !== undefined) {
+        await configStore.setConfig('cpu_reranker_enabled', !!req.body.cpuRerankerEnabled);
     }
     if (req.body.bingSearchKey !== undefined) {
         await configStore.setSecret('bing_search_key', req.body.bingSearchKey || '');

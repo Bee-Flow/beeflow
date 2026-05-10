@@ -450,7 +450,88 @@ function chunkText(text) {
     return filtered;
 }
 
-// ── Azure OpenAI Embeddings ─────────────────────────────────────────
+// ── Embedding dispatcher (provider → Azure → CPU) ───────────────────
+
+/**
+ * Dispatch an embedding call through the configured chain:
+ *   1. Global Embeddings provider (`ai.embeddingProviderId` / `embeddingModel`)
+ *      — works for OpenAI-compatible APIs (OpenAI, Mistral, generic) and Azure.
+ *   2. Legacy `azure_openai_embedding_*` configStore keys.
+ *   3. In-process CPU embedder (Xenova/multilingual-e5-small, 384-dim).
+ *
+ * Returns { vectors, source, model } where vectors is [][] aligned with input
+ * order. `source` is one of 'provider' | 'azure' | 'cpu' | null.
+ */
+async function dispatchEmbedTexts(texts) {
+    if (!Array.isArray(texts) || texts.length === 0) return { vectors: [], source: null, model: null };
+
+    // (1) Configured global provider via resolveEmbedTarget
+    try {
+        const { resolveEmbedTarget } = require('./embed/resolveTarget');
+        const target = await resolveEmbedTarget();
+        if (target?.endpoint && target?.modelId && target?.apiKey) {
+            const root = target.endpoint.replace(/\/+$/, '');
+            const isAzure = target.providerType === 'azure';
+            const url = isAzure
+                ? `${root}/openai/deployments/${encodeURIComponent(target.modelId)}/embeddings?api-version=2024-06-01`
+                : (root.endsWith('/v1') ? `${root}/embeddings` : `${root}/v1/embeddings`);
+
+            const BATCH = 16;
+            const out = [];
+            for (let i = 0; i < texts.length; i += BATCH) {
+                const batch = texts.slice(i, i + BATCH);
+                const headers = isAzure
+                    ? { 'Content-Type': 'application/json', 'api-key': target.apiKey }
+                    : { 'Content-Type': 'application/json', Authorization: `Bearer ${target.apiKey}` };
+                const body = isAzure
+                    ? JSON.stringify({ input: batch })
+                    : JSON.stringify({ model: target.modelId, input: batch });
+                const res = await fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(30000) });
+                if (!res.ok) {
+                    const errTxt = await res.text();
+                    throw new Error(`${target.providerName || target.providerType || 'provider'} embed ${res.status}: ${errTxt.slice(0, 200)}`);
+                }
+                const data = await res.json();
+                const sorted = (data.data || []).sort((a, b) => a.index - b.index).map(e => e.embedding);
+                out.push(...sorted);
+            }
+            console.log(`[LocalKBIngest] Embeddings via ${target.providerName || target.providerType} / ${target.modelId} (dim=${out[0]?.length})`);
+            return { vectors: out, source: 'provider', model: target.modelId };
+        }
+    } catch (err) {
+        console.warn(`[LocalKBIngest] Configured provider embed failed (${err.message}); falling through to Azure/CPU`);
+    }
+
+    // (2) Legacy azure_openai_embedding_* config
+    const azureEndpoint = await configStore.getConfig('azure_openai_embedding_endpoint');
+    const azureKey = await configStore.getSecret('azure_openai_embedding_key');
+    const azureModel = await configStore.getConfig('azure_openai_embedding_model') || 'text-embedding-3-small';
+    if (azureEndpoint && azureKey) {
+        try {
+            const out = await azureEmbed(texts, azureEndpoint, azureKey, azureModel);
+            console.log(`[LocalKBIngest] Embeddings via legacy Azure config / ${azureModel} (dim=${out[0]?.length})`);
+            return { vectors: out, source: 'azure', model: azureModel };
+        } catch (err) {
+            console.warn(`[LocalKBIngest] Legacy Azure embed failed (${err.message}); falling through to CPU`);
+        }
+    }
+
+    // (3) CPU in-process fallback (Xenova/multilingual-e5-small, 384-dim)
+    try {
+        const { cpuEmbed } = require('./embed/cpuEmbed');
+        const vectors = await cpuEmbed(texts, { kind: 'passage' });
+        if (vectors.length > 0) {
+            console.log(`[LocalKBIngest] Embeddings via in-process CPU embedder (dim=${vectors[0]?.length})`);
+            return { vectors, source: 'cpu', model: 'multilingual-e5-small' };
+        }
+    } catch (err) {
+        console.warn(`[LocalKBIngest] CPU embed failed (${err.message})`);
+    }
+
+    return { vectors: [], source: null, model: null };
+}
+
+// ── Azure OpenAI Embeddings (legacy direct) ─────────────────────────
 
 /**
  * Generate embeddings via Azure OpenAI.
@@ -519,7 +600,7 @@ let schemaInitialized = false;
 let pgvectorAvailable = true;
 
 async function ensureKBChunksTable(vectorDim = 1536) {
-    if (schemaInitialized) return;
+    if (schemaInitialized && !pgvectorAvailable) return;
 
     try {
         // Try to enable pgvector
@@ -528,6 +609,40 @@ async function ensureKBChunksTable(vectorDim = 1536) {
     } catch (e) {
         console.warn('[LocalKBIngest] pgvector extension not available — vector search disabled, keyword search will still work. Install postgresql-XX-pgvector to enable.');
         pgvectorAvailable = false;
+    }
+
+    // If table already exists, reconcile its embedding dim with the requested
+    // one. Empty tables can be ALTERed safely; non-empty ones with mismatched
+    // dim throw so the admin can decide (re-ingest vs keep current data).
+    if (pgvectorAvailable && schemaInitialized) {
+        try {
+            const dimRows = await getAll(`
+                SELECT a.atttypmod AS typmod
+                FROM pg_attribute a
+                JOIN pg_class c ON c.oid = a.attrelid
+                WHERE c.relname = 'kb_chunks' AND a.attname = 'embedding' AND a.attnum > 0
+            `);
+            // pgvector encodes dim directly in atttypmod
+            const currentDim = dimRows?.[0]?.typmod;
+            if (currentDim && currentDim !== vectorDim) {
+                const countRows = await getAll('SELECT COUNT(*)::int AS n FROM kb_chunks');
+                const rows = countRows?.[0]?.n || 0;
+                if (rows === 0) {
+                    console.log(`[LocalKBIngest] kb_chunks dim mismatch (${currentDim} → ${vectorDim}), table is empty — ALTERing column`);
+                    await exec(`ALTER TABLE kb_chunks ALTER COLUMN embedding TYPE VECTOR(${vectorDim})`);
+                    try { await exec(`DROP INDEX IF EXISTS idx_kb_chunks_embedding`); } catch (_) {}
+                    try { await exec(`CREATE INDEX IF NOT EXISTS idx_kb_chunks_embedding ON kb_chunks USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 200)`); } catch (_) {}
+                } else {
+                    throw new Error(`kb_chunks already populated with ${currentDim}-dim vectors but the configured embedding model is ${vectorDim}-dim. Re-ingest existing documents or set kb_provider='remote' to use the original ingest pipeline.`);
+                }
+            }
+        } catch (err) {
+            // Don't swallow our own throw above
+            if (/already populated/.test(err.message)) throw err;
+            // Other failures (race during ALTER etc.) — log and continue.
+            console.warn(`[LocalKBIngest] dim reconcile check skipped: ${err.message}`);
+        }
+        return;
     }
 
     // Create kb_chunks table matching the search-service schema
@@ -604,38 +719,38 @@ async function ensureKBChunksTable(vectorDim = 1536) {
 async function ingestLocally(tenantId, kbId, docId, content, options = {}) {
     const { title = '', sourceUri = '', lang = 'auto' } = options;
 
-    // Get Azure credentials
-    const endpoint = await configStore.getConfig('azure_openai_embedding_endpoint');
-    const apiKey = await configStore.getSecret('azure_openai_embedding_key');
-    const model = await configStore.getConfig('azure_openai_embedding_model') || 'text-embedding-3-small';
-
-    if (!endpoint || !apiKey) {
-        throw new Error('Azure OpenAI embedding not configured (endpoint or key missing)');
-    }
-
-    // Ensure table exists
-    await ensureKBChunksTable(1536);
-
-    // 1. Chunk
+    // 1. Chunk first so we know how many texts we're embedding
     const chunks = chunkText(content);
     if (chunks.length === 0) {
         throw new Error('Document produced no chunks');
     }
-
     console.log(`[LocalKBIngest] Chunked into ${chunks.length} pieces`);
 
-    // 2. Embed
+    // 2. Embed via dispatcher (configured provider → Azure legacy → CPU)
     const chunkTexts = chunks.map(c => c.text);
     let embeddings = [];
+    let embedDim = 1536; // fallback if pgvector is disabled — irrelevant in that case
+    let embedSource = 'none';
+
+    // Bootstrap pgvector availability flag without fixing dim yet — we set
+    // dim after we know what the dispatcher actually produced.
+    await ensureKBChunksTable(1536);
+
     if (pgvectorAvailable) {
-        console.log(`[LocalKBIngest] Generating Azure embeddings (${model})...`);
-        try {
-            embeddings = await azureEmbed(chunkTexts, endpoint, apiKey, model);
-            // Track embedding cost (estimate tokens from chunk text lengths)
-            const totalTokens = chunkTexts.reduce((sum, t) => sum + estimateTokens(t), 0);
-            _trackEmbeddingCost(totalTokens);
-        } catch (err) {
-            console.warn(`[LocalKBIngest] Azure embedding failed: ${err.message}. Falling back to keyword search only.`);
+        const result = await dispatchEmbedTexts(chunkTexts);
+        embeddings = result.vectors;
+        embedSource = result.source || 'none';
+        if (embeddings.length > 0 && embeddings[0]?.length) {
+            embedDim = embeddings[0].length;
+            // Reconcile the kb_chunks embedding column with the actual dim.
+            await ensureKBChunksTable(embedDim);
+            // Track cost only when we actually used a paid provider/Azure path.
+            if (embedSource === 'provider' || embedSource === 'azure') {
+                const totalTokens = chunkTexts.reduce((sum, t) => sum + estimateTokens(t), 0);
+                _trackEmbeddingCost(totalTokens);
+            }
+        } else {
+            console.warn('[LocalKBIngest] No embeddings produced — falling back to keyword search only for this doc.');
         }
     } else {
         console.log('[LocalKBIngest] Skipping embedding generation (pgvector disabled)');
@@ -1034,12 +1149,18 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
     }
 
     // ── Phase 2: Reranking — no DB connection held during these API calls ──
-    // Priority: Azure Cohere (when configured) > local GPU cross-encoder
-    // If Azure reranker is configured it is used exclusively — no GPU needed.
+    // Priority: Azure Cohere (provider) > CPU cross-encoder (in-process) >
+    // local GPU vLLM sidecar (`RERANKER_URL`) > RRF passthrough.
+    // CPU branch sits ahead of the GPU sidecar so users without a GPU box
+    // get a working reranker by default; existing GPU users are unaffected.
     const azureRerankerEndpoint = await configStore.getConfig('azure_reranker_endpoint') || process.env.AZURE_RERANKER_ENDPOINT;
     const azureRerankerKey = await configStore.getSecret('azure_reranker_key') || process.env.AZURE_RERANKER_KEY;
     const azureRerankerModel = await configStore.getConfig('azure_reranker_model') || process.env.AZURE_RERANKER_MODEL || 'Cohere-rerank-v4.0-fast';
     const localRerankerUrl = process.env.RERANKER_URL;
+    // Admin opt-in for the CPU cross-encoder. Default true so fresh installs
+    // get reranking out of the box; admins who want only Azure or only GPU
+    // can disable it via `cpu_reranker_enabled = false`.
+    const cpuRerankerEnabled = (await configStore.getConfig('cpu_reranker_enabled')) !== false;
 
     if (azureRerankerEndpoint && azureRerankerKey && results.length > 0) {
         // ── Azure Cohere rerank (primary — no GPU required) ──
@@ -1097,6 +1218,54 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
             }
         } catch (rerankerErr) {
             console.warn(`[LocalKBSearch] Azure reranker error (${rerankerErr.message}), falling back to RRF`);
+        }
+    } else if (cpuRerankerEnabled && results.length > 0) {
+        // ── CPU cross-encoder (Transformers.js, MIT bge-reranker-base) ──
+        // Runs in-process; first call lazy-loads the model (~280 MB).
+        // Returns early if the pipeline is unavailable so we still try
+        // the GPU sidecar (next branch) before falling back to RRF.
+        try {
+            const { rerankCpu } = require('./rerank/cpuCrossEncoder');
+            const scored = await rerankCpu(query, results.map(r => r.content), topK);
+            if (scored.length > 0) {
+                results = scored.map(s => ({
+                    content: results[s.index].content,
+                    title: results[s.index].title,
+                    source_uri: results[s.index].source_uri,
+                    score: s.relevance_score,
+                }));
+            } else if (localRerankerUrl) {
+                // Fall through to GPU sidecar
+                throw new Error('CPU reranker unavailable, trying GPU sidecar');
+            }
+        } catch (cpuErr) {
+            if (localRerankerUrl) {
+                console.warn(`[LocalKBSearch] CPU rerank failed (${cpuErr.message}); trying GPU sidecar`);
+                // Fall through by re-running the GPU branch below
+                try {
+                    const rerankerRes = await fetch(`${localRerankerUrl}/rerank`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ query, documents: results.map(r => r.content), top_n: topK }),
+                        signal: AbortSignal.timeout(10000),
+                    });
+                    if (rerankerRes.ok) {
+                        const rerankerData = await rerankerRes.json();
+                        if (rerankerData.results && rerankerData.results.length > 0) {
+                            results = rerankerData.results.map(rr => ({
+                                content: results[rr.index].content,
+                                title: results[rr.index].title,
+                                source_uri: results[rr.index].source_uri,
+                                score: rr.relevance_score,
+                            }));
+                        }
+                    }
+                } catch (gpuErr) {
+                    console.warn(`[LocalKBSearch] GPU sidecar also failed (${gpuErr.message}); using RRF`);
+                }
+            } else {
+                console.warn(`[LocalKBSearch] CPU rerank failed (${cpuErr.message}); using RRF`);
+            }
         }
     } else if (localRerankerUrl && results.length > 0) {
         // ── Local GPU cross-encoder sidecar (only when Azure is NOT configured) ──

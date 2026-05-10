@@ -21,7 +21,7 @@
 
 const configStore = require('../stores/configStore');
 
-const RERANK_METHODS = new Set(['cosine', 'provider', 'local', 'disabled']);
+const RERANK_METHODS = new Set(['cosine', 'cpu', 'provider', 'local', 'disabled']);
 
 const DEFAULTS = {
     embed:   { providerId: '', modelId: '' },

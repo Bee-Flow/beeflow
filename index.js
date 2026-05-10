@@ -282,8 +282,12 @@ app.use('/auth', require('./routes/webhooks/ncEvents'));
 app.use('/auth', require('./routes/admin/ncSync'));
 app.use('/auth', require('./routes/admin/ncIntegrations'));
 app.get('/api/guard/health', async (req, res) => {
+    // Optional Python guard-service sidecar — only probed when explicitly
+    // configured. With moderation moved to Azure Content Safety and PII to
+    // in-process Transformers.js, the sidecar is no longer required.
+    const guardUrl = process.env.GUARD_SERVICE_URL;
+    if (!guardUrl) return res.json({ status: 'not-configured' });
     try {
-        const guardUrl = process.env.GUARD_SERVICE_URL || 'http://guard-service:8100';
         const apiKey = process.env.SERVICES_API_KEY;
         const resp = await fetch(`${guardUrl}/health`, {
             headers: apiKey ? { 'X-API-Key': apiKey } : {},

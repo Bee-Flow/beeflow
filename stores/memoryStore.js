@@ -1,14 +1,26 @@
 /**
  * Memory Store - PostgreSQL management for user memories
- * Stores facts, preferences, and instructions extracted from conversations
- * Uses local BGE-M3 embeddings (via inference-gpu) for semantic retrieval.
+ * Stores facts, preferences, and instructions extracted from conversations.
+ *
+ * Embedding dispatch (in order):
+ *   1. Configured global embedding provider (preferred — same model used
+ *      by KB / web-search inference)
+ *   2. In-process CPU embedder (Xenova/multilingual-e5-small, MIT, 384-dim)
+ *   3. Optional self-hosted GPU service via `EMBED_API_URL` (legacy path)
+ *   4. Null — caller falls back to keyword retrieval
+ *
+ * Switching providers changes the vector dimension; existing memories
+ * remain readable but won't rank against new embeddings (cosineSimilarity
+ * returns 0 across mismatched dims). A re-embed migration is future work.
  */
 
 const { run, getOne, getAll, exec } = require('../db');
 const { v4: uuidv4 } = require('uuid');
+const { resolveEmbedTarget } = require('../core/embed/resolveTarget');
 
-// Embedding API — local GPU inference service (BGE-M3)
-const EMBED_API_URL = process.env.EMBED_API_URL || 'http://inference-gpu:8001/v1/embeddings';
+// Optional self-hosted GPU embedding service (legacy). Disabled when
+// the env var is unset — admins relying on it must set it explicitly.
+const EMBED_API_URL = process.env.EMBED_API_URL || null;
 const EMBED_MODEL = process.env.EMBED_MODEL || 'Qwen/Qwen3-Embedding-4B';
 
 let initialized = false;
@@ -76,24 +88,62 @@ initDB().catch(err => console.error('[MemoryStore] Init error:', err.message));
 // ============ Embedding Helpers ============
 
 /**
- * Get embedding vector for text from local GPU inference API.
- * Returns float array (1024 dimensions) or null on failure.
+ * Get embedding vector for text. Tries (1) configured global provider,
+ * then (2) in-process CPU embedder, then (3) optional self-hosted GPU
+ * service. Returns the float array on success or null on full failure
+ * so callers can degrade to keyword-only retrieval.
  */
 async function getEmbedding(text) {
+    if (!text) return null;
+
+    // (1) Configured global embedding provider — OpenAI-compatible /v1/embeddings.
     try {
-        const res = await fetch(EMBED_API_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model: EMBED_MODEL, input: [text] }),
-            signal: AbortSignal.timeout(5000),
-        });
-        if (!res.ok) return null;
-        const data = await res.json();
-        return data?.data?.[0]?.embedding || null;
-    } catch (e) {
-        // Inference service unavailable — degrade gracefully
-        return null;
+        const target = await resolveEmbedTarget();
+        if (target?.endpoint && target?.modelId && target?.apiKey) {
+            const root = target.endpoint.replace(/\/+$/, '');
+            const isAzure = target.providerType === 'azure';
+            const url = isAzure
+                ? `${root}/openai/deployments/${encodeURIComponent(target.modelId)}/embeddings?api-version=2024-06-01`
+                : (root.endsWith('/v1') ? `${root}/embeddings` : `${root}/v1/embeddings`);
+            const headers = isAzure
+                ? { 'Content-Type': 'application/json', 'api-key': target.apiKey }
+                : { 'Content-Type': 'application/json', Authorization: `Bearer ${target.apiKey}` };
+            const body = isAzure
+                ? JSON.stringify({ input: [text] })
+                : JSON.stringify({ model: target.modelId, input: [text] });
+            const res = await fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(8000) });
+            if (res.ok) {
+                const data = await res.json();
+                const vec = data?.data?.[0]?.embedding;
+                if (Array.isArray(vec)) return vec;
+            }
+        }
+    } catch (_) { /* try next tier */ }
+
+    // (2) CPU embedder — in-process, no external call.
+    try {
+        const { cpuEmbed } = require('../core/embed/cpuEmbed');
+        const vecs = await cpuEmbed([text], { kind: 'passage' });
+        if (vecs.length > 0) return vecs[0];
+    } catch (_) { /* try next tier */ }
+
+    // (3) Legacy self-hosted GPU service (`EMBED_API_URL`).
+    if (EMBED_API_URL) {
+        try {
+            const res = await fetch(EMBED_API_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model: EMBED_MODEL, input: [text] }),
+                signal: AbortSignal.timeout(5000),
+            });
+            if (res.ok) {
+                const data = await res.json();
+                return data?.data?.[0]?.embedding || null;
+            }
+        } catch (_) { /* fall through */ }
     }
+
+    return null;
 }
 
 /** Cosine similarity between two vectors. */

@@ -29,8 +29,12 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
 
     if (kbIds.length > 0) {
         try {
-            // Determine whether to use Azure embeddings for query (must match ingestion model)
-            const useAzure = !!(await configStore.getConfig('use_azure_doc_processing'));
+            // Determine whether to use the local KB path (in-process pgvector
+            // + RRF + reranker) or the remote search-service. Local is the
+            // default for fresh installs that have no SEARCH_SERVICE_URL.
+            const { resolveKbProvider } = require('../kb/resolveProvider');
+            const kbProvider = await resolveKbProvider();
+            const useAzure = kbProvider === 'local';
 
             // Query preprocessing: extract search intent
             let searchQuery = userMessage;

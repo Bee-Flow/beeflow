@@ -31,11 +31,12 @@ const { computePiiDetectionCost } = require('./azureServiceCosts');
 const azureServiceUsageStore = require('../stores/azureServiceUsageStore');
 const { detectPiiLocal } = require('./localPiiDetection');
 
-// ── PII service — guard-service running GLiNER multi PII v1 (Apache 2.0)
-// Set PII_SERVICE_URL in .env to point at the running guard-service instance.
-// Defaults to localhost:8200 (the pii-service default port).
+// ── PII service — optional Python sidecar running GLiNER multi PII v1 (Apache 2.0)
+// Only used when PII_SERVICE_URL is explicitly set in env. The default detector
+// path is now in-process Transformers.js (server/core/localPiiDetection.js)
+// followed by Azure Text Analytics if configured — neither requires a sidecar.
 // Set PII_SERVICE_API_KEY if the remote service requires API key auth.
-const PII_SERVICE_URL = process.env.PII_SERVICE_URL || 'http://localhost:8200';
+const PII_SERVICE_URL = process.env.PII_SERVICE_URL || null;
 const PII_SERVICE_API_KEY = process.env.PII_SERVICE_API_KEY || '';
 
 // Simple HTTP helper — no extra dependency beyond Node built-ins
@@ -393,6 +394,14 @@ async function detectPii(text, enabledCategories = null, confidenceThreshold = D
         } catch (localErr) {
             console.warn('[PiiDetection] Local model error:', localErr.message);
         }
+    }
+
+    if (!PII_SERVICE_URL) {
+        // No external CPU sidecar configured — local Transformers.js was
+        // either disabled by the admin or the model failed to load. Fail
+        // open so the request still completes (caller has the option to
+        // refuse the request explicitly via piiDetectionAction).
+        return null;
     }
 
     try {

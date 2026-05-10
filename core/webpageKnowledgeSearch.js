@@ -22,8 +22,9 @@ function preprocessQuery(query) {
 }
 
 async function getAzureSearchParams() {
-    const useAzure = !!(await configStore.getConfig('use_azure_doc_processing'));
-    if (!useAzure) return {};
+    const { resolveKbProvider } = require('./kb/resolveProvider');
+    const kbProvider = await resolveKbProvider();
+    if (kbProvider !== 'local') return {};
     return {
         use_azure: true,
         azure_endpoint: await configStore.getConfig('azure_openai_embedding_endpoint') || '',
