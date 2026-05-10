@@ -354,14 +354,18 @@ router.delete('/:id', requireAuth, requirePermission('manage_knowledge'), async 
         if (!kb) return res.status(404).json({ error: 'KB not found' });
         if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
 
-        // Delete chunks from search-service
+        // Delete chunks from remote search-service (skip when admin chose local-only)
         try {
-            await fetch(`${SEARCH_SERVICE_URL}/kb/${kb.id}/chunks`, {
-                method: 'DELETE',
-                headers: getServiceHeaders(),
-                body: JSON.stringify({ tenant_id: kb.tenant_id }),
-                signal: AbortSignal.timeout(10000)
-            });
+            const { resolveKbProvider } = require('../core/kb/resolveProvider');
+            const kbProvider = await resolveKbProvider();
+            if (kbProvider !== 'local') {
+                await fetch(`${SEARCH_SERVICE_URL}/kb/${kb.id}/chunks`, {
+                    method: 'DELETE',
+                    headers: getServiceHeaders(),
+                    body: JSON.stringify({ tenant_id: kb.tenant_id }),
+                    signal: AbortSignal.timeout(10000)
+                });
+            }
         } catch (e) {
             console.warn('[KB] Search-service chunk cleanup failed:', e.message);
         }
@@ -1091,9 +1095,12 @@ router.post('/search', requireAuth, async (req, res) => {
         }
 
         const useAzure = !!(await configStore.getConfig('use_azure_doc_processing'));
+        const { resolveKbProvider } = require('../core/kb/resolveProvider');
+        const kbProvider = await resolveKbProvider();
+        const useLocalKB = useAzure || kbProvider === 'local';
 
         let results;
-        if (useAzure) {
+        if (useLocalKB) {
             const { searchLocally } = require('../core/localKBIngest');
             const localResults = await searchLocally(userId, kb_ids, query, { topK: top_k || 8 });
             results = {
@@ -1175,7 +1182,10 @@ router.post('/:id/reindex', requireAuth, requirePermission('manage_knowledge'), 
         }
 
         const useAzure = !!(await configStore.getConfig('use_azure_doc_processing'));
-        console.log(`[KB] Re-indexing KB "${kb.name}" (${docs.length} docs, azure: ${useAzure})...`);
+        const { resolveKbProvider: _resolveKbProvider } = require('../core/kb/resolveProvider');
+        const kbProvider = await _resolveKbProvider();
+        const useLocalKB = useAzure || kbProvider === 'local';
+        console.log(`[KB] Re-indexing KB "${kb.name}" (${docs.length} docs, kbProvider=${kbProvider}, useAzure=${useAzure})...`);
         const results = { reindexed: 0, failed: 0, details: [] };
 
         for (let i = 0; i < docs.length; i++) {
@@ -1225,7 +1235,7 @@ router.post('/:id/reindex', requireAuth, requirePermission('manage_knowledge'), 
                 if (!content || content.trim().length < 20) {
                     console.log(`[KB] Reindex [${i + 1}/${docs.length}] Using existing content for: ${title}`);
 
-                    if (useAzure) {
+                    if (useLocalKB) {
                         // Issue #11: Try stored original_content first (fast path)
                         try {
                             const { getOne } = require('../db');
@@ -1261,8 +1271,9 @@ router.post('/:id/reindex', requireAuth, requirePermission('manage_knowledge'), 
                 }
 
                 // ── Re-ingest (delete old chunks → re-chunk → re-embed → insert) ──
-                if (useAzure) {
-                    // Local Azure path: delete old chunks then re-ingest locally
+                if (useLocalKB) {
+                    // Local path: delete old chunks then re-ingest via the
+                    // local embedding dispatcher (provider → Azure → CPU).
                     const { deleteChunksLocally, ingestLocally } = require('../core/localKBIngest');
                     await deleteChunksLocally(kb.tenant_id, kb.id, doc.id);
                     const ingestResult = await ingestLocally(kb.tenant_id, kb.id, doc.id, content, {
@@ -1276,7 +1287,7 @@ router.post('/:id/reindex', requireAuth, requirePermission('manage_knowledge'), 
                         status: doc.source_type === 'web' ? 'refetched' : 'reembedded',
                         chunks: ingestResult.chunks_created || 0
                     });
-                    console.log(`[KB] Reindex [${i + 1}/${docs.length}] ✓ ${title}: ${ingestResult.chunks_created} chunks (azure)`);
+                    console.log(`[KB] Reindex [${i + 1}/${docs.length}] ✓ ${title}: ${ingestResult.chunks_created} chunks (local, kb_provider=${kbProvider})`);
                 } else {
                     // Search-service path
                     const azureParams = await getAzureIngestParams();

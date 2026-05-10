@@ -369,12 +369,16 @@ async function ingestDocument(tenantId, kbId, content, title, sourceType, source
 
     // Send for chunking + embedding
     const azureParams = await getAzureIngestParams();
+    const { resolveKbProvider } = require('./kb/resolveProvider');
+    const kbProvider = await resolveKbProvider();
+    const useLocalIngest = azureParams.use_azure || kbProvider === 'local';
 
-    if (azureParams.use_azure) {
-        // ── Local ingestion path (Azure) ─────────────────────────────
-        // When Azure Document Processing is enabled, chunk + embed locally
-        // using Azure OpenAI — bypasses the external search-service.
-        console.log(`[KBHelpers] Embedding: Azure OpenAI (local path)`);
+    if (useLocalIngest) {
+        // ── Local ingestion path ─────────────────────────────────────
+        // Chunk + embed locally via the embedding dispatcher in
+        // localKBIngest (configured provider → Azure → CPU). Bypasses
+        // the external search-service entirely.
+        console.log(`[KBHelpers] Embedding: local dispatcher (kb_provider=${kbProvider}${azureParams.use_azure ? ', use_azure=true' : ''})`);
         console.log(`[KBHelpers] Chunking + embedding ${content.length} chars locally`);
 
         try {
@@ -451,14 +455,18 @@ async function deleteDocumentChunks(kbId, docId, tenantId) {
         await deleteChunksLocally(tenantId, kbId, docId);
     } catch (_) { /* table may not exist yet — that's fine */ }
 
-    // Also clean up via search-service (for search-service-path ingested docs)
+    // Also clean up via remote search-service (skip when admin chose local-only)
     try {
-        await fetch(`${SEARCH_SERVICE_URL}/kb/${kbId}/documents/${docId}/chunks`, {
-            method: 'DELETE',
-            headers: getServiceHeaders(),
-            body: JSON.stringify({ tenant_id: tenantId }),
-            signal: AbortSignal.timeout(10000)
-        });
+        const { resolveKbProvider } = require('./kb/resolveProvider');
+        const kbProvider = await resolveKbProvider();
+        if (kbProvider !== 'local') {
+            await fetch(`${SEARCH_SERVICE_URL}/kb/${kbId}/documents/${docId}/chunks`, {
+                method: 'DELETE',
+                headers: getServiceHeaders(),
+                body: JSON.stringify({ tenant_id: tenantId }),
+                signal: AbortSignal.timeout(10000)
+            });
+        }
     } catch (e) {
         console.warn('[KBHelpers] Search-service chunk cleanup failed:', e.message);
     }

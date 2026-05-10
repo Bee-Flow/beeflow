@@ -412,7 +412,8 @@ async function getAllUsers() {
                "masterWrappedDEK", "wrappedDEK", "kekSalt", "recoverySalt",
                "recoveryWrappedDEK", "ssoEncryptionSetup", "passwordResetRequired",
                "dekUnwrapFailures", "dekLockoutUntil", "kdfMode", "createdAt",
-               status, "activeIconPackId", "azureUserId"
+               status, "activeIconPackId", "azureUserId",
+               "nc_uid", "provider", "auto_provisioned"
         FROM users
     `);
     return rows.map(u => {

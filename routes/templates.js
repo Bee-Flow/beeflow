@@ -529,8 +529,11 @@ async function autoCreateTemplateKB(templateId, userId, fileName, text) {
 
     try {
         const useAzure = !!(await configStore.getConfig('use_azure_doc_processing'));
+        const { resolveKbProvider } = require('../core/kb/resolveProvider');
+        const kbProvider = await resolveKbProvider();
+        const useLocalIngest = useAzure || kbProvider === 'local';
 
-        if (useAzure) {
+        if (useLocalIngest) {
             const { ingestLocally } = require('../core/localKBIngest');
             const result = await ingestLocally(userId, kb.id, doc.id, text, {
                 title: fileName,
@@ -538,7 +541,7 @@ async function autoCreateTemplateKB(templateId, userId, fileName, text) {
             });
             await kbStore.updateChunkCount(doc.id, result.chunks_created || 0);
             await kbStore.bumpKBVersion(kb.id);
-            console.log(`[Templates] Auto-KB "${kbName}" created locally with ${result.chunks_created || 0} chunks`);
+            console.log(`[Templates] Auto-KB "${kbName}" created locally with ${result.chunks_created || 0} chunks (kb_provider=${kbProvider})`);
         } else {
             const ingestRes = await fetch(`${SEARCH_SERVICE_URL}/kb/ingest/json`, {
                 method: 'POST',
