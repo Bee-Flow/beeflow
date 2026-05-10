@@ -1694,8 +1694,15 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             // the PII gate. detectPii() in azurePiiDetection.js routes
             // between them automatically.
             const orgPiiEnabled = !!(orgShield?.enabled && (orgShield?.azurePiiEnabled || orgShield?.localPiiEnabled !== false));
-            console.log(`[DirectChat] PII calling validateInputForPii: orgPiiEnabled=${orgPiiEnabled} msgCount=${messages.length}`);
-            const piiResult = await validateInputForPii(messages.slice(-3), orgPiiEnabled, orgShield);
+            console.log(`[DirectChat] PII calling validateInputForPii: orgPiiEnabled=${orgPiiEnabled} msgCount=${messages.length} msgsSlice=${JSON.stringify(messages.slice(-3).map(m => ({role: m.role, contentType: typeof m.content, contentPreview: typeof m.content === 'string' ? m.content.slice(0, 50) : '(non-string)'}))).slice(0, 300)}`);
+            let piiResult;
+            try {
+                piiResult = await validateInputForPii(messages.slice(-3), orgPiiEnabled, orgShield);
+                console.log(`[DirectChat] PII validateInputForPii returned: ${piiResult ? `entities=${piiResult.entities?.length ?? 'n/a'} tokenized=${!!piiResult.tokenizedText}` : 'null'}`);
+            } catch (innerErr) {
+                console.error(`[DirectChat] PII INNER ERROR: ${innerErr.message}\n${innerErr.stack}`);
+                throw innerErr;
+            }
 
             if (piiResult && piiResult.tokenizedText) {
                 // Tokenize mode: replace last user message with tokenized version
@@ -2600,10 +2607,6 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                         if (toolResult._action === 'linkedin_draft') {
                             send('linkedin_draft', toolResult.draft);
                         }
-                        // Emit whatsapp_draft SSE event for user approval
-                        if (toolResult._action === 'whatsapp_draft') {
-                            send('whatsapp_draft', toolResult.draft);
-                        }
                         // Emit contacts_draft SSE event for user approval
                         if (toolResult._action === 'contacts_draft') {
                             send('contacts_draft', toolResult.draft);
@@ -3218,10 +3221,6 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                 // Emit linkedin_draft SSE event for user approval
                 if (toolResult._action === 'linkedin_draft') {
                     send('linkedin_draft', toolResult.draft);
-                }
-                // Emit whatsapp_draft SSE event for user approval
-                if (toolResult._action === 'whatsapp_draft') {
-                    send('whatsapp_draft', toolResult.draft);
                 }
                 // Emit contacts_draft SSE event for user approval
                 if (toolResult._action === 'contacts_draft') {

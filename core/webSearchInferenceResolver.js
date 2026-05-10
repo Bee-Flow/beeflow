@@ -1,50 +1,65 @@
 /**
  * Web-Search Inference Routing
  *
- * The search-service has three inference tasks: embedding, reranking,
- * and webpage-content cleanup. Configuration is intentionally minimal:
+ * The search pipeline has three inference tasks — embedding, reranking,
+ * and webpage-content cleanup — each independently configurable:
  *
- *   - **embed** inherits the global Embeddings settings (`embeddingProviderId`
- *     + `embeddingModel` from `/ai/config`). One source of truth, no
- *     duplicate picker in the web-search panel.
- *   - **rerank** is a method-only choice: cosine similarity (default),
- *     local cross-encoder, or disabled. Provider-agnostic.
- *   - **cleanup** picks any chat model from a configured provider via
- *     the same `SearchableModelSelect` UX used elsewhere in the admin.
+ *   - **embed**   picks any embedding model. Empty -> inherit the global
+ *                 Embeddings settings (`embeddingProviderId` + `embeddingModel`).
+ *   - **rerank**  is either method-only (cosine similarity, local cross-encoder,
+ *                 disabled) or provider-based (LLM-as-rerank / Cohere rerank).
+ *   - **cleanup** picks any chat model from a configured provider.
  *
  * Stored shape (`web_search_inference_config`):
  *   {
- *     rerank:  { method: 'cosine' | 'local' | 'disabled' },
- *     cleanup: { providerId: string, modelId: string }   // empty -> disabled
+ *     embed:   { providerId: string, modelId: string },                          // empty -> inherit global
+ *     rerank:  { method: 'cosine'|'provider'|'local'|'disabled',
+ *                providerId: string, modelId: string },                          // ids only meaningful when method='provider'
+ *     cleanup: { providerId: string, modelId: string }                           // empty -> disabled
  *   }
  */
 
 const configStore = require('../stores/configStore');
 
-const RERANK_METHODS = new Set(['cosine', 'local', 'disabled']);
+const RERANK_METHODS = new Set(['cosine', 'provider', 'local', 'disabled']);
 
 const DEFAULTS = {
-    rerank:  { method: 'cosine' },
+    embed:   { providerId: '', modelId: '' },
+    rerank:  { method: 'cosine', providerId: '', modelId: '' },
     cleanup: { providerId: '', modelId: '' },
 };
 
+function sanitizeProviderModel(raw) {
+    if (!raw || typeof raw !== 'object') return { providerId: '', modelId: '' };
+    const providerId = typeof raw.providerId === 'string' ? raw.providerId.slice(0, 200) : '';
+    const modelId = typeof raw.modelId === 'string' ? raw.modelId.trim().slice(0, 200) : '';
+    // Either both set or both empty — half-configured is treated as unset.
+    if (!providerId || !modelId) return { providerId: '', modelId: '' };
+    return { providerId, modelId };
+}
+
+function sanitizeEmbedConfig(raw) {
+    return sanitizeProviderModel(raw);
+}
+
 function sanitizeRerankConfig(raw) {
     if (!raw || typeof raw !== 'object') return { ...DEFAULTS.rerank };
-    return { method: RERANK_METHODS.has(raw.method) ? raw.method : DEFAULTS.rerank.method };
+    const method = RERANK_METHODS.has(raw.method) ? raw.method : DEFAULTS.rerank.method;
+    if (method !== 'provider') return { method, providerId: '', modelId: '' };
+    const { providerId, modelId } = sanitizeProviderModel(raw);
+    // Provider method without a target falls back to cosine — half-configured is invalid.
+    if (!providerId || !modelId) return { method: 'cosine', providerId: '', modelId: '' };
+    return { method, providerId, modelId };
 }
 
 function sanitizeCleanupConfig(raw) {
-    if (!raw || typeof raw !== 'object') return { ...DEFAULTS.cleanup };
-    const providerId = typeof raw.providerId === 'string' ? raw.providerId.slice(0, 200) : '';
-    const modelId = typeof raw.modelId === 'string' ? raw.modelId.trim().slice(0, 200) : '';
-    // Either both set or both empty — half-configured is treated as disabled.
-    if (!providerId || !modelId) return { providerId: '', modelId: '' };
-    return { providerId, modelId };
+    return sanitizeProviderModel(raw);
 }
 
 async function readWebSearchInferenceConfig() {
     const stored = await configStore.getConfig('web_search_inference_config') || {};
     return {
+        embed:   sanitizeEmbedConfig(stored.embed),
         rerank:  sanitizeRerankConfig(stored.rerank),
         cleanup: sanitizeCleanupConfig(stored.cleanup),
     };
@@ -52,6 +67,7 @@ async function readWebSearchInferenceConfig() {
 
 async function writeWebSearchInferenceConfig(body) {
     const cleaned = {
+        embed:   sanitizeEmbedConfig(body?.embed),
         rerank:  sanitizeRerankConfig(body?.rerank),
         cleanup: sanitizeCleanupConfig(body?.cleanup),
     };
@@ -92,14 +108,18 @@ async function resolveInferenceTargets() {
     const cfg = await readWebSearchInferenceConfig();
     const embedSummary = await readEmbedSummary();
 
-    // ── embed ──
+    // ── embed: per-feature override wins; otherwise inherit global ──
+    const embedProviderId = cfg.embed.providerId || embedSummary.providerId;
+    const embedModelId = cfg.embed.modelId || embedSummary.modelId;
+    const embedSource = cfg.embed.providerId && cfg.embed.modelId ? 'override' : 'global';
     const embedEntry = {
         task: 'embed',
-        providerId: embedSummary.providerId,
-        modelId: embedSummary.modelId,
+        providerId: embedProviderId,
+        modelId: embedModelId,
+        source: embedSource,
     };
-    if (embedSummary.providerId && embedSummary.modelId) {
-        const p = await lookupProvider(embedSummary.providerId);
+    if (embedProviderId && embedModelId) {
+        const p = await lookupProvider(embedProviderId);
         if (p) {
             embedEntry.providerType = p.type;
             embedEntry.providerName = p.name;
@@ -114,7 +134,23 @@ async function resolveInferenceTargets() {
     }
 
     // ── rerank ──
-    const rerankEntry = { task: 'rerank', method: cfg.rerank.method };
+    const rerankEntry = {
+        task: 'rerank',
+        method: cfg.rerank.method,
+        providerId: cfg.rerank.providerId || null,
+        modelId: cfg.rerank.modelId || null,
+    };
+    if (cfg.rerank.method === 'provider' && cfg.rerank.providerId && cfg.rerank.modelId) {
+        const p = await lookupProvider(cfg.rerank.providerId);
+        if (p) {
+            rerankEntry.providerType = p.type;
+            rerankEntry.providerName = p.name;
+            if (p.url) rerankEntry.endpoint = p.url;
+        } else {
+            rerankEntry.unresolved = true;
+            rerankEntry.reason = 'provider_not_found';
+        }
+    }
 
     // ── cleanup ──
     const cleanupEntry = {
@@ -150,7 +186,7 @@ async function fetchProviderApiKey(providerId) {
 
 async function resolveInferenceTargetsWithSecrets() {
     const resolved = await resolveInferenceTargets();
-    for (const task of ['embed', 'cleanup']) {
+    for (const task of ['embed', 'rerank', 'cleanup']) {
         const t = resolved[task];
         if (!t.providerId || !t.modelId) continue;
         const key = await fetchProviderApiKey(t.providerId);

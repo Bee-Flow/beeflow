@@ -167,7 +167,9 @@ router.post('/config', requireAuth, async (req, res) => {
         await configStore.setSecret('serper_api_key', serperApiKey || '');
     }
     if (req.body.searchProvider !== undefined) {
-        await configStore.setConfig('search_provider', req.body.searchProvider || 'agent-search');
+        const allowed = new Set(['agent-search', 'node-search', 'bing', 'disabled']);
+        const value = allowed.has(req.body.searchProvider) ? req.body.searchProvider : 'agent-search';
+        await configStore.setConfig('search_provider', value);
     }
     if (req.body.bingSearchKey !== undefined) {
         await configStore.setSecret('bing_search_key', req.body.bingSearchKey || '');

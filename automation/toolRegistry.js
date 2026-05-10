@@ -21,7 +21,6 @@ const TOOL_REGISTRY = [
     { app: 'agent-search',            label: 'Web Search',             module: '../integrations/agentSearchTools',          arrayName: 'AGENT_SEARCH_TOOLS',         enabledKey: 'agent-search' },
     { app: 'maps',                    label: 'Google Maps',            module: '../integrations/mapsTools',                 arrayName: 'MAPS_TOOLS',                 enabledKey: 'google-maps' },
     { app: 'linkedin',                label: 'LinkedIn',               module: '../integrations/linkedinTools',             arrayName: 'LINKEDIN_TOOLS',             enabledKey: 'linkedin' },
-    { app: 'whatsapp',                label: 'WhatsApp',               module: '../integrations/whatsappTools',             arrayName: 'WHATSAPP_TOOLS',             enabledKey: 'whatsapp' },
     { app: 'github',                  label: 'GitHub',                 module: '../integrations/githubTools',               arrayName: 'GITHUB_TOOLS',               enabledKey: 'github' },
     { app: 'outlook',                 label: 'Outlook',                module: '../integrations/outlookTools',              arrayName: 'OUTLOOK_TOOLS',              enabledKey: 'outlook' },
     { app: 'ms-calendar',             label: 'Microsoft Calendar',     module: '../integrations/msCalendarTools',           arrayName: 'MS_CALENDAR_TOOLS',          enabledKey: 'ms-calendar' },

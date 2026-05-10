@@ -44,7 +44,6 @@ const INTEGRATION_PREFIXES = {
     signrequest_:   { integration: 'signrequest',     label: 'SignRequest',         server: 'api.signrequest.com' },
     gamma_:         { integration: 'gamma',           label: 'Gamma',               server: 'gamma.app' },
     linkedin_:      { integration: 'linkedin',        label: 'LinkedIn',            server: 'api.linkedin.com' },
-    whatsapp_:      { integration: 'whatsapp',        label: 'WhatsApp',            server: 'web.whatsapp.com (local bridge)' },
     github_:        { integration: 'github',          label: 'GitHub',              server: 'api.github.com' },
 
     // Media generation

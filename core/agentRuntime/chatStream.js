@@ -1659,10 +1659,6 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         onEvent('linkedin_draft', finalToolResult.draft);
                         _linkedInDrafts.push({ ...finalToolResult.draft, status: 'pending' });
                     }
-                    // Emit whatsapp_draft SSE event for user approval
-                    if (finalToolResult?._action === 'whatsapp_draft') {
-                        onEvent('whatsapp_draft', finalToolResult.draft);
-                    }
 
 
                     // Emit map_embed SSE event so map renders persist on messages

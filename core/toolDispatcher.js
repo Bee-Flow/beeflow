@@ -32,7 +32,6 @@ const { executeWorkspaceTool } = require('../integrations/workspaceTools');
 const { isKbSearchTool, executeKbSearchTool } = require('../integrations/kbSearchTools');
 const { isMapsTool, executeMapsTool } = require('../integrations/mapsTools');
 const { isLinkedInTool, executeLinkedInTool } = require('../integrations/linkedinTools');
-const { isWhatsAppTool, executeWhatsAppTool } = require('../integrations/whatsappTools');
 const { isGitHubTool, executeGitHubTool } = require('../integrations/githubTools');
 const { isOutlookTool, executeOutlookTool } = require('../integrations/outlookTools');
 const { isMsCalendarTool, executeMsCalendarTool } = require('../integrations/msCalendarTools');
@@ -354,9 +353,6 @@ async function executeTool(toolName, toolArgs, context = {}) {
     }
     if (isLinkedInTool(toolName)) {
         return await executeLinkedInTool(toolName, toolArgs, session);
-    }
-    if (isWhatsAppTool(toolName)) {
-        return await executeWhatsAppTool(toolName, toolArgs, { userId, session });
     }
     if (isGitHubTool(toolName)) {
         return await executeGitHubTool(toolName, toolArgs, userId);

@@ -11,18 +11,16 @@ const { run, getOne, getAll } = require('../../db');
 const { initDB } = require('./initSchema');
 const convMessages = require('./conversationMessages');
 const { decryptMessages } = require('./messageEncryption');
-// Lazy-require to dodge the same circular-dep race that `getAIConfig` hit
-// (azurePiiDetection ↔ aiAgent ↔ stores). Resolving the live binding on
-// first call means the destructure isn't a stale undefined snapshot.
-const _piiDetectionModule = require('../../core/azurePiiDetection');
-
 // Replace [email_N] / [phone_N] etc. tokens with the real values stored in
 // the per-message tokenMap. Idempotent — messages without a tokenMap pass
 // through unchanged. Only used on the UI-display read path; the LLM
 // history loader passes restore=false so Claude keeps seeing tokens.
+// Lazy-require inside the function: same circular-dep reason as
+// azurePiiDetection.js→aiAgent — capturing a destructure at module load
+// can grab a stale snapshot of the cycle's partial exports.
 function _restoreTokensInMessages(messages) {
     if (!Array.isArray(messages)) return messages;
-    const restoreTokens = _piiDetectionModule.restoreTokens;
+    const restoreTokens = require('../../core/azurePiiDetection').restoreTokens;
     if (typeof restoreTokens !== 'function') return messages;
     return messages.map(m => {
         if (m && m.role === 'user' && m.tokenMap && typeof m.content === 'string' && Object.keys(m.tokenMap).length > 0) {

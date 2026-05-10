@@ -31,7 +31,6 @@ const { WORKSPACE_TOOLS } = require('../integrations/workspaceTools');
 const { KB_SEARCH_TOOLS } = require('../integrations/kbSearchTools');
 const { MAPS_TOOLS } = require('../integrations/mapsTools');
 const { LINKEDIN_TOOLS } = require('../integrations/linkedinTools');
-const { WHATSAPP_TOOLS } = require('../integrations/whatsappTools');
 const { GITHUB_TOOLS } = require('../integrations/githubTools');
 const { OUTLOOK_TOOLS, OUTLOOK_READONLY_TOOLS } = require('../integrations/outlookTools');
 const { MS_CALENDAR_TOOLS } = require('../integrations/msCalendarTools');
@@ -365,23 +364,6 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
         addTools(TRANSCRIPTION_TOOLS);
     }
 
-    // WhatsApp — requires active Baileys session
-    try {
-        const whatsappSession = require('../integrations/whatsappSession');
-        const waStatus = whatsappSession.getStatus(userId);
-        if ((waStatus === 'connected' || waStatus === 'saved') && isAppOn('whatsapp')) {
-            addTools(WHATSAPP_TOOLS);
-            // Auto-restore saved session if not already active
-            if (waStatus === 'saved') {
-                whatsappSession.restoreSession(userId).catch(e =>
-                    console.warn('[IntegrationTools] WhatsApp restore failed:', e.message)
-                );
-            }
-        }
-    } catch (e) {
-        console.warn('[IntegrationTools] WhatsApp check error:', e.message);
-    }
-
     return { tools, n8nOrgId };
 }
 
@@ -436,7 +418,6 @@ async function buildToolHint(tools, userId = null) {
     if (tools.some(t => t.function.name.startsWith('maps_'))) integrations.push('Google Maps (get directions between locations with route maps, search for places/businesses — IMPORTANT: after getting results, always output the map as a ```map-embed code block containing JSON with embedUrl, title, and mapsLink fields so it renders as an interactive map in the chat)');
     if (tools.some(t => t.function.name.startsWith('linkedin_'))) integrations.push('LinkedIn (create posts — user approves before publishing)');
     if (tools.some(t => t.function.name.startsWith('github_'))) integrations.push('GitHub (list repos, view code, create repos, manage branches)');
-    if (tools.some(t => t.function.name.startsWith('whatsapp_'))) integrations.push('WhatsApp (list chats, read messages, compose with approval). WORKFLOW: 1) Use whatsapp_list_chats to find chats (supports search query). 2) Use whatsapp_read_messages with a contact name or JID from the list. 3) Use whatsapp_compose to draft a message — it will be shown to the user for approval before sending. Messages are captured from the moment the user connected, so very old history may not be available. Always use JIDs from whatsapp_list_chats for accuracy.');
     if (tools.some(t => t.function.name.startsWith('outlook_'))) {
         // Check if compose tool is present — if not, it's read-only mode
         const hasCompose = tools.some(t => t.function.name === 'outlook_compose');

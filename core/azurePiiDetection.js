@@ -13,14 +13,19 @@
  * Method: recognizePiiEntities
  */
 
-// Lazy access to side-step a circular-dep race that left `getAIConfig`
-// undefined when this module loaded before aiAgent finished its top-level
-// requires. Indirecting through the live module export means we get the
-// real function as soon as aiAgent is initialised — the destructured
-// snapshot was stale and gave `getAIConfig is not a function`, killing
-// the PII gate silently inside directChat's swallow-all catch.
-const aiAgentModule = require('./aiAgent');
-const getAIConfig = (...args) => aiAgentModule.getAIConfig(...args);
+// Circular dep: azurePiiDetection ← aiAgent ← agentStore ← ... ← azurePiiDetection.
+// During the cycle aiAgent.js does `module.exports = { ... }` at the END
+// (full object replacement). If we capture `require('./aiAgent')` at module
+// load, we get a snapshot of the EMPTY pre-cycle exports object that never
+// gets updated — `module.exports = {...}` rebinds the new object in the
+// require cache but our captured reference points at the abandoned old one.
+// Calling `require('./aiAgent')` fresh on each invocation fetches the
+// up-to-date cached exports from Node's module cache. By the time
+// validateInputForPii runs (request time, not load time) aiAgent has long
+// finished initialising.
+function getAIConfig() {
+    return require('./aiAgent').getAIConfig();
+}
 const configStore = require('../stores/configStore');
 const { computePiiDetectionCost } = require('./azureServiceCosts');
 const azureServiceUsageStore = require('../stores/azureServiceUsageStore');
