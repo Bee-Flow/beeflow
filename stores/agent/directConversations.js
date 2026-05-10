@@ -11,6 +11,23 @@ const { run, getOne, getAll } = require('../../db');
 const { initDB } = require('./initSchema');
 const convMessages = require('./conversationMessages');
 const { decryptMessages } = require('./messageEncryption');
+const { restoreTokens } = require('../../core/azurePiiDetection');
+
+// Replace [email_N] / [phone_N] etc. tokens with the real values stored in
+// the per-message tokenMap. Idempotent — messages without a tokenMap pass
+// through unchanged. Only used on the UI-display read path; the LLM
+// history loader passes restore=false so Claude keeps seeing tokens.
+function _restoreTokensInMessages(messages) {
+    if (!Array.isArray(messages)) return messages;
+    return messages.map(m => {
+        if (m && m.role === 'user' && m.tokenMap && typeof m.content === 'string' && Object.keys(m.tokenMap).length > 0) {
+            try {
+                return { ...m, content: restoreTokens(m.content, m.tokenMap) };
+            } catch (e) { /* fall through with original */ }
+        }
+        return m;
+    });
+}
 
 async function createDirectConversation(userId, modelTier = 'fast') {
     await initDB();
@@ -19,12 +36,18 @@ async function createDirectConversation(userId, modelTier = 'fast') {
     return { id, title: 'New Chat', messages: [], model_tier: modelTier };
 }
 
-async function getDirectConversation(id, userId) {
+async function getDirectConversation(id, userId, options = {}) {
     await initDB();
+    // `restore` defaults to true: most callers (UI render, listings, search)
+    // expect tokens already mapped back to real values. The LLM-history
+    // loader in directChat.js passes `restore: false` so Claude continues
+    // to see [email_N] tokens on follow-up turns.
+    const restore = options.restore !== false;
     const row = await getOne('SELECT * FROM direct_conversations WHERE id = $1 AND user_id = $2', [id, userId]);
     if (!row) return null;
     const meta = JSON.parse(row.meta_json || '{}');
-    const messages = await _readDirectMessages(row);
+    let messages = await _readDirectMessages(row);
+    if (restore) messages = _restoreTokensInMessages(messages);
     return { ...row, messages, meta, ...meta };
 }
 

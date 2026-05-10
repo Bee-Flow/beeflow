@@ -937,7 +937,11 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         let resolvedHistory = Array.isArray(history) ? history : null;
         if ((!resolvedHistory || resolvedHistory.length === 0) && conversationId) {
             try {
-                const persisted = await agentStore.getDirectConversation(conversationId, userId);
+                // restore:false — keep [email_N] tokens in the history we
+                // hand to Claude on follow-up turns so PII never re-leaks
+                // into the model context. UI fetch paths still default to
+                // restore:true so users see their original values.
+                const persisted = await agentStore.getDirectConversation(conversationId, userId, { restore: false });
                 if (persisted && Array.isArray(persisted.messages) && persisted.messages.length > 0) {
                     resolvedHistory = persisted.messages;
                     console.log(`[DirectChat] No client history — loaded ${resolvedHistory.length} persisted messages from DB`);
@@ -1669,6 +1673,12 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         // When the org has the interactive DLP gate enabled, skip this auto-tokenising
         // path — the DLP block further down handles scan + user decision + audit.
         let piiTokenMap = null;  // non-null only in tokenize mode when PII found
+        // Mirror of `message` for non-LLM consumers (DB persistence, memory
+        // extraction, title generator). When PII tokenisation fires, this
+        // becomes the redacted form so downstream code never sees raw PII —
+        // the original `message` const is only used to fork into the LLM's
+        // `messages[]` array and isn't trustworthy after tokenisation.
+        let tokenizedMessage = message;
         const dlpWillHandleHere = !!(orgShield?.enabled && orgShield?.dlpEnabled);
         if (dlpWillHandleHere) {
             console.log('[DirectChat] DLP enabled — deferring PII handling to pre-flight DLP gate');
@@ -1692,6 +1702,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                     if (textPart) textPart.text = piiResult.tokenizedText;
                 }
                 piiTokenMap = piiResult.tokenMap;
+                tokenizedMessage = piiResult.tokenizedText;
                 // Register on the shared DLP conversation-token store so the streaming
                 // un-tokeniser restores these values on the way back even when DLP
                 // itself is disabled.
@@ -3395,9 +3406,16 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             } else {
                 savedMessages = dbMessages;
             }
-            const userSave = { role: 'user', content: moderationViolation ? '[Message removed - policy violation]' : message, timestamp: new Date().toISOString() };
+            const userSave = { role: 'user', content: moderationViolation ? '[Message removed - policy violation]' : tokenizedMessage, timestamp: new Date().toISOString() };
             if (persistedAttachments.length > 0) userSave.attachments = persistedAttachments;
             if (_userPrivacyMeta) Object.assign(userSave, _userPrivacyMeta);
+            // Persist the tokenMap with the user row so the read-on-display
+            // path can restore [email_N] → real values for the UI without
+            // re-running PII detection. Cross-turn restoration also works
+            // through dlpRunner.mergeTokenMap for chained references.
+            if (piiTokenMap && Object.keys(piiTokenMap).length > 0) {
+                userSave.tokenMap = piiTokenMap;
+            }
             savedMessages.push(userSave);
             const assistantSave = { role: 'assistant', content: fullContent, timestamp: new Date().toISOString() };
             if (_assistantTokenisationInfo) assistantSave.tokenisationInfo = _assistantTokenisationInfo;
@@ -3476,11 +3494,13 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             }
             await agentStore.updateDirectConversation(convId, savedMessages, userId, updateMeta);
 
-            // Auto-extract memories from conversation (async, fire-and-forget)
-            if (!moderationViolation && message && fullContent) {
+            // Auto-extract memories from conversation (async, fire-and-forget).
+            // Pass `tokenizedMessage` so PII redactions ([email_1] etc.) are
+            // what the extractor stores — never the raw email/phone/IBAN.
+            if (!moderationViolation && tokenizedMessage && fullContent) {
                 try {
                     const { extractMemories } = require('../../core/memoryExtractor');
-                    extractMemories(userId, message, fullContent, null, extractMemoriesEnabled ? projectId : null, userOrgForTiers).catch(e =>
+                    extractMemories(userId, tokenizedMessage, fullContent, null, extractMemoriesEnabled ? projectId : null, userOrgForTiers).catch(e =>
                         console.warn('[DirectChat] Memory extraction error:', e.message)
                     );
                 } catch (e) { /* ignore */ }
@@ -3502,7 +3522,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                     console.log(`[DirectChat] Title: generating with model=${titleModel}`);
                     const title = await llmClient.generateTitle(
                         titleModel,
-                        message,
+                        tokenizedMessage,
                         titleAgent?.system_prompt
                     );
                     console.log(`[DirectChat] Title generated: "${title}" for conv ${convId}`);
