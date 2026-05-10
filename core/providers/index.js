@@ -15,7 +15,6 @@ const ClaudeProvider = require('./claude');
 const GoogleProvider = require('./google');
 const GoogleVertexProvider = require('./googleVertex');
 const AzureProvider = require('./azure');
-const MiniMaxProvider = require('./minimax');
 const BaseProvider = require('./base');
 
 // Singleton instances
@@ -25,7 +24,6 @@ const claudeAdapter = new ClaudeProvider();
 const googleAdapter = new GoogleProvider();
 const googleVertexAdapter = new GoogleVertexProvider();
 const azureAdapter = new AzureProvider();
-const minimaxAdapter = new MiniMaxProvider();
 const baseAdapter = new BaseProvider('generic');
 
 // Map provider type strings to adapter instances
@@ -36,7 +34,6 @@ const PROVIDER_MAP = {
     'google': googleAdapter,
     'google-vertex': googleVertexAdapter,
     'azure': azureAdapter,
-    'minimax': minimaxAdapter,
 };
 
 // URL patterns to auto-detect provider when type is unknown
@@ -48,7 +45,6 @@ const URL_PATTERNS = [
     { pattern: /aiplatform\.googleapis\.com/i, adapter: googleVertexAdapter },
     { pattern: /\.openai\.azure\.com/i, adapter: azureAdapter },
     { pattern: /cognitiveservices\.azure\.com/i, adapter: azureAdapter },
-    { pattern: /minimax\.io/i, adapter: minimaxAdapter },
 ];
 
 /**
@@ -85,7 +81,6 @@ module.exports = {
     googleAdapter,
     googleVertexAdapter,
     azureAdapter,
-    minimaxAdapter,
     baseAdapter,
     // Re-export for convenience
     OpenAIProvider,
@@ -94,6 +89,5 @@ module.exports = {
     GoogleProvider,
     GoogleVertexProvider,
     AzureProvider,
-    MiniMaxProvider,
     BaseProvider,
 };

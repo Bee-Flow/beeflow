@@ -57,15 +57,11 @@ const PROVIDER_PREFIXES = {
     claude: ['', 'anthropic/', 'claude-'],
     google: ['gemini/', ''],
     'google-vertex': ['vertex_ai/gemini-', 'vertex_ai/', 'gemini/', ''],
-    minimax: ['minimax/', ''],
 };
 
 // ─── Fallback pricing for models not yet in the community database ──────────
 // Prices are per 1M tokens (USD). Sourced from official provider pages.
-const FALLBACK_PRICING = {
-    'MiniMax-M2.7':            { input: 0.30, output: 1.20 },
-    'MiniMax-M2.7-highspeed':  { input: 0.60, output: 2.40 },
-};
+const FALLBACK_PRICING = {};
 
 /**
  * Look up the cost for a model ID, trying various key patterns.
@@ -98,7 +94,7 @@ function getModelPricing(modelId, providerType) {
     // Build candidate keys to try
     const prefixes = providerType && PROVIDER_PREFIXES[providerType]
         ? PROVIDER_PREFIXES[providerType]
-        : ['', 'openai/', 'mistral/', 'gemini/', 'vertex_ai/', 'anthropic/', 'minimax/'];
+        : ['', 'openai/', 'mistral/', 'gemini/', 'vertex_ai/', 'anthropic/'];
 
     // Build candidate model IDs (original + without -latest)
     const candidates = [modelId];

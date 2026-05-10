@@ -24,7 +24,6 @@ const PROVIDER_PRESETS = {
     google: { name: 'Google AI', url: 'https://generativelanguage.googleapis.com', needsApiKey: true },
     'google-vertex': { name: 'Google Vertex AI', url: 'vertex-ai', needsApiKey: false },
     azure: { name: 'Azure AI', url: 'https://your-resource.openai.azure.com', needsApiKey: true },
-    minimax: { name: 'MiniMax', url: 'https://api.minimax.io/v1', needsApiKey: true },
 };
 
 // Reverse lookup: display name → model ID (for agents saved with human-readable names)
@@ -203,11 +202,6 @@ async function saveAIConfig(aiConfig) {
             await configStore.setSecret('google_vertex_service_account_key', aiConfig.googleVertexServiceAccountKey || '');
         }
 
-        // Save MiniMax API key to database
-        if (aiConfig.minimaxApiKey !== undefined) {
-            await configStore.setSecret('minimax_api_key', aiConfig.minimaxApiKey || '');
-        }
-
         // Save Azure AI config to database
         if (aiConfig.azureEndpoint !== undefined) {
             await configStore.setConfig('azure_endpoint', aiConfig.azureEndpoint || '');
@@ -250,7 +244,6 @@ async function saveAIConfig(aiConfig) {
         await ensureGoogleProvider();
         await ensureGoogleVertexProvider();
         await ensureAzureProvider();
-        await ensureMinimaxProvider();
 
         return true;
     } catch (e) {
@@ -441,35 +434,6 @@ async function ensureGoogleVertexProvider() {
 /**
  * Auto-create or update an Azure AI provider when endpoint + key are set.
  */
-/**
- * Auto-create or update a MiniMax provider when a MiniMax API key is configured.
- */
-async function ensureMinimaxProvider() {
-    const ai = await configStore.getConfig('ai') || {};
-    const minimaxApiKey = await configStore.getSecret('minimax_api_key');
-
-    if (!minimaxApiKey) return;
-
-    if (!ai.providers) ai.providers = [];
-
-    const existing = ai.providers.find(p => p.id === 'minimax-default');
-    if (existing) {
-        existing.apiKey = minimaxApiKey;
-        existing.url = 'https://api.minimax.io/v1';
-    } else {
-        ai.providers.push({
-            id: 'minimax-default',
-            name: 'MiniMax',
-            type: 'minimax',
-            url: 'https://api.minimax.io/v1',
-            model: '',
-            apiKey: minimaxApiKey
-        });
-        console.log('[AIAgent] Auto-created default MiniMax provider');
-    }
-    await configStore.setConfig('ai', ai);
-}
-
 async function ensureAzureProvider() {
     const ai = await configStore.getConfig('ai') || {};
     const endpoint = await configStore.getConfig('azure_endpoint');

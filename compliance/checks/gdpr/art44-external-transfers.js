@@ -16,7 +16,7 @@ const { classifyProvider } = require('../../../core/providers/classification');
 const EXTERNAL_PROVIDER_PREFIXES = new Set([
     'openai', 'claude', 'anthropic', 'google', 'google-vertex',
     'azure', 'mistral', 'cohere', 'groq', 'together',
-    'fireworks', 'perplexity', 'minimax',
+    'fireworks', 'perplexity',
 ]);
 
 module.exports = {
