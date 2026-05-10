@@ -13,7 +13,14 @@
  * Method: recognizePiiEntities
  */
 
-const { getAIConfig } = require('./aiAgent');
+// Lazy access to side-step a circular-dep race that left `getAIConfig`
+// undefined when this module loaded before aiAgent finished its top-level
+// requires. Indirecting through the live module export means we get the
+// real function as soon as aiAgent is initialised — the destructured
+// snapshot was stale and gave `getAIConfig is not a function`, killing
+// the PII gate silently inside directChat's swallow-all catch.
+const aiAgentModule = require('./aiAgent');
+const getAIConfig = (...args) => aiAgentModule.getAIConfig(...args);
 const configStore = require('../stores/configStore');
 const { computePiiDetectionCost } = require('./azureServiceCosts');
 const azureServiceUsageStore = require('../stores/azureServiceUsageStore');

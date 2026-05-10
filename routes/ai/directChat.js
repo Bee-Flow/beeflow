@@ -1683,6 +1683,10 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         if (dlpWillHandleHere) {
             console.log('[DirectChat] DLP enabled — deferring PII handling to pre-flight DLP gate');
         }
+        // Diagnostic: show why PII block may skip (orgShield may be null on
+        // some paths — e.g. when userOrgId is not yet resolved). Print on
+        // every turn so support can correlate to a specific convId.
+        console.log(`[DirectChat] PII gate: convId=${convId} orgShield=${orgShield ? 'present' : 'NULL'} enabled=${orgShield?.enabled} localPii=${orgShield?.localPiiEnabled} dlpWillHandleHere=${dlpWillHandleHere}`);
         try {
             if (dlpWillHandleHere) throw { __skip: true };
             const { validateInputForPii } = require('../../core/azurePiiDetection');
@@ -1690,6 +1694,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
             // the PII gate. detectPii() in azurePiiDetection.js routes
             // between them automatically.
             const orgPiiEnabled = !!(orgShield?.enabled && (orgShield?.azurePiiEnabled || orgShield?.localPiiEnabled !== false));
+            console.log(`[DirectChat] PII calling validateInputForPii: orgPiiEnabled=${orgPiiEnabled} msgCount=${messages.length}`);
             const piiResult = await validateInputForPii(messages.slice(-3), orgPiiEnabled, orgShield);
 
             if (piiResult && piiResult.tokenizedText) {
