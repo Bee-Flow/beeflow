@@ -101,7 +101,7 @@ router.get('/admin/:orgId/nc-sync/users', requireAuth, checkOrgAdmin, async (req
 // other NC users in this org are unblocked from auto-provisioning.
 router.post('/admin/:orgId/nc-onboarding/complete', requireAuth, checkOrgAdmin, express.json(), async (req, res) => {
     const configStore = require('../../stores/configStore');
-    const { syncMode, syncGroups, excludedGroups, newUserDefaultStatus, privacyShield } = req.body || {};
+    const { syncMode, syncGroups, excludedGroups, newUserDefaultStatus, privacyShield, deploymentMode, selectedPlanId } = req.body || {};
 
     if (!['mirror_all', 'selective_groups', 'manual'].includes(syncMode)) {
         return res.status(400).json({ error: 'Invalid syncMode' });
@@ -112,14 +112,25 @@ router.post('/admin/:orgId/nc-onboarding/complete', requireAuth, checkOrgAdmin, 
     if (syncMode === 'selective_groups' && (!Array.isArray(syncGroups) || syncGroups.length === 0)) {
         return res.status(400).json({ error: 'selective_groups mode requires at least one group' });
     }
+    if (deploymentMode !== undefined && !['cloud', 'self-hosted'].includes(deploymentMode)) {
+        return res.status(400).json({ error: 'Invalid deploymentMode' });
+    }
+    // selectedPlanId is optional. When provided, validate it points at an
+    // existing plan so we don't store a dangling reference.
+    if (selectedPlanId) {
+        const plan = await userStore.getPlan(selectedPlanId);
+        if (!plan) return res.status(400).json({ error: 'Invalid selectedPlanId' });
+    }
 
     try {
-        // 1. Sync settings on the org row.
+        // 1. Sync settings + wizard outputs on the org row.
         await userStore.updateOrganization(req.params.orgId, {
             ncSyncMode: syncMode,
             ncSyncGroups: Array.isArray(syncGroups) ? syncGroups : [],
             ncSyncExcludedGroups: Array.isArray(excludedGroups) ? excludedGroups : [],
             ncNewUserDefaultStatus: newUserDefaultStatus,
+            ...(deploymentMode !== undefined ? { deploymentMode } : {}),
+            ...(selectedPlanId !== undefined ? { selectedPlanId: selectedPlanId || null } : {}),
         });
 
         // 2. Privacy Shield in configStore (same shape GuardrailsPanel writes).

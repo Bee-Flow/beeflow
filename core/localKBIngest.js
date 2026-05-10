@@ -599,22 +599,28 @@ function _trackEmbeddingCost(totalTokensEstimate) {
 let schemaInitialized = false;
 let pgvectorAvailable = true;
 
-async function ensureKBChunksTable(vectorDim = 1536) {
+async function ensureKBChunksTable(vectorDim) {
+    // Bootstrap-only call (no specific dim requested) returns once the
+    // schema is known to exist. We still run the CREATE EXTENSION + initial
+    // CREATE TABLE the first time to populate pgvectorAvailable.
+    if (schemaInitialized && vectorDim == null) return;
     if (schemaInitialized && !pgvectorAvailable) return;
 
-    try {
-        // Try to enable pgvector
-        await exec('CREATE EXTENSION IF NOT EXISTS vector');
-        pgvectorAvailable = true;
-    } catch (e) {
-        console.warn('[LocalKBIngest] pgvector extension not available — vector search disabled, keyword search will still work. Install postgresql-XX-pgvector to enable.');
-        pgvectorAvailable = false;
+    if (!schemaInitialized) {
+        try {
+            await exec('CREATE EXTENSION IF NOT EXISTS vector');
+            pgvectorAvailable = true;
+        } catch (e) {
+            console.warn('[LocalKBIngest] pgvector extension not available — vector search disabled, keyword search will still work. Install postgresql-XX-pgvector to enable.');
+            pgvectorAvailable = false;
+        }
     }
 
-    // If table already exists, reconcile its embedding dim with the requested
-    // one. Empty tables can be ALTERed safely; non-empty ones with mismatched
-    // dim throw so the admin can decide (re-ingest vs keep current data).
-    if (pgvectorAvailable && schemaInitialized) {
+    // Dim reconcile — only when caller explicitly asked for a dim. Empty
+    // tables can be ALTERed safely; non-empty ones with mismatched dim are
+    // logged but NOT thrown — the INSERT will fail with a clearer pgvector
+    // error if dim actually matters at write time, and reads can still try.
+    if (pgvectorAvailable && schemaInitialized && vectorDim != null) {
         try {
             const dimRows = await getAll(`
                 SELECT a.atttypmod AS typmod
@@ -622,7 +628,6 @@ async function ensureKBChunksTable(vectorDim = 1536) {
                 JOIN pg_class c ON c.oid = a.attrelid
                 WHERE c.relname = 'kb_chunks' AND a.attname = 'embedding' AND a.attnum > 0
             `);
-            // pgvector encodes dim directly in atttypmod
             const currentDim = dimRows?.[0]?.typmod;
             if (currentDim && currentDim !== vectorDim) {
                 const countRows = await getAll('SELECT COUNT(*)::int AS n FROM kb_chunks');
@@ -633,19 +638,20 @@ async function ensureKBChunksTable(vectorDim = 1536) {
                     try { await exec(`DROP INDEX IF EXISTS idx_kb_chunks_embedding`); } catch (_) {}
                     try { await exec(`CREATE INDEX IF NOT EXISTS idx_kb_chunks_embedding ON kb_chunks USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 200)`); } catch (_) {}
                 } else {
-                    throw new Error(`kb_chunks already populated with ${currentDim}-dim vectors but the configured embedding model is ${vectorDim}-dim. Re-ingest existing documents or set kb_provider='remote' to use the original ingest pipeline.`);
+                    console.warn(`[LocalKBIngest] kb_chunks dim mismatch (table=${currentDim}, requested=${vectorDim}) with ${rows} existing rows. To switch embedding models, re-ingest existing docs OR run: ALTER TABLE kb_chunks ALTER COLUMN embedding TYPE VECTOR(${vectorDim}) USING NULL after truncating.`);
                 }
             }
         } catch (err) {
-            // Don't swallow our own throw above
-            if (/already populated/.test(err.message)) throw err;
-            // Other failures (race during ALTER etc.) — log and continue.
             console.warn(`[LocalKBIngest] dim reconcile check skipped: ${err.message}`);
         }
         return;
     }
 
-    // Create kb_chunks table matching the search-service schema
+    // Create kb_chunks table matching the search-service schema. Default dim
+    // for the *initial* table creation falls back to 1024 (mistral-embed) —
+    // most common provider in current deployments. The actual provider's dim
+    // will be reconciled on the next ingest call regardless of this default.
+    const initialDim = vectorDim || 1024;
     if (pgvectorAvailable) {
         await exec(`
             CREATE TABLE IF NOT EXISTS kb_chunks (
@@ -658,7 +664,7 @@ async function ensureKBChunksTable(vectorDim = 1536) {
                 title         TEXT,
                 content       TEXT NOT NULL,
                 tsv           TSVECTOR,
-                embedding     VECTOR(${vectorDim}),
+                embedding     VECTOR(${initialDim}),
                 source_uri    TEXT,
                 chunk_type    TEXT DEFAULT 'content',
                 created_at    TIMESTAMPTZ DEFAULT now()
@@ -732,9 +738,10 @@ async function ingestLocally(tenantId, kbId, docId, content, options = {}) {
     let embedDim = 1536; // fallback if pgvector is disabled — irrelevant in that case
     let embedSource = 'none';
 
-    // Bootstrap pgvector availability flag without fixing dim yet — we set
-    // dim after we know what the dispatcher actually produced.
-    await ensureKBChunksTable(1536);
+    // Bootstrap pgvector availability flag without committing to a dim yet —
+    // we set the dim below once the dispatcher tells us what the configured
+    // provider actually produces.
+    await ensureKBChunksTable();
 
     if (pgvectorAvailable) {
         const result = await dispatchEmbedTexts(chunkTexts);
@@ -890,15 +897,11 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
     const _searchStart = Date.now();
     console.log(`[LocalKBSearch] searchLocally — tenantId="${tenantId}" kbIds=${JSON.stringify(kbIds)} query="${query.slice(0,60)}"`);
 
-    // Get Azure credentials for embedding the query
-    const endpoint = await configStore.getConfig('azure_openai_embedding_endpoint');
-    const apiKey = await configStore.getSecret('azure_openai_embedding_key');
-    const model = await configStore.getConfig('azure_openai_embedding_model') || 'text-embedding-3-small';
-    if (pgvectorAvailable && (!endpoint || !apiKey)) {
-        throw new Error('Azure OpenAI embedding not configured');
-    }
-
-    await ensureKBChunksTable(1536);
+    // Bootstrap pgvector. Don't pin a dim — `dispatchEmbedTexts` will tell us
+    // what the configured provider actually produces (1024 for mistral-embed,
+    // 1536 for text-embedding-3-small, 384 for the CPU fallback) and the table
+    // reconciles to it on first ingest.
+    await ensureKBChunksTable();
 
     // ── Embed query (with LRU cache) — done BEFORE acquiring DB connection ──
     let vectorStr = null;
@@ -909,9 +912,13 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
             console.log('[LocalKBSearch] Using cached query embedding');
         } else {
             try {
-                const queryEmbedding = await azureEmbed([query], endpoint, apiKey, model);
-                vectorStr = `[${queryEmbedding[0].join(',')}]`;
-                setCachedEmbedding(query, vectorStr);
+                const result = await dispatchEmbedTexts([query]);
+                if (result.vectors.length > 0) {
+                    vectorStr = `[${result.vectors[0].join(',')}]`;
+                    setCachedEmbedding(query, vectorStr);
+                } else {
+                    console.warn('[LocalKBSearch] Query embedding produced no vector — falling back to keyword-only search');
+                }
             } catch (err) {
                 console.warn(`[LocalKBSearch] Query embedding failed: ${err.message}`);
             }

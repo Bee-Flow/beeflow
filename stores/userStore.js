@@ -188,6 +188,14 @@ async function initDB() {
     // users wait at a "Setup in progress" screen until the admin is done.
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "nc_onboarding_completed_at" TIMESTAMPTZ`); } catch (e) { }
 
+    // ── Onboarding-wizard outputs (deployment + selected plan) ──
+    // Set once during the App Store wizard so the SaaS knows whether the org
+    // intends to ride on Bee Flow Cloud vs self-hosted, and which subscription
+    // the admin pre-selected. Neither activates a license — `selected_plan_id`
+    // is a hint surfaced in License & Usage for the upsell flow.
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "deployment_mode" TEXT`); } catch (e) { }
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "selected_plan_id" TEXT`); } catch (e) { }
+
     // ── Pending NC bindings (deferred adoption) ──
     // When a connector bootstraps and the NC admin's email maps to an
     // existing Bee Flow org without nc_instance_id, we DO NOT bind
@@ -233,6 +241,12 @@ async function initDB() {
     try { await exec(`ALTER TABLE organization_subscriptions ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT`); } catch (e) { }
     try { await exec(`ALTER TABLE organization_subscriptions ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'none'`); } catch (e) { }
     try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS plan_type TEXT DEFAULT 'organization'`); } catch (e) { }
+    // Surfaced in the NC App Store onboarding wizard as the "Recommended for
+    // Nextcloud" card. Only one plan can carry this flag at a time — the
+    // admin-CRUD route enforces uniqueness on write.
+    try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS nc_recommended BOOLEAN DEFAULT FALSE`); } catch (e) { }
+    // Short marketing line shown under the plan name in the wizard cards.
+    try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS tagline TEXT`); } catch (e) { }
     // Auto-migrate legacy __consumer_default__ plan
     try { await exec(`UPDATE subscription_plans SET plan_type = 'consumer' WHERE name = '__consumer_default__' AND (plan_type IS NULL OR plan_type = 'organization')`); } catch (e) { }
     // Consumer subscriptions table (per-user, org-less)
@@ -616,7 +630,7 @@ async function updateOrganization(orgId, updates) {
     await initDB();
     const ex = await getOne('SELECT id FROM organizations WHERE id = $1', [orgId]);
     if (!ex) return false;
-    const colMap = { name: 'name', description: 'description', tagline: 'tagline', address: 'address', email: 'email', phone: 'phone', website: 'website', kvk: 'kvk', vat: 'vat', logo: 'logo', footerText: 'footerText', authMethod: 'authMethod', connectorCallbackUrl: 'connector_callback_url', ncSyncMode: 'nc_sync_mode', ncNewUserDefaultStatus: 'nc_new_user_default_status', ncLastSyncAt: 'nc_last_sync_at', ncInstanceId: 'nc_instance_id', ncBaseUrl: 'nc_base_url', ncAdminUid: 'nc_admin_uid', ncProvisionedAt: 'nc_provisioned_at', ncOnboardingCompletedAt: 'nc_onboarding_completed_at' };
+    const colMap = { name: 'name', description: 'description', tagline: 'tagline', address: 'address', email: 'email', phone: 'phone', website: 'website', kvk: 'kvk', vat: 'vat', logo: 'logo', footerText: 'footerText', authMethod: 'authMethod', connectorCallbackUrl: 'connector_callback_url', ncSyncMode: 'nc_sync_mode', ncNewUserDefaultStatus: 'nc_new_user_default_status', ncLastSyncAt: 'nc_last_sync_at', ncInstanceId: 'nc_instance_id', ncBaseUrl: 'nc_base_url', ncAdminUid: 'nc_admin_uid', ncProvisionedAt: 'nc_provisioned_at', ncOnboardingCompletedAt: 'nc_onboarding_completed_at', deploymentMode: 'deployment_mode', selectedPlanId: 'selected_plan_id' };
     const updateMap = {};
     for (const [k, v] of Object.entries(colMap)) { if (updates[k] !== undefined) updateMap[k] = updates[k]; }
     if (updates.defaultGroups !== undefined) updateMap.defaultGroups = JSON.stringify(updates.defaultGroups);
@@ -990,7 +1004,7 @@ initDefaultRoles().catch(err => console.error('[UserStore] initDefaultRoles erro
 
 // ── Subscription Plans ─────────────────────────────
 function parsePlan(p) {
-    return { ...p, allowed_features: parseJSON(p.allowed_features, []), allowed_models: parseJSON(p.allowed_models, []), max_messages_by_type: parseJSON(p.max_messages_by_type, {}), is_default: !!p.is_default, is_public: !!p.is_public, plan_type: p.plan_type || 'organization' };
+    return { ...p, allowed_features: parseJSON(p.allowed_features, []), allowed_models: parseJSON(p.allowed_models, []), max_messages_by_type: parseJSON(p.max_messages_by_type, {}), is_default: !!p.is_default, is_public: !!p.is_public, plan_type: p.plan_type || 'organization', nc_recommended: !!p.nc_recommended, tagline: p.tagline || null };
 }
 
 async function getAllPlans() {
@@ -1015,14 +1029,16 @@ async function createPlan(data) {
     const now = new Date().toISOString();
     try {
         if (data.is_default) await run('UPDATE subscription_plans SET is_default = FALSE WHERE is_default = TRUE');
-        await run(`INSERT INTO subscription_plans (id, name, description, max_messages_per_month, max_messages_by_type, max_tokens_per_month, max_cost_per_month, max_users, max_agents, max_knowledge_sources, allowed_features, allowed_models, is_default, price, currency, billing_interval, trial_days, sort_order, is_public, stripe_price_id, stripe_product_id, plan_type, created_at, updated_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`,
+        if (data.nc_recommended) await run('UPDATE subscription_plans SET nc_recommended = FALSE WHERE nc_recommended = TRUE');
+        await run(`INSERT INTO subscription_plans (id, name, description, max_messages_per_month, max_messages_by_type, max_tokens_per_month, max_cost_per_month, max_users, max_agents, max_knowledge_sources, allowed_features, allowed_models, is_default, price, currency, billing_interval, trial_days, sort_order, is_public, stripe_price_id, stripe_product_id, plan_type, nc_recommended, tagline, created_at, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)`,
             [id, data.name.trim(), data.description || '', data.max_messages_per_month ?? null, JSON.stringify(data.max_messages_by_type || {}),
                 data.max_tokens_per_month ?? null, data.max_cost_per_month ?? null, data.max_users ?? null, data.max_agents ?? null,
                 data.max_knowledge_sources ?? null, JSON.stringify(data.allowed_features || []), JSON.stringify(data.allowed_models || []),
                 !!data.is_default, data.price ?? null, data.currency || 'EUR', data.billing_interval || 'monthly',
                 data.trial_days ?? 0, data.sort_order ?? 0, !!data.is_public,
-                data.stripe_price_id || null, data.stripe_product_id || null, data.plan_type || 'organization', now, now]);
+                data.stripe_price_id || null, data.stripe_product_id || null, data.plan_type || 'organization',
+                !!data.nc_recommended, data.tagline || null, now, now]);
         return parsePlan(await getOne('SELECT * FROM subscription_plans WHERE id = $1', [id]));
     } catch (e) { console.error('[UserStore] createPlan error:', e); return null; }
 }
@@ -1036,6 +1052,7 @@ async function updatePlan(planId, data) {
     const now = new Date().toISOString();
     try {
         if (data.is_default) await run('UPDATE subscription_plans SET is_default = FALSE WHERE is_default = TRUE');
+        if (data.nc_recommended) await run('UPDATE subscription_plans SET nc_recommended = FALSE WHERE nc_recommended = TRUE AND id <> $1', [planId]);
         const updateMap = {};
         if (data.name !== undefined) updateMap.name = data.name.trim();
         if (data.description !== undefined) updateMap.description = data.description;
@@ -1057,9 +1074,11 @@ async function updatePlan(planId, data) {
         if (data.is_public !== undefined) updateMap.is_public = !!data.is_public;
         if (data.stripe_price_id !== undefined) updateMap.stripe_price_id = data.stripe_price_id;
         if (data.stripe_product_id !== undefined) updateMap.stripe_product_id = data.stripe_product_id;
+        if (data.nc_recommended !== undefined) updateMap.nc_recommended = !!data.nc_recommended;
+        if (data.tagline !== undefined) updateMap.tagline = data.tagline;
         updateMap.updated_at = now;
         if (data.plan_type !== undefined) updateMap.plan_type = data.plan_type;
-        const colMap = { name: 'name', description: 'description', max_messages_per_month: 'max_messages_per_month', max_messages_by_type: 'max_messages_by_type', max_tokens_per_month: 'max_tokens_per_month', max_cost_per_month: 'max_cost_per_month', max_users: 'max_users', max_agents: 'max_agents', max_knowledge_sources: 'max_knowledge_sources', allowed_features: 'allowed_features', allowed_models: 'allowed_models', is_default: 'is_default', price: 'price', currency: 'currency', billing_interval: 'billing_interval', trial_days: 'trial_days', sort_order: 'sort_order', is_public: 'is_public', stripe_price_id: 'stripe_price_id', stripe_product_id: 'stripe_product_id', plan_type: 'plan_type', updated_at: 'updated_at' };
+        const colMap = { name: 'name', description: 'description', max_messages_per_month: 'max_messages_per_month', max_messages_by_type: 'max_messages_by_type', max_tokens_per_month: 'max_tokens_per_month', max_cost_per_month: 'max_cost_per_month', max_users: 'max_users', max_agents: 'max_agents', max_knowledge_sources: 'max_knowledge_sources', allowed_features: 'allowed_features', allowed_models: 'allowed_models', is_default: 'is_default', price: 'price', currency: 'currency', billing_interval: 'billing_interval', trial_days: 'trial_days', sort_order: 'sort_order', is_public: 'is_public', stripe_price_id: 'stripe_price_id', stripe_product_id: 'stripe_product_id', plan_type: 'plan_type', nc_recommended: 'nc_recommended', tagline: 'tagline', updated_at: 'updated_at' };
         const q = dynamicUpdate('subscription_plans', planId, updateMap, colMap);
         if (q) await run(q.sql, q.params);
         return true;
