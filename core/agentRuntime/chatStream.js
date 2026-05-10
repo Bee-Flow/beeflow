@@ -921,7 +921,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     }
 
     let iterations = 0;
-    const maxIterations = 10;
+    const maxIterations = parseInt(await configStore.getConfig('max_tool_rounds_chat'), 10) || 10;
     let toolCalls = [];
     let fullResponse = '';
     const _chatStartTime = Date.now();

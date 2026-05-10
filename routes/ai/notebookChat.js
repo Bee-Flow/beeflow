@@ -505,7 +505,7 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
         // Track mutable document content (updated by tool calls)
         let currentDocContent = documentContent || '';
         let toolCallRounds = 0;
-        const MAX_TOOL_ROUNDS = 5;
+        const MAX_TOOL_ROUNDS = parseInt(await configStore.getConfig('max_tool_rounds_chat'), 10) || 5;
 
         while (toolCallRounds < MAX_TOOL_ROUNDS) {
             let result;

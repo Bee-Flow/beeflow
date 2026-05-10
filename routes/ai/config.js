@@ -77,6 +77,8 @@ router.get('/config', async (req, res) => {
         embeddingProviderId: config.embeddingProviderId || null,
         allowedModelsByAgentType: await configStore.getConfig('allowedModelsByAgentType') || {},
         directChatRegexGuardrails: await configStore.getConfig('direct_chat_regex_guardrails') || null,
+        // Tool-call rounds limit for chat surfaces (direct/notebook/webpage/native loop). null -> per-surface defaults.
+        maxToolRoundsChat: await configStore.getConfig('max_tool_rounds_chat') || null,
         // Azure Document Intelligence
         hasAzureDocIntelligenceEndpoint: !!(await configStore.getConfig('azure_doc_intelligence_endpoint')),
         hasAzureDocIntelligenceKey: !!(await configStore.getSecret('azure_doc_intelligence_key')),
@@ -169,6 +171,18 @@ router.post('/config', requireAuth, async (req, res) => {
         const allowed = new Set(['agent-search', 'node-search', 'bing', 'disabled']);
         const value = allowed.has(req.body.searchProvider) ? req.body.searchProvider : 'agent-search';
         await configStore.setConfig('search_provider', value);
+    }
+    if (req.body.maxToolRoundsChat !== undefined) {
+        const raw = req.body.maxToolRoundsChat;
+        if (raw === null || raw === '' || raw === false) {
+            await configStore.setConfig('max_tool_rounds_chat', null);
+        } else {
+            const n = parseInt(raw, 10);
+            if (Number.isFinite(n)) {
+                const clamped = Math.min(Math.max(n, 1), 50);
+                await configStore.setConfig('max_tool_rounds_chat', clamped);
+            }
+        }
     }
     if (req.body.bingSearchKey !== undefined) {
         await configStore.setSecret('bing_search_key', req.body.bingSearchKey || '');

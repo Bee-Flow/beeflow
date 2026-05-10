@@ -2140,7 +2140,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         // All providers handle tool calls natively in streaming — no need for a separate non-streaming call
         const skipToolPrecheck = adapter.shouldUseResponsesApi?.(modelId, chatOptions) || ['google', 'openai', 'claude', 'mistral'].includes(config.providerType);
         let toolCallRounds = 0;
-        const MAX_TOOL_ROUNDS = 5;
+        const MAX_TOOL_ROUNDS = parseInt(await configStore.getConfig('max_tool_rounds_chat'), 10) || 5;
         // Step-machine guard. Completion is explicit — the LLM calls
         // `complete_session_skill` to advance. Without explicit completion,
         // the LLM streams its final answer alongside integration-tool calls

@@ -498,8 +498,8 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
         let toolCallRounds = 0;
         // 10 rounds — DB workflows (schema → seed → verify → fix) routinely run
         // long, and partial edits via webpage_file_replace cluster the same way.
-        // Was 5; raised because the model was hitting the cap mid-task.
-        const MAX_TOOL_ROUNDS = 10;
+        // Admin can override via max_tool_rounds_chat (AI Configuratie → Limits).
+        const MAX_TOOL_ROUNDS = parseInt(await configStore.getConfig('max_tool_rounds_chat'), 10) || 10;
         // Flips to true when the AI calls propose_webpage_plan — the chat
         // handler exits the streaming/tool loop after the current round so the
         // user gets a chance to approve before any files are touched.
