@@ -266,6 +266,7 @@ async function connectorJwtMiddleware(req, res, next) {
             email: user.email,
             displayName: user.displayName || user.id,
             role: user.role || 'user',
+            orgRole: user.orgRole || '',
             organizationId: user.organizationId || orgId,
             ncUid,
             provider: user.provider || 'nextcloud_connector',

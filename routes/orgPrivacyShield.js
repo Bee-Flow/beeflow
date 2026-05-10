@@ -175,8 +175,8 @@ router.put('/:orgId', requireAuth, async (req, res) => {
             action: action === 'redact' ? 'redact' : 'delete',
             moderationEnabled: !!moderationEnabled,
             // Exactly one moderation provider may run per turn. Default to the
-            // self-hosted Llama Guard; admins opt in to Azure explicitly.
-            moderationProvider: moderationProvider === 'azure' ? 'azure' : 'llamaguard',
+            // Azure Content Safety is the only supported provider.
+            moderationProvider: moderationProvider === 'azure' ? 'azure' : 'azure',
             moderationCategories: Array.isArray(moderationCategories) ? moderationCategories : [],
             euModeEnabled: !!euModeEnabled,
             webSearchGuardEnabled: !!webSearchGuardEnabled,

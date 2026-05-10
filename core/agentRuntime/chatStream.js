@@ -1506,7 +1506,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         }
                     }
 
-                    // Web Search Guard — validate agent_search queries through Llama Guard
+                    // Web Search Guard — validate agent_search queries through content moderation
                     if (webSearchGuardEnabled && toolName === 'agent_search' && toolArgs?.query) {
                         try {
                             const searchMessages = [{ role: 'user', content: toolArgs.query }];

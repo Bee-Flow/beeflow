@@ -64,7 +64,7 @@ router.get('/config', async (req, res) => {
         hasLinkedInConfig: !!(await configStore.getSecret('linkedin_client_id')) && !!(await configStore.getSecret('linkedin_client_secret')),
         regexGuardrails: config.regexGuardrails || null,
         llamaGuardConfig: config.llamaGuardConfig || null,
-        moderationProvider: config.moderationProvider || 'llamaguard',
+        moderationProvider: config.moderationProvider || 'azure',
         hasAzureContentSafetyEndpoint: !!(await configStore.getConfig('azure_content_safety_endpoint')),
         hasAzureContentSafetyKey: !!(await configStore.getSecret('azure_content_safety_key')),
         azureContentSafetySeverityThreshold: config.azureContentSafetySeverityThreshold ?? 2,

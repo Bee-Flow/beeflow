@@ -99,9 +99,9 @@ async function executeTool(toolName, toolArgs, context = {}) {
     const MEDIA_GEN_TOOLS = ['generate_image', 'generate_video', 'generate_music', 'generate_song', 'generate_tts', 'generate_sfx'];
     if (MEDIA_GEN_TOOLS.includes(toolName) && (toolArgs?.prompt || toolArgs?.text)) {
         try {
-            const { validateWithLlamaGuard } = require('./moderation');
+            const { validateInput } = require('./moderation');
             const promptText = toolArgs.prompt || toolArgs.text;
-            await validateWithLlamaGuard([{ role: 'user', content: promptText }], true);
+            await validateInput([{ role: 'user', content: promptText }], true);
             console.log(`[ToolDispatcher] Media gen prompt passed moderation (${toolName})`);
         } catch (guardErr) {
             if (guardErr.message?.includes('Safety Violation')) {
@@ -259,13 +259,17 @@ async function executeTool(toolName, toolArgs, context = {}) {
         return await executeN8nTool(toolName, toolArgs, orgId, attachments);
     }
     if (isAgentSearchTool(toolName)) {
-        // Check if admin configured Bing as the search provider
-        // Wrapped in try-catch to survive transient PostgreSQL DNS failures (EAI_AGAIN)
+        // Route by admin-configured search provider.
+        // Wrapped in try-catch to survive transient PostgreSQL DNS failures (EAI_AGAIN).
         try {
             const searchProvider = await configStore.getConfig('search_provider');
             if (searchProvider === 'bing') {
                 const { executeBingSearchTool } = require('../integrations/bingSearchTools');
                 return await executeBingSearchTool(toolName, toolArgs);
+            }
+            if (searchProvider === 'node-search') {
+                const { executeNodeSearchTool } = require('../integrations/nodeSearchTools');
+                return await executeNodeSearchTool(toolName, toolArgs);
             }
         } catch (cfgErr) {
             console.warn(`[ToolDispatcher] Config lookup failed (search_provider), using default: ${cfgErr.message}`);

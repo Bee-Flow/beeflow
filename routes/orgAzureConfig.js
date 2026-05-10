@@ -137,7 +137,7 @@ router.get('/:orgId', requireAuth, async (req, res) => {
             contentSafetyKeyMasked: maskSecret(contentSafetyKey),
             contentSafetySeverityThreshold: config.azureContentSafetySeverityThreshold ?? 2,
             contentSafetyCategories: config.azureContentSafetyCategories || null,
-            moderationProvider: config.moderationProvider || 'llamaguard',
+            moderationProvider: config.moderationProvider || 'azure',
 
             // PII Detection
             piiDetectionEnabled: config.piiDetectionEnabled === true || config.piiDetectionEnabled === 'true',

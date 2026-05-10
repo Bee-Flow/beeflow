@@ -76,7 +76,7 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
 
 
 
-        // 2. Llama Guard Moderation
+        // 2. Content moderation (Azure Content Safety)
         await validateInput(validationRequest, agent.config?.llamaGuardEnabled);
     }
 

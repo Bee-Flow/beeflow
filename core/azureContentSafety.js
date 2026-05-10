@@ -2,7 +2,7 @@
  * Azure AI Content Safety — cloud-based content moderation
  *
  * Uses the @azure-rest/ai-content-safety SDK to check text for harmful content.
- * Provides the same interface as the Llama Guard moderation (moderation.js)
+ * Provides the moderation interface used by moderation.js.
  * so it can be used as a drop-in alternative.
  *
  * Categories detected:

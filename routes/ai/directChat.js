@@ -2385,7 +2385,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                                         return { role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify({ error: 'Web search blocked — query violates content policy. Please rephrase.' }) };
                                     }
                                 }
-                                // 2. Llama Guard on search query
+                                // 2. Content moderation on search query
                                 if (webSearchGuardEnabled) {
                                     try {
                                         const { validateInput } = require('../../core/moderation');
@@ -2994,7 +2994,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                                 return { role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify({ error: 'Web search blocked — query violates content policy. Please rephrase.' }) };
                             }
                         }
-                        // 2. Llama Guard on search query
+                        // 2. Content moderation on search query
                         if (webSearchGuardEnabled) {
                             try {
                                 const { validateInput } = require('../../core/moderation');

@@ -80,8 +80,8 @@ async function resolveOrgShield(orgId) {
         // Other features
         moderationEnabled: !!shield.moderationEnabled,
         // Exactly one provider runs per turn. If the stored value is missing
-        // or unknown, default to Llama Guard (self-hosted).
-        moderationProvider: shield.moderationProvider === 'azure' ? 'azure' : 'llamaguard',
+        // or unknown, default to Azure Content Safety.
+        moderationProvider: shield.moderationProvider === 'azure' ? 'azure' : 'azure',
         moderationCategories: shield.moderationCategories || [],
         euModeEnabled: !!shield.euModeEnabled,
         webSearchGuardEnabled: !!shield.webSearchGuardEnabled,

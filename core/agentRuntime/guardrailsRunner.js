@@ -79,7 +79,7 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
     
     if (shouldCheckInputModeration) {
         try {
-            // Per-org provider override — exactly one of Llama Guard / Azure Content Safety
+            // Per-org provider override — Azure Content Safety
             // runs per turn. When the org hasn't explicitly picked one, moderation.js falls
             // back to the global `ai.moderationProvider` setting.
             const preferredProvider = orgShield?.enabled ? orgShield.moderationProvider : null;
@@ -116,7 +116,7 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
     }
 
     // ── PII Detection ─────────────────────────────────────────────────
-    // Runs independently of Llama Guard / Azure moderation.
+    // Runs independently of Azure Content Safety moderation.
     // Uses Azure Text Analytics when configured, falls back to CPU model via guard service.
     // Org-level PII gate: either Azure or Local (Transformers.js) satisfies
     // it. detectPii() routes between them in azurePiiDetection.js.
