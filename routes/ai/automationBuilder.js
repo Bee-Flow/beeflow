@@ -199,6 +199,36 @@ router.post('/stream', requireAuth, builderRateLimit, async (req, res) => {
         // Filter the tool schema set by feature flag.
         const tools = TOOL_SCHEMAS.filter(t => codeStepEnabled || t.function.name !== 'builder_add_code_step');
 
+        // Inspection tools: if the user has the webpages beta, expose the
+        // same surface the direct-chat AI uses (schema/query/exec, file
+        // read/write/replace/patch, set metadata, create, list). The builder
+        // calls them while designing the automation so it can read the real
+        // table columns before drafting an INSERT, etc.
+        let webpageInspectorEnabled = false;
+        let webpageInspectorCtx = null;
+        try {
+            const { userHasBetaFeature } = require('../../core/betaFeatures');
+            webpageInspectorEnabled = await userHasBetaFeature(userId, 'webpages', req.session);
+        } catch (_) { /* default false */ }
+        if (webpageInspectorEnabled) {
+            const { WEBPAGE_AUTOMATION_TOOLS } = require('../../integrations/webpageAutomationTools');
+            const { resolveUserGroups } = require('../../auth/audience');
+            const { resolveUserOrgIds } = require('../../auth/permissions');
+            const userGroupIds = await resolveUserGroups(userId).catch(() => []);
+            const orgIdsSet = await resolveUserOrgIds(req).catch(() => null);
+            const userOrgIds = orgIdsSet instanceof Set ? [...orgIdsSet] : [];
+            webpageInspectorCtx = {
+                userId,
+                organizationId: req.session?.user?.organizationId || null,
+                userGroupIds,
+                userOrgIds,
+            };
+            for (const tool of WEBPAGE_AUTOMATION_TOOLS) {
+                if (!tools.find(t => t.function.name === tool.function.name)) tools.push(tool);
+            }
+        }
+        const { isWebpageAutomationTool, executeWebpageAutomationTool } = require('../../integrations/webpageAutomationTools');
+
         // Compose messages.
         // Attachments are NOT actually executed (the Builder is a design-time
         // agent, not a runtime). We surface their names/types so the user can
@@ -247,8 +277,13 @@ router.post('/stream', requireAuth, builderRateLimit, async (req, res) => {
                     try { args = typeof tc.function.arguments === 'string' ? JSON.parse(tc.function.arguments) : tc.function.arguments; }
                     catch { args = {}; }
                     let toolResult;
-                    try { toolResult = await applyToolCall(name, args, draftWrap); }
-                    catch (e) { toolResult = { error: e.message }; }
+                    try {
+                        if (webpageInspectorEnabled && isWebpageAutomationTool(name)) {
+                            toolResult = await executeWebpageAutomationTool(name, args, webpageInspectorCtx);
+                        } else {
+                            toolResult = await applyToolCall(name, args, draftWrap);
+                        }
+                    } catch (e) { toolResult = { error: e.message }; }
                     send('tool_call', { name, arguments: args, result: toolResult });
 
                     // After every mutation, persist + emit a draft snapshot.

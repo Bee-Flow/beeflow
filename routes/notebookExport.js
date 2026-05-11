@@ -11,10 +11,98 @@
 const express = require('express');
 const router = express.Router();
 const { buildExportHTML, cleanContentForExport } = require('../templates/exportTemplate');
+const houseStyleStore = require('../stores/houseStyleStore');
+const userStore = require('../stores/userStore');
 
 function requireAuth(req, res, next) {
     if (req.session?.user) return next();
     res.status(401).json({ error: 'Unauthorized' });
+}
+
+function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// Pull the user's org id from session/user record. Returns null when unknown.
+async function userOrgId(req) {
+    const u = req.session?.user;
+    if (u?.organizationId) return u.organizationId;
+    if (!u?.id) return null;
+    try {
+        const full = await userStore.getUser(u.id);
+        return full?.organizationId || null;
+    } catch (_) {
+        return null;
+    }
+}
+
+/**
+ * Resolve the house style to apply to an export.
+ *   - explicit `houseStyleId === 'none'`  → no style
+ *   - explicit `houseStyleId === '<id>'`  → that style if it belongs to user's org
+ *   - otherwise                           → the org's default style (or null)
+ */
+async function resolveHouseStyle(req, houseStyleId) {
+    if (houseStyleId === 'none') return null;
+    const orgId = await userOrgId(req);
+    if (!orgId) return null;
+    if (houseStyleId) {
+        return await houseStyleStore.getById(houseStyleId, orgId).catch(() => null);
+    }
+    return await houseStyleStore.getDefaultForOrg(orgId).catch(() => null);
+}
+
+/**
+ * Build a CSS block + html-to-docx options object from a house style.
+ * Returns sensible defaults when style is null so callers don't branch.
+ */
+function buildDocxStylingFromHouseStyle(style) {
+    const meta = style?.styleMeta || {};
+    const defaultFont = meta.defaultFont || 'Calibri';
+    const defaultSize = Number(meta.defaultFontSize) || 11;
+    const margins = meta.margins || { top: 1440, right: 1440, bottom: 1440, left: 1440 };
+    const h1 = meta.headings?.h1 || { font: defaultFont, size: 20, bold: true, color: '#111111' };
+    const h2 = meta.headings?.h2 || { font: defaultFont, size: 16, bold: true, color: '#1e293b' };
+    const h3 = meta.headings?.h3 || { font: defaultFont, size: 13, bold: true, color: '#334155' };
+
+    const css = `
+        body { font-family: "${defaultFont}", Calibri, Arial, sans-serif; font-size: ${defaultSize}pt; line-height: 1.5; color: #1a1a1a; }
+        h1 { font-family: "${h1.font || defaultFont}", sans-serif; font-size: ${h1.size}pt; font-weight: ${h1.bold ? 'bold' : 'normal'}; color: ${h1.color || '#111111'}; margin-top: 18pt; margin-bottom: 8pt; }
+        h2 { font-family: "${h2.font || defaultFont}", sans-serif; font-size: ${h2.size}pt; font-weight: ${h2.bold ? 'bold' : 'normal'}; color: ${h2.color || '#1e293b'}; margin-top: 14pt; margin-bottom: 6pt; }
+        h3 { font-family: "${h3.font || defaultFont}", sans-serif; font-size: ${h3.size}pt; font-weight: ${h3.bold ? 'bold' : 'normal'}; color: ${h3.color || '#334155'}; margin-top: 12pt; margin-bottom: 4pt; }
+        p { margin-bottom: 6pt; }
+        table { width: 100%; border-collapse: collapse; margin: 8pt 0; }
+        th, td { border: 1pt solid #999; padding: 4pt 8pt; vertical-align: top; text-align: left; }
+        th { background-color: #f0f0f0; font-weight: bold; }
+        blockquote { border-left: 3pt solid ${meta.accents?.secondary || '#3b82f6'}; padding: 6pt 12pt; margin: 8pt 0; background: #f8f9fa; }
+        code { font-family: Consolas, monospace; font-size: 9pt; background: #f1f5f9; padding: 1pt 3pt; }
+        pre { background: #f5f5f5; padding: 10pt; font-family: Consolas, monospace; font-size: 9pt; margin: 8pt 0; border: 1pt solid #ddd; }
+        pre code { background: none; padding: 0; }
+        ul, ol { margin-left: 0.4in; margin-bottom: 6pt; }
+        li { margin-bottom: 2pt; }
+        img { max-width: 100%; }
+    `;
+
+    const opts = {
+        margin: margins,
+        font: defaultFont,
+        fontSize: defaultSize * 2, // html-to-docx wants half-points
+    };
+
+    // Header / footer best-effort text injection. html-to-docx accepts these
+    // as HTML fragments wrapped in <body>…</body>; we keep them minimal.
+    if (meta.header?.text) {
+        opts.header = true;
+        opts.headerType = 'default';
+        opts.headerHTML = `<p style="font-family:'${defaultFont}',sans-serif;font-size:${Math.max(8, defaultSize - 2)}pt;color:#555">${escapeHtml(meta.header.text)}</p>`;
+    }
+    if (meta.footer?.text) {
+        opts.footer = true;
+        opts.footerHTML = `<p style="font-family:'${defaultFont}',sans-serif;font-size:${Math.max(8, defaultSize - 2)}pt;color:#555">${escapeHtml(meta.footer.text)}</p>`;
+    }
+
+    return { css, opts };
 }
 
 // ── PDF Export (Playwright) ─────────────────────────────────────────────────
@@ -117,7 +205,7 @@ router.post('/:id/export/pdf', requireAuth, async (req, res) => {
 // ── DOCX Export (html-to-docx) ──────────────────────────────────────────────
 
 router.post('/:id/export/docx', requireAuth, async (req, res) => {
-    const { content, title = 'Notebook' } = req.body;
+    const { content, title = 'Notebook', houseStyleId } = req.body;
     if (!content) return res.status(400).json({ error: 'No content provided' });
 
     try {
@@ -132,6 +220,11 @@ router.post('/:id/export/docx', requireAuth, async (req, res) => {
         } catch (e) {
             return res.status(500).json({ error: 'html-to-docx not installed. Run: npm install html-to-docx' });
         }
+
+        // Resolve which house style to apply (explicit id, org default, or none).
+        const houseStyle = await resolveHouseStyle(req, houseStyleId);
+        const { css, opts: styleOpts } = buildDocxStylingFromHouseStyle(houseStyle);
+        if (houseStyle) console.log(`[Export] Applying house style "${houseStyle.name}" (${houseStyle.id})`);
 
         // Clean content for Word export
         const cleanedContent = cleanContentForExport(content);
@@ -152,23 +245,7 @@ router.post('/:id/export/docx', requireAuth, async (req, res) => {
 <head>
 <meta charset="utf-8">
 <title>${title}</title>
-<style>
-    body { font-family: Calibri, Arial, sans-serif; font-size: 11pt; line-height: 1.5; color: #1a1a1a; }
-    h1 { font-size: 20pt; font-weight: bold; color: #111; margin-top: 18pt; margin-bottom: 8pt; border-bottom: 1pt solid #d0d0d0; padding-bottom: 4pt; }
-    h2 { font-size: 16pt; font-weight: bold; color: #1e293b; margin-top: 14pt; margin-bottom: 6pt; }
-    h3 { font-size: 13pt; font-weight: bold; color: #334155; margin-top: 12pt; margin-bottom: 4pt; }
-    p { margin-bottom: 6pt; }
-    table { width: 100%; border-collapse: collapse; margin: 8pt 0; }
-    th, td { border: 1pt solid #999; padding: 4pt 8pt; vertical-align: top; text-align: left; }
-    th { background-color: #f0f0f0; font-weight: bold; }
-    blockquote { border-left: 3pt solid #3b82f6; padding: 6pt 12pt; margin: 8pt 0; background: #f8f9fa; }
-    code { font-family: Consolas, monospace; font-size: 9pt; background: #f1f5f9; padding: 1pt 3pt; }
-    pre { background: #f5f5f5; padding: 10pt; font-family: Consolas, monospace; font-size: 9pt; margin: 8pt 0; border: 1pt solid #ddd; }
-    pre code { background: none; padding: 0; }
-    ul, ol { margin-left: 0.4in; margin-bottom: 6pt; }
-    li { margin-bottom: 2pt; }
-    img { max-width: 100%; }
-</style>
+<style>${css}</style>
 </head>
 <body>
     ${cleanedContent}
@@ -180,14 +257,7 @@ router.post('/:id/export/docx', requireAuth, async (req, res) => {
             footer: true,
             pageNumber: true,
             title: title,
-            margin: {
-                top: 1440,    // 1 inch in twips (1 inch = 1440 twips)
-                right: 1440,
-                bottom: 1440,
-                left: 1440,
-            },
-            font: 'Calibri',
-            fontSize: 22,  // half-points (22 = 11pt)
+            ...styleOpts,
         });
 
         const duration = Date.now() - startTime;

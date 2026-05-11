@@ -10,6 +10,7 @@
 
 const express = require('express');
 const userStore = require('../stores/userStore');
+const stripeService = require('../services/stripeService');
 const { requireAuth } = require('../auth/permissions');
 
 const router = express.Router();
@@ -38,7 +39,11 @@ router.get('/offered-plans', requireAuth, async (req, res) => {
                 ncRecommended: !!p.nc_recommended,
                 stripePriceId: p.stripe_price_id || null,
             }));
-        res.json({ plans, stripeEnabled: !!process.env.STRIPE_SECRET_KEY });
+        // Stripe enablement is determined by configStore (the encrypted
+        // secret store) — not env. stripeService.isEnabled() is the source
+        // of truth that POST /api/stripe/checkout actually uses.
+        const stripeEnabled = await stripeService.isEnabled().catch(() => false);
+        res.json({ plans, stripeEnabled });
     } catch (e) {
         console.error('[Billing] offered-plans error:', e.message);
         res.status(500).json({ error: e.message });

@@ -104,6 +104,19 @@ async function initDB() {
         await exec(`ALTER TABLE webpages ADD COLUMN IF NOT EXISTS db_size INTEGER DEFAULT 0`);
     } catch (_) { /* column already exists — fine */ }
 
+    // Card metadata — emoji icon, accent colour and tagline the AI sets after
+    // building/editing a page so the Webpages list shows a visual identity
+    // instead of a generic file-code icon. Thumbnail is a small rendered
+    // screenshot stored under users/{userId}/webpages/{id}/thumbnail.png; we
+    // keep its sha + size in DB for cache-busting and cheap list rendering.
+    try {
+        await exec(`ALTER TABLE webpages ADD COLUMN IF NOT EXISTS icon TEXT DEFAULT ''`);
+        await exec(`ALTER TABLE webpages ADD COLUMN IF NOT EXISTS accent_color TEXT DEFAULT ''`);
+        await exec(`ALTER TABLE webpages ADD COLUMN IF NOT EXISTS tagline TEXT DEFAULT ''`);
+        await exec(`ALTER TABLE webpages ADD COLUMN IF NOT EXISTS thumbnail_sha256 TEXT DEFAULT ''`);
+        await exec(`ALTER TABLE webpages ADD COLUMN IF NOT EXISTS thumbnail_size INTEGER DEFAULT 0`);
+    } catch (_) { /* columns already exist — fine */ }
+
     // Publishing — same 3-mode model as agents/KBs: Personal (is_published=false),
     // Entire Org (is_published=true, shared_groups=[]), Specific Groups
     // (is_published=true, shared_groups=[...]). organization_id is set on first
@@ -233,6 +246,39 @@ async function restoreSlotFromVersion(userId, webpageId, versionId, slot) {
             try { await storageStore.deleteFile(dst); } catch (_) {}
             return false;
         }
+        throw err;
+    }
+}
+
+// ── Thumbnail helpers ──────────────────────────────────────────────
+//
+// A small rendered screenshot stored alongside the slot files in RustFS so
+// the Webpages list can render a real preview tile instead of a generic
+// icon. Owner-prefixed because every webpage lives under its owner's path.
+
+function thumbnailKey(userId, webpageId) {
+    return `users/${userId}/webpages/${webpageId}/thumbnail.png`;
+}
+
+async function writeThumbnail(userId, webpageId, buffer) {
+    if (!storageStore.isAvailable()) {
+        throw new Error('RustFS not configured — cannot persist thumbnail');
+    }
+    const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+    const key = thumbnailKey(userId, webpageId);
+    await storageStore.uploadFile(key, buf, 'image/png');
+    return { sha: crypto.createHash('sha256').update(buf).digest('hex'), size: buf.length };
+}
+
+async function readThumbnail(userId, webpageId) {
+    if (!storageStore.isAvailable()) return null;
+    try {
+        const { stream } = await storageStore.streamFile(thumbnailKey(userId, webpageId));
+        const chunks = [];
+        for await (const c of stream) chunks.push(c);
+        return Buffer.concat(chunks);
+    } catch (err) {
+        if (err?.name === 'NoSuchKey' || err?.$metadata?.httpStatusCode === 404) return null;
         throw err;
     }
 }
@@ -573,6 +619,13 @@ function canReadWebpage(webpage, userId, userGroupIds = [], userOrgIds = []) {
     return groups.some(g => userGroupIds.includes(g));
 }
 
+// Same surface as canReadWebpage. Automations were opted in to write to
+// shared/published webpages by product decision; if we later need to gate
+// writes more tightly (e.g. only writers in an explicit acl), narrow here.
+function canWriteWebpage(webpage, userId, userGroupIds = [], userOrgIds = []) {
+    return canReadWebpage(webpage, userId, userGroupIds, userOrgIds);
+}
+
 /**
  * Toggle published state + sharing scope. When sharedGroups is undefined,
  * preserve the existing DB value (same trap as agents had — see
@@ -620,6 +673,11 @@ async function updateWebpageMetadata(id, userId, updates) {
     if (updates.jsSize !== undefined) { setClauses.push(`js_size = $${idx++}`); params.push(updates.jsSize); }
     if (updates.dbSha !== undefined) { setClauses.push(`db_sha256 = $${idx++}`); params.push(updates.dbSha); }
     if (updates.dbSize !== undefined) { setClauses.push(`db_size = $${idx++}`); params.push(updates.dbSize); }
+    if (updates.icon !== undefined) { setClauses.push(`icon = $${idx++}`); params.push(updates.icon); }
+    if (updates.accentColor !== undefined) { setClauses.push(`accent_color = $${idx++}`); params.push(updates.accentColor); }
+    if (updates.tagline !== undefined) { setClauses.push(`tagline = $${idx++}`); params.push(updates.tagline); }
+    if (updates.thumbnailSha !== undefined) { setClauses.push(`thumbnail_sha256 = $${idx++}`); params.push(updates.thumbnailSha); }
+    if (updates.thumbnailSize !== undefined) { setClauses.push(`thumbnail_size = $${idx++}`); params.push(updates.thumbnailSize); }
 
     if (setClauses.length === 0) return false;
     setClauses.push(`updated_at = NOW()`);
@@ -779,6 +837,11 @@ function mapWebpageRow(r) {
         isPublished: r.is_published === true || r.is_published === 't',
         sharedGroups: parseJSON(r.shared_groups, []),
         organizationId: r.organization_id || null,
+        icon: r.icon || '',
+        accentColor: r.accent_color || '',
+        tagline: r.tagline || '',
+        thumbnailSha: r.thumbnail_sha256 || '',
+        thumbnailSize: parseInt(r.thumbnail_size) || 0,
         sourceCount: parseInt(r.source_count) || 0,
         createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
         updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : null,
@@ -938,6 +1001,7 @@ module.exports = {
     getWebpageRaw,
     getAccessibleWebpages,
     canReadWebpage,
+    canWriteWebpage,
     setWebpagePublished,
     updateWebpageMetadata,
     deleteWebpage,
@@ -952,6 +1016,10 @@ module.exports = {
     writeSlot,
     restoreSlotFromVersion,
     purgeWebpageObjects,
+    // Thumbnail
+    writeThumbnail,
+    readThumbnail,
+    thumbnailKey,
     // Extra files (multi-file)
     listExtraFiles,
     getExtraFile,

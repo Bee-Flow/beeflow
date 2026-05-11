@@ -275,6 +275,9 @@ router.delete('/users/:id', requireOrgAdminForUser, async (req, res) => {
 
     if (await userStore.deleteUser(id)) {
         console.log(`[Audit] ${req.session.user?.id || 'system'} deleted user '${id}'`);
+        // Clear any stale permission cache for the deleted user so existing
+        // sessions can't continue resolving against the cached snapshot.
+        await invalidatePermissionCache(id);
         res.json({ success: true });
     } else {
         res.status(404).json({ error: 'User not found' });
@@ -903,8 +906,10 @@ router.get('/beta-features', requireAdmin, async (req, res) => {
     res.json({ registry: BETA_FEATURES, assignments });
 });
 
-// Set beta features for an organization
-router.put('/organizations/:orgId/beta-features', requireOrgAdmin('orgId'), async (req, res) => {
+// Set beta features for an organization (super-admin allow-list).
+// This is the master capability list — org admins use the
+// /active-beta-features routes to toggle within this set.
+router.put('/organizations/:orgId/beta-features', requireAdmin, async (req, res) => {
     const { orgId } = req.params;
     const { features } = req.body;
 
@@ -914,9 +919,124 @@ router.put('/organizations/:orgId/beta-features', requireOrgAdmin('orgId'), asyn
 
     if (await setOrgBetaFeatures(orgId, features)) {
         const updatedFeatures = await getOrgBetaFeatures(orgId);
+        // Trim the org-admin "enabled" subset to what's still in the
+        // allow-list so a feature pulled by the super admin can't linger.
+        try {
+            const current = await userStore.getOrgEnabledBetaFeatures(orgId);
+            const trimmed = current.filter(id => updatedFeatures.includes(id));
+            if (trimmed.length !== current.length) {
+                await userStore.setOrgEnabledBetaFeatures(orgId, trimmed);
+            }
+        } catch (e) { /* non-fatal */ }
         res.json({ success: true, features: updatedFeatures });
     } else {
         res.status(500).json({ error: 'Failed to update beta features' });
+    }
+});
+
+// ── Org-admin "active" subset routes ─────────────────────────────
+// The super admin sets allow-lists (organizations.beta_features and
+// organizations.enabledIntegrations). The org admin uses these four
+// routes to flip individual items on/off within their allow-list.
+// Both layers are intersected at runtime; an item must be in BOTH lists
+// to be active.
+
+const { NC_INTEGRATION_ID_SET: NC_ID_SET } = (() => {
+    try { return require('../core/ncIntegrationCatalog'); }
+    catch (_) { return { NC_INTEGRATION_ID_SET: new Set() }; }
+})();
+
+function parseAllowedIntegrations(raw) {
+    if (raw === null || raw === undefined) return [];
+    if (Array.isArray(raw)) return raw;
+    try { const v = JSON.parse(raw); return Array.isArray(v) ? v : []; }
+    catch (_) { return []; }
+}
+
+router.get('/organizations/:orgId/active-integrations', requireOrgAdmin('orgId'), async (req, res) => {
+    try {
+        const { orgId } = req.params;
+        const org = await userStore.getOrganization(orgId);
+        if (!org) return res.status(404).json({ error: 'Organization not found' });
+        // Allow-list is the super-admin's enabledIntegrations minus NC IDs
+        // (NC is managed by its dedicated panel). null = all enabled, which
+        // we materialise via the global default list at request time.
+        let allowed;
+        const raw = org.enabledIntegrations;
+        if (raw === null || raw === undefined) {
+            const globalDefaults = await configStore.getConfig('default_org_integrations');
+            allowed = globalDefaults ? parseAllowedIntegrations(globalDefaults) : ALL_INTEGRATIONS.map(i => i.id);
+        } else {
+            allowed = parseAllowedIntegrations(raw);
+        }
+        allowed = allowed.filter(id => !NC_ID_SET.has(id));
+        const enabled = await userStore.getOrgEnabledIntegrations(orgId);
+        res.json({ allowed, enabled });
+    } catch (e) {
+        console.error('[ActiveIntegrations] GET error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+router.put('/organizations/:orgId/active-integrations', requireOrgAdmin('orgId'), async (req, res) => {
+    try {
+        const { orgId } = req.params;
+        const { enabled } = req.body || {};
+        if (!Array.isArray(enabled)) {
+            return res.status(400).json({ error: 'enabled must be an array of integration IDs' });
+        }
+        const org = await userStore.getOrganization(orgId);
+        if (!org) return res.status(404).json({ error: 'Organization not found' });
+        let allowed;
+        const raw = org.enabledIntegrations;
+        if (raw === null || raw === undefined) {
+            const globalDefaults = await configStore.getConfig('default_org_integrations');
+            allowed = globalDefaults ? parseAllowedIntegrations(globalDefaults) : ALL_INTEGRATIONS.map(i => i.id);
+        } else {
+            allowed = parseAllowedIntegrations(raw);
+        }
+        const allowedSet = new Set(allowed.filter(id => !NC_ID_SET.has(id)));
+        // Intersect — drop anything not in the allow-list (incl. NC IDs).
+        const clean = Array.from(new Set(enabled.filter(id => allowedSet.has(id))));
+        if (!(await userStore.setOrgEnabledIntegrations(orgId, clean))) {
+            return res.status(500).json({ error: 'Failed to save' });
+        }
+        res.json({ success: true, enabled: clean });
+    } catch (e) {
+        console.error('[ActiveIntegrations] PUT error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+router.get('/organizations/:orgId/active-beta-features', requireOrgAdmin('orgId'), async (req, res) => {
+    try {
+        const { orgId } = req.params;
+        const allowed = await getOrgBetaFeatures(orgId); // returns string[] of IDs
+        const enabled = await userStore.getOrgEnabledBetaFeatures(orgId);
+        res.json({ allowed, enabled, registry: BETA_FEATURES });
+    } catch (e) {
+        console.error('[ActiveBetaFeatures] GET error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+router.put('/organizations/:orgId/active-beta-features', requireOrgAdmin('orgId'), async (req, res) => {
+    try {
+        const { orgId } = req.params;
+        const { enabled } = req.body || {};
+        if (!Array.isArray(enabled)) {
+            return res.status(400).json({ error: 'enabled must be an array of feature IDs' });
+        }
+        const allowed = await getOrgBetaFeatures(orgId);
+        const allowedSet = new Set(allowed);
+        const clean = Array.from(new Set(enabled.filter(id => allowedSet.has(id))));
+        if (!(await userStore.setOrgEnabledBetaFeatures(orgId, clean))) {
+            return res.status(500).json({ error: 'Failed to save' });
+        }
+        res.json({ success: true, enabled: clean });
+    } catch (e) {
+        console.error('[ActiveBetaFeatures] PUT error:', e.message);
+        res.status(500).json({ error: e.message });
     }
 });
 

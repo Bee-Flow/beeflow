@@ -68,7 +68,7 @@ const ALLOWED_ORIGINS = (process.env.CORS_ORIGIN || 'https://dev.beeflow.ai,http
 // content-script, which doesn't go through this CORS check.
 const ALLOW_BROWSER_EXTENSIONS = process.env.ALLOW_BROWSER_EXTENSIONS === 'true';
 
-app.use(cors({
+const globalCors = cors({
     origin: (origin, cb) => {
         // Same-origin / curl / server-to-server (no Origin header)
         if (!origin) return cb(null, true);
@@ -91,7 +91,23 @@ app.use(cors({
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Session-Token']
-}));
+});
+
+// Sandboxed preview iframes have an opaque origin (`Origin: null`) and never
+// carry cookies. Auth on /api/webpages-preview/* is HMAC bearer tokens scoped
+// to (userId, webpageId), so the origin check buys nothing — we just need
+// permissive CORS so the browser doesn't pre-flight-block the calls.
+const previewCors = cors({
+    origin: true,           // reflect whatever Origin the iframe sends, including 'null'
+    credentials: false,     // never send cookies; the bearer token is the trust anchor
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+});
+
+app.use((req, res, next) => {
+    if (req.path.startsWith('/api/webpages-preview/')) return previewCors(req, res, next);
+    return globalCors(req, res, next);
+});
 
 // Stripe webhook needs raw body for signature verification — must be BEFORE bodyParser.json
 app.use('/api/stripe/webhook', express.raw({ type: 'application/json' }));
@@ -271,6 +287,7 @@ app.use('/api/feedback', require('./routes/feedback'));
 app.use('/api/client-errors', require('./routes/clientErrors'));
 app.use('/api/org-privacy-shield', require('./routes/orgPrivacyShield'));
 app.use('/api/org-azure-config', require('./routes/orgAzureConfig'));
+app.use('/api/house-styles', require('./routes/houseStyles'));
 // Compliance Hub — Enterprise-tier feature.
 app.use('/api/compliance', (req, res, next) => require('./license/middleware').requireFeature('compliance_hub_gdpr')(req, res, next), require('./routes/compliance'));
 app.use('/api/chat/dlp-decision', require('./routes/dlpDecision'));

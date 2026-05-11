@@ -7,7 +7,7 @@ const { getAIConfig, getProviderForModel } = require('../../core/aiAgent');
 const configStore = require('../../stores/configStore');
 const { requirePermission } = require('../../auth');
 const MemoryStore = require('../../stores/memoryStore');
-const { resolveUserOrgIds } = require('../../auth');
+const { resolveUserOrgIds, validateSharedGroupsForOrg } = require('../../auth');
 const { getEffectiveUserId, getUserAuth } = require('../../utils/routeHelpers');
 
 const userStore = require('../../stores/userStore');
@@ -108,15 +108,24 @@ router.patch('/:id/publish', async (req, res) => {
     }
 
     const { isPublished, sharedGroups } = req.body;
+
+    // Validate sharedGroups belong to the agent's org. Undefined → leave as-is.
+    let cleanedGroups;
+    try {
+        cleanedGroups = await validateSharedGroupsForOrg(agent.organization_id, sharedGroups);
+    } catch (e) {
+        return res.status(e.status || 500).json({ error: e.message });
+    }
+
     // Use agent.owner_id (not userId) so the SQL WHERE owner_id matches even when
     // a non-owner (org admin, agent admin) is toggling publish.
-    const success = await agentStore.setAgentPublished(req.params.id, isPublished, agent.owner_id, sharedGroups);
+    const success = await agentStore.setAgentPublished(req.params.id, isPublished, agent.owner_id, cleanedGroups);
 
     if (!success) {
         return res.status(500).json({ error: 'Failed to update published status' });
     }
 
-    res.json({ success: true, isPublished, sharedGroups });
+    res.json({ success: true, isPublished, sharedGroups: cleanedGroups });
 });
 
 

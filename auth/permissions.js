@@ -1,8 +1,23 @@
 /**
  * Permissions, Middleware & Config
- * 
+ *
  * RBAC system with group/role resolution, middleware factories,
  * and auth config load/save via configStore.
+ *
+ * Studio authorization helpers:
+ *   - assertUserCanUseOrg(req, orgId)   — validates that the requesting user
+ *     belongs to `orgId` (or defaults to their primary org if omitted). Use
+ *     on every create endpoint that accepts `organizationId` from the body.
+ *   - validateSharedGroupsForOrg(orgId, ids) — confirms every supplied group
+ *     ID belongs to `orgId`. Use on every publish/share endpoint that mutates
+ *     `shared_groups`.
+ *
+ * Notes:
+ *   - Routines (automations) are intentionally user-private and do not have
+ *     `is_published` / `shared_groups` columns.
+ *   - The legacy `knowledge_metadata` table (per-agent) is NOT the studio KB
+ *     path. Studio KBs live in `knowledge_bases` and use the same
+ *     org + is_published + shared_groups model as Agents and Webpages.
  */
 
 const path = require('path');
@@ -33,6 +48,7 @@ const SYSTEM_PERMISSIONS = [
     // ── Actions ──
     { id: 'manage_users', name: 'Manage Users', description: 'Create, edit, and delete users', group: 'actions' },
     { id: 'manage_agents', name: 'Manage Agents', description: 'Create, edit, delete, and publish agents', group: 'actions' },
+    { id: 'manage_skills', name: 'Manage Skills', description: 'Create, edit, delete, and share skills', group: 'actions' },
     { id: 'manage_components', name: 'Manage Components', description: 'Create and edit workflow components', group: 'actions' },
     { id: 'manage_knowledge', name: 'Manage Knowledge', description: 'Create, edit, delete, and ingest knowledge bases', group: 'actions' },
     { id: 'manage_apps', name: 'Manage Apps', description: 'Create and publish apps', group: 'actions' },
@@ -490,6 +506,95 @@ function requireOrgAdmin(paramName = 'id') {
     };
 }
 
+/**
+ * Resolve the requesting user's primary org ID from the session.
+ * Returns the first org they belong to, or null. Super admins return null.
+ */
+async function resolvePrimaryOrgId(req) {
+    const orgIds = await resolveUserOrgIds(req);
+    if (orgIds === null) return null;
+    if (orgIds.size === 0) return null;
+    return Array.from(orgIds)[0];
+}
+
+/**
+ * Studio authorization helper: throws a 403-shaped Error if the requesting
+ * user does not belong to `orgId`. If `orgId` is falsy, falls back to the
+ * user's primary org. Returns the validated orgId.
+ *
+ * Super admins (resolveUserOrgIds === null) bypass the membership check but
+ * still get back the orgId they supplied (or null if none).
+ *
+ * Usage:
+ *   try {
+ *     const orgId = await assertUserCanUseOrg(req, req.body.organizationId);
+ *     // proceed with orgId
+ *   } catch (err) {
+ *     return res.status(err.status || 500).json({ error: err.message });
+ *   }
+ */
+async function assertUserCanUseOrg(req, orgId) {
+    const userOrgIds = await resolveUserOrgIds(req);
+    // Super admin: trust the supplied orgId, or null
+    if (userOrgIds === null) return orgId || null;
+
+    if (!orgId) {
+        // No explicit orgId — fall back to primary
+        if (userOrgIds.size === 0) {
+            const err = new Error('User does not belong to any organisation');
+            err.status = 403;
+            throw err;
+        }
+        return Array.from(userOrgIds)[0];
+    }
+
+    if (!userOrgIds.has(orgId)) {
+        const err = new Error('Organisation not accessible');
+        err.status = 403;
+        throw err;
+    }
+    return orgId;
+}
+
+/**
+ * Studio authorization helper: throws a 400-shaped Error if any of
+ * `sharedGroupIds` does not belong to `orgId`. An empty/undefined list is a
+ * no-op. Returns the validated array (deduped, falsy entries dropped).
+ *
+ * Usage:
+ *   try {
+ *     const groups = await validateSharedGroupsForOrg(orgId, sharedGroups);
+ *     await store.setPublished(id, true, groups);
+ *   } catch (err) {
+ *     return res.status(err.status || 500).json({ error: err.message });
+ *   }
+ */
+async function validateSharedGroupsForOrg(orgId, sharedGroupIds) {
+    if (sharedGroupIds === undefined || sharedGroupIds === null) return undefined;
+    if (!Array.isArray(sharedGroupIds)) {
+        const err = new Error('sharedGroups must be an array');
+        err.status = 400;
+        throw err;
+    }
+    const ids = Array.from(new Set(sharedGroupIds.filter(Boolean)));
+    if (ids.length === 0) return [];
+    if (!orgId) {
+        const err = new Error('Cannot assign shared groups: resource has no organisation');
+        err.status = 400;
+        throw err;
+    }
+
+    const allGroups = await userStore.getAllGroups();
+    const orgGroupIds = new Set(allGroups.filter(g => g.organizationId === orgId).map(g => g.id));
+    const invalid = ids.filter(id => !orgGroupIds.has(id));
+    if (invalid.length > 0) {
+        const err = new Error(`Invalid groups for this organisation: ${invalid.join(', ')}`);
+        err.status = 400;
+        throw err;
+    }
+    return ids;
+}
+
 module.exports = {
     SYSTEM_PERMISSIONS,
     OAUTH_PROVIDERS,
@@ -502,7 +607,10 @@ module.exports = {
     requirePermission,
     requirePluginAdmin,
     resolveUserOrgIds,
+    resolvePrimaryOrgId,
     requireOrgAdmin,
+    assertUserCanUseOrg,
+    validateSharedGroupsForOrg,
     invalidatePermissionCache,
     invalidateAllPermissionCaches
 };

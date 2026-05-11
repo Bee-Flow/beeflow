@@ -277,6 +277,15 @@ router.get('/catalog', async (req, res) => {
             }
         } catch (_) { /* user might not be fully set up */ }
 
+        // Webpages aren't surfaced via getIntegrationTools (direct chat injects
+        // them separately to avoid name collisions with its in-editor tools), so
+        // check the beta gate directly to decide availability.
+        let webpagesAvailable = false;
+        try {
+            const { userHasBetaFeature } = require('../core/betaFeatures');
+            webpagesAvailable = await userHasBetaFeature(userId, 'webpages', req.session);
+        } catch (_) { /* default false */ }
+
         const apps = TOOL_REGISTRY.map(entry => {
             const tools = loadTools(entry);
             const actions = tools.map(t => {
@@ -291,7 +300,9 @@ router.get('/catalog', async (req, res) => {
                     sideEffect: isSideEffect(name),
                 };
             }).filter(Boolean);
-            const available = actions.some(a => userToolNames.has(a.name));
+            const available = entry.app === 'webpages'
+                ? webpagesAvailable
+                : actions.some(a => userToolNames.has(a.name));
             return { id: entry.app, label: entry.label, available, actions };
         });
 

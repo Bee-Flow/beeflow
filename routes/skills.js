@@ -8,21 +8,7 @@ const express = require('express');
 const router = express.Router();
 const skillStore = require('../stores/skillStore');
 const userStore = require('../stores/userStore');
-
-// Drop any group IDs whose organizationId doesn't match the skill's org.
-// Skills are queried by org_id at read time, so a foreign-org group ID is
-// dead weight at best — but it's also a regression hazard if the org filter
-// is ever loosened. Strip it here so the column only ever holds valid IDs.
-async function sanitizeSharedGroups(orgId, sharedGroups) {
-    if (!Array.isArray(sharedGroups) || sharedGroups.length === 0) return [];
-    try {
-        const allGroups = await userStore.getAllGroups();
-        const orgGroupIds = new Set(allGroups.filter(g => g.organizationId === orgId).map(g => g.id));
-        return sharedGroups.filter(id => orgGroupIds.has(id));
-    } catch (_) {
-        return [];
-    }
-}
+const { requirePermission, validateSharedGroupsForOrg } = require('../auth');
 
 // ── Auth guard (same pattern as other routes) ────────────────
 function requireAuth(req, res, next) {
@@ -55,7 +41,7 @@ router.get('/', async (req, res) => {
 });
 
 // ── POST /api/skills — create a new skill ────────────────────
-router.post('/', async (req, res) => {
+router.post('/', requirePermission('manage_skills'), async (req, res) => {
     try {
         const orgId = await getOrgId(req);
         if (!orgId) return res.status(400).json({ error: 'No organization found' });
@@ -69,7 +55,12 @@ router.post('/', async (req, res) => {
             return res.status(400).json({ error: 'Instructions too long (max 4000 characters)' });
         }
 
-        const cleanedGroups = await sanitizeSharedGroups(orgId, sharedGroups);
+        let cleanedGroups;
+        try {
+            cleanedGroups = await validateSharedGroupsForOrg(orgId, sharedGroups);
+        } catch (e) {
+            return res.status(e.status || 500).json({ error: e.message });
+        }
         const skill = await skillStore.createSkill({
             orgId,
             userId: req.session.user.id,
@@ -82,7 +73,7 @@ router.post('/', async (req, res) => {
             icon,
             isShared,
             dynamicActivation,
-            sharedGroups: cleanedGroups,
+            sharedGroups: cleanedGroups || [],
             automationId: automationId || null,
         });
         res.status(201).json(skill);
@@ -108,19 +99,23 @@ router.get('/:id', async (req, res) => {
 });
 
 // ── PUT /api/skills/:id — update a skill ─────────────────────
-router.put('/:id', async (req, res) => {
+router.put('/:id', requirePermission('manage_skills'), async (req, res) => {
     try {
         const { name, description, instructions, workflow, rules, examples, icon, isShared, dynamicActivation, sharedGroups, automationId } = req.body;
         if (instructions && instructions.length > 4000) {
             return res.status(400).json({ error: 'Instructions too long (max 4000 characters)' });
         }
 
-        // Strip foreign-org group IDs before persisting. Only run when the
-        // caller explicitly sent sharedGroups — undefined means "leave as-is".
+        // Validate sharedGroups belong to the skill's org. `undefined` means
+        // "leave as-is" — the store preserves the existing value.
         let cleanedGroups;
         if (sharedGroups !== undefined) {
             const orgId = await getOrgId(req);
-            cleanedGroups = await sanitizeSharedGroups(orgId, Array.isArray(sharedGroups) ? sharedGroups : []);
+            try {
+                cleanedGroups = await validateSharedGroupsForOrg(orgId, sharedGroups);
+            } catch (e) {
+                return res.status(e.status || 500).json({ error: e.message });
+            }
         }
         const updated = await skillStore.updateSkill(req.params.id, req.session.user.id, {
             name, description, instructions, workflow, rules, examples, icon, isShared, dynamicActivation,

@@ -16,7 +16,10 @@ const {
     hasPermission,
     getUserPermissions,
     resolveUserOrgIds,
+    resolvePrimaryOrgId,
     requireOrgAdmin,
+    assertUserCanUseOrg,
+    validateSharedGroupsForOrg,
     invalidatePermissionCache,
     invalidateAllPermissionCaches
 } = require('./permissions');
@@ -44,7 +47,10 @@ module.exports = {
     hasPermission,
     getUserPermissions,
     resolveUserOrgIds,
+    resolvePrimaryOrgId,
     requireOrgAdmin,
+    assertUserCanUseOrg,
+    validateSharedGroupsForOrg,
     invalidatePermissionCache,
     invalidateAllPermissionCaches,
     canSeePublished,

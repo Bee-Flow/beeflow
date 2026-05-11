@@ -7,7 +7,7 @@ const { getAIConfig, getProviderForModel } = require('../../core/aiAgent');
 const configStore = require('../../stores/configStore');
 const { requirePermission } = require('../../auth');
 const MemoryStore = require('../../stores/memoryStore');
-const { resolveUserOrgIds, canSeePublished, resolveUserGroups } = require('../../auth');
+const { resolveUserOrgIds, canSeePublished, resolveUserGroups, assertUserCanUseOrg, validateSharedGroupsForOrg } = require('../../auth');
 const { getEffectiveUserId, getUserAuth } = require('../../utils/routeHelpers');
 
 const userStore = require('../../stores/userStore');
@@ -140,13 +140,24 @@ router.post('/', requirePermission('manage_agents'), async (req, res) => {
         return res.status(400).json({ error: 'Name is required' });
     }
 
-    // Auto-assign the user's first organization if none provided
-    let assignOrgId = organizationId;
-    if (!assignOrgId) {
-        const orgIds = await resolveUserOrgIds(req);
-        if (orgIds !== null && orgIds.size > 0) {
-            assignOrgId = Array.from(orgIds)[0];
-        }
+    // Validate that the user actually belongs to the requested organisation
+    // (or auto-assign their primary org when none was provided). Trusting
+    // organizationId from the body would let any member create agents in
+    // other orgs.
+    let assignOrgId;
+    try {
+        assignOrgId = await assertUserCanUseOrg(req, organizationId);
+    } catch (err) {
+        return res.status(err.status || 500).json({ error: err.message });
+    }
+
+    // Strip any shared_groups that don't belong to the agent's org. Empty/
+    // unset on create is fine — publish endpoint is the canonical write path.
+    let cleanedSharedGroups;
+    try {
+        cleanedSharedGroups = await validateSharedGroupsForOrg(assignOrgId, sharedGroups);
+    } catch (err) {
+        return res.status(err.status || 500).json({ error: err.message });
     }
 
     // Check agent count limit
@@ -171,7 +182,7 @@ router.post('/', requirePermission('manage_agents'), async (req, res) => {
         workspaceEnabled === true,
         config || {},
         assignOrgId || null,
-        sharedGroups || [],
+        cleanedSharedGroups || [],
         categoryId || null
     );
 
@@ -183,6 +194,67 @@ router.post('/', requirePermission('manage_agents'), async (req, res) => {
 
     res.json(agent);
 });
+
+// Validate that every cross-element ID referenced from an agent's config is
+// accessible to the AGENT'S OWNER (not the requesting user). This closes the
+// leak path where an editor in org A could attach a KB/skill that belongs to
+// a different org — once the agent is published, anyone who can see the
+// agent would receive cross-org data through it.
+async function validateAgentConfigReferences(agent, config) {
+    if (!config || typeof config !== 'object') return;
+    const errors = [];
+
+    const ownerId = agent.owner_id;
+    const agentOrgId = agent.organization_id || null;
+    const owner = await userStore.getUser(ownerId).catch(() => null);
+    const ownerOrgIds = new Set();
+    if (owner?.organizationId) ownerOrgIds.add(owner.organizationId);
+    let ownerGroups = [];
+    if (owner) {
+        ownerGroups = Array.isArray(owner.groups)
+            ? owner.groups
+            : (() => { try { return JSON.parse(owner.groups || '[]'); } catch { return []; } })();
+        if (ownerGroups.length > 0) {
+            const allGroups = await userStore.getAllGroups().catch(() => []);
+            for (const gid of ownerGroups) {
+                const g = allGroups.find(x => x.id === gid);
+                if (g?.organizationId) ownerOrgIds.add(g.organizationId);
+            }
+        }
+    }
+
+    // ── Knowledge base references ──
+    const kbIds = Array.isArray(config.knowledge_base_ids) ? config.knowledge_base_ids.filter(Boolean) : [];
+    if (kbIds.length > 0) {
+        const kbStore = require('../../stores/knowledgeBases');
+        for (const kbId of kbIds) {
+            const kb = await kbStore.getKB(kbId).catch(() => null);
+            if (!kb || !kbStore.canUserAccessKB(kb, ownerId, ownerOrgIds, ownerGroups)) {
+                errors.push(`knowledge base ${kbId}`);
+            }
+        }
+    }
+
+    // ── Skill references (wizard stores them as attachedSkillIds) ──
+    const skillIds = Array.isArray(config.attachedSkillIds) ? config.attachedSkillIds.filter(Boolean) : [];
+    if (skillIds.length > 0 && agentOrgId) {
+        const skillStore = require('../../stores/skillStore');
+        for (const sid of skillIds) {
+            const skill = await skillStore.getSkill(sid, agentOrgId, ownerId).catch(() => null);
+            if (!skill) errors.push(`skill ${sid}`);
+        }
+    } else if (skillIds.length > 0 && !agentOrgId) {
+        // Agent has no org but is referencing skills — block since skills are
+        // strictly org-scoped.
+        for (const sid of skillIds) errors.push(`skill ${sid}`);
+    }
+
+    if (errors.length > 0) {
+        const err = new Error(`Agent owner cannot access: ${errors.join(', ')}`);
+        err.status = 400;
+        throw err;
+    }
+}
 
 // Helper to enforce Agent Editor restriction
 async function canModifyAgent(agent, userId, req) {
@@ -253,6 +325,21 @@ router.put('/:id', requirePermission('manage_agents'), async (req, res) => {
         const orgIds = await resolveUserOrgIds(req);
         if (orgIds !== null && orgIds.size > 0) {
             assignOrgId = Array.from(orgIds)[0];
+        }
+    }
+
+    // Validate cross-element references in config (KB / skill IDs). Done
+    // BEFORE the DB write so a bad config doesn't half-commit.
+    if (config !== undefined && config !== null) {
+        try {
+            // Use the *new* config to validate, plus the agent's existing
+            // organization_id so skill lookups scope correctly.
+            await validateAgentConfigReferences(
+                { ...agent, organization_id: assignOrgId },
+                config
+            );
+        } catch (e) {
+            return res.status(e.status || 500).json({ error: e.message });
         }
     }
 

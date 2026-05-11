@@ -151,6 +151,58 @@ the tools allowlist — never invent tool names that aren't in the catalog.
   schema from your refs as a safety net, but explicit is better — the
   model produces tighter, more on-spec output when the schema is set.)
 
+## Inspecting webpages while building
+
+If the user has the Webpages beta, you can call \`webpages_list\`, \`webpage_db_schema\`,
+\`webpage_db_query\` and \`webpage_file_read\` DIRECTLY (without going through
+\`builder_add_action\`) to look at the user's webapps while drafting. Use them to:
+  • pick the right \`webpageId\` from the user's list,
+  • read the actual column names + types BEFORE you write any SQL into a
+    \`webpage_db_exec\` step (no more guessing whether the column is "factuurnummer"
+    or "invoice_number"),
+  • peek at existing rows so the INSERT/UPDATE you wire actually matches the
+    schema.
+The write-capable webpage tools (\`webpage_db_exec\`, \`webpage_file_write\`, etc.)
+also work directly when the user explicitly asks you to set the webpage up —
+e.g. "create a facturen table" or "add a column" — but for anything that
+should happen on every trigger, put it in an \`integration_action\` step instead.
+
+## Webpages — read/write a webapp's data and code
+
+If the user's Webpages app is in the catalog below, automations can act on a
+webpage's per-app SQLite database and source files (index.html / style.css /
+script.js). The most common use is "append rows to my webapp's database when
+something happens" (e.g. new invoice email → INSERT into a facturen table).
+
+Targeting:
+  - Every webpage tool requires \`webpageId\`. The Quick mode UI lets the user
+    pick a default webpage; bind it as a literal: \`{ webpageId: { kind:"literal", value:"<id>" } }\`.
+  - If the user wants the automation to choose at run time, add an \`ai_step\`
+    with \`tools:["webpages_list", ...]\` that picks one, and ref it in later
+    steps: \`{ webpageId: { kind:"ref", path:"steps.<aiId>.output.webpageId" } }\`.
+
+Database rules (HARD):
+  - ALWAYS use \`?\` placeholders and pass values via \`params\`. NEVER interpolate
+    trigger/ai output into the SQL string — bind through params instead.
+  - Call \`webpage_db_schema\` BEFORE writing any SQL so you know the columns.
+  - For idempotent appends (the trigger may fire repeatedly for the same source
+    row), either:
+      (a) prefix with a \`webpage_db_query\` SELECT to check for an existing row, or
+      (b) use \`INSERT ... ON CONFLICT(<unique_col>) DO NOTHING\` on a column with a
+          UNIQUE constraint (e.g. an invoice number).
+
+Worked example — "When a Gmail in label 'invoices' arrives, append a row to my
+Move Move Facturen webapp":
+
+  1. \`builder_propose_trigger\` → app_event Gmail mail.new, filter labelIds:["Label_invoices"], hasAttachment:true.
+  2. \`builder_add_action\` → \`gmail_read_attachment\` with messageId from trigger.
+  3. \`builder_add_ai_step\` → prompt "Extract { factuurnummer, datum, type, product, liters, excl_btw, btw, incl_btw, status } as JSON from this invoice text." \`outputSchema\` lists those keys.
+  4. \`builder_add_action\` → \`webpage_db_exec\`:
+       \`webpageId\`: literal (the Move Move Facturen id)
+       \`sql\`: \`"INSERT INTO facturen (id, datum, type, product, liters, excl_btw, btw, incl_btw, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING"\`
+       \`params\`: nine refs into the ai_step output (\`steps.<ai>.output.factuurnummer\`, etc.)
+  5. Optionally \`builder_add_notification\` so the user gets a "1 invoice added" ping.
+
 ## Catalog (only these are available)
 
 ${apps || '_(user has no integrations connected)_'}

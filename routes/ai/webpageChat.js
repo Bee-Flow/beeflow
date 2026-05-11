@@ -446,20 +446,64 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
         }
 
         if (attachments && attachments.length > 0) {
+            // Use the unified extractor so PDFs / DOCX / spreadsheets get the
+            // same pipeline as direct chat — previously this path was just
+            // base64-decode-as-utf8-and-slice, which fed the model raw PDF
+            // binary and made it claim it "can't read the file."
+            const { extractAttachment, formatTextHeader, formatImagesHeader, formatFailureNote } = require('../../core/attachmentExtractor');
+            const isClaude = (config?.providerType || '').toLowerCase() === 'claude' || (config?.providerType || '').toLowerCase() === 'anthropic';
+            const modelSupportsVision = typeof adapter?.supportsVision === 'function' ? adapter.supportsVision(modelId) : false;
+
             const contentParts = [];
             if (message) contentParts.push({ type: 'text', text: message });
             for (const att of attachments) {
                 try {
                     if (att.type && att.type.startsWith('image/') && att.content) {
-                        contentParts.push({ type: 'image_url', image_url: { url: att.content } });
-                    } else if (att.content && typeof att.content === 'string') {
-                        const textContent = att.content.startsWith('data:') ? Buffer.from(att.content.split(',')[1] || '', 'base64').toString('utf-8') : att.content;
-                        if (textContent) contentParts.push({ type: 'text', text: `[File: ${att.name}]\n---\n${textContent.slice(0, 8000)}\n---` });
+                        if (modelSupportsVision) {
+                            contentParts.push({ type: 'image_url', image_url: { url: att.content } });
+                        } else {
+                            contentParts.push({ type: 'text', text: `[Attached image: ${att.name || 'image'} — current model has no vision; ask the user to switch to a vision-capable model to analyse it.]` });
+                        }
+                        continue;
                     }
-                } catch {}
+                    if (!att.content || typeof att.content !== 'string') continue;
+
+                    const looksLikePdf = (att.type && att.type.includes('pdf')) || /\.pdf$/i.test(att.name || '');
+                    const looksLikeOfficeDoc = (att.type && (att.type.includes('wordprocessingml') || att.type.includes('spreadsheetml') || att.type.includes('ms-excel') || att.type === 'text/csv' || att.type === 'application/csv'))
+                        || /\.(docx|xlsx|xls|csv)$/i.test(att.name || '');
+
+                    if (looksLikePdf || looksLikeOfficeDoc) {
+                        const result = await extractAttachment(att, { modelSupportsVision });
+                        console.log(`[WebpageChat] Attachment ${att.name} extraction → kind=${result.kind}, source=${result.source || 'n/a'}`);
+                        if (result.kind === 'text') {
+                            const docText = `${formatTextHeader(att, result)}\n---\n${result.text}\n---`;
+                            contentParts.push({ type: 'text', text: docText });
+                            if (looksLikePdf && isClaude) {
+                                const base64Data = att.content.includes(',') ? att.content.split(',')[1] : att.content;
+                                const mediaType = att.type && att.type.includes('pdf') ? att.type : 'application/pdf';
+                                contentParts.push({ type: 'document', source: { type: 'base64', media_type: mediaType, data: base64Data } });
+                            }
+                        } else if (result.kind === 'images') {
+                            contentParts.push({ type: 'text', text: formatImagesHeader(att, result) });
+                            for (const img of result.images) {
+                                contentParts.push({ type: 'image_url', image_url: { url: `data:${img.mimeType};base64,${img.base64}` } });
+                            }
+                        } else {
+                            contentParts.push({ type: 'text', text: formatFailureNote(att, result) });
+                        }
+                        continue;
+                    }
+
+                    // Plain text / unknown — best-effort UTF-8 inline.
+                    const textContent = att.content.startsWith('data:') ? Buffer.from(att.content.split(',')[1] || '', 'base64').toString('utf-8') : att.content;
+                    if (textContent) contentParts.push({ type: 'text', text: `[File: ${att.name}]\n---\n${textContent.slice(0, 8000)}\n---` });
+                } catch (err) {
+                    console.warn(`[WebpageChat] Attachment processing failed for ${att?.name}: ${err.message}`);
+                    contentParts.push({ type: 'text', text: `[${att?.name || 'attachment'} — failed to read: ${err.message}]` });
+                }
             }
-            const hasImages = contentParts.some(p => p.type === 'image_url');
-            if (hasImages) {
+            const hasMultimodalBlocks = contentParts.some(p => p.type === 'image_url' || p.type === 'document');
+            if (hasMultimodalBlocks) {
                 messages.push({ role: 'user', content: contentParts });
             } else {
                 const combined = contentParts.filter(p => p.type === 'text').map(p => p.text).join('\n\n');

@@ -53,6 +53,10 @@ async function getAvailableIntegrations(userId) {
     const orgId = user?.organizationId || null;
 
     let orgEnabled = null;
+    // Org-admin "active" subset; null = no extra restriction (e.g. for super
+    // admin or when the org has no active list yet). Applied as an
+    // intersection AFTER the super-admin allow-list filter.
+    let orgActiveSet = null;
     if (orgId) {
         try {
             const org = await userStore.getOrganization(orgId);
@@ -65,8 +69,24 @@ async function getAvailableIntegrations(userId) {
                     orgEnabled = typeof globalDefaults === 'string' ? JSON.parse(globalDefaults) : globalDefaults;
                 }
             }
+            // Super admins bypass — they always see everything the platform
+            // allows in the wizard's suggestions.
+            if (user?.role !== 'admin') {
+                try {
+                    const active = await userStore.getOrgEnabledIntegrations(orgId);
+                    orgActiveSet = new Set(active);
+                } catch (_) { orgActiveSet = new Set(); }
+            }
         } catch (_) { /* ignore */ }
     }
+    // NC catalog — NC IDs aren't gated by the org-admin active list (they
+    // run through the dedicated NC panel + per-group opt-out path), so
+    // skip the intersection for them.
+    let ncIdSet = new Set();
+    try {
+        const cat = require('../../core/ncIntegrationCatalog');
+        ncIdSet = cat.NC_INTEGRATION_ID_SET || new Set(cat.NC_INTEGRATION_IDS || []);
+    } catch (_) { }
 
     const isGoogleUser = !!user?.oauthProvider && user.oauthProvider === 'google';
     const isMicrosoftUser = !!user?.oauthProvider && user.oauthProvider === 'microsoft';
@@ -88,6 +108,7 @@ async function getAvailableIntegrations(userId) {
 
     return INTEGRATION_CATALOG.filter(item => {
         if (orgEnabled && !orgEnabled.includes(item.id)) return false;
+        if (orgActiveSet && !ncIdSet.has(item.id) && !orgActiveSet.has(item.id)) return false;
         if (item.group === 'google') return isGoogleUser;
         if (item.id === 'outlook' || item.id === 'ms-calendar' || item.id === 'onedrive' || item.id === 'ms-contacts') return isMicrosoftUser;
         if (item.requiresKey) return !!status[item.requiresKey];

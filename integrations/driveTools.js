@@ -334,7 +334,10 @@ async function executeDriveTool(toolName, args, session) {
                 });
                 content = typeof exp.data === 'string' ? exp.data : String(exp.data);
             }
-            // PDF → download + extract text
+            // PDF → download + extract text via the unified attachment pipeline
+            // (pdfjs → Azure DI → Mistral OCR, with the garbage-text fallback
+            // that catches CID-font junk). Keeps Drive in lockstep with
+            // Nextcloud and chat uploads — one place to fix PDF quirks.
             else if (mimeType === 'application/pdf') {
                 try {
                     const dlRes = await drive.files.get({
@@ -344,24 +347,22 @@ async function executeDriveTool(toolName, args, session) {
                     }, { responseType: 'arraybuffer' });
                     const pdfBuffer = Buffer.from(dlRes.data);
 
-                    // Try Mistral OCR first, then local PDF extractor
-                    let extracted = '';
-                    try {
-                        const { mistralOCR } = require('../core/ocr');
-                        const base64 = pdfBuffer.toString('base64');
-                        extracted = await mistralOCR(base64, 'application/pdf', fileName);
-                    } catch (ocrErr) {
-                        console.log(`[Drive] OCR failed for ${fileName}: ${ocrErr.message}, trying local...`);
+                    const { extractAttachment } = require('../core/attachmentExtractor');
+                    const result = await extractAttachment({
+                        name: fileName,
+                        type: 'application/pdf',
+                        content: pdfBuffer.toString('base64'),
+                    });
+                    if (result.kind === 'text') {
+                        content = result.text;
+                    } else if (result.kind === 'images') {
+                        return {
+                            error: `${fileName} appears to be an image-only PDF (${result.meta?.numPages || '?'} pages) with no extractable text. Configure Azure Document Intelligence or Mistral OCR to read scanned PDFs from Drive.`,
+                            fileName,
+                        };
+                    } else {
+                        content = `[PDF: ${fileName} — could not extract text: ${result.reason || 'unknown reason'}]`;
                     }
-                    if (!extracted) {
-                        try {
-                            const { extractTextFromPDF } = require('../core/pdfExtractor');
-                            extracted = await extractTextFromPDF(pdfBuffer, fileName);
-                        } catch (pdfErr) {
-                            console.log(`[Drive] Local PDF extraction failed for ${fileName}: ${pdfErr.message}`);
-                        }
-                    }
-                    content = extracted || `[PDF: ${fileName} — could not extract text]`;
                 } catch (dlErr) {
                     return { error: `Failed to download PDF: ${dlErr.message}`, fileName };
                 }

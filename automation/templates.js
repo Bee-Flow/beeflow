@@ -150,6 +150,42 @@ const TEMPLATES = [
         },
     },
 
+    // ── Webpages ──────────────────────────────────────────────────────
+    {
+        id: 'webpage-invoice-sync',
+        title: 'Sync invoices to a webapp',
+        description: 'New invoice email arrives → extract fields → append a row to your invoice webapp\'s data.db. Pick the webpage in Quick mode before activating.',
+        category: 'Webpages',
+        icon: 'Database',
+        tags: ['gmail', 'webpages', 'ai'],
+        definition: {
+            trigger: { id: 'trg', type: 'trigger', kind: 'app_event', appEvent: { provider: 'gmail', event: 'mail.new', filter: { hasAttachment: true, subjectContains: 'invoice' } } },
+            steps: [
+                step('read', 'integration_action', { tool: 'gmail_read_attachment', label: 'Read invoice PDF', inputs: { messageId: { kind: 'ref', path: 'trigger.output.messageId' } } }),
+                step('extract', 'ai_step', {
+                    prompt: 'Extract the invoice fields from this attachment text. Return JSON with keys: factuurnummer, datum (YYYY-MM-DD), type, product, liters (number or null), excl_btw (number), btw (number), incl_btw (number), status. If a field is missing leave it null.',
+                    inputs: { text: { kind: 'ref', path: 'steps.read.output.text' } },
+                    outputSchema: { type: 'object', properties: {
+                        factuurnummer: { type: 'string' }, datum: { type: 'string' }, type: { type: 'string' },
+                        product: { type: 'string' }, liters: { type: 'number' },
+                        excl_btw: { type: 'number' }, btw: { type: 'number' }, incl_btw: { type: 'number' },
+                        status: { type: 'string' },
+                    } },
+                }),
+                step('insert', 'integration_action', {
+                    tool: 'webpage_db_exec',
+                    label: 'Append invoice row',
+                    inputs: {
+                        webpageId: { kind: 'literal', value: '' },
+                        sql: { kind: 'literal', value: 'INSERT INTO facturen (id, datum, type, product, liters, excl_btw, btw, incl_btw, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING' },
+                        params: { kind: 'expr', value: '[steps.extract.output.factuurnummer, steps.extract.output.datum, steps.extract.output.type, steps.extract.output.product, steps.extract.output.liters, steps.extract.output.excl_btw, steps.extract.output.btw, steps.extract.output.incl_btw, steps.extract.output.status]' },
+                    },
+                }),
+            ],
+            edges: [{ from: 'trg', to: 'read' }, { from: 'read', to: 'extract' }, { from: 'extract', to: 'insert' }],
+        },
+    },
+
     // ── Schedule-based ────────────────────────────────────────────────
     {
         id: 'nc-weekly-digest',

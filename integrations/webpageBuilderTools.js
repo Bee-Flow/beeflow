@@ -12,6 +12,23 @@
 
 const webpageStore = require('../stores/webpageStore');
 const { executeWebpageDocTool } = require('./webpageDocTools');
+const { scheduleThumbnail } = require('../core/webpageThumbnailGenerator');
+
+// Hex like "#aabbcc" or "#abc". Restrict to a known palette range so a stray
+// invalid string can't sneak into the DB and break the card render.
+function sanitizeHex(c) {
+    if (typeof c !== 'string') return '';
+    const t = c.trim();
+    return /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(t) ? t : '';
+}
+// Keep just the first grapheme — the AI sometimes sends "📊📊" or "📊 Dashboard".
+function sanitizeIcon(icon) {
+    if (typeof icon !== 'string') return '';
+    const t = icon.trim();
+    if (!t) return '';
+    // Array.from splits surrogate pairs correctly; one user-visible emoji is one entry.
+    return [...t][0] || '';
+}
 
 const BUILDER_TOOLS = [
     {
@@ -54,7 +71,7 @@ const BUILDER_TOOLS = [
         type: 'function',
         function: {
             name: 'webpage_file_write',
-            description: 'Overwrite the ENTIRE content of one webpage file. STRICT use cases:\n  (1) the slot is currently empty (initial creation right after create_webpage), or\n  (2) you genuinely need to replace ≥80% of the content (a from-scratch rewrite).\n\nNOT for partial edits — adding a section, tweaking styles, fixing a single bug. Use webpage_file_replace (substring) or webpage_file_patch (line range) for those. They are dramatically faster, cheaper, and safer because they don\'t re-emit the whole file.\n\nIframe rules: the preview runs with sandbox="allow-scripts" only (no same-origin). Vanilla HTML/CSS/JS. CDN <script> tags inside the HTML are fine. No npm imports, no build step. Code that depends on parent cookies, localStorage, or fetches to the host app will fail.\n\nReturns { message, file, webpageId }.',
+            description: 'Overwrite the ENTIRE content of one webpage file. STRICT use cases:\n  (1) the slot is currently empty (initial creation right after create_webpage), or\n  (2) you genuinely need to replace ≥80% of the content (a from-scratch rewrite).\n\nNOT for partial edits — adding a section, tweaking styles, fixing a single bug. Use webpage_file_replace (substring) or webpage_file_patch (line range) for those. They are dramatically faster, cheaper, and safer because they don\'t re-emit the whole file.\n\nRules for the CODE YOU WRITE into the page (these constrain the page, not you):\n  • Vanilla HTML/CSS/JS only. CDN <script> tags inside the HTML are fine. No npm imports, no build step.\n  • The generated page runs in a sandbox=\"allow-scripts\" iframe, so code inside it cannot read host-app cookies, host localStorage, or call /api/* directly. Use the pre-injected `window.beeflowDB` client for persistence.\n  • These rules apply to the page you produce, NOT to you. You run server-side and can freely call other tools (Nextcloud, web search, drive, etc.) to fetch data first, then write the results into the page or DB.\n\nReturns { message, file, webpageId }.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -82,6 +99,23 @@ const BUILDER_TOOLS = [
                     replace_all: { type: 'boolean', description: 'When true, replace every occurrence. Default false — single-match required.' },
                 },
                 required: ['webpageId', 'file', 'find_text', 'replace_text'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'webpage_set_metadata',
+            description: 'Set the visual identity of a webpage shown in the Webpages list — a single-character emoji icon, an accent hex colour and a one-line tagline. Call this once right after you finish the initial build (or after a significant redesign) so the user\'s list shows a recognisable tile instead of a generic file icon. Cheap, idempotent — safe to call multiple times.\n\nGuidance:\n  • icon: ONE emoji that captures the page\'s purpose (📊 for dashboards, 🧾 for invoicing, 🍰 for a bakery, 📅 for calendars). No text, no multi-char strings.\n  • accent_color: hex like "#00a86b" matching the page\'s primary colour so the tile and the page feel related. Pick a saturated colour, not pure black/white.\n  • tagline: ≤80 chars, plain text, no emoji. One sentence telling the user what the page does at a glance.\n\nReturns { message, webpageId }.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    webpageId: { type: 'string', description: 'The ID of the webpage.' },
+                    icon: { type: 'string', description: 'A single emoji.' },
+                    accent_color: { type: 'string', description: 'Hex colour like "#00a86b".' },
+                    tagline: { type: 'string', description: 'One-line description, ≤80 chars.' },
+                },
+                required: ['webpageId'],
             },
         },
     },
@@ -153,6 +187,26 @@ async function executeBuilderTool(toolName, args, ctx) {
         return { result: docResult };
     }
 
+    if (toolName === 'webpage_set_metadata') {
+        const { webpageId } = args;
+        if (!webpageId) return { result: { error: 'webpageId is required.' } };
+        const webpage = await webpageStore.getWebpage(webpageId, userId).catch(() => null);
+        if (!webpage) return { result: { error: `Webpage ${webpageId} not found.` } };
+        const icon = sanitizeIcon(args.icon);
+        const accentColor = sanitizeHex(args.accent_color);
+        const tagline = typeof args.tagline === 'string' ? args.tagline.trim().slice(0, 80) : '';
+        const updates = {};
+        if (icon) updates.icon = icon;
+        if (accentColor) updates.accentColor = accentColor;
+        if (tagline) updates.tagline = tagline;
+        if (Object.keys(updates).length === 0) {
+            return { result: { error: 'Provide at least one of icon, accent_color, tagline.' } };
+        }
+        await webpageStore.updateWebpageMetadata(webpageId, userId, updates);
+        console.log(`[WebpageBuilder] webpage_set_metadata: ${webpageId} ${JSON.stringify(updates)}`);
+        return { result: { message: 'Webpage metadata updated.', webpageId, ...updates } };
+    }
+
     if (toolName === 'webpage_file_write') {
         const { webpageId, file, content, title } = args;
         if (!webpageId) return { result: { error: 'webpageId is required.' } };
@@ -165,6 +219,10 @@ async function executeBuilderTool(toolName, args, ctx) {
 
         await webpageStore.writeSlot(userId, webpageId, file, content);
         console.log(`[WebpageBuilder] webpage_file_write: ${file} → ${webpageId} (${content.length} chars)`);
+
+        // Background thumbnail render — debounced so a burst of html+css+js
+        // writes coalesce into a single screenshot.
+        scheduleThumbnail({ userId, webpageId });
 
         return {
             result: { message: docResult.message, file, webpageId },
@@ -188,6 +246,8 @@ async function executeBuilderTool(toolName, args, ctx) {
         const newContent = docResult.content;
         await webpageStore.writeSlot(userId, webpageId, file, newContent);
         console.log(`[WebpageBuilder] ${toolName}: ${file} in ${webpageId}`);
+
+        scheduleThumbnail({ userId, webpageId });
 
         return {
             result: { message: docResult.message, file, webpageId },

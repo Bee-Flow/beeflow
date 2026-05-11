@@ -6,6 +6,7 @@
  */
 
 const BaseProvider = require("./base");
+const { downscaleClaudeMessages } = require("../imageDownscale");
 
 const DEFAULT_MAX_TOKENS = 8192;
 
@@ -391,6 +392,7 @@ class ClaudeProvider extends BaseProvider {
     async chat(apiKey, baseUrl, model, messages, options = {}) {
         const client = this.createClient(apiKey);
         const params = this._buildSdkParams(model, messages, options);
+        await downscaleClaudeMessages(params.messages);
 
         console.log('[Claude] SDK chat for model:', model);
         const response = await client.messages.create(params);
@@ -424,6 +426,7 @@ class ClaudeProvider extends BaseProvider {
     async stream(apiKey, baseUrl, model, messages, options = {}, onEvent) {
         const client = this.createClient(apiKey);
         const params = this._buildSdkParams(model, messages, options);
+        await downscaleClaudeMessages(params.messages);
 
         console.log('[Claude] SDK streaming for model:', model);
         console.log('[Claude] Params:', JSON.stringify({

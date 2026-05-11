@@ -38,6 +38,24 @@ async function getTierForUser(userId) {
 }
 
 /**
+ * Best tier across every license that touches the given set of orgs —
+ * org-scoped licenses on those orgs OR consumer licenses held by users
+ * whose primary org is one of those orgs. Spreads an admin's personal
+ * license to the rest of the org so group-invited members don't get
+ * `feature_locked` 403s while sharing a workspace with the licensee.
+ */
+async function getBestTierForOrgs(orgIds = []) {
+    if (!Array.isArray(orgIds) || orgIds.length === 0) return COMMUNITY_FALLBACK;
+    const licenses = await store.getActiveLicensesForOrgs(orgIds);
+    let best = COMMUNITY_FALLBACK;
+    for (const lic of licenses) {
+        const t = resolveTierFromLicense(lic);
+        if (tiers.tierRank(t) > tiers.tierRank(best)) best = t;
+    }
+    return best;
+}
+
+/**
  * Resolve the active tier from a license row. Performs a sanity-check on
  * `expires_at` so a stale "active" row doesn't accidentally grant access.
  */
@@ -79,17 +97,50 @@ async function resolveTier(scope) {
  * Full status object for the UI. Always returns a populated object so the
  * frontend can render a stable shape even on a fresh install.
  */
-async function getLicenseStatus({ organizationId = null, userId = null } = {}) {
+async function getLicenseStatus({ organizationId = null, userId = null, orgIds = null } = {}) {
     let lic = null;
     let scope = null;
-    if (organizationId) {
-        lic = await store.getActiveLicenseForOrg(organizationId);
-        scope = 'organization';
+
+    // Build the candidate org set: explicit org, any extra orgIds (e.g. from
+    // group memberships resolved via resolveUserOrgIds), in that order so the
+    // user's direct org wins ties.
+    const candidateOrgIds = [];
+    if (organizationId) candidateOrgIds.push(organizationId);
+    if (Array.isArray(orgIds)) {
+        for (const id of orgIds) {
+            if (id && !candidateOrgIds.includes(id)) candidateOrgIds.push(id);
+        }
+    } else if (orgIds instanceof Set) {
+        for (const id of orgIds) {
+            if (id && !candidateOrgIds.includes(id)) candidateOrgIds.push(id);
+        }
     }
+
+    // Pick the highest-tier active licence across every org the user touches,
+    // including consumer licences held by users whose direct org is in that
+    // set (so an admin's personal licence covers the rest of the org).
+    if (candidateOrgIds.length > 0) {
+        let best = null;
+        let bestTier = tiers.TIER_HIERARCHY[0];
+        const found = await store.getActiveLicensesForOrgs(candidateOrgIds);
+        for (const candidate of found) {
+            const t = resolveTierFromLicense(candidate);
+            if (tiers.tierRank(t) > tiers.tierRank(bestTier)) {
+                best = candidate;
+                bestTier = t;
+            }
+        }
+        if (best) {
+            lic = best;
+            scope = best.organizationId ? 'organization' : 'consumer';
+        }
+    }
+
     if (!lic && userId) {
         lic = await store.getActiveLicenseForUser(userId);
         scope = 'consumer';
     }
+
     const tier = resolveTierFromLicense(lic);
     return {
         tier,
@@ -184,6 +235,7 @@ module.exports = {
     // resolution
     getTierForOrg,
     getTierForUser,
+    getBestTierForOrgs,
     resolveTier,
     hasFeature,
     hasTier,

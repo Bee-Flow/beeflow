@@ -77,18 +77,40 @@ const SITE_DEFAULTS = {
 const BLOCK_DEFAULTS = {
     hero: {
         eyebrow: '',
-        badge: { text: '', icon: '' },
+        // Each toggle-able piece carries an `enabled: true` flag so the
+        // editor's "Show …" toggles can flip it off. Old hero blocks
+        // stored without these fields render as before because the
+        // renderer treats missing `enabled` as truthy via `!== false`.
+        badge: { enabled: true, text: '', icon: '' },
+        // Per-text styling — empty strings / 0 = inherit the page CSS
+        // and the Design tab. Old blocks read these as undefined and
+        // the renderer skips inline-style application.
+        badgeStyle: { fontFamily: '', fontSize: 0, color: '' },
         titleParts: [
             { text: 'Your headline here', gradient: false },
         ],
+        titleStyle: { fontFamily: '', fontSize: 0, color: '' },
         lead: 'Describe your product or service',
-        primaryCta:   { label: 'Get started', link: { kind: 'anchor', anchor: '' } },
-        secondaryCta: { label: 'Learn more',  link: { kind: 'anchor', anchor: '' } },
-        mockup: { chatBubbles: [] },
+        leadStyle: { fontFamily: '', fontSize: 0, color: '' },
+        // CTAs grew an explicit `style` field (matching site-chrome /
+        // multi-CTA patterns) and an `enabled` toggle. Defaults preserve
+        // the original visual: primary = filled, secondary = outline.
+        primaryCta:   { enabled: true, label: 'Get started', style: 'primary',   link: { kind: 'anchor', anchor: '' } },
+        secondaryCta: { enabled: true, label: 'Learn more',  style: 'secondary', link: { kind: 'anchor', anchor: '' } },
+        mockup: { enabled: true, chatBubbles: [] },
+        // 'default' / 'surface' / 'primary' / 'dark' — same scale as
+        // Media + Text and Content blocks. Default keeps the page bg.
+        backgroundVariant: 'default',
     },
 
     socialProof: {
         eyebrow: 'Add your client logos',
+        title: '',
+        // Empty fields = inherit page CSS / Design tab. Old blocks saved
+        // without these keys read as `undefined` and the renderer skips
+        // inline-style application, so backwards-compat is free.
+        eyebrowStyle: { fontFamily: '', fontSize: 14, color: '' },
+        titleStyle:   { fontFamily: '', fontSize: 32, color: '' },
         logos: [],
     },
 

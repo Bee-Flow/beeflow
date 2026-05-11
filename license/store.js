@@ -165,6 +165,36 @@ async function getActiveLicenseForUser(userId) {
 }
 
 /**
+ * Find every active license that is either
+ *   (a) scoped directly to one of the given orgs, OR
+ *   (b) scoped to a user whose primary organizationId is one of the given orgs.
+ *
+ * Used by the license middleware to spread a single org/admin licence across
+ * every member of that org — including members who joined the org via a
+ * group (no direct user.organizationId set on their record).
+ *
+ * NB: group-based licensee org-spread (where the licensee themselves has no
+ * direct organizationId but is in the org via a group) is not handled by
+ * this query — that's a much rarer case and would need a JSON contains query
+ * on users.groups. The common case (org-admin holds the license) is covered.
+ */
+async function getActiveLicensesForOrgs(orgIds = []) {
+    if (!Array.isArray(orgIds) || orgIds.length === 0) return [];
+    const rows = await getAll(
+        `SELECT lk.* FROM license_keys lk
+         LEFT JOIN users u ON u.id = lk.user_id
+         WHERE lk.refresh_status NOT IN ('expired', 'revoked')
+           AND (
+             lk.organization_id = ANY($1::text[])
+             OR u."organizationId" = ANY($1::text[])
+           )
+         ORDER BY lk.issued_at DESC`,
+        [orgIds]
+    );
+    return rows.map(rowToLicense);
+}
+
+/**
  * Returns all monthly licenses that have not been refreshed within the
  * given window (in seconds). The refresh scheduler walks this set.
  */
@@ -259,6 +289,7 @@ module.exports = {
     getLicenseById,
     getActiveLicenseForOrg,
     getActiveLicenseForUser,
+    getActiveLicensesForOrgs,
     getLicensesNeedingRefresh,
     markRefreshSuccess,
     markRefreshFailure,

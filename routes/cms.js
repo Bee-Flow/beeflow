@@ -230,12 +230,18 @@ function synthesizeLegacyContent(eff) {
                 })),
             })),
             // Header buttons (multi-CTA) — same flat {label, href, style,
-            // target?, rel?} shape Header.jsx renders.
+            // target?, rel?} shape Header.jsx renders. Per-button label
+            // typography (labelFont / labelSize / labelColor) is forwarded
+            // verbatim so the renderer can apply inline overrides without
+            // re-reading the storage shape.
             ctas: (eff.header.ctas || []).map(cta => ({
                 id: cta.id,
                 label: cta.label,
                 href:  cta.link?.href || '/app',
                 style: cta.style || 'primary',
+                labelFont:  cta.labelFont  || '',
+                labelSize:  Number.isFinite(cta.labelSize) ? cta.labelSize : 0,
+                labelColor: cta.labelColor || '',
                 ...(cta.link?.target ? { target: cta.link.target } : {}),
                 ...(cta.link?.rel    ? { rel:    cta.link.rel    } : {}),
             })),

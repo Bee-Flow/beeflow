@@ -44,6 +44,8 @@ const READ_ONLY = new Set([
     // Nextcloud Mail (read-only)
     'nextcloud_mail_list_accounts', 'nextcloud_mail_list_mailboxes',
     'nextcloud_mail_search', 'nextcloud_mail_read', 'nextcloud_mail_read_attachment',
+    // Webpages (read-only — writes are listed implicitly via fail-closed default)
+    'webpages_list', 'webpage_db_schema', 'webpage_db_query', 'webpage_file_read',
 ]);
 
 /**

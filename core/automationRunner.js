@@ -356,6 +356,8 @@ async function execIntegrationAction(step, ctx, runState, mode) {
             userId: ctx.userId,
             session: ctx.session,
             orgId: ctx.orgId,
+            userGroupIds: ctx.userGroupIds || [],
+            userOrgIds: ctx.userOrgIds || [],
             // Tell email/ticket-style tools that there is NO user UI here to
             // approve a draft — emit the side effect immediately. Only set
             // for live mode (dry_run is handled above with synthesized output).
@@ -577,6 +579,8 @@ async function execAiStep(step, ctx, runState, mode) {
                 try {
                     toolResult = await executeTool(tc.function.name, args, {
                         userId: ctx.userId, session: ctx.session, orgId: ctx.orgId,
+                        userGroupIds: ctx.userGroupIds || [],
+                        userOrgIds: ctx.userOrgIds || [],
                         autoSend: mode === 'live',
                     });
                 } catch (e) {
@@ -669,7 +673,11 @@ async function execCode(step, ctx, runState, mode) {
         bridges: {
             executeTool: async (name, args) => {
                 if (!allowedTools.has(name)) return { error: `tool "${name}" not allowed for this step` };
-                return executeTool(name, args, { userId: ctx.userId, session: ctx.session, orgId: ctx.orgId });
+                return executeTool(name, args, {
+                    userId: ctx.userId, session: ctx.session, orgId: ctx.orgId,
+                    userGroupIds: ctx.userGroupIds || [],
+                    userOrgIds: ctx.userOrgIds || [],
+                });
             },
             allowedTools,
             fetchHttp: sandbox.defaultFetchHttp,
@@ -891,9 +899,20 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
         loop: {},
     };
 
+    // Resolve the automation owner's groups once per run. Used by webpage
+    // tools (and any future tool) to check shared/published visibility
+    // outside the request-scoped audience helpers.
+    let runUserGroupIds = [];
+    try {
+        const { resolveUserGroups } = require('../auth/audience');
+        runUserGroupIds = await resolveUserGroups(automation.userId);
+    } catch (_) { /* tolerate */ }
+
     const ctx = {
         userId: automation.userId,
         orgId: automation.organizationId,
+        userGroupIds: runUserGroupIds,
+        userOrgIds: automation.organizationId ? [automation.organizationId] : [],
         session,
         runId: run.id,
         // First-run guard removed; field kept for shape compatibility with

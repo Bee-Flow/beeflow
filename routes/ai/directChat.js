@@ -31,6 +31,7 @@ const {
 const { resolveModelForTier } = require('../../core/modelResolver');
 const { WORKSPACE_TOOLS } = require('../../integrations/workspaceTools');
 const { BUILDER_TOOLS, isBuilderTool, executeBuilderTool } = require('../../integrations/webpageBuilderTools');
+const { WEBPAGE_DB_TOOLS, isDbTool, executeDbTool } = require('../../integrations/webpageDbTools');
 const { PROPOSE_WEBPAGE_PLAN_TOOL, executeProposeWebpagePlan } = require('../../integrations/webpagePlanTool');
 const guardrailEventStore = require('../../stores/guardrailEventStore');
 const { buildTokenPreservationAddendum } = require('../../core/dlp/tokenPreservationPrompt');
@@ -91,12 +92,24 @@ Use for interactive charts (bar, line, scatter, heatmap, etc). Provide a complet
 \`\`\`
 
 ### Interactive Webpages — call create_webpage + webpage_file_*
-Use for calculators, interactive demos, visualizations, games, landing pages, or any self-contained HTML+CSS+JS thing. The flow:
-  1. **Plan first for non-trivial work.** When the user asks for a brand-new webpage or a multi-file change, your FIRST tool call should be propose_webpage_plan({ title, summary, steps[] }) and you should make NO other tool calls in that turn. The system pauses and waits for the user to approve. After approval, the system injects an authorisation message and you proceed with the build. Skip planning for tiny edits.
-  2. After approval (or for small edits), call create_webpage({ name }) if the page doesn't exist yet → returns { webpageId, url }.
-  3. Call webpage_file_write({ webpageId, file, content }) for each slot. Use webpage_file_replace / webpage_file_patch for partial edits.
-  4. End your reply with: "I built it: [<title>](<url>)" — the user can click to open the editor and refine it further.
-Vanilla HTML/CSS/JS only. CDN <script> tags inside the HTML are fine. Do NOT depend on parent-page cookies, localStorage, or fetches to the host app — the preview iframe is sandboxed with allow-scripts only.
+IMPORTANT — capability boundary: YOU run server-side and have full access to every tool the user has enabled in this turn (Nextcloud, Google Drive, web search, file readers, etc.). The webpage you generate runs inside a sandboxed iframe in the user's browser and is what's restricted (no host cookies, no /api/* fetches from the page's JS). NEVER confuse the page's sandbox with your own capabilities — if the user asks "read invoices from Nextcloud and put them in the database", use the nextcloud_* + webpage_db_exec tools yourself. Do not refuse because "the page is sandboxed".
+
+Use for calculators, interactive demos, visualizations, games, landing pages, dashboards, trackers, or any self-contained HTML+CSS+JS thing. Build the page in a single turn — DO NOT propose a plan first, just go straight to the tools. The flow:
+  1. Call create_webpage({ name }) if the page doesn't exist yet → returns { webpageId, url }.
+  2. If the app needs persistent data (records, lists, settings, anything that should survive a reload) → call webpage_db_exec({ webpageId, sql: "CREATE TABLE ..." }) to set up the schema BEFORE writing the JS. Seed initial rows with webpage_db_exec({ webpageId, sql: "INSERT INTO ...", params: [...] }). Use webpage_db_query / webpage_db_schema to inspect.
+  3. Call webpage_file_write({ webpageId, file, content }) for each slot — html first, then css, then js. Use webpage_file_replace / webpage_file_patch for partial edits to existing pages.
+  4. After the build (or a significant redesign), call webpage_set_metadata({ webpageId, icon, accent_color, tagline }) once to give the page a visual identity in the user's Webpages list. Pick a single emoji that fits the topic, an accent hex matching the page's primary colour, and a ≤80-char tagline.
+  5. End your reply with: "I built it: [<title>](<url>)" — the user can click to open the editor and refine it further.
+
+Persistence — when the user says "database", "save", "remember", "persist", or describes anything multi-row (invoices, contacts, tasks, fuel logs…), use the SQLite DB. The running script.js talks to it via a pre-injected client — no setup needed by you:
+
+  await window.beeflowDB.query("SELECT * FROM rows WHERE id = ?", [id]);   // SELECT only
+  await window.beeflowDB.exec("INSERT INTO rows (a,b) VALUES (?,?)", [1,2]); // INSERT/UPDATE/DELETE
+  await window.beeflowDB.schema();                                          // inspect at runtime
+
+Each call returns a Promise. Use ? placeholders — never interpolate user values into SQL. Do NOT try to load sql.js from a CDN; the DB is server-side and survives reloads automatically. Do NOT use parent-page cookies or the host app's localStorage — use the DB.
+
+Vanilla HTML/CSS/JS only. CDN <script> tags inside the HTML are fine. The preview iframe is sandboxed (allow-scripts, no same-origin).
 DO NOT emit \`\`\`html-app\`\`\` code blocks — they no longer render. Always use create_webpage + webpage_file_write instead.
 
 ### Quotes / Proposals — \`\`\`quote
@@ -148,7 +161,7 @@ function requireAuth(req, res, next) {
 // ─── Streaming Direct Chat ───────────────────────────────────────
 
 router.post('/chat/direct/stream', requireAuth, async (req, res) => {
-    const { message, conversationId, modelTier, history, attachments, imageGenSettings, nanoBananaSettings, disabledMedia, webSearchEnabled = true, notebookspaceContent, notebookspaceSelection, projectId, timezone, systemPrompt: requestSystemPrompt, activeSkillIds, reasoningEffort: requestReasoningEffort, sessionSkills: requestSessionSkills, activatedSessionSkillIds: requestActivatedSessionSkillIds, knowledgeBaseIds: requestedKbIds, swarmOptions: requestedSwarmOptions, planExecution: webpagePlanExecution } = req.body;
+    const { message, conversationId, modelTier, history, attachments, imageGenSettings, nanoBananaSettings, disabledMedia, webSearchEnabled = true, notebookspaceContent, notebookspaceSelection, notebookspaceAvailable, sidePanelWebpage, projectId, timezone, systemPrompt: requestSystemPrompt, activeSkillIds, reasoningEffort: requestReasoningEffort, sessionSkills: requestSessionSkills, activatedSessionSkillIds: requestActivatedSessionSkillIds, knowledgeBaseIds: requestedKbIds, swarmOptions: requestedSwarmOptions, planExecution: webpagePlanExecution } = req.body;
     const userId = req.session.user.id;
 
     if (!message && (!attachments || attachments.length === 0)) {
@@ -633,13 +646,38 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                         directChatTools.push(tool);
                     }
                 }
-                // Plan tool only when this is NOT a plan-execution turn — on
-                // execution we strip it so the AI can't propose another plan
-                // mid-flight.
-                if (!webpagePlanExecution) {
-                    directChatTools.push(PROPOSE_WEBPAGE_PLAN_TOOL);
+                // DB tools — the editor binds webpageId via the request URL, but
+                // direct chat can target any webpage in the same turn, so we
+                // require webpageId as an explicit arg on each call.
+                for (const tool of WEBPAGE_DB_TOOLS) {
+                    if (directChatTools.find(t => t.function.name === tool.function.name)) continue;
+                    const params = tool.function.parameters || { type: 'object', properties: {}, required: [] };
+                    const directTool = {
+                        ...tool,
+                        function: {
+                            ...tool.function,
+                            parameters: {
+                                ...params,
+                                properties: {
+                                    webpageId: {
+                                        type: 'string',
+                                        description: 'The webpage ID returned by create_webpage (or referenced by the user).',
+                                    },
+                                    ...(params.properties || {}),
+                                },
+                                required: Array.from(new Set(['webpageId', ...(params.required || [])])),
+                            },
+                        },
+                    };
+                    directChatTools.push(directTool);
                 }
-                console.log('[DirectChat] Webpage builder tools enabled for user');
+                // No `propose_webpage_plan` in direct chat — the Approve/Reject
+                // card lives in the Webpages editor's chat, not here. Without
+                // that UI, planning would silently stall the conversation, so
+                // we just go straight to create_webpage + webpage_file_write*.
+                // Planning is preserved in /ai/chat/webpage/stream (editor) and
+                // in the side-panel webpage chat which is routed there.
+                console.log('[DirectChat] Webpage builder + db tools enabled for user');
             }
         } catch (builderErr) {
             console.warn('[DirectChat] Failed to check webpages beta for builder tools:', builderErr.message);
@@ -837,22 +875,60 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
             console.warn('[DirectChat] Memory retrieval failed:', e.message);
         }
 
+        // ─── House style awareness ──────────────────────────────────
+        // When the org has a default kantoorstijl, tell the model so it can
+        // match tone — actual formatting is applied at Notebook export time.
+        let houseStyleContext = '';
+        try {
+            if (userOrgForTiers) {
+                const houseStyleStore = require('../../stores/houseStyleStore');
+                const houseStyle = await houseStyleStore.getDefaultForOrg(userOrgForTiers);
+                if (houseStyle) {
+                    const tone = houseStyle.styleMeta?.toneDescription;
+                    houseStyleContext = `\n\n[HOUSE STYLE ACTIVE]\nOrg Word/DOCX kantoorstijl "${houseStyle.name}" wordt automatisch toegepast bij export naar .docx${houseStyle.description ? ` — ${houseStyle.description}` : ''}.${tone ? ` Tone of voice: ${tone}.` : ''} Schrijf documenten in het Notebook in Markdown — opmaak wordt bij export geregeld; geen inline styling nodig.`;
+                }
+            }
+        } catch (e) {
+            console.warn('[DirectChat] house style lookup failed:', e.message);
+        }
+
         // ─── Notebook context injection ─────────────────────────────
-        // Treat `undefined` as "no notebook open" and anything else (including
-        // empty string) as "notebook present, may be blank". The client drops
-        // the field entirely when the drawer is closed.
+        // Two flags from the client:
+        //   - notebookspaceAvailable: the Notebook panel exists in this UI
+        //     (may be closed). Tells the model the tools are usable; calling
+        //     notebook_write auto-opens the panel via the workspace_update SSE.
+        //   - notebookspaceContent: the panel is currently open. `undefined`
+        //     means closed; `""` is "open but blank".
         let notebookspaceContext = '';
-        if (notebooksEnabled && notebookspaceContent !== undefined) {
-            notebookspaceContext = `\n\n[NOTEBOOK]
-The user has a Notebook panel open. You have 4 tools:
+        if (notebooksEnabled && notebookspaceAvailable) {
+            notebookspaceContext = `\n\n[NOTEBOOK CAPABILITY]
+A Notebook panel is available in the user's UI. For long-form output the user is likely to keep or edit — memos, notes, letters, briefs, reports, articles, plans, code files, meeting notes — write the document into the notebook by calling notebook_write. The panel auto-opens when you write. Tools:
 - notebook_read: Read content. Modes: "outline" (default—headings+stats), "section" (one section by heading), "search" (find text), "full" (entire doc). Use outline first, then section/search for targeted access.
 - notebook_write: Replace ALL content (for new documents or full rewrites). Write in Markdown.
-- notebook_replace: Replace a SPECIFIC portion (find_text + replace_text). Preferred for edits.
+- notebook_replace: Replace a SPECIFIC portion (find_text + replace_text). Preferred for partial edits.
 - notebook_insert: Add content at "start", "end", or "after" a heading.
 
-RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="section" to get exact text. 2) Copy find_text EXACTLY from read output. 3) For partial edits always prefer notebook_replace over notebook_write. 4) Use Markdown for rich text (headings, bold, tables, code blocks, lists, etc.).`;
+CRITICAL: When you use a notebook tool, do NOT also write the document text in your chat reply. Acknowledge briefly (one short sentence) and stop — the user reads the result in the Notebook panel. Use Markdown inside the notebook for headings, bold, tables, lists, code blocks.`;
+        }
+        if (notebooksEnabled && notebookspaceContent !== undefined) {
+            notebookspaceContext += `\n\n[NOTEBOOK OPEN]
+The Notebook panel is currently open. Current rules for edits: 1) Before notebook_replace, use notebook_read mode="search" or mode="section" to get exact text. 2) Copy find_text EXACTLY from read output. 3) For partial edits always prefer notebook_replace over notebook_write. 4) After any notebook tool call, your chat reply is at most one short confirmation sentence — do not repeat the new or modified content.`;
             if (notebookspaceSelection && notebookspaceSelection.trim()) {
                 notebookspaceContext += `\n\n[SELECTED TEXT IN NOTEBOOK]\nThe user selected this text:\n\`\`\`\n${notebookspaceSelection}\n\`\`\`\nUse notebook_replace with find_text set to EXACTLY this text. Set replace_text to the new version.`;
+            }
+        }
+
+        // ─── Side-panel webpage awareness ────────────────────────
+        // The user has a webpage open in the right-side panel. Resolve its
+        // latest content from storage and inject it into the prompt so the
+        // AI can answer questions about "this page" / "deze pagina".
+        if (sidePanelWebpage?.id) {
+            try {
+                const { buildSidePanelWebpageContext } = require('../../core/sidePanelWebpageContext');
+                const block = await buildSidePanelWebpageContext(sidePanelWebpage, userId);
+                if (block) notebookspaceContext += block;
+            } catch (e) {
+                console.warn('[DirectChat] sidePanelWebpage injection failed:', e.message);
             }
         }
 
@@ -905,7 +981,7 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         // message blocks with the right cache_control on the stable one.
         emitPhaseEnd(send, 'building_prompt', Date.now() - _spT);
         let messages = [
-            { role: 'system', content: basePrompt + toolHint + memoryContext + notebookspaceContext + projectContext + skillsContext },
+            { role: 'system', content: basePrompt + toolHint + memoryContext + houseStyleContext + notebookspaceContext + projectContext + skillsContext },
             { role: 'system', content: `Now: ${_nowStr}` },
         ];
 
@@ -1330,23 +1406,23 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                         if (result.kind === 'text') {
                             const docText = `${formatTextHeader(att, result)}\n---\n${result.text}\n---`;
                             const isClaude = (config.providerType || '').toLowerCase() === 'claude' || (config.providerType || '').toLowerCase() === 'anthropic';
+                            // Always inline the extracted text. Some invoice PDFs
+                            // embed fonts with no usable ToUnicode CMap, and
+                            // Claude's native PDF parser hits the same dead end
+                            // pdfjs does — the model then reports back "I see
+                            // raw font tables, not text". Shipping the OCR'd /
+                            // pdfjs text alongside the document block gives the
+                            // model a guaranteed-readable channel.
+                            contentParts.push({ type: 'text', text: docText });
                             if (isClaude) {
-                                // Claude has native PDF support — send the binary
-                                // as a document block so the model can do its own
-                                // visual + text understanding (charts, diagrams,
-                                // tables). No explicit cache_control here; the
-                                // last-user-text breakpoint placed by Claude's
-                                // normalizeMessages already covers this prefix.
-                                // Persist the extracted text to the sidecar so
-                                // replays (and provider switches) still have
-                                // something to show.
+                                // Also include the original PDF so Claude can
+                                // see visual elements (logos, signatures, layout)
+                                // that pure text extraction discards.
                                 const mediaType = att.type && att.type.includes('pdf') ? att.type : 'application/pdf';
                                 contentParts.push({
                                     type: 'document',
                                     source: { type: 'base64', media_type: mediaType, data: base64Data },
                                 });
-                            } else {
-                                contentParts.push({ type: 'text', text: docText });
                             }
                             await pushAttachment({ name: att.name, type: att.type, url: pdfProxyUrl }, docText);
                         } else if (result.kind === 'images') {
@@ -2122,8 +2198,21 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         const tierDefaults = TIER_DEFAULTS[resolvedTier] || TIER_DEFAULTS['fast'];
         const isThinkingModel = modelId.includes('magistral');
         const defaultMaxTokens = isThinkingModel ? 40960 : tierDefaults.maxTokens;
+        // Builder tools write whole files (html/css/js) inside a single
+        // `webpage_file_write` tool call. On the `fast` tier that's
+        // maxTokens=2048 — Anthropic stops mid-string and the file ships
+        // truncated, leaving the page broken. Bump the cap whenever the
+        // webpage builder tools are in the tool list, regardless of tier,
+        // so the AI has room for a realistic file in one tool call.
+        const wantsWebpageBuilder = directChatTools.some(t => t?.function?.name === 'webpage_file_write');
+        const WEBPAGE_BUILD_MIN_TOKENS = 16384;
+        const baseMaxTokens = tierSettings.maxTokens || defaultMaxTokens;
+        const effectiveMaxTokens = wantsWebpageBuilder
+            ? Math.max(baseMaxTokens, WEBPAGE_BUILD_MIN_TOKENS)
+            : baseMaxTokens;
+
         const chatOptions = {
-            maxTokens: tierSettings.maxTokens || defaultMaxTokens,
+            maxTokens: effectiveMaxTokens,
             temperature: tierSettings.temperature !== undefined ? tierSettings.temperature : tierDefaults.temperature,
             // Per-turn user choice from the composer takes priority over the tier default.
             // Accepts: 'none' (disabled), 'low', 'medium', 'high', 'xhigh', 'max'.
@@ -2457,6 +2546,17 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                                 if (builderOut.webpageUpdate) {
                                     const { webpageId, file, content, title } = builderOut.webpageUpdate;
                                     send('webpage_doc_update', { webpageId, file, content, title });
+                                }
+                            } else if (isDbTool(toolName)) {
+                                const dbWebpageId = toolArgs?.webpageId;
+                                if (!dbWebpageId) {
+                                    toolResult = { error: 'webpageId is required — pass the id returned by create_webpage.' };
+                                } else {
+                                    const { webpageId: _wp, ...dbArgs } = toolArgs || {};
+                                    toolResult = await executeDbTool(toolName, dbArgs, { webpageId: dbWebpageId, userId });
+                                    if (toolResult?._action === 'webpage_db_update') {
+                                        send('webpage_db_update', { webpageId: dbWebpageId });
+                                    }
                                 }
                             } else {
                                 toolResult = await dispatchTool(toolName, toolArgs, {
@@ -3067,6 +3167,17 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
                             const { webpageId, file, content, title } = builderOut.webpageUpdate;
                             send('webpage_doc_update', { webpageId, file, content, title });
                         }
+                    } else if (isDbTool(toolName)) {
+                        const dbWebpageId = toolArgs?.webpageId;
+                        if (!dbWebpageId) {
+                            toolResult = { error: 'webpageId is required — pass the id returned by create_webpage.' };
+                        } else {
+                            const { webpageId: _wp, ...dbArgs } = toolArgs || {};
+                            toolResult = await executeDbTool(toolName, dbArgs, { webpageId: dbWebpageId, userId });
+                            if (toolResult?._action === 'webpage_db_update') {
+                                send('webpage_db_update', { webpageId: dbWebpageId });
+                            }
+                        }
                     } else {
                         toolResult = await dispatchTool(toolName, toolArgs, {
                             userId,
@@ -3563,9 +3674,28 @@ RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="sect
         send('done', { conversationId: convId });
     } catch (error) {
         console.error('[DirectChat] Stream error:', error);
-        send('error', { error: error.message });
+        // Translate well-known upstream failures to a useful Dutch message so
+        // the chat surfaces something readable instead of a transport error.
+        const raw = String(error?.message || error || '');
+        let friendly = raw;
+        if (/image dimensions exceed.*pixel/i.test(raw)) {
+            friendly = 'Eén van de afbeeldingen in deze chat is te groot voor het AI-model (>2000px). Verklein de afbeelding of verwijder oudere bijlagen en probeer opnieuw.';
+        } else if (/many-image requests/i.test(raw)) {
+            friendly = 'Te veel of te grote afbeeldingen in deze conversatie. Verwijder oudere bijlagen of start een nieuwe chat.';
+        } else if (/no low surrogate|invalid.*surrogate/i.test(raw)) {
+            friendly = 'De conversatie bevat ongeldige Unicode-tekens. Probeer een nieuw bericht; oudere berichten worden bij de volgende compactie opgeschoond.';
+        } else if (/API error 4\d\d/.test(raw)) {
+            friendly = `AI-provider gaf een fout terug: ${raw}`;
+        }
+        try {
+            if (!res.writableEnded) {
+                send('error', { error: friendly, raw });
+            }
+        } catch (sendErr) {
+            console.warn('[DirectChat] Failed to send SSE error event:', sendErr.message);
+        }
     } finally {
-        res.end();
+        try { if (!res.writableEnded) res.end(); } catch (_) { /* socket already gone */ }
     }
 });
 

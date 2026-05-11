@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const kbStore = require('../stores/knowledgeBases');
 const configStore = require('../stores/configStore');
 const userStore = require('../stores/userStore');
-const { requireAuth, resolveUserOrgIds, requirePermission, hasPermission } = require('../auth');
+const { requireAuth, resolveUserOrgIds, requirePermission, hasPermission, assertUserCanUseOrg, validateSharedGroupsForOrg } = require('../auth');
 
 const SEARCH_SERVICE_URL = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
 const { getServiceHeaders } = require('../core/serviceAuth');
@@ -182,13 +182,14 @@ router.post('/', requireAuth, requirePermission('manage_knowledge'), async (req,
             return res.status(400).json({ error: 'Name is required' });
         }
 
-        // Auto-assign the user's first organization if none provided
-        let assignOrgId = organizationId;
-        if (!assignOrgId) {
-            const orgIds = await resolveUserOrgIds(req);
-            if (orgIds !== null && orgIds.size > 0) {
-                assignOrgId = Array.from(orgIds)[0];
-            }
+        // Validate the user actually belongs to the requested org (or assign
+        // their primary org). Trusting organizationId from the body would let
+        // any member create KBs in other orgs.
+        let assignOrgId;
+        try {
+            assignOrgId = await assertUserCanUseOrg(req, organizationId);
+        } catch (err) {
+            return res.status(err.status || 500).json({ error: err.message });
         }
 
         const cleanedContexts = sanitizeUsageContexts(usageContexts);
@@ -334,10 +335,16 @@ router.patch('/:id/publish', requireAuth, async (req, res) => {
         }
 
         const { isPublished, sharedGroups } = req.body || {};
-        // Pass `sharedGroups` through verbatim — including undefined — so
-        // the store can preserve the current value when the client sent only
-        // a publish toggle. Coercing to `[]` here would wipe restrictions.
-        const updated = await kbStore.setPublished(kb.id, !!isPublished, sharedGroups);
+        // Validate sharedGroups belong to the KB's org. `undefined` means
+        // "leave as-is"; the validator returns undefined and the store
+        // preserves the existing column value.
+        let cleanedGroups;
+        try {
+            cleanedGroups = await validateSharedGroupsForOrg(kb.organization_id, sharedGroups);
+        } catch (err) {
+            return res.status(err.status || 500).json({ error: err.message });
+        }
+        const updated = await kbStore.setPublished(kb.id, !!isPublished, cleanedGroups);
         res.json({ success: true, kb: updated });
     } catch (e) {
         console.error('[KB] Publish error:', e.message);

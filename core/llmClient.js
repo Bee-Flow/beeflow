@@ -64,7 +64,20 @@ class LLMClient {
             ...options,
         });
         const raw = result.content || '';
-        return raw.trim().replace(/[\"']/g, '') || 'New Chat';
+        // Defensive sanitisation — the model has been observed returning a
+        // truncated HTML/code block when asked for a title in a tool-heavy
+        // session. Strip code-fence prefixes, collapse to a single line, drop
+        // anything that looks like a tag, and cap length.
+        let cleaned = raw.trim().replace(/[\"']/g, '');
+        // If it opens with a code fence ("```html", "```js", "```\n…") it's
+        // almost certainly hallucinated source code, not a title.
+        if (/^```/.test(cleaned)) return 'New Chat';
+        // Strip any leftover HTML tags before length-capping.
+        cleaned = cleaned.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+        if (!cleaned) return 'New Chat';
+        // Cap to a reasonable conversation-list length.
+        if (cleaned.length > 80) cleaned = cleaned.slice(0, 80).trim();
+        return cleaned;
     }
 
     /**

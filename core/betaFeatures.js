@@ -131,10 +131,18 @@ async function getUserBetaFeatures(userId, session = null) {
             if (group?.organizationId) orgIds.add(group.organizationId);
         }
 
+        // Intersection of the super-admin allow-list with the org-admin
+        // "active" subset — both must include a feature for it to be
+        // available to users in the org.
         const featureSet = new Set();
         for (const orgId of orgIds) {
-            for (const fid of await getOrgBetaFeatures(orgId)) {
-                featureSet.add(fid);
+            const allowed = await getOrgBetaFeatures(orgId);
+            let active;
+            try { active = await userStore.getOrgEnabledBetaFeatures(orgId); }
+            catch (_) { active = []; }
+            const activeSet = new Set(active);
+            for (const fid of allowed) {
+                if (activeSet.has(fid)) featureSet.add(fid);
             }
         }
 

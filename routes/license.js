@@ -16,7 +16,7 @@ const express = require('express');
 const router = express.Router();
 
 const license = require('../license');
-const { hasPermission } = require('../auth/permissions');
+const { hasPermission, resolveUserOrgIds } = require('../auth/permissions');
 
 function getSessionUser(req) {
     return req.session?.user || null;
@@ -52,7 +52,16 @@ router.get('/status', async (req, res) => {
     try {
         const orgId = getOrgId(req);
         const userId = getUserId(req);
-        const status = await license.getLicenseStatus({ organizationId: orgId, userId });
+        // Resolve every org the caller belongs to (direct organizationId +
+        // group-based memberships). Status now reports the highest-tier
+        // licence across all of them, so a member invited via a group sees
+        // the same plan as the org admin.
+        let orgIds = null;
+        try {
+            const resolved = await resolveUserOrgIds(req);
+            if (resolved instanceof Set) orgIds = [...resolved];
+        } catch (_) { /* ignore — fall back to direct org only */ }
+        const status = await license.getLicenseStatus({ organizationId: orgId, userId, orgIds });
         res.json(status);
     } catch (e) {
         console.error('[License] status error:', e);

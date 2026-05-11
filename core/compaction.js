@@ -17,6 +17,15 @@ const TOOL_RESULT_MAX_LEN = 500; // Truncate tool results beyond this in recent 
 // details from them. Anything larger gets head-truncated with a marker.
 const SUMMARY_FILE_TEXT_MAX_CHARS = 8_000;
 
+// Unpaired UTF-16 high (D800-DBFF) or low (DC00-DFFF) surrogate. JSON parsers
+// downstream of HTTP (notably Anthropic's) reject these, breaking the entire
+// compaction call. Strip rather than escape so the summarizer still runs.
+const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+function stripLoneSurrogates(s) {
+    if (typeof s !== 'string' || !s) return s;
+    return s.replace(LONE_SURROGATE_RE, '�');
+}
+
 /**
  * Compact a message array for efficient LLM consumption.
  *
@@ -211,6 +220,14 @@ async function generateSummary(oldMessages, existingSummary, summaryModelId, use
             modelId = 'gemini-2.0-flash-lite';
         }
     }
+
+    // Strip lone UTF-16 surrogates. Some upstream content (mangled paste,
+    // truncated emoji, broken decoder) leaves unpaired D800-DBFF / DC00-DFFF
+    // codepoints which Anthropic's JSON parser rejects with
+    //   "no low surrogate in string: line 1 column N"
+    // and the whole compaction call fails. Replace with U+FFFD so the
+    // summarizer still runs and the conversation actually shrinks.
+    contentToSummarize = stripLoneSurrogates(contentToSummarize);
 
     try {
         const result = await llmClient.chat(modelId, [

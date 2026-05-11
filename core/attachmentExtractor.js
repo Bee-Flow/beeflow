@@ -92,12 +92,43 @@ function isTextInsufficient(text, numPages) {
     return totalChars < threshold;
 }
 
+// Some invoice PDFs (notably fuel-card / logistics PDFs) embed fonts with no
+// usable ToUnicode CMap, so pdfjs returns long strings of CID-mapped glyphs
+// — enough characters to pass `isTextInsufficient` but visually unreadable.
+// Detect that case so we fall through to Azure/Mistral OCR instead of shipping
+// junk to the LLM.
+function isTextLikelyGarbage(text) {
+    const trimmed = (text || '').trim();
+    if (trimmed.length < 200) return false; // not enough sample to judge — let other checks decide
+    const sample = trimmed.slice(0, 4000);
+    let letters = 0;
+    let asciiLikePrintable = 0;
+    for (let i = 0; i < sample.length; i++) {
+        const code = sample.charCodeAt(i);
+        // Letters (incl. accented latin)
+        if ((code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a) || (code >= 0xc0 && code <= 0xff)) letters++;
+        // Printable ASCII + common whitespace
+        if ((code >= 0x20 && code <= 0x7e) || code === 0x0a || code === 0x0d || code === 0x09) asciiLikePrintable++;
+    }
+    const letterRatio = letters / sample.length;
+    const printableRatio = asciiLikePrintable / sample.length;
+    // Real-world prose hits letterRatio ≈ 0.6+, printableRatio ≈ 0.95+.
+    // Junk CID streams come out at letterRatio <0.25 with lots of control
+    // chars / high-codepoint glyphs that fail the printable check too.
+    return letterRatio < 0.25 || printableRatio < 0.75;
+}
+
 // ─── PDF pipeline ───────────────────────────────────────────
 async function extractPdf(buffer, att, opts) {
     const { text, numPages, pageCharCounts } = await extractTextFromPDFWithStats(buffer, att.name);
     const baseMeta = { numPages, pageCharCounts, totalChars: text.length };
 
-    if (!isTextInsufficient(text, numPages)) {
+    const insufficient = isTextInsufficient(text, numPages);
+    const garbage = !insufficient && isTextLikelyGarbage(text);
+    if (garbage) {
+        console.warn(`[AttachmentExtractor] pdfjs returned ${text.length} chars but the content looks like CID/font junk for ${att.name} — falling through to OCR.`);
+    }
+    if (!insufficient && !garbage) {
         return { kind: 'text', text, source: 'pdfjs', meta: baseMeta };
     }
 
@@ -203,6 +234,7 @@ module.exports = {
     formatFailureNote,
     // exposed for tests
     isTextInsufficient,
+    isTextLikelyGarbage,
     isPdf,
     isDocx,
     isSpreadsheet,

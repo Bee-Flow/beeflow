@@ -8,7 +8,6 @@
 
 const { google } = require('googleapis');
 const { loadConfig } = require('../auth/permissions');
-const { mistralOCR } = require('../core/ocr');
 
 /**
  * Tool definitions in OpenAI function-calling format.
@@ -345,33 +344,31 @@ async function executeGmailTool(toolName, args, session, opts = {}) {
 
         // Convert from URL-safe base64 to standard base64
         const standardBase64 = base64Data.replace(/-/g, '+').replace(/_/g, '/');
-        const pdfBuffer = Buffer.from(standardBase64, 'base64');
 
-        // Try Mistral OCR first, then fall back to local PDF text extraction
-        let extractedText = '';
-        try {
-            extractedText = await mistralOCR(standardBase64, 'application/pdf', fname || 'attachment.pdf');
-        } catch (ocrErr) {
-            console.log(`[Gmail] Mistral OCR failed for ${fname}: ${ocrErr.message}, trying local PDF parser...`);
-        }
+        // Unified attachment pipeline: pdfjs → Azure DI → Mistral OCR, plus
+        // the garbage-text fallback for CID-font invoices. Same code path
+        // chat uploads and Nextcloud reads use, so PDF quirks fix in one place.
+        const { extractAttachment } = require('../core/attachmentExtractor');
+        const result = await extractAttachment({
+            name: fname || 'attachment.pdf',
+            type: 'application/pdf',
+            content: standardBase64,
+        });
 
-        if (!extractedText) {
-            // Fallback: use local pdfjs-based text extraction
-            try {
-                const { extractTextFromPDF } = require('../core/pdfExtractor');
-                extractedText = await extractTextFromPDF(pdfBuffer, fname || 'attachment.pdf');
-            } catch (pdfErr) {
-                console.log(`[Gmail] Local PDF extraction also failed for ${fname}: ${pdfErr.message}`);
-            }
-        }
-
-        if (!extractedText) {
+        if (result.kind === 'images') {
             return {
-                error: 'Could not extract text from the PDF. Both OCR and text extraction failed.',
+                error: `${fname || 'attachment.pdf'} appears to be an image-only PDF (${result.meta?.numPages || '?'} pages) with no extractable text. Configure Azure Document Intelligence or Mistral OCR to read scanned PDFs from Gmail.`,
+                filename: fname || 'attachment.pdf',
+            };
+        }
+        if (result.kind !== 'text' || !result.text) {
+            return {
+                error: `Could not extract text from the PDF: ${result.reason || 'unknown reason'}.`,
                 filename: fname || 'attachment.pdf',
             };
         }
 
+        const extractedText = result.text;
         // Truncate if very large
         const MAX_CHARS = 80000;
         return {
@@ -381,6 +378,7 @@ async function executeGmailTool(toolName, args, session, opts = {}) {
                 : extractedText,
             charCount: extractedText.length,
             truncated: extractedText.length > MAX_CHARS,
+            extractedVia: result.source,
         };
 
     } else if (toolName === 'gmail_compose') {

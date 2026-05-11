@@ -33,7 +33,7 @@ const webpageDbStore = require('../stores/webpageDbStore');
 const { issuePreviewToken, requirePreviewToken } = require('../auth/webpagePreviewToken');
 const kbStore = require('../stores/knowledgeBases');
 const { resolveAudienceContext } = require('../auth/audience');
-const { hasPermission } = require('../auth');
+const { hasPermission, validateSharedGroupsForOrg } = require('../auth');
 const userStore = require('../stores/userStore');
 const {
     ingestFileSource,
@@ -186,6 +186,41 @@ router.put('/:id', requireAuth, async (req, res) => {
     }
 });
 
+// ── Thumbnail (rendered preview) ────────────────────────────────────
+
+router.get('/:id/thumbnail', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        // Same visibility logic as GET /:id — owner OR org/group-published.
+        let webpage = await webpageStore.getWebpage(req.params.id, userId);
+        if (!webpage) {
+            const raw = await webpageStore.getWebpageRaw(req.params.id);
+            const { orgIds, userGroups } = await resolveAudienceContext(req);
+            const orgIdArr = orgIds instanceof Set ? [...orgIds] : (Array.isArray(orgIds) ? orgIds : []);
+            if (raw && webpageStore.canReadWebpage(raw, userId, userGroups, orgIdArr)) {
+                webpage = raw;
+            }
+        }
+        if (!webpage) return res.status(404).end();
+        if (!webpage.thumbnailSha) return res.status(404).end();
+        const bytes = await webpageStore.readThumbnail(webpage.userId, webpage.id);
+        if (!bytes) return res.status(404).end();
+        // We may have written a JPEG (sharp path) or a raw PNG (no-sharp
+        // fallback). Sniff the first byte to pick the right Content-Type.
+        const isJpeg = bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8;
+        res.setHeader('Content-Type', isJpeg ? 'image/jpeg' : 'image/png');
+        res.setHeader('Cache-Control', 'private, max-age=60');
+        res.setHeader('ETag', `"${webpage.thumbnailSha}"`);
+        if (req.headers['if-none-match'] === `"${webpage.thumbnailSha}"`) {
+            return res.status(304).end();
+        }
+        return res.end(bytes);
+    } catch (err) {
+        console.error('[Webpages] Thumbnail fetch failed:', err);
+        return res.status(500).end();
+    }
+});
+
 // ── Publish (org/group visibility) ──────────────────────────────────
 
 router.patch('/:id/publish', requireAuth, async (req, res) => {
@@ -224,11 +259,21 @@ router.patch('/:id/publish', requireAuth, async (req, res) => {
             }
         }
 
+        // Validate sharedGroups belong to the webpage's org (existing org
+        // sticks; new org applies on first publish). Undefined → leave as-is.
+        const effectiveOrg = wp.organizationId || organizationId || null;
+        let cleanedGroups;
+        try {
+            cleanedGroups = await validateSharedGroupsForOrg(effectiveOrg, sharedGroups);
+        } catch (e) {
+            return res.status(e.status || 500).json({ error: e.message });
+        }
+
         const ok = await webpageStore.setWebpagePublished(
-            req.params.id, isPublished, wp.userId, sharedGroups, organizationId
+            req.params.id, isPublished, wp.userId, cleanedGroups, organizationId
         );
         if (!ok) return res.status(500).json({ error: 'Failed to update published status' });
-        res.json({ success: true, isPublished, sharedGroups });
+        res.json({ success: true, isPublished, sharedGroups: cleanedGroups });
     } catch (err) {
         console.error('[Webpages] Publish failed:', err);
         res.status(500).json({ error: 'Failed to update publish state' });

@@ -248,6 +248,56 @@ const OUTPUT_SCHEMAS = {
 
     // ── Notification (built-in step) ──────────────────────────────
     // Not technically a tool, but exposed for symmetry.
+
+    // ── Webpages ─────────────────────────────────────────────────
+    webpages_list: {
+        shape: { webpages: 'array of { id, name, description, isOwner, isPublished, updatedAt }' },
+        sample: { webpages: [
+            { id: 'wp-sample-1', name: 'Move Move Facturen', description: 'Fuel invoice tracker', isOwner: true, isPublished: false, updatedAt: new Date().toISOString() },
+        ], message: '1 accessible webpage.' },
+    },
+    webpage_db_schema: {
+        shape: { tables: 'array of { name, sql, columns: [{ name, type, notNull, defaultValue, primaryKey }] }', message: 'string' },
+        sample: { tables: [
+            { name: 'facturen', sql: 'CREATE TABLE facturen (...)', columns: [
+                { name: 'id', type: 'TEXT', notNull: 1, defaultValue: null, primaryKey: 1 },
+                { name: 'datum', type: 'TEXT', notNull: 1, defaultValue: null, primaryKey: 0 },
+                { name: 'incl_btw', type: 'REAL', notNull: 1, defaultValue: null, primaryKey: 0 },
+            ] },
+        ], message: '1 table: facturen' },
+    },
+    webpage_db_query: {
+        shape: { rows: 'array of row objects', columns: 'array of column names', truncated: 'boolean', message: 'string' },
+        sample: { rows: [{ id: 'sample-row', datum: '2026-05-05', incl_btw: 69.99 }], columns: ['id', 'datum', 'incl_btw'], truncated: false, message: 'Returned 1 row.' },
+    },
+    webpage_db_exec: {
+        shape: { changes: 'integer', lastInsertRowid: 'integer', multi: 'boolean', message: 'string' },
+        sample: { changes: 1, lastInsertRowid: 42, multi: false, message: 'OK — 1 row affected, lastInsertRowid=42.' },
+    },
+    webpage_file_read: {
+        shape: { file: 'string', content: 'string', lineCount: 'integer', message: 'string' },
+        sample: { file: 'js', content: '// sample js', lineCount: 1, message: 'Read 1 line.' },
+    },
+    webpage_file_write: {
+        shape: { message: 'string', file: 'string', webpageId: 'string' },
+        sample: { message: 'File written.', file: 'js', webpageId: 'wp-sample-1' },
+    },
+    webpage_file_replace: {
+        shape: { message: 'string', file: 'string', webpageId: 'string' },
+        sample: { message: 'Replaced 1 occurrence.', file: 'js', webpageId: 'wp-sample-1' },
+    },
+    webpage_file_patch: {
+        shape: { message: 'string', file: 'string', webpageId: 'string' },
+        sample: { message: 'Patched lines 5–7.', file: 'js', webpageId: 'wp-sample-1' },
+    },
+    webpage_set_metadata: {
+        shape: { message: 'string', webpageId: 'string' },
+        sample: { message: 'Webpage metadata updated.', webpageId: 'wp-sample-1' },
+    },
+    webpage_create: {
+        shape: { webpageId: 'string', url: 'string', name: 'string', message: 'string' },
+        sample: { webpageId: 'wp-new-1', url: '/app/webpages/wp-new-1', name: 'New Webpage', message: 'Created webpage "New Webpage".' },
+    },
 };
 
 function getOutputSchema(toolName) {

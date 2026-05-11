@@ -39,6 +39,7 @@ const TOOL_REGISTRY = [
     { app: 'nextcloud-notifications', label: 'Nextcloud Notifications',module: '../integrations/nextcloudNotificationsTools', arrayName: 'NEXTCLOUD_NOTIFICATIONS_TOOLS', enabledKey: 'nextcloud-notifications' },
     { app: 'nextcloud-status',        label: 'Nextcloud Status',       module: '../integrations/nextcloudStatusTools',      arrayName: 'NEXTCLOUD_STATUS_TOOLS',     enabledKey: 'nextcloud-status' },
     { app: 'n8n',                     label: 'n8n',                    module: '../integrations/n8nWorkflowTools',          arrayName: 'N8N_WORKFLOW_TOOLS',         enabledKey: 'n8n' },
+    { app: 'webpages',                label: 'Webpages',               module: '../integrations/webpageAutomationTools',    arrayName: 'WEBPAGE_AUTOMATION_TOOLS',   enabledKey: 'webpages' },
 ];
 
 /**

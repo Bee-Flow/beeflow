@@ -149,6 +149,32 @@ async function initDB() {
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "autoApproveSSO" TEXT DEFAULT '0'`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "enabledIntegrations" TEXT DEFAULT NULL`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "allowed_domains" TEXT DEFAULT NULL`); } catch (e) { /* column already exists */ }
+    // Org-admin "active" subsets of the super-admin allow-lists. The super
+    // admin grants capabilities (enabledIntegrations / beta_features); the
+    // org admin then chooses which of those to actually turn on for their
+    // org. Empty array (default) = nothing on. The runtime gates intersect
+    // these with the allow-list before letting tools/routes through.
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "org_enabled_integrations" TEXT DEFAULT '[]'`); } catch (e) { /* column already exists */ }
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "org_enabled_beta_features" TEXT DEFAULT '[]'`); } catch (e) { /* column already exists */ }
+
+    // One-shot backfill: any org that already has a super-admin allow-list
+    // gets that list copied into the new "enabled" column so today's
+    // behaviour is preserved. Only rows still at the '[]' default are
+    // touched, so this stays idempotent on subsequent boots.
+    try {
+        await exec(`UPDATE organizations
+            SET "org_enabled_integrations" = "enabledIntegrations"
+            WHERE "org_enabled_integrations" = '[]'
+              AND "enabledIntegrations" IS NOT NULL
+              AND "enabledIntegrations" != '[]'`);
+    } catch (e) { /* non-fatal — column may not be ready yet on first boot */ }
+    try {
+        await exec(`UPDATE organizations
+            SET "org_enabled_beta_features" = COALESCE("beta_features", '[]')
+            WHERE "org_enabled_beta_features" = '[]'
+              AND "beta_features" IS NOT NULL
+              AND "beta_features" != '[]'`);
+    } catch (e) { /* beta_features column is added lazily by betaFeatures.js; backfill will run next boot once it exists */ }
 
     // ── Azure AD Group Sync columns ──
     try { await exec(`ALTER TABLE groups ADD COLUMN IF NOT EXISTS "azureGroupId" TEXT`); } catch (e) { /* column already exists */ }
@@ -582,6 +608,8 @@ function parseOrg(o) {
         allowedDomains: parseJSON(o.allowed_domains, []),
         ncSyncGroups: parseJSON(o.nc_sync_groups, []),
         ncSyncExcludedGroups: parseJSON(o.nc_sync_excluded_groups, []),
+        orgEnabledIntegrations: parseJSON(o.org_enabled_integrations, []),
+        orgEnabledBetaFeatures: parseJSON(o.org_enabled_beta_features, []),
     };
 }
 
@@ -646,6 +674,45 @@ async function updateOrganization(orgId, updates) {
         if (q) await run(q.sql, q.params);
         return true;
     } catch (e) { console.error(e); return false; }
+}
+
+// ── Org-admin "active" subsets ────────────────────────────────────
+// These are the per-org enablement lists the ORG admin controls (as
+// opposed to enabledIntegrations / beta_features which the SUPER admin
+// controls). Runtime gates intersect with the super-admin lists, so a
+// stale entry here cannot grant access to something the super admin
+// hasn't allowed.
+
+async function getOrgEnabledIntegrations(orgId) {
+    await initDB();
+    const o = await getOne('SELECT "org_enabled_integrations" FROM organizations WHERE id = $1', [orgId]);
+    return parseJSON(o?.org_enabled_integrations, []);
+}
+
+async function setOrgEnabledIntegrations(orgId, ids) {
+    await initDB();
+    const clean = Array.isArray(ids) ? Array.from(new Set(ids.filter(Boolean))) : [];
+    const { rowCount } = await run(
+        'UPDATE organizations SET "org_enabled_integrations" = $1 WHERE id = $2',
+        [JSON.stringify(clean), orgId]
+    );
+    return rowCount > 0;
+}
+
+async function getOrgEnabledBetaFeatures(orgId) {
+    await initDB();
+    const o = await getOne('SELECT "org_enabled_beta_features" FROM organizations WHERE id = $1', [orgId]);
+    return parseJSON(o?.org_enabled_beta_features, []);
+}
+
+async function setOrgEnabledBetaFeatures(orgId, ids) {
+    await initDB();
+    const clean = Array.isArray(ids) ? Array.from(new Set(ids.filter(Boolean))) : [];
+    const { rowCount } = await run(
+        'UPDATE organizations SET "org_enabled_beta_features" = $1 WHERE id = $2',
+        [JSON.stringify(clean), orgId]
+    );
+    return rowCount > 0;
 }
 
 async function deleteOrganization(orgId) {
@@ -1304,6 +1371,7 @@ async function getAuditLog(opts = {}) {
 module.exports = {
     getAllUsers, getAllUserAvatars, getUser, getUserByEmail, createUser, updateUser, deleteUser,
     getAllOrganizations, getOrganization, getOrganizationByNcInstanceId, createOrganization, updateOrganization, deleteOrganization,
+    getOrgEnabledIntegrations, setOrgEnabledIntegrations, getOrgEnabledBetaFeatures, setOrgEnabledBetaFeatures,
     getUserByNcUid,
     createPendingNcBinding, getPendingNcBinding, getPendingNcBindingForOrg,
     countActivePendingNcBindingsForOrg, markPendingNcBindingApproved,

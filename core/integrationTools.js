@@ -49,6 +49,7 @@ const { NEXTCLOUD_MAIL_TOOLS } = require('../integrations/nextcloudMailTools');
 const { NEXTCLOUD_ACTIVITY_TOOLS } = require('../integrations/nextcloudActivityTools');
 const { NEXTCLOUD_STATUS_TOOLS } = require('../integrations/nextcloudStatusTools');
 const { TICKET_ASSISTANT_TOOLS } = require('../integrations/ticketAssistantTools');
+const { WEBPAGE_AUTOMATION_TOOLS } = require('../integrations/webpageAutomationTools');
 
 // IDs that are exempt from org-level gating (admin-only tools, internal utilities)
 const ORG_EXEMPT_APPS = ['workspace', 'regex-gen'];
@@ -71,11 +72,22 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
 
     // Load org-level enabled integrations
     let orgEnabledIntegrations = null;
+    // Org-admin "active" subset of the super-admin allow-list (non-NC only).
+    // null = no restriction (used for NC which has its own group path); a
+    // Set = only IDs in here pass the org-admin gate.
+    let orgActiveSet = null;
     let userOrgId = null;
     // Per-group NC opt-out (Fase G). Resolved per-user: only the groups the
     // current user belongs to are loaded, with their disabled_integrations
     // arrays. Used by isAppOn() with "enable wins" semantics — see below.
     let userGroupDisableLists = null;
+    // NC ID set — used to skip the org-admin active filter for NC tools,
+    // which are governed by the dedicated NC panel + per-group opt-out path.
+    let ncIdSet = new Set();
+    try {
+        const cat = require('./ncIntegrationCatalog');
+        ncIdSet = cat.NC_INTEGRATION_ID_SET || new Set(cat.NC_INTEGRATION_IDS || []);
+    } catch (_) { }
     try {
         const userStore = require('../stores/userStore');
         const currentUser = await userStore.getUser(userId);
@@ -97,6 +109,14 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
                         : globalDefaults;
                 }
                 // null globalDefaults = all enabled (no defaults configured yet)
+            }
+            // Org-admin's active subset. Super admin bypasses this entirely
+            // so they can always see/use everything the platform allows.
+            if (!isSuperAdmin) {
+                try {
+                    const activeList = await userStore.getOrgEnabledIntegrations(currentUser.organizationId);
+                    orgActiveSet = new Set(activeList);
+                } catch (_) { orgActiveSet = new Set(); }
             }
             // Collect disabled_integrations arrays from each group the user
             // belongs to. Skip when user is not in any groups; isAppOn then
@@ -123,7 +143,7 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
 
     // Auto-enable new integrations for users with existing saved lists
     // (these were added after the user saved their enabledApps, so they wouldn't be included)
-    const AUTO_ENABLED_APPS = ['agent-search', 'workspace', 'image-gen', 'music-gen', 'video-gen', 'elevenlabs', 'google-maps', 'linkedin', 'github', 'google-contacts', 'google-keep', 'outlook', 'outlook-readonly', 'ms-calendar', 'onedrive', 'ms-contacts', 'google-groups', 'n8n', 'nextcloud', 'nextcloud-calendar', 'nextcloud-contacts', 'nextcloud-deck', 'nextcloud-notifications', 'nextcloud-talk', 'nextcloud-tasks', 'nextcloud-notes', 'nextcloud-activity', 'nextcloud-status'];
+    const AUTO_ENABLED_APPS = ['agent-search', 'workspace', 'image-gen', 'music-gen', 'video-gen', 'elevenlabs', 'google-maps', 'linkedin', 'github', 'google-contacts', 'google-keep', 'outlook', 'outlook-readonly', 'ms-calendar', 'onedrive', 'ms-contacts', 'google-groups', 'n8n', 'nextcloud', 'nextcloud-calendar', 'nextcloud-contacts', 'nextcloud-deck', 'nextcloud-notifications', 'nextcloud-talk', 'nextcloud-tasks', 'nextcloud-notes', 'nextcloud-activity', 'nextcloud-status', 'webpages'];
 
     const isAppOn = (appId) => {
         // Must be enabled at user level
@@ -139,6 +159,13 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
         }
         // Org-level gating applies to all integrations except exempt ones
         if (!ORG_EXEMPT_APPS.includes(appId) && orgEnabledIntegrations && !orgEnabledIntegrations.includes(appId)) return false;
+        // Org-admin "active" subset filter — applies only to non-NC, non-
+        // exempt integrations. NC integrations are governed by the NC panel
+        // and the per-group opt-out below. Super admins bypass (orgActiveSet
+        // stays null) so the platform stays fully operable for them.
+        if (orgActiveSet && !ORG_EXEMPT_APPS.includes(appId) && !ncIdSet.has(appId) && !orgActiveSet.has(appId)) {
+            return false;
+        }
         // Per-group NC opt-out with "enable wins". Only kicks in for the NC
         // prefix and only when the user has at least one group with a non-
         // empty disabled list. The tool is denied only if EVERY user group
@@ -367,6 +394,21 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
     const hasMistralKey = !!(await configStore.getSecret('mistral_api_key'));
     if (hasMistralKey && isAppOn('transcription')) {
         addTools(TRANSCRIPTION_TOOLS);
+    }
+
+    // Webpages (automation-flavoured surface). Gated on the per-user
+    // "webpages" beta feature — automations only see these tools when the
+    // user can already use webpages in Studio. Direct chat injects its own
+    // webpage tools separately and ignores this surface; the names overlap
+    // but the dispatch paths are distinct (direct chat checks
+    // isBuilderTool/isDbTool first; the automation runner goes through
+    // toolDispatcher → isWebpageAutomationTool).
+    if (isAppOn('webpages')) {
+        try {
+            const { userHasBetaFeature } = require('./betaFeatures');
+            const ok = await userHasBetaFeature(userId, 'webpages', session);
+            if (ok) addTools(WEBPAGE_AUTOMATION_TOOLS);
+        } catch (_) { /* beta lookup failed — fail closed */ }
     }
 
     return { tools, n8nOrgId };

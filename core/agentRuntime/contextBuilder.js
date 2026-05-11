@@ -1,6 +1,7 @@
 const { processSystemPrompt } = require('../promptUtils');
 const { buildToolHint } = require('../integrationTools');
 const { buildSkillInjection } = require('../skillInjection');
+const houseStyleStore = require('../../stores/houseStyleStore');
 
 async function buildSystemPrompt({ agent, tools, userId, messageMetadata, memoryContext, isStrictKnowledge, forceDynamicSkills = false }) {
     const defaultPrompt = tools.length > 0
@@ -62,19 +63,58 @@ Skip these unless there is a material update since the date shown. If you do inc
     systemPrompt += `\nNow: ${new Date().toLocaleString('sv-SE', { timeZone: tz, timeZoneName: 'short' })}`;
 
     // ─── Notebook context injection ─────────────────────────────
-    // `undefined` → no notebook open. Empty string is still "notebook present
-    // but blank" so the AI knows the tools are available.
-    if (messageMetadata?.notebookspaceContent !== undefined) {
-        systemPrompt += `\n\n[NOTEBOOK]
-The user has a Notebook panel open. You have 4 tools:
+    // Two flags from the client:
+    //   - notebookspaceAvailable: the Notebook panel exists (may be closed).
+    //     Tells the model that calling notebook_write will auto-open it.
+    //   - notebookspaceContent: the panel is currently open. `undefined` =
+    //     closed; `""` = "open but blank".
+    // ─── House style awareness ───────────────────────────────────
+    // Org-level Word/DOCX template that gets applied at Notebook export time.
+    // We tell the model the style is active so it can match tone/structure; the
+    // model should NOT try to set fonts or colors in Markdown — styling is
+    // applied automatically when the user exports to .docx.
+    if (messageMetadata?.orgId) {
+        try {
+            const houseStyle = await houseStyleStore.getDefaultForOrg(messageMetadata.orgId);
+            if (houseStyle) {
+                const tone = houseStyle.styleMeta?.toneDescription;
+                systemPrompt += `\n\n[HOUSE STYLE ACTIVE]
+Org Word/DOCX kantoorstijl "${houseStyle.name}" wordt automatisch toegepast bij export naar .docx${houseStyle.description ? ` — ${houseStyle.description}` : ''}.${tone ? ` Tone of voice: ${tone}.` : ''} Schrijf documenten in het Notebook in Markdown — opmaak (lettertype, koppen, marges, header/footer) wordt bij export geregeld; geen inline styling nodig.`;
+            }
+        } catch (e) {
+            console.warn('[contextBuilder] house style lookup failed:', e.message);
+        }
+    }
+
+    if (messageMetadata?.notebookspaceAvailable) {
+        systemPrompt += `\n\n[NOTEBOOK CAPABILITY]
+A Notebook panel is available in the user's UI. For long-form output the user is likely to keep or edit — memos, notes, letters, briefs, reports, articles, plans, code files, meeting notes — write the document into the notebook by calling notebook_write. The panel auto-opens when you write. Tools:
 - notebook_read: Read content. Modes: "outline" (default—headings+stats), "section" (one section by heading), "search" (find text), "full" (entire doc). Use outline first, then section/search for targeted access.
 - notebook_write: Replace ALL content (for new documents or full rewrites). Write in Markdown.
-- notebook_replace: Replace a SPECIFIC portion (find_text + replace_text). Preferred for edits.
+- notebook_replace: Replace a SPECIFIC portion (find_text + replace_text). Preferred for partial edits.
 - notebook_insert: Add content at "start", "end", or "after" a heading.
 
-RULES: 1) Before notebook_replace, use notebook_read mode="search" or mode="section" to get exact text. 2) Copy find_text EXACTLY from read output. 3) For partial edits always prefer notebook_replace over notebook_write. 4) Use Markdown for rich text (headings, bold, tables, code blocks, lists, etc.).`;
+CRITICAL: When you use a notebook tool, do NOT also write the document text in your chat reply. Acknowledge briefly (one short sentence) and stop — the user reads the result in the Notebook panel. Use Markdown inside the notebook for headings, bold, tables, lists, code blocks.`;
+    }
+    if (messageMetadata?.notebookspaceContent !== undefined) {
+        systemPrompt += `\n\n[NOTEBOOK OPEN]
+The Notebook panel is currently open. Edit rules: 1) Before notebook_replace, use notebook_read mode="search" or mode="section" to get exact text. 2) Copy find_text EXACTLY from read output. 3) For partial edits always prefer notebook_replace over notebook_write. 4) After any notebook tool call, your chat reply is at most one short confirmation sentence — do not repeat the new or modified content.`;
         if (messageMetadata.notebookspaceSelection && messageMetadata.notebookspaceSelection.trim()) {
             systemPrompt += `\n\n[SELECTED TEXT IN NOTEBOOK]\nThe user selected this text:\n\`\`\`\n${messageMetadata.notebookspaceSelection}\n\`\`\`\nUse notebook_replace with find_text set to EXACTLY this text. Set replace_text to the new version.`;
+        }
+    }
+
+    // ─── Side-panel webpage awareness ────────────────────────────
+    // When the user has a webpage open in the right-side panel (next to the
+    // chat), inject its current content so the AI can reason about "this
+    // page" / "deze pagina" without needing a tool call.
+    if (messageMetadata?.sidePanelWebpage?.id) {
+        try {
+            const { buildSidePanelWebpageContext } = require('../sidePanelWebpageContext');
+            const block = await buildSidePanelWebpageContext(messageMetadata.sidePanelWebpage, userId);
+            if (block) systemPrompt += block;
+        } catch (e) {
+            console.warn('[contextBuilder] sidePanelWebpage injection failed:', e.message);
         }
     }
 
