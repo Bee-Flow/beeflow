@@ -34,6 +34,11 @@ const TOOL_REGISTRY = [
     { app: 'nextcloud-talk',          label: 'Nextcloud Talk',         module: '../integrations/nextcloudTalkTools',        arrayName: 'NEXTCLOUD_TALK_TOOLS',       enabledKey: 'nextcloud-talk' },
     { app: 'nextcloud-tasks',         label: 'Nextcloud Tasks',        module: '../integrations/nextcloudTasksTools',       arrayName: 'NEXTCLOUD_TASKS_TOOLS',      enabledKey: 'nextcloud-tasks' },
     { app: 'nextcloud-notes',         label: 'Nextcloud Notes',        module: '../integrations/nextcloudNotesTools',       arrayName: 'NEXTCLOUD_NOTES_TOOLS',      enabledKey: 'nextcloud-notes' },
+    { app: 'nextcloud-mail',          label: 'Nextcloud Mail',         module: '../integrations/nextcloudMailTools',        arrayName: 'NEXTCLOUD_MAIL_TOOLS',       enabledKey: 'nextcloud-mail' },
+    { app: 'nextcloud-activity',      label: 'Nextcloud Activity',     module: '../integrations/nextcloudActivityTools',    arrayName: 'NEXTCLOUD_ACTIVITY_TOOLS',   enabledKey: 'nextcloud-activity' },
+    { app: 'nextcloud-notifications', label: 'Nextcloud Notifications',module: '../integrations/nextcloudNotificationsTools', arrayName: 'NEXTCLOUD_NOTIFICATIONS_TOOLS', enabledKey: 'nextcloud-notifications' },
+    { app: 'nextcloud-status',        label: 'Nextcloud Status',       module: '../integrations/nextcloudStatusTools',      arrayName: 'NEXTCLOUD_STATUS_TOOLS',     enabledKey: 'nextcloud-status' },
+    { app: 'n8n',                     label: 'n8n',                    module: '../integrations/n8nWorkflowTools',          arrayName: 'N8N_WORKFLOW_TOOLS',         enabledKey: 'n8n' },
 ];
 
 /**

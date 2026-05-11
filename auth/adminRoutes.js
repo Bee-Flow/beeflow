@@ -426,6 +426,12 @@ router.post('/organizations', requireAdmin, async (req, res) => {
     }
 });
 
+router.get('/organizations/:id', requireOrgAdmin('id'), async (req, res) => {
+    const org = await userStore.getOrganization(req.params.id);
+    if (!org) return res.status(404).json({ error: 'Organization not found' });
+    res.json(org);
+});
+
 router.put('/organizations/:id', requireOrgAdmin('id'), async (req, res) => {
     const { id } = req.params;
     const { name, description, tagline, address, email, phone, website, kvk, vat, logo, footerText, defaultGroups, allowSignup, authMethod, enabledIntegrations, autoApproveSSO, allowedDomains } = req.body;

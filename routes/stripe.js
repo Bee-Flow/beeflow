@@ -109,13 +109,20 @@ router.post('/checkout', requireAuth, async (req, res) => {
         }
 
         const origin = req.body.origin || getOrigin(req);
+        // Optional caller-supplied success URL (wizard uses this to land the
+        // admin on the License & Usage panel with a wizard-complete banner).
+        // Any '{CHECKOUT_SESSION_ID}' placeholder in the caller URL is
+        // preserved — Stripe substitutes the real session id on redirect.
+        const customSuccessUrl = typeof req.body.successUrl === 'string' && req.body.successUrl.startsWith(origin)
+            ? req.body.successUrl
+            : null;
 
         if (isConsumer) {
             // ── Consumer Checkout ──
             const existingSub = await userStore.getConsumerSubscription(user.id);
             const stripeCustomerId = existingSub?.stripe_customer_id || null;
 
-            const successUrl = `${origin}/app/settings?tab=consumer_license&checkout=success&session_id={CHECKOUT_SESSION_ID}`;
+            const successUrl = customSuccessUrl || `${origin}/app/settings?tab=consumer_license&checkout=success&session_id={CHECKOUT_SESSION_ID}`;
             const cancelUrl = `${origin}/app/settings?tab=consumer_license&checkout=cancelled`;
 
             const session = await stripeService.createCheckoutSession({
@@ -136,7 +143,7 @@ router.post('/checkout', requireAuth, async (req, res) => {
             const existingSub = await userStore.getOrgSubscription(orgId);
             const stripeCustomerId = existingSub?.stripe_customer_id || null;
 
-            const successUrl = `${origin}/app/settings?tab=license&checkout=success&session_id={CHECKOUT_SESSION_ID}`;
+            const successUrl = customSuccessUrl || `${origin}/app/settings?tab=license&checkout=success&session_id={CHECKOUT_SESSION_ID}`;
             const cancelUrl = `${origin}/app/settings?tab=license&checkout=cancelled`;
 
             const orgs = await userStore.getAllOrganizations();

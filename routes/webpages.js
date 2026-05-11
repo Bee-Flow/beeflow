@@ -32,6 +32,9 @@ const storageStore = require('../stores/storageStore');
 const webpageDbStore = require('../stores/webpageDbStore');
 const { issuePreviewToken, requirePreviewToken } = require('../auth/webpagePreviewToken');
 const kbStore = require('../stores/knowledgeBases');
+const { resolveAudienceContext } = require('../auth/audience');
+const { hasPermission } = require('../auth');
+const userStore = require('../stores/userStore');
 const {
     ingestFileSource,
     ingestUrlSource,
@@ -67,8 +70,12 @@ router.post('/', requireAuth, async (req, res) => {
 
 router.get('/', requireAuth, async (req, res) => {
     try {
-        const userId = req.session.user.id;
-        const webpages = await webpageStore.getWebpages(userId);
+        const { userId, orgIds, userGroups } = await resolveAudienceContext(req);
+        // resolveUserOrgIds returns null for super-admin (sees everything in scope);
+        // collapse to [] so the SQL ANY($orgIds) doesn't blow up — super-admins fall
+        // through to their own webpages plus anything they own.
+        const orgIdArr = orgIds instanceof Set ? [...orgIds] : (Array.isArray(orgIds) ? orgIds : []);
+        const webpages = await webpageStore.getAccessibleWebpages(userId, userGroups, orgIdArr);
         res.json({ webpages });
     } catch (err) {
         console.error('[Webpages] List failed:', err);
@@ -79,18 +86,35 @@ router.get('/', requireAuth, async (req, res) => {
 router.get('/:id', requireAuth, async (req, res) => {
     try {
         const userId = req.session.user.id;
-        const webpage = await webpageStore.getWebpage(req.params.id, userId);
+        // Try owner-scoped read first (preserves owner-only RustFS path).
+        let webpage = await webpageStore.getWebpage(req.params.id, userId);
+        if (!webpage) {
+            // Owner mismatch — check published visibility.
+            const raw = await webpageStore.getWebpageRaw(req.params.id);
+            const { orgIds, userGroups } = await resolveAudienceContext(req);
+            const orgIdArr = orgIds instanceof Set ? [...orgIds] : (Array.isArray(orgIds) ? orgIds : []);
+            if (raw && webpageStore.canReadWebpage(raw, userId, userGroups, orgIdArr)) {
+                webpage = raw;
+            }
+        }
         if (!webpage) return res.status(404).json({ error: 'Webpage not found' });
+        // Files / sources / chat live under the OWNER's RustFS prefix, not the
+        // caller's — read with webpage.userId so org-viewers see the same bytes.
+        const ownerId = webpage.userId;
+        // Avoid the rest of the handler still referencing `userId` for owner ops.
+        var effectiveOwnerId = ownerId; // eslint-disable-line no-var
 
         await webpageStore.timeoutStuckSources(webpage.id).catch(() => {});
 
         const [sources, files, chatMessages, extraFiles] = await Promise.all([
             webpageStore.getSources(webpage.id),
-            webpageStore.readAllSlots(userId, webpage.id),
-            webpageStore.getChatMessages(webpage.id, userId),
+            webpageStore.readAllSlots(effectiveOwnerId, webpage.id),
+            // Chat history is per-owner; non-owner viewers get an empty array
+            // (don't leak the owner's chat with the AI builder).
+            webpage.userId === userId ? webpageStore.getChatMessages(webpage.id, userId) : Promise.resolve([]),
             webpageStore.listExtraFiles(webpage.id),
         ]);
-        res.json({ webpage, sources, files, chatMessages, extraFiles });
+        res.json({ webpage, sources, files, chatMessages, extraFiles, readOnly: webpage.userId !== userId });
     } catch (err) {
         console.error('[Webpages] Get failed:', err);
         res.status(500).json({ error: 'Failed to get webpage' });
@@ -159,6 +183,55 @@ router.put('/:id', requireAuth, async (req, res) => {
     } catch (err) {
         console.error('[Webpages] Update failed:', err);
         res.status(500).json({ error: 'Failed to update webpage: ' + err.message });
+    }
+});
+
+// ── Publish (org/group visibility) ──────────────────────────────────
+
+router.patch('/:id/publish', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const wp = await webpageStore.getWebpageRaw(req.params.id);
+        if (!wp) return res.status(404).json({ error: 'Webpage not found' });
+
+        // Non-owners need manage_webpages OR admin role.
+        const isAdmin = req.session?.isAdmin || req.session?.user?.role === 'admin';
+        if (wp.userId !== userId && !isAdmin) {
+            const ok = await hasPermission(userId, 'manage_webpages', req.session);
+            if (!ok) return res.status(403).json({ error: 'Permission denied' });
+        }
+
+        const { isPublished, sharedGroups } = req.body || {};
+
+        // Stamp organization_id on first publish. Owner's primary org is the
+        // source of truth — falling back to their first group's org if no
+        // direct organizationId is set on the user record.
+        let organizationId;
+        if (!!isPublished && !wp.organizationId) {
+            const owner = await userStore.getUser(wp.userId);
+            organizationId = owner?.organizationId || null;
+            if (!organizationId) {
+                const groups = Array.isArray(owner?.groups) ? owner.groups
+                    : (() => { try { return JSON.parse(owner?.groups || '[]'); } catch { return []; } })();
+                if (groups.length > 0) {
+                    const allGroups = await userStore.getAllGroups();
+                    const g = allGroups.find(x => groups.includes(x.id) && x.organizationId);
+                    organizationId = g?.organizationId || null;
+                }
+            }
+            if (!organizationId) {
+                return res.status(400).json({ error: 'Cannot publish: owner has no organisation' });
+            }
+        }
+
+        const ok = await webpageStore.setWebpagePublished(
+            req.params.id, isPublished, wp.userId, sharedGroups, organizationId
+        );
+        if (!ok) return res.status(500).json({ error: 'Failed to update published status' });
+        res.json({ success: true, isPublished, sharedGroups });
+    } catch (err) {
+        console.error('[Webpages] Publish failed:', err);
+        res.status(500).json({ error: 'Failed to update publish state' });
     }
 });
 

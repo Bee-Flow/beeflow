@@ -104,6 +104,17 @@ async function initDB() {
         await exec(`ALTER TABLE webpages ADD COLUMN IF NOT EXISTS db_size INTEGER DEFAULT 0`);
     } catch (_) { /* column already exists — fine */ }
 
+    // Publishing — same 3-mode model as agents/KBs: Personal (is_published=false),
+    // Entire Org (is_published=true, shared_groups=[]), Specific Groups
+    // (is_published=true, shared_groups=[...]). organization_id is set on first
+    // publish from the owner's primary org so cross-org leakage is impossible.
+    try {
+        await exec(`ALTER TABLE webpages ADD COLUMN IF NOT EXISTS is_published BOOLEAN DEFAULT FALSE`);
+        await exec(`ALTER TABLE webpages ADD COLUMN IF NOT EXISTS shared_groups TEXT DEFAULT '[]'`);
+        await exec(`ALTER TABLE webpages ADD COLUMN IF NOT EXISTS organization_id TEXT`);
+        await exec(`CREATE INDEX IF NOT EXISTS idx_webpages_org_published ON webpages(organization_id, is_published)`);
+    } catch (_) { /* columns already exist — fine */ }
+
     // Multi-file support — arbitrary additional files under a webpage.
     // The three primary slots (index.html / style.css / script.js) keep their
     // dedicated columns and RustFS keys; this table stores everything else.
@@ -491,6 +502,104 @@ async function getWebpage(id, userId) {
     return mapWebpageRow(r);
 }
 
+/**
+ * Owner-agnostic lookup — used by the publish endpoint and visibility checks
+ * where we need the row before we know if the caller is the owner. Callers
+ * MUST gate access via canReadWebpage / owner check before returning to UI.
+ */
+async function getWebpageRaw(id) {
+    await initDB();
+    const r = await getOne(
+        `SELECT w.*,
+                COALESCE(s.source_count, 0) AS source_count
+         FROM webpages w
+         LEFT JOIN (
+             SELECT webpage_id, COUNT(*) AS source_count
+             FROM webpage_sources GROUP BY webpage_id
+         ) s ON s.webpage_id = w.id
+         WHERE w.id = $1`,
+        [id]
+    );
+    return r ? mapWebpageRow(r) : null;
+}
+
+/**
+ * List webpages the user can see: ones they own + ones published into their
+ * org/groups. Mirrors getPublishedAgentsForUser's predicate.
+ */
+async function getAccessibleWebpages(userId, userGroupIds = [], userOrgIds = [], { limit = 50, offset = 0 } = {}) {
+    await initDB();
+    const orgIds = Array.isArray(userOrgIds) ? userOrgIds : [...(userOrgIds || [])];
+    const groupIds = Array.isArray(userGroupIds) ? userGroupIds : [];
+    const rows = await getAll(
+        `SELECT w.*,
+                COALESCE(s.source_count, 0) AS source_count
+         FROM webpages w
+         LEFT JOIN (
+             SELECT webpage_id, COUNT(*) AS source_count
+             FROM webpage_sources GROUP BY webpage_id
+         ) s ON s.webpage_id = w.id
+         WHERE w.user_id = $1
+            OR (w.is_published = TRUE AND w.organization_id IS NOT NULL AND w.organization_id = ANY($2::text[]))
+         ORDER BY w.updated_at DESC
+         LIMIT $3 OFFSET $4`,
+        [userId, orgIds, limit, offset]
+    );
+    // Filter shared_groups in JS — keeps the SQL portable and parsing consistent.
+    return rows
+        .map(mapWebpageRow)
+        .filter(w => {
+            if (w.userId === userId) return true;
+            if (!w.isPublished) return false;
+            const groups = Array.isArray(w.sharedGroups) ? w.sharedGroups : [];
+            if (groups.length === 0) return true; // entire-org publish
+            return groups.some(g => groupIds.includes(g));
+        });
+}
+
+/**
+ * Single-row visibility predicate. Returns true if the caller can read the
+ * webpage; mirrors the agent canSeePublished rules.
+ */
+function canReadWebpage(webpage, userId, userGroupIds = [], userOrgIds = []) {
+    if (!webpage) return false;
+    if (webpage.userId === userId) return true;
+    if (!webpage.isPublished) return false;
+    if (!webpage.organizationId) return false;
+    const orgIds = Array.isArray(userOrgIds) ? userOrgIds : [...(userOrgIds || [])];
+    if (!orgIds.includes(webpage.organizationId)) return false;
+    const groups = Array.isArray(webpage.sharedGroups) ? webpage.sharedGroups : [];
+    if (groups.length === 0) return true;
+    return groups.some(g => userGroupIds.includes(g));
+}
+
+/**
+ * Toggle published state + sharing scope. When sharedGroups is undefined,
+ * preserve the existing DB value (same trap as agents had — see
+ * setAgentPublished). organizationId is set on first publish so visibility
+ * filters can match against the owner's org without a join.
+ */
+async function setWebpagePublished(id, isPublished, ownerId, sharedGroups = undefined, organizationId = undefined) {
+    await initDB();
+    const sets = ['is_published = $1', 'updated_at = NOW()'];
+    const params = [!!isPublished];
+    let idx = 2;
+    if (sharedGroups !== undefined) {
+        sets.push(`shared_groups = $${idx++}`);
+        params.push(JSON.stringify(sharedGroups || []));
+    }
+    if (organizationId !== undefined) {
+        sets.push(`organization_id = $${idx++}`);
+        params.push(organizationId || null);
+    }
+    params.push(id, ownerId);
+    const { rowCount } = await run(
+        `UPDATE webpages SET ${sets.join(', ')} WHERE id = $${idx++} AND user_id = $${idx}`,
+        params
+    );
+    return rowCount > 0;
+}
+
 async function updateWebpageMetadata(id, userId, updates) {
     await initDB();
     const setClauses = [];
@@ -667,6 +776,9 @@ function mapWebpageRow(r) {
         cssSize: parseInt(r.css_size) || 0,
         jsSize: parseInt(r.js_size) || 0,
         dbSize: parseInt(r.db_size) || 0,
+        isPublished: r.is_published === true || r.is_published === 't',
+        sharedGroups: parseJSON(r.shared_groups, []),
+        organizationId: r.organization_id || null,
         sourceCount: parseInt(r.source_count) || 0,
         createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
         updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : null,
@@ -823,6 +935,10 @@ module.exports = {
     createWebpage,
     getWebpages,
     getWebpage,
+    getWebpageRaw,
+    getAccessibleWebpages,
+    canReadWebpage,
+    setWebpagePublished,
     updateWebpageMetadata,
     deleteWebpage,
     // Chat history
