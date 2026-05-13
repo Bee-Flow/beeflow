@@ -39,6 +39,7 @@ function sign(payload, { alg = 'RS256', headerOverrides = {} } = {}) {
 
 const now = Math.floor(Date.now() / 1000);
 
+(async () => {
 // ── Happy path: valid pro license ───────────────────────────────────────
 {
     const token = sign({
@@ -50,7 +51,7 @@ const now = Math.floor(Date.now() / 1000);
         exp: now + 86400,
         billing_interval: 'monthly',
     });
-    const r = verify.verifyToken(token, { now });
+    const r = await verify.verifyToken(token, { now });
     assert.strictEqual(r.valid, true, `expected valid, got: ${r.error}`);
     assert.strictEqual(r.payload.tier, 'pro');
     assert.strictEqual(r.payload.license_id, 'lic_pro_1');
@@ -66,7 +67,7 @@ const now = Math.floor(Date.now() / 1000);
         iat: now - 7200,
         exp: now - 3600,
     });
-    const r = verify.verifyToken(token, { now });
+    const r = await verify.verifyToken(token, { now });
     assert.strictEqual(r.valid, false);
     assert.strictEqual(r.error, 'token_expired');
 }
@@ -81,7 +82,7 @@ const now = Math.floor(Date.now() / 1000);
         iat: now,
         exp: now + 86400,
     });
-    const r = verify.verifyToken(token, { now });
+    const r = await verify.verifyToken(token, { now });
     assert.strictEqual(r.valid, false);
     assert.ok(r.error.startsWith('untrusted_issuer'), `got: ${r.error}`);
 }
@@ -98,7 +99,7 @@ const now = Math.floor(Date.now() / 1000);
     });
     const parts = token.split('.');
     const corrupted = `${parts[0]}.${parts[1]}.${b64url(Buffer.alloc(256, 0))}`;
-    const r = verify.verifyToken(corrupted, { now });
+    const r = await verify.verifyToken(corrupted, { now });
     assert.strictEqual(r.valid, false);
     assert.strictEqual(r.error, 'invalid_signature');
 }
@@ -113,7 +114,7 @@ const now = Math.floor(Date.now() / 1000);
         iat: now,
         exp: now + 86400,
     }, { headerOverrides: { alg: 'HS256' } });
-    const r = verify.verifyToken(token, { now });
+    const r = await verify.verifyToken(token, { now });
     assert.strictEqual(r.valid, false);
     assert.ok(r.error.startsWith('unexpected_alg'));
 }
@@ -128,7 +129,7 @@ const now = Math.floor(Date.now() / 1000);
         iat: now,
         exp: now + 86400,
     });
-    const r = verify.verifyToken(token, { now });
+    const r = await verify.verifyToken(token, { now });
     assert.strictEqual(r.valid, false);
     assert.ok(r.error.startsWith('invalid_tier'));
 }
@@ -142,7 +143,7 @@ const now = Math.floor(Date.now() / 1000);
         iat: now,
         exp: now + 86400,
     });
-    const r = verify.verifyToken(token, { now });
+    const r = await verify.verifyToken(token, { now });
     assert.strictEqual(r.valid, false);
     assert.strictEqual(r.error, 'missing_license_id');
 }
@@ -157,7 +158,7 @@ const now = Math.floor(Date.now() / 1000);
         iat: now,
         exp: now + 86400,
     });
-    const r = verify.verifyToken(token, { now });
+    const r = await verify.verifyToken(token, { now });
     assert.strictEqual(r.valid, false);
     assert.strictEqual(r.error, 'full_tier_requires_internal_issuer');
 }
@@ -172,19 +173,19 @@ const now = Math.floor(Date.now() / 1000);
         iat: now,
         exp: now + 86400,
     });
-    const r = verify.verifyToken(token, { now });
+    const r = await verify.verifyToken(token, { now });
     assert.strictEqual(r.valid, true, `expected valid, got: ${r.error}`);
     assert.strictEqual(r.payload.tier, 'full');
 }
 
 // ── Malformed token ─────────────────────────────────────────────────────
 {
-    const r = verify.verifyToken('not.a.jwt', { now });
+    const r = await verify.verifyToken('not.a.jwt', { now });
     assert.strictEqual(r.valid, false);
     assert.ok(r.error.startsWith('decode_failed'), `got: ${r.error}`);
 }
 {
-    const r = verify.verifyToken('only-one-part', { now });
+    const r = await verify.verifyToken('only-one-part', { now });
     assert.strictEqual(r.valid, false);
     assert.ok(r.error.startsWith('decode_failed'));
 }
@@ -206,7 +207,7 @@ const now = Math.floor(Date.now() / 1000);
         iat: now,
         exp: now + 86400,
     });
-    const r = verify.verifyToken(token, { now });
+    const r = await verify.verifyToken(token, { now });
     assert.strictEqual(r.valid, false);
     assert.ok(['invalid_signature', 'no_public_key_configured'].includes(r.error),
         `expected invalid_signature or no_public_key_configured, got ${r.error}`);
@@ -214,3 +215,7 @@ const now = Math.floor(Date.now() / 1000);
 }
 
 console.log('✓ license/verify.test.js — all assertions passed');
+})().catch(err => {
+    console.error('✗ license/verify.test.js FAILED:', err);
+    process.exit(1);
+});

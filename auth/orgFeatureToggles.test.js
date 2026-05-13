@@ -17,6 +17,23 @@ function intersect(allowed, active) {
     return active.filter(id => set.has(id));
 }
 
+// Mirror of the org-resolution rule used by /auth/me/active-features in
+// server/auth/adminRoutes.js (resolveActiveFeaturesContext). Kept here as a
+// pure function so we can unit-test the contract without spinning up Express.
+//
+//   userOrgIds === null         → super admin: first existing org or null
+//   userOrgIds is non-empty Set → first member
+//   userOrgIds is empty Set     → null
+function resolvePrimaryOrg(userOrgIds, allOrgs) {
+    if (userOrgIds === null) {
+        return Array.isArray(allOrgs) && allOrgs.length > 0 ? allOrgs[0].id : null;
+    }
+    if (userOrgIds instanceof Set && userOrgIds.size > 0) {
+        return Array.from(userOrgIds)[0];
+    }
+    return null;
+}
+
 async function run() {
     let passed = 0, failed = 0;
     function t(name, fn) {
@@ -50,6 +67,34 @@ async function run() {
     t('exact match returns the full set', () => {
         const r = intersect(['a', 'b', 'c'], ['a', 'b', 'c']);
         assert.deepStrictEqual(r.sort(), ['a', 'b', 'c']);
+    });
+
+    console.log('\n🧪 Org resolution rule — /auth/me/active-features\n');
+
+    t('super admin (null) picks first existing org', () => {
+        const r = resolvePrimaryOrg(null, [{ id: 'orgA' }, { id: 'orgB' }]);
+        assert.strictEqual(r, 'orgA');
+    });
+
+    t('super admin (null) with no orgs returns null', () => {
+        const r = resolvePrimaryOrg(null, []);
+        assert.strictEqual(r, null);
+    });
+
+    t('regular user with one org returns it', () => {
+        const r = resolvePrimaryOrg(new Set(['orgX']), [{ id: 'orgA' }, { id: 'orgX' }]);
+        assert.strictEqual(r, 'orgX');
+    });
+
+    t('regular user with multiple orgs returns the first', () => {
+        const r = resolvePrimaryOrg(new Set(['orgA', 'orgB']), []);
+        // Set iteration order = insertion order, so 'orgA' is first.
+        assert.strictEqual(r, 'orgA');
+    });
+
+    t('user with no orgs (empty Set) returns null even when orgs exist', () => {
+        const r = resolvePrimaryOrg(new Set(), [{ id: 'orgA' }]);
+        assert.strictEqual(r, null);
     });
 
     console.log(`\nResults: ${passed} passed, ${failed} failed\n`);

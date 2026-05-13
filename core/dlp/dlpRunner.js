@@ -31,6 +31,13 @@ const conversationDlpPrefs = new Map(); // conversationId → 'redact' | 'allow'
 // response path can still undo an earlier turn's token.
 const conversationTokenMaps = new Map(); // conversationId → Map<token, original>
 
+// One-shot "have we tried hydrating this conv from the DB yet" tracker. Once a
+// SELECT has returned (whether it found a row or not), we skip the query on
+// every subsequent `getConversationTokenMap` call. The in-process Map is the
+// source of truth for the rest of the conversation's lifetime.
+const _hydratedConversations = new Set();
+let _hydrationInFlight = new Map(); // convId → Promise resolved when the SELECT lands
+
 const MAX_TOKENS_PER_CONV = 500;
 
 function _ensureTokenMap(conversationId) {
@@ -53,9 +60,85 @@ function _mergeIntoTokenMap(conversationId, incoming) {
     }
 }
 
+// ─── DB persistence (write-through + hydrate) ───────────────────────
+// Without this, the in-process Map at line 32 is lost on every server
+// restart. Persisted content (Notebook, saved messages) that still contains
+// `[person_N]` placeholders would then be unredeemable forever. Persisting
+// the token map alongside the conversation row makes restore-on-reload
+// possible. See plan: token round-trip beyond the chat message.
+
+// Lazy-load DB helpers so this file stays cheap to require in test contexts
+// that don't touch persistence (the existing scanner tests, for example).
+function _db() {
+    return require('../../db');
+}
+
+async function _writeMapToDb(conversationId) {
+    if (!conversationId) return;
+    const map = conversationTokenMaps.get(conversationId);
+    if (!map) return;
+    const obj = {};
+    for (const [k, v] of map) obj[k] = v;
+    const payload = JSON.stringify(obj);
+    try {
+        const { run } = _db();
+        // Try agent_conversations first; fall back to direct_conversations.
+        const agentResult = await run(
+            'UPDATE agent_conversations SET pii_token_map = $1::jsonb WHERE id = $2',
+            [payload, conversationId],
+        );
+        if (agentResult?.rowCount > 0) return;
+        await run(
+            'UPDATE direct_conversations SET pii_token_map = $1::jsonb WHERE id = $2',
+            [payload, conversationId],
+        );
+    } catch (err) {
+        console.warn(`[DlpRunner] DB write-through failed for conv ${conversationId}: ${err.message}`);
+    }
+}
+
+async function _hydrateFromDb(conversationId) {
+    if (!conversationId || _hydratedConversations.has(conversationId)) return;
+    if (_hydrationInFlight.has(conversationId)) {
+        await _hydrationInFlight.get(conversationId);
+        return;
+    }
+    const p = (async () => {
+        try {
+            const { getOne } = _db();
+            let row = await getOne('SELECT pii_token_map FROM agent_conversations WHERE id = $1', [conversationId]);
+            if (!row) row = await getOne('SELECT pii_token_map FROM direct_conversations WHERE id = $1', [conversationId]);
+            const stored = row?.pii_token_map;
+            if (stored && typeof stored === 'object') {
+                // `node-postgres` parses JSONB into a plain object automatically.
+                const entries = Object.entries(stored);
+                if (entries.length > 0) {
+                    const map = _ensureTokenMap(conversationId);
+                    let added = 0;
+                    for (const [k, v] of entries) {
+                        if (!map.has(k)) { map.set(k, v); added++; }
+                    }
+                    if (added > 0) console.log(`[DlpRunner] Hydrated token map for conv ${conversationId} from DB (${added} tokens)`);
+                }
+            }
+        } catch (err) {
+            console.warn(`[DlpRunner] DB hydrate failed for conv ${conversationId}: ${err.message}`);
+        } finally {
+            _hydratedConversations.add(conversationId);
+            _hydrationInFlight.delete(conversationId);
+        }
+    })();
+    _hydrationInFlight.set(conversationId, p);
+    await p;
+}
+
 /**
  * Returns the accumulated token map for a conversation as a plain object
  * (consumable by `restoreTokens`).
+ *
+ * Sync by default. If you need post-restart hydration (i.e. you are about to
+ * render content for a user and want to handle the case where the in-process
+ * map is empty), use `getConversationTokenMapAsync` instead.
  */
 function getConversationTokenMap(conversationId) {
     const map = conversationTokenMaps.get(conversationId);
@@ -65,10 +148,35 @@ function getConversationTokenMap(conversationId) {
     return obj;
 }
 
+/**
+ * Async variant — hydrates from DB on the first call per process for a given
+ * conversation. Use this on render paths where the conversation may have been
+ * loaded after a server restart (workspace GET endpoint, reload routes).
+ */
+async function getConversationTokenMapAsync(conversationId) {
+    if (!conversationId) return {};
+    if (!_hydratedConversations.has(conversationId) && (!conversationTokenMaps.get(conversationId) || conversationTokenMaps.get(conversationId).size === 0)) {
+        await _hydrateFromDb(conversationId);
+    }
+    return getConversationTokenMap(conversationId);
+}
+
 function clearConversationState(conversationId) {
     if (!conversationId) return;
     conversationDlpPrefs.delete(conversationId);
     conversationTokenMaps.delete(conversationId);
+    _hydratedConversations.delete(conversationId);
+    // Best-effort DB clear so a deleted-then-recreated conversation doesn't
+    // inherit stale tokens. Fire-and-forget.
+    (async () => {
+        try {
+            const { run } = _db();
+            await run('UPDATE agent_conversations SET pii_token_map = NULL WHERE id = $1', [conversationId]);
+            await run('UPDATE direct_conversations SET pii_token_map = NULL WHERE id = $1', [conversationId]);
+        } catch (err) {
+            console.warn(`[DlpRunner] DB clear failed for conv ${conversationId}: ${err.message}`);
+        }
+    })();
 }
 
 function setConversationPref(conversationId, choice) {
@@ -276,6 +384,7 @@ async function scan({ messages, orgShieldConfig, orgId, conversationId, provider
     if (effectiveChoice === 'redact' || mode === 'auto_redact') {
         const { tokenizedText, tokenMap, summary } = _tokeniseAll(text, all);
         _mergeIntoTokenMap(conversationId, tokenMap);
+        _writeMapToDb(conversationId).catch(() => { /* logged in helper */ });
         return { action: 'redact', findings: all, provider, redactedText: tokenizedText, tokenMap, scanStatus: 'ok', summary };
     }
 
@@ -296,6 +405,7 @@ async function scan({ messages, orgShieldConfig, orgId, conversationId, provider
 function applyRedactionChoice({ conversationId, text, findings }) {
     const { tokenizedText, tokenMap, summary } = _tokeniseAll(text, findings);
     _mergeIntoTokenMap(conversationId, tokenMap);
+    _writeMapToDb(conversationId).catch(() => { /* logged in helper */ });
     return { tokenizedText, tokenMap, summary };
 }
 
@@ -318,6 +428,9 @@ function mergeTokenMap(conversationId, tokenMap) {
     } else {
         _mergeIntoTokenMap(conversationId, tokenMap);
     }
+    // Write-through to DB so the map survives a server restart. The chat
+    // turn does not block on this — failures are logged inside the helper.
+    _writeMapToDb(conversationId).catch(() => { /* already logged */ });
 }
 
 module.exports = {
@@ -325,6 +438,7 @@ module.exports = {
     applyRedactionChoice,
     mergeTokenMap,
     getConversationTokenMap,
+    getConversationTokenMapAsync,
     clearConversationState,
     setConversationPref,
     getConversationPref,

@@ -486,27 +486,74 @@ async function persistDraftWrap(draftWrap) {
 async function buildCatalogForUser(userId, session) {
     try {
         const { TOOL_REGISTRY, loadTools } = require('../../automation/toolRegistry');
-        const { getOutputSchema } = require('../../automation/outputSchemas');
+        const { getOutputSchema, OUTPUT_SCHEMAS } = require('../../automation/outputSchemas');
         const { isSideEffect } = require('../../automation/sideEffectMap');
-        const { getIntegrationTools } = require('../../core/integrationTools');
+        const { getIntegrationTools, getUserPermittedApps } = require('../../core/integrationTools');
+        const { buildTriggerOutputsCatalog } = require('../../automation/builderTools');
+
+        // `connected` set — apps the user can invoke RIGHT NOW (OAuth done,
+        // API key configured, group not opted-out, etc.). Drives the
+        // "Connect" badge on the palette.
         const userToolNames = new Set();
         try {
             const r = await getIntegrationTools({ userId, session, isAdmin: !!session?.isAdmin });
             for (const t of (r.tools || [])) if (t?.function?.name) userToolNames.add(t.function.name);
         } catch (_) {}
+
+        // `permitted` set — every app the user is ALLOWED to use under the
+        // org / group / personal-toggle gates, regardless of credentials.
+        // Mirrors the chat sidebar's Apps panel so an automation user sees
+        // exactly the same set of integrations they can wire up in chat.
+        // Without this the palette only showed apps OAuth'd today and felt
+        // empty on first launch.
+        let permittedSet = null;
+        try {
+            permittedSet = await getUserPermittedApps({ userId, session, isAdmin: !!session?.isAdmin });
+        } catch (_) {}
+
         const apps = TOOL_REGISTRY.map(entry => {
             const tools = loadTools(entry);
             const actions = tools.map(t => {
                 const name = t?.function?.name;
                 if (!name) return null;
-                return { name, description: t.function?.description, sideEffect: isSideEffect(name), outputSchema: getOutputSchema(name) };
+                // inputSchema is the OpenAI-format `parameters` block already attached
+                // to every tool entry — surface it so the client mapping UI can render
+                // typed fields instead of generic key+value rows.
+                // outputSample comes from outputSchemas.js so the VariableTree can
+                // show realistic placeholder values without needing a dry-run.
+                const sch = OUTPUT_SCHEMAS[name] || null;
+                return {
+                    name,
+                    description: t.function?.description,
+                    sideEffect: isSideEffect(name),
+                    outputSchema: getOutputSchema(name),
+                    inputSchema: t.function?.parameters || null,
+                    outputSample: sch?.sample || null,
+                };
             }).filter(Boolean);
-            const available = actions.some(a => userToolNames.has(a.name));
-            return { id: entry.app, label: entry.label, available, actions };
+            const connected = actions.some(a => userToolNames.has(a.name));
+            // Permitted = the user has rights to use this app (org/group/
+            // personal toggles all pass). Falls back to "permit-all" when
+            // the helper couldn't resolve (missing user record, etc.) so
+            // we never lock the user out of their own catalog.
+            const permitted = permittedSet ? permittedSet.has(entry.app) : true;
+            // App appears in the palette when EITHER the user has rights
+            // OR is already connected (a credential-only path — shouldn't
+            // happen in practice but we don't want to hide a tool the
+            // user is actively using).
+            const available = permitted || connected;
+            return {
+                id: entry.app,
+                label: entry.label,
+                available,
+                connected,
+                permitted,
+                actions,
+            };
         });
-        return { apps };
+        return { apps, triggerOutputs: buildTriggerOutputsCatalog() };
     } catch (e) {
-        return { apps: [] };
+        return { apps: [], triggerOutputs: {} };
     }
 }
 

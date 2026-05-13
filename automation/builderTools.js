@@ -91,6 +91,169 @@ function triggerFieldsFor(draft) {
 }
 
 /**
+ * Realistic sample values for each trigger output field — used by the
+ * client-side VariableTree to show "what does this field actually look
+ * like" without needing a dry-run. Keyed by `<provider>.<event>` and
+ * mirrors TRIGGER_FIELDS_BY_EVENT.
+ *
+ * For non-app_event triggers (manual, schedule, webhook) the trigger's
+ * own runtime payload is mostly empty (manual/schedule) or user-supplied
+ * (webhook body) — we expose a tiny `now` field instead so binding to a
+ * schedule trigger has at least one meaningful path.
+ */
+const TRIGGER_OUTPUT_SAMPLES = {
+    'gmail.mail.new': {
+        messageId: 'msg-abc123',
+        threadId: 'th-abc123',
+        from: 'alice@example.com',
+        to: 'me@example.com',
+        cc: '',
+        subject: 'Project update — Q2',
+        snippet: 'Hi, attached is the latest deck for the kickoff…',
+        labelIds: ['INBOX', 'UNREAD'],
+        date: 'Wed, 13 May 2026 09:15:00 +0200',
+        sizeEstimate: 12345,
+        historyId: '987654',
+    },
+    'gmail.label.added': {
+        messageId: 'msg-abc123',
+        threadId: 'th-abc123',
+        addedLabelIds: ['Label_3'],
+        from: 'alice@example.com',
+        to: 'me@example.com',
+        subject: 'Project update — Q2',
+        snippet: 'Hi, attached is the latest deck…',
+        labelIds: ['INBOX', 'Label_3'],
+        date: 'Wed, 13 May 2026 09:15:00 +0200',
+    },
+    'google-calendar.event.changed': {
+        eventId: 'evt-abc',
+        summary: 'Team standup',
+        description: 'Daily sync',
+        start: '2026-05-13T09:00:00+02:00',
+        end: '2026-05-13T09:30:00+02:00',
+        status: 'confirmed',
+        calendarId: 'primary',
+        organizer: { email: 'me@example.com', displayName: 'Me' },
+        attendees: [{ email: 'alice@example.com', responseStatus: 'accepted' }],
+        htmlLink: 'https://calendar.google.com/event?eid=…',
+    },
+    'google-calendar.event.upcoming': {
+        eventId: 'evt-abc',
+        summary: 'Team standup',
+        description: 'Daily sync',
+        start: '2026-05-13T09:00:00+02:00',
+        end: '2026-05-13T09:30:00+02:00',
+        status: 'confirmed',
+        calendarId: 'primary',
+        organizer: { email: 'me@example.com', displayName: 'Me' },
+        attendees: [{ email: 'alice@example.com', responseStatus: 'accepted' }],
+        htmlLink: 'https://calendar.google.com/event?eid=…',
+        minutesUntilStart: 15,
+    },
+    'google-drive.file.new': {
+        fileId: 'file-xyz',
+        name: 'Invoice-2026-001.pdf',
+        mimeType: 'application/pdf',
+        parents: ['folder-abc'],
+        createdTime: '2026-05-13T09:15:00Z',
+        owners: [{ emailAddress: 'me@example.com', displayName: 'Me' }],
+        webViewLink: 'https://drive.google.com/file/d/file-xyz',
+    },
+    'nextcloud.file.new': {
+        activityId: 12345,
+        path: '/Documents/Invoices/Invoice-2026-001.pdf',
+        name: 'Invoice-2026-001.pdf',
+        extension: 'pdf',
+        kind: 'file',
+        actor: 'alice',
+        datetime: '2026-05-13T09:15:00Z',
+        link: 'https://cloud.example.com/f/12345',
+    },
+    'nextcloud.file.changed': {
+        activityId: 12346,
+        path: '/Documents/Invoices/Invoice-2026-001.pdf',
+        name: 'Invoice-2026-001.pdf',
+        extension: 'pdf',
+        kind: 'file',
+        actor: 'alice',
+        datetime: '2026-05-13T10:20:00Z',
+        link: 'https://cloud.example.com/f/12345',
+    },
+    'nextcloud.share.received': {
+        activityId: 12347,
+        path: '/Shared/Project.docx',
+        name: 'Project.docx',
+        kind: 'file',
+        actor: 'bob',
+        datetime: '2026-05-13T11:00:00Z',
+        link: 'https://cloud.example.com/f/22345',
+    },
+    'nextcloud.activity.new': {
+        activityId: 12350,
+        type: 'file_created',
+        subject: 'alice created Invoice-2026-001.pdf',
+        message: '',
+        actor: 'alice',
+        objectName: 'Invoice-2026-001.pdf',
+        link: 'https://cloud.example.com/f/12345',
+        datetime: '2026-05-13T09:15:00Z',
+    },
+    'nextcloud.notification.new': {
+        notificationId: 9876,
+        app: 'comments',
+        subject: 'alice mentioned you',
+        message: '@me please take a look',
+        link: 'https://cloud.example.com/comment/9876',
+        datetime: '2026-05-13T12:00:00Z',
+    },
+    'ticket-assistant.ticket.new': {
+        ticketId: 'TKT-1024',
+        connectionId: 'conn-1',
+        provider: 'youtrack',
+        subject: 'Login fails after password reset',
+        body: 'Steps: 1. Reset password. 2. Try to log in. Result: 401.',
+        status: 'open',
+        status_bucket: 'open',
+        priority: 'high',
+        category: 'authentication',
+        sourceUri: 'https://youtrack.example.com/issue/TKT-1024',
+        attachments: [],
+        ingestedAt: '2026-05-13T08:00:00Z',
+    },
+    'ticket-assistant.sync.completed': {
+        connectionId: 'conn-1',
+        provider: 'youtrack',
+        outcome: 'success',
+        stats: { ingested: 12, updated: 3, skipped: 0 },
+    },
+};
+
+/**
+ * Build a `<provider>.<event>` → { fields:[{key, sample}] } map for the
+ * client catalog. Fields come from TRIGGER_FIELDS_BY_EVENT (the
+ * authoritative list); samples come from TRIGGER_OUTPUT_SAMPLES so the
+ * VariableTree can show a realistic placeholder next to each path.
+ */
+function buildTriggerOutputsCatalog() {
+    const out = {};
+    for (const [key, fields] of Object.entries(TRIGGER_FIELDS_BY_EVENT)) {
+        const sample = TRIGGER_OUTPUT_SAMPLES[key] || {};
+        out[key] = {
+            fields: fields.map(f => ({ key: f, sample: sample[f] })),
+            sample,
+        };
+    }
+    // Non-app_event triggers expose minimal output. Manual/schedule fire
+    // with no user-supplied payload; `now` is always available via the
+    // runtime so it's worth surfacing as a bindable path.
+    out['__manual'] = { fields: [{ key: 'now', sample: new Date().toISOString() }], sample: { now: new Date().toISOString() } };
+    out['__schedule'] = { fields: [{ key: 'now', sample: new Date().toISOString() }], sample: { now: new Date().toISOString() } };
+    out['__webhook'] = { fields: [{ key: 'body', sample: { /* user-defined */ } }, { key: 'headers', sample: {} }], sample: { body: {}, headers: {} } };
+    return out;
+}
+
+/**
  * Inspect every binding inside a freshly-supplied `inputs` map (and any
  * `template` strings within them). Returns `{ inputs, error }`:
  *   - `inputs`: the canonicalised map, with safe auto-fixes applied
@@ -467,6 +630,182 @@ leading search step just to look up data that's already in the payload.`,
     {
         type: 'function',
         function: {
+            name: 'builder_add_set',
+            description: `Append a "set" step that produces an explicit object. Each field's value uses the standard binding shape — literal/ref/template/expr. Use this to renaming/restructuring fields before a downstream integration_action. ${BINDING_HINT} EXAMPLE: {fields:{name:{kind:"literal",value:"Alice"},email:{kind:"ref",path:"trigger.output.from"}}}.`,
+            parameters: {
+                type: 'object',
+                properties: {
+                    afterStepId: { type: 'string' },
+                    fields: { type: 'object', description: `Map of fieldName → binding. ${BINDING_HINT}` },
+                    label: { type: 'string' },
+                },
+                required: ['fields'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'builder_add_datetime',
+            description: 'Append a date/time operation. ops: now (current time), parse (string→ISO), format (ISO→formatted string), addDays/addHours/addMinutes (offset by amount), diff (two refs → numeric diff in unit), extract (year/month/day/hour/minute/dayOfWeek). EXAMPLES: {op:"now"} | {op:"addDays",input:"trigger.output.timestamp",amount:7} | {op:"format",input:"steps.x.output.iso",format:"yyyy-MM-dd"} | {op:"diff",input:"trigger.output.start",input2:"trigger.output.end",unit:"hours"}.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    afterStepId: { type: 'string' },
+                    op: { type: 'string', enum: ['now', 'parse', 'format', 'addDays', 'addHours', 'addMinutes', 'diff', 'extract'] },
+                    input: { type: 'string', description: 'Path to a date value (ISO string or epoch ms). Omit for op:now.' },
+                    input2: { type: 'string', description: 'Second date path. Required for op:diff.' },
+                    amount: { type: 'number', description: 'Offset amount (positive or negative). Required for addDays/addHours/addMinutes.' },
+                    format: { type: 'string', description: 'Format string with tokens yyyy/MM/dd/HH/mm/ss. Required for op:format.' },
+                    part: { type: 'string', enum: ['year', 'month', 'day', 'hour', 'minute', 'second', 'dayOfWeek'], description: 'Required for op:extract.' },
+                    unit: { type: 'string', enum: ['days', 'hours', 'minutes', 'seconds'], description: 'Required for op:diff.' },
+                    label: { type: 'string' },
+                },
+                required: ['op'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'builder_add_wait',
+            description: 'Append a step that pauses the run for N seconds (1..86400). Use for simple rate limiting or to give an external service time to settle. Dry-run skips the wait.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    afterStepId: { type: 'string' },
+                    seconds: { type: 'integer', description: 'Number of seconds to wait. Capped at 86400 (24h).' },
+                    label: { type: 'string' },
+                },
+                required: ['seconds'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'builder_add_stop_error',
+            description: 'Append a step that halts the run with a custom error message. The message is a TEMPLATE — interpolate upstream fields with double curly braces. Use as a guardrail downstream of a condition that detects "we should not continue". EXAMPLE: {message:"Budget exceeded: {{steps.calc.output.delta}}"}.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    afterStepId: { type: 'string' },
+                    message: { type: 'string', description: 'Template string surfaced as the run error.' },
+                    label: { type: 'string' },
+                },
+                required: ['message'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'builder_add_switch',
+            description: 'Append a multi-way branch. Evaluates expr and routes to the first matching case. Each case is { name, value }. Wire each case to its next step by passing nextStepIds: { "<caseName>": "<stepId>", "default": "<stepId>" }. EXAMPLE: {expr:"trigger.output.priority",cases:[{name:"urgent",value:"high"},{name:"normal",value:"medium"}],defaultBranch:"fallback"}.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    afterStepId: { type: 'string' },
+                    expr: { type: 'string', description: 'Restricted JS expression whose value gets matched.' },
+                    cases: { type: 'array', description: 'Array of { name, value } — match in order, first hit wins.', items: { type: 'object', properties: { name: { type: 'string' }, value: {} }, required: ['name'] } },
+                    defaultBranch: { type: 'string', description: 'Case name to route to when no case matches (otherwise dead-ends).' },
+                    nextStepIds: { type: 'object', description: 'Map of case name → existing step id to wire as the branch target. Use this in one shot instead of calling builder_add_* with afterStepId per branch.' },
+                    label: { type: 'string' },
+                },
+                required: ['expr', 'cases'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'builder_add_filter',
+            description: 'Append a collection filter — keeps array items matching expr. arrayRef points to an upstream array; expr is evaluated per element with the current element bound as `item`. Output is { items, count }. EXAMPLE: {arrayRef:"steps.search.output.results",expr:"item.amount > 1000"}.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    afterStepId: { type: 'string' },
+                    arrayRef: { type: 'string' },
+                    expr: { type: 'string', description: 'Restricted JS expression referencing item.<field>.' },
+                    label: { type: 'string' },
+                },
+                required: ['arrayRef', 'expr'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'builder_add_limit',
+            description: 'Append a step that returns the first or last N items of an array. Output is { items, count }.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    afterStepId: { type: 'string' },
+                    arrayRef: { type: 'string' },
+                    count: { type: 'integer', description: 'How many items to keep.' },
+                    mode: { type: 'string', enum: ['first', 'last'], description: 'Default: first.' },
+                    label: { type: 'string' },
+                },
+                required: ['arrayRef', 'count'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'builder_add_dedupe',
+            description: 'Append a step that removes duplicate items. With keyField, dedup by that field; without, dedup by deep equality. Output is { items, removed }.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    afterStepId: { type: 'string' },
+                    arrayRef: { type: 'string' },
+                    keyField: { type: 'string', description: 'Optional. If set, items with the same value at this field are treated as duplicates.' },
+                    label: { type: 'string' },
+                },
+                required: ['arrayRef'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'builder_add_aggregate',
+            description: 'Append a step that pulls one field across every item of an array into a flat list. Output is { values, count }. EXAMPLE: {arrayRef:"steps.search.output.results",field:"email"} → values is an array of emails.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    afterStepId: { type: 'string' },
+                    arrayRef: { type: 'string' },
+                    field: { type: 'string', description: 'Field name to read from each item.' },
+                    label: { type: 'string' },
+                },
+                required: ['arrayRef', 'field'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'builder_add_summarize',
+            description: 'Append a statistics step over a numeric field of an array. ops: sum, count (length of arrayRef regardless of field), avg, min, max. Output is { result, op, count }.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    afterStepId: { type: 'string' },
+                    arrayRef: { type: 'string' },
+                    field: { type: 'string' },
+                    op: { type: 'string', enum: ['sum', 'count', 'avg', 'min', 'max'] },
+                    label: { type: 'string' },
+                },
+                required: ['arrayRef', 'field', 'op'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
             name: 'builder_remove_step',
             description: 'Remove a step from the draft by id, including its incident edges.',
             parameters: { type: 'object', properties: { stepId: { type: 'string' } }, required: ['stepId'] },
@@ -650,6 +989,105 @@ function applyAddNotification(draft, args) {
     return { added: step };
 }
 
+// ── n8n-style utility step appliers ─────────────────────
+
+function applyAddSet(draft, args) {
+    const { inputs: fields, error } = validateAndFixBindings(args.fields || {}, draft);
+    if (error) return { error };
+    const step = { id: newId('set'), type: 'set', fields, label: args.label || 'Edit fields' };
+    appendAfter(draft, args.afterStepId, step);
+    return { added: step };
+}
+
+function applyAddDateTime(draft, args) {
+    const step = {
+        id: newId('dt'),
+        type: 'datetime',
+        op: args.op,
+        input: typeof args.input === 'string' ? args.input : undefined,
+        input2: typeof args.input2 === 'string' ? args.input2 : undefined,
+        amount: typeof args.amount === 'number' ? args.amount : undefined,
+        format: typeof args.format === 'string' ? args.format : undefined,
+        part: typeof args.part === 'string' ? args.part : undefined,
+        unit: typeof args.unit === 'string' ? args.unit : undefined,
+        label: args.label || 'Date & Time',
+    };
+    appendAfter(draft, args.afterStepId, step);
+    return { added: step };
+}
+
+function applyAddWait(draft, args) {
+    const step = { id: newId('wait'), type: 'wait', seconds: Math.max(1, Math.min(86400, Number(args.seconds) || 1)), label: args.label || 'Wait' };
+    appendAfter(draft, args.afterStepId, step);
+    return { added: step };
+}
+
+function applyAddStopError(draft, args) {
+    const step = { id: newId('stop'), type: 'stop_error', message: args.message, label: args.label || 'Stop and error' };
+    appendAfter(draft, args.afterStepId, step);
+    return { added: step };
+}
+
+function applyAddSwitch(draft, args) {
+    const step = {
+        id: newId('sw'),
+        type: 'switch',
+        expr: args.expr,
+        cases: Array.isArray(args.cases) ? args.cases.map(c => ({ name: c.name, value: c.value })) : [],
+        defaultBranch: typeof args.defaultBranch === 'string' ? args.defaultBranch : null,
+        label: args.label || 'Switch',
+    };
+    const lastId = args.afterStepId || lastStepId(draft);
+    draft.steps.push(step);
+    draft.edges.push({ from: lastId, to: step.id });
+    // Wire any provided case targets in one shot.
+    const next = args.nextStepIds || {};
+    for (const caseName of Object.keys(next)) {
+        const target = next[caseName];
+        if (typeof target !== 'string') continue;
+        const label = caseName === 'default' ? 'case:default' : `case:${caseName}`;
+        draft.edges.push({ from: step.id, to: target, label, caseName });
+    }
+    return { added: step };
+}
+
+function applyAddFilter(draft, args) {
+    const step = { id: newId('filt'), type: 'filter', arrayRef: args.arrayRef, expr: args.expr, label: args.label || 'Filter' };
+    appendAfter(draft, args.afterStepId, step);
+    return { added: step };
+}
+
+function applyAddLimit(draft, args) {
+    const step = {
+        id: newId('lim'),
+        type: 'limit',
+        arrayRef: args.arrayRef,
+        count: Math.max(0, Math.floor(Number(args.count) || 0)),
+        mode: args.mode === 'last' ? 'last' : 'first',
+        label: args.label || 'Limit',
+    };
+    appendAfter(draft, args.afterStepId, step);
+    return { added: step };
+}
+
+function applyAddDedupe(draft, args) {
+    const step = { id: newId('ded'), type: 'dedupe', arrayRef: args.arrayRef, keyField: typeof args.keyField === 'string' ? args.keyField : undefined, label: args.label || 'Remove duplicates' };
+    appendAfter(draft, args.afterStepId, step);
+    return { added: step };
+}
+
+function applyAddAggregate(draft, args) {
+    const step = { id: newId('agg'), type: 'aggregate', arrayRef: args.arrayRef, field: args.field, label: args.label || 'Aggregate' };
+    appendAfter(draft, args.afterStepId, step);
+    return { added: step };
+}
+
+function applyAddSummarize(draft, args) {
+    const step = { id: newId('sum'), type: 'summarize', arrayRef: args.arrayRef, field: args.field, op: args.op, label: args.label || 'Summarize' };
+    appendAfter(draft, args.afterStepId, step);
+    return { added: step };
+}
+
 function applyRemoveStep(draft, args) {
     const id = args.stepId;
     draft.steps = draft.steps.filter(s => s.id !== id);
@@ -727,6 +1165,11 @@ const MUTATING_TOOLS = new Set([
     'builder_propose_trigger', 'builder_add_action', 'builder_add_ai_step',
     'builder_add_condition', 'builder_add_loop', 'builder_add_code_step',
     'builder_add_notification', 'builder_remove_step', 'builder_set_metadata',
+    // n8n-style utility nodes
+    'builder_add_set', 'builder_add_datetime', 'builder_add_wait',
+    'builder_add_stop_error', 'builder_add_switch',
+    'builder_add_filter', 'builder_add_limit', 'builder_add_dedupe',
+    'builder_add_aggregate', 'builder_add_summarize',
 ]);
 
 async function applyToolCall(name, args, draftWrap) {
@@ -759,6 +1202,16 @@ async function _applyToolCallRaw(name, args, draftWrap) {
         case 'builder_add_loop':           return applyAddLoop(draft, args);
         case 'builder_add_code_step':      return applyAddCode(draft, args);
         case 'builder_add_notification':   return applyAddNotification(draft, args);
+        case 'builder_add_set':            return applyAddSet(draft, args);
+        case 'builder_add_datetime':       return applyAddDateTime(draft, args);
+        case 'builder_add_wait':           return applyAddWait(draft, args);
+        case 'builder_add_stop_error':     return applyAddStopError(draft, args);
+        case 'builder_add_switch':         return applyAddSwitch(draft, args);
+        case 'builder_add_filter':         return applyAddFilter(draft, args);
+        case 'builder_add_limit':          return applyAddLimit(draft, args);
+        case 'builder_add_dedupe':         return applyAddDedupe(draft, args);
+        case 'builder_add_aggregate':      return applyAddAggregate(draft, args);
+        case 'builder_add_summarize':      return applyAddSummarize(draft, args);
         case 'builder_remove_step':        return applyRemoveStep(draft, args);
         case 'builder_set_metadata':       return applySetMetadata(draftWrap, args);
         case 'builder_summarise':          return applySummarise(draft);
@@ -844,4 +1297,8 @@ async function persistDraft(draftWrap, { finalize = false } = {}) {
     return u;
 }
 
-module.exports = { TOOL_SCHEMAS, applyToolCall, persistDraft, emptyDefinition, _test_validateAndFixBindings: validateAndFixBindings };
+module.exports = {
+    TOOL_SCHEMAS, applyToolCall, persistDraft, emptyDefinition,
+    TRIGGER_FIELDS_BY_EVENT, TRIGGER_OUTPUT_SAMPLES, buildTriggerOutputsCatalog,
+    _test_validateAndFixBindings: validateAndFixBindings,
+};

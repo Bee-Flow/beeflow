@@ -16,6 +16,8 @@ const { isGmailTool, executeGmailTool } = require('../integrations/gmailTools');
 const { isCalendarTool, executeCalendarTool } = require('../integrations/calendarTools');
 const { isDriveTool, executeDriveTool } = require('../integrations/driveTools');
 const { isDocsTool, executeDocsTool } = require('../integrations/docsTools');
+const { isSheetsTool, executeSheetsTool } = require('../integrations/sheetsTools');
+const { isSlidesTool, executeSlidesTool } = require('../integrations/slidesTools');
 const { isContactsTool, executeContactsTool } = require('../integrations/contactsTools');
 const { isKeepTool, executeKeepTool } = require('../integrations/keepTools');
 const { isGoogleGroupsTool, executeGoogleGroupsTool } = require('../integrations/googleGroupsTools');
@@ -222,6 +224,12 @@ async function executeTool(toolName, toolArgs, context = {}) {
     if (isDocsTool(toolName)) {
         return await executeDocsTool(toolName, toolArgs, session);
     }
+    if (isSheetsTool(toolName)) {
+        return await executeSheetsTool(toolName, toolArgs, session);
+    }
+    if (isSlidesTool(toolName)) {
+        return await executeSlidesTool(toolName, toolArgs, session);
+    }
     if (isDriveTool(toolName)) {
         return await executeDriveTool(toolName, toolArgs, session);
     }
@@ -271,6 +279,19 @@ async function executeTool(toolName, toolArgs, context = {}) {
             if (searchProvider === 'node-search') {
                 const { executeNodeSearchTool } = require('../integrations/nodeSearchTools');
                 return await executeNodeSearchTool(toolName, toolArgs);
+            }
+            // Implicit fallback: provider is agent-search (or unset) but the
+            // GPU service URL is empty. If a Serper key is configured, route
+            // to node-search so search still works in CPU-only deploys.
+            if (!searchProvider || searchProvider === 'agent-search') {
+                const hasAgentSearchUrl = !!process.env.SEARCH_SERVICE_URL || !!(await configStore.getConfig('agent_search_url'));
+                if (!hasAgentSearchUrl) {
+                    const hasSerperKey = !!(await configStore.getSecret('serper_api_key'));
+                    if (hasSerperKey) {
+                        const { executeNodeSearchTool } = require('../integrations/nodeSearchTools');
+                        return await executeNodeSearchTool(toolName, toolArgs);
+                    }
+                }
             }
         } catch (cfgErr) {
             console.warn(`[ToolDispatcher] Config lookup failed (search_provider), using default: ${cfgErr.message}`);

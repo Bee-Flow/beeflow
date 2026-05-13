@@ -12,6 +12,8 @@ const { GMAIL_TOOLS } = require('../integrations/gmailTools');
 const { CALENDAR_TOOLS } = require('../integrations/calendarTools');
 const { DRIVE_TOOLS } = require('../integrations/driveTools');
 const { DOCS_TOOLS } = require('../integrations/docsTools');
+const { SHEETS_TOOLS } = require('../integrations/sheetsTools');
+const { SLIDES_TOOLS } = require('../integrations/slidesTools');
 const { CONTACTS_TOOLS } = require('../integrations/contactsTools');
 const { KEEP_TOOLS } = require('../integrations/keepTools');
 const { GOOGLE_GROUPS_TOOLS } = require('../integrations/googleGroupsTools');
@@ -190,6 +192,8 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
         if (isAppOn('google-calendar')) addTools(CALENDAR_TOOLS);
         if (isAppOn('google-drive')) addTools(DRIVE_TOOLS);
         if (isAppOn('google-docs')) addTools(DOCS_TOOLS);
+        if (isAppOn('google-sheets')) addTools(SHEETS_TOOLS);
+        if (isAppOn('google-slides')) addTools(SLIDES_TOOLS);
         if (isAppOn('google-contacts')) addTools(CONTACTS_TOOLS);
         if (isAppOn('google-keep')) addTools(KEEP_TOOLS);
         if (isAppOn('google-groups')) addTools(GOOGLE_GROUPS_TOOLS);
@@ -226,13 +230,29 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
     const searchProvider = await configStore.getConfig('search_provider') || 'agent-search';
     const hasBingSearchKey = !!(await configStore.getSecret('bing_search_key'));
     const hasSerperKey = !!(await configStore.getSecret('serper_api_key'));
+    // When the configured provider is agent-search but the GPU service URL is
+    // gone (typical CPU-only deploy), fall back to node-search transparently
+    // so the agent keeps having a search tool. The dispatcher mirrors this.
+    const canFallbackToNode = searchProvider === 'agent-search' && !hasAgentSearchUrl && hasSerperKey;
     const searchAvailable = searchProvider !== 'disabled' && (
         (searchProvider === 'bing' && hasBingSearchKey) ||
         (searchProvider === 'node-search' && hasSerperKey) ||
-        (searchProvider === 'agent-search' && hasAgentSearchUrl)
+        (searchProvider === 'agent-search' && hasAgentSearchUrl) ||
+        canFallbackToNode
     );
     if (searchAvailable && isAppOn('agent-search')) {
         addTools(AGENT_SEARCH_TOOLS);
+        if (canFallbackToNode) {
+            console.warn('[IntegrationTools] agent_search registered via node-search fallback: provider=agent-search but SEARCH_SERVICE_URL/agent_search_url is empty. Using serper_api_key directly. Set search_provider=node-search explicitly to silence this.');
+        }
+    } else if (isAppOn('agent-search') && searchProvider !== 'disabled') {
+        if (searchProvider === 'agent-search') {
+            console.warn('[IntegrationTools] agent_search NOT registered: provider=agent-search but SEARCH_SERVICE_URL is not set, no agent_search_url admin config, and no serper_api_key for node-search fallback. The model will not have web search. Set SEARCH_SERVICE_URL, or set serper_api_key + search_provider=node-search.');
+        } else if (searchProvider === 'bing') {
+            console.warn('[IntegrationTools] agent_search NOT registered: provider=bing but bing_search_key secret is not set. The model will not have web search.');
+        } else if (searchProvider === 'node-search') {
+            console.warn('[IntegrationTools] agent_search NOT registered: provider=node-search but serper_api_key secret is not set. The model will not have web search.');
+        }
     }
 
     // Fireflies — requires user API key
@@ -530,4 +550,91 @@ async function buildToolHint(tools, userId = null) {
     return hint;
 }
 
-module.exports = { getIntegrationTools, buildToolHint };
+/**
+ * Same permission gates as `isAppOn` inside `getIntegrationTools`, exposed
+ * as a standalone helper for callers that want to know "what apps is this
+ * user *allowed* to use" — distinct from "what apps are wired up with
+ * credentials right now".
+ *
+ * Used by the automation builder's catalog: the palette shows every
+ * permitted app (with a "Connect" badge when credentials are missing) so
+ * users can drop the node first and authenticate after. Without this the
+ * palette was credential-gated and looked empty on dev instances where
+ * OAuth hadn't been completed yet.
+ */
+async function getUserPermittedApps({ userId, session, isAdmin } = {}) {
+    if (!userId) return new Set();
+    const userEnabledApps = await configStore.getConfig(`enabled_apps_user_${userId}`);
+    let orgEnabledIntegrations = null;
+    let userGroupDisableLists = null;
+    void session; void isAdmin; // reserved — currently no super-admin bypass needed (orgActiveSet dropped from this path)
+    try {
+        const cat = require('./ncIntegrationCatalog');
+        // ncIdSet was used only by the orgActiveSet gate (now dropped); kept require
+        // for parity with getIntegrationTools and to surface load errors fast.
+        void (cat.NC_INTEGRATION_ID_SET || new Set(cat.NC_INTEGRATION_IDS || []));
+    } catch (_) { }
+    try {
+        const userStore = require('../stores/userStore');
+        const currentUser = await userStore.getUser(userId);
+        if (currentUser?.organizationId) {
+            const org = await userStore.getOrganization(currentUser.organizationId);
+            if (org?.enabledIntegrations) {
+                orgEnabledIntegrations = typeof org.enabledIntegrations === 'string'
+                    ? JSON.parse(org.enabledIntegrations) : org.enabledIntegrations;
+            } else {
+                const globalDefaults = await configStore.getConfig('default_org_integrations');
+                if (globalDefaults) {
+                    orgEnabledIntegrations = typeof globalDefaults === 'string'
+                        ? JSON.parse(globalDefaults) : globalDefaults;
+                }
+            }
+            // NOTE: orgActiveSet (the org-admin "active integrations" subset) is
+            // intentionally NOT consulted here. That layer is a runtime override
+            // for tool dispatch — when an org hasn't populated it (the default
+            // on most installs incl. dev) it ends up as an empty Set which
+            // erroneously hides EVERY non-NC, non-exempt app. Palette is design-
+            // time discovery; runtime still enforces all gates via
+            // getIntegrationTools. See plan: kijk-naar-het-ontwerp-sequential-wirth.
+            const userGroupIds = Array.isArray(currentUser.groups)
+                ? currentUser.groups
+                : (() => { try { return JSON.parse(currentUser.groups || '[]'); } catch { return []; } })();
+            if (userGroupIds.length > 0) {
+                const allGroups = await userStore.getAllGroups();
+                const groupById = new Map(allGroups.map(g => [g.id, g]));
+                userGroupDisableLists = userGroupIds
+                    .map(gid => groupById.get(gid))
+                    .filter(Boolean)
+                    .map(g => Array.isArray(g.disabled_integrations) ? g.disabled_integrations : []);
+                if (userGroupDisableLists.every(lst => lst.length === 0)) userGroupDisableLists = null;
+            }
+        }
+    } catch (_) { /* fail open */ }
+
+    const isAppOn = (appId) => {
+        if (userEnabledApps) {
+            if (AUTO_ENABLED_APPS.includes(appId)) {
+                // auto-enabled — bypass user list
+            } else if (!userEnabledApps.includes(appId)) {
+                return false;
+            }
+        }
+        if (!ORG_EXEMPT_APPS.includes(appId) && orgEnabledIntegrations && !orgEnabledIntegrations.includes(appId)) return false;
+        // orgActiveSet check intentionally omitted — see comment above where it's resolved.
+        if (userGroupDisableLists && appId.startsWith('nextcloud') && userGroupDisableLists.every(lst => lst.includes(appId))) {
+            return false;
+        }
+        return true;
+    };
+
+    const out = new Set();
+    try {
+        const { TOOL_REGISTRY } = require('../automation/toolRegistry');
+        for (const entry of TOOL_REGISTRY) {
+            if (isAppOn(entry.app)) out.add(entry.app);
+        }
+    } catch (_) { /* registry unavailable */ }
+    return out;
+}
+
+module.exports = { getIntegrationTools, buildToolHint, getUserPermittedApps };

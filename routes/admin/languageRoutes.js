@@ -218,6 +218,7 @@ Return ONLY a valid JSON object mapping each key to its translated value.
 Keep translations concise — these are UI labels, buttons, and short messages.
 Preserve any placeholder tokens like {name}, {count}, etc.
 Do NOT translate keys, only values.
+For keys whose name contains "placeholder_" the value is an example shown as a form-field hint. Localize these examples to match the conventions of the target locale's primary country: phone numbers in local dialling format, addresses in local format, email domains, and tax/registration IDs (e.g. VAT/KVK) in the local equivalent. Keep company names that are proper nouns (e.g. "Bee Flow B.V.") unchanged.
 Do NOT add any explanation, markdown formatting, or code fences — output raw JSON only.`;
 
         // Run all batches in parallel

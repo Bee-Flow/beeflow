@@ -114,6 +114,7 @@ async function resolveServerGeo(serverEndpoint) {
         let countryCode = null;
         let region = null;
         let city = null;
+        let lowConfidence = false;
 
         if (geoip) {
             const geo = geoip.lookup(ip);
@@ -121,11 +122,15 @@ async function resolveServerGeo(serverEndpoint) {
                 countryCode = geo.country;
                 region = geo.region || null;
                 city = geo.city || null;
+                // Treat country-only matches as low-confidence — geoip-lite
+                // buckets entire CSPs under one country (e.g. GCP 34.x → US)
+                // even when the actual region is European. See geoFromIp().
+                if (!region && !city) lowConfidence = true;
             }
         }
 
         // 3. Fallback: HTTP API for Cloudflare/CDN IPs where geoip-lite has no data
-        if (!countryCode) {
+        if (!countryCode || lowConfidence) {
             try {
                 const controller = new AbortController();
                 const timeout = setTimeout(() => controller.abort(), 3000);
@@ -160,8 +165,60 @@ async function resolveServerGeo(serverEndpoint) {
     }
 }
 
+/**
+ * Geo-lookup for a known IP — no DNS step. Used when we already captured the
+ * peer IP at the socket (see outboundProbe.js).
+ *
+ * @param {string} ip
+ * @returns {Promise<object|null>} { country_code, country_name, region, city, is_eu, flag }
+ */
+async function geoFromIp(ip) {
+    if (!ip) return null;
+    let countryCode = null, region = null, city = null;
+    let lowConfidence = false;
+    if (geoip) {
+        const g = geoip.lookup(ip);
+        if (g && g.country) {
+            countryCode = g.country;
+            region = g.region || null;
+            city = g.city || null;
+            // geoip-lite returns country with empty region+city when its DB
+            // doesn't actually know the location — that's its "default
+            // bucket" pattern (e.g. 34.x.x.x all bucketed as US even though
+            // Google Cloud has EU regions in those ranges). Treat as a miss
+            // and let the live lookup correct it.
+            if (!region && !city) lowConfidence = true;
+        }
+    }
+    if (!countryCode || lowConfidence) {
+        try {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 3000);
+            const resp = await fetch(`http://ip-api.com/json/${ip}?fields=countryCode,regionName,city`, { signal: controller.signal });
+            clearTimeout(timeout);
+            if (resp.ok) {
+                const apiGeo = await resp.json();
+                if (apiGeo.countryCode) {
+                    countryCode = apiGeo.countryCode;
+                    region = apiGeo.regionName || null;
+                    city = apiGeo.city || null;
+                }
+            }
+        } catch (_) { /* ignore */ }
+    }
+    return {
+        country_code: countryCode || null,
+        country_name: COUNTRY_NAMES[countryCode] || countryCode || 'Unknown',
+        region: region || null,
+        city: city || null,
+        is_eu: EU_EEA_COUNTRIES.has(countryCode),
+        flag: countryFlag(countryCode),
+    };
+}
+
 module.exports = {
     resolveServerGeo,
+    geoFromIp,
     extractHostname,
     countryFlag,
     EU_EEA_COUNTRIES,

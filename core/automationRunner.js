@@ -779,6 +779,211 @@ function buildLinearEdges(steps) {
     return edges;
 }
 
+// ── n8n-style utility steps ─────────────────────────────
+//
+// Eight new step types: set, datetime, wait, stop_error, switch (Phase A)
+// and filter, limit, dedupe, aggregate, summarize (Phase B). Each is small
+// and pure on top of the existing bind/expr helpers — no new server-side
+// abstractions are introduced.
+
+/**
+ * Build a fixed object from explicit field bindings. Each value uses the
+ * standard binding shape ({kind:'literal'|'ref'|'template'|'expr'}), so
+ * the user gets the same fx toggle / variable picker / preview as for
+ * integration_action.inputs without any extra plumbing.
+ */
+async function execSet(step, ctx, runState) {
+    const fields = resolveInputs(step.fields || {}, runState, { allowSecrets: false });
+    return { output: fields };
+}
+
+/**
+ * Apply ONE date/time operation. We accept ISO strings and JS-parseable
+ * date strings; ints (epoch ms) too. Output normalises to ISO + a
+ * formatted `value` (matches the format string when op === 'format',
+ * otherwise equal to ISO).
+ */
+async function execDateTime(step, ctx, runState) {
+    const op = step.op;
+    const bind = require('../automation/bind');
+    const inputAt = step.input ? bind.walkPath(step.input, runState) : null;
+    const inputAt2 = step.input2 ? bind.walkPath(step.input2, runState) : null;
+
+    const toDate = (v) => {
+        if (v == null) return null;
+        if (v instanceof Date) return Number.isNaN(v.getTime()) ? null : v;
+        if (typeof v === 'number') return new Date(v);
+        if (typeof v === 'string') { const d = new Date(v); return Number.isNaN(d.getTime()) ? null : d; }
+        return null;
+    };
+
+    if (op === 'now') {
+        const d = new Date();
+        return { output: { iso: d.toISOString(), value: d.toISOString() } };
+    }
+    const d = toDate(inputAt);
+    if (!d) return { output: { iso: null, value: null, error: 'datetime input did not resolve to a parseable date' } };
+    if (op === 'parse') return { output: { iso: d.toISOString(), value: d.toISOString() } };
+    if (op === 'format') {
+        // Lightweight token formatter — enough for the common patterns
+        // (yyyy-MM-dd HH:mm) without pulling in date-fns just for this.
+        const pad = (n, w = 2) => String(n).padStart(w, '0');
+        const tokens = {
+            yyyy: d.getFullYear(),
+            MM: pad(d.getMonth() + 1),
+            dd: pad(d.getDate()),
+            HH: pad(d.getHours()),
+            mm: pad(d.getMinutes()),
+            ss: pad(d.getSeconds()),
+        };
+        const out = String(step.format).replace(/yyyy|MM|dd|HH|mm|ss/g, m => tokens[m]);
+        return { output: { iso: d.toISOString(), value: out } };
+    }
+    if (op === 'addDays' || op === 'addHours' || op === 'addMinutes') {
+        const ms = op === 'addDays' ? 86_400_000 : op === 'addHours' ? 3_600_000 : 60_000;
+        const next = new Date(d.getTime() + Number(step.amount || 0) * ms);
+        return { output: { iso: next.toISOString(), value: next.toISOString() } };
+    }
+    if (op === 'diff') {
+        const d2 = toDate(inputAt2);
+        if (!d2) return { output: { value: null, error: 'datetime diff requires second input to resolve to a date' } };
+        const diffMs = d2.getTime() - d.getTime();
+        const div = step.unit === 'days' ? 86_400_000 : step.unit === 'hours' ? 3_600_000 : step.unit === 'minutes' ? 60_000 : 1_000;
+        return { output: { value: diffMs / div, unit: step.unit } };
+    }
+    if (op === 'extract') {
+        const map = {
+            year: d.getFullYear(),
+            month: d.getMonth() + 1,
+            day: d.getDate(),
+            hour: d.getHours(),
+            minute: d.getMinutes(),
+            second: d.getSeconds(),
+            dayOfWeek: d.getDay(),
+        };
+        return { output: { value: map[step.part], part: step.part } };
+    }
+    return { output: { value: null, error: `Unknown datetime op: ${op}` } };
+}
+
+/**
+ * Pause the runner. Capped at 24h to keep a misconfigured cron from
+ * holding a runner pod hostage. Dry-run skips the actual sleep so a
+ * preview doesn't make the user wait.
+ */
+async function execWait(step, ctx, runState, mode) {
+    const seconds = Math.max(1, Math.min(86400, Number(step.seconds) || 1));
+    if (mode === 'dry_run') {
+        return { output: { waitedSeconds: 0, _dryRun: true, plannedSeconds: seconds } };
+    }
+    await new Promise(r => setTimeout(r, seconds * 1000));
+    return { output: { waitedSeconds: seconds } };
+}
+
+/**
+ * Halt the run with an error message. The message is interpolated as a
+ * template so it can include upstream fields (e.g. "budget exceeded by
+ * {{steps.calc.output.delta}}"). The thrown error is recorded by the
+ * normal error path and surfaces in run history.
+ */
+async function execStopError(step, ctx, runState) {
+    const msg = require('../automation/bind').interpolateTemplate(step.message || 'Stopped by stop_error step', runState);
+    throw new Error(msg);
+}
+
+/**
+ * Multi-way branch. expr is evaluated under the restricted grammar; the
+ * resulting value is matched against each case's `value` (loose equality
+ * — coerces strings/numbers as the user typed them). Output.branch is
+ * `case:<matchedName>` (or `case:default`); the runner reads it to
+ * follow the matching outgoing edge.
+ */
+async function execSwitch(step, ctx, runState) {
+    let v;
+    let evalError = null;
+    try { v = evaluate(step.expr || 'null', runState); }
+    catch (e) { v = null; evalError = e.message || String(e); }
+    const cases = Array.isArray(step.cases) ? step.cases : [];
+    let matched = null;
+    for (const c of cases) {
+        // eslint-disable-next-line eqeqeq
+        if (v == c.value) { matched = c.name; break; }
+    }
+    if (!matched && step.defaultBranch) matched = step.defaultBranch;
+    const branchName = matched || 'default';
+    return { output: { branch: `case:${branchName}`, matched: matched || null, value: v, ...(evalError ? { _evalError: evalError } : {}) } };
+}
+
+// ── Phase B: collection operators ──────────────────────
+//
+// Each takes step.arrayRef (path string) + per-op config. Resolves to
+// an array via bind.walkPath; non-array gets a clear "did not resolve"
+// stub instead of crashing the run.
+
+function resolveArrayRef(step, runState) {
+    const v = require('../automation/bind').walkPath(step.arrayRef || '', runState);
+    return Array.isArray(v) ? v : null;
+}
+
+async function execFilter(step, ctx, runState) {
+    const arr = resolveArrayRef(step, runState);
+    if (!arr) return { output: { items: [], count: 0, skipped: 'arrayRef did not resolve to an array' } };
+    const out = [];
+    for (let i = 0; i < arr.length; i++) {
+        const subState = { ...runState, item: arr[i], _index: i };
+        let keep = false;
+        try { keep = !!evaluate(step.expr || 'false', subState); } catch { keep = false; }
+        if (keep) out.push(arr[i]);
+    }
+    return { output: { items: out, count: out.length } };
+}
+
+async function execLimit(step, ctx, runState) {
+    const arr = resolveArrayRef(step, runState);
+    if (!arr) return { output: { items: [], count: 0, skipped: 'arrayRef did not resolve to an array' } };
+    const n = Math.max(0, Math.floor(Number(step.count) || 0));
+    const mode = step.mode === 'last' ? 'last' : 'first';
+    const items = mode === 'last' ? arr.slice(-n) : arr.slice(0, n);
+    return { output: { items, count: items.length } };
+}
+
+async function execDedupe(step, ctx, runState) {
+    const arr = resolveArrayRef(step, runState);
+    if (!arr) return { output: { items: [], removed: 0, skipped: 'arrayRef did not resolve to an array' } };
+    const seen = new Set();
+    const out = [];
+    for (const item of arr) {
+        const key = step.keyField ? JSON.stringify(item?.[step.keyField] ?? null) : JSON.stringify(item);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(item);
+    }
+    return { output: { items: out, removed: arr.length - out.length } };
+}
+
+async function execAggregate(step, ctx, runState) {
+    const arr = resolveArrayRef(step, runState);
+    if (!arr) return { output: { values: [], count: 0, skipped: 'arrayRef did not resolve to an array' } };
+    const values = arr.map(item => item?.[step.field]);
+    return { output: { values, count: values.length } };
+}
+
+async function execSummarize(step, ctx, runState) {
+    const arr = resolveArrayRef(step, runState);
+    if (!arr) return { output: { result: null, op: step.op, count: 0, skipped: 'arrayRef did not resolve to an array' } };
+    const values = arr.map(item => Number(item?.[step.field])).filter(v => Number.isFinite(v));
+    let result = null;
+    switch (step.op) {
+        case 'count': result = arr.length; break;
+        case 'sum':   result = values.reduce((a, b) => a + b, 0); break;
+        case 'avg':   result = values.length ? values.reduce((a, b) => a + b, 0) / values.length : 0; break;
+        case 'min':   result = values.length ? Math.min(...values) : null; break;
+        case 'max':   result = values.length ? Math.max(...values) : null; break;
+        default:      result = null;
+    }
+    return { output: { result, op: step.op, count: values.length } };
+}
+
 // ── Core DAG run ────────────────────────────────────────
 
 async function runDag(def, ctx, runStateInit, mode, dispatchStep, { recordSteps = true, branchIndex = null, skipUntilStepId = null } = {}) {
@@ -814,6 +1019,7 @@ async function runDag(def, ctx, runStateInit, mode, dispatchStep, { recordSteps 
             // same edge that the original run did.
             const replayed = runState.steps?.[step.id]?.output;
             if (step.type === 'condition' && replayed?.branch) nextLabel = replayed.branch;
+            if (step.type === 'switch' && replayed?.branch) nextLabel = replayed.branch;
             if (step.id === skipUntilStepId) stillSkipping = false;
         } else {
             const dispatched = await dispatchStep(step, ctx, runState, mode);
@@ -837,6 +1043,11 @@ async function runDag(def, ctx, runStateInit, mode, dispatchStep, { recordSteps 
                 });
             }
             if (step.type === 'condition' && dispatched.output?.branch) {
+                nextLabel = dispatched.output.branch;
+            }
+            // Switch routes by case name. exec returns branch='case:<name>'
+            // (or 'case:default'); we filter outgoing edges by that label.
+            if (step.type === 'switch' && dispatched.output?.branch) {
                 nextLabel = dispatched.output.branch;
             }
         }
@@ -955,6 +1166,17 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
                 case 'notification':       result = await execNotification(step, ctx_, state_, mode_); break;
                 case 'approval':           result = await execApproval(step, ctx_, state_, mode_); break;
                 case 'parallel':           result = await execParallel(step, ctx_, state_, mode_, dispatchStep); break;
+                // n8n-style utility nodes
+                case 'set':                result = await execSet(step, ctx_, state_); break;
+                case 'datetime':           result = await execDateTime(step, ctx_, state_); break;
+                case 'wait':               result = await execWait(step, ctx_, state_, mode_); break;
+                case 'stop_error':         result = await execStopError(step, ctx_, state_); break;
+                case 'switch':             result = await execSwitch(step, ctx_, state_); break;
+                case 'filter':             result = await execFilter(step, ctx_, state_); break;
+                case 'limit':              result = await execLimit(step, ctx_, state_); break;
+                case 'dedupe':             result = await execDedupe(step, ctx_, state_); break;
+                case 'aggregate':          result = await execAggregate(step, ctx_, state_); break;
+                case 'summarize':          result = await execSummarize(step, ctx_, state_); break;
                 default: throw new Error(`Unknown step type: ${step.type}`);
             }
             result.startedAt = stepStartedAt;
@@ -981,6 +1203,16 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
                             // (the retry block here only fires for actual errors).
                             approval:           () => execApproval(step, ctx_, state_, mode_),
                             parallel:           () => execParallel(step, ctx_, state_, mode_, dispatchStep),
+                            set:                () => execSet(step, ctx_, state_),
+                            datetime:           () => execDateTime(step, ctx_, state_),
+                            wait:               () => execWait(step, ctx_, state_, mode_),
+                            stop_error:         () => execStopError(step, ctx_, state_),
+                            switch:             () => execSwitch(step, ctx_, state_),
+                            filter:             () => execFilter(step, ctx_, state_),
+                            limit:              () => execLimit(step, ctx_, state_),
+                            dedupe:             () => execDedupe(step, ctx_, state_),
+                            aggregate:          () => execAggregate(step, ctx_, state_),
+                            summarize:          () => execSummarize(step, ctx_, state_),
                         }[step.type]();
                         await automationStore.recordRunStep({
                             runId: ctx_.runId, stepId: step.id, stepType: step.type, attempts: i + 1,

@@ -8,6 +8,7 @@
 
 const userStore = require('../stores/userStore');
 const usageStore = require('../stores/usageStore');
+const license = require('../license');
 
 // ── Consumer account limits ──────────────────────────────────────────────────
 
@@ -183,18 +184,30 @@ async function checkResourceLimits(orgId, resourceType, currentCount, userId = n
         return checkConsumerResourceLimits(userId, resourceType, currentCount);
     }
     const limits = await userStore.getEffectiveLimits(orgId);
-    if (!limits) return null;
 
     const fieldMap = {
         users: 'max_users',
         agents: 'max_agents',
         knowledge_sources: 'max_knowledge_sources',
     };
-
     const field = fieldMap[resourceType];
     if (!field) return null;
 
-    const max = limits[field];
+    let max = limits ? limits[field] : null;
+
+    // For 'users', a license-issued seat cap also applies. When both a
+    // subscription plan limit and a license max_seats exist, the lower of
+    // the two wins — a customer can't bypass a seat-licensed pack by
+    // bolting it onto a higher-tier subscription plan.
+    if (resourceType === 'users') {
+        try {
+            const seatCap = await license.getMaxSeatsForOrg(orgId);
+            if (seatCap !== null && (max === null || max === undefined || seatCap < max)) {
+                max = seatCap;
+            }
+        } catch (_) { /* license module unavailable — don't fail open in production but don't crash either */ }
+    }
+
     if (max !== null && max !== undefined && currentCount >= max) {
         const labels = { users: 'users', agents: 'agents', knowledge_sources: 'knowledge sources' };
         return `Your organization has reached its limit of ${max} ${labels[resourceType]}. Please upgrade your plan or contact your administrator.`;

@@ -300,7 +300,15 @@ async function executeComponentTool(toolName, args, userAuth = {}, fixedParams =
     const component = components.find(c => c.id === componentId);
 
     if (!component) {
-        return { error: `Component '${componentId}' not found` };
+        // Common hallucination when no web-search tool is registered: the
+        // model invents a `search` / `web_search` / `google_search` call.
+        // Convert that into actionable feedback instead of leaking the
+        // internal "Component" abstraction.
+        const SEARCH_HALLUCINATIONS = new Set(['search', 'web-search', 'google-search', 'bing-search', 'serper-search']);
+        if (SEARCH_HALLUCINATIONS.has(componentId)) {
+            return { error: `No web-search tool is currently available. An admin needs to configure Agent Search (Admin → AI Config → Agent Search) — either set SEARCH_SERVICE_URL, or set search_provider=node-search with a serper_api_key.` };
+        }
+        return { error: `Unknown tool '${toolName}'. The agent attempted to call a tool that is not registered for this session.` };
     }
 
     // Start with default values from component definition

@@ -52,9 +52,16 @@ class LLMClient {
      * Generate a short title for a conversation.
      */
     async generateTitle(modelId, userMessage, systemPrompt, options = {}) {
+        // Empty/whitespace user content is a fast no-op: Anthropic and others
+        // reject `messages.0` with no content. Without this guard the route
+        // logged a noisy 400 for every attachment-only turn.
+        const safeUserContent = typeof userMessage === 'string'
+            ? userMessage.slice(0, 500)
+            : (userMessage == null ? '' : JSON.stringify(userMessage).slice(0, 500));
+        if (!safeUserContent || !safeUserContent.trim()) return 'New Chat';
         const messages = [
             { role: 'system', content: systemPrompt || 'Generate a short 2-4 word title for this conversation. Output only the title.' },
-            { role: 'user', content: typeof userMessage === 'string' ? userMessage.slice(0, 500) : JSON.stringify(userMessage).slice(0, 500) },
+            { role: 'user', content: safeUserContent },
         ];
         const result = await this.chat(modelId, messages, {
             maxTokens: 60,

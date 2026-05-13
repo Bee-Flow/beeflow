@@ -29,9 +29,12 @@ const FULL_TIER_ISSUER = 'license.beeflow.ai/internal';
 const ALG = 'RS256';
 
 const BUNDLED_KEY_PATH = path.join(__dirname, 'bundled-public-key.pem');
+const JWKS_URL = process.env.LICENSE_JWKS_URL || '';
+const JWKS_CACHE_MS = parseInt(process.env.LICENSE_JWKS_CACHE_SECONDS || '300', 10) * 1000;
 
 let _cachedKey = null;
 let _cachedKeySource = null;
+let _jwksCache = { fetchedAt: 0, keysByKid: new Map() };
 
 /**
  * Resolve the public key in this precedence:
@@ -96,10 +99,52 @@ function decodeJwtUnverified(token) {
 }
 
 /**
+ * Fetch JWKS keys from LICENSE_JWKS_URL with a small in-process cache. Used
+ * for safe key rotation — verifiers pick the key whose kid matches the JWT
+ * header. Returns a Map<kid, KeyObject>; the bundled key is also indexed
+ * by its computed kid so it remains the default when JWKS is unavailable.
+ */
+async function getJwksKeys() {
+    const now = Date.now();
+    if (now - _jwksCache.fetchedAt < JWKS_CACHE_MS && _jwksCache.keysByKid.size > 0) {
+        return _jwksCache.keysByKid;
+    }
+    if (!JWKS_URL) return _jwksCache.keysByKid; // empty map → caller falls back
+    try {
+        const res = await fetch(JWKS_URL, { headers: { Accept: 'application/json' } });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const body = await res.json();
+        const keysByKid = new Map();
+        for (const jwk of (body.keys || [])) {
+            if (!jwk.kid) continue;
+            try {
+                const ko = crypto.createPublicKey({ key: jwk, format: 'jwk' });
+                keysByKid.set(jwk.kid, ko);
+            } catch (e) {
+                console.warn('[License Verify] could not import JWK', jwk.kid, e.message);
+            }
+        }
+        _jwksCache = { fetchedAt: now, keysByKid };
+    } catch (e) {
+        console.warn('[License Verify] JWKS fetch failed:', e.message);
+    }
+    return _jwksCache.keysByKid;
+}
+
+function kidForPem(pem) {
+    if (!pem) return null;
+    return crypto.createHash('sha256').update(pem).digest('hex').slice(0, 16);
+}
+
+/**
  * Verify the JWT signature and required claims.
  * @returns {{ valid: true, payload: object } | { valid: false, error: string }}
+ *
+ * Key resolution: if the JWT header carries a `kid`, prefer the matching key
+ * from the configured JWKS endpoint, then fall back to the bundled key when
+ * its kid matches (or when no kid is present at all).
  */
-function verifyToken(token, { now = Math.floor(Date.now() / 1000), publicKeyOverride = null } = {}) {
+async function verifyToken(token, { now = Math.floor(Date.now() / 1000), publicKeyOverride = null } = {}) {
     let decoded;
     try {
         decoded = decodeJwtUnverified(token);
@@ -116,7 +161,20 @@ function verifyToken(token, { now = Math.floor(Date.now() / 1000), publicKeyOver
         return { valid: false, error: `unexpected_typ: ${header.typ}` };
     }
 
-    const publicKey = publicKeyOverride || loadPublicKey().key;
+    let publicKey = publicKeyOverride;
+    if (!publicKey) {
+        const bundled = loadPublicKey().key;
+        const bundledKid = kidForPem(bundled);
+        if (header.kid) {
+            // Try JWKS first, then bundled if it happens to match the kid.
+            const jwks = await getJwksKeys();
+            if (jwks.has(header.kid)) publicKey = jwks.get(header.kid);
+            else if (bundled && bundledKid === header.kid) publicKey = bundled;
+            else if (bundled) publicKey = bundled; // best effort — verify will fail if the key doesn't match
+        } else {
+            publicKey = bundled;
+        }
+    }
     if (!publicKey) {
         return { valid: false, error: 'no_public_key_configured' };
     }

@@ -130,4 +130,199 @@ function trigger() {
     assert.ok(/a_4a3d50/.test(rec.hint), `hint must surface the real id, got: ${rec.hint}`);
 }
 
+// ── position: optional but must be {x, y} numbers when present ──────────
+{
+    const def = {
+        trigger: { id: 'trg', kind: 'manual', position: { x: 12, y: 34 } },
+        steps: [{ id: 's1', type: 'notification', title: 'hi', position: { x: 100, y: 200 } }],
+        edges: [{ from: 'trg', to: 's1' }],
+    };
+    const r = validateDefinition(def);
+    assert.strictEqual(r.ok, true, 'valid positions should pass');
+}
+{
+    const def = {
+        trigger: { id: 'trg', kind: 'manual', position: { x: 'NaN', y: 0 } },
+        steps: [], edges: [],
+    };
+    const r = validateDefinition(def);
+    assert.strictEqual(r.ok, false, 'non-numeric x must error');
+    assert.ok(r.errors.some(e => e.code === 'position.coord'), 'expected position.coord error');
+}
+{
+    const def = {
+        trigger: { id: 'trg', kind: 'manual' },
+        steps: [{ id: 's1', type: 'notification', title: 'hi', position: 'left' }],
+        edges: [{ from: 'trg', to: 's1' }],
+    };
+    const r = validateDefinition(def);
+    assert.strictEqual(r.ok, false, 'non-object position must error');
+    assert.ok(r.errors.some(e => e.code === 'position.shape'), 'expected position.shape error');
+}
+
+// ── n8n-style utility nodes ─────────────────────────────────────────────
+//
+// One pass + one fail case per new step type. We don't exhaustively cover
+// every per-op variant of datetime — the validator's per-op checks are
+// straightforward and additional coverage would just rehash the validator's
+// own enum lists.
+
+// set: passes when fields is omitted; fails when fields is non-object.
+{
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 's1', type: 'set', fields: { name: { kind: 'literal', value: 'Alice' } } }],
+        edges: [{ from: 'trg', to: 's1' }],
+    };
+    const r = validateDefinition(def);
+    assert.strictEqual(r.ok, true, 'set with valid fields should pass');
+}
+{
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 's1', type: 'set', fields: 'not-an-object' }],
+        edges: [{ from: 'trg', to: 's1' }],
+    };
+    const r = validateDefinition(def);
+    assert.strictEqual(r.ok, false, 'set with non-object fields must error');
+    assert.ok(r.errors.some(e => e.code === 'set.fields_shape'), 'expected set.fields_shape error');
+}
+
+// datetime
+{
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 's1', type: 'datetime', op: 'now' }],
+        edges: [{ from: 'trg', to: 's1' }],
+    };
+    assert.strictEqual(validateDefinition(def).ok, true, 'datetime op:now should pass');
+}
+{
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 's1', type: 'datetime', op: 'addDays', input: 'trigger.output.t' }],
+        edges: [{ from: 'trg', to: 's1' }],
+    };
+    const r = validateDefinition(def);
+    assert.strictEqual(r.ok, false, 'addDays without amount must error');
+    assert.ok(r.errors.some(e => e.code === 'datetime.amount_missing'));
+}
+
+// wait
+{
+    const def = { trigger: trigger(), steps: [{ id: 's1', type: 'wait', seconds: 5 }], edges: [{ from: 'trg', to: 's1' }] };
+    assert.strictEqual(validateDefinition(def).ok, true, 'wait 5s should pass');
+}
+{
+    const def = { trigger: trigger(), steps: [{ id: 's1', type: 'wait', seconds: 0 }], edges: [{ from: 'trg', to: 's1' }] };
+    const r = validateDefinition(def);
+    assert.ok(r.errors.some(e => e.code === 'wait.seconds_range'), 'wait < 1 must error');
+}
+
+// stop_error
+{
+    const def = { trigger: trigger(), steps: [{ id: 's1', type: 'stop_error', message: 'boom' }], edges: [{ from: 'trg', to: 's1' }] };
+    assert.strictEqual(validateDefinition(def).ok, true, 'stop_error with message should pass');
+}
+{
+    const def = { trigger: trigger(), steps: [{ id: 's1', type: 'stop_error' }], edges: [{ from: 'trg', to: 's1' }] };
+    const r = validateDefinition(def);
+    assert.ok(r.errors.some(e => e.code === 'stop_error.message_missing'));
+}
+
+// switch — needs at least one case AND at least one wired case edge.
+{
+    const def = {
+        trigger: trigger(),
+        steps: [
+            { id: 'sw', type: 'switch', expr: 'trigger.output.priority', cases: [{ name: 'urgent', value: 'high' }] },
+            { id: 'n1', type: 'notification', title: 'urgent path' },
+        ],
+        edges: [
+            { from: 'trg', to: 'sw' },
+            { from: 'sw', to: 'n1', label: 'case:urgent', caseName: 'urgent' },
+        ],
+    };
+    assert.strictEqual(validateDefinition(def).ok, true, 'switch with one wired case should pass');
+}
+{
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 'sw', type: 'switch', expr: 'trigger.output.x', cases: [] }],
+        edges: [{ from: 'trg', to: 'sw' }],
+    };
+    const r = validateDefinition(def);
+    assert.ok(r.errors.some(e => e.code === 'switch.cases_missing'), 'empty cases must error');
+}
+{
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 'sw', type: 'switch', expr: 'x', cases: [{ name: 'a', value: 1 }] }],
+        edges: [{ from: 'trg', to: 'sw' }],
+    };
+    const r = validateDefinition(def);
+    assert.ok(r.errors.some(e => e.code === 'switch.no_branches'), 'unwired switch must error');
+}
+
+// filter / limit / aggregate / summarize — arrayRef required
+{
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 's1', type: 'filter', arrayRef: 'trigger.output.items', expr: 'item.flag' }],
+        edges: [{ from: 'trg', to: 's1' }],
+    };
+    assert.strictEqual(validateDefinition(def).ok, true, 'filter with arrayRef + expr should pass');
+}
+{
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 's1', type: 'filter', expr: 'item.flag' }],
+        edges: [{ from: 'trg', to: 's1' }],
+    };
+    const r = validateDefinition(def);
+    assert.ok(r.errors.some(e => e.code === 'filter.arrayRef_missing'));
+}
+{
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 's1', type: 'limit', arrayRef: 'trigger.output.items', count: 5 }],
+        edges: [{ from: 'trg', to: 's1' }],
+    };
+    assert.strictEqual(validateDefinition(def).ok, true, 'limit with arrayRef + count should pass');
+}
+{
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 's1', type: 'aggregate', arrayRef: 'trigger.output.items' }],
+        edges: [{ from: 'trg', to: 's1' }],
+    };
+    const r = validateDefinition(def);
+    assert.ok(r.errors.some(e => e.code === 'aggregate.field_missing'));
+}
+{
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 's1', type: 'summarize', arrayRef: 'trigger.output.items', field: 'amount', op: 'sum' }],
+        edges: [{ from: 'trg', to: 's1' }],
+    };
+    assert.strictEqual(validateDefinition(def).ok, true, 'summarize with all fields should pass');
+}
+{
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 's1', type: 'summarize', arrayRef: 'trigger.output.items', field: 'amount', op: 'median' }],
+        edges: [{ from: 'trg', to: 's1' }],
+    };
+    const r = validateDefinition(def);
+    assert.ok(r.errors.some(e => e.code === 'summarize.op_invalid'));
+}
+{
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 's1', type: 'dedupe', arrayRef: 'trigger.output.items', keyField: 'id' }],
+        edges: [{ from: 'trg', to: 's1' }],
+    };
+    assert.strictEqual(validateDefinition(def).ok, true, 'dedupe with keyField should pass');
+}
+
 console.log('validate.test.js — all checks passed');

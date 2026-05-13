@@ -16,6 +16,7 @@ const { sanitizeError } = require('../errorSanitizer');
 const { emitPhase, emitPhaseEnd, withPhase } = require('./phaseEvents');
 const integrationActivityStore = require('../../stores/integrationActivityStore');
 const { resolveIntegration } = require('../integrationToolMap');
+const { runWithProbe, markLocal } = require('../outboundProbe');
 
 const { classifyPromptComplexity } = require('../promptClassifier');
 const configStore = require('../../stores/configStore');
@@ -304,6 +305,9 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
 
     // Use historyOverride if provided (for thread context isolation), otherwise use conversation
     let messages;
+    // Map of live-attachment object → its persisted sidecar so processAttachments()
+    // can write extracted text back onto the sidecar (replay across turns).
+    const persistedByLive = new Map();
     if (historyOverride && Array.isArray(historyOverride)) {
         // Use the overridden history (thread context)
         messages = [...historyOverride];
@@ -334,7 +338,9 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     } catch (e) {
                         console.warn(`[AgentRuntime] Failed to upload attachment image to RustFS: ${e.message}`);
                     }
-                    persistedAttachments.push({ name: att.name, type: att.type, storageKey, url: imageProxyUrl });
+                    const record = { name: att.name, type: att.type, storageKey, url: imageProxyUrl };
+                    persistedAttachments.push(record);
+                    persistedByLive.set(att, record);
                 } else if (att.type && att.type.includes('pdf')) {
                     // PDF — persist metadata without base64 content
                     let pdfProxyUrl = null;
@@ -350,7 +356,9 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     } catch (e) {
                         console.warn(`[AgentRuntime] Failed to upload attachment PDF to RustFS: ${e.message}`);
                     }
-                    persistedAttachments.push({ name: att.name, type: att.type, url: pdfProxyUrl });
+                    const record = { name: att.name, type: att.type, url: pdfProxyUrl };
+                    persistedAttachments.push(record);
+                    persistedByLive.set(att, record);
                 } else if (att.name) {
                     // Other file types — persist metadata only
                     let fileProxyUrl = null;
@@ -366,7 +374,9 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     } catch (e) {
                         console.warn(`[AgentRuntime] Failed to upload attachment file to RustFS: ${e.message}`);
                     }
-                    persistedAttachments.push({ name: att.name, type: att.type, url: fileProxyUrl });
+                    const record = { name: att.name, type: att.type, url: fileProxyUrl };
+                    persistedAttachments.push(record);
+                    persistedByLive.set(att, record);
                 }
             }
         }
@@ -745,10 +755,18 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     const _captureRaw = !!dlpShield?.showRawPayload;
     const RAW_BUFFER_MAX = 64 * 1024; // cap at 64 KB per turn, then truncate.
     {
-        const _dlpConvMap = require('../dlp/dlpRunner').getConversationTokenMap(conversation?.id);
-        if (_dlpConvMap && Object.keys(_dlpConvMap).length > 0) {
+        const _dlpRunner = require('../dlp/dlpRunner');
+        const _dlpConvMap = _dlpRunner.getConversationTokenMap(conversation?.id);
+        // Wrap the un-tokeniser whenever (a) the conv map already has tokens,
+        // OR (b) the org has PII detection enabled — because in that case the
+        // attachment scanner (which runs LATER in processAttachments) may add
+        // tokens that still need to be reversed on the response stream. The
+        // un-tokeniser uses a live getter so it picks up those late-added tokens.
+        const _piiMayFire = !!(dlpShield && (dlpShield.azurePiiEnabled || dlpShield.localPiiEnabled !== false));
+        const _shouldWrapUntokeniser = (_dlpConvMap && Object.keys(_dlpConvMap).length > 0) || _piiMayFire;
+        if (_shouldWrapUntokeniser) {
             const { createUntokeniser } = require('../dlp/untokeniseStream');
-            const _ut = createUntokeniser(_dlpConvMap);
+            const _ut = createUntokeniser(() => _dlpRunner.getConversationTokenMap(conversation?.id));
             const _rawOnEvent = onEvent;
             onEvent = (type, data) => {
                 if (type === 'content' && data && typeof data.text === 'string') {
@@ -1020,16 +1038,136 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             // has been hydrated onto the message.
             if (messageMetadata?.attachments && messageMetadata.attachments.length > 0) {
                 console.log(`[Agent] Processing ${messageMetadata.attachments.length} attachments...`);
-                if (iterations === 1) {
-                    const firstAtt = messageMetadata.attachments[0];
-                    const detail = messageMetadata.attachments.length === 1 && firstAtt?.name
-                        ? firstAtt.name
-                        : `${messageMetadata.attachments.length} files`;
-                    await withPhase(onEvent, 'processing_attachments', detail, () =>
-                        processAttachments(messageMetadata.attachments, lastMsg, userId, { modelId: modelToUse })
-                    );
-                } else {
-                    await processAttachments(messageMetadata.attachments, lastMsg, userId, { modelId: modelToUse });
+                const _attachOpts = {
+                    modelId: modelToUse,
+                    persistedByLive,
+                    // Privacy Shield: scan extracted text from each attachment
+                    // and either tokenise (default) or block (when org chose
+                    // "Block the message" action). Auto-follows the message-
+                    // level toggle — same categories, threshold, action.
+                    orgShield: dlpShield,
+                    conversationId: conversation?.id,
+                };
+                let _attachResult;
+                try {
+                    if (iterations === 1) {
+                        const firstAtt = messageMetadata.attachments[0];
+                        const detail = messageMetadata.attachments.length === 1 && firstAtt?.name
+                            ? firstAtt.name
+                            : `${messageMetadata.attachments.length} files`;
+                        _attachResult = await withPhase(onEvent, 'processing_attachments', detail, () =>
+                            processAttachments(messageMetadata.attachments, lastMsg, userId, _attachOpts)
+                        );
+                    } else {
+                        _attachResult = await processAttachments(messageMetadata.attachments, lastMsg, userId, _attachOpts);
+                    }
+                } catch (attErr) {
+                    if (attErr && attErr.code === 'ATTACHMENT_PII_BLOCKED') {
+                        const cats = Object.keys(attErr.summary?.byCategory || {});
+                        onEvent?.('dlp_blocked', {
+                            reason: 'attachment_pii',
+                            filename: attErr.filename,
+                            categories: cats,
+                            findings: [],
+                            provider: { isExternal: false, reason: 'attachment_pii' },
+                        });
+                        const dlpStore = require('../../stores/guardrailEventStore');
+                        dlpStore.logGuardrailEvent({
+                            organization_id: agent.organization_id || null,
+                            user_id: userId || null,
+                            agent_id: agentId || null,
+                            agent_name: agent.name || null,
+                            conversation_id: conversation?.id || null,
+                            model: modelToUse,
+                            source: config?.providerName || config?.providerType || 'LLM',
+                            violation_type: 'pii',
+                            violation_categories: cats.join(', ') || null,
+                            direction: 'input',
+                            action_taken: 'blocked',
+                            attachment_filename: attErr.filename,
+                            attachment_page: null,
+                        }).catch(() => {});
+                        const e = new Error(attErr.message);
+                        e.code = 'ATTACHMENT_PII_BLOCKED';
+                        throw e;
+                    }
+                    throw attErr;
+                }
+
+                // Audit + UI surfacing for tokenised attachments.
+                if (_attachResult?.attachmentScanSummaries?.length > 0) {
+                    const dlpStore = require('../../stores/guardrailEventStore');
+                    const auditBase = {
+                        organization_id: agent.organization_id || null,
+                        user_id: userId || null,
+                        agent_id: agentId || null,
+                        agent_name: agent.name || null,
+                        conversation_id: conversation?.id || null,
+                        model: modelToUse,
+                        source: config?.providerName || config?.providerType || 'LLM',
+                    };
+                    for (const s of _attachResult.attachmentScanSummaries) {
+                        dlpStore.logAttachmentPiiFindings({ summary: s, auditBase, action_taken: 'redacted' }).catch(() => {});
+                    }
+                    // Merge per-file detail into the assistant tokenisation info
+                    // so the chat UI can render the per-attachment badge.
+                    const aggCount = _attachResult.attachmentScanSummaries.reduce((a, s) => a + (s.count || 0), 0);
+                    const aggCats = new Set();
+                    for (const s of _attachResult.attachmentScanSummaries) {
+                        for (const c of Object.keys(s.byCategory || {})) aggCats.add(c);
+                    }
+                    _assistantTokenisationInfo = _assistantTokenisationInfo || {
+                        source: 'privacy_shield',
+                        action: 'redact',
+                        count: 0,
+                        categories: [],
+                        automatic: true,
+                    };
+                    _assistantTokenisationInfo.attachments = _attachResult.attachmentScanSummaries;
+                    _assistantTokenisationInfo.count = (_assistantTokenisationInfo.count || 0) + aggCount;
+                    const catSet = new Set([...(_assistantTokenisationInfo.categories || []), ...aggCats]);
+                    _assistantTokenisationInfo.categories = [...catSet];
+
+                    // Live SSE so the chat UI displays the privacy badge during
+                    // the turn (not only after a page reload). Mirrors directChat.
+                    if (aggCount > 0 || _attachResult.attachmentScanSummaries.some(s => s.timeout)) {
+                        onEvent?.('pii_tokenized', {
+                            entities: [...aggCats].map(label => ({ label, category: label })),
+                            tokenCount: aggCount,
+                            attachments: _attachResult.attachmentScanSummaries,
+                            source: 'privacy_shield',
+                        });
+                    }
+
+                    // Raw-payload transparency for attachments (only when the
+                    // org opted in). Lets the user verify the exact tokenised
+                    // text Claude received — the missing "Sent to AI" pane
+                    // in the privacy panel was the source of the "I can't see
+                    // that anything was tokenised" feedback.
+                    if (aggCount > 0 && dlpShield?.showRawPayload) {
+                        try {
+                            const flat = Array.isArray(lastMsg?.content)
+                                ? lastMsg.content
+                                    .filter(p => p && p.type === 'text' && typeof p.text === 'string')
+                                    .map(p => p.text)
+                                    .join('\n')
+                                : (typeof lastMsg?.content === 'string' ? lastMsg.content : '');
+                            if (flat) {
+                                onEvent?.('privacy_payload', {
+                                    tokenizedPrompt: flat,
+                                    provider: modelToUse,
+                                    source: 'privacy_shield',
+                                    timestamp: Date.now(),
+                                });
+                                _assistantTokenisationInfo.tokenizedPrompt = flat;
+                            }
+                            const _convMap = require('../dlp/dlpRunner').getConversationTokenMap(conversation?.id);
+                            if (_convMap && Object.keys(_convMap).length > 0) {
+                                onEvent?.('privacy_token_map', { tokenMap: _convMap, source: 'privacy_shield' });
+                                _assistantTokenisationInfo.tokenMap = _convMap;
+                            }
+                        } catch (_) { /* transparency is best-effort */ }
+                    }
                 }
             }
 
@@ -1580,21 +1718,27 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         }
                     }
 
-                    // Use unified tool dispatcher — supports integrations + components
+                    // Use unified tool dispatcher — supports integrations + components.
+                    // Wrap in runWithProbe so any outbound fetch via probedFetch
+                    // records the actual peer IP for the egress dashboard.
                     const { executeTool: dispatchTool } = require('../toolDispatcher');
-                    let toolResult = await dispatchTool(toolName, toolArgs, {
-                        userId,
-                        session: userAuth?.session,
-                        userAuth,
-                        fixedParams: fixedParams,
-                        agentId: agent.id,
-                        conversationId: conversation.id,
-                        send: onEvent,
-                        req: messageMetadata.req || null,
-                        nanoBananaSettings: messageMetadata.nanoBananaSettings || null,
-                        onImageGenerated: (data) => {
-                            onEvent('image', data);
-                        },
+                    const { result: toolResult, probe: outboundProbe } = await runWithProbe(async () => {
+                        const preMeta = resolveIntegration(toolName, toolArgs || {});
+                        if (preMeta?.isLocal) markLocal(preMeta.label || preMeta.integration);
+                        return await dispatchTool(toolName, toolArgs, {
+                            userId,
+                            session: userAuth?.session,
+                            userAuth,
+                            fixedParams: fixedParams,
+                            agentId: agent.id,
+                            conversationId: conversation.id,
+                            send: onEvent,
+                            req: messageMetadata.req || null,
+                            nanoBananaSettings: messageMetadata.nanoBananaSettings || null,
+                            onImageGenerated: (data) => {
+                                onEvent('image', data);
+                            },
+                        });
                     });
 
                     // Regex Guardrails - Tool Output scope
@@ -1613,6 +1757,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         toolName,
                         toolArgs,
                         finalToolResult,
+                        outboundProbe,
                         blocked: false
                     };
                 });
@@ -1623,7 +1768,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
 
                 // Process results in order
                 for (const result of toolResults) {
-                    const { toolCall, toolName, toolArgs, finalToolResult } = result;
+                    const { toolCall, toolName, toolArgs, finalToolResult, outboundProbe } = result;
 
                     toolCalls.push({ name: toolName, args: toolArgs, result: finalToolResult });
                     // Track for persistence
@@ -1667,9 +1812,16 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         _mapEmbeds.push(finalToolResult._mapEmbed);
                     }
 
-                    // Emit workspace_update SSE event so frontend updates panel
+                    // Emit workspace_update SSE event so frontend updates panel.
+                    // Render-time un-tokenisation: stored content keeps the raw
+                    // `[person_N]` tokens (so notebook_read in a later turn still
+                    // works for the AI), but the user-facing SSE replaces them
+                    // with the real values from the conversation token map.
                     if (finalToolResult?._action === 'workspace_update') {
-                        onEvent('workspace_update', { content: finalToolResult.content });
+                        const { restoreTokens } = require('../azurePiiDetection');
+                        const _convMapForWs = require('../dlp/dlpRunner').getConversationTokenMap(conversation?.id);
+                        const rendered = restoreTokens(finalToolResult.content || '', _convMapForWs);
+                        onEvent('workspace_update', { content: rendered });
                     }
 
                     // Emit kb_sources SSE event so frontend shows knowledge base sources.
@@ -1747,6 +1899,11 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                                         piiDetected = [...new Set(piiResult.entities.map(e => e.label))].join(', ');
                                     }
                                 } catch (piiErr) { /* fail-open: log without PII data */ }
+                                // If the resolver tagged this as local but the probe didn't catch
+                                // it (e.g. local tool that bypassed markLocal), reflect it on the
+                                // probe so the row carries is_local=true.
+                                const probeForLog = outboundProbe || null;
+                                if (probeForLog && integMeta.isLocal) probeForLog.is_local = true;
                                 integrationActivityStore.logIntegrationActivity({
                                     organization_id: agent.organization_id || null,
                                     user_id: userId,
@@ -1762,6 +1919,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                                     pii_scan_enabled: true,
                                     source: 'agent_stream',
                                     model: modelToUse,
+                                    probe: probeForLog,
                                 }).catch(e => console.error('[IntegrationActivityLog] Error:', e.message));
                             }).catch(() => {});
                         }
@@ -1868,7 +2026,31 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             if (_linkedInDrafts.length > 0) assistantMsg.linkedInDrafts = _linkedInDrafts;
             if (_mapEmbeds.length > 0) assistantMsg.mapEmbeds = _mapEmbeds;
             if (_audioFiles.length > 0) assistantMsg.audioFiles = _audioFiles;
-            if (_toolHistory.length > 0) assistantMsg.toolHistory = _toolHistory;
+            if (_toolHistory.length > 0) {
+                // Render-time un-tokenisation for the saved tool history —
+                // mirror of the same pass in [directChat.js#L3922](server/routes/ai/directChat.js#L3922).
+                // toolHistory is never fed back to the AI; it surfaces in the
+                // "How I got this answer" panel where the user wants real values.
+                try {
+                    const { restoreTokens } = require('../azurePiiDetection');
+                    const _convMapTH = require('../dlp/dlpRunner').getConversationTokenMap(conversation?.id);
+                    if (Object.keys(_convMapTH).length > 0) {
+                        for (const t of _toolHistory) {
+                            if (typeof t?.resultPreview === 'string') {
+                                t.resultPreview = restoreTokens(t.resultPreview, _convMapTH);
+                            }
+                            if (t?.args && typeof t.args === 'object') {
+                                for (const k of Object.keys(t.args)) {
+                                    if (typeof t.args[k] === 'string') {
+                                        t.args[k] = restoreTokens(t.args[k], _convMapTH);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (_) { /* render-layer best-effort */ }
+                assistantMsg.toolHistory = _toolHistory;
+            }
             if (_kbSources.length > 0) assistantMsg.kbSources = _kbSources;
             // Persistence format: `thinkingParts` is the structured array (with signatures
             // for Claude replay); `thinking` stays as the flat string for backwards compat
@@ -1914,13 +2096,17 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             // ============ MEMORY EXTRACTION ============
             // Skip memory extraction if ephemeral, guardrail violation, or redaction occurred
             if (!isEphemeral && !agent.embed_enabled) {
-                const shouldSkipMemoryExtraction = guardrailViolation || processedUserMessage !== userMessage;
+                // Session-level memory write toggle from the chat composer.
+                // Default-true so existing clients keep writing memories.
+                const memoryWriteEnabled = messageMetadata?.memoryWriteEnabled !== false;
+                const shouldSkipMemoryExtraction = !memoryWriteEnabled || guardrailViolation || processedUserMessage !== userMessage;
 
                 const debugData = {
                     agentId,
                     conversationId: conversation.id,
                     guardrailViolation: !!guardrailViolation,
                     isRedacted: processedUserMessage !== userMessage,
+                    memoryWriteEnabled,
                     shouldSkip: shouldSkipMemoryExtraction,
                     messagesCount: messages.length,
                     userMessageLength: userMessage.length
@@ -2027,7 +2213,8 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         // Extract memories from the conversation (skip for ephemeral/embed chats)
         if (!isEphemeral && !agent.embed_enabled) {
             try {
-                const shouldSkipMemoryExtraction = guardrailViolation || processedUserMessage !== userMessage;
+                const memoryWriteEnabled = messageMetadata?.memoryWriteEnabled !== false;
+                const shouldSkipMemoryExtraction = !memoryWriteEnabled || guardrailViolation || processedUserMessage !== userMessage;
                 if (!shouldSkipMemoryExtraction) {
                     const memoryExtractor = require('../../agents/memory/extractor');
 

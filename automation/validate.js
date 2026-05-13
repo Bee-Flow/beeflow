@@ -20,9 +20,38 @@ const VALID_STEP_TYPES = new Set([
     'trigger', 'integration_action', 'ai_step', 'condition', 'loop', 'code', 'notification',
     // Phase 2 flow primitives
     'approval', 'parallel',
+    // n8n-style utility nodes (Phase A: data + control flow, Phase B: collection ops)
+    'set', 'datetime', 'wait', 'stop_error', 'switch',
+    'filter', 'limit', 'dedupe', 'aggregate', 'summarize',
 ]);
 
+const DATETIME_OPS = new Set(['now', 'parse', 'format', 'addDays', 'addHours', 'addMinutes', 'diff', 'extract']);
+const SUMMARIZE_OPS = new Set(['sum', 'count', 'avg', 'min', 'max']);
+const LIMIT_MODES = new Set(['first', 'last']);
+const DATETIME_PARTS = new Set(['year', 'month', 'day', 'hour', 'minute', 'second', 'dayOfWeek']);
+const DATETIME_DIFF_UNITS = new Set(['days', 'hours', 'minutes', 'seconds']);
+
 function isObject(x) { return x && typeof x === 'object' && !Array.isArray(x); }
+
+/**
+ * Optional canvas position (`{ x, y }`) — written by the drag-and-drop
+ * builder, ignored by the runner. We reject only malformed shapes so a
+ * typo on the UI side surfaces fast instead of silently round-tripping
+ * garbage through the JSONB blob.
+ */
+function validatePosition(pos, at, push) {
+    if (pos === undefined || pos === null) return;
+    if (!isObject(pos)) {
+        push({ code: 'position.shape', severity: 'error', path: at + '.position', message: 'position must be an object { x, y }.', hint: 'Pass { x: number, y: number } or omit the field entirely.' });
+        return;
+    }
+    for (const k of ['x', 'y']) {
+        const v = pos[k];
+        if (typeof v !== 'number' || !Number.isFinite(v)) {
+            push({ code: 'position.coord', severity: 'error', path: at + `.position.${k}`, message: `position.${k} must be a finite number.`, hint: 'Use canvas coordinates from the visual editor.' });
+        }
+    }
+}
 
 function topoOrder(nodes, edges) {
     const inDeg = new Map();
@@ -155,6 +184,7 @@ function validateDefinition(def, { availableTools = null } = {}) {
     const trigger = def.trigger;
     if (!trigger.id || typeof trigger.id !== 'string') pushE({ code: 'trigger.id_missing', severity: 'error', path: 'trigger.id', message: 'trigger.id is required.', hint: 'Re-run builder_propose_trigger; it generates a stable id.' });
     if (!trigger.kind || typeof trigger.kind !== 'string') pushE({ code: 'trigger.kind_missing', severity: 'error', path: 'trigger.kind', message: 'trigger.kind is required.', hint: 'Use one of: schedule, manual, webhook, app_event.' });
+    validatePosition(trigger.position, 'trigger', pushE);
 
     // Steps — unique ids, valid types.
     const ids = new Set([trigger.id]);
@@ -167,6 +197,7 @@ function validateDefinition(def, { availableTools = null } = {}) {
         if (!s.id || typeof s.id !== 'string') { pushE({ code: 'step.id_missing', severity: 'error', path: at + '.id', message: 'Each step needs an `id`.', hint: 'Use the id returned from the previous builder_add_* tool result.' }); continue; }
         if (ids.has(s.id)) { pushE({ code: 'step.id_duplicate', severity: 'error', path: at + '.id', message: `Duplicate step id: ${s.id}`, hint: 'Remove the duplicate or call builder_remove_step on one of them.' }); continue; }
         if (!VALID_STEP_TYPES.has(s.type)) { pushE({ code: 'step.unknown_type', severity: 'error', path: at + '.type', message: `Step ${s.id}: unknown type "${s.type}".`, hint: `Use one of: ${[...VALID_STEP_TYPES].join(', ')}.` }); continue; }
+        validatePosition(s.position, at, pushE);
         ids.add(s.id);
         stepById.set(s.id, s);
     }
@@ -240,6 +271,72 @@ function validateDefinition(def, { availableTools = null } = {}) {
         if (step.type === 'notification') {
             if (!step.title && !step.body) pushE({ code: 'notification.empty', severity: 'error', path: at, message: `Step ${step.id}: notification needs at least \`title\` or \`body\`.`, hint: 'Provide one (or both) so the user has something to read.' });
         }
+        // ── n8n-style utility nodes ───────────────────────────────────
+        if (step.type === 'set') {
+            // Set is "edit fields" — every entry is a binding shape. An
+            // empty `fields` map IS allowed (degenerate but not invalid)
+            // so we only check the shape of what's provided.
+            if (step.fields !== undefined && !isObject(step.fields)) {
+                pushE({ code: 'set.fields_shape', severity: 'error', path: at + '.fields', message: `Step ${step.id}: set.fields must be an object map of {key: binding}.`, hint: 'Use { name: { kind: "literal", value: "..." }, ... }.' });
+            }
+        }
+        if (step.type === 'datetime') {
+            const op = step.op;
+            if (!op || typeof op !== 'string') pushE({ code: 'datetime.op_missing', severity: 'error', path: at + '.op', message: `Step ${step.id}: datetime requires \`op\`.`, hint: `One of: ${Array.from(DATETIME_OPS).join(', ')}.` });
+            else if (!DATETIME_OPS.has(op)) pushE({ code: 'datetime.op_unknown', severity: 'error', path: at + '.op', message: `Step ${step.id}: unknown datetime op "${op}".`, hint: `Use one of: ${Array.from(DATETIME_OPS).join(', ')}.` });
+            // Per-op required fields.
+            if (op === 'format' && !step.format) pushE({ code: 'datetime.format_missing', severity: 'error', path: at + '.format', message: `Step ${step.id}: datetime op "format" requires \`format\` string.`, hint: 'e.g. "yyyy-MM-dd HH:mm".' });
+            if ((op === 'addDays' || op === 'addHours' || op === 'addMinutes') && typeof step.amount !== 'number') pushE({ code: 'datetime.amount_missing', severity: 'error', path: at + '.amount', message: `Step ${step.id}: datetime op "${op}" requires numeric \`amount\`.`, hint: 'Positive or negative integer.' });
+            if (op === 'extract' && (!step.part || !DATETIME_PARTS.has(step.part))) pushE({ code: 'datetime.part_invalid', severity: 'error', path: at + '.part', message: `Step ${step.id}: datetime op "extract" requires \`part\` in ${Array.from(DATETIME_PARTS).join('/')}.`, hint: 'Pick one of the supported parts.' });
+            if (op === 'diff' && (!step.unit || !DATETIME_DIFF_UNITS.has(step.unit))) pushE({ code: 'datetime.unit_invalid', severity: 'error', path: at + '.unit', message: `Step ${step.id}: datetime op "diff" requires \`unit\` in ${Array.from(DATETIME_DIFF_UNITS).join('/')}.`, hint: 'Pick the unit you want the difference reported in.' });
+        }
+        if (step.type === 'wait') {
+            const s = step.seconds;
+            if (typeof s !== 'number' || s < 1 || s > 86400 || !Number.isFinite(s)) {
+                pushE({ code: 'wait.seconds_range', severity: 'error', path: at + '.seconds', message: `Step ${step.id}: wait.seconds must be 1..86400.`, hint: 'Pick a reasonable duration (max 24h).' });
+            }
+        }
+        if (step.type === 'stop_error') {
+            if (!step.message || typeof step.message !== 'string') pushE({ code: 'stop_error.message_missing', severity: 'error', path: at + '.message', message: `Step ${step.id}: stop_error requires \`message\` string.`, hint: 'Surface a human-readable reason for halting the run.' });
+        }
+        if (step.type === 'switch') {
+            if (!step.expr || typeof step.expr !== 'string') pushE({ code: 'switch.expr_missing', severity: 'error', path: at + '.expr', message: `Step ${step.id}: switch requires \`expr\`.`, hint: 'Restricted-grammar expression whose value is matched against each case.' });
+            else { try { parseExpr(step.expr); } catch (e) { pushE({ code: 'switch.expr_parse', severity: 'error', path: at + '.expr', message: `Step ${step.id}: switch expr parse error — ${e.message}`, hint: 'Restricted grammar only.' }); } }
+            if (!Array.isArray(step.cases) || step.cases.length === 0) pushE({ code: 'switch.cases_missing', severity: 'error', path: at + '.cases', message: `Step ${step.id}: switch requires at least one case.`, hint: 'cases: [{ name: "...", value: ... }].' });
+            else {
+                const seenNames = new Set();
+                for (let i = 0; i < step.cases.length; i++) {
+                    const c = step.cases[i];
+                    if (!isObject(c) || !c.name || typeof c.name !== 'string') { pushE({ code: 'switch.case_shape', severity: 'error', path: at + `.cases[${i}]`, message: `Step ${step.id}: switch case ${i} missing name.`, hint: 'Each case needs { name, value }.' }); continue; }
+                    if (c.name === 'default') { pushE({ code: 'switch.case_name_reserved', severity: 'error', path: at + `.cases[${i}].name`, message: `Step ${step.id}: case name "default" is reserved; use \`defaultBranch\` instead.`, hint: 'Set defaultBranch on the switch step to route unmatched values.' }); continue; }
+                    if (seenNames.has(c.name)) pushE({ code: 'switch.case_name_duplicate', severity: 'error', path: at + `.cases[${i}].name`, message: `Step ${step.id}: duplicate switch case name "${c.name}".`, hint: 'Each case name must be unique.' });
+                    seenNames.add(c.name);
+                }
+                const out = def.edges.filter(e => e.from === step.id);
+                const caseLabels = new Set(out.map(e => e.caseName).filter(Boolean));
+                const wired = step.cases.filter(c => caseLabels.has(c.name)).length;
+                if (wired === 0) pushE({ code: 'switch.no_branches', severity: 'error', path: at + '.edges', message: `Step ${step.id}: switch has no case edges wired — all branches dead-end.`, hint: 'Add edges from this switch with caseName matching each case.' });
+                else if (wired < step.cases.length) pushW({ code: 'switch.partial_branches', severity: 'warning', path: at + '.edges', message: `Step ${step.id}: only ${wired}/${step.cases.length} switch cases have outgoing edges.`, hint: 'Wire each case to its next step, or remove unused cases.' });
+            }
+        }
+        // Phase B: collection ops — every type takes `arrayRef`.
+        if (step.type === 'filter' || step.type === 'limit' || step.type === 'dedupe' || step.type === 'aggregate' || step.type === 'summarize') {
+            if (!step.arrayRef || typeof step.arrayRef !== 'string') pushE({ code: `${step.type}.arrayRef_missing`, severity: 'error', path: at + '.arrayRef', message: `Step ${step.id}: ${step.type} requires \`arrayRef\`.`, hint: 'Bind to an upstream array, e.g. `steps.<id>.output.items`.' });
+        }
+        if (step.type === 'filter') {
+            if (!step.expr || typeof step.expr !== 'string') pushE({ code: 'filter.expr_missing', severity: 'error', path: at + '.expr', message: `Step ${step.id}: filter requires \`expr\`.`, hint: 'Use the current element as `item`, e.g. `item.amount > 1000`.' });
+            else { try { parseExpr(step.expr); } catch (e) { pushE({ code: 'filter.expr_parse', severity: 'error', path: at + '.expr', message: `Step ${step.id}: filter expr parse error — ${e.message}`, hint: 'Restricted grammar only.' }); } }
+        }
+        if (step.type === 'limit') {
+            if (typeof step.count !== 'number' || step.count < 0 || !Number.isFinite(step.count)) pushE({ code: 'limit.count_missing', severity: 'error', path: at + '.count', message: `Step ${step.id}: limit requires non-negative numeric \`count\`.`, hint: '0 returns no items, 10 returns first/last 10.' });
+            if (step.mode !== undefined && !LIMIT_MODES.has(step.mode)) pushE({ code: 'limit.mode_invalid', severity: 'error', path: at + '.mode', message: `Step ${step.id}: limit.mode must be "first" or "last".`, hint: 'Default is "first".' });
+        }
+        if (step.type === 'aggregate' || step.type === 'summarize') {
+            if (!step.field || typeof step.field !== 'string') pushE({ code: `${step.type}.field_missing`, severity: 'error', path: at + '.field', message: `Step ${step.id}: ${step.type} requires \`field\` name to read from each item.`, hint: 'e.g. "amount" or "email".' });
+        }
+        if (step.type === 'summarize') {
+            if (!step.op || !SUMMARIZE_OPS.has(step.op)) pushE({ code: 'summarize.op_invalid', severity: 'error', path: at + '.op', message: `Step ${step.id}: summarize requires \`op\` in ${Array.from(SUMMARIZE_OPS).join('/')}.`, hint: 'Pick the aggregation operator.' });
+        }
 
         // Reference scoping — collect all ref paths used in this step's
         // inputs / prompt / expr / template fields, ensure their roots
@@ -260,6 +357,20 @@ function validateDefinition(def, { availableTools = null } = {}) {
         }
         if (step.type === 'condition') refs.push({ kind: 'expr', src: step.expr || '' });
         if (step.type === 'loop' && step.overRef) refs.push({ kind: 'ref', path: step.overRef });
+        if (step.type === 'set') collectRefPaths(step.fields, refs);
+        if (step.type === 'datetime') {
+            if (typeof step.input === 'string' && step.input) refs.push({ kind: 'ref', path: step.input });
+            if (typeof step.input2 === 'string' && step.input2) refs.push({ kind: 'ref', path: step.input2 });
+        }
+        if (step.type === 'stop_error') collectRefPaths({ kind: 'template', value: step.message || '' }, refs);
+        if (step.type === 'switch') refs.push({ kind: 'expr', src: step.expr || '' });
+        if ((step.type === 'filter' || step.type === 'limit' || step.type === 'dedupe' || step.type === 'aggregate' || step.type === 'summarize') && step.arrayRef) {
+            refs.push({ kind: 'ref', path: step.arrayRef });
+        }
+        // Filter's expr references `item` (loop-style scalar). The
+        // runtime injects item per element so we don't validate sub-paths
+        // here; the runtime returns undefined for typos. Same shortcut
+        // condition/switch already use for their exprs.
 
         for (const r of refs) {
             const path = r.kind === 'ref' ? r.path : null;

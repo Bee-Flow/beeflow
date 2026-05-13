@@ -17,17 +17,32 @@
 const MAX_TOKEN_LEN = 48;
 
 function createUntokeniser(tokenMapInput) {
-    const tokenMap = tokenMapInput instanceof Map
-        ? Object.fromEntries(tokenMapInput)
-        : (tokenMapInput || {});
-    const hasAny = Object.keys(tokenMap).length > 0;
+    // Accept either a static map (legacy callers) or a getter function that
+    // re-reads the current map. The getter form is used by chatStream so
+    // tokens added AFTER the un-tokeniser is wrapped — e.g. tokens produced
+    // when an attachment is scanned during processAttachments() — still
+    // round-trip on the response stream.
+    const isGetter = typeof tokenMapInput === 'function';
+    const staticMap = !isGetter
+        ? (tokenMapInput instanceof Map ? Object.fromEntries(tokenMapInput) : (tokenMapInput || {}))
+        : null;
+
+    function currentMap() {
+        if (!isGetter) return staticMap;
+        const v = tokenMapInput();
+        if (!v) return {};
+        if (v instanceof Map) return Object.fromEntries(v);
+        return v;
+    }
 
     let buffer = '';
 
     function replaceAll(text) {
-        if (!hasAny || !text) return text;
+        if (!text) return text;
+        const map = currentMap();
+        if (!map || Object.keys(map).length === 0) return text;
         let out = text;
-        for (const [token, original] of Object.entries(tokenMap)) {
+        for (const [token, original] of Object.entries(map)) {
             if (out.indexOf(token) === -1) continue;
             out = out.split(token).join(original);
         }
@@ -40,8 +55,13 @@ function createUntokeniser(tokenMapInput) {
      * small trailing buffer in case the next chunk completes an in-progress
      * token.
      */
+    function hasAny() {
+        const map = currentMap();
+        return !!(map && Object.keys(map).length > 0);
+    }
+
     function push(chunk) {
-        if (!hasAny) return chunk || '';
+        if (!hasAny()) return chunk || '';
         if (!chunk) return '';
         buffer += chunk;
 
@@ -67,12 +87,7 @@ function createUntokeniser(tokenMapInput) {
      * Drain any retained buffer; call when the stream closes.
      */
     function flush() {
-        if (!hasAny) {
-            const tail = buffer;
-            buffer = '';
-            return tail;
-        }
-        const tail = replaceAll(buffer);
+        const tail = hasAny() ? replaceAll(buffer) : buffer;
         buffer = '';
         return tail;
     }

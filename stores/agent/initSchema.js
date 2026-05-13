@@ -128,6 +128,14 @@ async function _doInit() {
     try { await exec(`ALTER TABLE direct_conversations ADD COLUMN IF NOT EXISTS labels_json TEXT DEFAULT '[]'`); } catch (e) { /* already exists */ }
     try { await exec(`ALTER TABLE agent_conversations ADD COLUMN IF NOT EXISTS labels_json TEXT DEFAULT '[]'`); } catch (e) { /* already exists */ }
 
+    // Migration: Add pii_token_map column for Privacy Shield token round-trip
+    // across server restarts. Stores `{ "[person_1]": "Gerard …", … }` so that
+    // notebook content / tool history / saved messages with raw tokens can be
+    // restored to real values on conversation reload even after the in-memory
+    // map at server/core/dlp/dlpRunner.js has been wiped.
+    try { await exec(`ALTER TABLE direct_conversations ADD COLUMN IF NOT EXISTS pii_token_map JSONB`); } catch (e) { /* already exists */ }
+    try { await exec(`ALTER TABLE agent_conversations ADD COLUMN IF NOT EXISTS pii_token_map JSONB`); } catch (e) { /* already exists */ }
+
     // Migration: Add workspace_notebook_id to link workspace notebook to conversation
     try { await exec(`ALTER TABLE direct_conversations ADD COLUMN IF NOT EXISTS workspace_notebook_id TEXT`); } catch (e) { /* already exists */ }
     try { await exec(`ALTER TABLE agent_conversations ADD COLUMN IF NOT EXISTS workspace_notebook_id TEXT`); } catch (e) { /* already exists */ }

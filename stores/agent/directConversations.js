@@ -18,14 +18,29 @@ const { decryptMessages } = require('./messageEncryption');
 // Lazy-require inside the function: same circular-dep reason as
 // azurePiiDetection.js→aiAgent — capturing a destructure at module load
 // can grab a stale snapshot of the cycle's partial exports.
-function _restoreTokensInMessages(messages) {
+function _restoreTokensInMessages(messages, convTokenMap = null) {
     if (!Array.isArray(messages)) return messages;
     const restoreTokens = require('../../core/azurePiiDetection').restoreTokens;
     if (typeof restoreTokens !== 'function') return messages;
+    const convMapHasEntries = convTokenMap && typeof convTokenMap === 'object' && Object.keys(convTokenMap).length > 0;
     return messages.map(m => {
-        if (m && m.role === 'user' && m.tokenMap && typeof m.content === 'string' && Object.keys(m.tokenMap).length > 0) {
+        if (!m || typeof m.content !== 'string') return m;
+        // User messages: use the per-message tokenMap (existing behaviour).
+        // Each user turn captured the message-level tokens at the moment it
+        // was tokenised — that's a stable, self-contained mapping.
+        if (m.role === 'user' && m.tokenMap && Object.keys(m.tokenMap).length > 0) {
             try {
                 return { ...m, content: restoreTokens(m.content, m.tokenMap) };
+            } catch (e) { /* fall through with original */ }
+        }
+        // Assistant messages: use the conversation-level token map. Assistant
+        // tokens come from attachment scans + cross-turn message PII and are
+        // not stashed per-message. Without this branch, an assistant response
+        // referencing `[person_N]` would be displayed as raw placeholders on
+        // a conversation reload.
+        if (m.role === 'assistant' && convMapHasEntries) {
+            try {
+                return { ...m, content: restoreTokens(m.content, convTokenMap) };
             } catch (e) { /* fall through with original */ }
         }
         return m;
@@ -50,7 +65,12 @@ async function getDirectConversation(id, userId, options = {}) {
     if (!row) return null;
     const meta = JSON.parse(row.meta_json || '{}');
     let messages = await _readDirectMessages(row);
-    if (restore) messages = _restoreTokensInMessages(messages);
+    if (restore) {
+        // The conversation-level pii_token_map covers assistant tokens that
+        // span turns (attachment scans + cross-turn message PII). User
+        // messages still consult their per-row tokenMap inside the helper.
+        messages = _restoreTokensInMessages(messages, row.pii_token_map || null);
+    }
     return { ...row, messages, meta, ...meta };
 }
 
@@ -258,4 +278,6 @@ module.exports = {
     updateDirectConversation, updateDirectConversationTitle, pinDirectConversation, setDirectConversationLabels, deleteDirectConversation,
     updateDirectConversationWorkspace, getDirectConversationWorkspace,
     searchDirectConversations, updateDirectConversationMeta,
+    // Exposed so agentConversations.js can reuse the same restore logic.
+    _restoreTokensInMessages,
 };

@@ -27,6 +27,8 @@ function buildRequestFilters(req) {
     if (req.query.agent) filters.agentId = req.query.agent;
     if (req.query.model) filters.model = req.query.model;
     if (req.query.source) filters.source = req.query.source;
+    if (req.query.integration) filters.integrationType = req.query.integration;
+    if (req.query.pii) filters.piiCategory = req.query.pii;
     return filters;
 }
 
@@ -478,6 +480,71 @@ router.get('/integrations/recent', async (req, res) => {
     } catch (err) {
         console.error('[Usage API] /integrations/recent error:', err.message);
         res.status(500).json({ error: 'Failed to fetch recent integration activity' });
+    }
+});
+
+// Per-call data egress log — the authoritative "where did the data go" view.
+// Each row corresponds to one tool call; peer_ip is the actual destination IP
+// captured at socket connect time (see core/outboundProbe.js).
+router.get('/integrations/egress', async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
+        const euOnly = req.query.eu === 'true' ? true : req.query.eu === 'false' ? false : undefined;
+        const localOnly = req.query.local === 'true';
+        const filters = { ...req.usageFilters, euOnly, localOnly };
+        const data = await integrationActivityStore.getEgressLog(filters, limit);
+        const userMap = await getUserMap();
+        const enriched = (data || []).map(row => ({
+            ...withUser(row, userMap),
+            country_flag: countryFlag(row.country_code),
+        }));
+        res.json(enriched);
+    } catch (err) {
+        console.error('[Usage API] /integrations/egress error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch egress log' });
+    }
+});
+
+// Operator summary — grouped by cloud / hosting company (Google / Microsoft /
+// Cloudflare / AWS / …). Unknown IPs surface as "Unknown" rather than being hidden.
+router.get('/integrations/operator-summary', async (req, res) => {
+    try {
+        const data = await integrationActivityStore.getOperatorSummary(req.usageFilters);
+        res.json(data || []);
+    } catch (err) {
+        console.error('[Usage API] /integrations/operator-summary error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch operator summary' });
+    }
+});
+
+// Sovereignty breakdown by dimension (user / integration / agent / pii).
+// Each row shape is uniform — the frontend renders all four with one template.
+router.get('/integrations/sovereignty', async (req, res) => {
+    try {
+        const dimension = req.query.dimension || 'user';
+        if (!['user', 'integration', 'agent', 'pii'].includes(dimension)) {
+            return res.status(400).json({ error: `Invalid dimension. Use one of: user, integration, agent, pii` });
+        }
+        const data = await integrationActivityStore.getSovereigntyByDimension(dimension, req.usageFilters);
+        // Hydrate user display names + avatars for the 'user' dimension so the
+        // UI can render an Avatar with a real label instead of a raw user_id.
+        if (dimension === 'user') {
+            const userMap = await getUserMap();
+            const enriched = (data || []).map(row => {
+                const u = userMap.get(row.key) || {};
+                return {
+                    ...row,
+                    label: u.display_name || row.label,
+                    avatar: u.avatar || null,
+                    avatarType: u.avatarType || null,
+                };
+            });
+            return res.json(enriched);
+        }
+        res.json(data || []);
+    } catch (err) {
+        console.error('[Usage API] /integrations/sovereignty error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch sovereignty breakdown' });
     }
 });
 

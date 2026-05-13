@@ -273,6 +273,13 @@ async function initDB() {
     try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS nc_recommended BOOLEAN DEFAULT FALSE`); } catch (e) { }
     // Short marketing line shown under the plan name in the wizard cards.
     try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS tagline TEXT`); } catch (e) { }
+    // Explicit tier mapping so license/index.js doesn't have to fall back to
+    // substring-matching the plan name. Backfill from name on first run; the
+    // admin Plans editor lets future plans set this explicitly.
+    try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS tier TEXT`); } catch (e) { }
+    try { await exec(`UPDATE subscription_plans SET tier = 'enterprise' WHERE tier IS NULL AND LOWER(name) LIKE '%enterprise%'`); } catch (e) { }
+    try { await exec(`UPDATE subscription_plans SET tier = 'pro'        WHERE tier IS NULL AND LOWER(name) LIKE '%pro%'`); } catch (e) { }
+    try { await exec(`UPDATE subscription_plans SET tier = 'community'  WHERE tier IS NULL AND (LOWER(name) LIKE '%community%' OR name = '__consumer_default__')`); } catch (e) { }
     // Auto-migrate legacy __consumer_default__ plan
     try { await exec(`UPDATE subscription_plans SET plan_type = 'consumer' WHERE name = '__consumer_default__' AND (plan_type IS NULL OR plan_type = 'organization')`); } catch (e) { }
     // Consumer subscriptions table (per-user, org-less)
@@ -1092,20 +1099,24 @@ async function createPlan(data) {
     if (!data.name || typeof data.name !== 'string' || !data.name.trim()) {
         throw new Error('Plan name is required');
     }
+    if (data.tier !== undefined && data.tier !== null && data.tier !== '' && !['community', 'pro', 'enterprise', 'full'].includes(data.tier)) {
+        throw new Error(`Invalid tier: ${data.tier}`);
+    }
+    if (data.tier === '') data.tier = null;
     const id = data.id || crypto.randomUUID();
     const now = new Date().toISOString();
     try {
         if (data.is_default) await run('UPDATE subscription_plans SET is_default = FALSE WHERE is_default = TRUE');
         if (data.nc_recommended) await run('UPDATE subscription_plans SET nc_recommended = FALSE WHERE nc_recommended = TRUE');
-        await run(`INSERT INTO subscription_plans (id, name, description, max_messages_per_month, max_messages_by_type, max_tokens_per_month, max_cost_per_month, max_users, max_agents, max_knowledge_sources, allowed_features, allowed_models, is_default, price, currency, billing_interval, trial_days, sort_order, is_public, stripe_price_id, stripe_product_id, plan_type, nc_recommended, tagline, created_at, updated_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)`,
+        await run(`INSERT INTO subscription_plans (id, name, description, max_messages_per_month, max_messages_by_type, max_tokens_per_month, max_cost_per_month, max_users, max_agents, max_knowledge_sources, allowed_features, allowed_models, is_default, price, currency, billing_interval, trial_days, sort_order, is_public, stripe_price_id, stripe_product_id, plan_type, nc_recommended, tagline, tier, created_at, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)`,
             [id, data.name.trim(), data.description || '', data.max_messages_per_month ?? null, JSON.stringify(data.max_messages_by_type || {}),
                 data.max_tokens_per_month ?? null, data.max_cost_per_month ?? null, data.max_users ?? null, data.max_agents ?? null,
                 data.max_knowledge_sources ?? null, JSON.stringify(data.allowed_features || []), JSON.stringify(data.allowed_models || []),
                 !!data.is_default, data.price ?? null, data.currency || 'EUR', data.billing_interval || 'monthly',
                 data.trial_days ?? 0, data.sort_order ?? 0, !!data.is_public,
                 data.stripe_price_id || null, data.stripe_product_id || null, data.plan_type || 'organization',
-                !!data.nc_recommended, data.tagline || null, now, now]);
+                !!data.nc_recommended, data.tagline || null, data.tier || null, now, now]);
         return parsePlan(await getOne('SELECT * FROM subscription_plans WHERE id = $1', [id]));
     } catch (e) { console.error('[UserStore] createPlan error:', e); return null; }
 }
@@ -1143,9 +1154,15 @@ async function updatePlan(planId, data) {
         if (data.stripe_product_id !== undefined) updateMap.stripe_product_id = data.stripe_product_id;
         if (data.nc_recommended !== undefined) updateMap.nc_recommended = !!data.nc_recommended;
         if (data.tagline !== undefined) updateMap.tagline = data.tagline;
+        if (data.tier !== undefined) {
+            if (data.tier !== null && data.tier !== '' && !['community', 'pro', 'enterprise', 'full'].includes(data.tier)) {
+                throw new Error(`Invalid tier: ${data.tier}`);
+            }
+            updateMap.tier = data.tier === '' ? null : data.tier;
+        }
         updateMap.updated_at = now;
         if (data.plan_type !== undefined) updateMap.plan_type = data.plan_type;
-        const colMap = { name: 'name', description: 'description', max_messages_per_month: 'max_messages_per_month', max_messages_by_type: 'max_messages_by_type', max_tokens_per_month: 'max_tokens_per_month', max_cost_per_month: 'max_cost_per_month', max_users: 'max_users', max_agents: 'max_agents', max_knowledge_sources: 'max_knowledge_sources', allowed_features: 'allowed_features', allowed_models: 'allowed_models', is_default: 'is_default', price: 'price', currency: 'currency', billing_interval: 'billing_interval', trial_days: 'trial_days', sort_order: 'sort_order', is_public: 'is_public', stripe_price_id: 'stripe_price_id', stripe_product_id: 'stripe_product_id', plan_type: 'plan_type', nc_recommended: 'nc_recommended', tagline: 'tagline', updated_at: 'updated_at' };
+        const colMap = { name: 'name', description: 'description', max_messages_per_month: 'max_messages_per_month', max_messages_by_type: 'max_messages_by_type', max_tokens_per_month: 'max_tokens_per_month', max_cost_per_month: 'max_cost_per_month', max_users: 'max_users', max_agents: 'max_agents', max_knowledge_sources: 'max_knowledge_sources', allowed_features: 'allowed_features', allowed_models: 'allowed_models', is_default: 'is_default', price: 'price', currency: 'currency', billing_interval: 'billing_interval', trial_days: 'trial_days', sort_order: 'sort_order', is_public: 'is_public', stripe_price_id: 'stripe_price_id', stripe_product_id: 'stripe_product_id', plan_type: 'plan_type', nc_recommended: 'nc_recommended', tagline: 'tagline', tier: 'tier', updated_at: 'updated_at' };
         const q = dynamicUpdate('subscription_plans', planId, updateMap, colMap);
         if (q) await run(q.sql, q.params);
         return true;
@@ -1162,13 +1179,13 @@ async function deletePlan(planId) {
 // ── Organization Subscriptions ─────────────────────────────
 async function getAllOrgSubscriptions() {
     await initDB();
-    const rows = await getAll('SELECT os.*, sp.name as plan_name FROM organization_subscriptions os LEFT JOIN subscription_plans sp ON os.plan_id = sp.id ORDER BY os.created_at DESC');
+    const rows = await getAll('SELECT os.*, sp.name as plan_name, sp.tier as plan_tier FROM organization_subscriptions os LEFT JOIN subscription_plans sp ON os.plan_id = sp.id ORDER BY os.created_at DESC');
     return rows.map(s => ({ ...s, allowed_features: parseJSON(s.allowed_features, null), allowed_models: parseJSON(s.allowed_models, null), max_messages_by_type: parseJSON(s.max_messages_by_type, null) }));
 }
 
 async function getOrgSubscription(orgId) {
     await initDB();
-    const s = await getOne('SELECT os.*, sp.name as plan_name FROM organization_subscriptions os LEFT JOIN subscription_plans sp ON os.plan_id = sp.id WHERE os.organization_id = $1', [orgId]);
+    const s = await getOne('SELECT os.*, sp.name as plan_name, sp.tier as plan_tier FROM organization_subscriptions os LEFT JOIN subscription_plans sp ON os.plan_id = sp.id WHERE os.organization_id = $1', [orgId]);
     if (!s) return null;
     return { ...s, allowed_features: parseJSON(s.allowed_features, null), allowed_models: parseJSON(s.allowed_models, null), max_messages_by_type: parseJSON(s.max_messages_by_type, null) };
 }
@@ -1289,7 +1306,7 @@ async function getEffectiveLimits(orgId) {
 // ── Consumer Subscriptions (per-user, org-less) ─────────────────────────────
 async function getConsumerSubscription(userId) {
     await initDB();
-    const s = await getOne('SELECT cs.*, sp.name as plan_name FROM consumer_subscriptions cs LEFT JOIN subscription_plans sp ON cs.plan_id = sp.id WHERE cs.user_id = $1', [userId]);
+    const s = await getOne('SELECT cs.*, sp.name as plan_name, sp.tier as plan_tier FROM consumer_subscriptions cs LEFT JOIN subscription_plans sp ON cs.plan_id = sp.id WHERE cs.user_id = $1', [userId]);
     if (!s) return null;
     return s;
 }
@@ -1336,7 +1353,7 @@ async function deleteConsumerSubscription(userId) {
 
 async function getAllConsumerSubscriptions() {
     await initDB();
-    const rows = await getAll('SELECT cs.*, sp.name as plan_name, u.username, u.email, u."displayName" FROM consumer_subscriptions cs LEFT JOIN subscription_plans sp ON cs.plan_id = sp.id LEFT JOIN users u ON cs.user_id = u.id ORDER BY cs.created_at DESC');
+    const rows = await getAll('SELECT cs.*, sp.name as plan_name, sp.tier as plan_tier, u.username, u.email, u."displayName" FROM consumer_subscriptions cs LEFT JOIN subscription_plans sp ON cs.plan_id = sp.id LEFT JOIN users u ON cs.user_id = u.id ORDER BY cs.created_at DESC');
     return rows;
 }
 

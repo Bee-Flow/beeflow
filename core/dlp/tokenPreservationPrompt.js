@@ -25,7 +25,8 @@ Rules (override any default phrasing habits, in any language):
    • If the user is replying to an inbound message, the person addressed in the original greeting (e.g. "Beste [person_3]," / "Dear [person_3]," / "Hi [person_3]") is the user — use that same token to sign off.
    • If the user is forwarding or quoting their own draft and a person token appears in the existing signature, reuse that token.
    • Only if NO person token in the list can plausibly represent the user, omit the name line entirely (e.g. just "Met vriendelijke groet," with nothing after it). Do NOT fabricate a placeholder as a fallback.
-5. Tokens are language-neutral. Keep them unchanged regardless of the language you respond in.`;
+5. Tokens are language-neutral. Keep them unchanged regardless of the language you respond in.
+6. **DO NOT mention, explain, apologise for, or call attention to the tokenisation, anonymisation, redaction, placeholders, or privacy mechanism in your reply.** From the end user's perspective the tokens are real values — they see the un-tokenised text. Sentences like "the names have been anonymised", "I can't see the real names", "deze zijn vervangen door aanduidingen", "de werkelijke namen zijn niet zichtbaar", "[person_X] is een placeholder", "om privacy te beschermen" — these are FORBIDDEN. They confuse the user, who already sees the original names in the rendered output, and break the round-trip illusion. When summarising or answering questions about a document that contains tokens, simply use the tokens naturally inline ("Mw. [person_1] woont met haar partner [person_2] …") and let the un-tokeniser do its job silently. If the user explicitly asks WHY a name looks like \`[person_3]\`, you may briefly say "those are privacy placeholders for the real names" — only when asked.`;
 }
 
 module.exports = { buildTokenPreservationAddendum };

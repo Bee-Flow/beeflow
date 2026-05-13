@@ -8,14 +8,14 @@
  * Also prunes long tool results in the recent window to save tokens.
  */
 
-const COMPACTION_THRESHOLD = 10;  // Start compacting after this many messages
-const RECENT_WINDOW = 6;         // Keep this many recent messages verbatim
+const COMPACTION_THRESHOLD = 16;  // Start compacting after this many messages
+const RECENT_WINDOW = 8;         // Keep this many recent messages verbatim
 const TOOL_RESULT_MAX_LEN = 500; // Truncate tool results beyond this in recent window
 // Per-file cap when carrying extracted text forward into the summary block.
-// Smaller than the live-replay cap (30k) because we may carry several files,
-// and the older they are the less likely the user is asking for verbatim
-// details from them. Anything larger gets head-truncated with a marker.
-const SUMMARY_FILE_TEXT_MAX_CHARS = 8_000;
+// Sized to fit a typical script/spreadsheet without truncation (was 8k, which
+// chopped the middle out of most uploads and broke BFSF-162). Anything larger
+// still gets head-truncated with a marker pointing at the RustFS storage key.
+const SUMMARY_FILE_TEXT_MAX_CHARS = 40_000;
 
 // Unpaired UTF-16 high (D800-DBFF) or low (DC00-DFFF) surrogate. JSON parsers
 // downstream of HTTP (notably Anthropic's) reject these, breaking the entire

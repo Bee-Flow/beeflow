@@ -24,6 +24,7 @@
 const fetch = require('node-fetch');
 const store = require('./store');
 const verify = require('./verify');
+const { ADMIN_ISSUER } = require('./adminIssuance');
 
 // Refresh is opt-in: leave LICENSE_REFRESH_URL unset and no pings happen at
 // all. The JWT exp/signature remain the source of truth. This avoids the
@@ -44,6 +45,12 @@ let _timer = null;
  */
 async function refreshOne(lic) {
     if (!lic || !lic.id) throw new Error('refreshOne: missing license');
+    // Admin-issued licenses have no upstream server to ping — they live or die
+    // by expires_at alone. Skipping prevents the refresh-failure → grace →
+    // expired cascade that would otherwise nuke every admin grant.
+    if (lic.issuer === ADMIN_ISSUER) {
+        return { skipped: true, reason: 'admin_issued_license' };
+    }
     // Without a configured license server, refresh is a no-op — JWT exp/sig
     // remain the source of truth. The license is left in 'active' state.
     if (!REFRESH_URL) {
@@ -89,7 +96,7 @@ async function refreshOne(lic) {
     if (body.status === 'active') {
         let newExpiresAt = null;
         if (body.new_token) {
-            const v = verify.verifyToken(body.new_token);
+            const v = await verify.verifyToken(body.new_token);
             if (v.valid && v.payload.license_id === lic.id) {
                 newExpiresAt = new Date(v.payload.exp * 1000).toISOString();
             }

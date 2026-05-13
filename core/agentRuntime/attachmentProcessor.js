@@ -2,6 +2,24 @@
 // (see ../attachmentExtractor.js) so PDF handling stays consistent with direct chat.
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
+const { persistExtractedText } = require('../extractedTextStore');
+
+// Writes the extracted text onto the matching persisted attachment sidecar
+// so that historyHydrator can replay the file on future turns. Without this,
+// XLSX/DOCX/CSV uploads only existed in the current turn's context and the
+// model would lose access to them after ~4 messages once compaction kicked in.
+async function persistExtractionOntoSidecar(att, fullText, persistedByLive, userId) {
+    if (!fullText || !persistedByLive) return;
+    const record = persistedByLive.get(att);
+    if (!record || record.extractedText) return; // idempotent: skip if already persisted
+    try {
+        const tiered = await persistExtractedText(fullText, userId, att.name);
+        record.extractedText = tiered.extractedText;
+        if (tiered.extractionKey) record.extractionKey = tiered.extractionKey;
+    } catch (err) {
+        console.warn(`[AttachmentProcessor] Failed to persist extracted text for ${att.name}: ${err.message}`);
+    }
+}
 
 /**
  * Try to upload an image to RustFS and return a short-lived public URL.
@@ -56,13 +74,53 @@ function modelSupportsVisionById(modelId) {
 }
 
 async function processAttachments(attachments = [], lastMsg, userId = null, opts = {}) {
-    if (!attachments || attachments.length === 0) return;
+    if (!attachments || attachments.length === 0) return { attachmentScanSummaries: [] };
 
     if (typeof lastMsg.content === 'string') {
         lastMsg.content = [{ type: 'text', text: lastMsg.content }];
     }
 
     const modelSupportsVision = modelSupportsVisionById(opts.modelId);
+    const persistedByLive = opts.persistedByLive || null;
+    const orgShield = opts.orgShield || null;
+    const conversationId = opts.conversationId || null;
+    // Per-file scan summaries (one row per attachment that produced findings).
+    // Returned to the caller so the chat UI badge can show per-file detail
+    // and the audit logger can emit per-page rows.
+    const attachmentScanSummaries = [];
+
+    const { scanAttachmentText, AttachmentPrivacyBlock } = require('../dlp/attachmentScanner');
+
+    async function maybeScan({ text, pages, filename }) {
+        if (!orgShield) return { action: 'pass', text };
+        const r = await scanAttachmentText({ text, pages, filename, orgShield, conversationId });
+        if (r.action === 'block') {
+            throw new AttachmentPrivacyBlock({ filename, summary: r.summary, findings: r.findings });
+        }
+        if (r.action === 'tokenize') {
+            attachmentScanSummaries.push({
+                filename,
+                action: 'tokenize',
+                count: r.findings.length,
+                byCategory: r.summary.byCategory,
+                pages: r.summary.pages,
+                overflow: r.summary.overflow,
+            });
+        } else if (r.summary && r.summary.timeout) {
+            // Scan deadline tripped under Tokenize-mode policy — content
+            // passed through unredacted. Surface a warning row in the UI badge.
+            attachmentScanSummaries.push({
+                filename,
+                action: 'pass',
+                count: 0,
+                byCategory: {},
+                pages: {},
+                overflow: !!r.summary.overflow,
+                timeout: true,
+            });
+        }
+        return r;
+    }
 
     for (const att of attachments) {
         if (att.type.includes('pdf')) {
@@ -75,9 +133,16 @@ async function processAttachments(attachments = [], lastMsg, userId = null, opts
 
             const textBlock = lastMsg.content.find(c => c.type === 'text');
             if (result.kind === 'text') {
-                const appendText = `\n\n${formatTextHeader(att, result)}\n---\n${result.text}\n---\n`;
+                // Privacy Shield: scan extracted PDF text before it touches the
+                // model. On `block`, the thrown AttachmentPrivacyBlock bubbles
+                // up to chatStream which emits a `dlp_blocked` SSE event and
+                // aborts the turn — matching the message-block UX.
+                const scanned = await maybeScan({ text: result.text, pages: result.pages, filename: att.name });
+                const safeText = scanned.action === 'tokenize' ? scanned.text : result.text;
+                const appendText = `\n\n${formatTextHeader(att, result)}\n---\n${safeText}\n---\n`;
                 if (textBlock) textBlock.text += appendText;
                 else lastMsg.content.push({ type: 'text', text: appendText });
+                await persistExtractionOntoSidecar(att, safeText, persistedByLive, userId);
             } else if (result.kind === 'images') {
                 // Vision fallback: a header note followed by the page images.
                 const note = `\n\n${formatImagesHeader(att, result)}\n`;
@@ -122,18 +187,31 @@ async function processAttachments(attachments = [], lastMsg, userId = null, opts
         } else {
             try {
                 const { parseDocument } = require('./documentParser');
-                const base64Data = att.content.split(',')[1];
+                // att.content is a data URL like "data:<mime>;base64,XXX". If
+                // upstream sent only the raw base64 (no comma) treat the whole
+                // value as the payload rather than crashing on undefined.
+                const base64Data = att.content && att.content.includes(',')
+                    ? att.content.split(',')[1]
+                    : att.content;
+                if (!base64Data) {
+                    console.warn(`[AttachmentProcessor] Skipping ${att.name}: no content payload`);
+                    continue;
+                }
                 const buffer = Buffer.from(base64Data, 'base64');
                 const text = await parseDocument(buffer, att.type, att.name);
 
+                const scanned = await maybeScan({ text, pages: undefined, filename: att.name });
+                const safeText = scanned.action === 'tokenize' ? scanned.text : text;
                 const textBlock = lastMsg.content.find(c => c.type === 'text');
-                const appendText = `\n\n[Attachment: ${att.name}]\n---\n${text}\n---\n`;
+                const appendText = `\n\n[Attachment: ${att.name}]\n---\n${safeText}\n---\n`;
                 if (textBlock) {
                     textBlock.text += appendText;
                 } else {
                     lastMsg.content.push({ type: 'text', text: appendText });
                 }
+                await persistExtractionOntoSidecar(att, safeText, persistedByLive, userId);
             } catch (e) {
+                if (e && e.code === 'ATTACHMENT_PII_BLOCKED') throw e;
                 console.error(`[AttachmentProcessor] Failed to parse document ${att.name}`, e);
             }
         }
@@ -152,6 +230,8 @@ async function processAttachments(attachments = [], lastMsg, userId = null, opts
             console.warn(`[AttachmentProcessor] ⚠️ Large base64 image payload: ${Math.round(totalBase64Size / 1024)} KB — configure RustFS to avoid context overflow`);
         }
     }
+
+    return { attachmentScanSummaries };
 }
 
 module.exports = { processAttachments };

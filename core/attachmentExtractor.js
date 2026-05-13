@@ -120,7 +120,7 @@ function isTextLikelyGarbage(text) {
 
 // ─── PDF pipeline ───────────────────────────────────────────
 async function extractPdf(buffer, att, opts) {
-    const { text, numPages, pageCharCounts } = await extractTextFromPDFWithStats(buffer, att.name);
+    const { text, numPages, pageCharCounts, pages } = await extractTextFromPDFWithStats(buffer, att.name);
     const baseMeta = { numPages, pageCharCounts, totalChars: text.length };
 
     const insufficient = isTextInsufficient(text, numPages);
@@ -129,7 +129,7 @@ async function extractPdf(buffer, att, opts) {
         console.warn(`[AttachmentExtractor] pdfjs returned ${text.length} chars but the content looks like CID/font junk for ${att.name} — falling through to OCR.`);
     }
     if (!insufficient && !garbage) {
-        return { kind: 'text', text, source: 'pdfjs', meta: baseMeta };
+        return { kind: 'text', text, pages, source: 'pdfjs', meta: baseMeta };
     }
 
     // Step 2: Azure Document Intelligence

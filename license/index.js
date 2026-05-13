@@ -18,23 +18,45 @@
 const store = require('./store');
 const verify = require('./verify');
 const tiers = require('./tiers');
+const adminIssuance = require('./adminIssuance');
+const { tierFromPlanName } = require('./issuance');
 
 const COMMUNITY_FALLBACK = 'community';
+
+// Lazy-required to avoid circular import (userStore is heavy and pulls in
+// DB init that depends on this module being loadable first).
+let _userStore = null;
+function getUserStore() {
+    if (!_userStore) _userStore = require('../stores/userStore');
+    return _userStore;
+}
 
 /**
  * Resolve the effective tier for an organization. Returns 'community' when
  * no usable license is present.
+ *
+ * Two sources, license_keys wins by tier rank:
+ *   1. license_keys (admin blob or signed JWT) — primary
+ *   2. organization_subscriptions (Stripe-paid SaaS) — fallback when no
+ *      license_keys row exists. This bridges the Stripe checkout → tier
+ *      flow without requiring a deployed JWT license-server.
  */
 async function getTierForOrg(organizationId) {
     if (!organizationId) return COMMUNITY_FALLBACK;
     const lic = await store.getActiveLicenseForOrg(organizationId);
-    return resolveTierFromLicense(lic);
+    const licTier = resolveTierFromLicense(lic);
+    if (licTier !== COMMUNITY_FALLBACK) return licTier;
+    const subTier = await resolveTierFromOrgSubscription(organizationId);
+    return subTier || COMMUNITY_FALLBACK;
 }
 
 async function getTierForUser(userId) {
     if (!userId) return COMMUNITY_FALLBACK;
     const lic = await store.getActiveLicenseForUser(userId);
-    return resolveTierFromLicense(lic);
+    const licTier = resolveTierFromLicense(lic);
+    if (licTier !== COMMUNITY_FALLBACK) return licTier;
+    const subTier = await resolveTierFromConsumerSubscription(userId);
+    return subTier || COMMUNITY_FALLBACK;
 }
 
 /**
@@ -43,6 +65,8 @@ async function getTierForUser(userId) {
  * whose primary org is one of those orgs. Spreads an admin's personal
  * license to the rest of the org so group-invited members don't get
  * `feature_locked` 403s while sharing a workspace with the licensee.
+ *
+ * Includes subscription-derived tiers for SaaS orgs without a license_keys row.
  */
 async function getBestTierForOrgs(orgIds = []) {
     if (!Array.isArray(orgIds) || orgIds.length === 0) return COMMUNITY_FALLBACK;
@@ -52,7 +76,50 @@ async function getBestTierForOrgs(orgIds = []) {
         const t = resolveTierFromLicense(lic);
         if (tiers.tierRank(t) > tiers.tierRank(best)) best = t;
     }
+    if (tiers.tierRank(best) >= tiers.tierRank('enterprise')) return best;
+    for (const orgId of orgIds) {
+        if (!orgId) continue;
+        const t = await resolveTierFromOrgSubscription(orgId);
+        if (t && tiers.tierRank(t) > tiers.tierRank(best)) best = t;
+    }
     return best;
+}
+
+/**
+ * Map a subscription row to a tier, honouring trial windows and payment status.
+ * Returns null when the subscription is missing/inactive/expired.
+ *
+ * Active states that grant tier: 'active', 'trialing' (within trial_end_date).
+ * Inactive: 'suspended', 'cancelled', 'past_due', expired trial without payment.
+ */
+function resolveTierFromSubscription(sub) {
+    if (!sub) return null;
+    const status = sub.status;
+    if (status === 'cancelled' || status === 'suspended' || status === 'past_due') return null;
+    if (status === 'trialing') {
+        if (!sub.trial_end_date) return null;
+        const trialEnd = new Date(sub.trial_end_date).getTime();
+        if (!Number.isFinite(trialEnd) || trialEnd <= Date.now()) {
+            if (sub.payment_status !== 'paid') return null;
+        }
+    }
+    const tier = sub.plan_tier || tierFromPlanName(sub.plan_name);
+    if (!tier || !tiers.isValidTier(tier)) return null;
+    return tier;
+}
+
+async function resolveTierFromOrgSubscription(organizationId) {
+    try {
+        const sub = await getUserStore().getOrgSubscription(organizationId);
+        return resolveTierFromSubscription(sub);
+    } catch (_) { return null; }
+}
+
+async function resolveTierFromConsumerSubscription(userId) {
+    try {
+        const sub = await getUserStore().getConsumerSubscription(userId);
+        return resolveTierFromSubscription(sub);
+    } catch (_) { return null; }
 }
 
 /**
@@ -96,6 +163,12 @@ async function resolveTier(scope) {
 /**
  * Full status object for the UI. Always returns a populated object so the
  * frontend can render a stable shape even on a fresh install.
+ *
+ * Resolution order:
+ *   1. Highest-tier license_keys row across the org set (admin blob or JWT).
+ *   2. organization_subscriptions on any of those orgs (Stripe SaaS).
+ *   3. consumer_subscriptions on userId.
+ *   4. Community fallback.
  */
 async function getLicenseStatus({ organizationId = null, userId = null, orgIds = null } = {}) {
     let lic = null;
@@ -141,14 +214,61 @@ async function getLicenseStatus({ organizationId = null, userId = null, orgIds =
         scope = 'consumer';
     }
 
-    const tier = resolveTierFromLicense(lic);
+    let tier = resolveTierFromLicense(lic);
+
+    // No license row beats community → consult Stripe subscriptions as fallback.
+    let subscriptionShape = null;
+    let subscriptionScope = null;
+    if (tier === COMMUNITY_FALLBACK) {
+        let bestSubTier = COMMUNITY_FALLBACK;
+        let bestSubRow = null;
+        for (const orgId of candidateOrgIds) {
+            const sub = await getUserStore().getOrgSubscription(orgId).catch(() => null);
+            const t = resolveTierFromSubscription(sub);
+            if (t && tiers.tierRank(t) > tiers.tierRank(bestSubTier)) {
+                bestSubTier = t;
+                bestSubRow = sub;
+                subscriptionScope = 'organization';
+            }
+        }
+        if (bestSubTier === COMMUNITY_FALLBACK && userId) {
+            const sub = await getUserStore().getConsumerSubscription(userId).catch(() => null);
+            const t = resolveTierFromSubscription(sub);
+            if (t && tiers.tierRank(t) > tiers.tierRank(bestSubTier)) {
+                bestSubTier = t;
+                bestSubRow = sub;
+                subscriptionScope = 'consumer';
+            }
+        }
+        if (bestSubTier !== COMMUNITY_FALLBACK) {
+            tier = bestSubTier;
+            subscriptionShape = publicSubscriptionShape(bestSubRow);
+        }
+    }
+
+    const source = lic ? 'license_key' : (subscriptionShape ? 'stripe_subscription' : 'default');
     return {
         tier,
-        source: lic ? 'license_key' : 'default',
-        scope,
+        source,
+        scope: scope || subscriptionScope,
         license: lic ? publicLicenseShape(lic) : null,
+        subscription: subscriptionShape,
         features: tiers.getFeaturesForTier(tier),
         limits: tiers.getLimitsForTier(tier),
+    };
+}
+
+function publicSubscriptionShape(sub) {
+    if (!sub) return null;
+    return {
+        planId: sub.plan_id,
+        planName: sub.plan_name,
+        tier: sub.plan_tier || tierFromPlanName(sub.plan_name) || null,
+        status: sub.status,
+        paymentStatus: sub.payment_status,
+        trialEndDate: sub.trial_end_date,
+        billingCycleStart: sub.billing_cycle_start,
+        stripeSubscriptionId: sub.stripe_subscription_id,
     };
 }
 
@@ -176,7 +296,7 @@ function publicLicenseShape(lic) {
  * activated license row (without raw_token). Throws on verification failure.
  */
 async function activateLicense({ token, organizationId = null, userId = null, activatedBy = null }) {
-    const result = verify.verifyToken(token);
+    const result = await verify.verifyToken(token);
     if (!result.valid) {
         const err = new Error(`License verification failed: ${result.error}`);
         err.code = result.error;
@@ -221,6 +341,24 @@ async function activateLicense({ token, organizationId = null, userId = null, ac
 }
 
 /**
+ * Return the seat cap from the active license metadata, or null when no
+ * active license is present or the license does not set a cap. Useful for
+ * enforcing per-license seat limits on user creation.
+ */
+async function getMaxSeatsForOrg(organizationId) {
+    if (!organizationId) return null;
+    const lic = await store.getActiveLicenseForOrg(organizationId);
+    if (!lic) return null;
+    if (lic.refreshStatus === 'expired' || lic.refreshStatus === 'revoked') return null;
+    if (lic.expiresAt && new Date(lic.expiresAt).getTime() <= Date.now()) return null;
+    const raw = lic.metadata && lic.metadata.max_seats;
+    if (raw == null) return null;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    return n;
+}
+
+/**
  * Deactivate (mark expired) the currently active license for the given scope.
  */
 async function deactivateLicenseForScope({ organizationId = null, userId = null, deactivatedBy = null } = {}) {
@@ -240,12 +378,16 @@ module.exports = {
     hasFeature,
     hasTier,
     getLicenseStatus,
+    getMaxSeatsForOrg,
     // mutation
     activateLicense,
     deactivateLicenseForScope,
+    // helpers (exposed for tests)
+    resolveTierFromSubscription,
     // re-exports for convenience
     tiers,
     store,
     verify,
+    adminIssuance,
     COMMUNITY_FALLBACK,
 };

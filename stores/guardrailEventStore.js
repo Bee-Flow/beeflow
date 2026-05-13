@@ -22,9 +22,16 @@ async function initDB() {
             direction TEXT DEFAULT 'input',
             action_taken TEXT DEFAULT 'blocked',
             source TEXT DEFAULT 'unknown',
-            model TEXT
+            model TEXT,
+            attachment_filename TEXT,
+            attachment_page INT
         )
     `);
+    // Idempotent column adds — for existing deployments whose table predates
+    // attachment scanning. NOT NULL is intentionally not enforced; message-path
+    // rows continue to leave these columns NULL.
+    await exec(`ALTER TABLE guardrail_events ADD COLUMN IF NOT EXISTS attachment_filename TEXT`);
+    await exec(`ALTER TABLE guardrail_events ADD COLUMN IF NOT EXISTS attachment_page INT`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_guardrail_timestamp ON guardrail_events(timestamp DESC)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_guardrail_org ON guardrail_events(organization_id)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_guardrail_org_timestamp ON guardrail_events(organization_id, timestamp DESC)`);
@@ -42,8 +49,8 @@ async function logGuardrailEvent(event) {
     await initDB();
     try {
         await run(`
-            INSERT INTO guardrail_events (timestamp, organization_id, user_id, agent_id, agent_name, conversation_id, violation_type, violation_categories, direction, action_taken, source, model)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            INSERT INTO guardrail_events (timestamp, organization_id, user_id, agent_id, agent_name, conversation_id, violation_type, violation_categories, direction, action_taken, source, model, attachment_filename, attachment_page)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         `, [
             event.timestamp || new Date().toISOString(),
             event.organization_id || null,
@@ -57,10 +64,53 @@ async function logGuardrailEvent(event) {
             event.action_taken || 'blocked',
             event.source || 'unknown',
             event.model || null,
+            event.attachment_filename || null,
+            typeof event.attachment_page === 'number' ? event.attachment_page : null,
         ]);
         console.log(`[GuardrailEventStore] Logged ${event.violation_type} event (${event.action_taken}) for user ${event.user_id || 'unknown'}`);
     } catch (e) {
         console.error('[GuardrailEventStore] Failed to log event:', e.message);
+    }
+}
+
+/**
+ * Convenience helper: emit one guardrail row per (page, category) for an
+ * attachment scan result. Message-path callers should stick with
+ * `logGuardrailEvent` / `logDlpDecision` and leave the attachment_* fields null.
+ */
+async function logAttachmentPiiFindings({ summary, auditBase, action_taken }) {
+    if (!summary || !summary.filename) return;
+    const pages = summary.pages || {};
+    const pageNumbers = Object.keys(pages);
+    if (pageNumbers.length === 0) {
+        // Non-paginated source (Office, txt) — emit one aggregate row.
+        const categories = Object.keys(summary.byCategory || {}).join(', ') || null;
+        if (!categories) return;
+        await logGuardrailEvent({
+            ...auditBase,
+            violation_type: 'pii',
+            violation_categories: categories,
+            direction: 'input',
+            action_taken: action_taken || 'redacted',
+            attachment_filename: summary.filename,
+            attachment_page: null,
+        });
+        return;
+    }
+    for (const pageStr of pageNumbers) {
+        const page = parseInt(pageStr, 10);
+        const byCat = pages[pageStr] || {};
+        const categories = Object.keys(byCat).join(', ');
+        if (!categories) continue;
+        await logGuardrailEvent({
+            ...auditBase,
+            violation_type: 'pii',
+            violation_categories: categories,
+            direction: 'input',
+            action_taken: action_taken || 'redacted',
+            attachment_filename: summary.filename,
+            attachment_page: page,
+        });
     }
 }
 
@@ -236,6 +286,7 @@ async function getGuardrailByAction(filters = {}) {
 module.exports = {
     logGuardrailEvent,
     logDlpDecision,
+    logAttachmentPiiFindings,
     getGuardrailSummary,
     getGuardrailTimeline,
     getGuardrailByUser,

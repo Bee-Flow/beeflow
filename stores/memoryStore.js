@@ -267,6 +267,40 @@ async function getMemories(userId, limit = 50) {
     `, [userId, limit]);
 }
 
+/**
+ * Paginated + searchable user-global memory list. Returns the page plus the
+ * total count so the UI can show "Load more" / progress.
+ *
+ * Search matches against content, subject, attribute, value (case-insensitive).
+ * Type filter is applied at the DB level so pagination is consistent.
+ */
+async function searchUserMemories(userId, { limit = 50, offset = 0, search = null, type = null } = {}) {
+    await initDB();
+    const where = [`user_id = $1`, `status = 'active'`, `project_id IS NULL`];
+    const params = [userId];
+    if (type) {
+        params.push(type);
+        where.push(`type = $${params.length}`);
+    }
+    if (search && String(search).trim()) {
+        params.push(`%${String(search).trim()}%`);
+        const idx = params.length;
+        where.push(`(content ILIKE $${idx} OR subject ILIKE $${idx} OR attribute ILIKE $${idx} OR value ILIKE $${idx})`);
+    }
+    const whereSql = where.join(' AND ');
+    const safeLimit = Math.max(1, Math.min(200, parseInt(limit, 10) || 50));
+    const safeOffset = Math.max(0, parseInt(offset, 10) || 0);
+    params.push(safeLimit);
+    params.push(safeOffset);
+    const items = await getAll(`
+        SELECT * FROM user_memories WHERE ${whereSql}
+        ORDER BY importance DESC, updated_at DESC
+        LIMIT $${params.length - 1} OFFSET $${params.length}
+    `, params);
+    const countRow = await getOne(`SELECT COUNT(*)::int AS total FROM user_memories WHERE ${whereSql}`, params.slice(0, -2));
+    return { items, total: countRow?.total || 0, limit: safeLimit, offset: safeOffset };
+}
+
 async function getMemoriesForProject(userId, projectId, limit = 50) {
     await initDB();
     return getAll(`
@@ -648,7 +682,7 @@ async function pruneExpiredCoverage() {
 }
 
 module.exports = {
-    createMemory, getMemories, getMemoriesForAgent, getMemoriesForProject, getMemoryById,
+    createMemory, getMemories, searchUserMemories, getMemoriesForAgent, getMemoriesForProject, getMemoryById,
     updateMemory, deleteMemory, clearAllMemories,
     addMemorySource, findSimilarMemory, findRelevantMemories,
     formatMemoriesForPrompt, getMemoryStats,

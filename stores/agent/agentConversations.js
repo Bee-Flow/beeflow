@@ -238,11 +238,20 @@ async function searchConversations(userId, query, filters = {}, encryptionKey) {
         .slice(0, 50);
 }
 
-async function getConversationById(conversationId, encryptionKey = null) {
+async function getConversationById(conversationId, encryptionKey = null, options = {}) {
     await initDB();
     const row = await getOne('SELECT * FROM agent_conversations WHERE id = $1', [conversationId]);
     if (!row) return null;
-    const messages = await _readMessages(row, encryptionKey);
+    let messages = await _readMessages(row, encryptionKey);
+    // Restore Privacy Shield tokens for UI render paths. `options.restore=false`
+    // is reserved for the LLM history loader (so Claude keeps seeing tokens).
+    const restore = options.restore !== false;
+    if (restore && row.pii_token_map) {
+        const { _restoreTokensInMessages } = require('./directConversations');
+        if (typeof _restoreTokensInMessages === 'function') {
+            messages = _restoreTokensInMessages(messages, row.pii_token_map);
+        }
+    }
     return { ...row, messages, meta: _parseMeta(row.meta_json), threadTitles: JSON.parse(row.thread_titles_json || '{}') };
 }
 

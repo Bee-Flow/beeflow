@@ -15,9 +15,11 @@ const READ_ONLY = new Set([
     'gmail_search', 'gmail_read', 'gmail_read_attachment', 'gmail_list_labels',
     // Calendar
     'calendar_list_events', 'calendar_search_events', 'calendar_get_event',
-    // Drive / Docs
+    // Drive / Docs / Sheets
     'drive_search', 'drive_list_files', 'drive_read_file',
     'docs_read', 'docs_list',
+    'sheets_list', 'sheets_get_values',
+    'slides_list', 'slides_get', 'slides_export_pdf',
     // Contacts / Keep / Groups
     'contacts_search', 'contacts_list',
     'keep_list', 'keep_search',

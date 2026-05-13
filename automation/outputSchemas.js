@@ -298,6 +298,113 @@ const OUTPUT_SCHEMAS = {
         shape: { webpageId: 'string', url: 'string', name: 'string', message: 'string' },
         sample: { webpageId: 'wp-new-1', url: '/app/webpages/wp-new-1', name: 'New Webpage', message: 'Created webpage "New Webpage".' },
     },
+
+    // ── AI-only integrations promoted to automation actions ──
+    generate_image: {
+        shape: { url: 'string', prompt: 'string', mimeType: 'string', sizeBytes: 'integer' },
+        sample: { url: 'https://storage.example/img-abc.png', prompt: '<your prompt>', mimeType: 'image/png', sizeBytes: 248_000 },
+    },
+    generate_video: {
+        shape: { url: 'string', durationSec: 'number', mimeType: 'string', prompt: 'string' },
+        sample: { url: 'https://storage.example/vid-abc.mp4', durationSec: 6, mimeType: 'video/mp4', prompt: '<your prompt>' },
+    },
+    elevenlabs_music: {
+        shape: { url: 'string', durationSec: 'number', prompt: 'string' },
+        sample: { url: 'https://storage.example/track.mp3', durationSec: 30, prompt: '<your prompt>' },
+    },
+    elevenlabs_tts: {
+        shape: { url: 'string', durationSec: 'number', voiceId: 'string', text: 'string' },
+        sample: { url: 'https://storage.example/tts.mp3', durationSec: 4, voiceId: 'EXAVITQu4vr4xnSDxMaL', text: '<spoken text>' },
+    },
+    elevenlabs_sfx: {
+        shape: { url: 'string', durationSec: 'number', prompt: 'string' },
+        sample: { url: 'https://storage.example/sfx.mp3', durationSec: 2, prompt: '<sound description>' },
+    },
+    // ── Google Sheets ──
+    sheets_list: {
+        shape: { results: 'array of { id, name, url, modifiedTime }', total: 'integer' },
+        sample: {
+            results: [
+                { id: '1AbCDeFgHiJkLmNoPqRsTuV', name: 'Invoice tracker 2026', url: 'https://docs.google.com/spreadsheets/d/1AbCDeFgHiJkLmNoPqRsTuV/edit', modifiedTime: '2026-05-12T10:23:00Z' },
+                { id: '1WxYzAbCDeFgHiJkLmNoPq', name: 'Customer leads', url: 'https://docs.google.com/spreadsheets/d/1WxYzAbCDeFgHiJkLmNoPq/edit', modifiedTime: '2026-05-09T14:51:00Z' },
+            ],
+            total: 2,
+        },
+    },
+    sheets_get_values: {
+        shape: { spreadsheetId: 'string', range: 'string', values: 'array of arrays (rows × columns)', rowCount: 'integer', colCount: 'integer' },
+        sample: {
+            spreadsheetId: '1AbCDeFgHiJkLmNoPqRsTuV',
+            range: "Sheet1!A1:C3",
+            values: [
+                ['Name', 'Email', 'Amount'],
+                ['Alice', 'alice@example.com', '125.00'],
+                ['Bob', 'bob@example.com', '90.50'],
+            ],
+            rowCount: 3,
+            colCount: 3,
+        },
+    },
+    sheets_append_rows: {
+        shape: { spreadsheetId: 'string', updatedRange: 'string', rowsAppended: 'integer', cellsAppended: 'integer' },
+        sample: { spreadsheetId: '1AbCDeFgHiJkLmNoPqRsTuV', updatedRange: 'Sheet1!A5:C5', rowsAppended: 1, cellsAppended: 3 },
+    },
+    sheets_update_range: {
+        shape: { spreadsheetId: 'string', updatedRange: 'string', rowsUpdated: 'integer', cellsUpdated: 'integer' },
+        sample: { spreadsheetId: '1AbCDeFgHiJkLmNoPqRsTuV', updatedRange: 'Sheet1!B2:B2', rowsUpdated: 1, cellsUpdated: 1 },
+    },
+    sheets_create: {
+        shape: { spreadsheetId: 'string', url: 'string', title: 'string' },
+        sample: { spreadsheetId: '1NewSheetIdABCDEF', url: 'https://docs.google.com/spreadsheets/d/1NewSheetIdABCDEF/edit', title: 'New spreadsheet' },
+    },
+
+    // ── Google Slides ──
+    slides_list: {
+        shape: { results: 'array of { id, name, url, modifiedTime }', total: 'integer' },
+        sample: {
+            results: [
+                { id: '1PrEsIdSlIdEsAbCdEfG', name: 'Q1 review template', url: 'https://docs.google.com/presentation/d/1PrEsIdSlIdEsAbCdEfG/edit', modifiedTime: '2026-04-22T08:11:00Z' },
+            ],
+            total: 1,
+        },
+    },
+    slides_get: {
+        shape: { presentationId: 'string', title: 'string', slides: 'array of { index, objectId, text }', slideCount: 'integer' },
+        sample: {
+            presentationId: '1PrEsIdSlIdEsAbCdEfG',
+            title: 'Q1 review template',
+            slides: [
+                { index: 0, objectId: 'p1', text: 'Q1 Review\nPrepared by: {{NAME}}' },
+                { index: 1, objectId: 'p2', text: 'Highlights\n- Revenue up 12%\n- Two new partners' },
+            ],
+            slideCount: 2,
+        },
+    },
+    slides_replace_text: {
+        shape: { presentationId: 'string', replacements: 'integer (total substitutions across deck)', replacementCount: 'integer (pairs supplied)' },
+        sample: { presentationId: '1PrEsIdSlIdEsAbCdEfG', replacements: 4, replacementCount: 2 },
+    },
+    slides_create: {
+        shape: { presentationId: 'string', url: 'string', title: 'string' },
+        sample: { presentationId: '1NewSlidesIdABCDEF', url: 'https://docs.google.com/presentation/d/1NewSlidesIdABCDEF/edit', title: 'New presentation' },
+    },
+    slides_export_pdf: {
+        shape: { presentationId: 'string', url: 'string', mimeType: 'string' },
+        sample: { presentationId: '1PrEsIdSlIdEsAbCdEfG', url: 'https://www.googleapis.com/drive/v3/files/1PrEsIdSlIdEsAbCdEfG/export?mimeType=application%2Fpdf', mimeType: 'application/pdf' },
+    },
+
+    transcribe_audio: {
+        shape: { text: 'string', durationSec: 'number', language: 'string', segments: 'array of { start, end, text, speaker? }' },
+        sample: {
+            text: '<full transcript>',
+            durationSec: 120,
+            language: 'en',
+            segments: [
+                { start: 0, end: 4.2, text: '<segment>', speaker: 'SPEAKER_00' },
+                { start: 4.2, end: 8.5, text: '<segment>', speaker: 'SPEAKER_01' },
+            ],
+        },
+    },
 };
 
 function getOutputSchema(toolName) {

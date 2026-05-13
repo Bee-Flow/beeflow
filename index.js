@@ -318,6 +318,7 @@ app.use('/api/subscriptions', require('./routes/subscriptions'));
 app.use('/api/stripe', require('./routes/stripe'));
 app.use('/api/billing', require('./routes/billing'));
 app.use('/api/license', require('./routes/license'));
+app.use('/api/admin/licenses', require('./routes/adminLicense'));
 const { requireFeature: requireLicenseFeature, requireTier: requireLicenseTier } = require('./license/middleware');
 app.use('/api/documents', require('./routes/documents'));
 app.use('/api/notifications', require('./routes/notifications'));

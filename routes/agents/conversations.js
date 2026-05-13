@@ -136,8 +136,13 @@ router.get('/:id/conversations/:convId/workspace', async (req, res) => {
         return res.status(404).json({ error: 'Conversation not found' });
     }
 
+    // Render-time un-tokenisation — stored content keeps raw tokens so the
+    // AI can re-read them via notebook_read; the user-facing API restores
+    // them to real values. Mirror of directChat.js workspace GET.
+    const { restoreTokens } = require('../../core/azurePiiDetection');
+    const _convMap = await require('../../core/dlp/dlpRunner').getConversationTokenMapAsync(req.params.convId);
     res.json({
-        content: conversation.workspace_content || '',
+        content: restoreTokens(conversation.workspace_content || '', _convMap),
         notebookId: conversation.workspace_notebook_id || null,
     });
 });

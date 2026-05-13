@@ -26,18 +26,25 @@ router.get('/types', (req, res) => {
     res.json({ types: MEMORY_TYPES });
 });
 
-// Get all memories for current user
+// Get all memories for current user. For the user-global view (no agentId /
+// projectId) supports `limit`, `offset`, and `search` so the Memory panel can
+// page through the full backlog and find specific entries (BFSF-161).
 router.get('/', async (req, res) => {
     const userId = getEffectiveUserId(req);
     const agentId = req.query.agentId || null;
     const projectId = req.query.projectId || null;
     const typeFilter = req.query.type || null;
+    const search = req.query.search || null;
+    const limit = req.query.limit;
+    const offset = req.query.offset;
 
     try {
-        let memories = [];
         if (projectId) {
-            memories = await memoryStore.getMemoriesForProject(userId, projectId);
-        } else if (agentId) {
+            const memories = await memoryStore.getMemoriesForProject(userId, projectId);
+            const filtered = typeFilter ? memories.filter(m => m.type === typeFilter) : memories;
+            return res.json({ memories: filtered });
+        }
+        if (agentId) {
             // Honor the agent's "use general memory" flag for per-agent agents.
             let includeGeneral = true;
             try {
@@ -48,17 +55,25 @@ router.get('/', async (req, res) => {
                     includeGeneral = false;
                 }
             } catch (_) { /* default to true */ }
-            memories = await memoryStore.getMemoriesForAgent(userId, agentId, 50, { includeGeneral });
-        } else {
-            memories = await memoryStore.getMemories(userId);
+            const memories = await memoryStore.getMemoriesForAgent(userId, agentId, 50, { includeGeneral });
+            const filtered = typeFilter ? memories.filter(m => m.type === typeFilter) : memories;
+            return res.json({ memories: filtered });
         }
 
-        // Filter by type if requested
-        if (typeFilter) {
-            memories = memories.filter(m => m.type === typeFilter);
-        }
-
-        res.json({ memories });
+        // User-global view — paginate + search at the DB layer.
+        const page = await memoryStore.searchUserMemories(userId, {
+            limit: limit !== undefined ? limit : 50,
+            offset: offset !== undefined ? offset : 0,
+            search,
+            type: typeFilter,
+        });
+        res.json({
+            memories: page.items,
+            total: page.total,
+            limit: page.limit,
+            offset: page.offset,
+            hasMore: page.offset + page.items.length < page.total,
+        });
     } catch (error) {
         console.error('Failed to get memories:', error);
         res.status(500).json({ error: error.message });

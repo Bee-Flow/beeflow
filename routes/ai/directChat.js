@@ -19,6 +19,8 @@ const { classifyPromptComplexity } = require('../../core/promptClassifier');
 const { getAdapter } = require('../../core/providers');
 const agentStore = require('../../stores/agentStore');
 const { executeTool: dispatchTool } = require('../../core/toolDispatcher');
+const { runWithProbe, markLocal } = require('../../core/outboundProbe');
+const { resolveIntegration: resolveIntegrationMeta } = require('../../core/integrationToolMap');
 const {
     ACTIVATE_SESSION_SKILL_TOOL_NAME,
     COMPLETE_SESSION_SKILL_TOOL_NAME,
@@ -720,6 +722,26 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
 
         emitPhaseEnd(send, 'loading_tools', Date.now() - _toolsT);
 
+        // ─── Per-turn Notebook strip ─────────────────────────────────
+        // System prompt at L907-917 steers Claude toward `notebook_write`
+        // when output looks long. With Privacy Shield tokenisation a PDF
+        // answer easily looks long — even a short user question like
+        // "what is in the file?" then triggers a tool-only response (no
+        // chat text), which the user perceives as "Error generating response".
+        // Strip notebook_* tools from THIS turn's tool list when the shape
+        // is "attachment present + short content-question prompt". Users
+        // who genuinely want a notebook-write include verbs like
+        // write/save/note/memo/draft/brief/report and bypass the strip.
+        const _hasAttachmentThisTurn = Array.isArray(attachments) && attachments.length > 0;
+        const _msgIsShortQuestion = typeof message === 'string' && message.length < 80;
+        const _msgHasWriteIntent = typeof message === 'string' && /(write|save|note|memo|draft|brief|report)/i.test(message);
+        const stripsNotebookTools = _hasAttachmentThisTurn && _msgIsShortQuestion && !_msgHasWriteIntent;
+        if (stripsNotebookTools) {
+            const before = directChatTools.length;
+            directChatTools = directChatTools.filter(t => !/^notebook_/.test(t.function?.name || ''));
+            console.log(`[DirectChat] Notebook tools stripped for attachment-Q&A turn (${before} → ${directChatTools.length} tools)`);
+        }
+
         // Build messages array
         emitPhase(send, 'building_prompt');
         const _spT = Date.now();
@@ -1299,8 +1321,32 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
         // its model before the first LLM round.
         await swapModelForActiveStage();
 
+        // ─── Eagerly create conversation BEFORE the attachment scan ──
+        // Two reasons:
+        //   1) workspace_* tools later in the turn need a valid DB row.
+        //   2) the attachment scanner calls
+        //      `dlpRunner.mergeTokenMap(convId, tokenMap)` — if convId is
+        //      null at scan time the merge is a no-op and Claude's
+        //      `[person_N]` echoes leak through to the rendered response.
+        // Moved up so the scanner gets a real convId. Side effect: a
+        // brand-new conversation row appears slightly earlier in the turn;
+        // orphan-row risk is unchanged because the original location had
+        // the same exposure.
+        if (!convId) {
+            const newConv = await agentStore.createDirectConversation(userId, resolvedTier);
+            convId = newConv.id;
+            send('conversation_created', { conversationId: convId });
+            console.log(`[DirectChat] Eagerly created conversation ${convId} for workspace/tool access`);
+        }
+
         // Add current message (with attachments if any)
         const persistedAttachments = []; // Track attachments for conversation persistence
+        // Per-turn attachment scan summaries — route-scoped so they survive
+        // the `messages = compactionResult.messages` reassignment that
+        // happens later in the route. The previous version stashed these
+        // on the messages array and lost them at compaction time, which
+        // also broke the on-reload privacy panel.
+        let _turnAttachmentSummaries = null;
         if (attachments && attachments.length > 0) {
             // Surface attachment processing as a phase so the user sees
             // "Reading attachment <filename>…" while OCR / PDF extraction
@@ -1317,6 +1363,57 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
             const storageStore = require('../../stores/storageStore');
             const crypto = require('crypto');
             const { persistExtractedText } = require('../../core/extractedTextStore');
+
+            // Resolve Privacy Shield once for the whole attachment loop so we
+            // can scan each extracted document for PII before it enters the
+            // model prompt. Mirrors the agent-chat path (attachmentProcessor.js).
+            // `userOrgId` is declared further down in this function scope
+            // (≈ line 1749) under `const`, which puts a temporal dead zone on
+            // the whole scope — we can't reference it here. Resolve the
+            // user's org locally instead.
+            const { resolveUserOrgIds: _resolveUserOrgIdsForAtt } = require('../../auth');
+            const _attUserOrgIds = await _resolveUserOrgIdsForAtt(req).catch(() => null);
+            const _attUserOrgId = (_attUserOrgIds && _attUserOrgIds.size > 0) ? Array.from(_attUserOrgIds)[0] : null;
+            const { resolveOrgShield: _resolvePsForAttachments } = require('../../core/orgShield');
+            const _psShield = _attUserOrgId ? await _resolvePsForAttachments(_attUserOrgId) : null;
+            const { scanAttachmentText: _scanAttText, AttachmentPrivacyBlock: _AttPiiBlock } = require('../../core/dlp/attachmentScanner');
+            const _attachmentScanSummaries = [];
+            // Local helper so the per-format branches below don't repeat the
+            // tokenise/block/pass switch. Returns the text to inline (possibly
+            // tokenised) or throws AttachmentPrivacyBlock for the route to catch.
+            // The eager-create-conversation block above guarantees `convId`
+            // is non-null here, so the scanner's internal
+            // `dlpRunner.mergeTokenMap(convId, tokenMap)` call lands in
+            // the correct conversation map. No need to accumulate maps
+            // locally or merge them later.
+            const _scanExtracted = async (text, pages, filename) => {
+                if (!_psShield || !text) return text;
+                const r = await _scanAttText({ text, pages, filename, orgShield: _psShield, conversationId: convId });
+                if (r.action === 'block') throw new _AttPiiBlock({ filename, summary: r.summary, findings: r.findings });
+                if (r.action === 'tokenize') {
+                    _attachmentScanSummaries.push({
+                        filename,
+                        action: 'tokenize',
+                        count: r.findings.length,
+                        byCategory: r.summary.byCategory,
+                        pages: r.summary.pages,
+                        overflow: r.summary.overflow,
+                    });
+                    return r.text;
+                }
+                if (r.summary && r.summary.timeout) {
+                    _attachmentScanSummaries.push({
+                        filename,
+                        action: 'pass',
+                        count: 0,
+                        byCategory: {},
+                        pages: {},
+                        overflow: !!r.summary.overflow,
+                        timeout: true,
+                    });
+                }
+                return text;
+            };
 
             // Sidecar carries the persistent representation of an attachment.
             // Big extractions are tiered to RustFS via persistExtractedText so
@@ -1335,6 +1432,7 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                 });
             };
 
+            try {
             for (const att of attachments) {
                 if (att.type && att.type.startsWith('image/') && att.content) {
                     // Upload image to RustFS for persistence + inference URL
@@ -1374,7 +1472,8 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
 
                 } else if (att.source === 'google-drive' && att.content) {
                     // Google Drive file — already exported as plain text, inject directly
-                    const driveText = `--- Google Drive: ${att.name} ---\n${att.content}\n--- End of ${att.name} ---`;
+                    const safeDrive = await _scanExtracted(att.content, undefined, att.name);
+                    const driveText = `--- Google Drive: ${att.name} ---\n${safeDrive}\n--- End of ${att.name} ---`;
                     contentParts.push({ type: 'text', text: driveText });
                     await pushAttachment({ name: att.name, type: 'google-drive' }, driveText);
                 } else if (att.content && att.type && att.type.includes('pdf')) {
@@ -1404,7 +1503,14 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                         console.log(`[DirectChat] PDF ${att.name} extraction → kind=${result.kind}, source=${result.source || 'n/a'}`);
 
                         if (result.kind === 'text') {
-                            const docText = `${formatTextHeader(att, result)}\n---\n${result.text}\n---`;
+                            // Privacy Shield: tokenise / block before the text
+                            // is inlined into the prompt. Throws AttachmentPrivacyBlock
+                            // on block-action; the outer try/catch surfaces that
+                            // as a dlp_blocked SSE event.
+                            const _scanResultsBefore = _attachmentScanSummaries.length;
+                            const safeText = await _scanExtracted(result.text, result.pages, att.name);
+                            const _wasTokenised = _attachmentScanSummaries.length > _scanResultsBefore;
+                            const docText = `${formatTextHeader(att, result)}\n---\n${safeText}\n---`;
                             const isClaude = (config.providerType || '').toLowerCase() === 'claude' || (config.providerType || '').toLowerCase() === 'anthropic';
                             // Always inline the extracted text. Some invoice PDFs
                             // embed fonts with no usable ToUnicode CMap, and
@@ -1414,10 +1520,14 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                             // pdfjs text alongside the document block gives the
                             // model a guaranteed-readable channel.
                             contentParts.push({ type: 'text', text: docText });
-                            if (isClaude) {
+                            if (isClaude && !_wasTokenised) {
                                 // Also include the original PDF so Claude can
                                 // see visual elements (logos, signatures, layout)
                                 // that pure text extraction discards.
+                                // Skipped when Privacy Shield tokenised the
+                                // text — sending the raw PDF would bypass the
+                                // redaction (the model would still see the
+                                // unredacted source).
                                 const mediaType = att.type && att.type.includes('pdf') ? att.type : 'application/pdf';
                                 contentParts.push({
                                     type: 'document',
@@ -1496,7 +1606,8 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                         }
 
                         if (docxText && !docxText.startsWith('[Document:')) {
-                            const docText = `[Word Document: ${att.name}]\n---\n${docxText}\n---`;
+                            const safeDocxText = await _scanExtracted(docxText, undefined, att.name);
+                            const docText = `[Word Document: ${att.name}]\n---\n${safeDocxText}\n---`;
                             contentParts.push({ type: 'text', text: docText });
                             await pushAttachment({ name: att.name, type: att.type, url: docxProxyUrl }, docText);
                             console.log(`[DirectChat] Extracted ${docxText.length} chars from DOCX: ${att.name}`);
@@ -1562,7 +1673,8 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                         }
 
                         if (sheetText && !sheetText.startsWith('[Spreadsheet:')) {
-                            const docText = `[Spreadsheet: ${att.name}]\n---\n${sheetText}\n---`;
+                            const safeSheetText = await _scanExtracted(sheetText, undefined, att.name);
+                            const docText = `[Spreadsheet: ${att.name}]\n---\n${safeSheetText}\n---`;
                             contentParts.push({ type: 'text', text: docText });
                             await pushAttachment({ name: att.name, type: att.type, url: sheetProxyUrl }, docText);
                             console.log(`[DirectChat] Extracted ${sheetText.length} chars from spreadsheet: ${att.name}`);
@@ -1600,6 +1712,114 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                     const note = `[Attached file: ${filename}] This file has been uploaded${fileProxyUrl ? ' and stored' : ''}.${att.type ? ' Type: ' + att.type : ''}`;
                     contentParts.push({ type: 'text', text: note });
                     await pushAttachment({ name: att.name, type: att.type, url: fileProxyUrl }, note);
+                }
+            }
+            } catch (attErr) {
+                if (attErr && attErr.code === 'ATTACHMENT_PII_BLOCKED') {
+                    const cats = Object.keys(attErr.summary?.byCategory || {});
+                    send('dlp_blocked', {
+                        reason: 'attachment_pii',
+                        filename: attErr.filename,
+                        categories: cats,
+                        findings: [],
+                        provider: { isExternal: false, reason: 'attachment_pii' },
+                    });
+                    try {
+                        const guardrailEventStore = require('../../stores/guardrailEventStore');
+                        await guardrailEventStore.logGuardrailEvent({
+                            organization_id: _attUserOrgId || null,
+                            user_id: userId || null,
+                            conversation_id: conversationId || null,
+                            violation_type: 'pii',
+                            violation_categories: cats.join(', ') || null,
+                            direction: 'input',
+                            action_taken: 'blocked',
+                            source: config?.providerName || config?.providerType || 'LLM',
+                            model: modelId || null,
+                            attachment_filename: attErr.filename,
+                            attachment_page: null,
+                        });
+                    } catch (_) { /* audit best-effort */ }
+                    send('done', {}); res.end(); return;
+                }
+                throw attErr;
+            }
+            // Audit + UI surfacing for tokenised attachments.
+            if (_attachmentScanSummaries.length > 0) {
+                try {
+                    const guardrailEventStore = require('../../stores/guardrailEventStore');
+                    const auditBase = {
+                        organization_id: _attUserOrgId || null,
+                        user_id: userId || null,
+                        conversation_id: conversationId || null,
+                        source: config?.providerName || config?.providerType || 'LLM',
+                        model: modelId || null,
+                    };
+                    for (const s of _attachmentScanSummaries) {
+                        await guardrailEventStore.logAttachmentPiiFindings({ summary: s, auditBase, action_taken: 'redacted' });
+                    }
+                } catch (_) { /* audit best-effort */ }
+            }
+            // Per-file summaries — route-scoped so they survive the
+            // `messages = compactionResult.messages` reassignment that
+            // happens later. The assistant-message builder reads from
+            // `_turnAttachmentSummaries`; without this hoist the
+            // privacy panel's "From attachments:" section disappears on
+            // reload even though it appears live via the SSE event below.
+            if (_attachmentScanSummaries.length > 0) {
+                _turnAttachmentSummaries = _attachmentScanSummaries;
+
+                // Live SSE notification so the UI shows the privacy badge
+                // immediately, not just after a page reload. Without this,
+                // the audit row is written but the user sees no evidence
+                // that Privacy Shield fired this turn. Re-uses the existing
+                // `pii_tokenized` event shape so the client handler
+                // (useChatEngine.js: case 'pii_tokenized') ingests both
+                // message-level and attachment-level findings the same way.
+                const _aggCount = _attachmentScanSummaries.reduce((a, s) => a + (s.count || 0), 0);
+                const _aggCats = new Set();
+                for (const s of _attachmentScanSummaries) {
+                    for (const c of Object.keys(s.byCategory || {})) _aggCats.add(c);
+                }
+                if (_aggCount > 0 || _attachmentScanSummaries.some(s => s.timeout)) {
+                    send('pii_tokenized', {
+                        // Synthesise an entities-shaped list so the existing
+                        // pii_tokenized handler picks the categories up.
+                        entities: [..._aggCats].map(label => ({ label, category: label })),
+                        tokenCount: _aggCount,
+                        attachments: _attachmentScanSummaries,
+                        source: 'privacy_shield',
+                    });
+                }
+
+                // When the org enabled "Show raw payload & token mapping",
+                // also push the *exact* tokenised text the model is about
+                // to receive (user prompt + tokenised attachment text) and
+                // the merged token map. This is what fills the "Sent to AI"
+                // pane in the "How I got this answer → Privacy protection"
+                // panel — without it the user sees only the un-tokenised
+                // round-tripped response and has no way to verify what
+                // Claude actually saw.
+                if (_aggCount > 0 && _psShield?.showRawPayload) {
+                    try {
+                        const flat = contentParts
+                            .filter(p => p && p.type === 'text' && typeof p.text === 'string')
+                            .map(p => p.text)
+                            .join('\n');
+                        if (flat) {
+                            send('privacy_payload', {
+                                tokenizedPrompt: flat,
+                                provider: modelId,
+                                source: 'privacy_shield',
+                                timestamp: Date.now(),
+                            });
+                        }
+                        const _dlpRunner = require('../../core/dlp/dlpRunner');
+                        const _convMap = _dlpRunner.getConversationTokenMap(conversationId);
+                        if (_convMap && Object.keys(_convMap).length > 0) {
+                            send('privacy_token_map', { tokenMap: _convMap, source: 'privacy_shield' });
+                        }
+                    } catch (_) { /* transparency is best-effort */ }
                 }
             }
             messages.push({ role: 'user', content: contentParts });
@@ -2379,16 +2599,62 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
             return clean;
         });
 
-        // ─── Eagerly create conversation so workspace (and terminal) tools have a valid DB row ──
-        // convId is null for brand-new chats that have no file attachments yet.
-        // Without a row in direct_conversations, workspace_read/write/replace will fail
-        // immediately with "Workspace requires an active conversation".
-        if (!convId) {
-            const newConv = await agentStore.createDirectConversation(userId, resolvedTier);
-            convId = newConv.id;
-            send('conversation_created', { conversationId: convId });
-            console.log(`[DirectChat] Eagerly created conversation ${convId} for workspace/tool access`);
-        }
+        // Eager-create moved above the attachment scan so `convId` is
+        // available when the attachment scanner calls
+        // `dlpRunner.mergeTokenMap(convId, …)`. See the block earlier in
+        // this route just before attachment processing.
+
+        // ─── PII token-preservation system-prompt addendum ─────────────
+        // For message-level PII and DLP, the addendum is appended inside
+        // those blocks at the point of tokenisation. Attachment-only turns
+        // (clean user prompt, tokens came only from a PDF/Office scan)
+        // never enter those blocks, so without this fallback the model has
+        // no idea what `[person_N]` placeholders mean — it then volunteers
+        // meta-commentary like "deze namen zijn geanonimiseerd" which
+        // confuses the end user (who actually sees the un-tokenised names
+        // in the rendered output). Mirrors the unconditional injection
+        // already used by [chatStream.js:1196](server/core/agentRuntime/chatStream.js#L1196).
+        // Idempotent: skips when the addendum tag is already in the system
+        // prompt (i.e. an earlier in-block injection already fired this turn).
+        try {
+            if (messages[0]?.role === 'system' && typeof messages[0].content === 'string'
+                && !messages[0].content.includes('[PII TOKEN PRESERVATION')) {
+                const _convMap = require('../../core/dlp/dlpRunner').getConversationTokenMap(convId);
+                const _add = buildTokenPreservationAddendum(_convMap);
+                if (_add) messages[0].content += _add;
+            }
+        } catch (_) { /* addendum is best-effort; missing it just means the model may
+                        meta-comment on placeholders — not a runtime failure */ }
+
+        // ─── Streaming un-tokeniser ───────────────────────────────────
+        // Mirrors the pattern at [chatStream.js:762](server/core/agentRuntime/chatStream.js#L762).
+        // Without this, content chunks emitted by the LLM containing `[person_N]`
+        // tokens flash to the user as raw placeholders until the end-of-stream
+        // `content_replace` swaps them. With this in place, each chunk passes
+        // through a buffered un-tokeniser that holds a `[…` tail until the
+        // closing `]` arrives, then replaces in-place — so the user only ever
+        // sees real values during streaming.
+        // The un-tokeniser uses a LIVE getter on the conversation map so tokens
+        // added mid-turn (rare but possible) are picked up.
+        const { createUntokeniser: _createUntok } = require('../../core/dlp/untokeniseStream');
+        const _dlpRunnerForStream = require('../../core/dlp/dlpRunner');
+        const _streamUntok = _createUntok(() => _dlpRunnerForStream.getConversationTokenMap(convId));
+        // Tiny wrapper used by both the primary stream callback and the
+        // follow-stream callback below in place of `send('content', ...)`.
+        const streamContent = (text) => {
+            if (!text) return;
+            const safe = _streamUntok.push(text);
+            if (safe) send('content', { text: safe });
+        };
+        // Flush helper — call at end-of-stream so any trailing partial token
+        // tail is released. The end-of-stream restoration step also runs a
+        // full-text `restoreTokens` as a safety net, so missing a flush would
+        // not cause a permanent leak — it would just delay the replacement
+        // by one event.
+        const streamContentFlush = () => {
+            const tail = _streamUntok.flush();
+            if (tail) send('content', { text: tail });
+        };
 
         while (toolCallRounds < MAX_TOOL_ROUNDS) {
             if (directChatTools.length > 0 && !skipToolPrecheck) {
@@ -2450,6 +2716,7 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                         }
 
                         let toolResult;
+                        let outboundProbe1 = null;
                         try {
                             // Web Search Guard — validate agent_search queries
                             if (toolName === 'agent_search' && toolArgs?.query) {
@@ -2559,7 +2826,10 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                                     }
                                 }
                             } else {
-                                toolResult = await dispatchTool(toolName, toolArgs, {
+                                const dispatched1 = await runWithProbe(async () => {
+                                    const preMeta = resolveIntegrationMeta(toolName, toolArgs || {});
+                                    if (preMeta?.isLocal) markLocal(preMeta.label || preMeta.integration);
+                                    return await dispatchTool(toolName, toolArgs, {
                                     userId,
                                     session: req.session,
                                     userAuth,
@@ -2586,7 +2856,10 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                                         onEvent: (type, data) => { send(type, data); },
                                         signal: undefined
                                     },
+                                    });
                                 });
+                                toolResult = dispatched1.result;
+                                outboundProbe1 = dispatched1.probe;
                             }
                         } catch (err) {
                             console.error(`[DirectChat] Tool execution failed for ${toolName}:`, err);
@@ -2665,6 +2938,7 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                                         pii_scan_enabled: true,
                                         source: 'direct_chat',
                                         model: modelId || null,
+                                        probe: (outboundProbe1 && integMeta.isLocal) ? { ...outboundProbe1, is_local: true } : outboundProbe1,
                                     }).catch(e => console.error('[IntegrationActivityLog] Error:', e.message));
                                 }).catch(() => {});
                             }
@@ -2715,9 +2989,16 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                         if (toolResult._action === 'keep_draft') {
                             send('keep_draft', toolResult.draft);
                         }
-                        // Emit workspace_update SSE event
+                        // Emit workspace_update SSE event. Render-time un-tokenisation:
+                        // the stored workspace_content keeps the raw tokens (so the AI
+                        // can re-read them via notebook_read in a later turn), but the
+                        // user-facing SSE payload gets `[person_N]` → real values
+                        // restored from the conversation token map.
                         if (toolResult._action === 'workspace_update') {
-                            send('workspace_update', { content: toolResult.content });
+                            const { restoreTokens } = require('../../core/azurePiiDetection');
+                            const _convMapForWs = require('../../core/dlp/dlpRunner').getConversationTokenMap(convId);
+                            const rendered = restoreTokens(toolResult.content || '', _convMapForWs);
+                            send('workspace_update', { content: rendered });
                         }
                         // Emit kb_sources SSE event
                         if (toolResult._action === 'kb_sources' && toolResult._sources?.length > 0) {
@@ -2787,8 +3068,11 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                 // alongside mid-pipeline integration tool calls.
                 if (muteAssistantText) return;
                 fullContent += data.text;
-                // Stream raw text (tokens like [PII:iban:1] will show briefly — restored at end)
-                send('content', { text: data.text });
+                // Pass through the streaming un-tokeniser so `[person_N]` etc.
+                // are replaced as they stream — the user never sees raw
+                // placeholders mid-response. A final `content_replace` after
+                // the stream ends covers any trailing partial.
+                streamContent(data.text);
             } else if (type === 'thinking_start') {
                 if (data.partId) {
                     const part = _getThinkingPart(data.partId);
@@ -2940,7 +3224,8 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
             if (type === 'text') {
                 if (muteAssistantText) return;
                 fullContent += data.text;
-                send('content', { text: data.text });
+                // Same un-tokeniser wrap as the primary stream above.
+                streamContent(data.text);
             } else if (type === 'thinking_start') {
                 if (data.partId) {
                     const part = _getThinkingPart(data.partId);
@@ -3070,6 +3355,7 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                 }
 
                 let toolResult;
+                let outboundProbe2 = null;
                 try {
                     // Web Search Guard — validate agent_search queries
                     if (toolName === 'agent_search' && toolArgs?.query) {
@@ -3179,7 +3465,10 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                             }
                         }
                     } else {
-                        toolResult = await dispatchTool(toolName, toolArgs, {
+                        const dispatched2 = await runWithProbe(async () => {
+                            const preMeta = resolveIntegrationMeta(toolName, toolArgs || {});
+                            if (preMeta?.isLocal) markLocal(preMeta.label || preMeta.integration);
+                            return await dispatchTool(toolName, toolArgs, {
                             userId,
                             session: req.session,
                             userAuth,
@@ -3206,7 +3495,10 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                                 onEvent: (type, data) => { send(type, data); },
                                 signal: undefined
                             },
+                            });
                         });
+                        toolResult = dispatched2.result;
+                        outboundProbe2 = dispatched2.probe;
                     }
                 } catch (err) {
                     console.error(`[DirectChat] Streamed tool execution failed for ${toolName}:`, err);
@@ -3285,6 +3577,7 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                                 pii_scan_enabled: true,
                                 source: 'direct_chat',
                                 model: modelId || null,
+                                probe: (outboundProbe2 && integMeta.isLocal) ? { ...outboundProbe2, is_local: true } : outboundProbe2,
                             }).catch(e => console.error('[IntegrationActivityLog] Error:', e.message));
                         }).catch(() => {});
                     }
@@ -3341,9 +3634,13 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                 if (toolResult._action === 'keep_draft') {
                     send('keep_draft', toolResult.draft);
                 }
-                // Emit workspace_update SSE event
+                // Emit workspace_update SSE event. Render-time un-tokenisation —
+                // see the matching block in the precheck loop above for rationale.
                 if (toolResult._action === 'workspace_update') {
-                    send('workspace_update', { content: toolResult.content });
+                    const { restoreTokens } = require('../../core/azurePiiDetection');
+                    const _convMapForWs = require('../../core/dlp/dlpRunner').getConversationTokenMap(convId);
+                    const rendered = restoreTokens(toolResult.content || '', _convMapForWs);
+                    send('workspace_update', { content: rendered });
                 }
                 // Emit kb_sources SSE event
                 if (toolResult._action === 'kb_sources' && toolResult._sources?.length > 0) {
@@ -3392,6 +3689,13 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
             }
         }
 
+        // Release any tail held by the streaming un-tokeniser. The end-of-
+        // stream `restoreTokens` below also fires a full `content_replace`
+        // as a final safety net, but flushing here means a stable token
+        // sitting at the very end of the stream gets replaced via the live
+        // content channel rather than waiting for the replace.
+        try { streamContentFlush(); } catch (_) { /* best-effort */ }
+
         // If LLM returned an empty response after tool calls, send a minimal confirmation
         if (!fullContent.trim() && toolCallRounds > 0) {
             fullContent = 'Done ✓';
@@ -3418,25 +3722,42 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
         }
 
         // ─── PII Token Restoration ──────────────────────────────────
-        // If tokens were injected before sending to AI, restore real values now
-        if (piiTokenMap && Object.keys(piiTokenMap).length > 0 && fullContent) {
+        // Restore tokens for the USER-FACING display channel only. The stored
+        // `fullContent` MUST stay tokenised so the next turn's history (fed
+        // back to the model) does not contain real PII. Without this split,
+        // an adversarial follow-up such as "spell each email character by
+        // character" would let Claude reformat real values it should never
+        // have seen — bypassing the un-tokeniser regex match.
+        // `displayContent` is used for: SSE content_replace, regex agent-
+        // output check, memory extraction, title generation.
+        let displayContent = fullContent;
+        if (fullContent) {
             const { restoreTokens } = require('../../core/azurePiiDetection');
-            const restored = restoreTokens(fullContent, piiTokenMap);
-            if (restored !== fullContent) {
-                console.log('[DirectChat] 🔓 PII tokens restored in AI response');
-                send('content_replace', { text: restored });
-                fullContent = restored;
+            const dlpRunner = require('../../core/dlp/dlpRunner');
+            const convMap = dlpRunner.getConversationTokenMap(convId) || {};
+            const mergedMap = { ...convMap, ...(piiTokenMap || {}) };
+            if (Object.keys(mergedMap).length > 0) {
+                const restored = restoreTokens(fullContent, mergedMap);
+                if (restored !== fullContent) {
+                    console.log(`[DirectChat] 🔓 PII tokens restored for display (${Object.keys(mergedMap).length} tokens in scope, ${fullContent.length}→${restored.length} chars); storage stays tokenised`);
+                    send('content_replace', { text: restored });
+                    displayContent = restored;
+                }
             }
         }
 
-        // Check agent output against regex rules
-        if (regexConfig?.enabled && regexConfig?.scope?.agentOutput && fullContent) {
-            const matches = checkRegexPatterns(fullContent, regexConfig.rulesWithNames);
+        // Check agent output against regex rules. Run against `displayContent`
+        // (un-tokenised) — regex patterns are designed to match real values
+        // like emails, phone numbers, IBANs, etc.; matching tokens would be
+        // accidentally narrow. Redactions still update `fullContent` (storage)
+        // so the next turn doesn't replay leaked content.
+        if (regexConfig?.enabled && regexConfig?.scope?.agentOutput && displayContent) {
+            const matches = checkRegexPatterns(displayContent, regexConfig.rulesWithNames);
             if (matches.length > 0) {
                 const ruleNames = matches.map(m => m.ruleName).join(', ');
                 console.log(`[DirectChat RegexGuard] Agent output violated rules: ${ruleNames}`);
                 if (regexConfig.action === 'redact') {
-                    let redacted = fullContent;
+                    let redacted = displayContent;
                     for (const rule of regexConfig.rulesWithNames) {
                         try {
                             const regex = new RegExp(rule.pattern, 'gi');
@@ -3444,18 +3765,20 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                         } catch (e) { /* skip */ }
                     }
                     send('content_replace', { text: redacted });
-                    fullContent = redacted;
+                    displayContent = redacted;
+                    fullContent = redacted; // redaction is destructive — replace storage too
                 } else {
                     send('guardrail_violation', { rules: ruleNames, autoDeleteSeconds: 5, source: 'agent_output' });
                 }
             }
         }
 
-        // Check agent output with AI moderation (only if scope.agentOutput)
-        if (moderationEnabled && moderationScope.agentOutput && fullContent && !moderationViolation) {
+        // Check agent output with AI moderation (only if scope.agentOutput).
+        // Same rationale: moderation matches real-value content, not tokens.
+        if (moderationEnabled && moderationScope.agentOutput && displayContent && !moderationViolation) {
             try {
                 const { validateInput } = require('../../core/moderation');
-                const outputMessages = [{ role: 'assistant', content: fullContent }];
+                const outputMessages = [{ role: 'assistant', content: displayContent }];
                 await validateInput(outputMessages, true, moderationCategories);
                 console.log(`[DirectChat] AI moderation passed (agent output)`);
             } catch (guardError) {
@@ -3468,6 +3791,7 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                     console.log(`[DirectChat] Agent output moderation violation: ${violationLabels.join(', ')}`);
                     send('content_replace', { text: `⚠️ This response was blocked by content moderation (${violationLabels.join(', ')}). The AI's response contained content that violates organization safety policies.` });
                     fullContent = '[Response blocked by content moderation]';
+                    displayContent = fullContent;
 
                     // Log output moderation event (fire-and-forget)
                     guardrailEventStore.logGuardrailEvent({
@@ -3501,6 +3825,25 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
             }
         }
 
+        // ─── Empty-response guard ────────────────────────────────────
+        // When the model emits only tool calls (most commonly `notebook_write`
+        // for long-form output), `fullContent` is an empty string. Saving an
+        // empty assistant bubble cascades into title-gen 400s and a confusing
+        // "Error generating response" in the chat UI. Replace with a useful
+        // human-readable line and push it to the client so the bubble renders
+        // sensibly. The Notebook panel auto-opens via `workspace_update`, so
+        // the user still gets the substance of the answer.
+        if (!fullContent || !fullContent.trim()) {
+            const usedTools = Array.isArray(collectedToolHistory) && collectedToolHistory.length > 0;
+            const fallbackText = usedTools
+                ? 'I wrote the answer to your Notebook — open the Notebook panel to view it.'
+                : 'The model returned no response. Please try rephrasing your question.';
+            console.warn(`[DirectChat] Empty assistant content (toolsUsed=${usedTools}) — surfacing fallback line.`);
+            try { send('content_replace', { text: fallbackText }); } catch (_) { /* SSE may be closing */ }
+            fullContent = fallbackText;
+            displayContent = fallbackText;
+        }
+
         const conv = await agentStore.getDirectConversation(convId, userId);
         if (conv) {
             // When the frontend sends a truncated history (retry / edit), use that as
@@ -3530,6 +3873,28 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
             // through dlpRunner.mergeTokenMap for chained references.
             if (piiTokenMap && Object.keys(piiTokenMap).length > 0) {
                 userSave.tokenMap = piiTokenMap;
+            }
+            // Merge attachment scan summaries collected during attachment
+            // processing into the assistant tokenisation info so the chat UI
+            // can render a per-file badge ("3 emails, 1 IBAN redacted from invoice.pdf p.2").
+            // Reads from `_turnAttachmentSummaries` (route-scoped) so it
+            // survives the `messages = compactionResult.messages` reassignment.
+            if (Array.isArray(_turnAttachmentSummaries) && _turnAttachmentSummaries.length > 0) {
+                if (!_assistantTokenisationInfo) {
+                    const aggCount = _turnAttachmentSummaries.reduce((a, s) => a + (s.count || 0), 0);
+                    const aggCats = new Set();
+                    for (const s of _turnAttachmentSummaries) {
+                        for (const c of Object.keys(s.byCategory || {})) aggCats.add(c);
+                    }
+                    _assistantTokenisationInfo = {
+                        source: 'privacy_shield',
+                        action: 'redact',
+                        count: aggCount,
+                        categories: [...aggCats],
+                        automatic: true,
+                    };
+                }
+                _assistantTokenisationInfo.attachments = _turnAttachmentSummaries;
             }
             savedMessages.push(userSave);
             const assistantSave = { role: 'assistant', content: fullContent, timestamp: new Date().toISOString() };
@@ -3564,7 +3929,35 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
             if (collectedEmailDrafts.length > 0) assistantSave.emailDrafts = collectedEmailDrafts;
             if (collectedCalendarDrafts.length > 0) assistantSave.calendarDrafts = collectedCalendarDrafts;
             if (collectedMapEmbeds.length > 0) assistantSave.mapEmbeds = collectedMapEmbeds;
-            if (collectedToolHistory.length > 0) assistantSave.toolHistory = collectedToolHistory;
+            if (collectedToolHistory.length > 0) {
+                // Render-time un-tokenisation for the saved tool history. The
+                // `resultPreview` strings are captured straight from raw tool
+                // output (which may contain `[person_N]` tokens) and surfaced
+                // in the "How I got this answer" panel. The AI never reads
+                // toolHistory back — it sees tool results inline during the
+                // same turn — so swapping tokens for real values is purely a
+                // user-render concern. Same applies to `query` / `find_text`
+                // values inside the recorded args.
+                try {
+                    const { restoreTokens } = require('../../core/azurePiiDetection');
+                    const _convMapForToolHist = require('../../core/dlp/dlpRunner').getConversationTokenMap(convId);
+                    if (Object.keys(_convMapForToolHist).length > 0) {
+                        for (const t of collectedToolHistory) {
+                            if (typeof t?.resultPreview === 'string') {
+                                t.resultPreview = restoreTokens(t.resultPreview, _convMapForToolHist);
+                            }
+                            if (t?.args && typeof t.args === 'object') {
+                                for (const k of Object.keys(t.args)) {
+                                    if (typeof t.args[k] === 'string') {
+                                        t.args[k] = restoreTokens(t.args[k], _convMapForToolHist);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (_) { /* render-layer best-effort */ }
+                assistantSave.toolHistory = collectedToolHistory;
+            }
             // Record the bootstrap so the UI can render a "Created N chat-local
             // skills" header above this assistant reply when reloaded.
             if (bootstrappedSessionSkills && Array.isArray(sessionSkills) && sessionSkills.length > 0) {
@@ -3610,12 +4003,25 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
             await agentStore.updateDirectConversation(convId, savedMessages, userId, updateMeta);
 
             // Auto-extract memories from conversation (async, fire-and-forget).
-            // Pass `tokenizedMessage` so PII redactions ([email_1] etc.) are
-            // what the extractor stores — never the raw email/phone/IBAN.
-            if (!moderationViolation && tokenizedMessage && fullContent) {
+            // Un-tokenise both sides before extraction so memories remain
+            // meaningful in a DIFFERENT conversation (the token map is
+            // per-conversation, so a memory containing `[email_1]` recalled
+            // in another conversation would be a dead placeholder).
+            // Privacy trade-off accepted: real PII may now appear in
+            // `user_memories`. That is local storage, not external AI traffic.
+            // `fullContent` is now KEPT tokenised for the DB save (so the next
+            // turn's history fed to the model does not contain real PII).
+            // For memory we want the un-tokenised version — use `displayContent`.
+            const memoryWriteEnabled = req.body?.memoryWriteEnabled !== false;
+            if (!moderationViolation && memoryWriteEnabled && tokenizedMessage && displayContent) {
                 try {
                     const { extractMemories } = require('../../core/memoryExtractor');
-                    extractMemories(userId, tokenizedMessage, fullContent, null, extractMemoriesEnabled ? projectId : null, userOrgForTiers).catch(e =>
+                    const { restoreTokens } = require('../../core/azurePiiDetection');
+                    const _convMapForMem = require('../../core/dlp/dlpRunner').getConversationTokenMap(convId);
+                    const _userTextForMem = Object.keys(_convMapForMem).length > 0
+                        ? restoreTokens(tokenizedMessage, _convMapForMem)
+                        : tokenizedMessage;
+                    extractMemories(userId, _userTextForMem, displayContent, null, extractMemoriesEnabled ? projectId : null, userOrgForTiers).catch(e =>
                         console.warn('[DirectChat] Memory extraction error:', e.message)
                     );
                 } catch (e) { /* ignore */ }
@@ -3623,7 +4029,16 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
 
             // Generate title for new conversations (skip if moderation violation — don't send unsafe content to title LLM)
             console.log(`[DirectChat] Title check: savedMessages=${savedMessages.length}, moderationViolation=${!!moderationViolation}`);
-            if (savedMessages.length <= 2 && !moderationViolation) {
+            // Title gen only runs when BOTH the user prompt and the assistant
+            // response have non-empty trimmed content. Anthropic and most other
+            // providers reject `messages.0` with empty content; attachment-only
+            // or tool-only turns would otherwise log a 400 every time.
+            // Use `displayContent` for the title-gen guard — `fullContent` is
+            // now the tokenised storage form which may differ in content but
+            // is never empty when the un-tokenised one isn't.
+            const _titleHasUserContent = !!(tokenizedMessage && typeof tokenizedMessage === 'string' && tokenizedMessage.trim());
+            const _titleHasAssistantContent = !!(displayContent && typeof displayContent === 'string' && displayContent.trim());
+            if (savedMessages.length <= 2 && !moderationViolation && _titleHasUserContent && _titleHasAssistantContent) {
                 try {
                     const llmClient = require('../../core/llmClient');
                     const { resolveModelWithGlobalFallback } = require('../../core/modelResolver');
@@ -3647,6 +4062,13 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                 } catch (e) {
                     console.error('[DirectChat] Title generation failed:', e.message, e.stack);
                 }
+            } else if (savedMessages.length <= 2 && !moderationViolation && (!_titleHasUserContent || !_titleHasAssistantContent)) {
+                // Skip title gen but seed a sensible default so the conversation
+                // doesn't appear nameless in the sidebar.
+                const fallbackTitle = 'New Chat';
+                try { await agentStore.updateDirectConversationTitle(convId, fallbackTitle, userId); } catch (_) { /* non-fatal */ }
+                send('title', { title: fallbackTitle, conversationId: convId });
+                console.log(`[DirectChat] Title gen skipped (userEmpty=${!_titleHasUserContent}, assistantEmpty=${!_titleHasAssistantContent}) — used fallback "${fallbackTitle}"`);
             } else if (savedMessages.length <= 2 && moderationViolation) {
                 // Moderation violation — set a safe generic title instead
                 const safeTitle = 'New Chat';
@@ -3656,7 +4078,8 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
         }
 
         // ─── Memory extraction (background, non-blocking) ──────────
-        if (!moderationViolation) {
+        // Honors the per-session memoryWriteEnabled toggle (default true).
+        if (!moderationViolation && req.body?.memoryWriteEnabled !== false) {
             try {
                 const memoryExtractor = require('../../agents/memory/extractor');
                 memoryExtractor.extractFromConversation(userId, null, messages, convId, validProjectId || null, userOrgForTiers || null)
@@ -4033,8 +4456,15 @@ router.get('/direct/conversations/:id/workspace', requireAuth, async (req, res) 
         const userId = req.session.user.id;
         const conv = await agentStore.getDirectConversation(req.params.id, userId);
         if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+        // Render-time un-tokenisation. The stored workspace_content keeps the
+        // raw `[person_N]` tokens so the AI can re-read them via notebook_read
+        // in a later turn; this endpoint reaches the user, so swap them back
+        // to real values. Async getter so an open-after-server-restart hits the
+        // DB hydrate path in dlpRunner.
+        const { restoreTokens } = require('../../core/azurePiiDetection');
+        const _convMap = await require('../../core/dlp/dlpRunner').getConversationTokenMapAsync(req.params.id);
         res.json({
-            content: conv.workspace_content || '',
+            content: restoreTokens(conv.workspace_content || '', _convMap),
             notebookId: conv.workspace_notebook_id || null,
         });
     } catch (e) {

@@ -41,6 +41,7 @@ const { TOOL_REGISTRY, loadTools } = require('../automation/toolRegistry');
 const { isSideEffect, READ_ONLY } = require('../automation/sideEffectMap');
 const { getOutputSchema, synthesizeDryRunOutput } = require('../automation/outputSchemas');
 const triggerBus = require('../automation/triggerBus');
+const { resolveIntegration } = require('../core/integrationToolMap');
 
 function requireAuth(req, res, next) {
     if (req.session?.user?.id) return next();
@@ -291,6 +292,10 @@ router.get('/catalog', async (req, res) => {
             const actions = tools.map(t => {
                 const name = t?.function?.name;
                 if (!name) return null;
+                // Resolve the integration that owns this tool so the visual
+                // builder can render the brand logo on each action chip /
+                // node. Falls back to the app id when no prefix matches.
+                const resolved = resolveIntegration(name) || null;
                 return {
                     name,
                     label: name.replace(/_/g, ' '),
@@ -298,6 +303,8 @@ router.get('/catalog', async (req, res) => {
                     inputSchema: t.function?.parameters || null,
                     outputSchema: getOutputSchema(name),
                     sideEffect: isSideEffect(name),
+                    integrationId: resolved?.integration || entry.app,
+                    integrationLabel: resolved?.label || entry.label,
                 };
             }).filter(Boolean);
             const available = entry.app === 'webpages'

@@ -65,11 +65,12 @@ async function extractTextFromPDF(pdfBuffer, filename = 'unknown') {
 /**
  * Extended extraction: returns text + numPages + per-page char counts so callers
  * can make density-based decisions (e.g. "fall back to OCR when avg chars/page
- * is too low").
+ * is too low"). Also returns the per-page text so downstream consumers (e.g.
+ * Privacy Shield attachment scanner) can attribute findings to specific pages.
  *
  * @param {Buffer|Uint8Array} pdfBuffer
  * @param {string} [filename]
- * @returns {Promise<{ text: string, numPages: number, pageCharCounts: number[] }>}
+ * @returns {Promise<{ text: string, numPages: number, pageCharCounts: number[], pages: Array<{ pageNumber: number, text: string }> }>}
  */
 async function extractTextFromPDFWithStats(pdfBuffer, filename = 'unknown') {
     try {
@@ -77,21 +78,23 @@ async function extractTextFromPDFWithStats(pdfBuffer, filename = 'unknown') {
         const data = new Uint8Array(pdfBuffer);
         const doc = await getDocument({ data, useSystemFonts: true }).promise;
 
-        const pages = [];
+        const nonEmptyTexts = [];
         const pageCharCounts = [];
+        const pages = [];
         for (let i = 1; i <= doc.numPages; i++) {
             const page = await doc.getPage(i);
             const content = await page.getTextContent();
             const pageText = content.items.map(item => item.str).join(' ').trim();
             pageCharCounts.push(pageText.length);
-            if (pageText) pages.push(pageText);
+            pages.push({ pageNumber: i, text: pageText });
+            if (pageText) nonEmptyTexts.push(pageText);
         }
 
-        const text = pages.join('\n\n').trim();
-        return { text, numPages: doc.numPages, pageCharCounts };
+        const text = nonEmptyTexts.join('\n\n').trim();
+        return { text, numPages: doc.numPages, pageCharCounts, pages };
     } catch (err) {
         console.warn(`[PDFExtractor] Failed to extract text+stats from ${filename}:`, err.message);
-        return { text: '', numPages: 0, pageCharCounts: [] };
+        return { text: '', numPages: 0, pageCharCounts: [], pages: [] };
     }
 }
 

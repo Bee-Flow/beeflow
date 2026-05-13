@@ -1040,6 +1040,137 @@ router.put('/organizations/:orgId/active-beta-features', requireOrgAdmin('orgId'
     }
 });
 
+// ── Self-scoped active-features routes ──────────────────────────
+// The org-scoped routes above require the client to know which org it is
+// managing. That breaks for super admins (no direct organizationId) and
+// for users whose org membership comes through groups — the SPA has no
+// reliable way to pick the right org. These "/me" routes resolve the
+// caller's primary org from the session instead, so the panel never has
+// to guess. Auth is requireAuth + org_admin/all perm so non-admins still
+// can't toggle these.
+
+/**
+ * Internal helper: resolve the user's "managed" org plus the allow-lists
+ * that the active-features panel needs. Returns:
+ *   { orgId, allowedBetaFeatures, enabledBetaFeatures,
+ *     allowedIntegrations, enabledIntegrations, betaRegistry }
+ *
+ * - Super admin (resolveUserOrgIds === null) → first org from
+ *   getAllOrganizations(); empty everything if no orgs exist.
+ * - Org admin / member → first entry of resolveUserOrgIds.
+ * - No resolvable org → orgId: null with empty allow-lists so the panel
+ *   can render a "not bound" message instead of disappearing.
+ */
+async function resolveActiveFeaturesContext(req) {
+    const userOrgIds = await resolveUserOrgIds(req);
+    let orgId = null;
+    if (userOrgIds === null) {
+        // Super admin — pick first existing org so they get a usable view.
+        const all = await userStore.getAllOrganizations().catch(() => []);
+        if (Array.isArray(all) && all.length > 0) orgId = all[0].id;
+    } else if (userOrgIds.size > 0) {
+        orgId = Array.from(userOrgIds)[0];
+    }
+
+    if (!orgId) {
+        return {
+            orgId: null,
+            allowedBetaFeatures: [], enabledBetaFeatures: [],
+            allowedIntegrations: [], enabledIntegrations: [],
+            betaRegistry: BETA_FEATURES,
+        };
+    }
+
+    const org = await userStore.getOrganization(orgId);
+
+    // Beta allow-list = super admin's grant; active = org admin's subset.
+    const allowedBetaFeatures = await getOrgBetaFeatures(orgId);
+    const enabledBetaFeatures = await userStore.getOrgEnabledBetaFeatures(orgId);
+
+    // Integration allow-list = super admin's enabledIntegrations (or global
+    // default if null), minus NC IDs (managed separately).
+    let allowedIntegrations;
+    const raw = org?.enabledIntegrations;
+    if (raw === null || raw === undefined) {
+        const globalDefaults = await configStore.getConfig('default_org_integrations');
+        allowedIntegrations = globalDefaults ? parseAllowedIntegrations(globalDefaults) : ALL_INTEGRATIONS.map(i => i.id);
+    } else {
+        allowedIntegrations = parseAllowedIntegrations(raw);
+    }
+    allowedIntegrations = allowedIntegrations.filter(id => !NC_ID_SET.has(id));
+    const enabledIntegrations = await userStore.getOrgEnabledIntegrations(orgId);
+
+    return {
+        orgId,
+        allowedBetaFeatures, enabledBetaFeatures,
+        allowedIntegrations, enabledIntegrations,
+        betaRegistry: BETA_FEATURES,
+    };
+}
+
+/** Permission check shared by both /me routes. */
+async function requireOrgAdminLike(req, res) {
+    const userId = req.session?.user?.id;
+    if (!userId) { res.status(401).json({ error: 'Not authenticated' }); return false; }
+    if (req.session.isAdmin || req.session.user?.role === 'admin') return true;
+    const perms = await getUserPermissions(userId, req.session);
+    if (perms.includes('all') || perms.includes('org_admin')) return true;
+    res.status(403).json({ error: 'Organization admin access required' });
+    return false;
+}
+
+router.get('/me/active-features', requireAuth, async (req, res) => {
+    if (!(await requireOrgAdminLike(req, res))) return;
+    try {
+        const ctx = await resolveActiveFeaturesContext(req);
+        res.json(ctx);
+    } catch (e) {
+        console.error('[ActiveFeatures] /me GET error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+router.put('/me/active-features', requireAuth, async (req, res) => {
+    if (!(await requireOrgAdminLike(req, res))) return;
+    try {
+        const { betaEnabled, integrationsEnabled } = req.body || {};
+        if (betaEnabled !== undefined && !Array.isArray(betaEnabled)) {
+            return res.status(400).json({ error: 'betaEnabled must be an array of feature IDs' });
+        }
+        if (integrationsEnabled !== undefined && !Array.isArray(integrationsEnabled)) {
+            return res.status(400).json({ error: 'integrationsEnabled must be an array of integration IDs' });
+        }
+        const ctx = await resolveActiveFeaturesContext(req);
+        if (!ctx.orgId) return res.status(400).json({ error: 'No organisation to update' });
+
+        let savedBeta = ctx.enabledBetaFeatures;
+        let savedInt = ctx.enabledIntegrations;
+
+        if (Array.isArray(betaEnabled)) {
+            const allowedSet = new Set(ctx.allowedBetaFeatures);
+            const clean = Array.from(new Set(betaEnabled.filter(id => allowedSet.has(id))));
+            if (!(await userStore.setOrgEnabledBetaFeatures(ctx.orgId, clean))) {
+                return res.status(500).json({ error: 'Failed to save beta features' });
+            }
+            savedBeta = clean;
+        }
+
+        if (Array.isArray(integrationsEnabled)) {
+            const allowedSet = new Set(ctx.allowedIntegrations);
+            const clean = Array.from(new Set(integrationsEnabled.filter(id => allowedSet.has(id))));
+            if (!(await userStore.setOrgEnabledIntegrations(ctx.orgId, clean))) {
+                return res.status(500).json({ error: 'Failed to save integrations' });
+            }
+            savedInt = clean;
+        }
+
+        res.json({ orgId: ctx.orgId, enabledBetaFeatures: savedBeta, enabledIntegrations: savedInt });
+    } catch (e) {
+        console.error('[ActiveFeatures] /me PUT error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // === Default Integrations Config (Super Admin Only) ===
 
 const configStore = require('../stores/configStore');

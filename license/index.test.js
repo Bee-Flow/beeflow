@@ -26,6 +26,11 @@ const fakeStore = {
     _users: {},
     async getActiveLicenseForOrg(orgId) { return this._orgs[orgId] || null; },
     async getActiveLicenseForUser(userId) { return this._users[userId] || null; },
+    async getActiveLicensesForOrgs(orgIds = []) {
+        const out = [];
+        for (const id of orgIds) if (this._orgs[id]) out.push(this._orgs[id]);
+        return out;
+    },
     async upsertLicense(args) {
         const lic = {
             id: args.licenseId,
@@ -53,11 +58,25 @@ const fakeStore = {
     async logLicenseAudit() { /* noop */ },
 };
 
-// Intercept require('./store') from license/index.js
+// In-memory userStore mock — only the methods the subscription-fallback code
+// touches need to be present.
+const fakeUserStore = {
+    _orgSubs: {},
+    _consumerSubs: {},
+    async getOrgSubscription(orgId) { return this._orgSubs[orgId] || null; },
+    async getConsumerSubscription(userId) { return this._consumerSubs[userId] || null; },
+};
+
+// Intercept require('./store') and require('../stores/userStore') from any
+// file inside server/license/ — store.js requires userStore at the top level
+// for its license-keys JOINs, and index.js lazy-requires it for the
+// subscription fallback. Both must hit the fake.
 const origResolve = Module._resolveFilename;
+const LICENSE_DIR = path.sep + path.join('license');
 Module._resolveFilename = function (request, parent, ...rest) {
-    if (request === './store' && parent && parent.filename.endsWith(path.join('license', 'index.js'))) {
-        return path.join(__dirname, '__fake_store__.js');
+    if (parent && parent.filename && parent.filename.includes(LICENSE_DIR + path.sep)) {
+        if (request === './store') return path.join(__dirname, '__fake_store__.js');
+        if (request === '../stores/userStore') return path.join(__dirname, '__fake_user_store__.js');
     }
     return origResolve.call(this, request, parent, ...rest);
 };
@@ -66,6 +85,12 @@ require.cache[path.join(__dirname, '__fake_store__.js')] = {
     filename: path.join(__dirname, '__fake_store__.js'),
     loaded: true,
     exports: fakeStore,
+};
+require.cache[path.join(__dirname, '__fake_user_store__.js')] = {
+    id: path.join(__dirname, '__fake_user_store__.js'),
+    filename: path.join(__dirname, '__fake_user_store__.js'),
+    loaded: true,
+    exports: fakeUserStore,
 };
 
 const license = require('./index');
@@ -178,6 +203,112 @@ const now = Math.floor(Date.now() / 1000);
         userId: 'user_in_mixed',
     });
     assert.strictEqual(resolved, 'enterprise');
+
+    // ── Stripe subscription fallback: no license_keys → tier from sub ──
+    fakeUserStore._orgSubs['org_saas_pro'] = {
+        plan_id: 'plan_pro_eu',
+        plan_name: 'Pro',
+        plan_tier: 'pro',
+        status: 'active',
+        payment_status: 'paid',
+    };
+    assert.strictEqual(await license.getTierForOrg('org_saas_pro'), 'pro');
+    const saasStatus = await license.getLicenseStatus({ organizationId: 'org_saas_pro' });
+    assert.strictEqual(saasStatus.tier, 'pro');
+    assert.strictEqual(saasStatus.source, 'stripe_subscription');
+    assert.strictEqual(saasStatus.license, null);
+    assert.ok(saasStatus.subscription, 'subscription shape should be present');
+    assert.strictEqual(saasStatus.subscription.tier, 'pro');
+    assert.strictEqual(saasStatus.subscription.status, 'active');
+
+    // ── Cancelled subscription falls back to community ─────────────────
+    fakeUserStore._orgSubs['org_saas_cancelled'] = {
+        plan_id: 'plan_pro_eu',
+        plan_name: 'Pro',
+        plan_tier: 'pro',
+        status: 'cancelled',
+        payment_status: 'paid',
+    };
+    assert.strictEqual(await license.getTierForOrg('org_saas_cancelled'), 'community');
+
+    // ── Trialing subscription within trial window grants tier ──────────
+    fakeUserStore._orgSubs['org_saas_trial_active'] = {
+        plan_id: 'plan_ent_eu',
+        plan_name: 'Enterprise',
+        plan_tier: 'enterprise',
+        status: 'trialing',
+        payment_status: 'trialing',
+        trial_end_date: new Date(Date.now() + 7 * 86400000).toISOString(),
+    };
+    assert.strictEqual(await license.getTierForOrg('org_saas_trial_active'), 'enterprise');
+
+    // ── Trialing past trial_end with no payment → community ────────────
+    fakeUserStore._orgSubs['org_saas_trial_expired'] = {
+        plan_id: 'plan_ent_eu',
+        plan_name: 'Enterprise',
+        plan_tier: 'enterprise',
+        status: 'trialing',
+        payment_status: 'none',
+        trial_end_date: new Date(Date.now() - 86400000).toISOString(),
+    };
+    assert.strictEqual(await license.getTierForOrg('org_saas_trial_expired'), 'community');
+
+    // ── License row beats subscription on same org ─────────────────────
+    fakeStore._orgs['org_both'] = {
+        id: 'lic_both_org', tier: 'enterprise', refreshStatus: 'active',
+        expiresAt: new Date(Date.now() + 86400000).toISOString(),
+    };
+    fakeUserStore._orgSubs['org_both'] = {
+        plan_id: 'plan_pro_eu', plan_name: 'Pro', plan_tier: 'pro',
+        status: 'active', payment_status: 'paid',
+    };
+    // license_keys row exists (enterprise) → it wins over subscription (pro)
+    assert.strictEqual(await license.getTierForOrg('org_both'), 'enterprise');
+    const bothStatus = await license.getLicenseStatus({ organizationId: 'org_both' });
+    assert.strictEqual(bothStatus.source, 'license_key');
+
+    // ── Plan-name parsing fallback when plan_tier is missing ───────────
+    fakeUserStore._orgSubs['org_legacy_plan'] = {
+        plan_id: 'plan_legacy', plan_name: 'Bee Flow Pro Monthly', plan_tier: null,
+        status: 'active', payment_status: 'paid',
+    };
+    assert.strictEqual(await license.getTierForOrg('org_legacy_plan'), 'pro');
+
+    // ── Consumer subscription fallback ─────────────────────────────────
+    fakeUserStore._consumerSubs['user_saas_consumer'] = {
+        plan_id: 'plan_pro_consumer',
+        plan_name: 'Pro Consumer',
+        plan_tier: 'pro',
+        status: 'active',
+        payment_status: 'paid',
+    };
+    assert.strictEqual(await license.getTierForUser('user_saas_consumer'), 'pro');
+
+    // ── getBestTierForOrgs picks up sub-derived tiers ──────────────────
+    fakeUserStore._orgSubs['org_in_set_a'] = {
+        plan_id: 'plan_pro_eu', plan_name: 'Pro', plan_tier: 'pro',
+        status: 'active', payment_status: 'paid',
+    };
+    const bestForOrgs = await license.getBestTierForOrgs(['org_unknown', 'org_in_set_a']);
+    assert.strictEqual(bestForOrgs, 'pro');
+
+    // ── resolveTierFromSubscription helper edge cases ──────────────────
+    assert.strictEqual(license.resolveTierFromSubscription(null), null);
+    assert.strictEqual(license.resolveTierFromSubscription({ status: 'suspended', plan_tier: 'pro' }), null);
+    assert.strictEqual(license.resolveTierFromSubscription({ status: 'past_due', plan_tier: 'pro' }), null);
+    assert.strictEqual(license.resolveTierFromSubscription({ status: 'active', plan_tier: 'bogus' }), null);
+
+    // ── getMaxSeatsForOrg reads from license metadata ──────────────────
+    fakeStore._orgs['org_seatcapped'] = {
+        id: 'lic_seatcapped', tier: 'pro', refreshStatus: 'active',
+        expiresAt: new Date(Date.now() + 86400000).toISOString(),
+        metadata: { max_seats: 10 },
+    };
+    assert.strictEqual(await license.getMaxSeatsForOrg('org_seatcapped'), 10);
+    assert.strictEqual(await license.getMaxSeatsForOrg('org_unknown'), null);
+    // Expired license → no seat cap
+    fakeStore._orgs['org_seatcapped'].refreshStatus = 'expired';
+    assert.strictEqual(await license.getMaxSeatsForOrg('org_seatcapped'), null);
 
     console.log('✓ license/index.test.js — all assertions passed');
 })().catch(err => {

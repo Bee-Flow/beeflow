@@ -256,6 +256,47 @@ async function markRevoked(licenseId, reason = null) {
     await logLicenseAudit('license_revoked', lic.organizationId || lic.userId, null, null, { license_id: licenseId, reason });
 }
 
+/**
+ * List licenses issued by the admin console (issuer = 'beeflow.admin.console').
+ * Pass `organizationId` to scope to a single org. Includes expired/revoked rows
+ * by default so the admin UI can show full grant history.
+ */
+async function getAdminIssuedLicenses({ organizationId = null, includeInactive = true } = {}) {
+    const params = ['beeflow.admin.console'];
+    let where = `issuer = $1`;
+    if (organizationId) {
+        params.push(organizationId);
+        where += ` AND organization_id = $${params.length}`;
+    }
+    if (!includeInactive) {
+        where += ` AND refresh_status NOT IN ('expired', 'revoked')`;
+    }
+    const rows = await getAll(
+        `SELECT * FROM license_keys WHERE ${where} ORDER BY issued_at DESC`,
+        params
+    );
+    return rows.map(rowToLicense);
+}
+
+/**
+ * Extend (or shorten) the expiry on an existing license. Audited.
+ */
+async function extendExpiry(licenseId, newExpiresAt, changedBy) {
+    const lic = await getLicenseById(licenseId);
+    if (!lic) return null;
+    const iso = newExpiresAt instanceof Date ? newExpiresAt.toISOString() : new Date(newExpiresAt).toISOString();
+    await run(
+        `UPDATE license_keys
+         SET expires_at = $1,
+             refresh_status = CASE WHEN refresh_status IN ('expired') THEN 'active' ELSE refresh_status END,
+             updated_at = NOW()
+         WHERE id = $2`,
+        [iso, licenseId]
+    );
+    await logLicenseAudit('license_extended', lic.organizationId || lic.userId, changedBy, { expires_at: lic.expiresAt }, { expires_at: iso, license_id: licenseId });
+    return getLicenseById(licenseId);
+}
+
 async function deactivateLicense(licenseId, deactivatedBy) {
     const lic = await getLicenseById(licenseId);
     if (!lic) return false;
@@ -295,6 +336,8 @@ module.exports = {
     markRefreshFailure,
     markRevoked,
     deactivateLicense,
+    getAdminIssuedLicenses,
+    extendExpiry,
     logLicenseAudit,
     // exported for tests
     _internal: { rowToLicense, parseJSON },

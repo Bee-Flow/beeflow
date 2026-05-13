@@ -39,6 +39,16 @@ draft is a typed DAG of steps:
   loop             — for-each over an upstream array
   ${codeStepEnabled ? 'code             — sandboxed JavaScript (use ONLY when no integration fits)' : '(code steps are currently DISABLED — never propose them)'}
   notification     — deliver a result to the user
+  set              — build an object from explicit field bindings (rename/restructure data)
+  datetime         — date/time op (now, parse, format, addDays/Hours/Minutes, diff, extract)
+  wait             — pause for N seconds (1..86400)
+  stop_error       — halt the run with a custom error message (template-interpolated)
+  switch           — multi-way branch by case name (preferred over chained conditions)
+  filter           — keep array items matching expr (item.<field>) — output {items, count}
+  limit            — first/last N items of an array
+  dedupe           — remove duplicate items (optional keyField)
+  aggregate        — pull one field across items into a flat list — output {values}
+  summarize        — sum/count/avg/min/max over a numeric field of an array — output {result}
 
 ## How you build (the canonical workflow)
 

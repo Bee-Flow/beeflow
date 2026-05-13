@@ -35,39 +35,47 @@ const INTEGRATION_PREFIXES = {
     ms_contacts_:   { integration: 'ms_contacts',     label: 'Microsoft Contacts',  server: 'graph.microsoft.com' },
     onedrive_:      { integration: 'onedrive',        label: 'OneDrive',            server: 'graph.microsoft.com' },
 
-    // n8n Workflow Management
-    n8n_workflow_:  { integration: 'n8n',             label: 'n8n Workflow Management', server: 'n8n-server (configured)' },
+    // n8n Workflow Management — server is dynamic (configured per-org)
+    n8n_workflow_:  { integration: 'n8n',             label: 'n8n Workflow Management', serverFn: (_args, ctx) => ctx?.n8nUrl || null },
 
     // Third-party SaaS
     fireflies_:     { integration: 'fireflies',       label: 'Fireflies',           server: 'api.fireflies.ai' },
-    youtrack_:      { integration: 'youtrack',        label: 'YouTrack',            server: process.env.YOUTRACK_URL || 'youtrack.cloud' },
+    // YouTrack URL is per-org (Connections settings). Static fallback used to
+    // be 'youtrack.cloud' which lied to the dashboard for self-hosted
+    // instances; null lets the probe-captured tls_servername be the truth.
+    youtrack_:      { integration: 'youtrack',        label: 'YouTrack',            serverFn: (_a, ctx) => ctx?.youtrackUrl || null },
     signrequest_:   { integration: 'signrequest',     label: 'SignRequest',         server: 'api.signrequest.com' },
     gamma_:         { integration: 'gamma',           label: 'Gamma',               server: 'gamma.app' },
     linkedin_:      { integration: 'linkedin',        label: 'LinkedIn',            server: 'api.linkedin.com' },
     github_:        { integration: 'github',          label: 'GitHub',              server: 'api.github.com' },
 
-    // Media generation
-    generate_:      { integration: 'media_gen',       label: 'Media Generation',    server: 'ai-generation-service' },
+    // Media generation — per-tool entries in INTEGRATION_TOOL_MAP carry the real
+    // endpoint (api.openai.com/images, api.elevenlabs.io, etc.). The catch-all
+    // here only fires for tools missing from the static map; null server keeps
+    // the dashboard honest instead of showing a fake hostname.
+    generate_:      { integration: 'media_gen',       label: 'Media Generation',    server: null },
 
     // Search & Maps
     maps_:          { integration: 'maps',            label: 'Google Maps',         server: 'maps.googleapis.com' },
     keyword_planner_: { integration: 'keyword_planner', label: 'Keyword Planner',   server: 'googleads.googleapis.com' },
 
-    // Transcription
-    transcribe_:    { integration: 'transcription',   label: 'Transcription',       server: process.env.WHISPER_URL || 'whisper-service (local)' },
+    // Transcription — Whisper is local unless an explicit URL is configured
+    transcribe_:    { integration: 'transcription',   label: 'Transcription',       serverFn: () => process.env.WHISPER_URL || null, isLocal: !process.env.WHISPER_URL },
 
-    // Nextcloud (longest prefix wins via the sort in resolveIntegration)
-    nextcloud_calendar_:      { integration: 'nextcloud_calendar',      label: 'Nextcloud Calendar',      server: 'nextcloud (CalDAV)' },
-    nextcloud_contacts_:      { integration: 'nextcloud_contacts',      label: 'Nextcloud Contacts',      server: 'nextcloud (CardDAV)' },
-    nextcloud_deck_:          { integration: 'nextcloud_deck',          label: 'Nextcloud Deck',          server: 'nextcloud (Deck app)' },
-    nextcloud_notifications_: { integration: 'nextcloud_notifications', label: 'Nextcloud Notifications', server: 'nextcloud (OCS)' },
-    nextcloud_talk_:          { integration: 'nextcloud_talk',          label: 'Nextcloud Talk',          server: 'nextcloud (Talk app)' },
-    nextcloud_tasks_:         { integration: 'nextcloud_tasks',         label: 'Nextcloud Tasks',         server: 'nextcloud (CalDAV / VTODO)' },
-    nextcloud_notes_:         { integration: 'nextcloud_notes',         label: 'Nextcloud Notes',         server: 'nextcloud (Notes app)' },
-    nextcloud_mail_:          { integration: 'nextcloud_mail',          label: 'Nextcloud Mail',          server: 'nextcloud (Mail app)' },
-    nextcloud_activity_:      { integration: 'nextcloud_activity',      label: 'Nextcloud Activity',      server: 'nextcloud (Activity app)' },
-    nextcloud_status_:        { integration: 'nextcloud_status',        label: 'Nextcloud User Status',   server: 'nextcloud (User Status)' },
-    nextcloud_:               { integration: 'nextcloud',               label: 'Nextcloud Files',         server: 'nextcloud (WebDAV)' },
+    // Nextcloud — destination is the user's configured Nextcloud host. Resolved
+    // at call time via ctx.nextcloudUrl. is_local left false so the probe can
+    // capture the real peer IP (could be on-prem or hosted).
+    nextcloud_calendar_:      { integration: 'nextcloud_calendar',      label: 'Nextcloud Calendar',      serverFn: (_a, ctx) => ctx?.nextcloudUrl || null },
+    nextcloud_contacts_:      { integration: 'nextcloud_contacts',      label: 'Nextcloud Contacts',      serverFn: (_a, ctx) => ctx?.nextcloudUrl || null },
+    nextcloud_deck_:          { integration: 'nextcloud_deck',          label: 'Nextcloud Deck',          serverFn: (_a, ctx) => ctx?.nextcloudUrl || null },
+    nextcloud_notifications_: { integration: 'nextcloud_notifications', label: 'Nextcloud Notifications', serverFn: (_a, ctx) => ctx?.nextcloudUrl || null },
+    nextcloud_talk_:          { integration: 'nextcloud_talk',          label: 'Nextcloud Talk',          serverFn: (_a, ctx) => ctx?.nextcloudUrl || null },
+    nextcloud_tasks_:         { integration: 'nextcloud_tasks',         label: 'Nextcloud Tasks',         serverFn: (_a, ctx) => ctx?.nextcloudUrl || null },
+    nextcloud_notes_:         { integration: 'nextcloud_notes',         label: 'Nextcloud Notes',         serverFn: (_a, ctx) => ctx?.nextcloudUrl || null },
+    nextcloud_mail_:          { integration: 'nextcloud_mail',          label: 'Nextcloud Mail',          serverFn: (_a, ctx) => ctx?.nextcloudUrl || null },
+    nextcloud_activity_:      { integration: 'nextcloud_activity',      label: 'Nextcloud Activity',      serverFn: (_a, ctx) => ctx?.nextcloudUrl || null },
+    nextcloud_status_:        { integration: 'nextcloud_status',        label: 'Nextcloud User Status',   serverFn: (_a, ctx) => ctx?.nextcloudUrl || null },
+    nextcloud_:               { integration: 'nextcloud',               label: 'Nextcloud Files',         serverFn: (_a, ctx) => ctx?.nextcloudUrl || null },
 };
 
 // ── Static overrides for specific tools ──────────────────────────────
@@ -85,7 +93,8 @@ const INTEGRATION_TOOL_MAP = {
     kb_search: {
         integration: 'kb_search',
         label: 'Knowledge Base',
-        serverFn: () => 'local (embedded search)',
+        serverFn: () => null,
+        isLocal: true,
         direction: 'received',
         dataCategories: 'search_query, document_content',
     },
@@ -271,6 +280,7 @@ function resolveIntegration(toolName, toolArgs = {}, ctx = {}) {
             server: typeof mapped.serverFn === 'function' ? mapped.serverFn(toolArgs, ctx) : mapped.serverFn,
             direction: mapped.direction || inferDirection(toolName),
             dataCategories: mapped.dataCategories || 'unknown',
+            isLocal: !!mapped.isLocal,
         };
     }
 
@@ -283,9 +293,10 @@ function resolveIntegration(toolName, toolArgs = {}, ctx = {}) {
             return {
                 integration: meta.integration,
                 label: meta.label,
-                server: meta.server,
+                server: typeof meta.serverFn === 'function' ? meta.serverFn(toolArgs, ctx) : (meta.server || null),
                 direction: inferDirection(toolName),
                 dataCategories: 'auto_detected',
+                isLocal: !!meta.isLocal,
             };
         }
     }

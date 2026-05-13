@@ -11,6 +11,8 @@ const TOOL_REGISTRY = [
     { app: 'google-calendar',         label: 'Google Calendar',        module: '../integrations/calendarTools',             arrayName: 'CALENDAR_TOOLS',             enabledKey: 'google-calendar' },
     { app: 'google-drive',            label: 'Google Drive',           module: '../integrations/driveTools',                arrayName: 'DRIVE_TOOLS',                enabledKey: 'google-drive' },
     { app: 'google-docs',             label: 'Google Docs',            module: '../integrations/docsTools',                 arrayName: 'DOCS_TOOLS',                 enabledKey: 'google-docs' },
+    { app: 'google-sheets',           label: 'Google Sheets',          module: '../integrations/sheetsTools',               arrayName: 'SHEETS_TOOLS',               enabledKey: 'google-sheets' },
+    { app: 'google-slides',           label: 'Google Slides',          module: '../integrations/slidesTools',               arrayName: 'SLIDES_TOOLS',               enabledKey: 'google-slides' },
     { app: 'google-contacts',         label: 'Google Contacts',        module: '../integrations/contactsTools',             arrayName: 'CONTACTS_TOOLS',             enabledKey: 'google-contacts' },
     { app: 'google-keep',             label: 'Google Keep',            module: '../integrations/keepTools',                 arrayName: 'KEEP_TOOLS',                 enabledKey: 'google-keep' },
     { app: 'google-groups',           label: 'Google Groups',          module: '../integrations/googleGroupsTools',         arrayName: 'GOOGLE_GROUPS_TOOLS',        enabledKey: 'google-groups' },
@@ -40,6 +42,15 @@ const TOOL_REGISTRY = [
     { app: 'nextcloud-status',        label: 'Nextcloud Status',       module: '../integrations/nextcloudStatusTools',      arrayName: 'NEXTCLOUD_STATUS_TOOLS',     enabledKey: 'nextcloud-status' },
     { app: 'n8n',                     label: 'n8n',                    module: '../integrations/n8nWorkflowTools',          arrayName: 'N8N_WORKFLOW_TOOLS',         enabledKey: 'n8n' },
     { app: 'webpages',                label: 'Webpages',               module: '../integrations/webpageAutomationTools',    arrayName: 'WEBPAGE_AUTOMATION_TOOLS',   enabledKey: 'webpages' },
+    // ── AI-only integrations promoted to first-class automation actions ──
+    // Tool dispatchers for these already exist in core/toolDispatcher.js
+    // (chat path uses them too); registry entries surface them in the
+    // automation catalog so the palette can drag them onto the canvas.
+    { app: 'image-gen',               label: 'Image Generation',       module: '../routes/ai/imageGenTool',                 arrayName: 'IMAGE_GEN_TOOLS',            enabledKey: 'image-gen' },
+    { app: 'video-gen',               label: 'Video Generation',       module: '../routes/ai/videoGenTool',                 arrayName: 'VIDEO_GEN_TOOLS',            enabledKey: 'video-gen' },
+    { app: 'elevenlabs',              label: 'ElevenLabs',             module: '../routes/ai/elevenLabsTools',              arrayName: 'ELEVENLABS_TOOLS',           enabledKey: 'elevenlabs' },
+    { app: 'transcription',           label: 'Transcription',          module: '../integrations/transcriptionTools',        arrayName: 'TRANSCRIPTION_TOOLS',        enabledKey: 'transcription' },
+    { app: 'outlook-readonly',        label: 'Outlook (read-only)',    module: '../integrations/outlookTools',              arrayName: 'OUTLOOK_READONLY_TOOLS',     enabledKey: 'outlook-readonly' },
 ];
 
 /**
