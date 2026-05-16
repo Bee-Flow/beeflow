@@ -440,6 +440,14 @@ async function handleSubscriptionUpdated(subscription) {
         stripe_subscription_id: subscription.id,
     };
 
+    // Mirror Stripe's billed seat quantity so getEffectiveLimits can
+    // multiply per-seat caps by the same number the customer is paying for.
+    // Consumer subs always bill quantity=1 so this is a no-op for them.
+    const billedQuantity = subscription.items?.data?.[0]?.quantity;
+    if (typeof billedQuantity === 'number' && billedQuantity > 0) {
+        updateData.stripe_seat_quantity = billedQuantity;
+    }
+
     // If plan changed, try to find the matching BeeFlow plan. Unmatched
     // Stripe price ids are logged + audited rather than silently nulled —
     // otherwise an unknown price leaves the local subscription orphaned.

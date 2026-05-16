@@ -282,9 +282,22 @@ async function createCheckoutSession({ plan, orgId, orgName, userId, subscriberT
         metadata.beeflow_org_id = orgId;
     }
 
+    // Per-seat org plans bill `quantity = active seat count` so Stripe
+    // pro-rates as the org grows or shrinks. Consumer plans always
+    // bill quantity=1 (they have a single user by definition).
+    let quantity = 1;
+    if (plan.per_seat && !isConsumer && orgId) {
+        try {
+            const userStore = require('../stores/userStore');
+            quantity = Math.max(1, await userStore.getActiveSeatCount(orgId));
+        } catch (e) {
+            console.warn('[Stripe] per-seat checkout: seat count lookup failed, defaulting to 1:', e.message);
+        }
+    }
+
     const sessionParams = {
         mode: 'subscription',
-        line_items: [{ price: plan.stripe_price_id, quantity: 1 }],
+        line_items: [{ price: plan.stripe_price_id, quantity }],
         success_url: successUrl,
         cancel_url: cancelUrl,
         client_reference_id: isConsumer ? userId : orgId,
@@ -397,6 +410,48 @@ async function createPortalSession(stripeCustomerId, returnUrl) {
         customer: stripeCustomerId,
         return_url: returnUrl,
     });
+}
+
+/**
+ * For per-seat plans, push the org's current active seat count to Stripe so
+ * the next invoice bills the right number of seats. Best-effort and silent:
+ * if Stripe is disabled, the plan isn't per-seat, or no subscription exists,
+ * this is a no-op. The subscription.updated webhook will echo the new
+ * quantity back into stripe_seat_quantity on the local row.
+ *
+ * Call this after any local action that changes the user count (invite,
+ * delete, suspend, NC group sync). Don't await it inside the user-creation
+ * transaction — kick it off after commit so a Stripe outage can never block
+ * a user being created.
+ */
+async function syncSeatQuantityForOrg(orgId) {
+    if (!orgId) return;
+    if (!(await isEnabled())) return;
+    const userStore = require('../stores/userStore');
+    const sub = await userStore.getOrgSubscription(orgId);
+    if (!sub?.stripe_subscription_id) return;
+    const plan = sub.plan_id ? await userStore.getPlan(sub.plan_id) : null;
+    if (!plan?.per_seat) return;
+
+    const stripe = await getClient();
+    const quantity = Math.max(1, await userStore.getActiveSeatCount(orgId));
+
+    try {
+        const stripeSub = await stripe.subscriptions.retrieve(sub.stripe_subscription_id);
+        const item = stripeSub.items?.data?.[0];
+        if (!item) {
+            console.warn(`[Stripe] syncSeatQuantityForOrg org=${orgId} sub has no items`);
+            return;
+        }
+        if (item.quantity === quantity) return; // already in sync
+        await stripe.subscriptions.update(sub.stripe_subscription_id, {
+            items: [{ id: item.id, quantity }],
+            proration_behavior: 'create_prorations',
+        });
+        console.log(`[Stripe] seat quantity sync org=${orgId} ${item.quantity} → ${quantity}`);
+    } catch (e) {
+        console.warn(`[Stripe] syncSeatQuantityForOrg org=${orgId} failed: ${e.message}`);
+    }
 }
 
 /**
@@ -558,6 +613,7 @@ module.exports = {
     createCheckoutSession,
     createTrialSubscription,
     createPortalSession,
+    syncSeatQuantityForOrg,
     constructWebhookEvent,
     createPromoCode,
     listPromoCodes,

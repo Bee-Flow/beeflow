@@ -285,6 +285,15 @@ async function initDB() {
     try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS markup_percent REAL DEFAULT 0`); } catch (e) { }
     try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS stripe_meter_id TEXT`); } catch (e) { }
     try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS stripe_meter_event_name TEXT`); } catch (e) { }
+    // Per-seat billing: when true, Stripe checkout uses quantity = active seat
+    // count and the effective max_messages_per_month is computed as
+    // max_messages_per_seat × seat_count in getEffectiveLimits.
+    try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS per_seat BOOLEAN DEFAULT FALSE`); } catch (e) { }
+    try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS max_messages_per_seat INTEGER`); } catch (e) { }
+    // Track the Stripe-side seat quantity on the subscription row so the
+    // effective-cap computation stays in sync with the bill even when the
+    // local user count and Stripe drift transiently.
+    try { await exec(`ALTER TABLE organization_subscriptions ADD COLUMN IF NOT EXISTS stripe_seat_quantity INTEGER`); } catch (e) { }
     try { await exec(`UPDATE subscription_plans SET billing_model = 'fixed' WHERE billing_model IS NULL`); } catch (e) { }
     // Surfaced in the NC App Store onboarding wizard as the "Recommended for
     // Nextcloud" card. Only one plan can carry this flag at a time — the
@@ -605,6 +614,13 @@ async function getUserByNcUid(organizationId, ncUid) {
 
 async function deleteUser(userId) {
     await initDB();
+    // Capture the org before DELETE so we can sync Stripe seat quantity
+    // afterwards. NULL orgId users (consumer accounts) skip the sync.
+    let orgIdForSeatSync = null;
+    try {
+        const owner = await getOne('SELECT "organizationId" FROM users WHERE id = $1', [userId]);
+        orgIdForSeatSync = owner?.organizationId || null;
+    } catch (_) { /* best-effort */ }
     const { rowCount } = await run('DELETE FROM users WHERE id = $1', [userId]);
     if (rowCount === 0) return false;
 
@@ -635,6 +651,16 @@ async function deleteUser(userId) {
     } catch (e) { /* PG store may not be initialized */ }
 
     console.log(`[UserStore] Cleanup complete for user '${userId}'`);
+    // Per-seat plans rebill on user count change. Fire-and-forget — Stripe
+    // outages don't block the delete; the webhook reconciles afterwards.
+    if (orgIdForSeatSync) {
+        Promise.resolve().then(async () => {
+            try {
+                const { syncSeatQuantityForOrg } = require('../services/stripeService');
+                await syncSeatQuantityForOrg(orgIdForSeatSync);
+            } catch (_) { /* best-effort */ }
+        });
+    }
     return true;
 }
 
@@ -1188,6 +1214,8 @@ function parsePlan(p) {
         markup_percent: p.markup_percent == null ? 0 : Number(p.markup_percent),
         stripe_meter_id: p.stripe_meter_id || null,
         stripe_meter_event_name: p.stripe_meter_event_name || null,
+        per_seat: !!p.per_seat,
+        max_messages_per_seat: p.max_messages_per_seat ?? null,
     };
 }
 
@@ -1225,8 +1253,8 @@ async function createPlan(data) {
     try {
         if (data.is_default) await run('UPDATE subscription_plans SET is_default = FALSE WHERE is_default = TRUE');
         if (data.nc_recommended) await run('UPDATE subscription_plans SET nc_recommended = FALSE WHERE nc_recommended = TRUE');
-        await run(`INSERT INTO subscription_plans (id, name, description, max_messages_per_month, max_messages_by_type, max_tokens_per_month, max_cost_per_month, max_users, max_agents, max_knowledge_sources, allowed_features, allowed_models, allowed_integrations, allowed_beta_features, is_default, price, currency, billing_interval, trial_days, sort_order, is_public, stripe_price_id, stripe_product_id, plan_type, nc_recommended, tagline, tier, billing_model, markup_percent, stripe_meter_id, stripe_meter_event_name, created_at, updated_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33)`,
+        await run(`INSERT INTO subscription_plans (id, name, description, max_messages_per_month, max_messages_by_type, max_tokens_per_month, max_cost_per_month, max_users, max_agents, max_knowledge_sources, allowed_features, allowed_models, allowed_integrations, allowed_beta_features, is_default, price, currency, billing_interval, trial_days, sort_order, is_public, stripe_price_id, stripe_product_id, plan_type, nc_recommended, tagline, tier, billing_model, markup_percent, stripe_meter_id, stripe_meter_event_name, per_seat, max_messages_per_seat, created_at, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35)`,
             [id, data.name.trim(), data.description || '', data.max_messages_per_month ?? null, JSON.stringify(data.max_messages_by_type || {}),
                 data.max_tokens_per_month ?? null, data.max_cost_per_month ?? null, data.max_users ?? null, data.max_agents ?? null,
                 data.max_knowledge_sources ?? null, JSON.stringify(data.allowed_features || []), JSON.stringify(data.allowed_models || []),
@@ -1238,6 +1266,7 @@ async function createPlan(data) {
                 !!data.nc_recommended, data.tagline || null, data.tier || null,
                 data.billing_model || 'fixed', data.markup_percent ?? 0,
                 data.stripe_meter_id || null, data.stripe_meter_event_name || null,
+                !!data.per_seat, data.max_messages_per_seat ?? null,
                 now, now]);
         return parsePlan(await getOne('SELECT * FROM subscription_plans WHERE id = $1', [id]));
     } catch (e) { console.error('[UserStore] createPlan error:', e); return null; }
@@ -1271,6 +1300,8 @@ async function updatePlan(planId, data) {
         if (data.markup_percent !== undefined) updateMap.markup_percent = data.markup_percent;
         if (data.stripe_meter_id !== undefined) updateMap.stripe_meter_id = data.stripe_meter_id;
         if (data.stripe_meter_event_name !== undefined) updateMap.stripe_meter_event_name = data.stripe_meter_event_name;
+        if (data.per_seat !== undefined) updateMap.per_seat = !!data.per_seat;
+        if (data.max_messages_per_seat !== undefined) updateMap.max_messages_per_seat = data.max_messages_per_seat;
         if (data.is_default !== undefined) updateMap.is_default = !!data.is_default;
         if (data.price !== undefined) updateMap.price = data.price;
         if (data.currency !== undefined) updateMap.currency = data.currency;
@@ -1290,7 +1321,7 @@ async function updatePlan(planId, data) {
         }
         updateMap.updated_at = now;
         if (data.plan_type !== undefined) updateMap.plan_type = data.plan_type;
-        const colMap = { name: 'name', description: 'description', max_messages_per_month: 'max_messages_per_month', max_messages_by_type: 'max_messages_by_type', max_tokens_per_month: 'max_tokens_per_month', max_cost_per_month: 'max_cost_per_month', max_users: 'max_users', max_agents: 'max_agents', max_knowledge_sources: 'max_knowledge_sources', allowed_features: 'allowed_features', allowed_models: 'allowed_models', allowed_integrations: 'allowed_integrations', allowed_beta_features: 'allowed_beta_features', is_default: 'is_default', price: 'price', currency: 'currency', billing_interval: 'billing_interval', trial_days: 'trial_days', sort_order: 'sort_order', is_public: 'is_public', stripe_price_id: 'stripe_price_id', stripe_product_id: 'stripe_product_id', plan_type: 'plan_type', nc_recommended: 'nc_recommended', tagline: 'tagline', tier: 'tier', billing_model: 'billing_model', markup_percent: 'markup_percent', stripe_meter_id: 'stripe_meter_id', stripe_meter_event_name: 'stripe_meter_event_name', updated_at: 'updated_at' };
+        const colMap = { name: 'name', description: 'description', max_messages_per_month: 'max_messages_per_month', max_messages_by_type: 'max_messages_by_type', max_tokens_per_month: 'max_tokens_per_month', max_cost_per_month: 'max_cost_per_month', max_users: 'max_users', max_agents: 'max_agents', max_knowledge_sources: 'max_knowledge_sources', allowed_features: 'allowed_features', allowed_models: 'allowed_models', allowed_integrations: 'allowed_integrations', allowed_beta_features: 'allowed_beta_features', is_default: 'is_default', price: 'price', currency: 'currency', billing_interval: 'billing_interval', trial_days: 'trial_days', sort_order: 'sort_order', is_public: 'is_public', stripe_price_id: 'stripe_price_id', stripe_product_id: 'stripe_product_id', plan_type: 'plan_type', nc_recommended: 'nc_recommended', tagline: 'tagline', tier: 'tier', billing_model: 'billing_model', markup_percent: 'markup_percent', stripe_meter_id: 'stripe_meter_id', stripe_meter_event_name: 'stripe_meter_event_name', per_seat: 'per_seat', max_messages_per_seat: 'max_messages_per_seat', updated_at: 'updated_at' };
         const q = dynamicUpdate('subscription_plans', planId, updateMap, colMap);
         if (q) await run(q.sql, q.params);
         return true;
@@ -1376,8 +1407,9 @@ async function setOrgSubscription(orgId, data) {
             if (data.payment_status !== undefined) updateMap.payment_status = data.payment_status;
             if (data.manual_override_until !== undefined) updateMap.manual_override_until = data.manual_override_until;
             if (data.manual_override_by !== undefined) updateMap.manual_override_by = data.manual_override_by;
+            if (data.stripe_seat_quantity !== undefined) updateMap.stripe_seat_quantity = data.stripe_seat_quantity;
             updateMap.updated_at = now;
-            const colMap = { plan_id: 'plan_id', status: 'status', max_messages_per_month: 'max_messages_per_month', max_messages_by_type: 'max_messages_by_type', max_tokens_per_month: 'max_tokens_per_month', max_cost_per_month: 'max_cost_per_month', max_users: 'max_users', max_agents: 'max_agents', max_knowledge_sources: 'max_knowledge_sources', allowed_features: 'allowed_features', allowed_models: 'allowed_models', billing_cycle_start: 'billing_cycle_start', notes: 'notes', trial_end_date: 'trial_end_date', stripe_customer_id: 'stripe_customer_id', stripe_subscription_id: 'stripe_subscription_id', payment_status: 'payment_status', manual_override_until: 'manual_override_until', manual_override_by: 'manual_override_by', updated_at: 'updated_at' };
+            const colMap = { plan_id: 'plan_id', status: 'status', max_messages_per_month: 'max_messages_per_month', max_messages_by_type: 'max_messages_by_type', max_tokens_per_month: 'max_tokens_per_month', max_cost_per_month: 'max_cost_per_month', max_users: 'max_users', max_agents: 'max_agents', max_knowledge_sources: 'max_knowledge_sources', allowed_features: 'allowed_features', allowed_models: 'allowed_models', billing_cycle_start: 'billing_cycle_start', notes: 'notes', trial_end_date: 'trial_end_date', stripe_customer_id: 'stripe_customer_id', stripe_subscription_id: 'stripe_subscription_id', payment_status: 'payment_status', manual_override_until: 'manual_override_until', manual_override_by: 'manual_override_by', stripe_seat_quantity: 'stripe_seat_quantity', updated_at: 'updated_at' };
             const q = dynamicUpdate('organization_subscriptions', orgId, updateMap, colMap, 'organization_id');
             if (q) await run(q.sql, q.params);
         } else {
@@ -1433,6 +1465,18 @@ function getBillingPeriod(sub) {
     };
 }
 
+// Active seat count for an org — the number of users currently billable on a
+// per-seat plan. Matches the FOR UPDATE query used by the seat-cap enforcer
+// in createUserWithSeatCheck (without the lock).
+async function getActiveSeatCount(orgId) {
+    await initDB();
+    const row = await getOne(
+        `SELECT COUNT(*)::int AS n FROM users WHERE "organizationId" = $1 AND COALESCE(status, 'active') = 'active'`,
+        [orgId]
+    );
+    return row?.n ?? 0;
+}
+
 async function getEffectiveLimits(orgId) {
     const sub = await getOrgSubscription(orgId);
     if (!sub) return null;
@@ -1445,6 +1489,19 @@ async function getEffectiveLimits(orgId) {
     const effective = { status: sub.status, billing_cycle_start: sub.billing_cycle_start };
     for (const field of LIMIT_FIELDS) {
         effective[field] = sub[field] !== null && sub[field] !== undefined ? sub[field] : (plan ? plan[field] : null);
+    }
+    // Per-seat plans: the org-wide message cap is computed as
+    // per_seat_cap × seat_count. Prefer the Stripe-billed quantity (kept in
+    // sync by the customer.subscription.updated webhook) so the cap matches
+    // the bill even when the local user count drifts; fall back to the live
+    // active-user count if no Stripe quantity is recorded yet.
+    if (plan?.per_seat && plan?.max_messages_per_seat != null) {
+        const billedSeats = sub.stripe_seat_quantity ?? null;
+        const seats = billedSeats ?? await getActiveSeatCount(orgId);
+        effective.max_messages_per_month = Number(plan.max_messages_per_seat) * Number(seats);
+        effective.seat_count = seats;
+        effective.per_seat = true;
+        effective.max_messages_per_seat = plan.max_messages_per_seat;
     }
     const planByType = plan?.max_messages_by_type || {};
     const subByType = sub.max_messages_by_type || {};
@@ -1961,6 +2018,18 @@ async function createUserWithSeatCheck(userData, { strict = true } = {}) {
             );
             await client.query('COMMIT');
             client.release();
+            // Fire-and-forget Stripe seat-quantity sync. Per-seat plans rebill
+            // when the active user count changes; we don't await so a Stripe
+            // outage can't block user creation. The webhook will reconcile
+            // stripe_seat_quantity once the update is processed.
+            if (organizationId) {
+                Promise.resolve().then(async () => {
+                    try {
+                        const { syncSeatQuantityForOrg } = require('../services/stripeService');
+                        await syncSeatQuantityForOrg(organizationId);
+                    } catch (_) { /* best-effort */ }
+                });
+            }
             return { created: true, reason: null };
         } catch (e) {
             try { await client.query('ROLLBACK'); } catch (_) { }
@@ -1987,7 +2056,7 @@ module.exports = {
     storeAppPassword, getAppPassword, hasAppPassword, deleteAppPassword,
     getAllRoles, createRole, updateRole, deleteRole,
     getAllPlans, getPlan, createPlan, updatePlan, deletePlan,
-    getAllOrgSubscriptions, getOrgSubscription, setOrgSubscription, deleteOrgSubscription, getEffectiveLimits,
+    getAllOrgSubscriptions, getOrgSubscription, setOrgSubscription, deleteOrgSubscription, getEffectiveLimits, getActiveSeatCount,
     getConsumerSubscription, setConsumerSubscription, deleteConsumerSubscription, getAllConsumerSubscriptions,
     getBillingPeriod, logSubscriptionAudit, getAuditLog,
     markTrialUsed, hasOrgUsedTrial, hasUserUsedTrial,
