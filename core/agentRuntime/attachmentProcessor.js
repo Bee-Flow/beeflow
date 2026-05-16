@@ -197,6 +197,17 @@ async function processAttachments(attachments = [], lastMsg, userId = null, opts
                     console.warn(`[AttachmentProcessor] Skipping ${att.name}: no content payload`);
                     continue;
                 }
+                // Reject oversized base64 before we allocate the buffer. 50 MB raw
+                // file → ~67 MB base64; cap there to avoid memory blow-up from a
+                // malicious or buggy uploader.
+                const MAX_BASE64_LEN = 80 * 1024 * 1024;
+                if (typeof base64Data === 'string' && base64Data.length > MAX_BASE64_LEN) {
+                    console.warn(`[AttachmentProcessor] Skipping ${att.name}: base64 payload too large (${base64Data.length} chars)`);
+                    const textBlock = lastMsg.content.find(c => c.type === 'text');
+                    const note = `\n\n[Attachment: ${att.name} — skipped, payload exceeded ${MAX_BASE64_LEN} chars]\n`;
+                    if (textBlock) textBlock.text += note; else lastMsg.content.push({ type: 'text', text: note });
+                    continue;
+                }
                 const buffer = Buffer.from(base64Data, 'base64');
                 const text = await parseDocument(buffer, att.type, att.name);
 

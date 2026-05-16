@@ -6,6 +6,7 @@
 const express = require('express');
 const memoryStore = require('../stores/memoryStore');
 const projectStore = require('../stores/projectStore');
+const { resolveUserGroups } = require('../auth');
 const { getEffectiveUserId } = require('./agents');
 
 const router = express.Router();
@@ -40,6 +41,13 @@ router.get('/', async (req, res) => {
 
     try {
         if (projectId) {
+            // Verify the caller can actually see this project before returning its
+            // memories — every other project-scoped memory endpoint already does
+            // this; the list endpoint was missing the check, letting any logged-in
+            // user dump project memories by guessing the UUID.
+            const groupIds = await resolveUserGroups(userId);
+            const hasAccess = await projectStore.userHasAccess(userId, projectId, groupIds);
+            if (!hasAccess) return res.status(403).json({ error: 'No access to this project' });
             const memories = await memoryStore.getMemoriesForProject(userId, projectId);
             const filtered = typeFilter ? memories.filter(m => m.type === typeFilter) : memories;
             return res.json({ memories: filtered });

@@ -66,6 +66,64 @@ async function _vaultUpsertSafe({ userId, orgId, provider, tokenData }) {
  * Admin users always have encryption enabled.
  * Encryption is a paid feature — disabled by default unless plan explicitly includes it.
  */
+/**
+ * Save the session and respond with either the popup-close HTML (when the
+ * OAuth flow was launched in a popup/iframe) or a normal redirect. Shared by
+ * the org-signup path and the consumer-signup early-return path so the two
+ * cannot drift.
+ */
+function _respondOAuthLogin(req, res, provider, returnTo, userId) {
+    console.log(`[OAuth/${provider}] Saving session and redirecting to: ${returnTo}`);
+    req.session.save(async (err) => {
+        if (err) console.error(`[OAuth/${provider}] SESSION SAVE ERROR:`, err);
+        else console.log(`[OAuth/${provider}] === LOGIN COMPLETE === Redirecting user ${userId}`);
+
+        if (req.session.oauthPopup) {
+            const pickupId = req.session.oauthPickupId;
+            delete req.session.oauthPopup;
+            delete req.session.oauthPickupId;
+            req.session.save();
+
+            if (pickupId) {
+                try {
+                    const { setSessionToken, setPickup, generateToken } = require('../utils/sessionToken');
+                    const appPasswordData = await userStore.getAppPassword(userId);
+                    const sessionToken = generateToken();
+                    await setSessionToken(sessionToken, {
+                        user: req.session.user,
+                        accessToken: req.session.accessToken,
+                        refreshToken: req.session.refreshToken,
+                        oauthProvider: req.session.oauthProvider,
+                        nextcloudUid: req.session.nextcloudUid,
+                        appPassword: appPasswordData,
+                        isAuthenticated: true,
+                        isAdmin: req.session.isAdmin || false,
+                    });
+                    await setPickup(pickupId, { sessionToken });
+                    console.log(`[OAuth/${provider}] Pickup ${pickupId} deposited (token len=${sessionToken.length})`);
+                } catch (pickupErr) {
+                    console.error(`[OAuth/${provider}] Pickup deposit failed:`, pickupErr.message);
+                }
+            }
+
+            const html = `<!DOCTYPE html><html><head><title>Login Complete</title></head><body>
+<script>
+  try {
+    if (window.opener) {
+      window.opener.postMessage({ type: 'beeflow-oauth-complete' }, '*');
+    }
+  } catch(e) {}
+  window.close();
+</script>
+<p style="font-family:sans-serif;text-align:center;margin-top:40px">Login complete. You can close this window.</p>
+</body></html>`;
+            return res.send(html);
+        }
+
+        res.redirect(returnTo);
+    });
+}
+
 async function isEncryptionEnabledForUser(userId) {
     try {
         const user = await userStore.getUser(userId);
@@ -743,20 +801,30 @@ router.get('/callback/:provider', async (req, res) => {
                 preResolvedOrg = resolveOrgByEmailDomain(user.email, allOrgs);
             }
 
-            await userStore.createUser({
-                id: localId,
-                username: user.email || localId,
-                displayName: user.displayName,
-                firstName: user.firstName || '',
-                lastName: user.lastName || '',
-                email: user.email || '',
-                avatar: user.picture || null,
-                avatarType: user.picture ? 'url' : null,
-                role: 'user',
-                groups: [],
-                azureUserId: user.azureUserId || null,
-                organizationId: preResolvedOrg?.id || '',
-            });
+            try {
+                const r = await userStore.createUserWithSeatCheck({
+                    id: localId,
+                    username: user.email || localId,
+                    displayName: user.displayName,
+                    firstName: user.firstName || '',
+                    lastName: user.lastName || '',
+                    email: user.email || '',
+                    avatar: user.picture || null,
+                    avatarType: user.picture ? 'url' : null,
+                    role: 'user',
+                    groups: [],
+                    azureUserId: user.azureUserId || null,
+                    organizationId: preResolvedOrg?.id || '',
+                }, { strict: true });
+                if (!r.created && r.reason !== 'duplicate_id') {
+                    console.warn('[OAuth] auto-provision failed:', r.reason, r.error || '');
+                }
+            } catch (e) {
+                if (e instanceof userStore.SeatCapExceededError) {
+                    return res.status(403).json({ error: 'seat_cap_exceeded', current: e.current, max: e.max });
+                }
+                throw e;
+            }
             console.log(`[OAuth/${provider}] Created new user via branch=create → ${localId} (azureUserId=${user.azureUserId || 'none'}, preResolvedOrg=${preResolvedOrg?.id || 'none'})`);
         }
 
@@ -766,7 +834,11 @@ router.get('/callback/:provider', async (req, res) => {
             delete req.session.pendingSignup;
 
             if (pendingData.signupType === 'consumer') {
-                // Consumer OAuth signup — mark user as consumer, no org
+                // Consumer OAuth signup — mark user as consumer, no org.
+                // We finalize the session here and return early so the
+                // org-resolution code below (domain matching, noOrganization
+                // gate) can't accidentally bind a personal account to an
+                // existing org or trip the "No Organisation Found" screen.
                 const configStore = require('../stores/configStore');
                 const waitlistEnabled = (await configStore.getConfig('signup_waitlist_enabled')) ?? false;
                 const userStatus = waitlistEnabled ? 'waitlist' : 'active';
@@ -775,6 +847,24 @@ router.get('/callback/:provider', async (req, res) => {
                     status: userStatus,
                 });
                 console.log(`[OAuth] Consumer account created for ${user.id} (status: ${userStatus})`);
+
+                req.session.accessToken = tokenData.access_token;
+                req.session.refreshToken = tokenData.refresh_token;
+                req.session.user = user;
+                req.session.isAuthenticated = true;
+                req.session.isAdmin = false;
+                req.session.oauthProvider = provider;
+
+                console.log(`[OAuth/${provider}] Checking encryption for user ${user.id}...`);
+                const encryptionEnabled = await isEncryptionEnabledForUser(user.id);
+                console.log(`[OAuth/${provider}] Encryption enabled: ${encryptionEnabled}`);
+                const ssoResult = await getOrCreateSSOUserDEKCompat(user.id, encryptionEnabled);
+                console.log(`[OAuth/${provider}] SSO DEK result — hasKey: ${!!ssoResult.encryptionKey}, needsSetup: ${!!ssoResult.needsEncryptionSetup}, needsPin: ${!!ssoResult.needsEncryptionPin}`);
+                if (ssoResult.encryptionKey) req.session.encryptionKey = ssoResult.encryptionKey;
+                if (ssoResult.needsEncryptionSetup) req.session.needsEncryptionSetup = true;
+                if (ssoResult.needsEncryptionPin) req.session.needsEncryptionPin = true;
+
+                return _respondOAuthLogin(req, res, provider, returnTo, user.id);
             } else {
                 // Org OAuth signup
                 const { newOrgName, orgDetails: od } = pendingData;
@@ -967,61 +1057,7 @@ router.get('/callback/:provider', async (req, res) => {
             req.session.needsEncryptionPin = true;
         }
 
-        console.log(`[OAuth/${provider}] Saving session and redirecting to: ${returnTo}`);
-        req.session.save(async (err) => {
-            if (err) console.error(`[OAuth/${provider}] SESSION SAVE ERROR:`, err);
-            else console.log(`[OAuth/${provider}] === LOGIN COMPLETE === Redirecting user ${user.id}`);
-
-            // Popup mode (embedded iframe): render a tiny HTML page that
-            // posts a message to the parent/opener and closes itself.
-            if (req.session.oauthPopup) {
-                const pickupId = req.session.oauthPickupId;
-                delete req.session.oauthPopup;
-                delete req.session.oauthPickupId;
-                req.session.save(); // persist the deletion
-
-                // If the iframe handed us a pickup id, deposit a session token
-                // under it so the iframe (which is in a partitioned cookie
-                // store and never sees our Set-Cookie) can claim it.
-                if (pickupId) {
-                    try {
-                        const { setSessionToken, setPickup, generateToken } = require('../utils/sessionToken');
-                        const userStore = require('../stores/userStore');
-                        const appPasswordData = await userStore.getAppPassword(user.id);
-                        const sessionToken = generateToken();
-                        await setSessionToken(sessionToken, {
-                            user: req.session.user,
-                            accessToken: req.session.accessToken,
-                            refreshToken: req.session.refreshToken,
-                            oauthProvider: req.session.oauthProvider,
-                            nextcloudUid: req.session.nextcloudUid,
-                            appPassword: appPasswordData,
-                            isAuthenticated: true,
-                            isAdmin: req.session.isAdmin || false,
-                        });
-                        await setPickup(pickupId, { sessionToken });
-                        console.log(`[OAuth/${provider}] Pickup ${pickupId} deposited (token len=${sessionToken.length})`);
-                    } catch (pickupErr) {
-                        console.error(`[OAuth/${provider}] Pickup deposit failed:`, pickupErr.message);
-                    }
-                }
-
-                const html = `<!DOCTYPE html><html><head><title>Login Complete</title></head><body>
-<script>
-  try {
-    if (window.opener) {
-      window.opener.postMessage({ type: 'beeflow-oauth-complete' }, '*');
-    }
-  } catch(e) {}
-  window.close();
-</script>
-<p style="font-family:sans-serif;text-align:center;margin-top:40px">Login complete. You can close this window.</p>
-</body></html>`;
-                return res.send(html);
-            }
-
-            res.redirect(returnTo);
-        });
+        _respondOAuthLogin(req, res, provider, returnTo, user.id);
 
     } catch (err) {
         console.error(`[OAuth/${provider}] CALLBACK EXCEPTION:`, err.message);

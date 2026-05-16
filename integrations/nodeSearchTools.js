@@ -206,7 +206,12 @@ async function rerankProviderLLM(rerankTarget, query, results) {
         { role: 'user', content: `Query: ${query}\n\nResults:\n${numbered}\n\nReturn JSON only.` },
     ];
     try {
-        const out = await adapter.chat(rerankTarget.apiKey, baseUrl, rerankTarget.modelId, messages, { temperature: 0, maxTokens: 800 });
+        const out = await adapter.chat(rerankTarget.apiKey, baseUrl, rerankTarget.modelId, messages, {
+            temperature: 0,
+            maxTokens: 800,
+            timeoutMs: 20000,
+            retries: { strategy: 'none' },
+        });
         const text = (out.content || '').trim();
         const match = text.match(/\[[\s\S]*\]/);
         if (!match) return results;
@@ -219,7 +224,11 @@ async function rerankProviderLLM(rerankTarget, query, results) {
             .map((r, i) => ({ ...r, score: map.has(i) ? map.get(i) : 0 }))
             .sort((a, b) => (b.score || 0) - (a.score || 0));
     } catch (err) {
-        console.warn(`[NodeSearch] provider rerank failed (${err.message}); returning original order`);
+        const msg = err?.message || String(err);
+        const cleanMsg = /\[object Request\]/.test(msg)
+            ? 'transient upstream fetch error (Mistral SDK retry surfaced as TypeError)'
+            : msg;
+        console.warn(`[NodeSearch] provider rerank failed (${cleanMsg}); returning original order`);
         return results;
     }
 }
@@ -265,10 +274,26 @@ async function cleanupPage(cleanupTarget, query, page) {
         { role: 'user', content: `Query: ${query}\n\nURL: ${page.url}\n\nRaw content:\n${truncated}` },
     ];
     try {
-        const out = await adapter.chat(cleanupTarget.apiKey, baseUrl, cleanupTarget.modelId, messages, { temperature: 0.1, maxTokens: 700 });
+        // Cleanup runs all pages in parallel and is best-effort — short timeout
+        // + no retries keeps a slow/failing page from holding back the others.
+        // The Mistral SDK's internal retry path was also the source of the
+        // confusing "Failed to parse URL from [object Request]" log noise.
+        const out = await adapter.chat(cleanupTarget.apiKey, baseUrl, cleanupTarget.modelId, messages, {
+            temperature: 0.1,
+            maxTokens: 700,
+            timeoutMs: 30000,
+            retries: { strategy: 'none' },
+        });
         return (out.content || '').trim() || null;
     } catch (err) {
-        console.warn(`[NodeSearch] cleanup failed for ${page.url}: ${err.message}`);
+        const msg = err?.message || String(err);
+        // The Mistral SDK stringifies its inner cause as "[object Request]"
+        // when an upstream fetch fails with a TypeError. Surface a cleaner
+        // log line so this looks like the transient network issue it is.
+        const cleanMsg = /\[object Request\]/.test(msg)
+            ? 'transient upstream fetch error (Mistral SDK retry surfaced as TypeError)'
+            : msg;
+        console.warn(`[NodeSearch] cleanup failed for ${page.url}: ${cleanMsg}`);
         return null;
     }
 }

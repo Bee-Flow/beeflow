@@ -474,9 +474,11 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     };
 
-    if (modelTier === 'auto') {
-        send('model_selected', { tier: resolvedTier, modelId });
-    }
+    // Emit on every turn so the "How I got this answer" panel always knows
+    // which concrete model produced this reply, including for fixed tiers.
+    // `fromAuto` distinguishes the case where the classifier picked the tier
+    // (we want to show "Auto → Fast (gpt-5-mini)") from a user-pinned choice.
+    send('model_selected', { tier: resolvedTier, modelId, fromAuto: modelTier === 'auto' });
     emitPhase(send, 'model_resolved', modelId);
     emitPhaseEnd(send, 'model_resolved');
 
@@ -626,10 +628,15 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
             },
         });
 
+        // Simple Mode strips the agent's toolbelt — same set we hide in the
+        // shared integration tools loader. Notebooks + webpages must not be
+        // injected here either since direct chat wires them up separately.
+        const userSimpleMode = !!(await configStore.getConfig(`simple_mode_user_${userId}`));
+
         // ─── Built-in: workspace tools ────────────────────────────────
         // Only inject notebook tools if the feature is enabled
         const notebooksEnabled = (await configStore.getConfig('feature_notebooks_enabled')) !== false;
-        if (notebooksEnabled) {
+        if (!userSimpleMode && notebooksEnabled) {
             for (const wsTool of WORKSPACE_TOOLS) {
                 if (!directChatTools.find(t => t.function.name === wsTool.function.name)) {
                     directChatTools.push(wsTool);
@@ -641,7 +648,7 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         let webpageBetaEnabled = false;
         try {
             const { userHasBetaFeature: userHasWebpagesBetaForBuilder } = require('../../core/betaFeatures');
-            webpageBetaEnabled = await userHasWebpagesBetaForBuilder(userId, 'webpages', req.session);
+            webpageBetaEnabled = !userSimpleMode && await userHasWebpagesBetaForBuilder(userId, 'webpages', req.session);
             if (webpageBetaEnabled) {
                 for (const tool of BUILDER_TOOLS) {
                     if (!directChatTools.find(t => t.function.name === tool.function.name)) {
@@ -782,7 +789,7 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                         if (kbIds.length > 0) {
                             try {
                                 const { quickKBSearch } = require('../../core/agentRuntime/knowledgeSearch');
-                                const kbResults = await quickKBSearch(userId, kbIds, message, { topK: 6 });
+                                const kbResults = await quickKBSearch(userId, kbIds, message, { topK: 6, session: req.session });
 
                                 if (kbResults.length > 0) {
                                     const kbText = kbResults.map((c, i) => {
@@ -832,7 +839,7 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
 
                 if (accessibleKbIds.length > 0) {
                     const { quickKBSearch } = require('../../core/agentRuntime/knowledgeSearch');
-                    const kbResults = await quickKBSearch(userId, accessibleKbIds, message, { topK: 6 });
+                    const kbResults = await quickKBSearch(userId, accessibleKbIds, message, { topK: 6, session: req.session });
                     if (kbResults.length > 0) {
                         const kbText = kbResults.map((c, i) => {
                             const src = c.source_uri || c.title || 'KB';
@@ -1333,7 +1340,10 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
         // orphan-row risk is unchanged because the original location had
         // the same exposure.
         if (!convId) {
-            const newConv = await agentStore.createDirectConversation(userId, resolvedTier);
+            // Persist the user's pick (e.g. "auto"), not the classifier's
+            // resolution. On reload the UI restores `selectedTier` from this
+            // value; storing "fast" here would turn Auto into Fast after refresh.
+            const newConv = await agentStore.createDirectConversation(userId, modelTier || 'fast');
             convId = newConv.id;
             send('conversation_created', { conversationId: convId });
             console.log(`[DirectChat] Eagerly created conversation ${convId} for workspace/tool access`);
@@ -1374,8 +1384,8 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
             const { resolveUserOrgIds: _resolveUserOrgIdsForAtt } = require('../../auth');
             const _attUserOrgIds = await _resolveUserOrgIdsForAtt(req).catch(() => null);
             const _attUserOrgId = (_attUserOrgIds && _attUserOrgIds.size > 0) ? Array.from(_attUserOrgIds)[0] : null;
-            const { resolveOrgShield: _resolvePsForAttachments } = require('../../core/orgShield');
-            const _psShield = _attUserOrgId ? await _resolvePsForAttachments(_attUserOrgId) : null;
+            const { resolveShieldFor: _resolvePsForAttachments } = require('../../core/orgShield');
+            const _psShield = await _resolvePsForAttachments({ orgId: _attUserOrgId, userId: req.session?.user?.id });
             const { scanAttachmentText: _scanAttText, AttachmentPrivacyBlock: _AttPiiBlock } = require('../../core/dlp/attachmentScanner');
             const _attachmentScanSummaries = [];
             // Local helper so the per-format branches below don't repeat the
@@ -2307,12 +2317,15 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
         }
 
         // ─── Regex Guardrails ────────────────────────────────────────
-        const { resolveOrgShield, mergeWithOrgShield } = require('../../core/orgShield');
+        const { resolveShieldFor, mergeWithOrgShield } = require('../../core/orgShield');
 
-        // 1. Resolve org-level privacy shield regex rules for this user
-        const orgShieldConfig = await resolveOrgShield(userOrgId);
+        // 1. Resolve the privacy shield for this turn. Org-bound users get
+        //    their org shield; consumer accounts (no org) fall back to their
+        //    own user-level shield from the personal Privacy Shield settings.
+        const orgShieldConfig = await resolveShieldFor({ orgId: userOrgId, userId: req.session?.user?.id });
         if (orgShieldConfig) {
-            console.log(`[DirectChat] Org Privacy Shield active for org ${userOrgId} (${orgShieldConfig.rulesWithNames.length} rules)`);
+            const scope = userOrgId ? `org ${userOrgId}` : `user ${req.session?.user?.id}`;
+            console.log(`[DirectChat] Privacy Shield active for ${scope} (${orgShieldConfig.rulesWithNames.length} rules)`);
         }
 
         // 2. Resolve direct-chat-specific regex guardrails
@@ -3811,14 +3824,14 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
 
         // ─── Conversation persistence ────────────────────────────
         if (!convId) {
-            const conv = await agentStore.createDirectConversation(userId, resolvedTier || 'fast');
+            const conv = await agentStore.createDirectConversation(userId, modelTier || 'fast');
             convId = conv.id;
             send('conversation_created', { conversationId: convId });
             // Assign to project if provided
             if (projectId) {
                 try {
                     const projectStore = require('../../stores/projectStore');
-                    await projectStore.assignConversation(convId, projectId, 'direct_conversations');
+                    await projectStore.assignConversation(convId, projectId, userId, 'direct_conversations');
                 } catch (e) {
                     console.warn('[DirectChat] Failed to assign conversation to project:', e.message);
                 }
@@ -3898,6 +3911,17 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
             }
             savedMessages.push(userSave);
             const assistantSave = { role: 'assistant', content: fullContent, timestamp: new Date().toISOString() };
+            // Persist the concrete model + tier so the "How I got this answer"
+            // panel still renders the right pill after a reload. `modelTier`
+            // captures what the user picked ("auto" stays "auto" across reloads);
+            // `autoSelectedTier` is the classifier's resolution when on auto,
+            // and `modelId` is the actual model string the provider was called
+            // with this turn.
+            assistantSave.modelId = modelId;
+            assistantSave.modelTier = resolvedTier;
+            if (modelTier === 'auto') {
+                assistantSave.autoSelectedTier = resolvedTier;
+            }
             if (_assistantTokenisationInfo) assistantSave.tokenisationInfo = _assistantTokenisationInfo;
             // Prefer the structured thinking parts (with signatures + timing) over the flat string.
             // The flat string is kept as a fallback for providers that only emit `thinking` without
@@ -4001,6 +4025,13 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                 updateMeta.sessionSkillsCompletions = sessionSkillsCompletions;
             }
             await agentStore.updateDirectConversation(convId, savedMessages, userId, updateMeta);
+            // Persist the user's tier selection on the conversation so a refresh
+            // restores the picker to what they last chose ("auto" stays "auto").
+            // Without this, model_tier is frozen at creation and never reflects
+            // mid-conversation switches.
+            if (modelTier) {
+                await agentStore.updateDirectConversationModelTier(convId, modelTier, userId).catch(() => {});
+            }
 
             // Auto-extract memories from conversation (async, fire-and-forget).
             // Un-tokenise both sides before extraction so memories remain

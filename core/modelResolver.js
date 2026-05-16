@@ -99,12 +99,22 @@ async function isEUModeActive({ userOrgId = null, userId = null } = {}) {
         }
     }
 
-    // 2. Check personal user EU preference
+    // 2. Check the user-level Privacy Shield — the canonical store for
+    //    per-user EU residency. The consumer Privacy Shield settings panel
+    //    writes this key; the EU master toggle requires the shield to be
+    //    enabled as well as euModeEnabled, mirroring the org check above.
     if (userId) {
-        const userEU = await configStore.getConfig(`user_eu_mode_${userId}`);
-        if (userEU === true) {
-            return { isEU: true, source: 'user' };
+        const userShield = await configStore.getConfig(`user_privacy_shield_${userId}`);
+        if (userShield?.enabled && userShield?.euModeEnabled) {
+            return { isEU: true, source: 'user_shield' };
         }
+
+        // 3. Fallback for legacy users who set the old `user_eu_mode_${userId}`
+        //    flag (the now-removed Startup Agent EU toggle) before the
+        //    Privacy Shield panel existed. Keeps EU routing on until they
+        //    re-save through the new panel, at which point the new key wins.
+        const legacy = await configStore.getConfig(`user_eu_mode_${userId}`);
+        if (legacy === true) return { isEU: true, source: 'user_legacy' };
     }
 
     return { isEU: false, source: 'none' };

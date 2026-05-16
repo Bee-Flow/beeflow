@@ -46,7 +46,7 @@ async function resolveAgentModel(agentModel, userMessage, globalConfig) {
 
     // Auto tier — use unified classifier (LLM + heuristic fallback)
     try {
-        const { classifyWithLLM } = require('./promptClassifier');
+        const { classifyWithLLM } = require('../promptClassifier');
         const result = await classifyWithLLM(userMessage, tiers);
         const model = tiers[result.tier]?.modelId || tiers.fast?.modelId || resolveModelId(globalConfig.model);
         console.log(`[AgentRuntime] Auto: tier="${result.tier}" → model: ${model} (${result.method}: ${result.reason})`);

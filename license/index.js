@@ -10,9 +10,13 @@
  *
  *   const license = require('./license');
  *
- *   const tier = await license.getTierForOrg(orgId);          // 'community' | 'pro' | ...
+ *   const tier = await license.getTierForOrg(orgId);          // 'community' | 'enterprise' | 'full'
  *   const ok   = await license.hasFeature(orgId, 'automations');
  *   const lic  = await license.getLicenseStatus({ organizationId: orgId });
+ *
+ * Legacy `pro` tier values (from old JWTs, admin blobs, or subscription rows
+ * minted before the Pro tier was retired) are normalised to `enterprise` at
+ * every output boundary via tiers.normalizeTier — see server/license/tiers.js.
  */
 
 const store = require('./store');
@@ -105,21 +109,30 @@ function resolveTierFromSubscription(sub) {
     }
     const tier = sub.plan_tier || tierFromPlanName(sub.plan_name);
     if (!tier || !tiers.isValidTier(tier)) return null;
-    return tier;
+    return tiers.normalizeTier(tier);
 }
 
 async function resolveTierFromOrgSubscription(organizationId) {
     try {
         const sub = await getUserStore().getOrgSubscription(organizationId);
         return resolveTierFromSubscription(sub);
-    } catch (_) { return null; }
+    } catch (e) {
+        // Missing table (early boot, fresh install) is benign — return null and
+        // let the next source provide a tier. Anything else is a real DB error
+        // and should bubble so middleware can fail-closed with 503.
+        if (e && e.code === '42P01') return null;
+        throw e;
+    }
 }
 
 async function resolveTierFromConsumerSubscription(userId) {
     try {
         const sub = await getUserStore().getConsumerSubscription(userId);
         return resolveTierFromSubscription(sub);
-    } catch (_) { return null; }
+    } catch (e) {
+        if (e && e.code === '42P01') return null;
+        throw e;
+    }
 }
 
 /**
@@ -134,7 +147,7 @@ function resolveTierFromLicense(lic) {
     if (lic.expiresAt && new Date(lic.expiresAt).getTime() <= Date.now()) {
         return COMMUNITY_FALLBACK;
     }
-    return tiers.isValidTier(lic.tier) ? lic.tier : COMMUNITY_FALLBACK;
+    return tiers.isValidTier(lic.tier) ? tiers.normalizeTier(lic.tier) : COMMUNITY_FALLBACK;
 }
 
 /**
@@ -260,10 +273,11 @@ async function getLicenseStatus({ organizationId = null, userId = null, orgIds =
 
 function publicSubscriptionShape(sub) {
     if (!sub) return null;
+    const rawTier = sub.plan_tier || tierFromPlanName(sub.plan_name) || null;
     return {
         planId: sub.plan_id,
         planName: sub.plan_name,
-        tier: sub.plan_tier || tierFromPlanName(sub.plan_name) || null,
+        tier: rawTier ? tiers.normalizeTier(rawTier) : null,
         status: sub.status,
         paymentStatus: sub.payment_status,
         trialEndDate: sub.trial_end_date,
@@ -278,7 +292,7 @@ function publicSubscriptionShape(sub) {
 function publicLicenseShape(lic) {
     return {
         id: lic.id,
-        tier: lic.tier,
+        tier: tiers.normalizeTier(lic.tier),
         issuer: lic.issuer,
         issuedAt: lic.issuedAt,
         expiresAt: lic.expiresAt,
@@ -296,6 +310,68 @@ function publicLicenseShape(lic) {
  * activated license row (without raw_token). Throws on verification failure.
  */
 async function activateLicense({ token, organizationId = null, userId = null, activatedBy = null }) {
+    // Admin-issued blob path — no JWT verify, trust comes from the activate
+    // endpoint's existing admin/org-admin gate.
+    if (typeof token === 'string' && token.startsWith(adminIssuance.BLOB_PREFIX)) {
+        let decoded;
+        try {
+            decoded = adminIssuance.decodeAdminLicenseBlob(token);
+        } catch (e) {
+            const err = new Error(`License verification failed: malformed_admin_blob`);
+            err.code = 'malformed_admin_blob';
+            throw err;
+        }
+        if (decoded.v !== 1) {
+            const err = new Error(`License verification failed: unsupported_blob_version`);
+            err.code = 'unsupported_blob_version';
+            throw err;
+        }
+        if (!tiers.isValidTier(decoded.tier)) {
+            const err = new Error(`License verification failed: invalid_tier`);
+            err.code = 'invalid_tier';
+            throw err;
+        }
+        const expMs = new Date(decoded.expires_at).getTime();
+        if (!Number.isFinite(expMs) || expMs <= Date.now()) {
+            const err = new Error(`License verification failed: token_expired`);
+            err.code = 'token_expired';
+            throw err;
+        }
+        // No ALLOW_ADMIN_FULL_TIER check here — issuance is the security
+        // boundary. If an admin-issued blob carries tier=full, the receiver
+        // honours it. Otherwise customers couldn't activate a Full-tier
+        // license unless they set the env var locally too.
+
+        const blobScope = userId ? 'consumer' : 'organization';
+        const orgIdResolved = blobScope === 'organization' ? (organizationId || decoded.organization_id || null) : null;
+        const userIdResolved = blobScope === 'consumer' ? (userId || null) : null;
+        if (blobScope === 'organization' && !orgIdResolved) {
+            const err = new Error('No organization context for license activation');
+            err.code = 'missing_org_context';
+            throw err;
+        }
+
+        // Mint a fresh license_id so the receiver's row doesn't collide with
+        // the issuer's row when both happen to live in the same DB (admin
+        // minting and activating against their own org). The blob's original
+        // license_id stays inside rawToken if anyone needs to trace it back.
+        const lic = await store.upsertLicense({
+            licenseId: require('crypto').randomUUID(),
+            organizationId: orgIdResolved,
+            userId: userIdResolved,
+            scope: blobScope,
+            rawToken: token,
+            tier: decoded.tier,
+            issuer: decoded.issuer || adminIssuance.ADMIN_ISSUER,
+            issuedAt: decoded.issued_at,
+            expiresAt: decoded.expires_at,
+            billingInterval: decoded.billing_interval || 'yearly',
+            activatedBy,
+            metadata: decoded.metadata || {},
+        });
+        return publicLicenseShape(lic);
+    }
+
     const result = await verify.verifyToken(token);
     if (!result.valid) {
         const err = new Error(`License verification failed: ${result.error}`);

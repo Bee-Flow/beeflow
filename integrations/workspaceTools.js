@@ -229,19 +229,33 @@ async function executeWorkspaceTool(toolName, args, context) {
 
     // Lazy-load DB helpers to avoid circular deps
     const { getOne, run } = require('../db');
+    const notebookStore = require('../stores/notebookStore');
 
     // Helper: get notebook content from either agent or direct conversations.
     // Returns user_id alongside content so callers can cross-check ownership
-    // against the tool's execution context (defence in depth — the caller-side
-    // context.userId should always match the conversation owner in practice).
+    // against the tool's execution context. When the conversation row has a
+    // `workspace_notebook_id` link, we resolve content from the standalone
+    // `notebooks` table — that is the source of truth the UI reads, so the
+    // tool must read/write there too. Otherwise we fall back to the legacy
+    // per-conversation `workspace_content` column.
     async function getWorkspace(convId) {
-        // Try agent_conversations first
-        let row = await getOne('SELECT workspace_content, user_id FROM agent_conversations WHERE id = $1', [convId]);
-        if (row) return { content: row.workspace_content || '', user_id: row.user_id, source: 'agent' };
-        // Fallback to direct_conversations
-        row = await getOne('SELECT workspace_content, user_id FROM direct_conversations WHERE id = $1', [convId]);
-        if (row) return { content: row.workspace_content || '', user_id: row.user_id, source: 'direct' };
-        return null;
+        let row = await getOne('SELECT workspace_content, workspace_notebook_id, user_id FROM agent_conversations WHERE id = $1', [convId]);
+        let source = 'agent';
+        if (!row) {
+            row = await getOne('SELECT workspace_content, workspace_notebook_id, user_id FROM direct_conversations WHERE id = $1', [convId]);
+            source = 'direct';
+        }
+        if (!row) return null;
+        if (row.workspace_notebook_id) {
+            const notebook = await notebookStore.getNotebook(row.workspace_notebook_id, row.user_id);
+            return {
+                content: notebook?.documentContent || '',
+                user_id: row.user_id,
+                source,
+                notebookId: row.workspace_notebook_id,
+            };
+        }
+        return { content: row.workspace_content || '', user_id: row.user_id, source };
     }
 
     function denyIfCrossUser(workspace) {
@@ -253,12 +267,16 @@ async function executeWorkspaceTool(toolName, args, context) {
         return null;
     }
 
-    // Helper: set notebook content in the correct table
-    async function setWorkspace(convId, content) {
-        // Try agent_conversations first
+    // Helper: persist notebook content. Writes to the linked standalone
+    // notebook when the conversation has one (via notebookStore so version
+    // tracking and owner gating stay consistent), otherwise to the legacy
+    // per-conversation column.
+    async function setWorkspace(convId, content, workspace) {
+        if (workspace?.notebookId) {
+            return notebookStore.updateNotebook(workspace.notebookId, workspace.user_id, { documentContent: content });
+        }
         const agentResult = await run('UPDATE agent_conversations SET workspace_content = $1, updated_at = NOW() WHERE id = $2', [content, convId]);
         if (agentResult.rowCount > 0) return true;
-        // Fallback to direct_conversations
         const directResult = await run('UPDATE direct_conversations SET workspace_content = $1, updated_at = NOW() WHERE id = $2', [content, convId]);
         return directResult.rowCount > 0;
     }
@@ -389,7 +407,7 @@ async function executeWorkspaceTool(toolName, args, context) {
             const existing = await getWorkspace(conversationId);
             const denied = denyIfCrossUser(existing);
             if (denied) return denied;
-            await setWorkspace(conversationId, content);
+            await setWorkspace(conversationId, content, existing);
             const words = wordCount(content);
             return {
                 _action: 'workspace_update',
@@ -460,7 +478,7 @@ async function executeWorkspaceTool(toolName, args, context) {
                 return { error: `Invalid position: ${position}. Use "start", "end", or "after".` };
             }
 
-            await setWorkspace(conversationId, newContent);
+            await setWorkspace(conversationId, newContent, workspace);
             const words = wordCount(insertContent);
             return {
                 _action: 'workspace_update',
@@ -605,7 +623,7 @@ async function executeWorkspaceTool(toolName, args, context) {
                 }
             }
 
-            await setWorkspace(conversationId, newContent);
+            await setWorkspace(conversationId, newContent, workspace);
             const action = replaceText ? 'replaced' : 'removed';
             return {
                 _action: 'workspace_update',

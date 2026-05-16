@@ -132,7 +132,7 @@ async function applyUserCreated(org, ncUid) {
     const bfGroupIds = (ncGroups || [])
         .filter(g => g !== 'admin')
         .map(g => ncGroupToBfId(org.id, g));
-    await userStore.createUser({
+    const r = await userStore.createUserWithSeatCheck({
         id: userId,
         username: ncUser.email,
         email: ncUser.email,
@@ -145,7 +145,15 @@ async function applyUserCreated(org, ncUid) {
         autoProvisioned: true,
         status,
         groups: bfGroupIds,
-    });
+    }, { strict: false });
+    if (!r.created) {
+        if (r.reason === 'seat_cap') {
+            console.warn(`[ncSync] seat.cap.skipped org=${org.id} nc_uid=${ncUid} current=${r.current} max=${r.max}`);
+            return { action: 'skip', reason: 'seat_cap' };
+        }
+        console.warn(`[ncSync] createUser failed for ${ncUid}: ${r.reason}`);
+        return { action: 'skip', reason: r.reason };
+    }
     console.log(`[ncSync] Mirrored NC user ${ncUid} → ${userId} (status=${status}, groups=${bfGroupIds.length})`);
     return { action: 'create', userId, status, groups: bfGroupIds };
 }

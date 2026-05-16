@@ -52,6 +52,12 @@ const { NEXTCLOUD_ACTIVITY_TOOLS } = require('../integrations/nextcloudActivityT
 const { NEXTCLOUD_STATUS_TOOLS } = require('../integrations/nextcloudStatusTools');
 const { TICKET_ASSISTANT_TOOLS } = require('../integrations/ticketAssistantTools');
 const { WEBPAGE_AUTOMATION_TOOLS } = require('../integrations/webpageAutomationTools');
+const { RECHTSPRAAK_TOOLS } = require('../integrations/rechtspraakTools');
+const { EURLEX_TOOLS } = require('../integrations/eurlexTools');
+const { KAMERSTUKKEN_TOOLS } = require('../integrations/kamerstukkenTools');
+const { BEKENDMAKINGEN_TOOLS } = require('../integrations/bekendmakingenTools');
+const { TUCHTRECHT_TOOLS } = require('../integrations/tuchtrechtTools');
+const { userHasBetaFeature } = require('./betaFeatures');
 
 // IDs that are exempt from org-level gating (admin-only tools, internal utilities)
 const ORG_EXEMPT_APPS = ['workspace', 'regex-gen'];
@@ -68,6 +74,12 @@ const ORG_EXEMPT_APPS = ['workspace', 'regex-gen'];
 async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
     const tools = [];
     let n8nOrgId = null;
+
+    // Simple Mode strips the agent's toolbelt to the basics. Notebooks,
+    // webpages, meeting transcripts (Fireflies), automations (n8n) and the
+    // admin regex-guardrail tools are all withheld so the agent can't act on
+    // surfaces the user has explicitly opted out of.
+    const userSimpleMode = !!(await configStore.getConfig(`simple_mode_user_${userId}`));
 
     // Load user's enabled apps (null = all enabled)
     const userEnabledApps = await configStore.getConfig(`enabled_apps_user_${userId}`);
@@ -257,7 +269,7 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
 
     // Fireflies — requires user API key
     const hasFirefliesKey = !!(await configStore.getSecret(`fireflies_api_key_user_${userId}`));
-    if (hasFirefliesKey && isAppOn('fireflies')) {
+    if (!userSimpleMode && hasFirefliesKey && isAppOn('fireflies')) {
         addTools(FIREFLIES_TOOLS);
     }
 
@@ -284,7 +296,7 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
     // AUTO_ENABLED_APPS so legacy users with stale enabledApps lists don't lose
     // access). Only the write-bucket is permission-gated via modify_n8n_workflows.
     try {
-        if (userOrgId) {
+        if (!userSimpleMode && userOrgId) {
             n8nOrgId = userOrgId;
             const n8nUrl = await configStore.getConfig(`n8n_url_org_${n8nOrgId}`);
             const n8nKey = await configStore.getSecret(`n8n_api_key_org_${n8nOrgId}`);
@@ -319,13 +331,13 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
     }
 
     // Regex Generator — admin only
-    if (isAdmin) {
+    if (!userSimpleMode && isAdmin) {
         addTools(REGEX_GENERATOR_TOOLS);
     }
 
     // Workspace/Notebook — check feature flag (disabled from admin panel = no tools)
     const notebooksFeatureEnabled = (await configStore.getConfig('feature_notebooks_enabled')) !== false;
-    if (notebooksFeatureEnabled && isAppOn('workspace')) {
+    if (!userSimpleMode && notebooksFeatureEnabled && isAppOn('workspace')) {
         addTools(WORKSPACE_TOOLS);
     }
 
@@ -423,11 +435,27 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
     // but the dispatch paths are distinct (direct chat checks
     // isBuilderTool/isDbTool first; the automation runner goes through
     // toolDispatcher → isWebpageAutomationTool).
-    if (isAppOn('webpages')) {
+    if (!userSimpleMode && isAppOn('webpages')) {
         try {
-            const { userHasBetaFeature } = require('./betaFeatures');
             const ok = await userHasBetaFeature(userId, 'webpages', session);
             if (ok) addTools(WEBPAGE_AUTOMATION_TOOLS);
+        } catch (_) { /* beta lookup failed — fail closed */ }
+    }
+
+    // Dutch legal sources — gated only on the `dutch_legal_sources` beta
+    // feature. No API key, no OAuth, no per-app toggle: enabling the feature
+    // for an org is the full activation. The matching system-managed KB is
+    // gated separately in routes/knowledgeBases.js + knowledgeSearch.js.
+    if (!userSimpleMode) {
+        try {
+            const ok = await userHasBetaFeature(userId, 'dutch_legal_sources', session);
+            if (ok) {
+                addTools(RECHTSPRAAK_TOOLS);
+                addTools(EURLEX_TOOLS);
+                addTools(KAMERSTUKKEN_TOOLS);
+                addTools(BEKENDMAKINGEN_TOOLS);
+                addTools(TUCHTRECHT_TOOLS);
+            }
         } catch (_) { /* beta lookup failed — fail closed */ }
     }
 
@@ -482,6 +510,11 @@ async function buildToolHint(tools, userId = null) {
     if (tools.some(t => t.function.name === 'agent_search')) integrations.push('Agent Search (AI-powered web search with reranking)');
     if (tools.some(t => t.function.name.startsWith('workspace_') || t.function.name.startsWith('notebook_'))) integrations.push('Notebook (read and write a persistent rich-text document alongside the conversation)');
     if (tools.some(t => t.function.name === 'kb_search')) integrations.push('Knowledge Base Search (look up internal documentation when the user asks a specific question — do NOT search for greetings or small-talk)');
+    if (tools.some(t => t.function.name.startsWith('rechtspraak_'))) integrations.push('Rechtspraak.nl (Nederlandse jurisprudentie via Open Data: zoek arresten/uitspraken op rechtsgebied + instantie + datumbereik via rechtspraak_search, haal volledige tekst per ECLI op via rechtspraak_get)');
+    if (tools.some(t => t.function.name.startsWith('eurlex_'))) integrations.push('EUR-Lex (EU-recht en HvJEU-arresten in het Nederlands: eurlex_search op trefwoord + doc_type, eurlex_get per CELEX)');
+    if (tools.some(t => t.function.name.startsWith('kamerstukken_') || t.function.name === 'kamerstuk_get')) integrations.push('Tweede Kamer Open Data — kamerstukken (memorie van toelichting, amendementen, kamervragen, brieven regering) voor wetsgeschiedenis: kamerstukken_search op trefwoord + soort + vergaderjaar, kamerstuk_get haalt de tekst van een specifiek stuk op via GUID');
+    if (tools.some(t => t.function.name.startsWith('bekendmakingen_') || t.function.name === 'bekendmaking_get')) integrations.push('Officiële Bekendmakingen — Staatsblad (vastgestelde wetten/AMvB), Staatscourant (regelingen, AP-besluiten, AVV-CAO\'s), Tractatenblad (verdragen): bekendmakingen_search op trefwoord + publicatie + datum, bekendmaking_get per identifier (bv. stcrt-2024-1234)');
+    if (tools.some(t => t.function.name.startsWith('tuchtrecht_'))) integrations.push('Tuchtrecht — Nederlandse tuchtuitspraken voor advocaten (Raad/Hof van Discipline), notarissen (Kamer voor het notariaat), accountants (Accountantskamer), gerechtsdeurwaarders en BIG-beroepen (Tuchtcollege Gezondheidszorg): tuchtrecht_search op trefwoord + beroepsgroep + datum, tuchtrecht_get per ECLI');
     if (tools.some(t => t.function.name.startsWith('maps_'))) integrations.push('Google Maps (get directions between locations with route maps, search for places/businesses — IMPORTANT: after getting results, always output the map as a ```map-embed code block containing JSON with embedUrl, title, and mapsLink fields so it renders as an interactive map in the chat)');
     if (tools.some(t => t.function.name.startsWith('linkedin_'))) integrations.push('LinkedIn (create posts — user approves before publishing)');
     if (tools.some(t => t.function.name.startsWith('github_'))) integrations.push('GitHub (list repos, view code, create repos, manage branches)');

@@ -22,7 +22,15 @@ const appsRouter = require('./routes/apps');
 
 
 const app = express();
-app.enable('trust proxy');
+// Trust proxy: how many reverse-proxy hops sit in front of us. Default `1`
+// matches the standard nginx-in-front production deploy. Override via
+// `TRUST_PROXY_HOPS` (positive integer) if you have multiple proxies (e.g.
+// CDN → load balancer → app). Setting this to `true` works for IP detection
+// but causes express-rate-limit to refuse to start with ERR_ERL_PERMISSIVE_TRUST_PROXY
+// because anyone could spoof X-Forwarded-For; the numeric value pins down
+// exactly how many forwarded IPs to peel off.
+const TRUST_PROXY_HOPS = Math.max(0, parseInt(process.env.TRUST_PROXY_HOPS || '1', 10) || 1);
+app.set('trust proxy', TRUST_PROXY_HOPS);
 const PORT = process.env.SERVER_PORT || process.env.PORT || 3001;
 
 // ── Security headers (helmet) ─────────────────────────────────────────────────
@@ -61,22 +69,10 @@ const ALLOWED_ORIGINS = (process.env.CORS_ORIGIN || 'https://dev.beeflow.ai,http
     .map(s => s.trim())
     .filter(Boolean);
 
-// Browser-extension origins are opt-in. When ALLOW_BROWSER_EXTENSIONS=true
-// the operator accepts the trade-off: any installed Chrome/Firefox extension
-// can issue authenticated cross-origin XHRs riding the user's session cookie.
-// Default off — extensions must use Bearer (PAT) auth on a same-origin
-// content-script, which doesn't go through this CORS check.
-const ALLOW_BROWSER_EXTENSIONS = process.env.ALLOW_BROWSER_EXTENSIONS === 'true';
-
 const globalCors = cors({
     origin: (origin, cb) => {
         // Same-origin / curl / server-to-server (no Origin header)
         if (!origin) return cb(null, true);
-
-        if (ALLOW_BROWSER_EXTENSIONS &&
-            (origin.startsWith('chrome-extension://') || origin.startsWith('moz-extension://'))) {
-            return cb(null, true);
-        }
 
         const normalizedOrigin = origin.endsWith('/') ? origin.slice(0, -1) : origin;
         const isAllowed = ALLOWED_ORIGINS.some(o => (o.endsWith('/') ? o.slice(0, -1) : o) === normalizedOrigin);
@@ -177,15 +173,9 @@ app.use(session({
 }));
 
 // Nextcloud Connector JWT auth — handles requests from the Bee Flow ExApp
-// connector. Tagged with `X-Beeflow-Source: nextcloud-connector`; falls
-// through to patAuth for everything else. Populates req.session the same
-// way patAuth does so downstream handlers see no difference.
+// connector. Tagged with `X-Beeflow-Source: nextcloud-connector`. Populates
+// req.session so downstream handlers see no difference from a cookie session.
 app.use(require('./auth/connectorJwt'));
-
-// Personal Access Token auth — runs after session, populates session if Bearer token is valid
-app.use(require('./auth/patAuth'));
-
-
 
 // ── Session-token bridge (popup→iframe handoff for embedded mode) ──
 // Helpers live in utils/sessionToken so OAuth callback can mint pickup tokens.
@@ -195,7 +185,18 @@ app.use(async (req, res, next) => {
     const sessionToken = req.headers['x-session-token'];
     if (sessionToken) {
         const data = await getSessionToken(sessionToken);
-        if (data) Object.assign(req.session, data);
+        if (data) {
+            Object.assign(req.session, data);
+            // Re-validate license on bridge transfer. Without this the iframe
+            // would inherit whatever tier was cached when the parent session
+            // was created — possibly stale after a revocation/upgrade. The
+            // resolution is memoised on req.session for 30s anyway.
+            try {
+                const { resolveBestTierForRequest } = require('./license/middleware');
+                const resolution = await resolveBestTierForRequest(req);
+                req.session._bridgeTier = resolution.tier;
+            } catch (_e) { /* non-fatal */ }
+        }
     }
     next();
 });
@@ -276,6 +277,7 @@ app.use('/ai', aiRouter);
 app.use('/workflow-ai', (req, res) => res.status(404).json({ error: 'Workflow AI removed' }));
 app.use('/', executeRouter);
 app.use('/agents/memory', memoryRouter);   // Must be before /agents
+app.use('/api/agent-presets', require('./routes/agentPresets'));
 app.use('/agents', agentsRouter);
 app.use('/reports', reportsRouter);
 app.use('/apps', appsRouter);
@@ -285,11 +287,17 @@ app.use('/api/usage', require('./routes/usage'));
 app.use('/api/terminations', require('./routes/terminations'));
 app.use('/api/feedback', require('./routes/feedback'));
 app.use('/api/client-errors', require('./routes/clientErrors'));
+app.use('/api/web-vitals', require('./routes/webVitals'));
+app.use('/api/csp-report', require('./routes/cspReport'));
 app.use('/api/org-privacy-shield', require('./routes/orgPrivacyShield'));
 app.use('/api/org-azure-config', require('./routes/orgAzureConfig'));
 app.use('/api/house-styles', require('./routes/houseStyles'));
 // Compliance Hub — Enterprise-tier feature.
 app.use('/api/compliance', (req, res, next) => require('./license/middleware').requireFeature('compliance_hub_gdpr')(req, res, next), require('./routes/compliance'));
+// DSR — public submission must remain reachable (GDPR Art. 12). Admin endpoints
+// inside the router enforce admin_compliance permission; the router is mounted
+// without the license gate so unauthenticated subjects can submit requests.
+app.use('/api/dsr', require('./routes/dsr'));
 app.use('/api/chat/dlp-decision', require('./routes/dlpDecision'));
 app.use('/api/cms', require('./routes/cms'));
 // Nextcloud webhook + admin sync — mounted under /auth so they share the
@@ -384,13 +392,12 @@ app.use('/api/skills', requireLicenseFeature('skills'), requireBetaFeature('skil
 const ticketAssistantRouter = require('./routes/ticketAssistant');
 app.use('/api/ticket-assistant', requireLicenseFeature('ticket_assistant'), requireBetaFeature('itil_ticket_assistant'), ticketAssistantRouter);
 app.use('/api/email-kb',        requireLicenseFeature('ticket_assistant'), requireBetaFeature('itil_ticket_assistant'), ticketAssistantRouter);
-app.use('/api/browser-agent', require('./routes/browserAgent'));
-app.use('/api/pat', requireBetaFeature('personal_access_tokens'), require('./routes/personalAccessTokens'));
 
 app.use('/', require('./routes/knowledge'));
 app.use('/api/kb', require('./routes/knowledgeBases'));
 app.use('/api/languages', require('./routes/admin/languageRoutes'));
 app.use('/api/icons', require('./routes/icons'));
+app.use('/api/branding', require('./routes/branding'));
 
 // ── SPA fallback (production) ─────────────────────────────────────────────────
 if (process.env.NODE_ENV === 'production') {
@@ -413,11 +420,71 @@ app.listen(PORT, '0.0.0.0', () => {
     const { runBootInit } = require('./boot-init');
     runBootInit().catch(err => console.error('[boot-init] Fatal:', err));
 
+    // Dutch Legal Sources — auto-seed the system KB if it's empty. The
+    // service itself is idempotent (content_hash skip) and runs in the
+    // background via setImmediate, so this never blocks boot. Admins can
+    // re-trigger from the System Knowledge Bases admin panel.
+    try {
+        const dutchLawIngest = require('./services/dutchLawIngest');
+        dutchLawIngest.seedIfMissing();
+    } catch (e) {
+        console.warn('[dutchLawIngest] Boot auto-seed could not start:', e.message);
+    }
+
+    // CPU cross-encoder + CPU embedder — pre-load the Transformers.js
+    // pipelines so the first user KB search / web rerank doesn't pay the
+    // ~280 MB cold-start cost. Both warmup()s are non-blocking and
+    // fail-open; if the model load fails the pipelines stay disabled and
+    // search falls back to RRF / cosine.
+    try {
+        const { warmup: warmRerank } = require('./core/rerank/cpuCrossEncoder');
+        const { warmup: warmEmbed } = require('./core/embed/cpuEmbed');
+        setImmediate(() => { warmRerank().catch(() => {}); });
+        setImmediate(() => { warmEmbed().catch(() => {}); });
+    } catch (e) {
+        console.warn('[CpuPipelines] Warmup could not start:', e.message);
+    }
+
     // License refresh scheduler — periodic ping to license.beeflow.ai for
     // monthly licenses. Yearly/lifetime licenses are validated by JWT exp
     // and skip this loop. Disable with LICENSE_REFRESH_DISABLED=true.
     try { require('./license/refresh').start(); } catch (e) {
         console.warn('[License Refresh] Failed to start scheduler:', e.message);
+    }
+
+    // Dunning + trial-expiry schedulers. The dunning tick scans for orgs
+    // that have been past_due longer than STRIPE_DUNNING_GRACE_DAYS and
+    // flips them to suspended. The trial tick suspends trials whose
+    // trial_end_date is in the past and that don't have payment_status='paid'.
+    // Both are idempotent and re-run safely.
+    try {
+        const userStore = require('./stores/userStore');
+        const DUNNING_INTERVAL_MS = parseInt(process.env.STRIPE_DUNNING_TICK_INTERVAL_MS || String(6 * 60 * 60 * 1000), 10);
+        const DUNNING_GRACE_DAYS = parseInt(process.env.STRIPE_DUNNING_GRACE_DAYS || '7', 10);
+        const TRIAL_TICK_INTERVAL_MS = parseInt(process.env.TRIAL_EXPIRY_TICK_INTERVAL_MS || String(30 * 60 * 1000), 10);
+        const runDunningTick = async () => {
+            try {
+                const r = await userStore.suspendPastDueSubscriptions(DUNNING_GRACE_DAYS);
+                if (r.orgs || r.consumers) {
+                    console.log(`[Dunning] suspended orgs=${r.orgs} consumers=${r.consumers} grace_days=${DUNNING_GRACE_DAYS}`);
+                }
+            } catch (e) { console.error('[Dunning] tick error:', e.message); }
+        };
+        const runTrialExpiryTick = async () => {
+            try {
+                const r = await userStore.expireOverdueTrials();
+                if (r.orgs || r.consumers) {
+                    console.log(`[TrialExpiry] suspended orgs=${r.orgs} consumers=${r.consumers}`);
+                }
+            } catch (e) { console.error('[TrialExpiry] tick error:', e.message); }
+        };
+        setTimeout(runDunningTick, 60_000).unref();
+        setInterval(runDunningTick, DUNNING_INTERVAL_MS).unref();
+        setTimeout(runTrialExpiryTick, 45_000).unref();
+        setInterval(runTrialExpiryTick, TRIAL_TICK_INTERVAL_MS).unref();
+        console.log(`[Server] Dunning+TrialExpiry schedulers started (dunning=${DUNNING_INTERVAL_MS}ms grace=${DUNNING_GRACE_DAYS}d, trial=${TRIAL_TICK_INTERVAL_MS}ms)`);
+    } catch (e) {
+        console.warn('[Server] Failed to start dunning/trial schedulers:', e.message);
     }
 
     // Non-invasive self-check of every org Privacy Shield blob. Logs warnings
@@ -441,9 +508,11 @@ app.listen(PORT, '0.0.0.0', () => {
         warmLocalWhisper();
     }
 
-    // Register and schedule AI Act + GDPR compliance checks (6-hour interval).
+    // Register and schedule AI Act + GDPR compliance checks (6-hour interval,
+    // multi-tenant). Also start the Art-5(1)(e) memory retention enforcer.
     require('./compliance/checks');
     require('./compliance/scheduler').start();
+    require('./jobs/memoryRetentionEnforcer').start();
 
     // Seed system agents into the database (explicit lifecycle call, not a require() side-effect)
     const { seedSystemAgents } = require('./stores/agent/systemAgents');

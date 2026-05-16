@@ -297,4 +297,71 @@ async function selfCheckOrgShields() {
     }
 }
 
-module.exports = { resolveOrgShield, mergeWithOrgShield, selfCheckOrgShields };
+/**
+ * Resolve a *user-level* privacy shield for consumer accounts (no org).
+ * Stored under `user_privacy_shield_${userId}` by the consumer Privacy
+ * Shield settings panel. Returns null when the user hasn't enabled it,
+ * mirroring resolveOrgShield's contract so callers can use the same
+ * downstream merge logic.
+ *
+ * The shape returned is intentionally a subset of resolveOrgShield's
+ * output — consumer accounts can't configure regex collections, DLP,
+ * Content Safety moderation, or web-search guard categories. They get
+ * the basic Privacy Shield: EU mode, search-on-upload, and PII detection
+ * with per-category, threshold and action choices.
+ */
+async function resolveUserShield(userId) {
+    if (!userId) return null;
+    const shield = await configStore.getConfig(`user_privacy_shield_${userId}`);
+    if (!shield?.enabled) return null;
+
+    const piiEnabled = !!shield.piiDetectionEnabled;
+    return {
+        enabled: true,
+        rulesWithNames: [],
+        stalenessWarnings: [],
+        scope: { userInput: true, agentOutput: true },
+        action: 'delete',
+        // PII — the user opted in via the consumer panel
+        azurePiiEnabled: piiEnabled,
+        localPiiEnabled: piiEnabled,
+        piiDetectionCategories: Array.isArray(shield.piiDetectionCategories) ? shield.piiDetectionCategories : [],
+        piiDetectionConfidenceThreshold: typeof shield.piiDetectionConfidenceThreshold === 'number' ? shield.piiDetectionConfidenceThreshold : 0.7,
+        piiDetectionAction: ['block', 'tokenize'].includes(shield.piiDetectionAction) ? shield.piiDetectionAction : 'tokenize',
+        // Moderation / DLP / web-search guard are org-only features
+        moderationEnabled: false,
+        moderationProvider: 'azure',
+        moderationCategories: [],
+        euModeEnabled: !!shield.euModeEnabled,
+        webSearchGuardEnabled: false,
+        disableSearchOnUpload: !!shield.disableSearchOnUpload,
+        monitorIntegrations: false,
+        showRawPayload: !!shield.showRawPayload,
+        webSearchGuardPiiCategories: [],
+        dlpEnabled: false,
+        dlpScope: 'external',
+        dlpMode: 'ask',
+        dlpFailureMode: 'fail_closed',
+        dlpAllowlistedHosts: [],
+        customSensitiveTerms: [],
+        // Canonical Privacy fields (mirror of org synth path).
+        privacyScanEnabled: piiEnabled,
+        privacyAction: shield.piiDetectionAction === 'block' ? 'block' : 'redact',
+        privacyScope: 'external',
+        privacyFailureMode: 'fail_closed',
+    };
+}
+
+/**
+ * Convenience for code paths that have both an orgId (often null for
+ * consumer accounts) and a userId. Returns the org shield when it exists,
+ * otherwise falls back to the user shield, otherwise null. Keeps callers
+ * from having to branch on "do I have an org?" themselves.
+ */
+async function resolveShieldFor({ orgId, userId }) {
+    const org = orgId ? await resolveOrgShield(orgId) : null;
+    if (org) return org;
+    return resolveUserShield(userId);
+}
+
+module.exports = { resolveOrgShield, resolveUserShield, resolveShieldFor, mergeWithOrgShield, selfCheckOrgShields };

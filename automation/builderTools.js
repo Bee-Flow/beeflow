@@ -49,11 +49,49 @@ function canonicalizeInputs(inputs) {
     return out;
 }
 
+// Normalise a ref path the way weaker models tend to mangle it:
+//   $steps.x.output.y   → steps.x.output.y     (leading $ for "expression")
+//   steps[x].output[y]  → steps.x.output.y     (bracket access)
+//   .steps.x.output.y   → steps.x.output.y     (leading dot)
+//   steps . x . output  → steps.x.output       (stray whitespace)
+function _normalizeRefPath(path) {
+    if (typeof path !== 'string') return path;
+    return path
+        .trim()
+        .replace(/^\$+/, '')
+        .replace(/\[\s*['"]?([^\]'"]+)['"]?\s*\]/g, '.$1')
+        .replace(/^\.+/, '')
+        .replace(/\s*\.\s*/g, '.')
+        .replace(/\.{2,}/g, '.');
+}
+
 function canonicalizeBinding(v) {
-    // Already a binding wrapper — pass through.
+    // Already a binding wrapper with a recognised kind — normalise ref/template values then pass through.
     if (v && typeof v === 'object' && !Array.isArray(v) && typeof v.kind === 'string'
         && ['literal', 'ref', 'template', 'expr'].includes(v.kind)) {
+        if (v.kind === 'ref' && typeof v.path === 'string') {
+            const normalised = _normalizeRefPath(v.path);
+            if (normalised !== v.path) return { ...v, path: normalised };
+        }
         return v;
+    }
+    // Wrapper with no kind but has a discriminating field — infer the kind.
+    // Weaker models often emit { value: "..." } or { path: "..." } without
+    // the kind tag; we recover those instead of silently flattening to literal.
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+        if (typeof v.path === 'string') {
+            return { kind: 'ref', path: _normalizeRefPath(v.path) };
+        }
+        if ('value' in v && Object.keys(v).every(k => k === 'value' || k === 'kind')) {
+            const val = v.value;
+            if (typeof val === 'string' && /\{\{[^}]+\}\}/.test(val)) {
+                return { kind: 'template', value: val };
+            }
+            return { kind: 'literal', value: val };
+        }
+        // Unrecognised object shape → wrap as literal so the runtime
+        // doesn't see an opaque blob. The LLM gets a repair hint via
+        // validateAndFixBindings so it learns the right shape.
     }
     // String containing {{...}} → template.
     if (typeof v === 'string' && /\{\{[^}]+\}\}/.test(v)) {
@@ -61,6 +99,15 @@ function canonicalizeBinding(v) {
     }
     // Anything else → literal. This is the safe, runtime-friendly choice.
     return { kind: 'literal', value: v };
+}
+
+// Was the raw value already in canonical binding shape? Used by
+// validateAndFixBindings to decide which inputs need a "you sent a bare
+// string, I wrapped it as literal" repair hint sent back to the LLM.
+function _isCanonicalBinding(v) {
+    return v && typeof v === 'object' && !Array.isArray(v)
+        && typeof v.kind === 'string'
+        && ['literal', 'ref', 'template', 'expr'].includes(v.kind);
 }
 
 const VALID_REF_ROOTS = new Set(['trigger', 'steps', 'vars', 'secrets', 'loop']);
@@ -268,6 +315,24 @@ function validateAndFixBindings(rawInputs, draft) {
     const fixed = canonicalizeInputs(rawInputs || {});
     const triggerFields = new Set(triggerFieldsFor(draft));
     const errors = [];
+    const repairs = [];
+
+    // Record auto-wrapping: if the caller passed a bare value (string, number,
+    // boolean, plain {value:...}) for a key, canonicalizeBinding already wrapped
+    // it as literal. Surface this to the LLM as a repair hint so the next call
+    // uses the binding shape directly.
+    for (const [k, raw] of Object.entries(rawInputs || {})) {
+        if (!_isCanonicalBinding(raw)) {
+            const cur = fixed[k];
+            if (cur && cur.kind === 'literal') {
+                repairs.push(`inputs.${k}: wrapped bare value as {kind:"literal", value:…}. Use the binding shape next time.`);
+            } else if (cur && cur.kind === 'template') {
+                repairs.push(`inputs.${k}: detected {{…}} placeholders in a bare string; wrapped as {kind:"template", value:…}.`);
+            } else if (cur && cur.kind === 'ref') {
+                repairs.push(`inputs.${k}: inferred ref shape from {path:…}; wrapped as {kind:"ref", path:…}.`);
+            }
+        }
+    }
 
     for (const [k, v] of Object.entries(fixed)) {
         if (!v || typeof v !== 'object') continue;
@@ -275,19 +340,38 @@ function validateAndFixBindings(rawInputs, draft) {
         if (v.kind === 'ref' && typeof v.path === 'string') {
             const cleaned = v.path.replace(/^\.+/, '').trim();
             const root = cleaned.split('.')[0];
+            // Handle "trigger.<field>" (skipping the .output. segment) BEFORE the
+            // VALID_REF_ROOTS short-circuit, because 'trigger' is itself a valid
+            // root and the short-circuit would otherwise leave the path broken.
+            const segments = cleaned.split('.');
+            if (root === 'trigger' && segments.length === 2 && segments[1] !== 'output' && triggerFields.has(segments[1])) {
+                v.path = `trigger.output.${segments[1]}`;
+                repairs.push(`inputs.${k}: inserted .output. segment → "${v.path}".`);
+                continue;
+            }
             if (VALID_REF_ROOTS.has(root)) {
-                if (cleaned !== v.path) v.path = cleaned;
+                if (cleaned !== v.path) {
+                    v.path = cleaned;
+                    repairs.push(`inputs.${k}: cleaned ref path to "${cleaned}".`);
+                }
                 continue;
             }
             if (triggerFields.has(cleaned)) {
                 v.path = `trigger.output.${cleaned}`;
+                repairs.push(`inputs.${k}: prepended root → "${v.path}". Always start ref paths with trigger/steps/vars/secrets/loop.`);
+                continue;
+            }
+            // "output.foo" → "trigger.output.foo" (when foo is a known trigger field).
+            if (cleaned.startsWith('output.') && triggerFields.has(cleaned.slice('output.'.length))) {
+                v.path = `trigger.${cleaned}`;
+                repairs.push(`inputs.${k}: prepended trigger root → "${v.path}".`);
                 continue;
             }
             errors.push(
                 `inputs.${k}: ref path "${v.path}" has unknown root "${root}". `
                 + `Valid roots: trigger, steps, vars, secrets, loop. `
                 + (triggerFields.size
-                    ? `For this Gmail trigger use trigger.output.<field>, e.g. trigger.output.${triggerFields.has(cleaned) ? cleaned : 'subject'}.`
+                    ? `For this trigger use trigger.output.<field>, e.g. trigger.output.${triggerFields.has(cleaned) ? cleaned : 'subject'}.`
                     : 'Use e.g. trigger.output.<field> or steps.<id>.output.<field>.')
             );
         }
@@ -297,14 +381,21 @@ function validateAndFixBindings(rawInputs, draft) {
             // identifier matches a known trigger field. Reject anything else
             // that has an unknown root.
             const bad = [];
+            const rewrites = [];
             v.value = v.value.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (full, expr) => {
                 const cleaned = expr.replace(/^\.+/, '').trim();
                 const root = cleaned.split('.')[0];
                 if (VALID_REF_ROOTS.has(root)) return `{{${cleaned}}}`;
-                if (triggerFields.has(cleaned)) return `{{trigger.output.${cleaned}}}`;
+                if (triggerFields.has(cleaned)) {
+                    rewrites.push(cleaned);
+                    return `{{trigger.output.${cleaned}}}`;
+                }
                 bad.push(expr);
                 return full;
             });
+            if (rewrites.length) {
+                repairs.push(`inputs.${k}: template placeholders ${rewrites.map(s => `"${s}"`).join(', ')} prepended with trigger.output.`);
+            }
             if (bad.length) {
                 errors.push(
                     `inputs.${k}: template references ${bad.map(s => `"${s}"`).join(', ')} which has unknown root. `
@@ -314,7 +405,11 @@ function validateAndFixBindings(rawInputs, draft) {
         }
     }
 
-    return { inputs: fixed, error: errors.length ? errors.join(' ') : null };
+    return {
+        inputs: fixed,
+        error: errors.length ? errors.join(' ') : null,
+        repairs: repairs.length ? repairs : undefined,
+    };
 }
 
 function lastStepId(def) {
@@ -806,6 +901,38 @@ leading search step just to look up data that's already in the payload.`,
     {
         type: 'function',
         function: {
+            name: 'builder_add_array_op',
+            description: `Append an array operation step. Single entry point for filter / limit / dedupe / aggregate / summarize — pick \`op\` and supply the matching fields. Preferred over the five individual builder_add_{filter,limit,dedupe,aggregate,summarize} tools (which still work but are legacy).
+
+OPS:
+  - filter:    keep items matching expr.    Required: arrayRef, expr.        Output: { items, count }.
+  - limit:     first/last N items.          Required: arrayRef, count.       Optional: mode ("first"|"last"). Output: { items, count }.
+  - dedupe:    drop duplicates.             Required: arrayRef.               Optional: keyField (dedup by that field; else deep equality). Output: { items, removed }.
+  - aggregate: pull one field across items. Required: arrayRef, field.       Output: { values, count }.
+  - summarize: numeric stats over a field.  Required: arrayRef, field, fn.   fn ∈ sum|count|avg|min|max. Output: { result, op, count }.
+
+arrayRef is a path string (e.g. "steps.search.output.results"), NOT a binding object. EXAMPLE: {op:"filter",arrayRef:"steps.search.output.results",expr:"item.amount > 1000"}.`,
+            parameters: {
+                type: 'object',
+                properties: {
+                    op: { type: 'string', enum: ['filter', 'limit', 'dedupe', 'aggregate', 'summarize'] },
+                    afterStepId: { type: 'string' },
+                    arrayRef: { type: 'string', description: 'Dotted path to an upstream array, e.g. "steps.search.output.results".' },
+                    expr: { type: 'string', description: 'filter only: restricted JS expression referencing item.<field>.' },
+                    count: { type: 'integer', description: 'limit only: how many items to keep.' },
+                    mode: { type: 'string', enum: ['first', 'last'], description: 'limit only: default "first".' },
+                    keyField: { type: 'string', description: 'dedupe only: field to dedup by; omit for deep-equality dedup.' },
+                    field: { type: 'string', description: 'aggregate and summarize: field name on each item.' },
+                    fn: { type: 'string', enum: ['sum', 'count', 'avg', 'min', 'max'], description: 'summarize only: which statistic to compute.' },
+                    label: { type: 'string' },
+                },
+                required: ['op', 'arrayRef'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
             name: 'builder_remove_step',
             description: 'Remove a step from the draft by id, including its incident edges.',
             parameters: { type: 'object', properties: { stepId: { type: 'string' } }, required: ['stepId'] },
@@ -1088,6 +1215,36 @@ function applyAddSummarize(draft, args) {
     return { added: step };
 }
 
+// Unified entry point for the five legacy array-op tools. Translates the
+// flatter `builder_add_array_op` schema (op + a handful of optional fields)
+// into the per-op apply* call. Lets the LLM use a single tool name across
+// the array-handling cases — drops the tool-surface by 4 entries which
+// matters on weaker models that get overwhelmed by big tool menus.
+function applyAddArrayOp(draft, args) {
+    const op = args && typeof args.op === 'string' ? args.op : null;
+    if (!op) return { error: 'op is required (filter|limit|dedupe|aggregate|summarize)' };
+    const common = { afterStepId: args.afterStepId, arrayRef: args.arrayRef, label: args.label };
+    switch (op) {
+        case 'filter':
+            if (typeof args.expr !== 'string') return { error: 'filter op requires expr (restricted JS, references item.<field>)' };
+            return applyAddFilter(draft, { ...common, expr: args.expr });
+        case 'limit':
+            if (args.count === undefined || args.count === null) return { error: 'limit op requires count (integer)' };
+            return applyAddLimit(draft, { ...common, count: args.count, mode: args.mode });
+        case 'dedupe':
+            return applyAddDedupe(draft, { ...common, keyField: args.keyField });
+        case 'aggregate':
+            if (typeof args.field !== 'string') return { error: 'aggregate op requires field (the per-item field to pull)' };
+            return applyAddAggregate(draft, { ...common, field: args.field });
+        case 'summarize':
+            if (typeof args.field !== 'string') return { error: 'summarize op requires field (numeric per-item field)' };
+            if (!args.fn) return { error: 'summarize op requires fn (sum|count|avg|min|max)' };
+            return applyAddSummarize(draft, { ...common, field: args.field, op: args.fn });
+        default:
+            return { error: `Unknown array op "${op}". Use one of: filter, limit, dedupe, aggregate, summarize.` };
+    }
+}
+
 function applyRemoveStep(draft, args) {
     const id = args.stepId;
     draft.steps = draft.steps.filter(s => s.id !== id);
@@ -1170,6 +1327,7 @@ const MUTATING_TOOLS = new Set([
     'builder_add_stop_error', 'builder_add_switch',
     'builder_add_filter', 'builder_add_limit', 'builder_add_dedupe',
     'builder_add_aggregate', 'builder_add_summarize',
+    'builder_add_array_op',
 ]);
 
 async function applyToolCall(name, args, draftWrap) {
@@ -1212,6 +1370,7 @@ async function _applyToolCallRaw(name, args, draftWrap) {
         case 'builder_add_dedupe':         return applyAddDedupe(draft, args);
         case 'builder_add_aggregate':      return applyAddAggregate(draft, args);
         case 'builder_add_summarize':      return applyAddSummarize(draft, args);
+        case 'builder_add_array_op':       return applyAddArrayOp(draft, args);
         case 'builder_remove_step':        return applyRemoveStep(draft, args);
         case 'builder_set_metadata':       return applySetMetadata(draftWrap, args);
         case 'builder_summarise':          return applySummarise(draft);

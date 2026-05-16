@@ -17,22 +17,63 @@
  */
 
 const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 const DEFAULT_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours
 let cachedSecret = null;
 
 function getSecret() {
     if (cachedSecret) return cachedSecret;
+
     const fromEnv = process.env.WEBPAGE_PREVIEW_TOKEN_SECRET;
     if (fromEnv && fromEnv.length >= 32) {
         cachedSecret = Buffer.from(fromEnv, 'utf8');
         return cachedSecret;
     }
+
+    // Production must have the env var. Falling back to a random secret
+    // there would invalidate every active preview token on each restart;
+    // we keep the warning loud so operators notice in their logs.
+    if (process.env.NODE_ENV === 'production') {
+        cachedSecret = crypto.randomBytes(32);
+        console.warn(
+            '[WebpagePreviewToken] WEBPAGE_PREVIEW_TOKEN_SECRET is not set in production. ' +
+            'Preview tokens will be invalidated on every restart. Generate one with: ' +
+            'node -e "console.log(require(\'crypto\').randomBytes(48).toString(\'hex\'))" ' +
+            'and add it to your environment.'
+        );
+        return cachedSecret;
+    }
+
+    // Dev: persist the generated secret to a per-project file in OS temp so
+    // a nodemon restart keeps the same secret. Keyed on cwd so two checkouts
+    // get distinct files; tmp is wiped on reboot which is fine for dev.
+    // Silent by design — operators only see noise from this module when
+    // something is actually wrong (production misconfig, write failure).
+    const projHash = crypto.createHash('sha1').update(process.cwd()).digest('hex').slice(0, 12);
+    const cachePath = path.join(os.tmpdir(), `beeflow-webpage-preview-secret-${projHash}`);
+    try {
+        const stored = fs.readFileSync(cachePath);
+        if (stored.length >= 32) {
+            cachedSecret = stored;
+            return cachedSecret;
+        }
+    } catch (_) { /* missing file — first run, fall through */ }
+
     cachedSecret = crypto.randomBytes(32);
-    console.warn(
-        '[WebpagePreviewToken] WEBPAGE_PREVIEW_TOKEN_SECRET is not set (or too short). ' +
-        'Generated a random secret for this process — preview tokens will be invalidated on every restart.'
-    );
+    try {
+        fs.writeFileSync(cachePath, cachedSecret, { mode: 0o600 });
+    } catch (err) {
+        // Persistence failed (read-only tmp, permission issue, …) — fall back
+        // to in-memory only. Worth a warning because tokens will now reset on
+        // every restart for this process.
+        console.warn(
+            `[WebpagePreviewToken] Could not persist dev secret (${err.message}); ` +
+            'preview tokens will be invalidated on every restart.'
+        );
+    }
     return cachedSecret;
 }
 

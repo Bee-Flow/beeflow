@@ -31,6 +31,7 @@ const shapeCache = require('../automation/shapeCache');
 const { summariseDefinition } = require('../automation/summarise');
 const cron = require('../automation/cron');
 const sandbox = require('../automation/codeSandbox');
+const { NOTIFICATION_DEFAULTS, VALID_LEVELS } = require('../automation/notificationDefaults');
 
 const RUNNER_INTERVAL_MS = 60_000;
 const POLLING_INTERVAL_MS = 30_000;
@@ -53,6 +54,39 @@ function clampRunTimeout(automation) {
     const ms = automation?.runTimeoutMs;
     if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return RUN_HARD_TIMEOUT_MS;
     return Math.min(ms, MAX_RUN_TIMEOUT_MS);
+}
+
+// Deep-clone for run-state and step outputs. Without this, an object output
+// stored in `runState.steps[...]` is shared by reference with downstream
+// steps' inputs; if one mutates the object, every later binding to the same
+// step's output sees the mutated value, and a resume / partial-run loaded
+// from `replayState` corrupts the persisted run row on subsequent partial
+// executions.
+function cloneRunValue(value) {
+    if (value === null || value === undefined) return value;
+    if (typeof value !== 'object') return value;
+    try { return structuredClone(value); }
+    catch { return JSON.parse(JSON.stringify(value)); }
+}
+
+/**
+ * Per-automation notification policy. Merges the user-saved
+ * `definition.notificationSettings[event]` (if any) over the shared
+ * defaults so a missing field on an older automation row picks up the
+ * baseline behaviour without a backfill migration.
+ *
+ * The returned `level` is hard-allowlisted against the four valid
+ * notification categories so a malformed JSON edit in the inspector
+ * can't crash createNotification.
+ */
+function resolveNotificationPolicy(automation, event) {
+    const baseline = NOTIFICATION_DEFAULTS[event];
+    if (!baseline) return { enabled: false, level: 'info' };
+    const settings = automation?.definition?.notificationSettings || {};
+    const merged = { ...baseline, ...(settings[event] || {}) };
+    if (!VALID_LEVELS.includes(merged.level)) merged.level = baseline.level;
+    merged.enabled = !!merged.enabled;
+    return merged;
 }
 
 // ── Run cancellation registry ───────────────────────────
@@ -733,7 +767,16 @@ async function execParallel(step, ctx, runState, mode, dispatchSubStep) {
         return { output: { branches: [] } };
     }
     const results = await Promise.allSettled(branches.map((branchSteps, branchIndex) => {
-        const subState = { ...runState, parallel: { ...(runState.parallel || {}), _branchIndex: branchIndex } };
+        // Each branch needs its own `steps` map so concurrent writes don't
+        // clobber sibling branches. Upstream steps are visible (the clone
+        // copies them in); branch-internal writes stay local. Per-branch
+        // step outputs are still persisted to `automation_run_steps` via
+        // recordRunStep so the run history captures everything.
+        const subState = {
+            ...runState,
+            steps: { ...(runState.steps || {}) },
+            parallel: { ...(runState.parallel || {}), _branchIndex: branchIndex },
+        };
         const subDef = {
             steps: branchSteps || [],
             edges: buildLinearEdges(branchSteps || []),
@@ -745,7 +788,15 @@ async function execParallel(step, ctx, runState, mode, dispatchSubStep) {
         if (r.status === 'fulfilled') {
             return { branchIndex: idx, status: 'success', output: r.value?.lastOutput ?? null };
         }
-        return { branchIndex: idx, status: 'error', error: r.reason?.message || String(r.reason) };
+        const reason = r.reason;
+        return {
+            branchIndex: idx,
+            status: 'error',
+            error: reason?.message || String(reason),
+            errorName: reason?.name || null,
+            errorStack: reason?.stack || null,
+            errorCause: reason?.cause ? (reason.cause.message || String(reason.cause)) : null,
+        };
     });
     if (step.failOnAnyBranchError && branchOutputs.some(b => b.status === 'error')) {
         const firstError = branchOutputs.find(b => b.status === 'error');
@@ -986,7 +1037,7 @@ async function execSummarize(step, ctx, runState) {
 
 // ── Core DAG run ────────────────────────────────────────
 
-async function runDag(def, ctx, runStateInit, mode, dispatchStep, { recordSteps = true, branchIndex = null, skipUntilStepId = null } = {}) {
+async function runDag(def, ctx, runStateInit, mode, dispatchStep, { recordSteps = true, branchIndex = null, skipUntilStepId = null, onlyStepId = null, fromStepId = null } = {}) {
     const { adj, stepById } = buildAdjacency(def);
     const runState = runStateInit;
     const triggerId = def.trigger?.id;
@@ -996,11 +1047,14 @@ async function runDag(def, ctx, runStateInit, mode, dispatchStep, { recordSteps 
     let queue = [triggerId];
     let lastOutput = null;
 
-    // Resume-from-step: when set, skip dispatch+record for every step up to
-    // and INCLUDING `skipUntilStepId`. Their outputs must already be in
-    // runState.steps from the resume bootstrap. This lets us replay a
-    // failed/approval-paused run from the next step onwards.
-    let stillSkipping = !!skipUntilStepId;
+    // Resume / partial-execution flags:
+    //   - skipUntilStepId: replay all steps up to AND INCLUDING this id,
+    //     then dispatch live. Used by approval-resume.
+    //   - fromStepId: replay all steps before this id, then dispatch this
+    //     step and everything downstream live. Used by retry-from-step.
+    //   - onlyStepId: replay all steps before this id, dispatch only this
+    //     step, then stop. Used by "Execute Step" (n8n-style single-node run).
+    let stillSkipping = !!(skipUntilStepId || fromStepId || onlyStepId);
 
     while (queue.length > 0) {
         const id = queue.shift();
@@ -1009,32 +1063,53 @@ async function runDag(def, ctx, runStateInit, mode, dispatchStep, { recordSteps 
         const step = stepById.get(id);
         if (!step) continue;
 
+        const isTargetForFrom = !!(fromStepId && step.id === fromStepId);
+        const isTargetForOnly = !!(onlyStepId && step.id === onlyStepId);
+
         let nextLabel = null; // for condition branching
         if (id === triggerId) {
             // Trigger output is already in runState.trigger.output
             nextLabel = null;
-        } else if (stillSkipping) {
+        } else if (stillSkipping && !isTargetForFrom && !isTargetForOnly) {
             // Replay path — outputs already in runState.steps; honour
             // condition branching so the resumed traversal follows the
-            // same edge that the original run did.
+            // same edge that the original run did. If a condition/switch
+            // step is replayed without a `branch` marker, we'd fall back
+            // to following *every* outgoing edge — fail loudly instead.
             const replayed = runState.steps?.[step.id]?.output;
-            if (step.type === 'condition' && replayed?.branch) nextLabel = replayed.branch;
-            if (step.type === 'switch' && replayed?.branch) nextLabel = replayed.branch;
+            if (step.type === 'condition') {
+                if (replayed && replayed.branch) nextLabel = replayed.branch;
+                else throw new Error(`Replay missing branch label on condition step ${step.id}`);
+            }
+            if (step.type === 'switch') {
+                if (replayed && replayed.branch) nextLabel = replayed.branch;
+                else throw new Error(`Replay missing branch label on switch step ${step.id}`);
+            }
             if (step.id === skipUntilStepId) stillSkipping = false;
         } else {
+            // Live dispatch. fromStepId/onlyStepId targets break us out of
+            // the skip block; their dispatch is the resumption point.
+            if (isTargetForFrom || isTargetForOnly) stillSkipping = false;
             const dispatched = await dispatchStep(step, ctx, runState, mode);
-            // Save into runState
+            // Save into runState. Clone the output so downstream steps
+            // that mutate it can't corrupt the cached binding source.
             runState.steps = runState.steps || {};
-            runState.steps[step.id] = { output: dispatched.output, status: 'success' };
+            const recordedStatus = dispatched.skippedReason === 'pinned' ? 'pinned'
+                : dispatched.skippedReason ? 'skipped' : 'success';
+            runState.steps[step.id] = { output: cloneRunValue(dispatched.output), status: recordedStatus };
             lastOutput = dispatched.output;
             if (recordSteps && ctx.runId) {
+                // When dispatchStep returns from a retry-success path, it
+                // tags the result with `attempt` + `attemptStartedAt` so
+                // this row lands on attempts=N rather than overwriting the
+                // attempts=1 'error' row recorded inside the catch.
                 await automationStore.recordRunStep({
                     runId: ctx.runId,
                     stepId: step.id,
                     stepType: step.type,
-                    attempts: 1,
-                    status: 'success',
-                    startedAt: dispatched.startedAt,
+                    attempts: dispatched.attempt || 1,
+                    status: recordedStatus,
+                    startedAt: dispatched.attemptStartedAt || dispatched.startedAt,
                     finishedAt: new Date().toISOString(),
                     input: dispatched.inputSnapshot ?? null,
                     output: dispatched.output ?? null,
@@ -1050,6 +1125,8 @@ async function runDag(def, ctx, runStateInit, mode, dispatchStep, { recordSteps 
             if (step.type === 'switch' && dispatched.output?.branch) {
                 nextLabel = dispatched.output.branch;
             }
+            // onlyStepId terminates the walk after dispatching the target.
+            if (isTargetForOnly) break;
         }
 
         const outEdges = nextEdgesFor(id, adj, nextLabel);
@@ -1061,7 +1138,7 @@ async function runDag(def, ctx, runStateInit, mode, dispatchStep, { recordSteps 
 
 // ── Top-level executeAutomation ─────────────────────────
 
-async function executeAutomation(automation, { triggerKind = 'manual', triggerPayload = null, mode = 'live', confirmFirstRun = false, parentRunId = null, replayState = null, skipUntilStepId = null } = {}) {
+async function executeAutomation(automation, { triggerKind = 'manual', triggerPayload = null, mode = 'live', confirmFirstRun = false, parentRunId = null, replayState = null, skipUntilStepId = null, onlyStepId = null, fromStepId = null } = {}) {
     const startedAt = Date.now();
     const session = await resolveUserSession(automation.userId);
 
@@ -1103,11 +1180,16 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
         trigger: { output: triggerPayload || {} },
         // Hydrate from a previous run's recorded outputs when resuming —
         // bindings like {{steps.stepA.output.field}} need the values the
-        // original run produced.
-        steps: replayState ? { ...replayState } : {},
+        // original run produced. Deep-clone the replay snapshot so step
+        // handlers can't mutate the persisted prior-run rows.
+        steps: replayState ? (cloneRunValue(replayState) || {}) : {},
         vars: automation.definition?.vars || {},
         secrets: {}, // populated by sandbox/secret bridges only; never echoed
         loop: {},
+        // When non-null, interpolateTemplate pushes unresolved paths here so
+        // the runner can surface a single warning summary per run instead of
+        // silently swallowing missing bindings.
+        _templateWarnings: [],
     };
 
     // Resolve the automation owner's groups once per run. Used by webpage
@@ -1155,6 +1237,38 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
             step.id = `unknown_${Math.random().toString(36).slice(2, 8)}`;
             console.warn(`[AutomationRunner] Step missing id; synthesized ${step.id}`);
         }
+
+        // n8n-style data pinning. When a step has `pinnedOutput` we skip
+        // the real handler and emit the pinned value verbatim — saves
+        // upstream API/model calls during iterative debugging. Pinned
+        // steps record as 'success' with source='pinned' so audit trails
+        // distinguish synthetic outputs from live ones.
+        if (step.pinnedOutput !== undefined && step.pinnedOutput !== null) {
+            return {
+                output: step.pinnedOutput,
+                startedAt: stepStartedAt,
+                inputSnapshot: step.inputs ? resolveDeep(step.inputs, state_, { allowSecrets: false }) : null,
+                pinned: true,
+                // 'pinned' status threads through runDag's recordedStatus
+                // mapper so audit rows can distinguish synthetic from live
+                // outputs without having to inspect the output JSON itself.
+                skippedReason: 'pinned',
+            };
+        }
+
+        // n8n-style "disable this node" toggle. Disabled steps pass
+        // their resolved input through as `{ disabled: true, input }`
+        // so downstream bindings don't crash on undefined, and never
+        // call into integrations / models / notifications.
+        if (step.disabled) {
+            return {
+                output: { disabled: true },
+                startedAt: stepStartedAt,
+                inputSnapshot: step.inputs ? resolveDeep(step.inputs, state_, { allowSecrets: false }) : null,
+                skippedReason: 'disabled',
+            };
+        }
+
         let result;
         try {
             switch (step.type) {
@@ -1183,11 +1297,36 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
             result.inputSnapshot = step.inputs ? resolveDeep(step.inputs, state_, { allowSecrets: false }) : null;
             return result;
         } catch (err) {
+            const inputForRecord = step.inputs ? resolveDeep(step.inputs, state_, { allowSecrets: false }) : null;
+            // Approval pauses are not errors — record the step as
+            // 'awaiting_approval' so run history shows the pause point and
+            // the resume path can find it.
+            if (err instanceof ApprovalRequiredError) {
+                await automationStore.recordRunStep({
+                    runId: ctx_.runId, stepId: step.id, stepType: step.type, attempts: 1,
+                    status: 'awaiting_approval', startedAt: stepStartedAt, finishedAt: new Date().toISOString(),
+                    input: inputForRecord,
+                    output: { prompt: err.prompt }, error: null,
+                });
+                throw err;
+            }
+            // Record the initial failed attempt up-front. Without this, an
+            // initial fail followed by a successful retry would erase the
+            // original error from the audit trail (runDag would overwrite
+            // attempts=1 from 'error' to 'success'). Subsequent retries are
+            // recorded as attempts=i+1 by the retry loop below.
+            await automationStore.recordRunStep({
+                runId: ctx_.runId, stepId: step.id, stepType: step.type, attempts: 1,
+                status: 'error', startedAt: stepStartedAt, finishedAt: new Date().toISOString(),
+                input: inputForRecord,
+                output: null, error: err.message,
+            });
             // Attempt retry per step config.
             const retry = step.retry || null;
             if (retry && retry.max && retry.max > 0) {
                 for (let i = 1; i <= retry.max; i++) {
                     if (retry.backoffMs) await new Promise(r => setTimeout(r, retry.backoffMs));
+                    const attemptStartedAt = new Date().toISOString();
                     try {
                         const retryResult = await {
                             integration_action: () => execIntegrationAction(step, ctx_, state_, mode_),
@@ -1214,45 +1353,27 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
                             aggregate:          () => execAggregate(step, ctx_, state_),
                             summarize:          () => execSummarize(step, ctx_, state_),
                         }[step.type]();
-                        await automationStore.recordRunStep({
-                            runId: ctx_.runId, stepId: step.id, stepType: step.type, attempts: i + 1,
-                            status: 'success', startedAt: stepStartedAt, finishedAt: new Date().toISOString(),
-                            input: step.inputs ? resolveDeep(step.inputs, state_, { allowSecrets: false }) : null,
-                            output: retryResult.output, error: null,
-                        });
                         retryResult.startedAt = stepStartedAt;
+                        retryResult.inputSnapshot = inputForRecord;
+                        // Tell runDag to record the final outcome at the
+                        // correct `attempts` slot rather than overwriting
+                        // attempts=1 (the initial-fail row above).
+                        retryResult.attempt = i + 1;
+                        retryResult.attemptStartedAt = attemptStartedAt;
                         return retryResult;
                     } catch (retryErr) {
-                        if (i === retry.max) {
-                            await automationStore.recordRunStep({
-                                runId: ctx_.runId, stepId: step.id, stepType: step.type, attempts: i + 1,
-                                status: 'error', startedAt: stepStartedAt, finishedAt: new Date().toISOString(),
-                                input: step.inputs ? resolveDeep(step.inputs, state_, { allowSecrets: false }) : null,
-                                output: null, error: retryErr.message,
-                            });
-                        }
+                        // Record every retry attempt — not just the last. The
+                        // audit trail otherwise has no rows for intermediate
+                        // failures, hiding flaky-tool patterns from users.
+                        await automationStore.recordRunStep({
+                            runId: ctx_.runId, stepId: step.id, stepType: step.type, attempts: i + 1,
+                            status: 'error', startedAt: attemptStartedAt, finishedAt: new Date().toISOString(),
+                            input: inputForRecord,
+                            output: null, error: retryErr.message,
+                        });
                     }
                 }
             }
-            // Approval pauses are not errors — record the step as
-            // 'awaiting_approval' so run history shows the pause point and
-            // the resume path can find it.
-            if (err instanceof ApprovalRequiredError) {
-                await automationStore.recordRunStep({
-                    runId: ctx_.runId, stepId: step.id, stepType: step.type, attempts: 1,
-                    status: 'awaiting_approval', startedAt: stepStartedAt, finishedAt: new Date().toISOString(),
-                    input: step.inputs ? resolveDeep(step.inputs, state_, { allowSecrets: false }) : null,
-                    output: { prompt: err.prompt }, error: null,
-                });
-                throw err;
-            }
-            // Record error and rethrow so outer catch terminates the run (unless catch.goto).
-            await automationStore.recordRunStep({
-                runId: ctx_.runId, stepId: step.id, stepType: step.type, attempts: 1,
-                status: 'error', startedAt: stepStartedAt, finishedAt: new Date().toISOString(),
-                input: step.inputs ? resolveDeep(step.inputs, state_, { allowSecrets: false }) : null,
-                output: null, error: err.message,
-            });
             throw err;
         }
     };
@@ -1279,7 +1400,7 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
 
     try {
         runResult = await Promise.race([
-            runDag(automation.definition || {}, ctx, runState, effectiveMode, dispatchStep, { recordSteps: true, skipUntilStepId }),
+            runDag(automation.definition || {}, ctx, runState, effectiveMode, dispatchStep, { recordSteps: true, skipUntilStepId, onlyStepId, fromStepId }),
             guard,
             cancelGuard,
         ]);
@@ -1350,35 +1471,50 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
 
     // Notifications — error path uses the sanitized message so we never
     // leak upstream API payloads or bearer tokens echoed in error bodies.
+    // Each event consults the per-automation policy (see
+    // resolveNotificationPolicy) so success-path noise can be silenced
+    // by the user without losing failure / approval alerts.
     try {
         if (firstRunNeedsConfirm) {
-            await notificationStore.createNotification({
-                userId: automation.userId,
-                category: 'heads_up',
-                title: `Confirm first real run of "${automation.title}"`,
-                message: `Your automation produced a dry-run preview. Approve to run it live (run id ${run.id}).`,
-            });
+            const policy = resolveNotificationPolicy(automation, 'onApproval');
+            if (policy.enabled) {
+                await notificationStore.createNotification({
+                    userId: automation.userId,
+                    category: policy.level,
+                    title: `Confirm first real run of "${automation.title}"`,
+                    message: `Your automation produced a dry-run preview. Approve to run it live (run id ${run.id}).`,
+                });
+            }
         } else if (runStatus === 'success' && triggerKind !== 'dry_run' && effectiveMode === 'live') {
-            await notificationStore.createNotification({
-                userId: automation.userId,
-                category: 'ai_task',
-                title: `🤖 ${automation.title}`,
-                message: summary,
-            });
+            const policy = resolveNotificationPolicy(automation, 'onSuccess');
+            if (policy.enabled) {
+                await notificationStore.createNotification({
+                    userId: automation.userId,
+                    category: policy.level,
+                    title: `🤖 ${automation.title}`,
+                    message: summary,
+                });
+            }
         } else if (runStatus === 'error') {
-            await notificationStore.createNotification({
-                userId: automation.userId,
-                category: 'urgent',
-                title: `⚠️ Automation failed: ${automation.title}`,
-                message: userSafeError || 'Unknown error',
-            });
+            const policy = resolveNotificationPolicy(automation, 'onError');
+            if (policy.enabled) {
+                await notificationStore.createNotification({
+                    userId: automation.userId,
+                    category: policy.level,
+                    title: `⚠️ Automation failed: ${automation.title}`,
+                    message: userSafeError || 'Unknown error',
+                });
+            }
         } else if (runStatus === 'awaiting_approval' && runErrorObj instanceof ApprovalRequiredError) {
-            await notificationStore.createNotification({
-                userId: automation.userId,
-                category: 'heads_up',
-                title: `🛂 Approval needed: ${automation.title}`,
-                message: `${runErrorObj.prompt || 'Approval requested'} — open the run history to approve.`,
-            });
+            const policy = resolveNotificationPolicy(automation, 'onApproval');
+            if (policy.enabled) {
+                await notificationStore.createNotification({
+                    userId: automation.userId,
+                    category: policy.level,
+                    title: `🛂 Approval needed: ${automation.title}`,
+                    message: `${runErrorObj.prompt || 'Approval requested'} — open the run history to approve.`,
+                });
+            }
         }
         // No notification for cancelled runs — the user initiated the cancel
         // so they already know. The run history shows the status.
@@ -1535,6 +1671,113 @@ async function start() {
     console.log(`[AutomationRunner] started (instance=${INSTANCE_ID}, 60s schedule, 30s polling, 60s reaper)`);
 }
 
+/**
+ * Run a single step (n8n "Execute step"), or a step and everything
+ * downstream of it (retry-from-step). Builds the synthetic `replayState`
+ * from the most recent successful run's recorded step rows so binding
+ * expressions resolve to real upstream values, and from any step's
+ * `pinnedOutput` so pinned data wins over historical output.
+ *
+ * mode='only' → dispatch just `stepId`, then stop.
+ * mode='from' → dispatch `stepId` and walk the downstream subgraph live.
+ *
+ * The new run is recorded as a CHILD of the most recent run when one
+ * exists so audit history threads back to the run that seeded the
+ * replay. With no prior run, runs from a fresh state.
+ */
+async function runPartial(automation, stepId, { mode = 'only', triggerKind = 'manual', triggerPayload = null } = {}) {
+    if (!stepId) throw new Error('runPartial: stepId is required');
+    const def = automation.definition || {};
+    const steps = Array.isArray(def.steps) ? def.steps : [];
+    const triggerId = def.trigger?.id || null;
+    const isTrigger = triggerId && stepId === triggerId;
+    const target = isTrigger ? def.trigger : steps.find(s => s.id === stepId);
+    if (!target) throw new Error(`runPartial: step ${stepId} not found in definition`);
+
+    // Trigger-only run: there's nothing to execute downstream. Synthesize a
+    // run with just the trigger output so the UI's "Run step" on a trigger
+    // node returns a real run record (the payload IS the output).
+    if (isTrigger && mode === 'only') {
+        const run = await automationStore.createRun({
+            automationId: automation.id,
+            version: automation.version,
+            userId: automation.userId,
+            triggerKind,
+            triggerPayload,
+            mode: 'live',
+            parentRunId: null,
+        });
+        const triggerOutput = triggerPayload || {};
+        const nowIso = new Date().toISOString();
+        try {
+            await automationStore.recordRunStep({
+                runId: run.id,
+                stepId: triggerId,
+                stepType: 'trigger',
+                attempts: 1,
+                status: 'success',
+                startedAt: nowIso,
+                finishedAt: nowIso,
+                input: triggerPayload ?? null,
+                output: triggerOutput,
+                error: null,
+            });
+        } catch (_) { /* recordRunStep is best-effort here */ }
+        await automationStore.updateRun(run.id, {
+            status: 'success',
+            startedAt: nowIso,
+            finishedAt: nowIso,
+            output: triggerOutput,
+            summary: 'Trigger step (no downstream execution)',
+        }).catch(() => {});
+        return { ...run, status: 'success', output: triggerOutput };
+    }
+
+    // Seed replay from the most recent prior run's persisted step rows.
+    // Bindings like {{steps.stepA.output.field}} need real values to
+    // resolve; falling back to {} produces undefined and downstream
+    // bindings silently fail.
+    const prior = await automationStore.getRunsForAutomation(automation.id, { limit: 1 }).catch(() => []);
+    const priorRunId = prior?.[0]?.id || null;
+    const replayState = {};
+    if (priorRunId) {
+        const priorSteps = await automationStore.getRunSteps(priorRunId).catch(() => []);
+        for (const s of priorSteps) {
+            if (s.status === 'success' && s.output != null) {
+                replayState[s.stepId] = { output: s.output, status: 'success' };
+            }
+        }
+    }
+    // Pinned outputs override historical replay so the user's "Pin" wins.
+    for (const s of steps) {
+        if (s.pinnedOutput !== undefined && s.pinnedOutput !== null) {
+            replayState[s.id] = { output: s.pinnedOutput, status: 'success' };
+        }
+    }
+
+    const opts = {
+        triggerKind,
+        triggerPayload,
+        mode: 'live',
+        parentRunId: priorRunId,
+        replayState,
+    };
+    // "From trigger" → run the whole automation downstream of the trigger.
+    // Treating it as a normal run (no fromStepId/onlyStepId) is the cleanest
+    // way to do this and matches the user's intent of "execute from here".
+    if (isTrigger && mode === 'from') {
+        // No partial-execution flags — let runDag walk the full DAG.
+    } else if (mode === 'only') {
+        opts.onlyStepId = stepId;
+    } else if (mode === 'from') {
+        opts.fromStepId = stepId;
+    } else {
+        throw new Error(`runPartial: unknown mode "${mode}" (expected 'only' or 'from')`);
+    }
+
+    return executeAutomation(automation, opts);
+}
+
 module.exports = {
     start,
     executeAutomation,
@@ -1542,6 +1785,7 @@ module.exports = {
     reapStuckAutomations,
     requestCancel,
     resumeFromStep,
+    runPartial,
     ApprovalRequiredError,
     INSTANCE_ID,
 };

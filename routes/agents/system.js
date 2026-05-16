@@ -3,9 +3,15 @@ const agentStore = require('../../stores/agentStore');
 const { getProviderForModel } = require('../../core/aiAgent');
 const { resolveModelWithGlobalFallback, getTierConfig } = require('../../core/modelResolver');
 const llmClient = require('../../core/llmClient');
-const { resolveUserOrgIds } = require('../../auth');
+const { resolveUserOrgIds, requireAuth } = require('../../auth');
+const { perUserRateLimit } = require('../../utils/perUserRateLimit');
 
 const router = express.Router();
+
+// System-agent helpers all make LLM calls. They need auth + a rate limit for
+// the same reason /thread/title and /describe-building do — anonymous users
+// could otherwise drive arbitrary cost.
+const systemHelperLimiter = perUserRateLimit({ windowMs: 60_000, max: 30 });
 
 // ── Generic system agent handler factory ─────────────────────────────────────
 //
@@ -94,7 +100,7 @@ router.get('/system', async (req, res) => {
 // This endpoint uses SSE streaming, so it can't use the generic handler factory.
 // It stays as a standalone implementation.
 
-router.post('/system/prompt-designer/stream', async (req, res) => {
+router.post('/system/prompt-designer/stream', requireAuth, systemHelperLimiter, async (req, res) => {
     try {
         const { message } = req.body;
         if (!message) {
@@ -172,7 +178,7 @@ router.post('/system/prompt-designer/stream', async (req, res) => {
 
 // ── POST /system/conversation-starters/generate ──────────────────────────────
 
-router.post('/system/conversation-starters/generate',
+router.post('/system/conversation-starters/generate', requireAuth, systemHelperLimiter,
     createHandler({
         agentId: 'system-conversation-starters',
         tier: 'smart',
@@ -193,7 +199,7 @@ router.post('/system/conversation-starters/generate',
 
 // ── POST /system/description-improver/generate ───────────────────────────────
 
-router.post('/system/description-improver/generate',
+router.post('/system/description-improver/generate', requireAuth, systemHelperLimiter,
     createHandler({
         agentId: 'system-description-improver',
         tier: 'smart',
@@ -212,7 +218,7 @@ router.post('/system/description-improver/generate',
 
 // ── POST /system/identity-improver/generate ──────────────────────────────────
 
-router.post('/system/identity-improver/generate',
+router.post('/system/identity-improver/generate', requireAuth, systemHelperLimiter,
     createHandler({
         agentId: 'system-identity-improver',
         tier: 'smart',

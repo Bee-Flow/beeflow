@@ -58,7 +58,11 @@ router.delete('/:id/favorite', async (req, res) => {
     }
 });
 
-// Bulk add — used for one-time client→DB migration of legacy localStorage favorites
+// Bulk add — used for one-time client→DB migration of legacy localStorage favorites.
+// Validate each agent exists and the caller can read it before favouriting; without
+// this an attacker could favourite (and later enumerate via GET /favorites)
+// arbitrary agent IDs they have no business seeing.
+const MAX_BULK_FAVORITES = 200;
 router.post('/favorites/bulk', async (req, res) => {
     const userId = requireUser(req, res);
     if (!userId) return;
@@ -66,11 +70,17 @@ router.post('/favorites/bulk', async (req, res) => {
     if (!Array.isArray(agentIds)) {
         return res.status(400).json({ error: 'agentIds array required' });
     }
+    if (agentIds.length > MAX_BULK_FAVORITES) {
+        return res.status(413).json({ error: `Too many agentIds (max ${MAX_BULK_FAVORITES})` });
+    }
     try {
+        const { canReadAgent } = require('./crud');
         for (const id of agentIds) {
-            if (typeof id === 'string' && id) {
-                try { await agentStore.addAgentFavorite(userId, id); } catch (_) { /* skip invalid */ }
-            }
+            if (typeof id !== 'string' || !id) continue;
+            const agent = await agentStore.getAgent(id).catch(() => null);
+            if (!agent) continue;
+            if (!(await canReadAgent(agent, userId, req))) continue;
+            try { await agentStore.addAgentFavorite(userId, id); } catch (_) { /* skip invalid */ }
         }
         const ids = await agentStore.listAgentFavorites(userId);
         res.json(ids);

@@ -54,12 +54,22 @@ async function ensureNotebookKB(notebookId, userId) {
  * @param {string} text       — extracted text content
  * @param {string} sourceName — human label for the source
  */
+// Normalize the human label used for a source — trim and collapse internal
+// whitespace so names like "  My\tDoc \n " don't appear with stray tabs or
+// newlines in the source list UI.
+function normalizeSourceName(name, fallback = 'Untitled source') {
+    if (!name) return fallback;
+    const cleaned = String(name).replace(/\s+/g, ' ').trim();
+    return cleaned.length > 0 ? cleaned.slice(0, 200) : fallback;
+}
+
 async function ingestTextIntoKB(notebookId, sourceId, userId, text, sourceName) {
     if (!text || text.length < 10) {
         await notebookStore.updateSource(sourceId, { status: 'ready', wordCount: 0 });
         return;
     }
 
+    sourceName = normalizeSourceName(sourceName);
     const wordCount = text.split(/\s+/).length;
 
     try {
@@ -110,7 +120,7 @@ async function ingestUrlSource(notebookId, sourceId, userId, url) {
 
         await notebookStore.updateSource(sourceId, {
             metadata: { url: resolvedUrl, charCount: content.length },
-            name: title || url
+            name: normalizeSourceName(title || url, url)
         });
 
         await ingestTextIntoKB(notebookId, sourceId, userId, content, resolvedUrl);

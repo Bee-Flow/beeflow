@@ -378,6 +378,29 @@ router.post('/', async (req, res) => {
     }
 });
 
+// Templates routes MUST come before `/:id` — otherwise Express matches
+// `/:id` for the literal string 'templates' and returns 404 from
+// automationStore.getAutomation('templates').
+router.get('/templates', (req, res) => {
+    try {
+        const { listTemplates, CATEGORIES } = require('../automation/templates');
+        res.json({ templates: listTemplates(), categories: CATEGORIES });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+router.get('/templates/:id', (req, res) => {
+    try {
+        const { getTemplate } = require('../automation/templates');
+        const tmpl = getTemplate(req.params.id);
+        if (!tmpl) return res.status(404).json({ error: 'Template not found' });
+        res.json({ template: tmpl });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 router.get('/:id', async (req, res) => {
     try {
         const a = await automationStore.getAutomation(req.params.id);
@@ -867,6 +890,88 @@ router.post('/:id/dry-run', async (req, res) => {
     }
 });
 
+/**
+ * n8n-style "Execute step" — run a single step using replay data from
+ * the most recent prior run (and any pinned outputs). Returns the
+ * resulting step record so the inspector can show input/output without
+ * the user waiting for a full dry-run.
+ *
+ * mode='only' (default) runs just `stepId`. mode='from' runs the step
+ * and every downstream node — used by the retry-from-failed-step UI.
+ */
+router.post('/:id/steps/:stepId/run', async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const a = await automationStore.getAutomation(req.params.id);
+        if (!a) return res.status(404).json({ error: 'Not found' });
+        if (a.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
+        const partialMode = req.body?.mode === 'from' ? 'from' : 'only';
+        const runner = require('../core/automationRunner');
+        const run = await runner.runPartial(a, req.params.stepId, {
+            mode: partialMode,
+            triggerKind: 'manual_step',
+            triggerPayload: req.body?.triggerPayload || null,
+        });
+        const steps = await automationStore.getRunSteps(run.id);
+        const stepRecord = steps.find(s => s.stepId === req.params.stepId) || null;
+        res.json({ run, steps, stepRecord });
+    } catch (e) {
+        console.error('[automation/steps/run] error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * Active runs for the current user — drives the sidebar "● Running" dot
+ * and the concurrent-run guard. Lightweight: returns a flat list of
+ * `{ runId, automationId, status, startedAt }`.
+ */
+router.get('/_runs/active', async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const active = await automationStore.getActiveRunsForUser(userId);
+        res.json({ active });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * Preview a cron expression. Used by the visual schedule builder to
+ * show the user the next N firing times in their chosen timezone and
+ * to validate ad-hoc expressions before they save. Delegates to the
+ * same `cron.nextRunAt` the runner uses, so the preview is bit-exact
+ * with what would actually fire.
+ *
+ * Body: { cron, tz, count? } — count defaults to 3, capped at 20.
+ */
+router.post('/_schedule/preview', async (req, res) => {
+    try {
+        const cronExpr = String(req.body?.cron || '').trim();
+        const tz = String(req.body?.tz || 'Europe/Amsterdam').trim() || 'Europe/Amsterdam';
+        const count = Math.min(Math.max(parseInt(req.body?.count, 10) || 3, 1), 20);
+        if (!cronExpr) return res.status(400).json({ valid: false, error: 'cron expression is required' });
+        try {
+            cron.parseCron(cronExpr);
+        } catch (e) {
+            return res.json({ valid: false, error: e.message });
+        }
+        const next = [];
+        let from = Date.now();
+        for (let i = 0; i < count; i++) {
+            const iso = cron.nextRunAt(cronExpr, tz, from);
+            if (!iso) break;
+            next.push(iso);
+            // Step 60s past the matched time so the next iteration finds a
+            // STRICTLY-later match rather than re-returning the same minute.
+            from = new Date(iso).getTime() + 60_000;
+        }
+        res.json({ valid: true, cron: cronExpr, tz, next });
+    } catch (e) {
+        res.status(500).json({ valid: false, error: e.message });
+    }
+});
+
 router.get('/:id/runs', async (req, res) => {
     try {
         const userId = req.session.user.id;
@@ -897,31 +1002,8 @@ router.get('/_runs/recent', async (req, res) => {
     }
 });
 
-/**
- * Template gallery — curated, ready-to-go automation templates the Studio
- * surfaces in the empty state. Listing returns metadata only; the
- * detail endpoint includes the full definition so the builder can
- * pre-fill it.
- */
-router.get('/templates', (req, res) => {
-    try {
-        const { listTemplates, CATEGORIES } = require('../automation/templates');
-        res.json({ templates: listTemplates(), categories: CATEGORIES });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-router.get('/templates/:id', (req, res) => {
-    try {
-        const { getTemplate } = require('../automation/templates');
-        const tmpl = getTemplate(req.params.id);
-        if (!tmpl) return res.status(404).json({ error: 'Template not found' });
-        res.json({ template: tmpl });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
+// Templates routes were moved to the top of this file (just before `/:id`)
+// to avoid Express matching `/:id` first against the literal "templates".
 
 router.get('/:id/versions', async (req, res) => {
     try {

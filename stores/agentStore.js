@@ -99,6 +99,7 @@ module.exports = {
     updateDirectConversation: directConversations.updateDirectConversation,
     updateDirectConversationMeta: directConversations.updateDirectConversationMeta,
     updateDirectConversationTitle: directConversations.updateDirectConversationTitle,
+    updateDirectConversationModelTier: directConversations.updateDirectConversationModelTier,
     pinDirectConversation: directConversations.pinDirectConversation,
     setDirectConversationLabels: directConversations.setDirectConversationLabels,
     deleteDirectConversation: directConversations.deleteDirectConversation,

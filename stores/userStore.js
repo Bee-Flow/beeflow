@@ -267,6 +267,25 @@ async function initDB() {
     try { await exec(`ALTER TABLE organization_subscriptions ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT`); } catch (e) { }
     try { await exec(`ALTER TABLE organization_subscriptions ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'none'`); } catch (e) { }
     try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS plan_type TEXT DEFAULT 'organization'`); } catch (e) { }
+    // One-shot trial gate — set when a trial is granted/started, never cleared.
+    // Survives subscription churn so an org/user cannot start a second trial
+    // after cancelling the first.
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS trial_used_at TIMESTAMPTZ`); } catch (e) { }
+    try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_used_at TIMESTAMPTZ`); } catch (e) { }
+    // Plan-bound integrations + beta-feature allow-lists. Both act as a cap
+    // (org cannot enable anything not in this list) AND a default-on bundle
+    // applied when the plan is assigned. NULL = unrestricted (legacy plans).
+    try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS allowed_integrations TEXT`); } catch (e) { }
+    try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS allowed_beta_features TEXT`); } catch (e) { }
+    // Pay-as-you-go (PAYG) plans: bill per actual usage with a markup % on
+    // top of raw AI provider cost. `billing_model='metered'` swings the
+    // plan onto a Stripe Billing Meter price; `markup_percent` applies on
+    // top of `computeCost(...)` before the meter event is reported.
+    try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS billing_model TEXT DEFAULT 'fixed'`); } catch (e) { }
+    try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS markup_percent REAL DEFAULT 0`); } catch (e) { }
+    try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS stripe_meter_id TEXT`); } catch (e) { }
+    try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS stripe_meter_event_name TEXT`); } catch (e) { }
+    try { await exec(`UPDATE subscription_plans SET billing_model = 'fixed' WHERE billing_model IS NULL`); } catch (e) { }
     // Surfaced in the NC App Store onboarding wizard as the "Recommended for
     // Nextcloud" card. Only one plan can carry this flag at a time — the
     // admin-CRUD route enforces uniqueness on write.
@@ -332,6 +351,58 @@ async function initDB() {
     try { await exec(`CREATE INDEX IF NOT EXISTS idx_license_keys_org ON license_keys(organization_id) WHERE organization_id IS NOT NULL`); } catch (e) { }
     try { await exec(`CREATE INDEX IF NOT EXISTS idx_license_keys_user ON license_keys(user_id) WHERE user_id IS NOT NULL`); } catch (e) { }
     try { await exec(`CREATE INDEX IF NOT EXISTS idx_license_keys_status ON license_keys(refresh_status)`); } catch (e) { }
+
+    // Stripe webhook idempotency. Stripe retries on 5xx/timeout, so every
+    // event handler runs through a dedup check keyed on event.id. Rows older
+    // than ~30d can be pruned out-of-band; the index keeps that scan cheap.
+    try {
+        await exec(`CREATE TABLE IF NOT EXISTS stripe_processed_events (
+            event_id     TEXT PRIMARY KEY,
+            event_type   TEXT NOT NULL,
+            processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            payload_hash TEXT
+        )`);
+    } catch (e) { }
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_stripe_evt_processed_at ON stripe_processed_events(processed_at)`); } catch (e) { }
+
+    // Notification idempotency. Each (target_id, notif_kind) pair can fire
+    // at most once. Used by trial/dunning/expiry warnings so retries don't
+    // double-email customers.
+    try {
+        await exec(`CREATE TABLE IF NOT EXISTS license_notifications_sent (
+            target_id   TEXT NOT NULL,
+            notif_kind  TEXT NOT NULL,
+            sent_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (target_id, notif_kind)
+        )`);
+    } catch (e) { }
+
+    // Dunning / payment-failure escalation columns. The webhook bumps the
+    // attempt counter; a periodic tick flips status='suspended' after the
+    // configured grace expires. invoice.paid resets both.
+    try { await exec(`ALTER TABLE organization_subscriptions ADD COLUMN IF NOT EXISTS payment_attempt_count INTEGER DEFAULT 0`); } catch (e) { }
+    try { await exec(`ALTER TABLE organization_subscriptions ADD COLUMN IF NOT EXISTS last_payment_failure_at TIMESTAMPTZ`); } catch (e) { }
+    try { await exec(`ALTER TABLE organization_subscriptions ADD COLUMN IF NOT EXISTS past_due_since TIMESTAMPTZ`); } catch (e) { }
+    try { await exec(`ALTER TABLE consumer_subscriptions ADD COLUMN IF NOT EXISTS payment_attempt_count INTEGER DEFAULT 0`); } catch (e) { }
+    try { await exec(`ALTER TABLE consumer_subscriptions ADD COLUMN IF NOT EXISTS last_payment_failure_at TIMESTAMPTZ`); } catch (e) { }
+    try { await exec(`ALTER TABLE consumer_subscriptions ADD COLUMN IF NOT EXISTS past_due_since TIMESTAMPTZ`); } catch (e) { }
+
+    // Manual-override window (PR 2.B). Admin sets manual_override_until to a
+    // timestamp; Stripe webhooks honour it by skipping status/plan_id writes
+    // until it elapses. Audit-logged on both ends.
+    try { await exec(`ALTER TABLE organization_subscriptions ADD COLUMN IF NOT EXISTS manual_override_until TIMESTAMPTZ`); } catch (e) { }
+    try { await exec(`ALTER TABLE organization_subscriptions ADD COLUMN IF NOT EXISTS manual_override_by TEXT`); } catch (e) { }
+    try { await exec(`ALTER TABLE consumer_subscriptions ADD COLUMN IF NOT EXISTS manual_override_until TIMESTAMPTZ`); } catch (e) { }
+    try { await exec(`ALTER TABLE consumer_subscriptions ADD COLUMN IF NOT EXISTS manual_override_by TEXT`); } catch (e) { }
+
+    // Seat-cap atomic enforcement support index (PR 1.C). The serializable
+    // transaction in createUserWithSeatCheck reads a COUNT()...FOR UPDATE
+    // and benefits from a covering partial index.
+    try {
+        await exec(`CREATE INDEX IF NOT EXISTS idx_users_org_status
+            ON users ("organizationId", status)
+            WHERE "organizationId" IS NOT NULL AND "organizationId" != ''`);
+    } catch (e) { }
 
     initialized = true;
 }
@@ -553,6 +624,10 @@ async function deleteUser(userId) {
     try { await run('DELETE FROM agent_conversations WHERE user_id = $1', [userId]); } catch (e) { /* table may not exist */ }
     try { await run('DELETE FROM direct_conversations WHERE user_id = $1', [userId]); } catch (e) { /* table may not exist */ }
     try { await run('DELETE FROM execution_history WHERE user_id = $1', [userId]); } catch (e) { /* table may not exist */ }
+    // Projects: drop the user's owned projects (cascades shares + activity via FK)
+    // and remove any shares that target this user directly.
+    try { await run('DELETE FROM projects WHERE owner_id = $1', [userId]); } catch (e) { /* table may not exist */ }
+    try { await run(`DELETE FROM project_shares WHERE shared_with_type = 'user' AND shared_with_id = $1`, [userId]); } catch (e) { /* table may not exist */ }
 
     try {
         const notificationStore = require('./notificationStore');
@@ -655,8 +730,19 @@ async function createOrganization(orgData) {
             if (defaultPlan) {
                 await setOrgSubscription(id, { plan_id: defaultPlan.id, status: 'active' });
                 console.log(`[UserStore] Auto-assigned default plan '${defaultPlan.id}' to new org '${id}'`);
+                // Seed integrations + beta-feature enablement from the plan
+                // so new orgs immediately have the right defaults switched on.
+                try {
+                    await require('../services/planEntitlements').applyPlanToOrg(id, defaultPlan.id, { mode: 'reset' });
+                } catch (e) { console.warn('[UserStore] applyPlanToOrg (default plan) failed:', e.message); }
             }
         } catch (e) { console.warn('[UserStore] Failed to auto-assign default plan:', e.message); }
+        // Fire-and-forget: if a global trial-offer plan is configured for orgs,
+        // start the trial in Stripe asynchronously. Failure must not block org
+        // creation; trialService swallows errors and logs warnings.
+        setImmediate(() => {
+            require('../services/trialService').maybeAutoGrantOrgTrial(id);
+        });
         return true;
     } catch (e) { console.error(e); return false; }
 }
@@ -746,6 +832,11 @@ async function deleteOrganization(orgId) {
 
     // Knowledge bases cleanup
     try { await run('DELETE FROM knowledge_bases WHERE organization_id = $1', [orgId]); } catch (e) { }
+
+    // Projects (cascades shares + activity via FK). Group shares targeting this
+    // org's groups are wiped by the groups DELETE above; user shares targeting
+    // org users were cleaned up when those users were deleted.
+    try { await run('DELETE FROM projects WHERE organization_id = $1', [orgId]); } catch (e) { }
 
     try { await run('DELETE FROM group_chats WHERE organization_id = $1', [orgId]); } catch (e) { }
 
@@ -1078,7 +1169,33 @@ initDefaultRoles().catch(err => console.error('[UserStore] initDefaultRoles erro
 
 // ── Subscription Plans ─────────────────────────────
 function parsePlan(p) {
-    return { ...p, allowed_features: parseJSON(p.allowed_features, []), allowed_models: parseJSON(p.allowed_models, []), max_messages_by_type: parseJSON(p.max_messages_by_type, {}), is_default: !!p.is_default, is_public: !!p.is_public, plan_type: p.plan_type || 'organization', nc_recommended: !!p.nc_recommended, tagline: p.tagline || null };
+    return {
+        ...p,
+        allowed_features: parseJSON(p.allowed_features, []),
+        allowed_models: parseJSON(p.allowed_models, []),
+        // null in DB = unrestricted; only parse when explicitly set so the
+        // distinction between "all integrations" and "zero integrations"
+        // survives a round-trip.
+        allowed_integrations: p.allowed_integrations == null ? null : parseJSON(p.allowed_integrations, null),
+        allowed_beta_features: p.allowed_beta_features == null ? null : parseJSON(p.allowed_beta_features, null),
+        max_messages_by_type: parseJSON(p.max_messages_by_type, {}),
+        is_default: !!p.is_default,
+        is_public: !!p.is_public,
+        plan_type: p.plan_type || 'organization',
+        nc_recommended: !!p.nc_recommended,
+        tagline: p.tagline || null,
+        billing_model: p.billing_model || 'fixed',
+        markup_percent: p.markup_percent == null ? 0 : Number(p.markup_percent),
+        stripe_meter_id: p.stripe_meter_id || null,
+        stripe_meter_event_name: p.stripe_meter_event_name || null,
+    };
+}
+
+function serializeAllowList(v) {
+    if (v === undefined) return undefined;
+    if (v === null) return null;
+    if (!Array.isArray(v)) throw new Error('allow-list must be an array or null');
+    return JSON.stringify(v);
 }
 
 async function getAllPlans() {
@@ -1108,15 +1225,20 @@ async function createPlan(data) {
     try {
         if (data.is_default) await run('UPDATE subscription_plans SET is_default = FALSE WHERE is_default = TRUE');
         if (data.nc_recommended) await run('UPDATE subscription_plans SET nc_recommended = FALSE WHERE nc_recommended = TRUE');
-        await run(`INSERT INTO subscription_plans (id, name, description, max_messages_per_month, max_messages_by_type, max_tokens_per_month, max_cost_per_month, max_users, max_agents, max_knowledge_sources, allowed_features, allowed_models, is_default, price, currency, billing_interval, trial_days, sort_order, is_public, stripe_price_id, stripe_product_id, plan_type, nc_recommended, tagline, tier, created_at, updated_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)`,
+        await run(`INSERT INTO subscription_plans (id, name, description, max_messages_per_month, max_messages_by_type, max_tokens_per_month, max_cost_per_month, max_users, max_agents, max_knowledge_sources, allowed_features, allowed_models, allowed_integrations, allowed_beta_features, is_default, price, currency, billing_interval, trial_days, sort_order, is_public, stripe_price_id, stripe_product_id, plan_type, nc_recommended, tagline, tier, billing_model, markup_percent, stripe_meter_id, stripe_meter_event_name, created_at, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33)`,
             [id, data.name.trim(), data.description || '', data.max_messages_per_month ?? null, JSON.stringify(data.max_messages_by_type || {}),
                 data.max_tokens_per_month ?? null, data.max_cost_per_month ?? null, data.max_users ?? null, data.max_agents ?? null,
                 data.max_knowledge_sources ?? null, JSON.stringify(data.allowed_features || []), JSON.stringify(data.allowed_models || []),
+                serializeAllowList(data.allowed_integrations) ?? null,
+                serializeAllowList(data.allowed_beta_features) ?? null,
                 !!data.is_default, data.price ?? null, data.currency || 'EUR', data.billing_interval || 'monthly',
                 data.trial_days ?? 0, data.sort_order ?? 0, !!data.is_public,
                 data.stripe_price_id || null, data.stripe_product_id || null, data.plan_type || 'organization',
-                !!data.nc_recommended, data.tagline || null, data.tier || null, now, now]);
+                !!data.nc_recommended, data.tagline || null, data.tier || null,
+                data.billing_model || 'fixed', data.markup_percent ?? 0,
+                data.stripe_meter_id || null, data.stripe_meter_event_name || null,
+                now, now]);
         return parsePlan(await getOne('SELECT * FROM subscription_plans WHERE id = $1', [id]));
     } catch (e) { console.error('[UserStore] createPlan error:', e); return null; }
 }
@@ -1143,6 +1265,12 @@ async function updatePlan(planId, data) {
         if (data.max_knowledge_sources !== undefined) updateMap.max_knowledge_sources = data.max_knowledge_sources;
         if (data.allowed_features !== undefined) updateMap.allowed_features = JSON.stringify(data.allowed_features);
         if (data.allowed_models !== undefined) updateMap.allowed_models = JSON.stringify(data.allowed_models);
+        if (data.allowed_integrations !== undefined) updateMap.allowed_integrations = serializeAllowList(data.allowed_integrations);
+        if (data.allowed_beta_features !== undefined) updateMap.allowed_beta_features = serializeAllowList(data.allowed_beta_features);
+        if (data.billing_model !== undefined) updateMap.billing_model = data.billing_model;
+        if (data.markup_percent !== undefined) updateMap.markup_percent = data.markup_percent;
+        if (data.stripe_meter_id !== undefined) updateMap.stripe_meter_id = data.stripe_meter_id;
+        if (data.stripe_meter_event_name !== undefined) updateMap.stripe_meter_event_name = data.stripe_meter_event_name;
         if (data.is_default !== undefined) updateMap.is_default = !!data.is_default;
         if (data.price !== undefined) updateMap.price = data.price;
         if (data.currency !== undefined) updateMap.currency = data.currency;
@@ -1162,16 +1290,43 @@ async function updatePlan(planId, data) {
         }
         updateMap.updated_at = now;
         if (data.plan_type !== undefined) updateMap.plan_type = data.plan_type;
-        const colMap = { name: 'name', description: 'description', max_messages_per_month: 'max_messages_per_month', max_messages_by_type: 'max_messages_by_type', max_tokens_per_month: 'max_tokens_per_month', max_cost_per_month: 'max_cost_per_month', max_users: 'max_users', max_agents: 'max_agents', max_knowledge_sources: 'max_knowledge_sources', allowed_features: 'allowed_features', allowed_models: 'allowed_models', is_default: 'is_default', price: 'price', currency: 'currency', billing_interval: 'billing_interval', trial_days: 'trial_days', sort_order: 'sort_order', is_public: 'is_public', stripe_price_id: 'stripe_price_id', stripe_product_id: 'stripe_product_id', plan_type: 'plan_type', nc_recommended: 'nc_recommended', tagline: 'tagline', tier: 'tier', updated_at: 'updated_at' };
+        const colMap = { name: 'name', description: 'description', max_messages_per_month: 'max_messages_per_month', max_messages_by_type: 'max_messages_by_type', max_tokens_per_month: 'max_tokens_per_month', max_cost_per_month: 'max_cost_per_month', max_users: 'max_users', max_agents: 'max_agents', max_knowledge_sources: 'max_knowledge_sources', allowed_features: 'allowed_features', allowed_models: 'allowed_models', allowed_integrations: 'allowed_integrations', allowed_beta_features: 'allowed_beta_features', is_default: 'is_default', price: 'price', currency: 'currency', billing_interval: 'billing_interval', trial_days: 'trial_days', sort_order: 'sort_order', is_public: 'is_public', stripe_price_id: 'stripe_price_id', stripe_product_id: 'stripe_product_id', plan_type: 'plan_type', nc_recommended: 'nc_recommended', tagline: 'tagline', tier: 'tier', billing_model: 'billing_model', markup_percent: 'markup_percent', stripe_meter_id: 'stripe_meter_id', stripe_meter_event_name: 'stripe_meter_event_name', updated_at: 'updated_at' };
         const q = dynamicUpdate('subscription_plans', planId, updateMap, colMap);
         if (q) await run(q.sql, q.params);
         return true;
     } catch (e) { console.error('[UserStore] updatePlan error:', e); return false; }
 }
 
+class PlanInUseError extends Error {
+    constructor(planId, affectedOrgs, affectedConsumers) {
+        super(`Plan ${planId} is in use by ${affectedOrgs.length} org(s) and ${affectedConsumers.length} consumer(s)`);
+        this.name = 'PlanInUseError';
+        this.planId = planId;
+        this.affectedOrgs = affectedOrgs;
+        this.affectedConsumers = affectedConsumers;
+    }
+}
+
 async function deletePlan(planId) {
     await initDB();
-    await run('UPDATE organization_subscriptions SET plan_id = NULL WHERE plan_id = $1', [planId]);
+    // Refuse to delete a plan that has live subscriptions. Previously this
+    // nulled plan_id on org_subscriptions and orphaned the rows so
+    // getEffectiveLimits returned a partially-populated shape — which then
+    // cascades into undefined gating behaviour. Force the admin to migrate
+    // affected subscriptions first.
+    const orgs = await getAll(
+        `SELECT organization_id FROM organization_subscriptions
+          WHERE plan_id = $1 AND COALESCE(status,'active') IN ('active','trialing','past_due')`,
+        [planId]
+    );
+    const consumers = await getAll(
+        `SELECT user_id FROM consumer_subscriptions
+          WHERE plan_id = $1 AND COALESCE(status,'active') IN ('active','trialing','past_due')`,
+        [planId]
+    );
+    if (orgs.length > 0 || consumers.length > 0) {
+        throw new PlanInUseError(planId, orgs.map(r => r.organization_id), consumers.map(r => r.user_id));
+    }
     const { rowCount } = await run('DELETE FROM subscription_plans WHERE id = $1', [planId]);
     return rowCount > 0;
 }
@@ -1185,14 +1340,16 @@ async function getAllOrgSubscriptions() {
 
 async function getOrgSubscription(orgId) {
     await initDB();
-    const s = await getOne('SELECT os.*, sp.name as plan_name, sp.tier as plan_tier FROM organization_subscriptions os LEFT JOIN subscription_plans sp ON os.plan_id = sp.id WHERE os.organization_id = $1', [orgId]);
+    const s = await getOne('SELECT os.*, sp.name as plan_name, sp.tier as plan_tier, sp.billing_model as plan_billing_model FROM organization_subscriptions os LEFT JOIN subscription_plans sp ON os.plan_id = sp.id WHERE os.organization_id = $1', [orgId]);
     if (!s) return null;
-    return { ...s, allowed_features: parseJSON(s.allowed_features, null), allowed_models: parseJSON(s.allowed_models, null), max_messages_by_type: parseJSON(s.max_messages_by_type, null) };
+    return { ...s, billing_model: s.plan_billing_model || 'fixed', allowed_features: parseJSON(s.allowed_features, null), allowed_models: parseJSON(s.allowed_models, null), max_messages_by_type: parseJSON(s.max_messages_by_type, null) };
 }
+
+const VALID_SUB_STATUSES = ['active', 'suspended', 'cancelled', 'trialing', 'past_due', 'incomplete', 'paused'];
 
 async function setOrgSubscription(orgId, data) {
     await initDB();
-    if (data.status && !['active', 'suspended', 'cancelled', 'trialing', 'past_due'].includes(data.status)) {
+    if (data.status && !VALID_SUB_STATUSES.includes(data.status)) {
         throw new Error(`Invalid subscription status: ${data.status}`);
     }
     const existing = await getOrgSubscription(orgId);
@@ -1217,8 +1374,10 @@ async function setOrgSubscription(orgId, data) {
             if (data.stripe_customer_id !== undefined) updateMap.stripe_customer_id = data.stripe_customer_id;
             if (data.stripe_subscription_id !== undefined) updateMap.stripe_subscription_id = data.stripe_subscription_id;
             if (data.payment_status !== undefined) updateMap.payment_status = data.payment_status;
+            if (data.manual_override_until !== undefined) updateMap.manual_override_until = data.manual_override_until;
+            if (data.manual_override_by !== undefined) updateMap.manual_override_by = data.manual_override_by;
             updateMap.updated_at = now;
-            const colMap = { plan_id: 'plan_id', status: 'status', max_messages_per_month: 'max_messages_per_month', max_messages_by_type: 'max_messages_by_type', max_tokens_per_month: 'max_tokens_per_month', max_cost_per_month: 'max_cost_per_month', max_users: 'max_users', max_agents: 'max_agents', max_knowledge_sources: 'max_knowledge_sources', allowed_features: 'allowed_features', allowed_models: 'allowed_models', billing_cycle_start: 'billing_cycle_start', notes: 'notes', trial_end_date: 'trial_end_date', stripe_customer_id: 'stripe_customer_id', stripe_subscription_id: 'stripe_subscription_id', payment_status: 'payment_status', updated_at: 'updated_at' };
+            const colMap = { plan_id: 'plan_id', status: 'status', max_messages_per_month: 'max_messages_per_month', max_messages_by_type: 'max_messages_by_type', max_tokens_per_month: 'max_tokens_per_month', max_cost_per_month: 'max_cost_per_month', max_users: 'max_users', max_agents: 'max_agents', max_knowledge_sources: 'max_knowledge_sources', allowed_features: 'allowed_features', allowed_models: 'allowed_models', billing_cycle_start: 'billing_cycle_start', notes: 'notes', trial_end_date: 'trial_end_date', stripe_customer_id: 'stripe_customer_id', stripe_subscription_id: 'stripe_subscription_id', payment_status: 'payment_status', manual_override_until: 'manual_override_until', manual_override_by: 'manual_override_by', updated_at: 'updated_at' };
             const q = dynamicUpdate('organization_subscriptions', orgId, updateMap, colMap, 'organization_id');
             if (q) await run(q.sql, q.params);
         } else {
@@ -1235,6 +1394,9 @@ async function setOrgSubscription(orgId, data) {
                     data.trial_end_date || null, data.stripe_customer_id || null,
                     data.stripe_subscription_id || null, data.payment_status || 'none', now, now]);
         }
+        // Bust the PAYG hot-path cache so the next usage event sees the new
+        // plan / customer / status immediately instead of waiting for TTL.
+        try { require('./usageStore').invalidatePaygCache(orgId, null); } catch (_) { /* circular-load safe */ }
         return true;
     } catch (e) { console.error('[UserStore] setOrgSubscription error:', e); return false; }
 }
@@ -1274,19 +1436,10 @@ function getBillingPeriod(sub) {
 async function getEffectiveLimits(orgId) {
     const sub = await getOrgSubscription(orgId);
     if (!sub) return null;
-    // Check trial: if in trial and trial hasn't expired, status is 'trialing'
-    if (sub.trial_end_date) {
-        const trialEnd = new Date(sub.trial_end_date);
-        if (trialEnd > new Date() && sub.status === 'trialing') {
-            // Trial is active — treat as active
-            sub.status = 'active';
-        } else if (trialEnd <= new Date() && sub.status === 'trialing') {
-            // Trial expired — treat as suspended unless payment is set up
-            if (sub.payment_status !== 'paid') {
-                sub.status = 'suspended';
-            }
-        }
-    }
+    // Read-only: the trial-expiry tick (server/index.js) persists transitions
+    // to the DB. Reading-time mutation here used to TOCTOU with concurrent
+    // webhooks. The authoritative gate is resolveTierFromSubscription in
+    // server/license/index.js, which also handles trialing → no-tier.
     const plan = sub.plan_id ? await getPlan(sub.plan_id) : null;
     const LIMIT_FIELDS = ['max_messages_per_month', 'max_tokens_per_month', 'max_cost_per_month', 'max_users', 'max_agents', 'max_knowledge_sources'];
     const effective = { status: sub.status, billing_cycle_start: sub.billing_cycle_start };
@@ -1306,14 +1459,14 @@ async function getEffectiveLimits(orgId) {
 // ── Consumer Subscriptions (per-user, org-less) ─────────────────────────────
 async function getConsumerSubscription(userId) {
     await initDB();
-    const s = await getOne('SELECT cs.*, sp.name as plan_name, sp.tier as plan_tier FROM consumer_subscriptions cs LEFT JOIN subscription_plans sp ON cs.plan_id = sp.id WHERE cs.user_id = $1', [userId]);
+    const s = await getOne('SELECT cs.*, sp.name as plan_name, sp.tier as plan_tier, sp.billing_model as plan_billing_model FROM consumer_subscriptions cs LEFT JOIN subscription_plans sp ON cs.plan_id = sp.id WHERE cs.user_id = $1', [userId]);
     if (!s) return null;
-    return s;
+    return { ...s, billing_model: s.plan_billing_model || 'fixed' };
 }
 
 async function setConsumerSubscription(userId, data) {
     await initDB();
-    if (data.status && !['active', 'suspended', 'cancelled', 'trialing', 'past_due'].includes(data.status)) {
+    if (data.status && !VALID_SUB_STATUSES.includes(data.status)) {
         throw new Error(`Invalid subscription status: ${data.status}`);
     }
     const existing = await getConsumerSubscription(userId);
@@ -1328,8 +1481,10 @@ async function setConsumerSubscription(userId, data) {
             if (data.payment_status !== undefined) updateMap.payment_status = data.payment_status;
             if (data.billing_cycle_start !== undefined) updateMap.billing_cycle_start = data.billing_cycle_start;
             if (data.trial_end_date !== undefined) updateMap.trial_end_date = data.trial_end_date;
+            if (data.manual_override_until !== undefined) updateMap.manual_override_until = data.manual_override_until;
+            if (data.manual_override_by !== undefined) updateMap.manual_override_by = data.manual_override_by;
             updateMap.updated_at = now;
-            const colMap = { plan_id: 'plan_id', status: 'status', stripe_customer_id: 'stripe_customer_id', stripe_subscription_id: 'stripe_subscription_id', payment_status: 'payment_status', billing_cycle_start: 'billing_cycle_start', trial_end_date: 'trial_end_date', updated_at: 'updated_at' };
+            const colMap = { plan_id: 'plan_id', status: 'status', stripe_customer_id: 'stripe_customer_id', stripe_subscription_id: 'stripe_subscription_id', payment_status: 'payment_status', billing_cycle_start: 'billing_cycle_start', trial_end_date: 'trial_end_date', manual_override_until: 'manual_override_until', manual_override_by: 'manual_override_by', updated_at: 'updated_at' };
             const q = dynamicUpdate('consumer_subscriptions', userId, updateMap, colMap, 'user_id');
             if (q) await run(q.sql, q.params);
         } else {
@@ -1341,6 +1496,7 @@ async function setConsumerSubscription(userId, data) {
                     data.payment_status || 'none', data.billing_cycle_start || now,
                     data.trial_end_date || null, now, now]);
         }
+        try { require('./usageStore').invalidatePaygCache(null, userId); } catch (_) { /* circular-load safe */ }
         return true;
     } catch (e) { console.error('[UserStore] setConsumerSubscription error:', e); return false; }
 }
@@ -1355,6 +1511,36 @@ async function getAllConsumerSubscriptions() {
     await initDB();
     const rows = await getAll('SELECT cs.*, sp.name as plan_name, sp.tier as plan_tier, u.username, u.email, u."displayName" FROM consumer_subscriptions cs LEFT JOIN subscription_plans sp ON cs.plan_id = sp.id LEFT JOIN users u ON cs.user_id = u.id ORDER BY cs.created_at DESC');
     return rows;
+}
+
+// ── Trial gate ─────────────────────────────
+// Marks an org or user as having used its one-time trial. Idempotent —
+// callers can re-invoke safely; the column only moves forward in time.
+async function markTrialUsed(targetType, targetId) {
+    await initDB();
+    if (!targetId) return false;
+    const now = new Date().toISOString();
+    if (targetType === 'organization') {
+        const r = await run('UPDATE organizations SET trial_used_at = $1 WHERE id = $2 AND trial_used_at IS NULL', [now, targetId]);
+        return (r.rowCount || 0) > 0;
+    }
+    if (targetType === 'consumer' || targetType === 'user') {
+        const r = await run('UPDATE users SET trial_used_at = $1 WHERE id = $2 AND trial_used_at IS NULL', [now, targetId]);
+        return (r.rowCount || 0) > 0;
+    }
+    return false;
+}
+
+async function hasOrgUsedTrial(orgId) {
+    await initDB();
+    const r = await getOne('SELECT trial_used_at FROM organizations WHERE id = $1', [orgId]);
+    return !!(r && r.trial_used_at);
+}
+
+async function hasUserUsedTrial(userId) {
+    await initDB();
+    const r = await getOne('SELECT trial_used_at FROM users WHERE id = $1', [userId]);
+    return !!(r && r.trial_used_at);
 }
 
 // ── Audit Logging ─────────────────────────────
@@ -1385,8 +1571,412 @@ async function getAuditLog(opts = {}) {
     return rows.map(r => ({ ...r, old_values: parseJSON(r.old_values, null), new_values: parseJSON(r.new_values, null) }));
 }
 
+// ── Notification idempotency ─────────────────────────────
+// Returns true when we have NOT yet sent this kind to this target — caller
+// should then send. Atomic via PK conflict so two cron ticks can't race.
+async function claimNotificationSlot(targetId, notifKind) {
+    if (!targetId || !notifKind) return false;
+    await initDB();
+    try {
+        const result = await run(
+            `INSERT INTO license_notifications_sent (target_id, notif_kind)
+             VALUES ($1, $2)
+             ON CONFLICT (target_id, notif_kind) DO NOTHING`,
+            [String(targetId), String(notifKind)]
+        );
+        return (result.rowCount || 0) > 0;
+    } catch (e) {
+        console.error('[UserStore] claimNotificationSlot error:', e.message);
+        return false;
+    }
+}
+
+async function getDunningCounts() {
+    await initDB();
+    try {
+        const o = await getOne(`SELECT
+            COUNT(*) FILTER (WHERE status = 'past_due')::int AS past_due_count,
+            COUNT(*) FILTER (WHERE status = 'suspended')::int AS suspended_count
+            FROM organization_subscriptions`);
+        const c = await getOne(`SELECT
+            COUNT(*) FILTER (WHERE status = 'past_due')::int AS past_due_count,
+            COUNT(*) FILTER (WHERE status = 'suspended')::int AS suspended_count
+            FROM consumer_subscriptions`);
+        return {
+            past_due_count: (o?.past_due_count || 0) + (c?.past_due_count || 0),
+            suspended_count: (o?.suspended_count || 0) + (c?.suspended_count || 0),
+        };
+    } catch (_e) {
+        return { past_due_count: 0, suspended_count: 0 };
+    }
+}
+
+// ── Stripe webhook idempotency ─────────────────────────────
+// Records that an event has been processed. Returns true on first insert,
+// false if the event_id was already present (i.e. a duplicate delivery).
+async function recordStripeEventProcessed(eventId, eventType, payloadHash = null) {
+    if (!eventId) return true;
+    await initDB();
+    try {
+        const result = await run(
+            `INSERT INTO stripe_processed_events (event_id, event_type, payload_hash)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (event_id) DO NOTHING`,
+            [eventId, eventType || 'unknown', payloadHash]
+        );
+        return (result.rowCount || 0) > 0;
+    } catch (e) {
+        console.error('[UserStore] recordStripeEventProcessed error:', e.message);
+        return true;
+    }
+}
+
+// ── Dunning counters ─────────────────────────────
+// Increment payment_attempt_count and stamp past_due_since on the first
+// failure. Used by the Stripe invoice.payment_failed handler.
+async function recordPaymentFailureForOrg(orgId) {
+    await initDB();
+    await run(
+        `UPDATE organization_subscriptions
+            SET payment_attempt_count = COALESCE(payment_attempt_count, 0) + 1,
+                last_payment_failure_at = NOW(),
+                past_due_since = COALESCE(past_due_since, NOW()),
+                updated_at = $2
+          WHERE organization_id = $1`,
+        [orgId, new Date().toISOString()]
+    );
+    const row = await getOne(
+        'SELECT payment_attempt_count, past_due_since FROM organization_subscriptions WHERE organization_id = $1',
+        [orgId]
+    );
+    return row || null;
+}
+
+async function recordPaymentFailureForConsumer(userId) {
+    await initDB();
+    await run(
+        `UPDATE consumer_subscriptions
+            SET payment_attempt_count = COALESCE(payment_attempt_count, 0) + 1,
+                last_payment_failure_at = NOW(),
+                past_due_since = COALESCE(past_due_since, NOW()),
+                updated_at = $2
+          WHERE user_id = $1`,
+        [userId, new Date().toISOString()]
+    );
+    const row = await getOne(
+        'SELECT payment_attempt_count, past_due_since FROM consumer_subscriptions WHERE user_id = $1',
+        [userId]
+    );
+    return row || null;
+}
+
+async function resetPaymentFailureForOrg(orgId) {
+    await initDB();
+    await run(
+        `UPDATE organization_subscriptions
+            SET payment_attempt_count = 0,
+                past_due_since = NULL,
+                updated_at = $2
+          WHERE organization_id = $1`,
+        [orgId, new Date().toISOString()]
+    );
+}
+
+async function resetPaymentFailureForConsumer(userId) {
+    await initDB();
+    await run(
+        `UPDATE consumer_subscriptions
+            SET payment_attempt_count = 0,
+                past_due_since = NULL,
+                updated_at = $2
+          WHERE user_id = $1`,
+        [userId, new Date().toISOString()]
+    );
+}
+
+// Run a sweep that suspends any org/consumer sub whose past_due_since is
+// older than graceDays. Returns counts so the caller (scheduler) can log
+// activity. Idempotent: re-running flips nothing once the sub is suspended.
+async function suspendPastDueSubscriptions(graceDays = 7) {
+    await initDB();
+    const graceMs = Math.max(0, Number(graceDays)) * 86400 * 1000;
+    const cutoffIso = new Date(Date.now() - graceMs).toISOString();
+
+    const orgsToSuspend = await getAll(
+        `SELECT organization_id, payment_attempt_count, past_due_since
+           FROM organization_subscriptions
+          WHERE past_due_since IS NOT NULL
+            AND past_due_since < $1
+            AND status NOT IN ('suspended', 'cancelled')`,
+        [cutoffIso]
+    );
+    for (const row of orgsToSuspend) {
+        try {
+            await run(
+                `UPDATE organization_subscriptions
+                    SET status = 'suspended', payment_status = 'failed', updated_at = $2
+                  WHERE organization_id = $1`,
+                [row.organization_id, new Date().toISOString()]
+            );
+            await logSubscriptionAudit(
+                'dunning_suspend', 'organization', row.organization_id, 'system', null,
+                { reason: 'past_due_grace_exceeded', attempt_count: row.payment_attempt_count, past_due_since: row.past_due_since, grace_days: graceDays }
+            );
+        } catch (e) {
+            console.error('[UserStore] suspendPastDueSubscriptions org error:', row.organization_id, e.message);
+        }
+    }
+
+    const consumersToSuspend = await getAll(
+        `SELECT user_id, payment_attempt_count, past_due_since
+           FROM consumer_subscriptions
+          WHERE past_due_since IS NOT NULL
+            AND past_due_since < $1
+            AND status NOT IN ('suspended', 'cancelled')`,
+        [cutoffIso]
+    );
+    for (const row of consumersToSuspend) {
+        try {
+            await run(
+                `UPDATE consumer_subscriptions
+                    SET status = 'suspended', payment_status = 'failed', updated_at = $2
+                  WHERE user_id = $1`,
+                [row.user_id, new Date().toISOString()]
+            );
+            await logSubscriptionAudit(
+                'dunning_suspend', 'consumer', row.user_id, 'system', null,
+                { reason: 'past_due_grace_exceeded', attempt_count: row.payment_attempt_count, past_due_since: row.past_due_since, grace_days: graceDays }
+            );
+        } catch (e) {
+            console.error('[UserStore] suspendPastDueSubscriptions consumer error:', row.user_id, e.message);
+        }
+    }
+
+    return { orgs: orgsToSuspend.length, consumers: consumersToSuspend.length };
+}
+
+// Persist trial-end transitions. Called by the trial-expiry scheduler.
+// Subs whose trial_end_date has passed and that aren't paid get flipped to
+// status='suspended', payment_status='trial_expired'. Idempotent.
+async function expireOverdueTrials() {
+    await initDB();
+    const nowIso = new Date().toISOString();
+
+    const orgsExpiring = await getAll(
+        `SELECT organization_id, trial_end_date
+           FROM organization_subscriptions
+          WHERE status = 'trialing'
+            AND trial_end_date IS NOT NULL
+            AND trial_end_date < $1
+            AND COALESCE(payment_status, '') NOT IN ('paid', 'trialing')`,
+        [nowIso]
+    );
+    for (const row of orgsExpiring) {
+        try {
+            await run(
+                `UPDATE organization_subscriptions
+                    SET status = 'suspended', payment_status = 'trial_expired', updated_at = $2
+                  WHERE organization_id = $1`,
+                [row.organization_id, nowIso]
+            );
+            await logSubscriptionAudit(
+                'trial_expired', 'organization', row.organization_id, 'system', null,
+                { trial_end_date: row.trial_end_date, transitioned_to: 'suspended' }
+            );
+        } catch (e) {
+            console.error('[UserStore] expireOverdueTrials org error:', row.organization_id, e.message);
+        }
+    }
+
+    const consumersExpiring = await getAll(
+        `SELECT user_id, trial_end_date
+           FROM consumer_subscriptions
+          WHERE status = 'trialing'
+            AND trial_end_date IS NOT NULL
+            AND trial_end_date < $1
+            AND COALESCE(payment_status, '') NOT IN ('paid', 'trialing')`,
+        [nowIso]
+    );
+    for (const row of consumersExpiring) {
+        try {
+            await run(
+                `UPDATE consumer_subscriptions
+                    SET status = 'suspended', payment_status = 'trial_expired', updated_at = $2
+                  WHERE user_id = $1`,
+                [row.user_id, nowIso]
+            );
+            await logSubscriptionAudit(
+                'trial_expired', 'consumer', row.user_id, 'system', null,
+                { trial_end_date: row.trial_end_date, transitioned_to: 'suspended' }
+            );
+        } catch (e) {
+            console.error('[UserStore] expireOverdueTrials consumer error:', row.user_id, e.message);
+        }
+    }
+
+    return { orgs: orgsExpiring.length, consumers: consumersExpiring.length };
+}
+
+// Returns true if the subscription has a manual_override_until in the
+// future. The Stripe webhook checks this before writing status/plan_id so
+// admin-set state isn't immediately clobbered by a Stripe update.
+function isManualOverrideActive(sub) {
+    if (!sub || !sub.manual_override_until) return false;
+    const t = new Date(sub.manual_override_until).getTime();
+    return Number.isFinite(t) && t > Date.now();
+}
+
+// Locate a subscription row by stripe_customer_id so customer.deleted can
+// null the local mapping. Returns { scope: 'organization'|'consumer', id }
+// or null.
+async function findSubscriptionByStripeCustomerId(stripeCustomerId) {
+    if (!stripeCustomerId) return null;
+    await initDB();
+    const org = await getOne(
+        'SELECT organization_id FROM organization_subscriptions WHERE stripe_customer_id = $1 LIMIT 1',
+        [stripeCustomerId]
+    );
+    if (org) return { scope: 'organization', id: org.organization_id };
+    const consumer = await getOne(
+        'SELECT user_id FROM consumer_subscriptions WHERE stripe_customer_id = $1 LIMIT 1',
+        [stripeCustomerId]
+    );
+    if (consumer) return { scope: 'consumer', id: consumer.user_id };
+    return null;
+}
+
+async function clearStripeCustomerIdForOrg(orgId) {
+    await initDB();
+    await run(
+        `UPDATE organization_subscriptions
+            SET stripe_customer_id = NULL, updated_at = $2
+          WHERE organization_id = $1`,
+        [orgId, new Date().toISOString()]
+    );
+}
+
+async function clearStripeCustomerIdForConsumer(userId) {
+    await initDB();
+    await run(
+        `UPDATE consumer_subscriptions
+            SET stripe_customer_id = NULL, updated_at = $2
+          WHERE user_id = $1`,
+        [userId, new Date().toISOString()]
+    );
+}
+
+// ── Atomic seat-cap user creation ─────────────────────────────
+// Wraps createUser in a serializable transaction so that two concurrent
+// admin-add-user requests cannot both pass a "we have room" check and both
+// commit. The cap is computed inside the transaction from the live row
+// count + the org's effective max_users + the license seat cap. Throws
+// SeatCapExceededError when the cap is hit; the caller maps that to 403.
+//
+// strict=true (default): throw on cap exceed.
+// strict=false: return { created: false, reason: 'seat_cap' } so bulk sync
+//   paths (Azure, NC) can log+skip without crashing the batch.
+class SeatCapExceededError extends Error {
+    constructor(current, max, organizationId) {
+        super(`seat_cap_exceeded org=${organizationId} current=${current} max=${max}`);
+        this.name = 'SeatCapExceededError';
+        this.current = current;
+        this.max = max;
+        this.organizationId = organizationId;
+    }
+}
+
+async function createUserWithSeatCheck(userData, { strict = true } = {}) {
+    await initDB();
+    const orgId = userData.organizationId || '';
+    if (!orgId) {
+        const ok = await createUser(userData);
+        return { created: ok, reason: ok ? null : 'create_failed' };
+    }
+
+    let max = null;
+    try {
+        const limits = await getEffectiveLimits(orgId);
+        max = limits?.max_users ?? null;
+    } catch (_e) { /* ignore */ }
+    try {
+        const license = require('../license');
+        const seatCap = typeof license.getMaxSeatsForOrg === 'function'
+            ? await license.getMaxSeatsForOrg(orgId)
+            : null;
+        if (seatCap != null && (max == null || seatCap < max)) max = seatCap;
+    } catch (_e) { /* license module optional during early boot */ }
+
+    const insertParams = (() => {
+        const mwDek = userData.masterWrappedDEK
+            ? (typeof userData.masterWrappedDEK === 'string' ? userData.masterWrappedDEK : JSON.stringify(userData.masterWrappedDEK))
+            : null;
+        const wDek = userData.wrappedDEK
+            ? (typeof userData.wrappedDEK === 'string' ? userData.wrappedDEK : JSON.stringify(userData.wrappedDEK))
+            : null;
+        return [
+            userData.id, userData.username, userData.displayName || userData.username,
+            userData.firstName || null, userData.lastName || null, userData.email || null,
+            userData.phone || null, userData.avatar || null, userData.avatarType || null,
+            userData.passwordHash, userData.role || 'user',
+            JSON.stringify(userData.groups || []), mwDek, wDek,
+            userData.orgRole || '', orgId,
+            new Date().toISOString().split('T')[0], userData.status || 'active',
+            userData.azureUserId || null, userData.ncUid || null,
+            userData.provider || null, userData.autoProvisioned ? true : false,
+        ];
+    })();
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+        const client = await getClient();
+        try {
+            await client.query('BEGIN');
+            await client.query("SET LOCAL TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+
+            if (max != null) {
+                const countRow = await client.query(
+                    `SELECT COUNT(*)::int AS n FROM users WHERE "organizationId" = $1 AND COALESCE(status, 'active') = 'active' FOR UPDATE`,
+                    [orgId]
+                );
+                const current = countRow.rows[0]?.n ?? 0;
+                if (current >= max) {
+                    await client.query('ROLLBACK');
+                    client.release();
+                    console.warn(`[seat.cap] ${strict ? 'blocked' : 'skipped'} org=${orgId} current=${current} max=${max}`);
+                    if (strict) throw new SeatCapExceededError(current, max, orgId);
+                    return { created: false, reason: 'seat_cap', current, max };
+                }
+            }
+
+            const existing = await client.query('SELECT id FROM users WHERE id = $1', [userData.id]);
+            if (existing.rowCount > 0) {
+                await client.query('ROLLBACK');
+                client.release();
+                return { created: false, reason: 'duplicate_id' };
+            }
+
+            await client.query(
+                `INSERT INTO users (id, username, "displayName", "firstName", "lastName", email, phone, avatar, "avatarType", "passwordHash", role, groups, "masterWrappedDEK", "wrappedDEK", "orgRole", "organizationId", "createdAt", status, "azureUserId", "nc_uid", "provider", "auto_provisioned")
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
+                insertParams
+            );
+            await client.query('COMMIT');
+            client.release();
+            return { created: true, reason: null };
+        } catch (e) {
+            try { await client.query('ROLLBACK'); } catch (_) { }
+            client.release();
+            if (e && e.code === '40001' && attempt < 1) continue;
+            if (e instanceof SeatCapExceededError) throw e;
+            console.error('[UserStore] createUserWithSeatCheck error:', e.message);
+            return { created: false, reason: 'create_failed', error: e.message };
+        }
+    }
+    return { created: false, reason: 'create_failed' };
+}
+
 module.exports = {
     getAllUsers, getAllUserAvatars, getUser, getUserByEmail, createUser, updateUser, deleteUser,
+    createUserWithSeatCheck, SeatCapExceededError, PlanInUseError,
     getAllOrganizations, getOrganization, getOrganizationByNcInstanceId, createOrganization, updateOrganization, deleteOrganization,
     getOrgEnabledIntegrations, setOrgEnabledIntegrations, getOrgEnabledBetaFeatures, setOrgEnabledBetaFeatures,
     getUserByNcUid,
@@ -1400,4 +1990,12 @@ module.exports = {
     getAllOrgSubscriptions, getOrgSubscription, setOrgSubscription, deleteOrgSubscription, getEffectiveLimits,
     getConsumerSubscription, setConsumerSubscription, deleteConsumerSubscription, getAllConsumerSubscriptions,
     getBillingPeriod, logSubscriptionAudit, getAuditLog,
+    markTrialUsed, hasOrgUsedTrial, hasUserUsedTrial,
+    recordStripeEventProcessed,
+    recordPaymentFailureForOrg, recordPaymentFailureForConsumer,
+    resetPaymentFailureForOrg, resetPaymentFailureForConsumer,
+    suspendPastDueSubscriptions, expireOverdueTrials,
+    findSubscriptionByStripeCustomerId, clearStripeCustomerIdForOrg, clearStripeCustomerIdForConsumer,
+    isManualOverrideActive,
+    claimNotificationSlot, getDunningCounts,
 };

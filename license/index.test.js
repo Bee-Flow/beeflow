@@ -2,7 +2,8 @@
  * Unit tests for license/index.js
  *
  * Mocks the store module so no DB is required. Tests focus on tier
- * resolution, the Community fallback, and the activation orchestration.
+ * resolution, the Community fallback, the activation orchestration, and
+ * the legacy `pro` → `enterprise` normalisation.
  *
  * Run: node license/index.test.js
  */
@@ -129,9 +130,10 @@ const now = Math.floor(Date.now() / 1000);
     assert.strictEqual(status.source, 'default');
     assert.strictEqual(status.license, null);
     assert.ok(status.features.includes('chat_basic'));
-    assert.strictEqual(status.limits.max_users, 1);
+    assert.ok(status.features.includes('automations'), 'community ships with automations');
+    assert.strictEqual(status.limits.max_users, -1, 'community is uncapped');
 
-    // ── Activate a Pro license ──────────────────────────────────────────
+    // ── Activate a legacy Pro license → resolves as enterprise ─────────
     const proToken = sign({
         iss: 'license.beeflow.ai',
         sub: 'org_acme',
@@ -148,23 +150,26 @@ const now = Math.floor(Date.now() / 1000);
         organizationId: 'org_acme',
         activatedBy: 'user_admin',
     });
-    assert.strictEqual(activated.tier, 'pro');
+    assert.strictEqual(activated.tier, 'enterprise', 'legacy pro tier must be normalised on the public shape');
     assert.strictEqual(activated.id, 'lic_pro_acme');
     assert.ok(!('rawToken' in activated), 'public license shape must hide rawToken');
 
-    // ── Tier resolves to pro now ────────────────────────────────────────
-    assert.strictEqual(await license.getTierForOrg('org_acme'), 'pro');
+    // ── Tier resolves to enterprise (legacy pro normalised) ────────────
+    assert.strictEqual(await license.getTierForOrg('org_acme'), 'enterprise');
     assert.strictEqual(await license.hasFeature('org_acme', 'automations'), true);
-    assert.strictEqual(await license.hasFeature('org_acme', 'guardrails_dlp'), false);
-    assert.strictEqual(await license.hasTier('org_acme', 'pro'), true);
-    assert.strictEqual(await license.hasTier('org_acme', 'enterprise'), false);
+    assert.strictEqual(await license.hasFeature('org_acme', 'sso_saml'), true, 'enterprise unlocks compliance features');
+    assert.strictEqual(await license.hasFeature('org_acme', 'white_label'), false);
+    assert.strictEqual(await license.hasTier('org_acme', 'enterprise'), true);
     assert.strictEqual(await license.hasTier('org_acme', 'community'), true);
+    assert.strictEqual(await license.hasTier('org_acme', 'full'), false);
 
     const proStatus = await license.getLicenseStatus({ organizationId: 'org_acme' });
-    assert.strictEqual(proStatus.tier, 'pro');
+    assert.strictEqual(proStatus.tier, 'enterprise');
     assert.strictEqual(proStatus.source, 'license_key');
     assert.strictEqual(proStatus.license.id, 'lic_pro_acme');
+    assert.strictEqual(proStatus.license.tier, 'enterprise', 'license shape exposes normalised tier');
     assert.ok(proStatus.features.includes('automations'));
+    assert.ok(proStatus.features.includes('sso_saml'));
 
     // ── Bogus token rejection ───────────────────────────────────────────
     let threw = false;
@@ -191,7 +196,7 @@ const now = Math.floor(Date.now() / 1000);
 
     // ── Higher of org/user tiers wins ──────────────────────────────────
     fakeStore._orgs['org_mixed'] = {
-        id: 'lic_mixed_org', tier: 'pro', refreshStatus: 'active',
+        id: 'lic_mixed_org', tier: 'community', refreshStatus: 'active',
         expiresAt: new Date(Date.now() + 86400000).toISOString(),
     };
     fakeStore._users['user_in_mixed'] = {
@@ -204,7 +209,7 @@ const now = Math.floor(Date.now() / 1000);
     });
     assert.strictEqual(resolved, 'enterprise');
 
-    // ── Stripe subscription fallback: no license_keys → tier from sub ──
+    // ── Stripe subscription with legacy plan_tier 'pro' → normalised ──
     fakeUserStore._orgSubs['org_saas_pro'] = {
         plan_id: 'plan_pro_eu',
         plan_name: 'Pro',
@@ -212,13 +217,13 @@ const now = Math.floor(Date.now() / 1000);
         status: 'active',
         payment_status: 'paid',
     };
-    assert.strictEqual(await license.getTierForOrg('org_saas_pro'), 'pro');
+    assert.strictEqual(await license.getTierForOrg('org_saas_pro'), 'enterprise');
     const saasStatus = await license.getLicenseStatus({ organizationId: 'org_saas_pro' });
-    assert.strictEqual(saasStatus.tier, 'pro');
+    assert.strictEqual(saasStatus.tier, 'enterprise');
     assert.strictEqual(saasStatus.source, 'stripe_subscription');
     assert.strictEqual(saasStatus.license, null);
     assert.ok(saasStatus.subscription, 'subscription shape should be present');
-    assert.strictEqual(saasStatus.subscription.tier, 'pro');
+    assert.strictEqual(saasStatus.subscription.tier, 'enterprise', 'subscription shape exposes normalised tier');
     assert.strictEqual(saasStatus.subscription.status, 'active');
 
     // ── Cancelled subscription falls back to community ─────────────────
@@ -262,7 +267,7 @@ const now = Math.floor(Date.now() / 1000);
         plan_id: 'plan_pro_eu', plan_name: 'Pro', plan_tier: 'pro',
         status: 'active', payment_status: 'paid',
     };
-    // license_keys row exists (enterprise) → it wins over subscription (pro)
+    // license_keys row exists (enterprise) → it wins over subscription
     assert.strictEqual(await license.getTierForOrg('org_both'), 'enterprise');
     const bothStatus = await license.getLicenseStatus({ organizationId: 'org_both' });
     assert.strictEqual(bothStatus.source, 'license_key');
@@ -272,7 +277,8 @@ const now = Math.floor(Date.now() / 1000);
         plan_id: 'plan_legacy', plan_name: 'Bee Flow Pro Monthly', plan_tier: null,
         status: 'active', payment_status: 'paid',
     };
-    assert.strictEqual(await license.getTierForOrg('org_legacy_plan'), 'pro');
+    // tierFromPlanName parses "Pro" → 'pro', which normalises to 'enterprise'.
+    assert.strictEqual(await license.getTierForOrg('org_legacy_plan'), 'enterprise');
 
     // ── Consumer subscription fallback ─────────────────────────────────
     fakeUserStore._consumerSubs['user_saas_consumer'] = {
@@ -282,7 +288,7 @@ const now = Math.floor(Date.now() / 1000);
         status: 'active',
         payment_status: 'paid',
     };
-    assert.strictEqual(await license.getTierForUser('user_saas_consumer'), 'pro');
+    assert.strictEqual(await license.getTierForUser('user_saas_consumer'), 'enterprise');
 
     // ── getBestTierForOrgs picks up sub-derived tiers ──────────────────
     fakeUserStore._orgSubs['org_in_set_a'] = {
@@ -290,17 +296,22 @@ const now = Math.floor(Date.now() / 1000);
         status: 'active', payment_status: 'paid',
     };
     const bestForOrgs = await license.getBestTierForOrgs(['org_unknown', 'org_in_set_a']);
-    assert.strictEqual(bestForOrgs, 'pro');
+    assert.strictEqual(bestForOrgs, 'enterprise');
 
     // ── resolveTierFromSubscription helper edge cases ──────────────────
     assert.strictEqual(license.resolveTierFromSubscription(null), null);
     assert.strictEqual(license.resolveTierFromSubscription({ status: 'suspended', plan_tier: 'pro' }), null);
     assert.strictEqual(license.resolveTierFromSubscription({ status: 'past_due', plan_tier: 'pro' }), null);
     assert.strictEqual(license.resolveTierFromSubscription({ status: 'active', plan_tier: 'bogus' }), null);
+    assert.strictEqual(
+        license.resolveTierFromSubscription({ status: 'active', plan_tier: 'pro', payment_status: 'paid' }),
+        'enterprise',
+        'active pro subscription normalises to enterprise',
+    );
 
     // ── getMaxSeatsForOrg reads from license metadata ──────────────────
     fakeStore._orgs['org_seatcapped'] = {
-        id: 'lic_seatcapped', tier: 'pro', refreshStatus: 'active',
+        id: 'lic_seatcapped', tier: 'enterprise', refreshStatus: 'active',
         expiresAt: new Date(Date.now() + 86400000).toISOString(),
         metadata: { max_seats: 10 },
     };

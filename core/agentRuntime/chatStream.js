@@ -38,6 +38,32 @@ const { hydrateHistoryAttachments } = require('./historyHydrator');
 const { compactMessages } = require('../compaction');
 const { buildTokenPreservationAddendum } = require('../dlp/tokenPreservationPrompt');
 
+// ─────────────────────────────────────────────────────────────────
+// Per-conversation write serializer.
+// A single conversation row gets multiple updateConversation calls per turn
+// (after tool execution, after final response, plus a setImmediate redaction).
+// Without a transaction/version column, two concurrent turns on the same
+// conversation can interleave and clobber each other. Until the schema gets
+// optimistic-lock support, queue writes per conversation in-process so the
+// last-write-wins behaviour is at least intra-process ordered.
+// ─────────────────────────────────────────────────────────────────
+const _convWriteChains = new Map();
+async function _serializeConversationWrite(convId, fn) {
+    const prev = _convWriteChains.get(convId) || Promise.resolve();
+    // Chain so the next call waits for the previous one regardless of result.
+    const next = prev.then(() => fn(), () => fn());
+    _convWriteChains.set(convId, next);
+    try {
+        return await next;
+    } finally {
+        // Free the map slot once the tail of the chain settles, so the Map
+        // doesn't grow unboundedly across conversations.
+        if (_convWriteChains.get(convId) === next) {
+            _convWriteChains.delete(convId);
+        }
+    }
+}
+
 /**
  * Serialize a tool result for the LLM's tool message.
  *
@@ -54,10 +80,19 @@ const { buildTokenPreservationAddendum } = require('../dlp/tokenPreservationProm
  *     and drop known noise fields (`instruction`, `resultCount`) that are
  *     superseded by the agent's system prompt.
  */
+// Hard cap on tool result string fed to the model. A misbehaving tool that
+// returns several megabytes of JSON can blow the context window or rack up
+// token charges; truncate with a clear marker so the model knows.
+const MAX_TOOL_CONTENT_BYTES = 128 * 1024;
+function truncateToolContent(s) {
+    if (typeof s !== 'string') return s;
+    if (s.length <= MAX_TOOL_CONTENT_BYTES) return s;
+    return s.slice(0, MAX_TOOL_CONTENT_BYTES) + `\n…[tool output truncated at ${MAX_TOOL_CONTENT_BYTES} chars]`;
+}
 function buildLLMToolContent(finalToolResult) {
-    if (typeof finalToolResult === 'string') return finalToolResult;
+    if (typeof finalToolResult === 'string') return truncateToolContent(finalToolResult);
     if (finalToolResult == null || typeof finalToolResult !== 'object') {
-        return JSON.stringify(finalToolResult);
+        return truncateToolContent(JSON.stringify(finalToolResult));
     }
 
     // Strip bulky notebook content — LLM only needs the confirmation message.
@@ -72,7 +107,7 @@ function buildLLMToolContent(finalToolResult) {
         if (NOISE_KEYS.has(k)) continue;     // Redundant with system prompt
         clean[k] = v;
     }
-    return JSON.stringify(clean);
+    return truncateToolContent(JSON.stringify(clean));
 }
 
 // ============ RETRY & ERROR HELPERS ============
@@ -120,9 +155,15 @@ function classifyStreamError(error) {
  * @param {number} maxRetries - Maximum retry attempts (default 2)
  * @returns {Promise} Result of fn()
  */
-async function retryStreamCall(fn, maxRetries = 3) {
+async function retryStreamCall(fn, maxRetries = 3, signal = null) {
     let lastError;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        // Don't waste cycles on a retry if the client already gave up.
+        if (signal?.aborted) {
+            const err = new Error('Client aborted before retry');
+            err.name = 'AbortError';
+            throw err;
+        }
         try {
             return await fn();
         } catch (error) {
@@ -130,6 +171,10 @@ async function retryStreamCall(fn, maxRetries = 3) {
             const classified = classifyStreamError(error);
             if (!classified.retryable || attempt >= maxRetries) {
                 // Attach classification to the error for downstream handling
+                error._classified = classified;
+                throw error;
+            }
+            if (signal?.aborted) {
                 error._classified = classified;
                 throw error;
             }
@@ -197,6 +242,12 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         // Also strip web search when external tools are disabled
         tools = tools.filter(t => t.function?.name !== 'agent_search');
         console.log(`[AgentRuntime] External tools disabled for agent ${agentId} — skipping integrations and web search`);
+    }
+
+    // Per-turn user toggle: strip agent_search when the composer's web-search switch is off
+    if (messageMetadata?.webSearchEnabled === false) {
+        tools = tools.filter(t => t.function?.name !== 'agent_search');
+        console.log(`[AgentRuntime] Web search disabled by user for agent ${agentId} — stripped agent_search`);
     }
 
     // ── Built-in: set_reminder tool (always available) ────────────
@@ -294,27 +345,36 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         }
     }
 
-    if (conversation && messageMetadata.projectId && !messageMetadata.conversationId && !isEphemeral) {
+    // Only assign the new conversation to a project we actually validated above.
+    // Skipping the validation step left orphan rows pointing at unknown projects
+    // when the user had no access (or the project no longer existed).
+    if (conversation && validProjectId && !messageMetadata.conversationId && !isEphemeral) {
         try {
             const projectStore = require('../../stores/projectStore');
-            await projectStore.assignConversation(conversation.id, messageMetadata.projectId, 'agent_conversations');
+            await projectStore.assignConversation(conversation.id, validProjectId, userId, 'agent_conversations');
         } catch (e) {
             console.warn('[AgentRuntime] Failed to assign conversation to project:', e.message);
         }
     }
 
-    // Use historyOverride if provided (for thread context isolation), otherwise use conversation
+    // Use historyOverride if provided (for thread context isolation / edit-retry
+    // truncation), otherwise use the conversation's full history. Either way the
+    // current user turn is appended below — without that append, retrying the
+    // first message of a conversation passes [] as the override and the request
+    // reached the LLM with no messages at all (Anthropic 400: "messages: at
+    // least one message is required").
     let messages;
     // Map of live-attachment object → its persisted sidecar so processAttachments()
     // can write extracted text back onto the sidecar (replay across turns).
     const persistedByLive = new Map();
     if (historyOverride && Array.isArray(historyOverride)) {
-        // Use the overridden history (thread context)
         messages = [...historyOverride];
     } else {
         messages = [...conversation.messages];
+    }
 
-        // Build persisted attachments (strip base64, upload to RustFS for persistent URLs)
+    // Build persisted attachments (strip base64, upload to RustFS for persistent URLs)
+    {
         const persistedAttachments = [];
         if (messageMetadata?.attachments && messageMetadata.attachments.length > 0) {
             const storageStore = require('../../stores/storageStore');
@@ -753,7 +813,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     // exact string the LLM produced.
     let _rawResponseBuffer = '';
     const _captureRaw = !!dlpShield?.showRawPayload;
-    const RAW_BUFFER_MAX = 64 * 1024; // cap at 64 KB per turn, then truncate.
+    const RAW_BUFFER_MAX = 256 * 1024; // cap at 256 KB per turn, then truncate.
     {
         const _dlpRunner = require('../dlp/dlpRunner');
         const _dlpConvMap = _dlpRunner.getConversationTokenMap(conversation?.id);
@@ -825,7 +885,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         if (kbIds.length > 0) {
             try {
                 const { quickKBSearch } = require('./knowledgeSearch');
-                const kbResults = await quickKBSearch(userId, kbIds, userMessage, { topK: 6 });
+                const kbResults = await quickKBSearch(userId, kbIds, userMessage, { topK: 6, session: userAuth?.session });
                 if (kbResults.length > 0) {
                     const kbText = kbResults.map((c, i) => {
                         const src = c.source_uri || c.title || 'KB';
@@ -855,7 +915,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         emitPhase(onEvent, 'kb_search');
         const _kbT = Date.now();
         try {
-            const kbExtension = await performKnowledgeSearch({ agent, userId, userMessage, isStrictKnowledge, onEvent: (type, data) => {
+            const kbExtension = await performKnowledgeSearch({ agent, userId, userMessage, isStrictKnowledge, session: userAuth?.session, onEvent: (type, data) => {
                 // Intercept kb_sources to accumulate for persistence
                 if (type === 'kb_sources' && data?.sources) {
                     _kbSources.push(...data.sources);
@@ -897,7 +957,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         };
         messages.push(assistantMsg);
         if (!isEphemeral) {
-            await agentStore.updateConversation(conversation.id, messages, userAuth.encryptionKey, userAuth.userId);
+            await _serializeConversationWrite(conversation.id, () => agentStore.updateConversation(conversation.id, messages, userAuth.encryptionKey, userAuth.userId));
         }
 
         // Server-side persistence: redact/remove the violating user message
@@ -917,7 +977,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                             const updatedMessages = conv.messages.map((m, idx) =>
                                 idx === lastUserIdx ? { ...m, content: redactedContent, isRedacted: true } : m
                             );
-                            await agentStore.updateConversation(conversation.id, updatedMessages, userAuth.encryptionKey, userAuth.userId);
+                            await _serializeConversationWrite(conversation.id, () => agentStore.updateConversation(conversation.id, updatedMessages, userAuth.encryptionKey, userAuth.userId));
                             console.log(`[AgentRuntime] Guardrail: server-side redaction completed for conversation ${conversation.id}`);
                         }
                     }
@@ -1004,6 +1064,18 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
 
     // Abort signal from the route handler (client disconnect)
     const signal = messageMetadata.signal || null;
+
+    // Track repeated failing tool calls so the loop breaks instead of burning
+    // the full max-iterations budget on a deterministic failure (e.g. permission
+    // denied). Key: tool-name + stable JSON of args; value: failure count.
+    const _failingToolCounts = new Map();
+    const MAX_TOOL_REPEAT = 3;
+    function _stableStringify(value) {
+        if (value === null || typeof value !== 'object') return JSON.stringify(value);
+        if (Array.isArray(value)) return '[' + value.map(_stableStringify).join(',') + ']';
+        const keys = Object.keys(value).sort();
+        return '{' + keys.map(k => JSON.stringify(k) + ':' + _stableStringify(value[k])).join(',') + '}';
+    }
 
     while (iterations < maxIterations) {
         // Check if client disconnected
@@ -1237,8 +1309,20 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 const tierName = (agent.model && agent.model.startsWith('tier:')) ? agent.model.substring(5) : 'fast';
                 const tierDefaults = TIER_DEFAULTS[tierName] || TIER_DEFAULTS['fast'];
                 const defaultMaxTokens = isThinkingModel ? 40960 : tierDefaults.maxTokens;
+
+                // Auto-bump: attachments routinely require long-form output that
+                // fast/standard ceilings clip mid-response. Lift to the writer-tier
+                // budget for this turn — tier defaults still apply to non-attachment turns,
+                // and higher tiers (deep_thinking @ 40K) keep their ceiling via Math.max.
+                const _turnHasAttachments = Array.isArray(messageMetadata?.attachments) && messageMetadata.attachments.length > 0;
+                const ATTACHMENT_MIN_MAX_TOKENS = 16384;
+                const _resolvedMaxTokens = tierSettings.maxTokens || defaultMaxTokens;
+                const _effectiveMaxTokens = _turnHasAttachments
+                    ? Math.max(_resolvedMaxTokens, ATTACHMENT_MIN_MAX_TOKENS)
+                    : _resolvedMaxTokens;
+
                 const adapterOptions = {
-                    maxTokens: tierSettings.maxTokens || defaultMaxTokens,
+                    maxTokens: _effectiveMaxTokens,
                     temperature: tierSettings.temperature !== undefined ? tierSettings.temperature : tierDefaults.temperature,
                     budgetTokens: tierSettings.budgetTokens || undefined,
                     // messageMetadata.reasoningEffort is the per-turn user choice from the composer.
@@ -1282,10 +1366,14 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 });
 
                 let _adapterStreamUsage = null;
+                // Pass the abort signal through to retryStreamCall so the retry
+                // loop bails immediately when the client disconnects. The native
+                // provider adapter receives the signal via adapterOptions.
                 await retryStreamCall(() => providerAdapter.stream(
                     config.apiKey, config.url, modelToUse,
                     adapterMessages, adapterOptions,
                     (type, data) => {
+                        if (signal?.aborted) return; // Drop callbacks once client aborted
                         if (type === 'text') {
                             const textChunk = data.text || '';
                             contentBuffer += textChunk;
@@ -1357,7 +1445,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                             onEvent('error', data);
                         }
                     }
-                ));
+                ), 3, signal);
 
                 // Log usage for native adapter streams
                 try {
@@ -1445,7 +1533,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         throw new Error(`API error ${resp.status}: ${errorText}`);
                     }
                     return resp;
-                });
+                }, 3, signal);
 
 
                 // Parse SSE stream
@@ -1617,15 +1705,42 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 const toolExecutionPromises = currentToolCalls.map(async (toolCall) => {
                     const toolName = toolCall.function.name;
                     let toolArgs = {};
+                    let jsonParseError = null;
                     try {
                         toolArgs = JSON.parse(toolCall.function.arguments || '{}');
                     } catch (e) {
                         toolArgs = {};
+                        jsonParseError = e.message || 'invalid JSON';
+                    }
+                    // Surface the parse failure as a tool result so the model can self-correct
+                    // instead of silently retrying with empty args.
+                    if (jsonParseError) {
+                        return {
+                            toolCall,
+                            toolName,
+                            toolArgs,
+                            finalToolResult: `[Tool '${toolName}' arguments were not valid JSON: ${jsonParseError}. Please re-emit the tool call with well-formed JSON.]`,
+                            blocked: true
+                        };
                     }
 
                     const fixedParams = toolParamsMap[toolName] || null;
-                    console.log(`[AgentRuntime] Tool lookup: ${toolName}, found fixedParams:`, fixedParams);
+                    // Don't log fixedParams directly — they often contain secrets (API keys,
+                    // tokens, OAuth refresh creds). Just log whether they were present.
+                    console.log(`[AgentRuntime] Tool lookup: ${toolName}, fixedParams=${fixedParams ? 'present' : 'none'}`);
                     onEvent('tool_start', { name: toolName, args: toolArgs });
+
+                    // Per-tool abort check: if the client has already disconnected, skip
+                    // remaining tool work in this batch rather than ploughing on.
+                    if (signal?.aborted) {
+                        return {
+                            toolCall,
+                            toolName,
+                            toolArgs,
+                            finalToolResult: '[Tool execution skipped — client aborted]',
+                            blocked: true
+                        };
+                    }
 
                     // Regex Guardrails - Tool Input scope
                     if (regexConfig?.enabled && regexConfig?.scope?.toolInput) {
@@ -1721,25 +1836,44 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     // Use unified tool dispatcher — supports integrations + components.
                     // Wrap in runWithProbe so any outbound fetch via probedFetch
                     // records the actual peer IP for the egress dashboard.
+                    // Catch per-tool exceptions so one failing tool doesn't reject the
+                    // whole batch — the model receives the error as a tool result and
+                    // can decide how to react.
                     const { executeTool: dispatchTool } = require('../toolDispatcher');
-                    const { result: toolResult, probe: outboundProbe } = await runWithProbe(async () => {
-                        const preMeta = resolveIntegration(toolName, toolArgs || {});
-                        if (preMeta?.isLocal) markLocal(preMeta.label || preMeta.integration);
-                        return await dispatchTool(toolName, toolArgs, {
-                            userId,
-                            session: userAuth?.session,
-                            userAuth,
-                            fixedParams: fixedParams,
-                            agentId: agent.id,
-                            conversationId: conversation.id,
-                            send: onEvent,
-                            req: messageMetadata.req || null,
-                            nanoBananaSettings: messageMetadata.nanoBananaSettings || null,
-                            onImageGenerated: (data) => {
-                                onEvent('image', data);
-                            },
+                    let toolResult;
+                    let outboundProbe;
+                    try {
+                        const probed = await runWithProbe(async () => {
+                            const preMeta = resolveIntegration(toolName, toolArgs || {});
+                            if (preMeta?.isLocal) markLocal(preMeta.label || preMeta.integration);
+                            return await dispatchTool(toolName, toolArgs, {
+                                userId,
+                                session: userAuth?.session,
+                                userAuth,
+                                fixedParams: fixedParams,
+                                agentId: agent.id,
+                                conversationId: conversation.id,
+                                send: onEvent,
+                                req: messageMetadata.req || null,
+                                nanoBananaSettings: messageMetadata.nanoBananaSettings || null,
+                                onImageGenerated: (data) => {
+                                    onEvent('image', data);
+                                },
+                            });
                         });
-                    });
+                        toolResult = probed.result;
+                        outboundProbe = probed.probe;
+                    } catch (toolErr) {
+                        console.error(`[AgentRuntime] Tool '${toolName}' threw:`, toolErr?.message || toolErr);
+                        const errMsg = toolErr?.message || String(toolErr);
+                        return {
+                            toolCall,
+                            toolName,
+                            toolArgs,
+                            finalToolResult: `[Tool '${toolName}' failed: ${errMsg}]`,
+                            blocked: true
+                        };
+                    }
 
                     // Regex Guardrails - Tool Output scope
                     let finalToolResult = toolResult;
@@ -1762,9 +1896,42 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     };
                 });
 
-                // Wait for all tools to complete
+                // Wait for all tools to complete. Use allSettled defensively — every
+                // path inside the map already returns a sentinel object, but a future
+                // refactor that throws synchronously shouldn't take the whole turn down.
                 console.log(`[AgentRuntime] Executing ${currentToolCalls.length} tools in parallel...`);
-                const toolResults = await Promise.all(toolExecutionPromises);
+                const settled = await Promise.allSettled(toolExecutionPromises);
+                const toolResults = settled.map((s, i) => {
+                    if (s.status === 'fulfilled') return s.value;
+                    const tc = currentToolCalls[i];
+                    const name = tc?.function?.name || 'unknown';
+                    console.error(`[AgentRuntime] Tool '${name}' unexpectedly rejected:`, s.reason?.message || s.reason);
+                    return {
+                        toolCall: tc,
+                        toolName: name,
+                        toolArgs: {},
+                        finalToolResult: `[Tool '${name}' failed: ${s.reason?.message || 'unknown error'}]`,
+                        blocked: true
+                    };
+                });
+
+                // Detect deterministic tool-call loops: if the model has called the
+                // same (name, args) tuple and it has failed multiple iterations in a
+                // row, stop now rather than burning the iteration budget.
+                let _shouldBailOnLoop = false;
+                for (const result of toolResults) {
+                    const fr = result?.finalToolResult;
+                    const looksLikeFailure = result?.blocked === true
+                        || (typeof fr === 'string' && fr.startsWith('[Tool '));
+                    if (!looksLikeFailure) continue;
+                    const key = `${result.toolName}|${_stableStringify(result.toolArgs || {})}`;
+                    const count = (_failingToolCounts.get(key) || 0) + 1;
+                    _failingToolCounts.set(key, count);
+                    if (count >= MAX_TOOL_REPEAT) {
+                        console.warn(`[AgentRuntime] Tool '${result.toolName}' failed ${count}× with identical args — breaking out of loop to avoid budget burn`);
+                        _shouldBailOnLoop = true;
+                    }
+                }
 
                 // Process results in order
                 for (const result of toolResults) {
@@ -1781,10 +1948,14 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     // Sanitize tool result before streaming to client to prevent API key exposure
                     onEvent('tool_end', { name: toolName, result: sanitizeToolResult(finalToolResult) });
 
-                    // Emit email_draft SSE event for user approval (with dedup)
+                    // Emit email_draft SSE event for user approval (with dedup).
+                    // Use a key derived via _stableStringify so the dedup is order-stable —
+                    // JSON.stringify on object literals respects insertion order, and the
+                    // model can produce slightly different draft object shapes that still
+                    // mean the same draft.
                     if (finalToolResult?._action === 'email_draft') {
-                        const draftKey = JSON.stringify({ to: finalToolResult.draft?.to, subject: finalToolResult.draft?.subject, body: finalToolResult.draft?.body });
-                        const alreadySent = _emailDrafts.some(d => JSON.stringify({ to: d.to, subject: d.subject, body: d.body }) === draftKey);
+                        const draftKey = _stableStringify({ to: finalToolResult.draft?.to, subject: finalToolResult.draft?.subject, body: finalToolResult.draft?.body });
+                        const alreadySent = _emailDrafts.some(d => _stableStringify({ to: d.to, subject: d.subject, body: d.body }) === draftKey);
                         if (!alreadySent) {
                             onEvent('email_draft', finalToolResult.draft);
                             _emailDrafts.push({ ...finalToolResult.draft, status: 'pending' });
@@ -1792,8 +1963,8 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     }
                     // Emit calendar_draft SSE event for user approval (with dedup)
                     if (finalToolResult?._action === 'calendar_draft') {
-                        const draftKey = JSON.stringify({ summary: finalToolResult.draft?.summary, start: finalToolResult.draft?.start, end: finalToolResult.draft?.end });
-                        const alreadySent = _calendarDrafts.some(d => JSON.stringify({ summary: d.summary, start: d.start, end: d.end }) === draftKey);
+                        const draftKey = _stableStringify({ summary: finalToolResult.draft?.summary, start: finalToolResult.draft?.start, end: finalToolResult.draft?.end });
+                        const alreadySent = _calendarDrafts.some(d => _stableStringify({ summary: d.summary, start: d.start, end: d.end }) === draftKey);
                         if (!alreadySent) {
                             onEvent('calendar_draft', finalToolResult.draft);
                             _calendarDrafts.push({ ...finalToolResult.draft, status: 'pending' });
@@ -1934,7 +2105,18 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
 
                 // Save conversation after tool execution (so tool calls are persisted)
                 console.log('[AgentStream] Saving conversation with tool calls:', JSON.stringify(messages.slice(-3), null, 2));
-                await agentStore.updateConversation(conversation.id, messages, userAuth.encryptionKey, userAuth.userId);
+                await _serializeConversationWrite(conversation.id, () => agentStore.updateConversation(conversation.id, messages, userAuth.encryptionKey, userAuth.userId));
+
+                if (_shouldBailOnLoop) {
+                    // Inject a system message so the next turn (if any) gets a clear nudge.
+                    messages.push({
+                        role: 'system',
+                        content: 'A tool has failed repeatedly with identical arguments. Stop calling that tool with those arguments and explain to the user what is going wrong, or try a meaningfully different approach.'
+                    });
+                    // Tell the user-facing client that we are stopping the autonomous loop.
+                    onEvent('tool_loop_broken', { reason: 'repeated_failure' });
+                    break;
+                }
                 continue;
             }
 
@@ -2055,19 +2237,39 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             // Persistence format: `thinkingParts` is the structured array (with signatures
             // for Claude replay); `thinking` stays as the flat string for backwards compat
             // with memory extraction and anything reading the old shape.
+            // Cap total thinking size — runaway models can emit hundreds of KB
+            // of chain-of-thought, bloating conversation rows and slowing reads.
+            const THINKING_BUDGET = 64 * 1024;
+            const _capText = (s) => (typeof s === 'string' && s.length > THINKING_BUDGET)
+                ? s.slice(0, THINKING_BUDGET) + '…[thinking truncated]'
+                : (typeof s === 'string' ? s : '');
             if (_thinkingParts.length > 0) {
-                assistantMsg.thinking = _thinkingParts.map(p => ({
-                    id: p.id,
-                    text: p.text,
-                    startedAt: p.startedAt,
-                    endedAt: p.endedAt || Date.now(),
-                    redacted: p.redacted || undefined,
-                    signature: p.signature || undefined,
-                    phase: p.phase || undefined,
-                }));
+                let budget = THINKING_BUDGET;
+                assistantMsg.thinking = _thinkingParts.map(p => {
+                    const text = typeof p.text === 'string' ? p.text : '';
+                    let outText;
+                    if (budget <= 0) {
+                        outText = '';
+                    } else if (text.length <= budget) {
+                        outText = text;
+                        budget -= text.length;
+                    } else {
+                        outText = text.slice(0, budget) + '…[thinking truncated]';
+                        budget = 0;
+                    }
+                    return {
+                        id: p.id,
+                        text: outText,
+                        startedAt: p.startedAt,
+                        endedAt: p.endedAt || Date.now(),
+                        redacted: p.redacted || undefined,
+                        signature: p.signature || undefined,
+                        phase: p.phase || undefined,
+                    };
+                });
             } else if (_thinking) {
                 // Legacy path: flat-string thinking without part metadata.
-                assistantMsg.thinking = _thinking;
+                assistantMsg.thinking = _capText(_thinking);
             }
 
             // Privacy / DLP — persist redaction metadata so the badge + "How I got
@@ -2090,7 +2292,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             }
             messages.push(assistantMsg);
             if (!isEphemeral) {
-                await agentStore.updateConversation(conversation.id, messages, userAuth.encryptionKey, userAuth.userId);
+                await _serializeConversationWrite(conversation.id, () => agentStore.updateConversation(conversation.id, messages, userAuth.encryptionKey, userAuth.userId));
             }
 
             // ============ MEMORY EXTRACTION ============
@@ -2126,7 +2328,9 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                             })
                             .catch(err => {
                                 console.error('[AgentRuntime] Memory extraction failed:', err.message);
-
+                                // Surface to the client so operators can see persistent extraction
+                                // failures rather than silently losing all memory writes.
+                                try { onEvent('memory_extraction_failed', { error: err.message }); } catch (_) { /* ignore */ }
                             });
                     } catch (memErr) {
                         console.error('[AgentRuntime] Memory extractor load failed:', memErr.message);
@@ -2172,7 +2376,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                                     }
                                     return m;
                                 });
-                                await agentStore.updateConversation(conversation.id, updatedMessages, userAuth.encryptionKey, userAuth.userId);
+                                await _serializeConversationWrite(conversation.id, () => agentStore.updateConversation(conversation.id, updatedMessages, userAuth.encryptionKey, userAuth.userId));
                                 console.log(`[RegexGuard] Server-side persistence completed for conversation ${conversation.id}`);
                             }
                         } catch (redactErr) {

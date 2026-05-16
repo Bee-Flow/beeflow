@@ -8,16 +8,16 @@
  * marker.
  *
  * Flow on this side:
- *   1. Spot the connector marker — if absent, fall through (PAT / cookie auth
- *      handle their own paths and we must not interfere with them).
+ *   1. Spot the connector marker — if absent, fall through (cookie auth
+ *      handles its own paths and we must not interfere with it).
  *   2. Resolve the tenant key. The connector signs with one specific
  *      customer's key, but the JWT body doesn't tell us which customer —
  *      that's the whole point of HS256 (we re-derive who it is by trying
  *      keys until one verifies). For a small number of tenants we iterate;
  *      at scale we'd index by a key hint in the JWT header (kid).
  *   3. Verify the signature, decode the payload, look up the user by email,
- *      populate req.session exactly the way patAuth.js does so downstream
- *      handlers see no difference.
+ *      populate req.session so downstream handlers see no difference from a
+ *      cookie session.
  *   4. Reject (403) if the email isn't provisioned — never auto-create users
  *      from the connector path.
  *
@@ -156,7 +156,7 @@ async function connectorJwtMiddleware(req, res, next) {
     }
 
     // Connector requests are tagged with this header. Without it, fall through
-    // to patAuth and the rest of the chain.
+    // to the rest of the chain.
     if (req.headers['x-beeflow-source'] !== 'nextcloud-connector') {
         return next();
     }
@@ -214,7 +214,7 @@ async function connectorJwtMiddleware(req, res, next) {
             const ncUid = String(req.headers['x-beeflow-nc-uid'] || payload.sub || '').trim();
             const status = (org.nc_new_user_default_status === 'pending') ? 'pending' : 'active';
             const userId = `nc_${orgId}_${(ncUid || payload.email).replace(/[^a-zA-Z0-9]+/g, '-').slice(0, 40)}`;
-            await userStore.createUser({
+            const r = await userStore.createUserWithSeatCheck({
                 id: userId,
                 username: payload.email,
                 email: payload.email,
@@ -226,7 +226,17 @@ async function connectorJwtMiddleware(req, res, next) {
                 provider: 'nextcloud_connector',
                 autoProvisioned: true,
                 status,
-            });
+            }, { strict: false });
+            if (!r.created) {
+                if (r.reason === 'seat_cap') {
+                    return res.status(403).json({
+                        error: 'Your organization has reached its user seat limit. Ask your Bee Flow administrator to upgrade.',
+                        code: 'seat_cap_exceeded',
+                    });
+                }
+                console.warn(`[ConnectorJWT] auto-provision failed userId=${userId} reason=${r.reason}`);
+                return res.status(500).json({ error: 'Failed to provision user' });
+            }
             user = await userStore.getUser(userId);
             console.log(`[ConnectorJWT] Auto-provisioned user ${userId} (org=${orgId}, status=${status})`);
             if (status === 'pending') {

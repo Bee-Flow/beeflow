@@ -37,7 +37,14 @@ async function attachOrgFilter(req, res, next) {
     if (!req.session?.isAuthenticated) return res.status(401).json({ error: 'Not authenticated' });
     const orgId = await getOrgFilter(req);
     req.usageFilters = buildRequestFilters(req);
-    if (orgId) req.usageFilters.organizationId = orgId;
+    if (orgId === '__none__') {
+        // Consumer account — no org. Scope strictly to the caller's own
+        // usage so the personal "Usage & Monitoring" panel works, and so a
+        // ?user= query param can't be used to peek at someone else's rows.
+        req.usageFilters.userId = req.session.user.id;
+    } else if (orgId) {
+        req.usageFilters.organizationId = orgId;
+    }
     next();
 }
 

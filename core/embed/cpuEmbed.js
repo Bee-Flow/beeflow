@@ -13,6 +13,7 @@
  */
 
 const os = require('os');
+const path = require('path');
 
 // Pinned permissive-licensed embedding model (MIT). Multilingual-e5
 // requires the "query: " / "passage: " prefix for best quality —
@@ -20,14 +21,22 @@ const os = require('os');
 const CPU_EMBED_MODEL_ID = 'Xenova/multilingual-e5-small';
 const CPU_EMBED_DIM = 384;
 
-const CPU_EMBED_TIMEOUT_MS  = Number(process.env.CPU_EMBED_TIMEOUT_MS)  || 8000;
-const CPU_EMBED_BATCH_SIZE  = Number(process.env.CPU_EMBED_BATCH_SIZE)  || 16;
-const CPU_EMBED_TEXT_CHARS  = Number(process.env.CPU_EMBED_TEXT_CHARS)  || 2000;
+const CPU_EMBED_TIMEOUT_MS       = Number(process.env.CPU_EMBED_TIMEOUT_MS)      || 8000;
+// Cold-start budget for model download + ONNX init. See cpuCrossEncoder.js
+// for the same pattern — both pipelines share the same cache directory
+// so the first call after a fresh boot pays one download per model.
+const CPU_EMBED_LOAD_TIMEOUT_MS  = Number(process.env.CPU_EMBED_LOAD_TIMEOUT_MS) || 60000;
+const CPU_EMBED_BATCH_SIZE       = Number(process.env.CPU_EMBED_BATCH_SIZE)      || 16;
+const CPU_EMBED_TEXT_CHARS       = Number(process.env.CPU_EMBED_TEXT_CHARS)      || 2000;
 const CPU_EMBED_WASM_THREADS = Math.max(
     1,
     Number(process.env.CPU_EMBED_WASM_THREADS) ||
         Math.max(1, Math.floor((os.cpus()?.length || 2) / 2))
 );
+
+const CPU_EMBED_CACHE_DIR = process.env.HF_HOME
+    || process.env.TRANSFORMERS_CACHE
+    || path.join(__dirname, '..', '..', 'data', 'transformers-cache');
 
 let _pipelinePromise = null;
 let _loadFailed = false;
@@ -39,17 +48,21 @@ async function getPipeline() {
     _pipelinePromise = (async () => {
         try {
             const { pipeline, env } = await import('@huggingface/transformers');
+            env.cacheDir = CPU_EMBED_CACHE_DIR;
             env.allowRemoteModels = true;
+            env.allowLocalModels = true;
             try {
                 if (env.backends?.onnx?.wasm) {
                     env.backends.onnx.wasm.numThreads = CPU_EMBED_WASM_THREADS;
                 }
             } catch (_) { /* older versions: ignore */ }
 
-            const extractor = await pipeline('feature-extraction', CPU_EMBED_MODEL_ID, {
-                dtype: 'q8',
-            });
-            console.log(`[CpuEmbed] Model ${CPU_EMBED_MODEL_ID} ready (dim=${CPU_EMBED_DIM}, threads=${CPU_EMBED_WASM_THREADS})`);
+            const extractor = await withTimeout(
+                pipeline('feature-extraction', CPU_EMBED_MODEL_ID, { dtype: 'q8' }),
+                CPU_EMBED_LOAD_TIMEOUT_MS,
+                'cpu-embed-load',
+            );
+            console.log(`[CpuEmbed] Model ${CPU_EMBED_MODEL_ID} ready (cache=${CPU_EMBED_CACHE_DIR}, dim=${CPU_EMBED_DIM}, threads=${CPU_EMBED_WASM_THREADS})`);
             return extractor;
         } catch (err) {
             console.warn(`[CpuEmbed] Failed to load ${CPU_EMBED_MODEL_ID}: ${err.message}`);
@@ -122,7 +135,12 @@ async function cpuEmbed(texts, options = {}) {
 }
 
 async function warmup() {
-    try { await cpuEmbed(['warmup']); } catch (_) {}
+    try {
+        const out = await cpuEmbed(['warmup']);
+        if (out.length > 0) {
+            console.log('[CpuEmbed] Warmup complete — first user query will be fast.');
+        }
+    } catch (_) { /* fail-open */ }
 }
 
 module.exports = {

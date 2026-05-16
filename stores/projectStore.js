@@ -315,22 +315,27 @@ async function getProjectShares(projectId) {
 
 // ── Conversation assignment ──────────────────────────────
 
-async function assignConversation(conversationId, projectId, tableName = 'direct_conversations') {
+// Both helpers require userId so we only touch conversations the caller owns.
+// Without this guard, anyone with editor+ on a project could attach (or detach)
+// other users' conversations via the project assignment endpoint.
+async function assignConversation(conversationId, projectId, userId, tableName = 'direct_conversations') {
     await initDB();
+    if (!userId) return false;
     const safeTable = tableName === 'agent_conversations' ? 'agent_conversations' : 'direct_conversations';
     const { rowCount } = await run(
-        `UPDATE ${safeTable} SET project_id = $1 WHERE id = $2`,
-        [projectId, conversationId]
+        `UPDATE ${safeTable} SET project_id = $1 WHERE id = $2 AND user_id = $3`,
+        [projectId, conversationId, userId]
     );
     return rowCount > 0;
 }
 
-async function unassignConversation(conversationId, tableName = 'direct_conversations') {
+async function unassignConversation(conversationId, userId, tableName = 'direct_conversations') {
     await initDB();
+    if (!userId) return false;
     const safeTable = tableName === 'agent_conversations' ? 'agent_conversations' : 'direct_conversations';
     const { rowCount } = await run(
-        `UPDATE ${safeTable} SET project_id = NULL WHERE id = $1`,
-        [conversationId]
+        `UPDATE ${safeTable} SET project_id = NULL WHERE id = $1 AND user_id = $2`,
+        [conversationId, userId]
     );
     return rowCount > 0;
 }
@@ -416,6 +421,7 @@ async function listActivity(projectId, limit = 50, offset = 0) {
 }
 
 module.exports = {
+    initDB,
     createProject,
     getProject,
     listUserProjects,

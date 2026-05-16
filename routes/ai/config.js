@@ -1299,8 +1299,17 @@ router.get('/user-settings', requireAuth, async (req, res) => {
         }
     } catch (e) { /* ignore */ }
 
-    // Personal EU mode preference
-    const userEuModeEnabled = !!(await configStore.getConfig(`user_eu_mode_${userId}`));
+    // Personal EU mode preference — the Privacy Shield panel
+    // (user_privacy_shield_${userId}) is the canonical store. We still
+    // honour the legacy `user_eu_mode_${userId}` key as a fallback for
+    // users who toggled the old (now-removed) Startup Agent EU switch
+    // before this panel existed; isEUModeActive does the same.
+    const userShield = await configStore.getConfig(`user_privacy_shield_${userId}`);
+    const userEuModeEnabled = !!(userShield?.enabled && userShield?.euModeEnabled)
+        || !!(await configStore.getConfig(`user_eu_mode_${userId}`));
+
+    // Personal Simple Mode preference — strips the UI down to chat + agents
+    const simpleMode = !!(await configStore.getConfig(`simple_mode_user_${userId}`));
 
     // Check if EU models are configured at all (admin must set these up)
     let hasEuModelsConfigured = false;
@@ -1329,12 +1338,14 @@ router.get('/user-settings', requireAuth, async (req, res) => {
         userEuModeEnabled,
         orgEuModeForced,
         hasEuModelsConfigured,
+        // Simple Mode (personal UI preference)
+        simpleMode,
     });
 });
 
 router.post('/user-settings', requireAuth, async (req, res) => {
     const userId = req.session.user.id;
-    const { firefliesApiKey, youtrackUrl, youtrackToken, gammaApiKey, signrequestSubdomain, signrequestToken, enabledApps, userEuModeEnabled } = req.body;
+    const { firefliesApiKey, youtrackUrl, youtrackToken, gammaApiKey, signrequestSubdomain, signrequestToken, enabledApps, simpleMode } = req.body;
 
     if (firefliesApiKey !== undefined) {
         await configStore.setSecret(`fireflies_api_key_user_${userId}`, firefliesApiKey || '');
@@ -1362,9 +1373,15 @@ router.post('/user-settings', requireAuth, async (req, res) => {
         await configStore.setConfig(`enabled_apps_user_${userId}`, enabledApps);
     }
 
-    if (userEuModeEnabled !== undefined) {
-        await configStore.setConfig(`user_eu_mode_${userId}`, !!userEuModeEnabled);
-        console.log(`[UserSettings] User ${userId} set EU-only models: ${!!userEuModeEnabled}`);
+    // EU mode is now managed exclusively through the Privacy Shield panel
+    // (`user_privacy_shield_${userId}.euModeEnabled`). The legacy
+    // `userEuModeEnabled` write here used to power the Startup-Agent toggle;
+    // that toggle was removed because it bypassed the master Privacy Shield
+    // switch and split the source of truth. Accepting writes here would let
+    // a stale client silently change EU routing — so we drop them.
+
+    if (simpleMode !== undefined) {
+        await configStore.setConfig(`simple_mode_user_${userId}`, !!simpleMode);
     }
 
     res.json({ success: true });

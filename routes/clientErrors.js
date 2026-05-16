@@ -4,10 +4,15 @@
  * Log-only (no DB persistence). The goal is to get minified production stack
  * traces + React component stacks into the server log so they can be decoded
  * against sourcemap CI artifacts. Fire-and-forget from the client side.
+ *
+ * Intentionally unauthenticated: errors that fire during the boot path (e.g.
+ * before the session is established, or while auth is mid-refresh) are
+ * exactly the ones most worth capturing. Gating behind requireAuth caused
+ * those reports to 500/401 and never reach the log. Best-effort userId
+ * capture from the session when one happens to be present.
  */
 
 const express = require('express');
-const { requireAuth } = require('../auth/permissions');
 
 const router = express.Router();
 
@@ -16,7 +21,7 @@ function truncate(s, max) {
     return s.length > max ? s.slice(0, max) + '…[truncated]' : s;
 }
 
-router.post('/', requireAuth, (req, res) => {
+router.post('/', (req, res) => {
     try {
         const body = req.body || {};
         const entry = {

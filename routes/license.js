@@ -14,9 +14,22 @@
 
 const express = require('express');
 const router = express.Router();
+const rateLimit = require('express-rate-limit');
 
 const license = require('../license');
 const { hasPermission, resolveUserOrgIds } = require('../auth/permissions');
+
+// Rate-limit license status and activation. /status is polled by the UI on
+// every page load; activation is a low-frequency operation but a useful
+// target for enumeration of valid license_ids. 30/min/IP is generous for
+// a normal SPA and tight for abuse.
+const licenseLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: parseInt(process.env.LICENSE_API_RATE_PER_MIN || '30', 10),
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many license requests' },
+});
 
 function getSessionUser(req) {
     return req.session?.user || null;
@@ -42,13 +55,23 @@ async function isOrgAdmin(req) {
     } catch (_) { return false; }
 }
 
+// Router-level guard. Every endpoint requires authentication; individual
+// endpoints assert their own additional access policy (isOrgAdmin for org
+// scope, self-only for consumer scope) — we deliberately do NOT hoist
+// isOrgAdmin to the router because POST /activate and DELETE /deactivate
+// have different rules for the consumer-scope path (a consumer can self-
+// activate but a non-admin org user cannot activate an org license).
+//
+// IMPORTANT for reviewers: when adding a new endpoint here, explicitly
+// assert your access policy (isOrgAdmin, or scope-based equivalent) at
+// the start of the handler. Document the gate in server/license/featureMap.js.
 router.use((req, res, next) => {
     if (!req.session?.isAuthenticated) return res.status(401).json({ error: 'Not authenticated' });
     next();
 });
 
 // ── GET /status ─────────────────────────────────────────────────────────
-router.get('/status', async (req, res) => {
+router.get('/status', licenseLimiter, async (req, res) => {
     try {
         const orgId = getOrgId(req);
         const userId = getUserId(req);
@@ -71,7 +94,7 @@ router.get('/status', async (req, res) => {
 
 // ── POST /activate ──────────────────────────────────────────────────────
 // body: { token: '<jwt>', scope?: 'organization' | 'consumer' }
-router.post('/activate', async (req, res) => {
+router.post('/activate', licenseLimiter, async (req, res) => {
     try {
         const { token, scope } = req.body || {};
         if (!token || typeof token !== 'string') {
@@ -131,6 +154,42 @@ router.post('/refresh', async (req, res) => {
         res.json(result);
     } catch (e) {
         console.error('[License] refresh error:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ── GET /health ─────────────────────────────────────────────────────────
+// Admin-only observability surface. Single endpoint for ops dashboards.
+// Reports refresher tick health, CRL poll status, and dunning counts.
+router.get('/health', async (req, res) => {
+    try {
+        if (!(await isOrgAdmin(req))) {
+            return res.status(403).json({ error: 'Admin required' });
+        }
+        let refresherHealth = null;
+        try {
+            const refresh = require('../license/refresh');
+            if (typeof refresh.getRefresherHealth === 'function') {
+                refresherHealth = refresh.getRefresherHealth();
+            }
+        } catch (_) { /* refresh module not present */ }
+
+        let dunning = { past_due_count: 0, suspended_count: 0 };
+        try {
+            const userStore = require('../stores/userStore');
+            if (typeof userStore.getDunningCounts === 'function') {
+                dunning = await userStore.getDunningCounts();
+            }
+        } catch (_) { }
+
+        res.json({
+            refresher: refresherHealth || { enabled: false },
+            crl: refresherHealth?.crl || { enabled: false },
+            dunning,
+            now: new Date().toISOString(),
+        });
+    } catch (e) {
+        console.error('[License] health error:', e);
         res.status(500).json({ error: e.message });
     }
 });

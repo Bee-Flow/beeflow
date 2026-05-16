@@ -20,21 +20,34 @@
  */
 
 const os = require('os');
+const path = require('path');
 
 // Pinned permissive-licensed cross-encoder model (MIT). Do NOT swap to
 // a Llama-Community-licensed reranker without a licence audit.
 const CPU_RERANK_MODEL_ID = 'Xenova/bge-reranker-base';
 
 // ── Resource caps (override via env) ──────────────────────────────────
-const CPU_RERANK_TIMEOUT_MS  = Number(process.env.CPU_RERANK_TIMEOUT_MS)  || 8000;
-const CPU_RERANK_MAX_DOCS    = Number(process.env.CPU_RERANK_MAX_DOCS)    || 50;
-const CPU_RERANK_DOC_CHARS   = Number(process.env.CPU_RERANK_DOC_CHARS)   || 2000;
-const CPU_RERANK_QUERY_CHARS = Number(process.env.CPU_RERANK_QUERY_CHARS) || 500;
+const CPU_RERANK_TIMEOUT_MS       = Number(process.env.CPU_RERANK_TIMEOUT_MS)      || 8000;
+// Cold-start budget: model download + ONNX init can take 10-30 s on a
+// fresh cache. Without an explicit cap, a hung HuggingFace Hub fetch
+// would block every queued rerank call indefinitely (they all await
+// the same `_pipelinePromise`).
+const CPU_RERANK_LOAD_TIMEOUT_MS  = Number(process.env.CPU_RERANK_LOAD_TIMEOUT_MS) || 60000;
+const CPU_RERANK_MAX_DOCS         = Number(process.env.CPU_RERANK_MAX_DOCS)        || 50;
+const CPU_RERANK_DOC_CHARS        = Number(process.env.CPU_RERANK_DOC_CHARS)       || 2000;
+const CPU_RERANK_QUERY_CHARS      = Number(process.env.CPU_RERANK_QUERY_CHARS)     || 500;
 const CPU_RERANK_WASM_THREADS = Math.max(
     1,
     Number(process.env.CPU_RERANK_WASM_THREADS) ||
         Math.max(1, Math.floor((os.cpus()?.length || 2) / 2))
 );
+
+// Persistent cache so the 280 MB download survives restarts. Pinned
+// under server/data/ alongside the rest of the runtime state (DB
+// snapshots, uploads). Override with HF_HOME for shared deploys.
+const CPU_RERANK_CACHE_DIR = process.env.HF_HOME
+    || process.env.TRANSFORMERS_CACHE
+    || path.join(__dirname, '..', '..', 'data', 'transformers-cache');
 
 let _pipelinePromise = null;
 let _loadFailed = false;
@@ -46,17 +59,21 @@ async function getPipeline() {
     _pipelinePromise = (async () => {
         try {
             const { pipeline, env } = await import('@huggingface/transformers');
+            env.cacheDir = CPU_RERANK_CACHE_DIR;
             env.allowRemoteModels = true;
+            env.allowLocalModels = true;
             try {
                 if (env.backends?.onnx?.wasm) {
                     env.backends.onnx.wasm.numThreads = CPU_RERANK_WASM_THREADS;
                 }
             } catch (_) { /* older versions: ignore */ }
 
-            const ranker = await pipeline('text-classification', CPU_RERANK_MODEL_ID, {
-                dtype: 'q8',
-            });
-            console.log(`[CpuRerank] Model ${CPU_RERANK_MODEL_ID} ready (threads=${CPU_RERANK_WASM_THREADS}, maxDocs=${CPU_RERANK_MAX_DOCS})`);
+            const ranker = await withTimeout(
+                pipeline('text-classification', CPU_RERANK_MODEL_ID, { dtype: 'q8' }),
+                CPU_RERANK_LOAD_TIMEOUT_MS,
+                'cpu-rerank-load',
+            );
+            console.log(`[CpuRerank] Model ${CPU_RERANK_MODEL_ID} ready (cache=${CPU_RERANK_CACHE_DIR}, threads=${CPU_RERANK_WASM_THREADS}, maxDocs=${CPU_RERANK_MAX_DOCS})`);
             return ranker;
         } catch (err) {
             console.warn(`[CpuRerank] Failed to load ${CPU_RERANK_MODEL_ID}: ${err.message}`);
@@ -142,7 +159,10 @@ async function rerankCpu(query, documents, topN = null) {
  */
 async function warmup() {
     try {
-        await rerankCpu('warmup', ['warmup document'], 1);
+        const out = await rerankCpu('warmup', ['warmup document'], 1);
+        if (out.length > 0) {
+            console.log('[CpuRerank] Warmup complete — first user query will be fast.');
+        }
     } catch (_) { /* fail-open */ }
 }
 

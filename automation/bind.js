@@ -20,6 +20,17 @@ const { evaluate } = require('./expr');
 
 const REF_RE = /^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*|\[(?:[0-9]+|"[^"]*"|'[^']*')\])*$/;
 
+// Defensive deep-clone for binding values. Without this, an object literal
+// in a definition (`{kind:'literal', value:{...}}`) would be returned by
+// reference — a downstream step mutating its inputs would silently corrupt
+// the definition's binding for every subsequent run. Primitives are
+// returned as-is to keep the hot path cheap.
+function cloneLiteral(value) {
+    if (value === null || typeof value !== 'object') return value;
+    try { return structuredClone(value); }
+    catch { return JSON.parse(JSON.stringify(value)); }
+}
+
 /**
  * Walk a dotted/bracketed path on an object. Used by both ref-resolution
  * and the inside of {{...}} templates. Tolerates undefined intermediates.
@@ -80,7 +91,7 @@ function resolveValue(binding, runState, opts = {}) {
 
     switch (binding.kind) {
         case 'literal':
-            return binding.value;
+            return cloneLiteral(binding.value);
         case 'ref':
             return walkPath(binding.path, safeState);
         case 'template':
@@ -122,13 +133,29 @@ function resolveInputs(inputs, runState, opts = {}) {
 }
 
 /**
- * Interpolate a template string with {{ path }} segments.
+ * Interpolate a template string with {{ path }} segments. `undefined` and
+ * `null` paths render as the empty string (callers historically depend on
+ * this — e.g. notification bodies and prompt prefixes). To make the silent
+ * failure mode discoverable, when a path resolves to `undefined` we record
+ * it on `runState._templateWarnings` (if the array exists) so the runner
+ * can surface a per-run warning summary; `AUTOMATION_DEBUG_BINDINGS=1`
+ * additionally logs to the server console.
  */
 function interpolateTemplate(template, runState) {
     return String(template).replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_, path) => {
-        const v = walkPath(path.trim(), runState);
-        return v == null ? '' : (typeof v === 'object' ? JSON.stringify(v) : String(v));
+        const trimmed = path.trim();
+        const v = walkPath(trimmed, runState);
+        if (v === undefined) {
+            if (runState && Array.isArray(runState._templateWarnings)) {
+                runState._templateWarnings.push(trimmed);
+            }
+            if (process.env.AUTOMATION_DEBUG_BINDINGS) {
+                console.warn(`[bind] template path "${trimmed}" resolved to undefined`);
+            }
+            return '';
+        }
+        return v === null ? '' : (typeof v === 'object' ? JSON.stringify(v) : String(v));
     });
 }
 
-module.exports = { resolveValue, resolveDeep, resolveInputs, walkPath, interpolateTemplate };
+module.exports = { resolveValue, resolveDeep, resolveInputs, walkPath, interpolateTemplate, cloneLiteral };

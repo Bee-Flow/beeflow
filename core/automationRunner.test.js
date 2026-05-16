@@ -49,8 +49,26 @@ const runner = require('./automationRunner');
     assert.strictEqual(typeof runner.requestCancel, 'function');
     assert.strictEqual(typeof runner.processDueAutomations, 'function');
     assert.strictEqual(typeof runner.reapStuckAutomations, 'function');
+    assert.strictEqual(typeof runner.runPartial, 'function');
+    assert.strictEqual(typeof runner.resumeFromStep, 'function');
     assert.strictEqual(typeof runner.INSTANCE_ID, 'string');
     assert.ok(runner.INSTANCE_ID.startsWith('runner-'), 'instance id is namespaced');
+
+    // ── runPartial validates its inputs ────────────────────────────────
+    // Without a stepId in the definition we should throw a clear error
+    // (not crash inside the DAG walker).
+    let threw = false;
+    try {
+        await runner.runPartial({ id: 'a', userId: 'u', definition: { trigger: { id: 't', type: 'trigger' }, steps: [] } }, 'does-not-exist');
+    } catch (e) {
+        threw = e.message.includes('not found in definition');
+    }
+    assert.ok(threw, 'runPartial rejects when stepId is missing from definition');
+
+    let threwMissing = false;
+    try { await runner.runPartial({ id: 'a', userId: 'u', definition: {} }); }
+    catch (e) { threwMissing = e.message.includes('stepId is required'); }
+    assert.ok(threwMissing, 'runPartial rejects when no stepId is supplied');
 
     console.log('automationRunner.test.js — all checks passed');
     process.exit(0);

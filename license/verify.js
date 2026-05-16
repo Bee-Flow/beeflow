@@ -74,6 +74,14 @@ function loadPublicKey() {
 
     try {
         if (fs.existsSync(BUNDLED_KEY_PATH)) {
+            // In production, refuse to fall back to the bundled dev key.
+            // Operators must set LICENSE_PUBLIC_KEY or LICENSE_PUBLIC_KEY_FILE
+            // explicitly. Otherwise a deploy that forgot to install the
+            // production key would silently validate dev-signed tokens.
+            if (process.env.NODE_ENV === 'production' && process.env.LICENSE_ALLOW_BUNDLED_KEY !== 'true') {
+                console.error('[License Verify] Refusing bundled dev key in production. Set LICENSE_PUBLIC_KEY or LICENSE_PUBLIC_KEY_FILE.');
+                return { key: null, source: null };
+            }
             _cachedKey = fs.readFileSync(BUNDLED_KEY_PATH, 'utf8');
             _cachedKeySource = 'bundled';
             return { key: _cachedKey, source: _cachedKeySource };
@@ -110,8 +118,11 @@ async function getJwksKeys() {
         return _jwksCache.keysByKid;
     }
     if (!JWKS_URL) return _jwksCache.keysByKid; // empty map → caller falls back
+    const timeoutMs = parseInt(process.env.LICENSE_JWKS_TIMEOUT_MS || '5000', 10);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-        const res = await fetch(JWKS_URL, { headers: { Accept: 'application/json' } });
+        const res = await fetch(JWKS_URL, { headers: { Accept: 'application/json' }, signal: ctrl.signal });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const body = await res.json();
         const keysByKid = new Map();
@@ -126,7 +137,10 @@ async function getJwksKeys() {
         }
         _jwksCache = { fetchedAt: now, keysByKid };
     } catch (e) {
-        console.warn('[License Verify] JWKS fetch failed:', e.message);
+        const reason = e.name === 'AbortError' ? `timeout_${timeoutMs}ms` : e.message;
+        console.warn(`[License Verify] license.jwks.fetch_failed reason=${reason}`);
+    } finally {
+        clearTimeout(timer);
     }
     return _jwksCache.keysByKid;
 }

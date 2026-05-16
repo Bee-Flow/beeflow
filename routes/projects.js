@@ -23,7 +23,54 @@ const express = require('express');
 const router = express.Router();
 const projectStore = require('../stores/projectStore');
 const userStore = require('../stores/userStore');
+const kbStore = require('../stores/knowledgeBases');
 const { resolveUserGroups } = require('../auth');
+const { perUserRateLimit } = require('../utils/perUserRateLimit');
+
+// Single shared budget across all membership mutations (invite / role change /
+// removal / unshare). Keeps a runaway client or accidental spam loop from
+// flooding the activity log without rejecting reasonable interactive use.
+const memberMutationLimiter = perUserRateLimit({ windowMs: 60_000, max: 30 });
+
+// Length caps applied at the boundary so the DB stays tidy and the UI's
+// matching maxLength attributes give immediate feedback.
+const NAME_MAX = 120;
+const DESCRIPTION_MAX = 1000;
+const INSTRUCTIONS_MAX = 8000;
+
+function validateLengths({ name, description, customInstructions }) {
+    if (name !== undefined && typeof name === 'string' && name.length > NAME_MAX) {
+        return `Name exceeds ${NAME_MAX} characters`;
+    }
+    if (description !== undefined && typeof description === 'string' && description.length > DESCRIPTION_MAX) {
+        return `Description exceeds ${DESCRIPTION_MAX} characters`;
+    }
+    if (customInstructions !== undefined && typeof customInstructions === 'string' && customInstructions.length > INSTRUCTIONS_MAX) {
+        return `Custom instructions exceed ${INSTRUCTIONS_MAX} characters`;
+    }
+    return null;
+}
+
+// Validate that every requested KB id exists and belongs to the same
+// organisation as the project. Rejects any unknown / foreign-org id so a
+// project owner can't link cross-tenant KBs through the editor.
+async function validateKnowledgeBaseIds(ids, projectOrganizationId) {
+    if (!Array.isArray(ids) || ids.length === 0) return { ok: true, invalid: [] };
+    const invalid = [];
+    for (const kbId of ids) {
+        if (!kbId || typeof kbId !== 'string') { invalid.push(kbId); continue; }
+        try {
+            const kb = await kbStore.getKB(kbId);
+            if (!kb) { invalid.push(kbId); continue; }
+            if (projectOrganizationId && kb.organization_id && kb.organization_id !== projectOrganizationId) {
+                invalid.push(kbId);
+            }
+        } catch (e) {
+            invalid.push(kbId);
+        }
+    }
+    return { ok: invalid.length === 0, invalid };
+}
 
 function getUserId(req) { return req.session?.user?.id; }
 // Read groups from the DB on every request, not from req.session — group
@@ -79,7 +126,18 @@ router.post('/', async (req, res) => {
         const { name, description, customInstructions, color, icon, knowledgeBaseIds, extractMemories } = req.body;
         if (!name || !name.trim()) return res.status(400).json({ error: 'Name is required' });
 
+        const lenError = validateLengths({ name, description, customInstructions });
+        if (lenError) return res.status(400).json({ error: lenError });
+
         const organizationId = req.session?.user?.organizationId || '';
+
+        if (knowledgeBaseIds !== undefined) {
+            const kbCheck = await validateKnowledgeBaseIds(knowledgeBaseIds, organizationId);
+            if (!kbCheck.ok) {
+                return res.status(400).json({ error: 'Unknown or cross-organisation knowledge bases', invalid: kbCheck.invalid });
+            }
+        }
+
         const project = await projectStore.createProject({
             name: name.trim(),
             description,
@@ -122,6 +180,17 @@ router.put('/:id', requireRole('editor'), async (req, res) => {
         if (!before) return res.status(404).json({ error: 'Not found' });
 
         const { name, description, customInstructions, color, icon, knowledgeBaseIds, extractMemories } = req.body;
+
+        const lenError = validateLengths({ name, description, customInstructions });
+        if (lenError) return res.status(400).json({ error: lenError });
+
+        if (knowledgeBaseIds !== undefined) {
+            const kbCheck = await validateKnowledgeBaseIds(knowledgeBaseIds, before.organizationId);
+            if (!kbCheck.ok) {
+                return res.status(400).json({ error: 'Unknown or cross-organisation knowledge bases', invalid: kbCheck.invalid });
+            }
+        }
+
         const updated = await projectStore.updateProject(req.params.id, {
             name, description, customInstructions, color, icon, knowledgeBaseIds, extractMemories,
         });
@@ -176,7 +245,7 @@ router.delete('/:id', requireRole('owner'), async (req, res) => {
 // ── Shares (legacy) — kept for back-compat, aliased to /members semantics ──
 
 // POST /:id/share — share with user or group (owner only)
-router.post('/:id/share', requireRole('owner'), async (req, res) => {
+router.post('/:id/share', memberMutationLimiter, requireRole('owner'), async (req, res) => {
     try {
         const userId = getUserId(req);
         const { sharedWithType, sharedWithId, permission } = req.body;
@@ -187,9 +256,9 @@ router.post('/:id/share', requireRole('owner'), async (req, res) => {
         if (!['viewer', 'editor'].includes(role)) return res.status(400).json({ error: 'permission must be viewer or editor' });
 
         // Cross-tenant guard: an owner could otherwise share their project
-        // with a foreign-org group ID and leak project content + KB IDs to
-        // members of another tenant. Match the target group's org against
-        // the project's org before persisting.
+        // with a foreign-org group/user ID and leak project content + KB IDs
+        // to members of another tenant. Match the target's org against the
+        // project's org before persisting.
         if (sharedWithType === 'group') {
             const project = await projectStore.getProject(req.params.id);
             const allGroups = await userStore.getAllGroups();
@@ -197,6 +266,13 @@ router.post('/:id/share', requireRole('owner'), async (req, res) => {
             if (!targetGroup) return res.status(400).json({ error: 'Unknown group' });
             if (project?.organizationId && targetGroup.organizationId !== project.organizationId) {
                 return res.status(400).json({ error: 'Group does not belong to this project\'s organisation' });
+            }
+        } else if (sharedWithType === 'user') {
+            const project = await projectStore.getProject(req.params.id);
+            const targetUser = await userStore.getUser(sharedWithId);
+            if (!targetUser) return res.status(400).json({ error: 'Unknown user' });
+            if (project?.organizationId && targetUser.organizationId && targetUser.organizationId !== project.organizationId) {
+                return res.status(400).json({ error: 'User does not belong to this project\'s organisation' });
             }
         }
 
@@ -213,16 +289,19 @@ router.post('/:id/share', requireRole('owner'), async (req, res) => {
 });
 
 // DELETE /:id/share/:shareId — remove share (owner only)
-router.delete('/:id/share/:shareId', requireRole('owner'), async (req, res) => {
+router.delete('/:id/share/:shareId', memberMutationLimiter, requireRole('owner'), async (req, res) => {
     try {
         const userId = getUserId(req);
         const share = await projectStore.getShareById(req.params.shareId);
-        const ok = await projectStore.unshareProject(req.params.shareId);
-        if (share) {
-            await projectStore.logActivity(req.params.id, userId, 'member_removed', {
-                targetType: share.sharedWithType, targetId: share.sharedWithId,
-            });
+        // Guard against IDOR: confirm the share actually belongs to this project,
+        // otherwise an owner of project A could delete shares from project B.
+        if (!share || share.projectId !== req.params.id) {
+            return res.status(404).json({ error: 'Member not found' });
         }
+        const ok = await projectStore.unshareProject(req.params.shareId);
+        await projectStore.logActivity(req.params.id, userId, 'member_removed', {
+            targetType: share.sharedWithType, targetId: share.sharedWithId,
+        });
         const shares = await projectStore.getProjectShares(req.params.id);
         res.json({ success: ok, shares });
     } catch (err) {
@@ -247,7 +326,7 @@ router.get('/:id/members', requireRole('viewer'), async (req, res) => {
 });
 
 // PUT /:id/members/:memberId — change role (owner only)
-router.put('/:id/members/:memberId', requireRole('owner'), async (req, res) => {
+router.put('/:id/members/:memberId', memberMutationLimiter, requireRole('owner'), async (req, res) => {
     try {
         const userId = getUserId(req);
         const { role } = req.body;
@@ -272,7 +351,7 @@ router.put('/:id/members/:memberId', requireRole('owner'), async (req, res) => {
 });
 
 // DELETE /:id/members/:memberId — owner removes OR member self-leaves
-router.delete('/:id/members/:memberId', async (req, res) => {
+router.delete('/:id/members/:memberId', memberMutationLimiter, async (req, res) => {
     try {
         const userId = getUserId(req);
         if (!userId) return res.status(401).json({ error: 'Not authenticated' });
@@ -304,8 +383,11 @@ router.get('/:id/activity', requireRole('viewer'), async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
         const offset = parseInt(req.query.offset, 10) || 0;
-        const items = await projectStore.listActivity(req.params.id, limit, offset);
-        res.json(items);
+        // Fetch one extra row to cheaply detect "more available" without a
+        // second COUNT(*) query against the activity table.
+        const items = await projectStore.listActivity(req.params.id, limit + 1, offset);
+        const hasMore = items.length > limit;
+        res.json({ items: hasMore ? items.slice(0, limit) : items, hasMore });
     } catch (err) {
         console.error('[Projects] Activity error:', err.message);
         res.status(500).json({ error: err.message });
@@ -327,7 +409,9 @@ router.put('/:id/conversations', requireRole('editor'), async (req, res) => {
         if (Array.isArray(assign)) {
             for (const conv of assign) {
                 const table = conv.type === 'agent' ? 'agent_conversations' : 'direct_conversations';
-                const ok = await projectStore.assignConversation(conv.id, req.params.id, table);
+                // Pass userId so the store WHERE clause rejects conversations
+                // belonging to other users (IDOR guard).
+                const ok = await projectStore.assignConversation(conv.id, req.params.id, userId, table);
                 if (ok) {
                     results.assigned++;
                     await projectStore.logActivity(req.params.id, userId, 'conversation_assigned', {
@@ -339,7 +423,7 @@ router.put('/:id/conversations', requireRole('editor'), async (req, res) => {
         if (Array.isArray(unassign)) {
             for (const conv of unassign) {
                 const table = conv.type === 'agent' ? 'agent_conversations' : 'direct_conversations';
-                const ok = await projectStore.unassignConversation(conv.id, table);
+                const ok = await projectStore.unassignConversation(conv.id, userId, table);
                 if (ok) {
                     results.unassigned++;
                     await projectStore.logActivity(req.params.id, userId, 'conversation_unassigned', {

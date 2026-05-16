@@ -31,9 +31,10 @@ const { getProviderForModel, getAIConfig } = require('../../core/aiAgent');
 const { getAdapter } = require('../../core/providers');
 const { getEUAwareTiers, isEUModeActive } = require('../../core/modelResolver');
 const { TOOL_SCHEMAS, applyToolCall, emptyDefinition } = require('../../automation/builderTools');
-const { buildSystemPrompt } = require('../../automation/builderPrompt');
+const { buildFullSystemPrompt, buildLeanSystemPrompt, buildFewShotMessages } = require('../../automation/builderPrompt');
 const { summariseDefinition } = require('../../automation/summarise');
 const { validateDefinition } = require('../../automation/validate');
+const { getProfileForModel, CORE_TOOL_NAMES } = require('../../automation/builderModelProfiles');
 const { perUserRateLimit } = require('../../utils/perUserRateLimit');
 
 function requireAuth(req, res, next) {
@@ -42,8 +43,47 @@ function requireAuth(req, res, next) {
 }
 
 // The AI may need: propose_trigger → multiple add_*  → summarise → dry_run
-// → fix → dry_run → finalize. Bumped so the auto-test loop has room.
-const MAX_ITERATIONS = 16;
+// → fix → dry_run → finalize. This is a ceiling; the per-model profile
+// (server/automation/builderModelProfiles.js) chooses its own budget within
+// this ceiling — small / reasoning models get more headroom because they
+// take more turns to converge.
+const MAX_ITERATIONS = 24;
+
+// Catalog filter: when the resolved model profile asks for a trimmed
+// catalog (small / Ministral-class models with tight context), reduce the
+// list of apps the system prompt advertises. We keep apps whose id/label
+// or any action name shares a token with the user message, plus apps
+// already referenced in the existing draft. Hard cap so the prompt can't
+// blow up on a verbose user message.
+function filterCatalogForUser(catalog, userMessage, draft) {
+    if (!catalog || !Array.isArray(catalog.apps)) return catalog;
+    const text = String(userMessage || '').toLowerCase();
+    const usedAppIds = new Set();
+    for (const s of (draft?.steps || [])) {
+        if (s.tool && typeof s.tool === 'string') {
+            const head = s.tool.split('_')[0];
+            if (head) usedAppIds.add(head);
+        }
+    }
+    if (draft?.trigger?.appEvent?.provider) usedAppIds.add(String(draft.trigger.appEvent.provider).toLowerCase());
+
+    const tokens = new Set(text.split(/[^a-z0-9]+/).filter(t => t.length > 2));
+    const matches = (app) => {
+        if (usedAppIds.has(String(app.id).toLowerCase())) return true;
+        const hay = `${app.id} ${app.label || ''}`.toLowerCase();
+        for (const t of tokens) if (hay.includes(t)) return true;
+        for (const a of (app.actions || [])) {
+            const ah = `${a.name} ${a.label || ''} ${a.description || ''}`.toLowerCase();
+            for (const t of tokens) if (ah.includes(t)) return true;
+        }
+        return false;
+    };
+    const filtered = catalog.apps.filter(matches);
+    // Always keep a small fallback if nothing matched, otherwise the
+    // model has nothing to pick from and refuses.
+    const final = filtered.length > 0 ? filtered.slice(0, 8) : catalog.apps.slice(0, 4);
+    return { ...catalog, apps: final };
+}
 
 // Each builder turn is a multi-iteration LLM conversation that can chain
 // many tool calls and a dry-run — i.e. expensive. Cap to 12/min/user so a
@@ -120,18 +160,13 @@ router.post('/stream', requireAuth, builderRateLimit, async (req, res) => {
             } catch (_) { /* non-fatal */ }
         }
 
-        // Build catalog for the prompt.
+        // Build catalog for the prompt. (Prompt construction is deferred
+        // until after the model is resolved, so we can pick full vs. lean
+        // prompt + apply per-model catalog filtering — see Step 5 of the
+        // multi-model optimization in the plan file.)
         const catalog = await buildCatalogForUser(userId, req.session);
 
         const summary = summariseDefinition(draftWrap.def).summary;
-        const sys = buildSystemPrompt({
-            catalog,
-            codeStepEnabled,
-            userTimezone: timezone || 'Europe/Amsterdam',
-            existingDraftSummary: summary,
-            webSearchEnabled: !!webSearchEnabled,
-            disabledMedia: disabledMedia || {},
-        });
 
         // Resolve model — mirrors the direct-chat flow (server/routes/ai/directChat.js)
         // so the builder honours the same tier dropdown, EU overrides, custom
@@ -196,8 +231,37 @@ router.post('/stream', requireAuth, builderRateLimit, async (req, res) => {
             send('model_selected', { tier: resolvedTier, modelId });
         }
 
-        // Filter the tool schema set by feature flag.
-        const tools = TOOL_SCHEMAS.filter(t => codeStepEnabled || t.function.name !== 'builder_add_code_step');
+        // Pick the capability profile for this model. Drives prompt
+        // variant, tool surface, temperature, iteration budget,
+        // first-turn toolChoice enforcement, catalogue filtering, and
+        // few-shot count. See server/automation/builderModelProfiles.js.
+        const profile = getProfileForModel(modelId);
+        console.log(`[AutomationBuilder] model=${modelId} profile=${JSON.stringify(profile)}`);
+
+        // Build the system prompt with the profile-appropriate variant
+        // and (possibly filtered) catalogue.
+        const promptCatalog = profile.catalogMode === 'filtered'
+            ? filterCatalogForUser(catalog, message, draftWrap.def)
+            : catalog;
+        const buildPrompt = profile.promptVariant === 'lean' ? buildLeanSystemPrompt : buildFullSystemPrompt;
+        const sys = buildPrompt({
+            catalog: promptCatalog,
+            codeStepEnabled,
+            userTimezone: timezone || 'Europe/Amsterdam',
+            existingDraftSummary: summary,
+            webSearchEnabled: !!webSearchEnabled,
+            disabledMedia: disabledMedia || {},
+        });
+
+        // Filter the tool schema set: by feature flag AND by profile.
+        // The 'core' subset shrinks the tool menu from 26 to 13 for small
+        // models. The five legacy array tools are still listed in full
+        // mode so existing chat histories keep validating; core mode
+        // hides them in favour of the unified builder_add_array_op.
+        let tools = TOOL_SCHEMAS.filter(t => codeStepEnabled || t.function.name !== 'builder_add_code_step');
+        if (profile.toolset === 'core') {
+            tools = tools.filter(t => CORE_TOOL_NAMES.has(t.function.name));
+        }
 
         // Inspection tools: if the user has the webpages beta, expose the
         // same surface the direct-chat AI uses (schema/query/exec, file
@@ -236,22 +300,41 @@ router.post('/stream', requireAuth, builderRateLimit, async (req, res) => {
         const attachmentSummary = Array.isArray(attachments) && attachments.length
             ? `\n\n[User attached ${attachments.length} file(s) to this turn: ${attachments.map(a => a?.name || a?.filename || 'untitled').join(', ')}. They are not executed by the Builder, but you can refer to them when proposing steps.]`
             : '';
+        // Few-shot examples are prepended ONLY for a fresh draft (no
+        // history yet). Once the user has been chatting, the prior turns
+        // are the real-world example the model should learn from — adding
+        // canned examples on top would dilute that signal.
+        const fewShotMessages = (!history || history.length === 0)
+            ? buildFewShotMessages(profile.fewShots || 0)
+            : [];
         const messages = [
             { role: 'system', content: sys },
+            ...fewShotMessages,
             ...sanitizeHistory(history),
             { role: 'user', content: (message || '') + attachmentSummary },
         ];
+
+        // The profile sets a higher cap than the legacy MAX_ITERATIONS
+        // when needed (e.g. small models that take more turns to
+        // converge). Clamp to the hard ceiling so a bad profile can't
+        // burn unbounded tokens.
+        const iterationBudget = Math.min(profile.maxIterations || 16, MAX_ITERATIONS);
 
         let lastFinalized = false;
         let lastValidation = null;
         let lastSummary = summary || null;
         let iter = 0;
-        for (iter = 0; iter < MAX_ITERATIONS; iter++) {
+        for (iter = 0; iter < iterationBudget; iter++) {
+            // First iteration on small / reasoning profiles: force a
+            // tool call so the model can't fall back to prose. From
+            // iteration 2 onward it's 'auto' — the model legitimately
+            // needs to emit text once it's done mutating the draft.
+            const turnToolChoice = (iter === 0 && profile.forceFirstToolCall) ? 'required' : 'auto';
             const response = await adapter.chat(cfg.apiKey, cfg.url, modelId, messages, {
                 maxTokens: 4096,
-                temperature: 0.2,
+                temperature: typeof profile.temperature === 'number' ? profile.temperature : 0.2,
                 tools,
-                toolChoice: 'auto',
+                toolChoice: turnToolChoice,
             });
 
             // Stream assistant content tokens (whole-message; we don't have
@@ -354,14 +437,38 @@ router.post('/stream', requireAuth, builderRateLimit, async (req, res) => {
         }
 
         // If the model exhausted its iteration budget without finalizing,
-        // surface that explicitly so the UI can prompt the user (rather
-        // than silently giving up after a no-op final response).
-        if (!lastFinalized && iter >= MAX_ITERATIONS) {
-            send('builder_aborted', {
-                reason: 'max_iterations',
-                iterations: MAX_ITERATIONS,
-                lastValidation: lastValidation || null,
-            });
+        // try to auto-finalize when the draft is structurally complete.
+        // Small models sometimes run out of conversational turns AFTER
+        // they've already produced a valid graph — abandoning the work
+        // would force the user to start over, even though the routine
+        // is ready. We only fall back when:
+        //   - the draft passes validateDefinition,
+        //   - it has a trigger and at least one step (non-empty), and
+        //   - the model didn't itself call builder_finalize already.
+        if (!lastFinalized && iter >= iterationBudget) {
+            const finalCheck = validateDefinition(draftWrap.def);
+            const def = draftWrap.def;
+            const hasTrigger = !!def?.trigger;
+            const hasStep = Array.isArray(def?.steps) && def.steps.length > 0;
+            if (finalCheck.ok && hasTrigger && hasStep) {
+                try {
+                    const finalized = await applyToolCall('builder_finalize', {}, draftWrap);
+                    if (finalized?.automation) {
+                        send('finalized', { automationId: finalized.automation.id, autoFinalized: true });
+                        send('message', { content: 'I ran out of conversational turns but your draft validates — finalising as-is. Activate when ready.' });
+                        lastFinalized = true;
+                    }
+                } catch (e) {
+                    console.warn('[AutomationBuilder] auto-finalize failed:', e.message);
+                }
+            }
+            if (!lastFinalized) {
+                send('builder_aborted', {
+                    reason: 'max_iterations',
+                    iterations: iterationBudget,
+                    lastValidation: lastValidation || finalCheck || null,
+                });
+            }
         }
 
         // Snapshot for SSE-resume. Captures just enough state to hydrate

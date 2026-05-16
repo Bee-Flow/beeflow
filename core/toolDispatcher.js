@@ -32,6 +32,11 @@ const { isAgentSearchTool, executeAgentSearchTool } = require('../integrations/a
 const { isRegexGeneratorTool, executeRegexGeneratorTool } = require('../integrations/regexGeneratorTools');
 const { executeWorkspaceTool } = require('../integrations/workspaceTools');
 const { isKbSearchTool, executeKbSearchTool } = require('../integrations/kbSearchTools');
+const { isRechtspraakTool, executeRechtspraakTool } = require('../integrations/rechtspraakTools');
+const { isEurlexTool, executeEurlexTool } = require('../integrations/eurlexTools');
+const { isKamerstukkenTool, executeKamerstukkenTool } = require('../integrations/kamerstukkenTools');
+const { isBekendmakingenTool, executeBekendmakingenTool } = require('../integrations/bekendmakingenTools');
+const { isTuchtrechtTool, executeTuchtrechtTool } = require('../integrations/tuchtrechtTools');
 const { isMapsTool, executeMapsTool } = require('../integrations/mapsTools');
 const { isLinkedInTool, executeLinkedInTool } = require('../integrations/linkedinTools');
 const { isGitHubTool, executeGitHubTool } = require('../integrations/githubTools');
@@ -78,7 +83,7 @@ async function executeTool(toolName, toolArgs, context = {}) {
     // Guard: some providers return tool_calls without a valid function name
     if (!toolName) {
         console.warn('[ToolDispatcher] Skipping tool with undefined name');
-        return { error: 'Tool call had no function name — skipped.' };
+        return { error: 'Tool call had no function name — emit a fresh tool_call with the function.name field set, or answer in plain text.' };
     }
 
     const {
@@ -371,6 +376,23 @@ async function executeTool(toolName, toolArgs, context = {}) {
             agentId,
             conversationId: context.conversationId,
         });
+    }
+
+    // ─── Dutch legal sources (anonymous public APIs) ──────────────
+    if (isRechtspraakTool(toolName)) {
+        return await executeRechtspraakTool(toolName, toolArgs);
+    }
+    if (isEurlexTool(toolName)) {
+        return await executeEurlexTool(toolName, toolArgs);
+    }
+    if (isKamerstukkenTool(toolName)) {
+        return await executeKamerstukkenTool(toolName, toolArgs);
+    }
+    if (isBekendmakingenTool(toolName)) {
+        return await executeBekendmakingenTool(toolName, toolArgs);
+    }
+    if (isTuchtrechtTool(toolName)) {
+        return await executeTuchtrechtTool(toolName, toolArgs);
     }
 
     // ─── Maps Tools ─────────────────────────────────────────────

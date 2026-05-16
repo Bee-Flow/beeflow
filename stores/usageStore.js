@@ -56,6 +56,10 @@ async function initDB() {
     // belonging to a single swarm invocation so per-swarm cost is derivable.
     try { await exec(`ALTER TABLE ai_usage_log ADD COLUMN IF NOT EXISTS parent_call_id TEXT`); } catch (e) { /* ignore */ }
     try { await exec(`ALTER TABLE ai_usage_log ADD COLUMN IF NOT EXISTS swarm_run_id TEXT`); } catch (e) { /* ignore */ }
+    // billed_cost — for PAYG (metered) subscriptions, the marked-up cost we
+    // reported to Stripe at log time. NULL on fixed-plan rows so dashboards
+    // can distinguish "this org never had PAYG history" from "PAYG cost 0".
+    try { await exec(`ALTER TABLE ai_usage_log ADD COLUMN IF NOT EXISTS billed_cost REAL`); } catch (e) { /* ignore */ }
     await exec(`CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON ai_usage_log(timestamp DESC)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_usage_model ON ai_usage_log(model)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_usage_agent ON ai_usage_log(agent_id)`);
@@ -84,6 +88,63 @@ async function initDB() {
 initDB().catch(err => console.error('[UsageStore] Init error:', err.message));
 console.log('[UsageStore] Initialized (PostgreSQL)');
 
+// ============ PAYG meter event resolver ============
+// Per-subscriber cache: avoid hitting the DB for every AI call. Plan +
+// subscription rows mutate rarely (admin actions, Stripe webhooks); a 60s
+// TTL is enough for fresh-enough billing while keeping the hot path cheap.
+// Callers that mutate subscription state should call invalidatePaygCache
+// (see userStore.setOrgSubscription / setConsumerSubscription).
+const _paygCache = new Map();
+const PAYG_CACHE_TTL_MS = 60_000;
+
+async function _resolvePaygTarget(organizationId, userId) {
+    if (!organizationId && !userId) return null;
+    const key = organizationId ? `org:${organizationId}` : `user:${userId}`;
+    const hit = _paygCache.get(key);
+    if (hit && hit.expiresAt > Date.now()) return hit.value;
+
+    let row = null;
+    try {
+        if (organizationId) {
+            row = await getOne(`
+                SELECT os.stripe_customer_id, os.status,
+                       sp.billing_model, sp.markup_percent, sp.stripe_meter_event_name
+                  FROM organization_subscriptions os
+             LEFT JOIN subscription_plans sp ON sp.id = os.plan_id
+                 WHERE os.organization_id = $1`, [organizationId]);
+        } else {
+            row = await getOne(`
+                SELECT cs.stripe_customer_id, cs.status,
+                       sp.billing_model, sp.markup_percent, sp.stripe_meter_event_name
+                  FROM consumer_subscriptions cs
+             LEFT JOIN subscription_plans sp ON sp.id = cs.plan_id
+                 WHERE cs.user_id = $1`, [userId]);
+        }
+    } catch (e) {
+        // Bad DB state shouldn't throw on the AI hot path; cache the miss
+        // so we don't retry the failing query on every call.
+        console.error('[UsageStore] _resolvePaygTarget query failed:', e.message);
+    }
+
+    const eligible = !!row
+        && row.billing_model === 'metered'
+        && row.stripe_customer_id
+        && row.stripe_meter_event_name
+        && ['active', 'trialing', 'past_due'].includes(row.status || 'active');
+    const value = eligible ? {
+        stripeCustomerId: row.stripe_customer_id,
+        markupPercent: Number(row.markup_percent || 0),
+        meterEventName: row.stripe_meter_event_name,
+    } : null;
+    _paygCache.set(key, { value, expiresAt: Date.now() + PAYG_CACHE_TTL_MS });
+    return value;
+}
+
+function invalidatePaygCache(organizationId, userId) {
+    if (organizationId) _paygCache.delete(`org:${organizationId}`);
+    if (userId) _paygCache.delete(`user:${userId}`);
+}
+
 // ============ Logging ============
 
 async function logUsage(entry) {
@@ -103,9 +164,23 @@ async function logUsage(entry) {
         // Cache-aware cost: cached reads at provider discount, cache writes at
         // TTL-specific premium (Anthropic 1.25× for 5m, 2× for 1h).
         const cost = computeCost(model, promptTokens, completionTokens, cachedTokens, cacheCreationTokens, cacheTtl);
-        await run(`
-            INSERT INTO ai_usage_log (timestamp, user_id, agent_id, agent_name, agent_type, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_creation_tokens, reasoning_tokens, cache_ttl, stop_reason, parent_call_id, swarm_run_id, tool_name, source, duration_ms, organization_id, estimated_cost, conversation_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+
+        // Resolve PAYG target up front (cached, <1ms after warmup) so we can
+        // persist the marked-up `billed_cost` alongside the raw cost in a
+        // single INSERT. Same target value is reused for the Stripe meter
+        // event below, ensuring local history and Stripe stay in sync.
+        const paygTarget = (cost > 0)
+            ? await _resolvePaygTarget(entry.organization_id || null, entry.user_id || null).catch(err => {
+                console.error('[UsageStore] PAYG resolve failed:', err.message);
+                return null;
+            })
+            : null;
+        const billedCost = paygTarget ? cost * (1 + paygTarget.markupPercent / 100) : null;
+
+        const insertResult = await run(`
+            INSERT INTO ai_usage_log (timestamp, user_id, agent_id, agent_name, agent_type, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_creation_tokens, reasoning_tokens, cache_ttl, stop_reason, parent_call_id, swarm_run_id, tool_name, source, duration_ms, organization_id, estimated_cost, billed_cost, conversation_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+            RETURNING id
         `, [
             entry.timestamp || now,
             entry.user_id || null,
@@ -128,10 +203,35 @@ async function logUsage(entry) {
             entry.duration_ms || 0,
             entry.organization_id || null,
             cost,
+            billedCost,
             entry.conversation_id || null
         ]);
         if (cachedTokens > 0) {
             console.log(`[UsageStore] 💰 Cache savings: ${cachedTokens} cached tokens (model: ${model})`);
+        }
+
+        // PAYG meter reporting — fire-and-forget so the AI response path
+        // isn't blocked on Stripe. Failures are logged but never retried in
+        // v1 (a future v2 will introduce an outbox + drain job).
+        if (paygTarget && billedCost > 0) {
+            const insertedId = insertResult?.rows?.[0]?.id;
+            if (insertedId !== undefined) {
+                // Marked-up cost expressed in micro-units of the plan currency
+                // (price = 0.000001 per meter unit → 1.00 EUR worth of usage =
+                // 1_000_000 meter units).
+                const amountMicroUnits = Math.round(billedCost * 1_000_000);
+                if (amountMicroUnits > 0) {
+                    const identifier = `usage_${insertedId}`;
+                    setImmediate(() => {
+                        require('../services/stripeService').reportPaygUsage({
+                            stripeCustomerId: paygTarget.stripeCustomerId,
+                            amountMicroUnits,
+                            identifier,
+                            eventName: paygTarget.meterEventName,
+                        }).catch(err => console.error('[UsageStore] PAYG meter event failed:', err.message, { identifier }));
+                    });
+                }
+            }
         }
     } catch (e) {
         console.error('[UsageStore] Failed to log usage:', e.message);
@@ -198,7 +298,9 @@ async function getUsageSummary(filters = {}) {
             COUNT(DISTINCT model) as unique_models,
             COUNT(DISTINCT agent_id) as unique_agents,
             COUNT(DISTINCT user_id) as unique_users,
-            COALESCE(SUM(estimated_cost), 0) as total_estimated_cost
+            COALESCE(SUM(estimated_cost), 0) as total_estimated_cost,
+            COALESCE(SUM(billed_cost), 0) as total_billed_cost,
+            COUNT(*) FILTER (WHERE billed_cost IS NOT NULL) as billed_calls
         FROM ai_usage_log ${where}
     `, params);
 }
@@ -340,6 +442,7 @@ async function getCostTimeline(filters = {}, interval = 'day') {
             ${groupExpr} as period,
             COUNT(*) as calls,
             COALESCE(SUM(estimated_cost), 0) as total_cost,
+            COALESCE(SUM(billed_cost), 0) as total_billed_cost,
             COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
             COALESCE(SUM(completion_tokens), 0) as completion_tokens
         FROM ai_usage_log ${where}
@@ -524,4 +627,5 @@ module.exports = {
     getUsageByModelAndAgent,
     getUsageByModelAndUser,
     getUsageBySwarmRun,
+    invalidatePaygCache,
 };

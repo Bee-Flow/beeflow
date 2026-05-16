@@ -120,6 +120,44 @@ async function _doInit() {
     try { await exec(`CREATE INDEX IF NOT EXISTS idx_direct_conversations_project ON direct_conversations(project_id)`); } catch (e) { /* already exists */ }
     try { await exec(`CREATE INDEX IF NOT EXISTS idx_agent_conversations_project ON agent_conversations(project_id)`); } catch (e) { /* already exists */ }
 
+    // Migration: FK constraint so deleting a project clears project_id on its
+    // conversations instead of leaving dangling references (a recycled UUID
+    // could otherwise silently re-attach old conversations). Requires the
+    // projects table to exist, so initialise projectStore first.
+    try {
+        const projectStore = require('../projectStore');
+        if (typeof projectStore.initDB === 'function') await projectStore.initDB();
+
+        await exec(`
+            UPDATE direct_conversations SET project_id = NULL
+              WHERE project_id IS NOT NULL
+                AND project_id NOT IN (SELECT id FROM projects);
+        `);
+        await exec(`
+            UPDATE agent_conversations SET project_id = NULL
+              WHERE project_id IS NOT NULL
+                AND project_id NOT IN (SELECT id FROM projects);
+        `);
+        await exec(`
+            DO $$ BEGIN
+                ALTER TABLE direct_conversations
+                  ADD CONSTRAINT direct_conversations_project_fk
+                  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL;
+            EXCEPTION WHEN duplicate_object THEN NULL;
+            END $$;
+        `);
+        await exec(`
+            DO $$ BEGIN
+                ALTER TABLE agent_conversations
+                  ADD CONSTRAINT agent_conversations_project_fk
+                  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL;
+            EXCEPTION WHEN duplicate_object THEN NULL;
+            END $$;
+        `);
+    } catch (e) {
+        console.warn('[initSchema] project_id FK migration skipped:', e.message);
+    }
+
     // Migration: Add pinned column for pin/unpin feature
     try { await exec(`ALTER TABLE direct_conversations ADD COLUMN IF NOT EXISTS pinned BOOLEAN DEFAULT FALSE`); } catch (e) { /* already exists */ }
     try { await exec(`ALTER TABLE agent_conversations ADD COLUMN IF NOT EXISTS pinned BOOLEAN DEFAULT FALSE`); } catch (e) { /* already exists */ }

@@ -37,6 +37,7 @@ router.get('/capabilities', (_req, res) => {
     res.json({
         tiers: tiers.TIER_HIERARCHY.filter(t => t === 'full' ? process.env.ALLOW_ADMIN_FULL_TIER === 'true' : true),
         billingIntervals: ['monthly', 'yearly'],
+        scopes: ['organization', 'server'],
         tierFeatures: tiers.TIER_FEATURES,
         tierLimits: tiers.TIER_LIMITS,
         fullTierEnabled: process.env.ALLOW_ADMIN_FULL_TIER === 'true',
@@ -71,13 +72,14 @@ router.get('/', async (req, res) => {
 router.post('/grant', async (req, res) => {
     try {
         const {
-            organizationId, tier, expiresAt,
+            scope, organizationId, tier, expiresAt,
             billingInterval, featuresOverride, limitsOverride,
             maxSeats, notes, deliverEmail,
         } = req.body || {};
+        const resolvedScope = scope === 'server' ? 'server' : 'organization';
         const result = await adminIssuance.issueAdminLicense({
-            scope: 'organization',
-            organizationId,
+            scope: resolvedScope,
+            organizationId: resolvedScope === 'organization' ? organizationId : null,
             tier,
             expiresAt,
             billingInterval: billingInterval || 'yearly',
@@ -100,6 +102,13 @@ router.post('/grant', async (req, res) => {
                 blob: result.blob,
             }).catch(e => ({ success: false, error: e.message }));
             result.emailDelivery = delivery;
+            if (!delivery?.success) {
+                console.warn(`[Admin License] email.delivery_failed to=${deliverEmail} reason=${delivery?.error || 'unknown'}`);
+                try {
+                    const userStore = require('../stores/userStore');
+                    await userStore.logSubscriptionAudit('email_send_failed', 'license', result.license.id, actorId(req), null, { to: deliverEmail, reason: delivery?.error || 'unknown' });
+                } catch (_) { /* audit best-effort */ }
+            }
         }
 
         res.json(result);
@@ -173,6 +182,7 @@ router.post('/:id/extend', async (req, res) => {
         }
         const d = new Date(expiresAt);
         if (Number.isNaN(d.getTime())) return res.status(400).json({ error: 'Invalid expiresAt' });
+        if (d.getTime() <= Date.now()) return res.status(400).json({ error: 'expiresAt must be in the future' });
         const updated = await store.extendExpiry(req.params.id, d.toISOString(), actorId(req));
         res.json({ license: adminIssuance.publicLicenseShape(updated) });
     } catch (e) {

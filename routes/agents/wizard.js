@@ -295,6 +295,16 @@ router.post('/wizard/draft', requirePermission('manage_agents'), wizardLimiter, 
         res.json({ plan });
     } catch (err) {
         console.error('Agent wizard draft failed:', err);
+        // Distinguish parse failures from infrastructure failures so the client
+        // can show a "model returned malformed output, please retry" message
+        // instead of a generic 500.
+        if (err.raw !== undefined) {
+            return res.status(422).json({
+                error: err.message,
+                reason: 'plan_parse_failed',
+                rawPreview: typeof err.raw === 'string' ? err.raw.slice(0, 500) : null,
+            });
+        }
         res.status(500).json({ error: err.message });
     }
 });

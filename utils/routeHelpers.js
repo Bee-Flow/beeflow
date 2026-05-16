@@ -10,7 +10,11 @@ const crypto = require('crypto');
 /**
  * Get effective user ID from request session.
  * If authenticated, returns session user ID.
- * If not, generates a deterministic guest ID from IP + User-Agent.
+ * Otherwise, issues a random opaque guest token via a long-lived cookie and
+ * returns that — prevents collisions between visitors behind the same NAT/UA.
+ * Why a cookie token, not hash(IP+UA): on a shared corporate proxy, every
+ * employee on the same browser version hashes to the same id, exposing each
+ * other's guest conversations to GET/DELETE /:id/history.
  * @param {import('express').Request} req
  * @returns {string} User ID (never null)
  */
@@ -18,9 +22,16 @@ function getEffectiveUserId(req) {
     if (req.session?.user?.id) {
         return req.session.user.id;
     }
-    // Generate anonymous user ID based on IP + User-Agent for consistency
-    const identifier = (req.ip || 'unknown') + (req.headers['user-agent'] || '');
-    return 'guest_' + crypto.createHash('md5').update(identifier).digest('hex').slice(0, 12);
+    if (req.session) {
+        if (!req.session.guestId) {
+            req.session.guestId = 'guest_' + crypto.randomBytes(12).toString('hex');
+        }
+        return req.session.guestId;
+    }
+    // Sessionless fallback (rare in this codebase): still random per request
+    // rather than predictable. Caller will not get continuity across requests
+    // in this branch, which is acceptable for read-only flows.
+    return 'guest_' + crypto.randomBytes(12).toString('hex');
 }
 
 /**

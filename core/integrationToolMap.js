@@ -38,6 +38,15 @@ const INTEGRATION_PREFIXES = {
     // n8n Workflow Management — server is dynamic (configured per-org)
     n8n_workflow_:  { integration: 'n8n',             label: 'n8n Workflow Management', serverFn: (_args, ctx) => ctx?.n8nUrl || null },
 
+    // Dutch legal open data — anonymous public APIs
+    rechtspraak_:    { integration: 'rechtspraak',     label: 'Rechtspraak.nl',           server: 'data.rechtspraak.nl' },
+    eurlex_:         { integration: 'eurlex',          label: 'EUR-Lex',                  server: 'eur-lex.europa.eu' },
+    kamerstukken_:   { integration: 'kamerstukken',    label: 'Tweede Kamer Open Data',   server: 'gegevensmagazijn.tweedekamer.nl' },
+    kamerstuk_:      { integration: 'kamerstukken',    label: 'Tweede Kamer Open Data',   server: 'gegevensmagazijn.tweedekamer.nl' },
+    bekendmakingen_: { integration: 'bekendmakingen',  label: 'Officiële Bekendmakingen', server: 'repository.overheid.nl' },
+    bekendmaking_:   { integration: 'bekendmakingen',  label: 'Officiële Bekendmakingen', server: 'repository.overheid.nl' },
+    tuchtrecht_:     { integration: 'tuchtrecht',      label: 'Tuchtrecht',               server: 'repository.overheid.nl' },
+
     // Third-party SaaS
     fireflies_:     { integration: 'fireflies',       label: 'Fireflies',           server: 'api.fireflies.ai' },
     // YouTrack URL is per-org (Connections settings). Static fallback used to
@@ -104,6 +113,13 @@ const INTEGRATION_TOOL_MAP = {
         serverFn: () => 'api.tavily.com',
         direction: 'sent',
         dataCategories: 'search_query',
+    },
+    format_citation: {
+        integration: 'rechtspraak',
+        label: 'Citaat formatteren',
+        serverFn: () => 'data.rechtspraak.nl',
+        direction: 'both',
+        dataCategories: 'citation, ecli',
     },
 
     // ── Legacy email tools (generic provider) ────────────────

@@ -103,17 +103,15 @@ function parseSpreadsheet(buffer, filename) {
 
             let table = `| ${headers.join(' | ')} |\n| ${divider.join(' | ')} |\n`;
 
-            // Cap at 200 rows to avoid token explosion
-            const maxRows = Math.min(rows.length, 200);
-            for (let i = 0; i < maxRows; i++) {
+            for (let i = 0; i < rows.length; i++) {
                 const cells = rows[i].map(c => String(c ?? '').replace(/\|/g, '\\|').replace(/\n/g, ' '));
-                // Pad to match header length
                 while (cells.length < headers.length) cells.push('');
                 table += `| ${cells.join(' | ')} |\n`;
             }
 
-            if (rows.length > maxRows) {
-                table += `\n*...and ${rows.length - maxRows} more rows (truncated)*\n`;
+            const LARGE_SHEET_WARN = 5000;
+            if (rows.length > LARGE_SHEET_WARN) {
+                console.warn(`[DocumentParser] Large sheet "${sheetName}" in "${filename}": ${rows.length} rows — token usage will be high`);
             }
 
             if (sheets.length > 1) {

@@ -79,6 +79,32 @@ async function initDB() {
     await exec(`CREATE INDEX IF NOT EXISTS idx_memory_sources ON memory_sources(memory_id)`);
     // Phase 2: composite index for the hot retrieve path (user_id+status filter)
     await exec(`CREATE INDEX IF NOT EXISTS idx_memories_user_status_type ON user_memories(user_id, status, type)`);
+
+    // Migration: FK constraint on project_id so deleting a project also
+    // removes its memories (otherwise rows linger and stay queryable after
+    // the access-check on /api/memories was tightened). Requires the
+    // projects table to exist, so initialise projectStore first.
+    try {
+        const projectStore = require('./projectStore');
+        if (typeof projectStore.initDB === 'function') await projectStore.initDB();
+
+        await exec(`
+            DELETE FROM user_memories
+              WHERE project_id IS NOT NULL
+                AND project_id NOT IN (SELECT id FROM projects);
+        `);
+        await exec(`
+            DO $$ BEGIN
+                ALTER TABLE user_memories
+                  ADD CONSTRAINT user_memories_project_fk
+                  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+            EXCEPTION WHEN duplicate_object THEN NULL;
+            END $$;
+        `);
+    } catch (e) {
+        console.warn('[MemoryStore] project_id FK migration skipped:', e.message);
+    }
+
     initialized = true;
 }
 

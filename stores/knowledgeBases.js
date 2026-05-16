@@ -66,6 +66,11 @@ async function initDB() {
     try { await exec(`ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS shared_groups TEXT DEFAULT '[]'`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS category_id TEXT`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS icon TEXT`); } catch (e) { /* column already exists */ }
+    // System-managed KBs (Bee Flow-provided content like Dutch legal sources).
+    // `system_slug` ties the KB row to a beta-feature id; the listKBs filter
+    // surfaces it to orgs whose beta toggle matches. NULL on user-created KBs.
+    try { await exec(`ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS system_slug TEXT`); } catch (e) { /* column already exists */ }
+    try { await exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_system_slug ON knowledge_bases(system_slug) WHERE system_slug IS NOT NULL`); } catch (e) { /* index already exists */ }
     try { await exec(`CREATE INDEX IF NOT EXISTS idx_kb_org_published ON knowledge_bases(organization_id, is_published) WHERE is_published = TRUE`); } catch (e) { /* index already exists */ }
     // First-deploy backfill: org KBs that already existed before the publish flow
     // were visible to the whole org; preserve that by marking them published.
@@ -135,14 +140,54 @@ const KnowledgeBasesStore = {
         const usageContexts = Array.isArray(extra.usageContexts)
             ? extra.usageContexts
             : ['agent', 'direct_chat'];
+        const isPublished = extra.isPublished === true || sourceKind === 'system_managed';
         const row = await getOne(
-            `INSERT INTO knowledge_bases (tenant_id, name, description, organization_id, category_id, icon, source_kind, usage_contexts)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+            `INSERT INTO knowledge_bases (tenant_id, name, description, organization_id, category_id, icon, source_kind, usage_contexts, system_slug, is_published)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10)
              RETURNING *`,
-            [tenantId, name, description, organizationId || null, extra.categoryId || null, extra.icon || null, sourceKind, JSON.stringify(usageContexts)]
+            [tenantId, name, description, organizationId || null, extra.categoryId || null, extra.icon || null, sourceKind, JSON.stringify(usageContexts), extra.systemSlug || null, isPublished]
         );
         return row;
     },
+
+    /**
+     * Look up a system-managed KB by its `system_slug` (e.g. 'dutch_legal_sources').
+     * Returns the row or null. Used by the ingest script for idempotent upserts
+     * and by the chat layer to resolve enabled-beta-feature → KB id.
+     */
+    getSystemKBBySlug: async (slug) => {
+        await initDB();
+        if (!slug) return null;
+        return getOne(
+            `SELECT * FROM knowledge_bases
+             WHERE source_kind = 'system_managed' AND system_slug = $1
+             LIMIT 1`,
+            [slug]
+        );
+    },
+
+    /**
+     * List every seeded system-managed KB. Cheap — at most a handful of rows.
+     * Used by the admin status panel and by the chat KB resolver.
+     */
+    listSystemKBs: async () => {
+        await initDB();
+        return getAll(
+            `SELECT kb.*,
+                    COALESCE(d.doc_count, 0) AS document_count,
+                    COALESCE(d.total_chunks, 0) AS total_chunks
+             FROM knowledge_bases kb
+             LEFT JOIN (
+                 SELECT knowledge_base_id, COUNT(*) AS doc_count, SUM(chunk_count) AS total_chunks
+                 FROM documents GROUP BY knowledge_base_id
+             ) d ON d.knowledge_base_id = kb.id
+             WHERE kb.source_kind = 'system_managed'
+             ORDER BY kb.name`
+        );
+    },
+
+    /** Lightweight predicate for guarding write paths in routes. */
+    isSystemKB: (kb) => !!(kb && kb.source_kind === 'system_managed'),
 
     /**
      * List KBs accessible to the user.
@@ -150,18 +195,27 @@ const KnowledgeBasesStore = {
      * @param {Set|null} orgIds - User's org IDs from resolveUserOrgIds().
      *   null = super admin (see all), Set with values = org member, empty Set = no org
      * @param {object} [opts]
-     * @param {string|null} [opts.sourceKind='manual'] - Filter by source kind. Pass null to disable.
+     * @param {string|string[]|null} [opts.sourceKind='manual'] - Filter by source kind.
+     *   Pass a string for one kind, an array for several, or null to include all kinds.
      * @param {string|null} [opts.usageContext=null] - When set, only KBs whose `usage_contexts`
      *   array contains this value are returned ('agent' | 'direct_chat' | 'webpage').
      * @param {string|null} [opts.excludeContext=null] - Inverse of `usageContext`. KBs whose
      *   `usage_contexts` array contains this value are excluded.
+     * @param {string[]} [opts.systemSlugs=null] - When provided, system-managed KBs whose
+     *   `system_slug` is in this list are included in addition to the normal personal/org
+     *   results. Used by the chat layer to surface system KBs whose beta feature is enabled
+     *   for the requesting user's org.
      */
     listKBs: async (tenantId, orgIds = undefined, opts = {}) => {
         await initDB();
 
-        const sourceKind = opts.sourceKind === undefined ? 'manual' : opts.sourceKind;
+        const sourceKindOpt = opts.sourceKind === undefined ? 'manual' : opts.sourceKind;
+        const sourceKindList = sourceKindOpt === null
+            ? null
+            : (Array.isArray(sourceKindOpt) ? sourceKindOpt : [sourceKindOpt]);
         const usageContext = opts.usageContext || null;
         const excludeContext = opts.excludeContext || null;
+        const systemSlugs = Array.isArray(opts.systemSlugs) ? opts.systemSlugs : null;
 
         // Build optional filter clauses + their bound params. Each branch below
         // appends these so the marketplace, agent and direct-chat pickers all
@@ -170,9 +224,9 @@ const KnowledgeBasesStore = {
             const conds = [];
             const params = [];
             let idx = startIdx;
-            if (sourceKind) {
-                conds.push(`kb.source_kind = $${idx++}`);
-                params.push(sourceKind);
+            if (sourceKindList && sourceKindList.length > 0) {
+                conds.push(`kb.source_kind = ANY($${idx++})`);
+                params.push(sourceKindList);
             }
             if (usageContext) {
                 conds.push(`kb.usage_contexts ? $${idx++}`);
@@ -183,6 +237,36 @@ const KnowledgeBasesStore = {
                 params.push(excludeContext);
             }
             return { sql: conds.length > 0 ? ' AND ' + conds.join(' AND ') : '', params };
+        };
+
+        // System-managed KBs ride alongside personal + org-published results.
+        // They are filtered by an explicit allow-list of system_slugs from the
+        // caller (resolved from the org's enabled beta features). We OR them
+        // into the visibility predicate AFTER the sourceKind/usageContext
+        // filters so the same slug list always applies regardless of the kind
+        // filter.
+        const buildSystemUnion = (startIdx) => {
+            if (!systemSlugs || systemSlugs.length === 0) return { sql: '', params: [] };
+            const conds = [`kb.source_kind = 'system_managed'`, `kb.system_slug = ANY($${startIdx})`];
+            const params = [systemSlugs];
+            let idx = startIdx + 1;
+            if (usageContext) {
+                conds.push(`kb.usage_contexts ? $${idx++}`);
+                params.push(usageContext);
+            }
+            if (excludeContext) {
+                conds.push(`NOT (kb.usage_contexts ? $${idx++})`);
+                params.push(excludeContext);
+            }
+            return { sql: ` UNION SELECT kb.*,
+                       COALESCE(d.doc_count, 0) AS document_count,
+                       COALESCE(d.total_chunks, 0) AS total_chunks
+                FROM knowledge_bases kb
+                LEFT JOIN (
+                    SELECT knowledge_base_id, COUNT(*) AS doc_count, SUM(chunk_count) AS total_chunks
+                    FROM documents GROUP BY knowledge_base_id
+                ) d ON d.knowledge_base_id = kb.id
+                WHERE ${conds.join(' AND ')}`, params };
         };
 
         const baseSelect = `
@@ -201,38 +285,51 @@ const KnowledgeBasesStore = {
         // Legacy fallback: if orgIds not provided, show only user's own KBs
         if (orgIds === undefined) {
             const f = buildFilters(2);
+            const u = buildSystemUnion(2 + f.params.length);
             return getAll(
-                `${baseSelect} WHERE kb.tenant_id = $1${f.sql} ORDER BY kb.created_at DESC`,
-                [tenantId, ...f.params]
+                `${baseSelect} WHERE kb.tenant_id = $1${f.sql}${u.sql}
+                 ORDER BY created_at DESC`,
+                [tenantId, ...f.params, ...u.params]
             );
         }
 
-        // Super admin — see all KBs
+        // Super admin — see all KBs. When the caller has narrowed by
+        // sourceKind (e.g. 'manual' for the picker), system KBs whose slug is
+        // on the systemSlugs allow-list are unioned back in so super admins
+        // get the same chat UX as regular users.
         if (orgIds === null) {
             const f = buildFilters(1);
             const where = f.sql ? ' WHERE ' + f.sql.replace(/^ AND /, '') : '';
-            return getAll(`${baseSelect}${where} ORDER BY kb.created_at DESC`, f.params);
+            const u = buildSystemUnion(1 + f.params.length);
+            return getAll(
+                `${baseSelect}${where}${u.sql} ORDER BY created_at DESC`,
+                [...f.params, ...u.params]
+            );
         }
 
         const orgIdArray = Array.from(orgIds);
 
         if (orgIdArray.length === 0) {
-            // No org membership — only personal KBs
+            // No org membership — only personal KBs (+ enabled system KBs, if any)
             const f = buildFilters(2);
+            const u = buildSystemUnion(2 + f.params.length);
             return getAll(
-                `${baseSelect} WHERE kb.tenant_id = $1${f.sql} ORDER BY kb.created_at DESC`,
-                [tenantId, ...f.params]
+                `${baseSelect} WHERE kb.tenant_id = $1${f.sql}${u.sql}
+                 ORDER BY created_at DESC`,
+                [tenantId, ...f.params, ...u.params]
             );
         }
 
         // Org member — personal KBs (any state) + PUBLISHED KBs from user's org(s)
+        // + enabled system-managed KBs.
         // Group restriction (shared_groups) is applied in JS by callers via filterByGroupAccess.
         const f = buildFilters(3);
+        const u = buildSystemUnion(3 + f.params.length);
         return getAll(
             `${baseSelect}
-             WHERE (kb.tenant_id = $1 OR (kb.organization_id = ANY($2) AND kb.is_published = TRUE))${f.sql}
-             ORDER BY kb.created_at DESC`,
-            [tenantId, orgIdArray, ...f.params]
+             WHERE (kb.tenant_id = $1 OR (kb.organization_id = ANY($2) AND kb.is_published = TRUE))${f.sql}${u.sql}
+             ORDER BY created_at DESC`,
+            [tenantId, orgIdArray, ...f.params, ...u.params]
         );
     },
 
@@ -264,6 +361,11 @@ const KnowledgeBasesStore = {
      */
     canUserAccessKB: (kb, userId, orgIds = undefined, userGroups = []) => {
         if (!kb) return false;
+        // System-managed KBs hold public reference content (e.g. Dutch
+        // legislation). Read access is granted to any authenticated user; the
+        // beta-feature toggle gates whether they appear in pickers / chat,
+        // not whether the underlying public text is reachable.
+        if (kb.source_kind === 'system_managed') return true;
         // Owner always has access
         if (kb.tenant_id === userId) return true;
         // Super admin
@@ -369,7 +471,20 @@ const KnowledgeBasesStore = {
 
     deleteKB: async (id) => {
         await initDB();
-        // Documents cascade-delete; chunks must be deleted via search-service
+        // Documents cascade-delete; chunks must be deleted via search-service.
+        // Also scrub this KB from any project's knowledge_base_ids so projects
+        // don't carry dangling references after the KB row is gone.
+        try {
+            await run(
+                `UPDATE projects
+                 SET knowledge_base_ids = COALESCE(
+                     (SELECT jsonb_agg(elem) FROM jsonb_array_elements_text(knowledge_base_ids) elem WHERE elem <> $1),
+                     '[]'::jsonb
+                 )
+                 WHERE knowledge_base_ids @> to_jsonb($1::text)`,
+                [id]
+            );
+        } catch (e) { /* projects table may not exist yet on first boot */ }
         await run('DELETE FROM knowledge_bases WHERE id = $1', [id]);
         return true;
     },

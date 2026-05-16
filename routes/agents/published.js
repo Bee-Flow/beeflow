@@ -21,7 +21,6 @@ const router = express.Router();
 // ============ Published Agents (public access) ============
 
 // Get all published agents (no auth required)
-// Get all published agents (no auth required)
 router.get('/published', async (req, res) => {
     try {
         // Get user's groups and direct org for org-scoped filtering
@@ -69,8 +68,9 @@ router.get('/published', async (req, res) => {
     }
 });
 
-// Get ALL agents (for Admin Dashboard)
-router.get('/all', async (req, res) => {
+// Get ALL agents (for Admin Dashboard). Requires manage_agents — lower-privileged
+// users would otherwise see unpublished drafts owned by colleagues in their org.
+router.get('/all', requirePermission('manage_agents'), async (req, res) => {
     try {
         let agents = await agentStore.getAllAgents();
 

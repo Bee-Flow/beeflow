@@ -1,6 +1,46 @@
 const configStore = require('../../stores/configStore');
 const { getServiceHeaders } = require('../serviceAuth');
 const { estimateTokens, fitIntoTokenBudget } = require('../tokenBudget');
+const { getAll } = require('../../db');
+const { getUserBetaFeatures } = require('../betaFeatures');
+
+// Mirror of routes/knowledgeBases.js — kept here too so the agent runtime
+// doesn't have to import a routes-layer constant. Slugs identify a
+// system-managed KB by its `system_slug` and 1:1 to a beta-feature id.
+const SYSTEM_KB_BETA_SLUGS = new Set(['dutch_legal_sources']);
+
+/**
+ * Drop any system-managed KB ids from `kbIds` whose `system_slug` is not in
+ * the requesting user's enabled beta features. Returns the filtered id list.
+ * Returns the input unchanged when no system KBs are referenced — cheap path
+ * for the common case where an agent only uses ordinary user/org KBs.
+ */
+async function filterSystemKBsForUser(kbIds, userId, session) {
+    if (!Array.isArray(kbIds) || kbIds.length === 0) return kbIds;
+    let rows;
+    try {
+        rows = await getAll(
+            `SELECT id, system_slug FROM knowledge_bases
+             WHERE id = ANY($1::uuid[]) AND source_kind = 'system_managed'`,
+            [kbIds]
+        );
+    } catch (_) { return kbIds; }
+    if (!rows || rows.length === 0) return kbIds;
+    let enabled;
+    try {
+        const features = await getUserBetaFeatures(userId, session || null);
+        enabled = new Set(features);
+    } catch (_) { enabled = new Set(); }
+    const denied = new Set(
+        rows
+            .filter(r => r.system_slug && SYSTEM_KB_BETA_SLUGS.has(r.system_slug) && !enabled.has(r.system_slug))
+            .map(r => String(r.id))
+    );
+    if (denied.size === 0) return kbIds;
+    const filtered = kbIds.filter(id => !denied.has(String(id)));
+    console.log(`[KnowledgeSearch] Dropped ${denied.size} system KB(s) (beta feature not enabled for user)`);
+    return filtered;
+}
 
 // Rough budget for knowledge injection. Exposed as env vars so we can tune
 // per model-family without a code change.
@@ -12,9 +52,10 @@ const GLOBAL_INJECT_TOKEN_CAP = parseInt(process.env.EMAIL_KB_INJECT_TOKENS || '
 // false positives would hide real queries.
 const GREETING_RE = /^(h(i|ey|ello|oi|allo|oi+)|yo|sup|goedemorgen|goedemiddag|goedenavond|goedendag|dag|bedankt|dankjewel|thanks|thank you|ok(ay)?|yes|no|ja|nee|sure|cool|nice|great|good morning|good afternoon|good evening|how are you|hoe gaat het|alles goed|what'?s up|how'?s it going)[\s!.,?]*$/i;
 
-async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnowledge, onEvent }) {
+async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnowledge, onEvent, session }) {
     let systemPromptExtension = '';
-    const kbIds = agent.config?.knowledge_base_ids || [];
+    const rawKbIds = agent.config?.knowledge_base_ids || [];
+    const kbIds = await filterSystemKBsForUser(rawKbIds, userId, session);
     let allKnowledgeResults = [];
 
     // ── Skip KB search for greetings / small-talk ───────────────────
@@ -316,13 +357,17 @@ Suggest the user rephrase their question or ask about topics covered in your kno
  * @returns {Promise<Array<{title: string, content: string, score: number}>>}
  */
 async function quickKBSearch(userId, kbIds, query, options = {}) {
-    const { topK = 6, contentCap = 3000 } = options;
+    const { topK = 6, contentCap = 3000, session = null } = options;
 
     if (!kbIds || kbIds.length === 0 || !query) return [];
 
     // Greeting guard — don't waste API calls on "hi"
     const trimmed = (query || '').trim();
     if (GREETING_RE.test(trimmed)) return [];
+
+    // Strip system KBs the user's org has no beta-feature entitlement to.
+    kbIds = await filterSystemKBsForUser(kbIds, userId, session);
+    if (kbIds.length === 0) return [];
 
     const useAzure = !!(await configStore.getConfig('use_azure_doc_processing'));
     let chunks = [];

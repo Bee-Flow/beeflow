@@ -56,9 +56,26 @@ router.post('/categories', requirePermission('manage_agents'), async (req, res) 
     }
 });
 
-// Delete a category
+// Delete a category. Reject if any agent still references it — otherwise
+// the agents survive with a dangling category_id and the UI shows them as
+// uncategorised on the next page load.
 router.delete('/categories/:id', requirePermission('manage_agents'), async (req, res) => {
     try {
+        if (typeof agentStore.countAgentsInCategory === 'function') {
+            const inUse = await agentStore.countAgentsInCategory(req.params.id);
+            if (inUse > 0) {
+                return res.status(409).json({ error: `Category in use by ${inUse} agent(s)` });
+            }
+        } else {
+            // Fallback: scan getAllAgents and reject if any reference this category.
+            try {
+                const all = await agentStore.getAllAgents();
+                const inUse = Array.isArray(all) ? all.filter(a => a.category_id === req.params.id).length : 0;
+                if (inUse > 0) {
+                    return res.status(409).json({ error: `Category in use by ${inUse} agent(s)` });
+                }
+            } catch (_) { /* if scan fails, fall through and let the store decide */ }
+        }
         const deleted = await agentStore.deleteAgentCategory(req.params.id);
         if (!deleted) return res.status(404).json({ error: 'Category not found' });
         res.json({ success: true });
@@ -140,6 +157,11 @@ router.post('/', requirePermission('manage_agents'), async (req, res) => {
         return res.status(400).json({ error: 'Name is required' });
     }
 
+    {
+        const e = rejectUnsafeConfigKeys(config);
+        if (e) return res.status(400).json({ error: e });
+    }
+
     // Validate that the user actually belongs to the requested organisation
     // (or auto-assign their primary org when none was provided). Trusting
     // organizationId from the body would let any member create agents in
@@ -194,6 +216,28 @@ router.post('/', requirePermission('manage_agents'), async (req, res) => {
 
     res.json(agent);
 });
+
+// Reject prototype-polluting keys at the route boundary. The config object
+// gets spread into the stored agent record; allowing __proto__/constructor/
+// prototype keys would let a malicious client tamper with Object.prototype on
+// stores that JSON.parse + spread without freezing first. Whitelisting all
+// "valid" config keys is brittle (new flags are added frequently); rejecting
+// the dangerous ones is the minimum bar.
+const _FORBIDDEN_CONFIG_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+function rejectUnsafeConfigKeys(config) {
+    if (!config || typeof config !== 'object') return null;
+    const stack = [config];
+    while (stack.length) {
+        const node = stack.pop();
+        if (!node || typeof node !== 'object') continue;
+        for (const key of Object.keys(node)) {
+            if (_FORBIDDEN_CONFIG_KEYS.has(key)) return `forbidden config key: ${key}`;
+            const v = node[key];
+            if (v && typeof v === 'object') stack.push(v);
+        }
+    }
+    return null;
+}
 
 // Validate that every cross-element ID referenced from an agent's config is
 // accessible to the AGENT'S OWNER (not the requesting user). This closes the
@@ -284,6 +328,11 @@ router.put('/:id', requirePermission('manage_agents'), async (req, res) => {
     // group-membership check in one place. Either field arriving here is
     // silently dropped (the existing values are reused from `agent.*`).
     const { name, description, systemPrompt, tools, toolParams, model, starterPrompts, avatar, threadsEnabled, copyEnabled, workspaceEnabled, config, embedEnabled, categoryId } = req.body;
+
+    {
+        const e = rejectUnsafeConfigKeys(config);
+        if (e) return res.status(400).json({ error: e });
+    }
 
     const agent = await agentStore.getAgent(req.params.id);
     if (!agent) {
@@ -428,12 +477,16 @@ router.get('/:id/tools', async (req, res) => {
     res.json(toolsWithParams);
 });
 
-// Update params for a specific tool
-router.put('/:id/tools/:componentId/params', async (req, res) => {
+// Update params for a specific tool. Tool params often hold API keys, so
+// require manage_agents + the same canModifyAgent gate the other write
+// endpoints use (covers org admins / agent editors, blocks read-only colleagues
+// in the same org from rewriting credentials).
+router.put('/:id/tools/:componentId/params', requirePermission('manage_agents'), async (req, res) => {
     const userId = getEffectiveUserId(req);
     const agent = await agentStore.getAgent(req.params.id);
-    if (!agent || agent.owner_id !== userId) {
-        return res.status(404).json({ error: 'Agent not found' });
+    if (!agent) return res.status(404).json({ error: 'Agent not found' });
+    if (!(await canModifyAgent(agent, userId, req))) {
+        return res.status(403).json({ error: 'Access denied' });
     }
 
     const { params } = req.body;

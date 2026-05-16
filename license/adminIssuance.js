@@ -61,15 +61,23 @@ function normalizeExpiresAt(expiresAt) {
     const d = expiresAt instanceof Date ? expiresAt : new Date(expiresAt);
     if (Number.isNaN(d.getTime())) throw new Error('Invalid expiresAt');
     if (d.getTime() <= Date.now()) throw new Error('expiresAt must be in the future');
-    return d.toISOString();
+    // Policy ceiling: admin grants cap at LICENSE_ADMIN_MAX_DURATION_DAYS
+    // (default 730 = 2y). Clamp silently rather than reject — UI never
+    // surfaces "100 year license" mistakes that way.
+    const maxDays = parseInt(process.env.LICENSE_ADMIN_MAX_DURATION_DAYS || '730', 10);
+    const ceiling = Date.now() + maxDays * 86400 * 1000;
+    const final = Math.min(d.getTime(), ceiling);
+    return new Date(final).toISOString();
 }
 
 /**
- * Mint a new admin-issued license for an organization.
+ * Mint a new admin-issued license.
  *
  * @param {object} args
- * @param {'organization'} args.scope                  — org-scope only in v1
- * @param {string}  args.organizationId
+ * @param {'organization'|'server'} args.scope         — 'server' = unbound license blob
+ *                                                        that the receiver binds to
+ *                                                        its own org on import/activate
+ * @param {string}  [args.organizationId]              — required when scope='organization'
  * @param {string}  args.tier                          — community|pro|enterprise|full
  * @param {string|Date} args.expiresAt                 — ISO date or Date
  * @param {string}  [args.billingInterval='yearly']    — 'monthly' | 'yearly'
@@ -91,10 +99,10 @@ async function issueAdminLicense({
     notes = null,
     activatedBy = null,
 } = {}) {
-    if (scope !== 'organization') {
-        throw new Error('Only organization-scope admin grants are supported');
+    if (scope !== 'organization' && scope !== 'server') {
+        throw new Error(`Unsupported scope: ${scope}`);
     }
-    if (!organizationId) throw new Error('organizationId required');
+    if (scope === 'organization' && !organizationId) throw new Error('organizationId required');
     if (!tiers.isValidTier(tier)) throw new Error(`Invalid tier: ${tier}`);
     if (tier === 'full' && process.env.ALLOW_ADMIN_FULL_TIER !== 'true') {
         throw new Error('full tier admin grants disabled (set ALLOW_ADMIN_FULL_TIER=true to enable)');
@@ -117,11 +125,13 @@ async function issueAdminLicense({
         admin_grant: true,
     };
 
+    const orgIdForRow = scope === 'organization' ? organizationId : null;
+
     const blob = encodeAdminLicenseBlob({
         v: 1,
         license_id: licenseId,
         scope,
-        organization_id: organizationId,
+        organization_id: orgIdForRow,
         tier,
         issuer: ADMIN_ISSUER,
         issued_at: issuedAtIso,
@@ -132,7 +142,7 @@ async function issueAdminLicense({
 
     const lic = await store.upsertLicense({
         licenseId,
-        organizationId,
+        organizationId: orgIdForRow,
         userId: null,
         scope,
         rawToken: blob,
@@ -144,6 +154,20 @@ async function issueAdminLicense({
         activatedBy,
         metadata,
     });
+
+    // Per-grant audit row. Closes bug 4.6 — `full` tier grants (which need
+    // ALLOW_ADMIN_FULL_TIER=true) had no per-grant trace.
+    try {
+        const ttlDays = Math.round((new Date(expiresAtIso).getTime() - Date.now()) / 86400000);
+        await store.logLicenseAudit('license_admin_issued', orgIdForRow, activatedBy, null, {
+            license_id: licenseId,
+            scope,
+            tier,
+            ttl_days: ttlDays,
+            max_seats: metadata.max_seats,
+            billing_interval: billingInterval,
+        });
+    } catch (_e) { /* audit best-effort */ }
 
     return { license: publicLicenseShape(lic), blob };
 }
@@ -161,11 +185,16 @@ async function importAdminLicense(blob, { activatedBy = null, organizationId = n
         throw new Error('full tier admin imports disabled (set ALLOW_ADMIN_FULL_TIER=true to enable)');
     }
 
-    const targetOrgId = organizationId || decoded.organization_id;
-    if (!targetOrgId) throw new Error('organizationId required (not present in blob and not provided)');
+    // Server-scope blobs are "unbound" — caller-provided org wins; if absent
+    // we persist as scope='server' on this install too.
+    const targetOrgId = organizationId || decoded.organization_id || null;
+    const targetScope = targetOrgId ? 'organization' : 'server';
+    if (targetScope === 'organization' && !targetOrgId) {
+        throw new Error('organizationId required (not present in blob and not provided)');
+    }
 
     return issueAdminLicense({
-        scope: 'organization',
+        scope: targetScope,
         organizationId: targetOrgId,
         tier: decoded.tier,
         expiresAt: decoded.expires_at,

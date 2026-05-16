@@ -306,6 +306,51 @@ router.get('/:id/files', requireAuth, async (req, res) => {
     }
 });
 
+// Upsert content of one extra text file. Owner-only — read-only viewers
+// must keep using the AI tools to mutate files.
+router.put('/:id/files', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const wp = await webpageStore.getWebpage(req.params.id, userId);
+        if (!wp) return res.status(404).json({ error: 'Webpage not found' });
+        if (wp.userId !== userId) return res.status(403).json({ error: 'Read-only' });
+        const { path, content } = req.body || {};
+        if (typeof path !== 'string' || !path.trim()) return res.status(400).json({ error: 'path is required' });
+        if (typeof content !== 'string') return res.status(400).json({ error: 'content is required (string)' });
+        const file = await webpageStore.upsertExtraFile({
+            webpageId: req.params.id,
+            userId,
+            path: path.trim(),
+            content,
+        });
+        res.json({ file });
+    } catch (err) {
+        // upsertExtraFile validates the path and surfaces clear messages
+        // (reserved paths, traversal attempts) — pass those through as 400s.
+        const status = /^(Reserved|Invalid|Path)/i.test(err.message) ? 400 : 500;
+        if (status === 500) console.error('[Webpages] Put extra file failed:', err);
+        res.status(status).json({ error: err.message || 'Failed to save file' });
+    }
+});
+
+// Delete one extra file. Owner-only.
+router.delete('/:id/files', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const wp = await webpageStore.getWebpage(req.params.id, userId);
+        if (!wp) return res.status(404).json({ error: 'Webpage not found' });
+        if (wp.userId !== userId) return res.status(403).json({ error: 'Read-only' });
+        const path = req.query.path;
+        if (typeof path !== 'string' || !path.trim()) return res.status(400).json({ error: 'path is required' });
+        const ok = await webpageStore.deleteExtraFile({ webpageId: req.params.id, userId, path: path.trim() });
+        if (!ok) return res.status(404).json({ error: 'File not found' });
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[Webpages] Delete extra file failed:', err);
+        res.status(500).json({ error: 'Failed to delete file' });
+    }
+});
+
 // ── Preview token (for sandboxed iframe → API calls) ────────────────
 //
 // The preview iframe runs with `sandbox="allow-scripts"` (no
@@ -506,6 +551,16 @@ router.post('/:id/sources/url', requireAuth, async (req, res) => {
 
         const wp = await webpageStore.getWebpage(webpageId, userId);
         if (!wp) return res.status(404).json({ error: 'Webpage not found' });
+
+        // SSRF guard — reject internal/loopback/link-local hosts up-front so
+        // the user sees a clear error instead of an ingestion task that
+        // mysteriously transitions to "error" later.
+        try {
+            const { assertUrlIsPublic } = require('../core/kbIngestionHelpers');
+            await assertUrlIsPublic(url);
+        } catch (e) {
+            return res.status(400).json({ error: e.message || 'URL is not allowed' });
+        }
 
         let name;
         try { name = new URL(url).hostname + new URL(url).pathname; } catch { name = url; }

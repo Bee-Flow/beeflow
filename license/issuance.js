@@ -31,7 +31,7 @@ const ISSUE_TIMEOUT_MS = parseInt(process.env.LICENSE_ISSUE_TIMEOUT_MS || '15000
  * @param {string} [args.organizationId]
  * @param {string} [args.userId]
  * @param {string} args.planId        - internal Beeflow plan id (or stripe price id)
- * @param {string} args.tier          - 'pro' | 'enterprise' | (community is free, no key)
+ * @param {string} args.tier          - 'enterprise' | 'full' (community is free, no key). Legacy 'pro' is also accepted and minted as enterprise.
  * @param {string} args.stripeCustomerId
  * @param {string} args.stripeSubscriptionId
  * @returns {Promise<{ token: string, licenseId: string } | null>}

@@ -73,7 +73,31 @@ router.get('/my-permissions', requireAuth, async (req, res) => {
         betaFeatures = await getUserBetaFeatures(userId, req.session);
     } catch (_) { }
 
-    res.json({ permissions: perms, groups: userGroups, organizations: userOrgIds, allowedAgentTypes, betaFeatures, orgRole: user?.orgRole || '' });
+    // Compute a server-aligned `canUseFeature` map for features that the server
+    // gates with `requireLicenseFeature(X) + requireBetaFeature(Y)`. The frontend
+    // should drive UI visibility off this — checking betaFeatures alone leaves
+    // the UI showing for users whose org lacks the licence, then every API call
+    // 403s and the page looks broken.
+    const canUseFeature = {};
+    try {
+        const { resolveBestTierForRequest } = require('../license/middleware');
+        const licenseTiers = require('../license/tiers');
+        const { listCompoundGatedFeatures } = require('../core/betaFeatures');
+        const { tier } = await resolveBestTierForRequest(req);
+        // Derived from the BETA_FEATURES registry — every entry with a
+        // licenseFeature is automatically reflected here. Adding a new
+        // compound-gated feature requires only a registry edit, never a
+        // change to this endpoint.
+        for (const g of listCompoundGatedFeatures()) {
+            const hasLicense = licenseTiers.tierHasFeature(tier, g.licenseFeature);
+            const hasBeta = betaFeatures.includes(g.id);
+            canUseFeature[g.id] = hasLicense && hasBeta;
+        }
+    } catch (err) {
+        console.warn('[Auth] my-permissions — canUseFeature resolution failed:', err?.message);
+    }
+
+    res.json({ permissions: perms, groups: userGroups, organizations: userOrgIds, allowedAgentTypes, betaFeatures, canUseFeature, orgRole: user?.orgRole || '' });
 });
 
 // Check if setup is complete (admin password set)
@@ -119,6 +143,9 @@ router.get('/setup-status', async (req, res) => {
         consumerLoginMethods,
         allowPasswordLogin: process.env.ALLOW_PASSWORD_LOGIN !== 'false',
         availableLocales,
+        // Self-hosted / white-label deploys can override the upgrade URL via
+        // LICENSE_UPGRADE_URL. Frontend reads this once at boot.
+        licenseUpgradeUrl: process.env.LICENSE_UPGRADE_URL || 'https://beeflow.ai/pricing',
     });
 });
 
@@ -369,7 +396,16 @@ router.get('/user', async (req, res) => {
                 avatarType: freshUser?.avatarType || req.session.user.avatarType || (req.session.user.picture ? 'url' : null),
                 provider: req.session.user.provider || req.session.oauthProvider || 'local',
                 organizationId: freshUser?.organizationId || '',
-                orgRole: freshUser?.orgRole || ''
+                orgRole: freshUser?.orgRole || '',
+                // Personal UI preference — strips the sidebar/settings down to
+                // chat + agents. Read here so the SPA has the flag on first
+                // paint and doesn't flash the full UI before /api/ai/user-settings resolves.
+                simpleMode: await (async () => {
+                    try {
+                        const configStore = require('../stores/configStore');
+                        return !!(await configStore.getConfig(`simple_mode_user_${req.session.user.id}`));
+                    } catch (_) { return false; }
+                })()
             },
             isOAuthConfigured: !!(config.oauth.clientId && config.oauth.clientSecret),
             // Encryption status for SSO users
@@ -378,7 +414,7 @@ router.get('/user', async (req, res) => {
             encryptionEnabled: await isEncryptionEnabledForUser(req.session.user.id),
             // Organisation membership for SSO users
             noOrganization: req.session.noOrganization || false,
-            isConsumerAccount: !freshUser?.organizationId && !req.session.noOrganization && process.env.DEPLOYMENT_MODE === 'cloud',
+            isConsumerAccount: !freshUser?.organizationId && !req.session.noOrganization && (process.env.DEPLOYMENT_MODE || 'cloud') === 'cloud',
             pendingApproval: req.session.pendingApproval || false,
             // NC App Store onboarding wizard gate. When the connector has
             // bootstrapped a fresh org but the admin hasn't completed the
@@ -977,7 +1013,7 @@ router.post('/signup', async (req, res) => {
         }
         // Invited users are auto-approved; self-signup depends on org allowSignup
         var userStatus = (inviteData || org.allowSignup) ? 'active' : 'pending';
-    } else if (process.env.DEPLOYMENT_MODE === 'cloud') {
+    } else if ((process.env.DEPLOYMENT_MODE || 'cloud') === 'cloud') {
         // ── Granular check: consumer signups ──
         const consumerSignupsEnabled = (await configStore.getConfig('signup_consumer_enabled')) ?? true;
         if (!consumerSignupsEnabled) {
@@ -1017,9 +1053,30 @@ router.post('/signup', async (req, res) => {
         status: resolvedStatus
     };
 
-    const createUserResult = await userStore.createUser(newUser);
-    if (!createUserResult) {
-        return res.status(400).json({ error: 'Username already taken' });
+    let createUserResult;
+    try {
+        const r = await userStore.createUserWithSeatCheck(newUser, { strict: true });
+        createUserResult = r.created;
+        if (!createUserResult) {
+            if (r.reason === 'duplicate_id') return res.status(400).json({ error: 'Username already taken' });
+            return res.status(400).json({ error: r.error || 'Failed to create user' });
+        }
+    } catch (e) {
+        if (e instanceof userStore.SeatCapExceededError) {
+            return res.status(403).json({ error: 'seat_cap_exceeded', current: e.current, max: e.max });
+        }
+        throw e;
+    }
+
+    // ── Auto-grant consumer trial (fire-and-forget) ─────────────
+    // Only fires for genuine consumer signups (no org). Org admins picked
+    // their own trial via the org-trial config; that's triggered inside
+    // userStore.createOrganization. trialService swallows errors so signup
+    // is never blocked by Stripe issues.
+    if (!orgId && !newOrgName) {
+        setImmediate(() => {
+            require('../services/trialService').maybeAutoGrantConsumerTrial(newUser.id);
+        });
     }
 
     // ── Mark invitation as accepted ──────────────────────────

@@ -225,6 +225,13 @@ async function updateDirectConversationTitle(id, title, userId) {
     return rowCount > 0;
 }
 
+async function updateDirectConversationModelTier(id, modelTier, userId) {
+    if (!modelTier) return false;
+    await initDB();
+    const { rowCount } = await run('UPDATE direct_conversations SET model_tier = $1 WHERE id = $2 AND user_id = $3', [modelTier, id, userId]);
+    return rowCount > 0;
+}
+
 async function deleteDirectConversation(id, userId) {
     await initDB();
     await run('DELETE FROM conversation_messages WHERE conversation_id = $1', [id]).catch(() => {});
@@ -275,7 +282,7 @@ async function _readDirectMessages(row) {
 
 module.exports = {
     createDirectConversation, getDirectConversation, listDirectConversations,
-    updateDirectConversation, updateDirectConversationTitle, pinDirectConversation, setDirectConversationLabels, deleteDirectConversation,
+    updateDirectConversation, updateDirectConversationTitle, updateDirectConversationModelTier, pinDirectConversation, setDirectConversationLabels, deleteDirectConversation,
     updateDirectConversationWorkspace, getDirectConversationWorkspace,
     searchDirectConversations, updateDirectConversationMeta,
     // Exposed so agentConversations.js can reuse the same restore logic.

@@ -42,6 +42,11 @@ const {
 } = require('../../integrations/webpageDbTools');
 const { AGENT_SEARCH_TOOLS, executeAgentSearchTool, isAgentSearchTool } = require('../../integrations/agentSearchTools');
 const {
+    WEBPAGE_BRIDGE_TOOLS,
+    executeBridgeTool,
+    isBridgeTool,
+} = require('../../integrations/webpageBridgeTools');
+const {
     searchWebpageKB,
     executeWebpageKBSearchTool,
     WEBPAGE_KB_SEARCH_TOOL,
@@ -340,53 +345,83 @@ RUNTIME CONSTRAINTS — READ ONCE, OBEY ALWAYS
 1. Vanilla HTML / CSS / JavaScript only. There is NO build step.
 2. NO package installation. No \`npm install\`, no \`yarn add\`, no \`require()\` of node modules, no bundler. If you need a library, use a CDN \`<script>\` tag inside the HTML (e.g. \`<script src="https://cdn.jsdelivr.net/...">\`).
 3. NO TypeScript, JSX, SCSS, LESS, or any language that needs compilation.
-4. The preview iframe runs with \`sandbox="allow-scripts"\` and NO \`allow-same-origin\`. That means:
+4. The preview iframe runs with \`sandbox="allow-scripts allow-forms"\` and NO \`allow-same-origin\`. That means:
    - \`document.cookie\`, \`localStorage\`, \`sessionStorage\` are unavailable inside the page.
    - \`fetch()\` to the host app or any same-origin URL fails (CORS / opaque origin).
    - \`parent.window\` access throws SecurityError.
+   - \`<form>\` is allowed but submission cannot navigate to a real URL (target origin is \`null\`). ALWAYS call \`event.preventDefault()\` in the form's submit handler and do the actual work via \`window.beeflowDB\` / fetch-to-CDN / in-page state. Never rely on the form's \`action\` attribute.
    Use in-memory variables for state. CDN fetches are allowed.
 5. Reference styles and scripts however you like — \`<link href="style.css">\` and \`<script src="script.js"></script>\` work in the downloaded zip; the in-app preview inlines them automatically.
 6. Default to a clean, modern aesthetic when the user's brief is sparse: sensible spacing, readable typography, accessible color contrast (WCAG AA), responsive on mobile.
 
 ────────────────────────────────────────
-FILES
+FILES — DEFAULT TO MODULAR LAYOUTS
 ────────────────────────────────────────
 ${filesBlock}
+
+The three primary slots (\`index.html\`, \`style.css\`, \`script.js\`) are the entry points. They should stay small — wire components together, hold the top-level layout, declare the runtime config. Anything bigger than a few sections of CSS, more than a handful of UI sections, or any logic that has its own identity belongs in its own file under a sensible folder. Smaller files = surgical partial edits, less context noise per turn, less risk of clobbering unrelated code.
+
+Recommended starter layout, even for "small" pages:
+  components/        HTML partials for individual sections (hero, features, footer, …) — see RUNTIME CONTRACT below
+  modules/           Focused JS files (state.js, ui.js, api.js, …) referenced from index.html via <script src="…">
+  modules/           …or stylesheet partials (theme.css, layout.css, components.css) referenced via <link href="…">
+  data/              .json content the script reads (menu.json, copy.json, …)
+  assets/            images, fonts, SVGs
+
+Rule of thumb: aim for files under ~200 lines. If a slot or extra file is creeping past that and the content is coherent enough to split, split it.
+
+────────────────────────────────────────
+RUNTIME CONTRACT FOR EXTRAS — read carefully, get this wrong and the preview breaks
+────────────────────────────────────────
+The preview iframe runs sandboxed with NO same-origin, so it CANNOT \`fetch()\` extra files. Extras are inlined into the page at compose time, only when their path is referenced by a recognised tag in \`index.html\`:
+
+• CSS extras → reference via \`<link rel="stylesheet" href="modules/theme.css">\` in index.html. The compiler substitutes the link with an inline <style> block.
+• JS extras → reference via \`<script src="modules/state.js"></script>\` in index.html. Substituted with an inline <script>.
+• Binary assets (images, fonts, SVGs, audio…) → reference via \`src=\` / \`href=\` on any tag. Substituted with a data: URL.
+• .json / .md / other text extras → only usable by JS that embeds them as a string at build/edit time. They are NOT auto-fetched. If script.js needs the JSON, paste the parsed object into a \`<script>\` block in index.html (e.g. \`<script>window.__menu = { ... };</script>\`) or hardcode it in modules/state.js. Do NOT write \`fetch("data/menu.json")\` — it will fail silently.
+• HTML partials in \`components/*.html\` are NOT auto-inlined. Treat them as your own reference scratchpad: write the component there, then copy/paste the markup into index.html at the right location. Updating the partial alone will NOT update the page; you must edit index.html for the change to show. (You can still split components this way — it keeps each file small and gives you a clear "library" to copy from.)
+
+Worked example — bakery landing page split into ~6 small files:
+  index.html         shell + sections copied from components/, with <link>/<script src> for modules/
+  style.css          page-level layout + tokens
+  script.js          bootstrap + event wiring; imports app behaviour from modules/
+  modules/theme.css  colour tokens + typography, referenced via <link href="modules/theme.css">
+  modules/menu.js    menu data + render fn, referenced via <script src="modules/menu.js">
+  components/hero.html       reference partial (copy into index.html)
+  components/contact.html    reference partial (copy into index.html)
+  assets/logo.svg    referenced via <img src="assets/logo.svg"> → data URL
+
+This stays under ~150 lines per file with clean diff cards for each edit.
 
 ────────────────────────────────────────
 EDITING TOOLS — partial edits are the default, full rewrites are the exception
 ────────────────────────────────────────
-The cardinal rule: when a file already has content, edit it partially. webpage_file_write is reserved for empty files or genuine from-scratch rewrites — using it on a non-empty file is almost always wrong and the system will warn you about it.
+Cardinal rule: when a file already has content, edit it partially. webpage_file_write / webpage_create_file with new content for an existing path are reserved for empty files or genuine from-scratch rewrites.
 
 Decision tree for any change:
-  1. Is the file empty or being created for the first time? → webpage_file_write
-  2. Does the change span ≥80% of the file (genuine total rewrite)? → webpage_file_write
-  3. Otherwise (the realistic 95% case) → webpage_file_replace or webpage_file_patch
+  1. File is empty or being created for the first time? → webpage_file_write (primary slot) or webpage_create_file (extra)
+  2. Change spans ≥80% of the file (genuine total rewrite)? → write/create
+  3. Otherwise (the realistic 95% case) → webpage_file_replace (primary slot) or webpage_replace_in_file (extra)
 
-Tools, in order of preference:
-• webpage_file_read({ file }) — always call this BEFORE any partial edit on the same file in the same turn. The system tracks reads and warns when an edit comes in cold.
-• webpage_file_replace({ file, find_text, replace_text [, replace_all] }) — your default editing tool. Surgical substring replace; preserves everything around the change. find_text must match EXACTLY ONCE by default; if it appears multiple times the tool errors with the matching line numbers and asks you to either narrow the snippet or set \`replace_all: true\`. Whitespace-normalised matching is a fallback. Use this for: adding sections, removing sections, swapping copy, fixing bugs, restyling specific elements, anything contained.
-• webpage_file_patch({ file, start_line, end_line, expected_text, replacement }) — line-anchored partial edit. Use when you know exactly which lines to rewrite (you just read the file and counted) and the change is bigger than a clean substring. The expected_text sanity check protects against stale reads.
-• webpage_file_write({ file, content [, title] }) — LAST RESORT. Only for empty files or full rewrites where you're throwing away ≥80% of the existing content. The system emits a warning when you call this on a non-empty file because it's nearly always a mistake — use the partial tools instead.
+Primary-slot tools (html/css/js):
+• webpage_file_read({ file }) — call BEFORE any partial edit. The system tracks reads and warns when an edit comes in cold.
+• webpage_file_replace({ file, find_text, replace_text [, replace_all] }) — surgical substring replace; preserves everything around the change. find_text must match EXACTLY ONCE by default; set \`replace_all: true\` for repeated patterns. Use for: adding sections, swapping copy, restyling specific elements.
+• webpage_file_patch({ file, start_line, end_line, expected_text, replacement }) — line-anchored partial edit when you know the exact range. expected_text sanity-checks against stale reads.
+• webpage_file_write({ file, content [, title] }) — LAST RESORT for non-empty files.
 
-Inserting new content with webpage_file_replace: pick a stable anchor in the existing file (a closing tag, a CSS rule selector, a comment), use that as find_text, and put the anchor + your new content into replace_text. This is how you add things without destroying what's around them.
+Extra-file tools (anything outside the three primary slots):
+• webpage_list_files() — see every file currently in the project. Always call this first when you're not sure what's already scaffolded.
+• webpage_read_file({ path }) — read an extra file's contents before partial-editing it.
+• webpage_create_file({ path, content }) — create OR overwrite an extra. Reject reserved paths (index.html, style.css, script.js) — for those, use webpage_file_write.
+• webpage_replace_in_file({ path, find_text, replace_text [, replace_all] }) — partial edit on an extra. Same single-match-required contract.
+• webpage_delete_file({ path }) — remove an extra.
+
+Inserting new content: pick a stable anchor (a closing tag, a CSS rule selector, a comment), use it as find_text, put the anchor + your new content into replace_text. This is how you add things without destroying what's around them.
 
 Iteration discipline:
 - Read first, then edit. Never call a partial-edit tool on a file you haven't read this turn.
 - Many small focused replaces > one giant rewrite. Each replace shows the user a clean diff card.
-- After edits land, briefly confirm what changed in plain language: "I added the hero section to index.html and centered the menu grid in style.css."
-
-────────────────────────────────────────
-EXTRA FILES & FOLDERS — beyond the three primary slots
-────────────────────────────────────────
-You can split your work across additional files when it makes the project clearer (e.g. components/header.html, modules/state.js, assets/products.json). Folders are created implicitly from the path.
-• webpage_list_files() — see every file currently in the project.
-• webpage_create_file({ path, content }) — create or overwrite an extra file. Reject reserved paths (index.html, style.css, script.js); for those, use webpage_file_write({ file: "html"|"css"|"js" }).
-• webpage_read_file({ path }) — read an extra file's contents.
-• webpage_replace_in_file({ path, find_text, replace_text [, replace_all] }) — partial edit on an extra file. Same single-match-required contract as webpage_file_replace.
-• webpage_delete_file({ path }) — remove an extra file.
-
-When to split files: only when it genuinely simplifies the project. A small page belongs in the three primary slots. Split when you have multiple components, reusable modules, or content that wants its own file. Don't pre-emptively scaffold dozens of files for a simple page.
+- After edits land, briefly confirm what changed in plain language: "I added the hero section to index.html and centered the menu grid in modules/menu.css."
 
 ────────────────────────────────────────
 SQLITE DATABASE — per-webpage server-side persistence
@@ -408,17 +443,89 @@ Three tools to manage the DB directly. The user can also see and edit the DB liv
 Use these to set up the schema and seed data the user describes. The DB persists across reloads; new webpages start empty. If the page doesn't actually need persistence, don't create a schema — local state in script.js is fine.
 
 ────────────────────────────────────────
+PLATFORM BRIDGES — script.js runtime APIs
+────────────────────────────────────────
+The sandboxed iframe exposes three additional bridges alongside \`window.beeflowDB\`. Each call goes through an HMAC-authenticated server proxy and runs **acts-as-author** — so when a visitor (not the page owner) triggers an action, the call still uses the AUTHOR's credentials, quota, and routines. All calls are async and return Promises. Server-side allowlists (\`bridge_grants\`) gate what's callable; visitors cannot bypass them.
+
+1. \`window.beeflowAI\` — chat the configured LLM from script.js.
+     await beeflowAI.chat("Summarise this product");                   // → string
+     await beeflowAI.chatJSON("Extract fields", schema);               // → object matching schema
+     await beeflowAI.stream("Long answer", t => append(t));             // → string (streams via callback)
+     await beeflowAI.ask("What's new with X in our docs and on the web?", {
+       onToken: t => append(t),
+       onEvent: (name, data) => showStatus(name, data)
+     });  // → { text, rounds, toolCalls }
+   The webpage's knowledge_base_ids + uploaded sources are auto-injected as context. Default-on; manage with \`webpage_grant_ai\` if the author wants to disable it or pick a different tier.
+
+   **Prefer \`ask()\` over \`chat()\` whenever the answer needs *fetching*** — searching the web, looking up the author's Nextcloud/Drive/Gmail, running a routine, or scanning page knowledge. \`ask\` runs an agentic tool loop server-side: it autonomously calls every tool you've granted (integrations + automations) plus \`page_knowledge_search\` (when grounding is on) and synthesises a final answer. The page just awaits one promise. Use \`chat()\` only when the answer is purely from the system prompt + page context.
+
+   To make \`ask()\` powerful: grant the tools the AI will need. Example: a Study Studio that learns from the author's Nextcloud:
+     • \`webpage_grant_integration({ tool: "agent_search" })\`              // web research
+     • \`webpage_grant_integration({ tool: "nextcloud_list_files", fixedArgs: { path: "/study" } })\`
+     • \`webpage_grant_integration({ tool: "nextcloud_get_file_content" })\`
+   Then \`script.js\` calls \`beeflowAI.ask(userQuestion, { onEvent })\` and the server-side AI orchestrates browsing the folder, reading files, web-searching, and answering — no JS pipeline needed in script.js.
+
+   **\`onEvent(name, data)\` for status UI** — fires on every SSE event so you can show "🔍 Searching the web…" / "📁 Reading Nextcloud…" pills while the loop runs. Useful event names: \`tool_call\` (\`{ id, name, args }\` — show start), \`tool_result\` (\`{ id, name, ok }\` — show done/failed), \`done\` (\`{ rounds, truncated }\`), \`error\` (\`{ error }\`).
+
+   **Integration response shapes are typed** — the AI uses them automatically inside \`ask()\`, but if your script.js calls \`beeflowIntegrations.run('nextcloud_list_files', …)\` directly, expect \`{ result: { path, count, items: [{ name, type, size, lastModified }] } }\`. \`count === 0\` with \`items: []\` is a valid empty-success state — render "No files in this folder yet", not a parse-failure error.
+
+   **Render markdown + LaTeX whenever you display \`beeflowAI\` output to a human.** Responses are plain text containing markdown (\`**bold**\`, \`# heading\`, lists, code fences) and may contain LaTeX (\`$inline$\`, \`$$display$$\`). Showing \`textContent\` makes literal asterisks and dollar signs visible to the user — that looks broken. Pull in CDN renderers from \`index.html\`:
+
+       <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+       <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
+       <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.6/dist/purify.min.js"></script>
+       <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+       <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+
+   Then in script.js, render with sanitised HTML + KaTeX auto-render:
+
+       function renderAIResponse(el, text) {
+         var html = DOMPurify.sanitize(marked.parse(text || ''));
+         el.innerHTML = html;
+         if (window.renderMathInElement) {
+           renderMathInElement(el, {
+             delimiters: [
+               { left: '$$', right: '$$', display: true },
+               { left: '$', right: '$', display: false },
+               { left: '\\\\(', right: '\\\\)', display: false },
+               { left: '\\\\[', right: '\\\\]', display: true }
+             ],
+             throwOnError: false
+           });
+         }
+       }
+
+   For \`beeflowAI.stream(prompt, onToken, opts)\` — accumulate tokens into a buffer and re-render the whole buffer through \`marked\` on every chunk (cheap), then re-run KaTeX once at the end. Don't render KaTeX per token; partial \`$...\` strings throw parser errors.
+
+2. \`window.beeflowAutomations\` — trigger the author's studio routines.
+     const r = await beeflowAutomations.run("automation-id", { name, email });
+     // r = { runId, status, output, steps }
+     await beeflowAutomations.list();                                   // discover what's granted
+   Authors must explicitly grant each automation via \`webpage_grant_automation\` before it's callable. List first via \`webpage_list_my_automations\` so you only grant routines the author owns.
+
+3. \`window.beeflowIntegrations\` — call one specific integration action.
+     await beeflowIntegrations.run("slack_post_message", { text: "New signup!" });
+   Authors must grant each tool via \`webpage_grant_integration\`. ALWAYS use \`fixedArgs\` to pin sensitive fields the visitor must not override (channel, recipient, sheet ID). NEVER grant a destructive tool (delete/drop/revoke) without pinning the target. List first via \`webpage_list_my_integrations\` so you only grant tools the author has actually connected.
+
+Granting workflow (when the user asks for "a form that posts to my Slack", "a button that triggers my routine", etc.):
+1. List → \`webpage_list_my_automations\` / \`webpage_list_my_integrations\`.
+2. Pick the relevant entry.
+3. Grant → \`webpage_grant_automation\` / \`webpage_grant_integration\` (with \`fixedArgs\` pins for integrations).
+4. Generate HTML + script.js that uses the bridge. Forms must call \`event.preventDefault()\` in the submit handler — the iframe sandbox blocks native form submission.
+
+────────────────────────────────────────
 PLANNING
 ────────────────────────────────────────
 ${planningRule}
 
 ────────────────────────────────────────
-SOURCES & RESEARCH
+KNOWLEDGE & RESEARCH
 ────────────────────────────────────────
+Imported knowledge (files, URLs, pasted text) attached to this webpage for reference:
 ${sourceSummary}
 ${searchAvailable ? `\nWeb research:
 • agent_search — current information, factual lookups.
-• webpage_add_source — attach search results / references as a webpage source for grounding future questions.` : ''}${kbContext}${selectionContext}
+• webpage_add_source — attach search results / references to this webpage's knowledge for grounding future questions.` : ''}${kbContext}${selectionContext}
 
 Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = new Date(); const _dp = _now.toLocaleString('sv-SE', { timeZone: _tz }); const _lp = new Date(_now.toLocaleString('en-US', { timeZone: _tz })); const _om = Math.round((_lp - _now) / 60000); const _s = _om >= 0 ? '+' : '-'; const _a = Math.abs(_om); return `${_dp} UTC${_s}${String(Math.floor(_a / 60)).padStart(2, '0')}:${String(_a % 60).padStart(2, '0')} (${_tz})`; } catch (_) { return new Date().toISOString(); } })()}`;
 
@@ -514,7 +621,7 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
         }
 
         // Tool list
-        const webpageTools = [...WEBPAGE_DOC_TOOLS, ...WEBPAGE_MULTI_FILE_TOOLS, ...WEBPAGE_DB_TOOLS, WEBPAGE_ADD_SOURCE_TOOL];
+        const webpageTools = [...WEBPAGE_DOC_TOOLS, ...WEBPAGE_MULTI_FILE_TOOLS, ...WEBPAGE_DB_TOOLS, ...WEBPAGE_BRIDGE_TOOLS, WEBPAGE_ADD_SOURCE_TOOL];
         // Plan tool exposed ONLY in ask/plan modes — auto mode is "just work,
         // no approval gate". Also dropped on plan-execution turns so the AI
         // can't propose another plan after the user already approved one.
@@ -640,6 +747,8 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
                     // the iframe hot-reload if the user wants it.
                     send('webpage_db_update', {});
                 }
+            } else if (isBridgeTool(toolName)) {
+                toolResult = await executeBridgeTool(toolName, toolArgs, { webpageId, userId, session: req.session });
             } else if (toolName === 'webpage_add_source') {
                 try {
                     const { ingestTextSource } = require('../../agents/webpages/sourceIngestion');

@@ -146,4 +146,74 @@ function wrapWithRedisCache(pgStore, redis) {
     return cachedStore;
 }
 
-module.exports = { wrapWithRedisCache };
+/**
+ * Bust all live sessions for a given user. Used after the user's license is
+ * revoked, their role is downgraded, or their account is deleted — without
+ * this, the existing cookie still validates for up to 30 days.
+ *
+ * Returns the number of sessions destroyed (PG row count).
+ */
+async function bustSessionsForUser(userId) {
+    if (!userId) return 0;
+    try {
+        const { pool, getRedis } = require('../db');
+        const result = await pool.query(
+            `DELETE FROM user_sessions
+                   WHERE sess::jsonb -> 'user' ->> 'id' = $1
+               RETURNING sid`,
+            [String(userId)]
+        );
+        const sids = (result.rows || []).map(r => r.sid);
+        const r = getRedis();
+        if (r && sids.length) {
+            try {
+                const keys = sids.map(sid => `${CACHE_PREFIX}${sid}`);
+                await r.unlink(...keys).catch(() => r.del(...keys).catch(() => { }));
+            } catch (_e) { /* best-effort */ }
+        }
+        if (sids.length) {
+            console.log(`[SessionCache] bust.user user_id=${userId} sessions=${sids.length}`);
+        }
+        return sids.length;
+    } catch (e) {
+        console.error('[SessionCache] bustSessionsForUser error:', e.message);
+        return 0;
+    }
+}
+
+/**
+ * Bust every session belonging to any user in the given org. Used on org-wide
+ * license revocation. Walks `users."organizationId"` to enumerate IDs, then
+ * delegates per-user to bustSessionsForUser so the Redis bust happens too.
+ */
+async function bustSessionsForOrg(organizationId) {
+    if (!organizationId) return 0;
+    try {
+        const { pool } = require('../db');
+        const result = await pool.query(
+            `DELETE FROM user_sessions
+                   WHERE sess::jsonb -> 'user' ->> 'organizationId' = $1
+                      OR sess::jsonb -> 'user' ->> 'orgId' = $1
+               RETURNING sid`,
+            [String(organizationId)]
+        );
+        const sids = (result.rows || []).map(r => r.sid);
+        const { getRedis } = require('../db');
+        const r = getRedis();
+        if (r && sids.length) {
+            try {
+                const keys = sids.map(sid => `${CACHE_PREFIX}${sid}`);
+                await r.unlink(...keys).catch(() => r.del(...keys).catch(() => { }));
+            } catch (_e) { /* best-effort */ }
+        }
+        if (sids.length) {
+            console.log(`[SessionCache] bust.org org_id=${organizationId} sessions=${sids.length}`);
+        }
+        return sids.length;
+    } catch (e) {
+        console.error('[SessionCache] bustSessionsForOrg error:', e.message);
+        return 0;
+    }
+}
+
+module.exports = { wrapWithRedisCache, bustSessionsForUser, bustSessionsForOrg };

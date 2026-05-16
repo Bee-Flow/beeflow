@@ -12,6 +12,24 @@ const kbStore = require('../stores/knowledgeBases');
 const configStore = require('../stores/configStore');
 const userStore = require('../stores/userStore');
 const { requireAuth, resolveUserOrgIds, requirePermission, hasPermission, assertUserCanUseOrg, validateSharedGroupsForOrg } = require('../auth');
+const { getUserBetaFeatures } = require('../core/betaFeatures');
+
+// Beta-feature ids that map 1:1 to a system_slug on a system-managed KB. The
+// chat KB picker should only surface a system KB when the user's org has the
+// matching beta feature enabled. New system KBs append a slug here.
+const SYSTEM_KB_BETA_SLUGS = ['dutch_legal_sources'];
+
+async function resolveEnabledSystemSlugs(req) {
+    const userId = req.session?.user?.id;
+    if (!userId) return [];
+    try {
+        const features = await getUserBetaFeatures(userId, req.session);
+        const featureSet = new Set(features);
+        return SYSTEM_KB_BETA_SLUGS.filter(slug => featureSet.has(slug));
+    } catch (_) {
+        return [];
+    }
+}
 
 const SEARCH_SERVICE_URL = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
 const { getServiceHeaders } = require('../core/serviceAuth');
@@ -87,6 +105,19 @@ async function canAccessKB(req, kb) {
     return kbStore.canUserAccessKB(kb, userId, orgIds, userGroups);
 }
 
+/**
+ * Guard for mutating routes. System-managed KBs are read-only — their content
+ * is owned by Bee Flow and refreshed by the ingest script. Returns true and
+ * sends a 403 when the request should be aborted, false otherwise.
+ */
+function blockIfSystemKB(kb, res) {
+    if (kbStore.isSystemKB(kb)) {
+        res.status(403).json({ error: 'System-managed knowledge bases are read-only' });
+        return true;
+    }
+    return false;
+}
+
 // Multer for file uploads
 const upload = multer({
     storage: multer.memoryStorage(),
@@ -102,7 +133,8 @@ router.get('/', requireAuth, async (req, res) => {
     try {
         const userId = getUserId(req);
         const orgIds = await resolveUserOrgIds(req);
-        const kbs = await kbStore.listKBs(userId, orgIds, listFilterFromQuery(req));
+        const systemSlugs = await resolveEnabledSystemSlugs(req);
+        const kbs = await kbStore.listKBs(userId, orgIds, { ...listFilterFromQuery(req), systemSlugs });
         const userGroups = await resolveUserGroups(req);
         // Owners always see drafts; org members see only published KBs that pass
         // shared_groups restriction.
@@ -122,7 +154,8 @@ router.get('/published', requireAuth, async (req, res) => {
         const userId = getUserId(req);
         const orgIds = await resolveUserOrgIds(req);
         const userGroups = await resolveUserGroups(req);
-        const kbs = await kbStore.listKBs(userId, orgIds, listFilterFromQuery(req));
+        const systemSlugs = await resolveEnabledSystemSlugs(req);
+        const kbs = await kbStore.listKBs(userId, orgIds, { ...listFilterFromQuery(req), systemSlugs });
         const accessible = kbStore.filterByGroupAccess(kbs, userId, userGroups);
         // Only KBs that are explicitly published (drafts owned by the user are dropped here)
         res.json(accessible.filter(kb => !!kb.is_published));
@@ -216,6 +249,120 @@ router.post('/', requireAuth, requirePermission('manage_knowledge'), async (req,
     }
 });
 
+// ── System-managed KBs (Bee Flow-provided content) ─────────────────
+// Lightweight status endpoint so the admin dashboard can show what's
+// available, how many documents are loaded, and whether the *org* (not
+// the user's bypass) currently has the matching beta feature enabled.
+// Super-admins get an extra `superAdminBypass: true` flag — they can
+// always use the system KB in their own chats regardless of org toggle.
+router.get('/system', requireAuth, async (req, res) => {
+    try {
+        const userId = getUserId(req);
+        const orgIds = await resolveUserOrgIds(req);
+        const isSuperAdmin = orgIds === null
+            || !!req.session?.isAdmin
+            || req.session?.user?.role === 'admin';
+
+        // Pick the org whose toggle state we'll report. Super-admins fall
+        // back to the first org in the system (same rule as
+        // /auth/me/active-features) so the panel has something to manage.
+        let orgId = null;
+        if (orgIds instanceof Set && orgIds.size > 0) {
+            orgId = Array.from(orgIds)[0];
+        } else if (isSuperAdmin) {
+            try {
+                const all = await userStore.getAllOrganizations();
+                if (Array.isArray(all) && all.length > 0) orgId = all[0].id;
+            } catch (_) { /* no orgs */ }
+        }
+
+        // The org's real-world active set = intersection of super-admin
+        // allow-list (∪ features marked `freeForAllOrgs`) AND org-admin
+        // active list. We surface both so the UI can tell whether enabling
+        // requires a super-admin step first.
+        const { getOrgBetaFeatures, listBetaFeatures } = require('../core/betaFeatures');
+        const freeForAll = new Set(listBetaFeatures().filter(f => f.freeForAllOrgs).map(f => f.id));
+        let orgAllowed = new Set();
+        let orgActive = new Set();
+        if (orgId) {
+            try { orgAllowed = new Set(await getOrgBetaFeatures(orgId)); } catch (_) { /* */ }
+            try { orgActive = new Set(await userStore.getOrgEnabledBetaFeatures(orgId)); } catch (_) { /* */ }
+        }
+        // Free-for-all features count as allowed even without a super-admin grant.
+        for (const id of freeForAll) orgAllowed.add(id);
+
+        const all = await kbStore.listSystemKBs();
+        const payload = all.map(kb => {
+            const slug = kb.system_slug || null;
+            const enabledForOrg = !!(slug && orgAllowed.has(slug) && orgActive.has(slug));
+            const allowedForOrg = !!(slug && orgAllowed.has(slug));
+            return {
+                id: kb.id,
+                name: kb.name,
+                description: kb.description,
+                icon: kb.icon,
+                system_slug: slug,
+                documentCount: Number(kb.document_count || 0),
+                totalChunks: Number(kb.total_chunks || 0),
+                updatedAt: kb.updated_at,
+                betaFeatureId: slug,
+                enabledForOrg,
+                allowedForOrg,
+                // Super-admins always have the feature regardless of org toggle.
+                // Surface that to the UI so it can label the row "available to you"
+                // even when enabledForOrg is false.
+                superAdminBypass: isSuperAdmin,
+            };
+        });
+        res.json({ items: payload, orgId, isSuperAdmin });
+    } catch (e) {
+        console.error('[KB] System list error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Live status of the seed/refresh job for a given system KB. Per-slug routing
+// keeps this forward-compatible with additional system KBs later (e.g. NEN
+// standards, Belastingdienst guidance).
+router.get('/system/:slug/status', requireAuth, async (req, res) => {
+    try {
+        const slug = String(req.params.slug || '').toLowerCase();
+        if (slug !== 'dutch_legal_sources') {
+            return res.status(404).json({ error: 'Unknown system KB slug' });
+        }
+        const dutchLawIngest = require('../services/dutchLawIngest');
+        res.json({ slug, ...dutchLawIngest.getStatus() });
+    } catch (e) {
+        console.error('[KB] System status error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Admin-triggered re-seed. Returns immediately (202) with current job status;
+// the actual ingest runs in the background. Super-admins only — re-seeding
+// hits external endpoints (KOOP) and is the kind of action that should not
+// be available to every org-admin.
+router.post('/system/:slug/refresh', requireAuth, async (req, res) => {
+    try {
+        const isSuperAdmin = !!req.session?.isAdmin || req.session?.user?.role === 'admin';
+        if (!isSuperAdmin) {
+            return res.status(403).json({ error: 'Super-admin only' });
+        }
+        const slug = String(req.params.slug || '').toLowerCase();
+        if (slug !== 'dutch_legal_sources') {
+            return res.status(404).json({ error: 'Unknown system KB slug' });
+        }
+        const force = req.body?.force === true || req.query?.force === '1';
+        const bwbIds = Array.isArray(req.body?.bwbIds) ? req.body.bwbIds : null;
+        const dutchLawIngest = require('../services/dutchLawIngest');
+        const result = dutchLawIngest.refresh({ force, bwbIds });
+        res.status(202).json({ slug, force, ...result });
+    } catch (e) {
+        console.error('[KB] System refresh error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // ── KB Favorites ────────────────────────────────────────────────────
 // Per-user favorited KBs (DB-backed; replaces client-side localStorage).
 // Defined before /:id routes so GET /favorites is not captured by GET /:id.
@@ -298,6 +445,7 @@ router.patch('/:id', requireAuth, requirePermission('manage_knowledge'), async (
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
         if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
+        if (blockIfSystemKB(kb, res)) return;
 
         const { name, description, categoryId, icon, usageContexts } = req.body || {};
         const cleanedContexts = sanitizeUsageContexts(usageContexts);
@@ -321,6 +469,7 @@ router.patch('/:id/publish', requireAuth, async (req, res) => {
         const userId = getUserId(req);
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
+        if (blockIfSystemKB(kb, res)) return;
 
         const isOwner = kb.tenant_id === userId;
         const isAdmin = req.session?.isAdmin || req.session?.user?.role === 'admin';
@@ -360,6 +509,7 @@ router.delete('/:id', requireAuth, requirePermission('manage_knowledge'), async 
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
         if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
+        if (blockIfSystemKB(kb, res)) return;
 
         // Delete chunks from remote search-service (skip when admin chose local-only)
         try {
@@ -434,6 +584,7 @@ router.post('/:id/documents/bulk-delete', requireAuth, requirePermission('manage
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
         if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
+        if (blockIfSystemKB(kb, res)) return;
 
         const ids = Array.isArray(req.body?.documentIds) ? req.body.documentIds.slice(0, 200) : [];
         if (ids.length === 0) return res.status(400).json({ error: 'documentIds required' });
@@ -550,6 +701,7 @@ router.delete('/:id/documents/:docId', requireAuth, requirePermission('manage_kn
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
         if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
+        if (blockIfSystemKB(kb, res)) return;
 
         const doc = await kbStore.getDocument(req.params.docId);
         if (!doc || doc.knowledge_base_id !== kb.id) {
@@ -574,6 +726,7 @@ router.post('/:id/ingest/text', requireAuth, requirePermission('manage_knowledge
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
         if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
+        if (blockIfSystemKB(kb, res)) return;
 
         const { content, title } = req.body;
         if (!content || typeof content !== 'string' || content.trim().length < 3) {
@@ -608,6 +761,7 @@ router.post('/:id/ingest/file', requireAuth, requirePermission('manage_knowledge
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
         if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
+        if (blockIfSystemKB(kb, res)) return;
 
         if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
@@ -649,6 +803,7 @@ router.post('/:id/ingest/url', requireAuth, requirePermission('manage_knowledge'
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
         if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
+        if (blockIfSystemKB(kb, res)) return;
 
         const { url } = req.body;
         if (!url) return res.status(400).json({ error: 'URL is required' });
@@ -691,6 +846,7 @@ router.post('/:id/ingest/sitemap', requireAuth, requirePermission('manage_knowle
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
         if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
+        if (blockIfSystemKB(kb, res)) return;
 
         const { url, maxPages = 50 } = req.body;
         if (!url) return res.status(400).json({ error: 'URL is required' });
@@ -929,6 +1085,7 @@ router.post('/:id/ingest/n8n', requireAuth, requirePermission('manage_knowledge'
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
         if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
+        if (blockIfSystemKB(kb, res)) return;
 
         const { workflowId, mode = 'data' } = req.body;
         if (!workflowId) {
@@ -1182,6 +1339,7 @@ router.post('/:id/reindex', requireAuth, requirePermission('manage_knowledge'), 
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
         if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
+        if (blockIfSystemKB(kb, res)) return;
 
         const docs = await kbStore.listDocuments(kb.id);
         if (docs.length === 0) {

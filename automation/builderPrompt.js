@@ -1,12 +1,18 @@
 /**
  * System prompt for the conversational automation builder agent.
  *
- * Instructs the model to use the structured `builder_*` tools to mutate
- * a draft definition. The catalog (apps × actions) is injected at call
- * time so the model can only refer to tools the user has connected.
+ * Two variants ship side by side:
+ *   - buildFullSystemPrompt — long, exhaustive guidance the frontier
+ *     models (Opus, GPT-5-pro, o3, Mistral Large) use today.
+ *   - buildLeanSystemPrompt — ~80 lines, hard rules + binding examples
+ *     only; for small/reasoning models that lose focus on a 200-line
+ *     wall of guidance.
+ *
+ * Few-shot helpers prepend short worked dialogues to the message history
+ * when the model profile requests them (see builderModelProfiles.js).
  */
 
-function buildSystemPrompt({ catalog, codeStepEnabled, userTimezone = 'Europe/Amsterdam', existingDraftSummary = null, webSearchEnabled = true, disabledMedia = {} }) {
+function renderCatalog(catalog) {
     const { describeShape } = require('./outputSchemas');
     const apps = (catalog?.apps || [])
         .filter(a => a.available && a.actions.length)
@@ -22,6 +28,27 @@ function buildSystemPrompt({ catalog, codeStepEnabled, userTimezone = 'Europe/Am
             return `### ${a.label} (${a.id})\n${actions}`;
         })
         .join('\n\n');
+    return apps;
+}
+
+function renderCatalogLean(catalog) {
+    // Strip output-shape annotations and action descriptions; small models
+    // get tripped up by the volume. Just list app:action names.
+    const apps = (catalog?.apps || [])
+        .filter(a => a.available && a.actions.length)
+        .map(a => {
+            const actions = a.actions
+                .slice(0, 20)
+                .map(act => `  - ${act.name}${act.sideEffect ? ' [side-effect]' : ''}`)
+                .join('\n');
+            return `### ${a.label} (${a.id})\n${actions}`;
+        })
+        .join('\n\n');
+    return apps;
+}
+
+function buildFullSystemPrompt({ catalog, codeStepEnabled, userTimezone = 'Europe/Amsterdam', existingDraftSummary = null, webSearchEnabled = true, disabledMedia = {} }) {
+    const apps = renderCatalog(catalog);
 
     return `You are the BeeFlow Automation Builder.
 
@@ -44,11 +71,7 @@ draft is a typed DAG of steps:
   wait             — pause for N seconds (1..86400)
   stop_error       — halt the run with a custom error message (template-interpolated)
   switch           — multi-way branch by case name (preferred over chained conditions)
-  filter           — keep array items matching expr (item.<field>) — output {items, count}
-  limit            — first/last N items of an array
-  dedupe           — remove duplicate items (optional keyField)
-  aggregate        — pull one field across items into a flat list — output {values}
-  summarize        — sum/count/avg/min/max over a numeric field of an array — output {result}
+  array_op         — filter/limit/dedupe/aggregate/summarize over an upstream array
 
 ## How you build (the canonical workflow)
 
@@ -222,4 +245,218 @@ ${existingDraftSummary ? '\n## Current draft\n\n' + existingDraftSummary + '\n' 
 Begin now.`;
 }
 
-module.exports = { buildSystemPrompt };
+/**
+ * Lean prompt for small / reasoning models. ~80 lines vs. the 220-line
+ * full prompt. Drops the long worked-examples and the Webpages section;
+ * keeps the hard rules and binding examples (those are why models drift).
+ *
+ * Use the few-shot helper to teach by example instead.
+ */
+function buildLeanSystemPrompt({ catalog, codeStepEnabled, userTimezone = 'Europe/Amsterdam', existingDraftSummary = null, webSearchEnabled = true, disabledMedia = {} }) {
+    const apps = renderCatalogLean(catalog);
+
+    return `You are the BeeFlow Automation Builder. Your only output channel is the structured \`builder_*\` tools — do NOT describe steps in prose, call the tool.
+
+## Workflow
+
+1. Call \`builder_propose_trigger\` first (kind: schedule | manual | webhook | app_event).
+2. Add steps with \`builder_add_action\`, \`builder_add_ai_step\`, \`builder_add_loop\`, \`builder_add_condition\`, \`builder_add_notification\`, \`builder_add_array_op\`.
+3. Call \`builder_summarise\` so the user can see the plan.
+4. Call \`builder_request_dry_run\` to test. Read errors. Fix and rerun.
+5. Call \`builder_finalize\` once the dry-run is clean.
+
+## Binding rules (the #1 source of errors)
+
+EVERY tool input value must be a binding object — never a bare string/number:
+
+  literal:   { kind: "literal", value: "label:Invoices" }
+  ref:       { kind: "ref", path: "trigger.output.from" }
+  template:  { kind: "template", value: "Re: {{trigger.output.subject}}" }
+  expr:      { kind: "expr", value: "item.priority === 'high'" }
+
+Ref paths MUST start with one of: \`trigger\`, \`steps\`, \`vars\`, \`secrets\`, \`loop\`.
+Field names alone (e.g. \`"from"\`, \`"subject"\`) are NOT valid paths — prepend \`trigger.output.\`.
+
+Gmail mail.new trigger exposes: \`messageId, threadId, from, to, cc, subject, snippet, labelIds, date\` — reference as \`trigger.output.<field>\`.
+
+When replying to a Gmail trigger, bind \`replyToMessageId: trigger.output.messageId\` on the \`gmail_compose\` step.
+
+## Hard rules
+
+- ${codeStepEnabled ? 'Code steps are available — use only when no integration fits.' : 'Code steps are DISABLED — never propose them.'}
+- NEVER invent tool names. Only use tools listed in the catalog below.
+- Reuse step ids returned by previous tool results for \`afterStepId\`, \`thenStepId\`, etc.
+- Side-effect actions (send email, create ticket, post message) are flagged automatically. The dry-run synthesises their output.
+- All times use timezone: ${userTimezone}.
+- Web search: ${webSearchEnabled ? 'ENABLED — you may propose `agent_search`' : 'DISABLED — avoid `agent_search` unless explicitly asked'}.
+${Object.entries(disabledMedia || {}).filter(([, v]) => v).map(([k]) => `- ${k} generation is disabled.`).join('\n')}
+
+## Catalog (the ONLY tools you may propose)
+
+${apps || '_(user has no integrations connected)_'}
+
+${existingDraftSummary ? '\n## Current draft\n\n' + existingDraftSummary + '\n' : ''}
+
+Begin now.`;
+}
+
+/**
+ * Few-shot messages prepended to the conversation when the model profile
+ * asks for them (small / mid / reasoning profiles set `fewShots: 1 or 2`).
+ *
+ * Each example is a short [user, assistant_with_tool_calls, tool_result]
+ * triplet that teaches a concrete tool-call sequence. Small models learn
+ * the binding format from these much faster than from a wall of prose.
+ *
+ * Returns an array of OpenAI-format messages suitable for splicing into
+ * the existing messages list right after the system prompt.
+ *
+ * The tool_call ids are sentinels (\`ex_*\`); applyToolCall is never called
+ * on them — they only exist to teach the protocol.
+ */
+function buildFewShotMessages(count = 0) {
+    if (count <= 0) return [];
+
+    const examples = [
+        // Example 1: a schedule trigger + AI step + notification.
+        // Demonstrates literal bindings, ref bindings, outputSchema.
+        [
+            { role: 'user', content: 'Every Monday at 9am, summarise unread emails labeled "invoices" and send me the summary.' },
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: [{
+                    id: 'ex_t1', type: 'function',
+                    function: {
+                        name: 'builder_propose_trigger',
+                        arguments: JSON.stringify({ kind: 'schedule', cron: '0 9 * * 1', tz: 'Europe/Amsterdam' }),
+                    },
+                }],
+            },
+            { role: 'tool', tool_call_id: 'ex_t1', content: JSON.stringify({ ok: true, trigger: { id: 'trg', kind: 'schedule' } }) },
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: [{
+                    id: 'ex_t2', type: 'function',
+                    function: {
+                        name: 'builder_add_action',
+                        arguments: JSON.stringify({
+                            tool: 'gmail_search',
+                            inputs: {
+                                q: { kind: 'literal', value: 'label:invoices is:unread newer_than:7d' },
+                                maxResults: { kind: 'literal', value: 50 },
+                            },
+                        }),
+                    },
+                }],
+            },
+            { role: 'tool', tool_call_id: 'ex_t2', content: JSON.stringify({ ok: true, stepId: 's_a1' }) },
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: [{
+                    id: 'ex_t3', type: 'function',
+                    function: {
+                        name: 'builder_add_ai_step',
+                        arguments: JSON.stringify({
+                            afterStepId: 's_a1',
+                            prompt: 'Summarise these invoice emails into a one-paragraph digest. Respond with JSON {"summary":"..."}.',
+                            outputSchema: { summary: 'string' },
+                            inputs: { messages: { kind: 'ref', path: 'steps.s_a1.output.messages' } },
+                        }),
+                    },
+                }],
+            },
+            { role: 'tool', tool_call_id: 'ex_t3', content: JSON.stringify({ ok: true, stepId: 's_ai' }) },
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: [{
+                    id: 'ex_t4', type: 'function',
+                    function: {
+                        name: 'builder_add_notification',
+                        arguments: JSON.stringify({
+                            afterStepId: 's_ai',
+                            title: { kind: 'literal', value: 'Weekly invoice digest' },
+                            body: { kind: 'ref', path: 'steps.s_ai.output.summary' },
+                        }),
+                    },
+                }],
+            },
+            { role: 'tool', tool_call_id: 'ex_t4', content: JSON.stringify({ ok: true, stepId: 's_n1' }) },
+        ],
+        // Example 2: an app_event trigger (Gmail) + reply via ai_step + compose.
+        // Demonstrates template bindings and replyToMessageId.
+        [
+            { role: 'user', content: 'When an email comes from boss@example.com, draft a polite acknowledgement and reply.' },
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: [{
+                    id: 'ex_u1', type: 'function',
+                    function: {
+                        name: 'builder_propose_trigger',
+                        arguments: JSON.stringify({
+                            kind: 'app_event',
+                            appProvider: 'gmail',
+                            appEvent: 'mail.new',
+                            filter: { from: 'boss@example.com', excludeFromSelf: true },
+                        }),
+                    },
+                }],
+            },
+            { role: 'tool', tool_call_id: 'ex_u1', content: JSON.stringify({ ok: true, trigger: { id: 'trg' } }) },
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: [{
+                    id: 'ex_u2', type: 'function',
+                    function: {
+                        name: 'builder_add_ai_step',
+                        arguments: JSON.stringify({
+                            prompt: 'Draft a polite acknowledgement to this email. Respond with JSON {"replyText":"..."}.',
+                            outputSchema: { replyText: 'string' },
+                            inputs: {
+                                from: { kind: 'ref', path: 'trigger.output.from' },
+                                subject: { kind: 'ref', path: 'trigger.output.subject' },
+                                snippet: { kind: 'ref', path: 'trigger.output.snippet' },
+                            },
+                        }),
+                    },
+                }],
+            },
+            { role: 'tool', tool_call_id: 'ex_u2', content: JSON.stringify({ ok: true, stepId: 's_ai' }) },
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: [{
+                    id: 'ex_u3', type: 'function',
+                    function: {
+                        name: 'builder_add_action',
+                        arguments: JSON.stringify({
+                            afterStepId: 's_ai',
+                            tool: 'gmail_compose',
+                            inputs: {
+                                replyToMessageId: { kind: 'ref', path: 'trigger.output.messageId' },
+                                body: { kind: 'ref', path: 'steps.s_ai.output.replyText' },
+                            },
+                        }),
+                    },
+                }],
+            },
+            { role: 'tool', tool_call_id: 'ex_u3', content: JSON.stringify({ ok: true, stepId: 's_send' }) },
+        ],
+    ];
+
+    return examples.slice(0, count).flat();
+}
+
+module.exports = {
+    buildFullSystemPrompt,
+    buildLeanSystemPrompt,
+    buildFewShotMessages,
+    // Backwards compatibility: callers that still import buildSystemPrompt
+    // get the full variant (current behaviour preserved exactly).
+    buildSystemPrompt: buildFullSystemPrompt,
+};

@@ -1,13 +1,13 @@
 /**
  * Compliance Store — AI Act & GDPR monitoring persistence.
  *
- * Tables (Phase 1 MVP):
- *   compliance_settings    org-wide onboarding answers (DPO, legal bases, residency, retention)
- *   compliance_checks      time-series check results (one row per check run)
- *   compliance_evidence    append-only audit trail (hash + payload)
- *
- * Phase 2 adds processing_activities, ai_risk_assessments;
- * Phase 3 adds data_subject_requests.
+ * Tables:
+ *   compliance_settings    org-wide onboarding answers (DPO, legal bases, residency,
+ *                          retention, SCC attestations, RoPA review timestamp,
+ *                          retention-job heartbeat).
+ *   compliance_checks      time-series check results (one row per check run).
+ *   compliance_evidence    append-only audit trail (sha256 hash + payload). Now
+ *                          written on every recordCheckResult via runner.
  */
 
 const { run, getOne, getAll, exec } = require('../db');
@@ -31,6 +31,12 @@ async function initDB() {
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         `);
+        // Additive columns introduced by Compliance Hub v2.
+        await exec(`ALTER TABLE compliance_settings ADD COLUMN IF NOT EXISTS scc_confirmed_operators JSONB DEFAULT '[]'::jsonb`).catch(() => {});
+        await exec(`ALTER TABLE compliance_settings ADD COLUMN IF NOT EXISTS ropa_reviewed_at TIMESTAMPTZ`).catch(() => {});
+        await exec(`ALTER TABLE compliance_settings ADD COLUMN IF NOT EXISTS ropa_reviewed_by TEXT`).catch(() => {});
+        await exec(`ALTER TABLE compliance_settings ADD COLUMN IF NOT EXISTS last_retention_run_at TIMESTAMPTZ`).catch(() => {});
+
         await exec(`
             CREATE TABLE IF NOT EXISTS compliance_checks (
                 id SERIAL PRIMARY KEY,
@@ -51,6 +57,8 @@ async function initDB() {
         await exec(`CREATE INDEX IF NOT EXISTS idx_compliance_checks_org_run ON compliance_checks(organization_id, run_at DESC)`);
         await exec(`CREATE INDEX IF NOT EXISTS idx_compliance_checks_check_id ON compliance_checks(organization_id, check_id, run_at DESC)`);
         await exec(`CREATE INDEX IF NOT EXISTS idx_compliance_checks_scope ON compliance_checks(scope_type, scope_id)`);
+        // Latest-per-(check, scope) lookups; underpins /overview perf.
+        await exec(`CREATE INDEX IF NOT EXISTS idx_compliance_checks_latest ON compliance_checks(organization_id, check_id, scope_type, scope_id, run_at DESC)`);
 
         await exec(`
             CREATE TABLE IF NOT EXISTS compliance_evidence (
@@ -65,6 +73,7 @@ async function initDB() {
             )
         `);
         await exec(`CREATE INDEX IF NOT EXISTS idx_compliance_evidence_org ON compliance_evidence(organization_id, captured_at DESC)`);
+        await exec(`CREATE INDEX IF NOT EXISTS idx_compliance_evidence_check ON compliance_evidence(organization_id, check_id, captured_at DESC)`);
     })();
     return _initPromise;
 }
@@ -74,33 +83,36 @@ console.log('[ComplianceStore] Initialized (PostgreSQL)');
 
 // ───────────────────────── Settings ─────────────────────────
 
+const _EMPTY_SETTINGS = (orgId) => ({
+    organization_id: orgId || 'default',
+    dpo_name: null, dpo_email: null, dpo_phone: null,
+    legal_bases: [], data_residency: 'eu',
+    breach_recipients: [], default_retention_days: null,
+    privacy_notice_url: null, onboarded_at: null,
+    scc_confirmed_operators: [],
+    ropa_reviewed_at: null, ropa_reviewed_by: null,
+    last_retention_run_at: null,
+});
+
 async function getSettings(orgId) {
     await initDB();
     const row = await getOne(`SELECT * FROM compliance_settings WHERE organization_id = $1`, [orgId || 'default']);
-    if (!row) {
-        return {
-            organization_id: orgId || 'default',
-            dpo_name: null, dpo_email: null, dpo_phone: null,
-            legal_bases: [], data_residency: 'eu',
-            breach_recipients: [], default_retention_days: null,
-            privacy_notice_url: null, onboarded_at: null,
-        };
-    }
+    if (!row) return _EMPTY_SETTINGS(orgId);
     return row;
 }
 
 async function saveSettings(orgId, patch) {
     await initDB();
-    const existing = await getOne(`SELECT organization_id FROM compliance_settings WHERE organization_id = $1`, [orgId]);
+    const existing = await getOne(`SELECT * FROM compliance_settings WHERE organization_id = $1`, [orgId]);
     const safe = {
-        dpo_name: patch.dpo_name ?? null,
-        dpo_email: patch.dpo_email ?? null,
-        dpo_phone: patch.dpo_phone ?? null,
-        legal_bases: JSON.stringify(patch.legal_bases ?? []),
-        data_residency: patch.data_residency ?? 'eu',
-        breach_recipients: JSON.stringify(patch.breach_recipients ?? []),
-        default_retention_days: patch.default_retention_days ?? null,
-        privacy_notice_url: patch.privacy_notice_url ?? null,
+        dpo_name: patch.dpo_name ?? existing?.dpo_name ?? null,
+        dpo_email: patch.dpo_email ?? existing?.dpo_email ?? null,
+        dpo_phone: patch.dpo_phone ?? existing?.dpo_phone ?? null,
+        legal_bases: JSON.stringify(patch.legal_bases ?? existing?.legal_bases ?? []),
+        data_residency: patch.data_residency ?? existing?.data_residency ?? 'eu',
+        breach_recipients: JSON.stringify(patch.breach_recipients ?? existing?.breach_recipients ?? []),
+        default_retention_days: patch.default_retention_days ?? existing?.default_retention_days ?? null,
+        privacy_notice_url: patch.privacy_notice_url ?? existing?.privacy_notice_url ?? null,
         onboarded_at: patch.onboarded_at ?? null,
     };
     if (existing) {
@@ -134,6 +146,54 @@ async function markOnboarded(orgId) {
     await run(`
         UPDATE compliance_settings SET onboarded_at = NOW(), updated_at = NOW()
         WHERE organization_id = $1 AND onboarded_at IS NULL
+    `, [orgId]);
+}
+
+// ───────────────────────── SCC attestation ─────────────────────────
+//
+// Admins confirm that Standard Contractual Clauses are in place for a given
+// processor (operator name as it appears in integration_activity_log.operator).
+// Each entry stores who attested and when so it is auditable via the evidence
+// chain. Removing an operator does NOT delete prior evidence rows.
+
+async function setSccConfirmed(orgId, operator, confirmed, attestedBy) {
+    await initDB();
+    const existing = await getSettings(orgId);
+    const list = Array.isArray(existing.scc_confirmed_operators) ? existing.scc_confirmed_operators : [];
+    const filtered = list.filter(e => (e?.operator || '').toLowerCase() !== String(operator).toLowerCase());
+    const next = confirmed
+        ? [...filtered, { operator, attested_by: attestedBy || null, attested_at: new Date().toISOString() }]
+        : filtered;
+    await run(`
+        INSERT INTO compliance_settings (organization_id, scc_confirmed_operators, updated_at)
+        VALUES ($1, $2::jsonb, NOW())
+        ON CONFLICT (organization_id)
+        DO UPDATE SET scc_confirmed_operators = EXCLUDED.scc_confirmed_operators, updated_at = NOW()
+    `, [orgId, JSON.stringify(next)]);
+    return next;
+}
+
+// ───────────────────────── RoPA review ─────────────────────────
+
+async function markRopaReviewed(orgId, reviewerId) {
+    await initDB();
+    await run(`
+        INSERT INTO compliance_settings (organization_id, ropa_reviewed_at, ropa_reviewed_by, updated_at)
+        VALUES ($1, NOW(), $2, NOW())
+        ON CONFLICT (organization_id)
+        DO UPDATE SET ropa_reviewed_at = NOW(), ropa_reviewed_by = $2, updated_at = NOW()
+    `, [orgId, reviewerId || null]);
+}
+
+// ───────────────────────── Retention enforcer heartbeat ─────────────────────────
+
+async function markRetentionRun(orgId) {
+    await initDB();
+    await run(`
+        INSERT INTO compliance_settings (organization_id, last_retention_run_at, updated_at)
+        VALUES ($1, NOW(), NOW())
+        ON CONFLICT (organization_id)
+        DO UPDATE SET last_retention_run_at = NOW(), updated_at = NOW()
     `, [orgId]);
 }
 
@@ -202,13 +262,28 @@ async function addEvidence(row) {
     ]);
 }
 
+async function getEvidenceHistory(orgId, checkId, limit = 100) {
+    await initDB();
+    return getAll(`
+        SELECT id, check_id, subject_type, subject_id, captured_at, hash, payload
+        FROM compliance_evidence
+        WHERE organization_id = $1 AND check_id = $2
+        ORDER BY captured_at DESC
+        LIMIT $3
+    `, [orgId, checkId, limit]);
+}
+
 module.exports = {
     initDB,
     getSettings,
     saveSettings,
     markOnboarded,
+    setSccConfirmed,
+    markRopaReviewed,
+    markRetentionRun,
     recordCheckResult,
     getLatestPerCheck,
     getCheckHistory,
     addEvidence,
+    getEvidenceHistory,
 };

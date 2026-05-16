@@ -146,7 +146,7 @@ async function ensureOrgAdminUser(org, { ncAdminEmail, ncAdminUid, ncAdminDispla
     let user = await userStore.getUserByEmail(ncAdminEmail);
     if (!user) {
         const userId = `nc_${org.id}_${slugify(ncAdminUid)}`;
-        await userStore.createUser({
+        const r = await userStore.createUserWithSeatCheck({
             id: userId,
             username: ncAdminEmail,
             email: ncAdminEmail,
@@ -158,7 +158,11 @@ async function ensureOrgAdminUser(org, { ncAdminEmail, ncAdminUid, ncAdminDispla
             provider: 'nextcloud_connector',
             autoProvisioned: true,
             status: 'active',
-        });
+        }, { strict: false });
+        if (!r.created) {
+            console.warn(`[connectorBootstrap] could not create NC admin for org=${org.id} reason=${r.reason}`);
+            return null;
+        }
         return await userStore.getUser(userId);
     }
     if (user.organizationId && user.organizationId !== org.id) {

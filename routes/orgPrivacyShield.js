@@ -285,16 +285,35 @@ router.get('/:orgId/effective', requireAuth, async (req, res) => {
 //  User-level Privacy Shield (Consumer Accounts)
 // ═══════════════════════════════════════
 
+const USER_SHIELD_DEFAULTS = {
+    enabled: false,
+    euModeEnabled: false,
+    disableSearchOnUpload: false,
+    piiDetectionEnabled: false,
+    piiDetectionCategories: [],
+    piiDetectionConfidenceThreshold: 0.7,
+    piiDetectionAction: 'tokenize',
+    showRawPayload: false,
+};
+
 // GET /user/me — get user-level shield config (consumer accounts)
 router.get('/user/me', requireAuth, async (req, res) => {
     try {
         const userId = req.session.user.id;
-        const config = await configStore.getConfig(`user_privacy_shield_${userId}`) || {
-            enabled: false,
-            euModeEnabled: false,
-            disableSearchOnUpload: false,
-        };
-        res.json(config);
+        const stored = await configStore.getConfig(`user_privacy_shield_${userId}`);
+        if (stored) {
+            return res.json({ ...USER_SHIELD_DEFAULTS, ...stored });
+        }
+        // Legacy migration: users who turned on EU mode through the
+        // (now-removed) Startup Agent toggle had it written to
+        // `user_eu_mode_${userId}`. Surface that as enabled+euModeEnabled
+        // so the new panel reflects their existing preference; the next
+        // Save through the panel persists into the canonical key.
+        const legacyEu = await configStore.getConfig(`user_eu_mode_${userId}`);
+        if (legacyEu === true) {
+            return res.json({ ...USER_SHIELD_DEFAULTS, enabled: true, euModeEnabled: true });
+        }
+        res.json({ ...USER_SHIELD_DEFAULTS });
     } catch (e) {
         console.error('[UserPrivacyShield] GET error:', e);
         res.status(500).json({ error: e.message });
@@ -305,11 +324,26 @@ router.get('/user/me', requireAuth, async (req, res) => {
 router.put('/user/me', requireAuth, async (req, res) => {
     try {
         const userId = req.session.user.id;
-        const { enabled, euModeEnabled, disableSearchOnUpload } = req.body;
+        const {
+            enabled, euModeEnabled, disableSearchOnUpload,
+            piiDetectionEnabled, piiDetectionCategories,
+            piiDetectionConfidenceThreshold, piiDetectionAction,
+            showRawPayload,
+        } = req.body;
+
+        const threshold = typeof piiDetectionConfidenceThreshold === 'number'
+            ? Math.max(0.1, Math.min(1, piiDetectionConfidenceThreshold))
+            : 0.7;
+
         const config = {
             enabled: !!enabled,
             euModeEnabled: !!euModeEnabled,
             disableSearchOnUpload: !!disableSearchOnUpload,
+            piiDetectionEnabled: !!piiDetectionEnabled,
+            piiDetectionCategories: Array.isArray(piiDetectionCategories) ? piiDetectionCategories : [],
+            piiDetectionConfidenceThreshold: threshold,
+            piiDetectionAction: ['block', 'tokenize'].includes(piiDetectionAction) ? piiDetectionAction : 'tokenize',
+            showRawPayload: !!showRawPayload,
             updatedAt: new Date().toISOString(),
             updatedBy: userId,
         };

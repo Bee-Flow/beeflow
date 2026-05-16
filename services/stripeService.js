@@ -130,6 +130,123 @@ async function syncPlanToStripe(plan) {
 }
 
 /**
+ * Ensure the global PAYG Billing Meter exists. Used by every pay-as-you-go
+ * Price as their `recurring.meter` reference. Idempotent — looks up the
+ * cached ID from configStore first; if missing or stripe returns
+ * `resource_missing`, creates a fresh one and caches both the meter id and
+ * its event name so the runtime hot path (usageStore.logUsage) can post
+ * meter events without an extra Stripe round-trip.
+ */
+async function ensurePaygMeter() {
+    const stripe = await getClient();
+    const cachedId = await configStore.getConfig('stripe_payg_meter_id');
+    if (cachedId) {
+        try { return await stripe.billing.meters.retrieve(cachedId); }
+        catch (err) {
+            if (err.code !== 'resource_missing') throw err;
+            // fall through to recreate
+        }
+    }
+    const meter = await stripe.billing.meters.create({
+        display_name: 'BeeFlow PAYG usage',
+        event_name: 'beeflow_payg_usage',
+        default_aggregation: { formula: 'sum' },
+        customer_mapping: { type: 'by_id', event_payload_key: 'stripe_customer_id' },
+        value_settings: { event_payload_key: 'value' },
+    });
+    await configStore.setConfig('stripe_payg_meter_id', meter.id);
+    await configStore.setConfig('stripe_payg_meter_event_name', meter.event_name);
+    return meter;
+}
+
+/**
+ * Sync a PAYG (metered) plan to Stripe — parallel to syncPlanToStripe.
+ * Creates / updates the Product, ensures the global meter, then creates a
+ * metered Price priced at 1 micro-unit of the plan's currency per meter
+ * unit. The caller (subscriptions.js) persists meterId / meterEventName
+ * onto the plan row alongside stripe_product_id / stripe_price_id.
+ */
+async function syncPaygPlanToStripe(plan) {
+    const stripe = await getClient();
+
+    const productData = {
+        name: plan.name,
+        description: plan.description || `BeeFlow ${plan.name} Plan (Pay-as-you-go)`,
+        metadata: {
+            beeflow_plan_id: plan.id,
+            beeflow_billing_model: 'metered',
+            beeflow_markup_percent: String(plan.markup_percent ?? 0),
+        },
+    };
+
+    let product;
+    if (plan.stripe_product_id) {
+        try {
+            product = await stripe.products.update(plan.stripe_product_id, productData);
+        } catch (err) {
+            if (err.code === 'resource_missing') product = await stripe.products.create(productData);
+            else throw err;
+        }
+    } else {
+        product = await stripe.products.create(productData);
+    }
+
+    const meter = await ensurePaygMeter();
+
+    const priceData = {
+        product: product.id,
+        currency: (plan.currency || 'eur').toLowerCase(),
+        billing_scheme: 'per_unit',
+        // 1 micro-unit of currency per meter unit. logUsage reports
+        // marked-up cost * 1_000_000, so 1.00 EUR worth of usage = 1_000_000
+        // meter units = 1.00 EUR billed.
+        unit_amount_decimal: '0.000001',
+        recurring: {
+            interval: plan.billing_interval === 'yearly' ? 'year' : 'month',
+            usage_type: 'metered',
+            meter: meter.id,
+        },
+        metadata: { beeflow_plan_id: plan.id, beeflow_billing_model: 'metered' },
+    };
+
+    const taxEnabled = await configStore.getConfig('stripe_tax_enabled');
+    if (taxEnabled) priceData.tax_behavior = 'exclusive';
+
+    const price = await stripe.prices.create(priceData);
+
+    // Archive the previous metered price if it differs.
+    if (plan.stripe_price_id && plan.stripe_price_id !== price.id) {
+        try { await stripe.prices.update(plan.stripe_price_id, { active: false }); }
+        catch { /* already archived */ }
+    }
+    await stripe.products.update(product.id, { default_price: price.id });
+
+    return { productId: product.id, priceId: price.id, meterId: meter.id, meterEventName: meter.event_name };
+}
+
+/**
+ * Push a usage event to the PAYG meter. Called fire-and-forget from
+ * usageStore.logUsage after each AI call.
+ *
+ * `amountMicroUnits` is the marked-up cost expressed in micro-units of the
+ * plan's currency (cost * 1_000_000, rounded). `identifier` is the
+ * ai_usage_log row id — Stripe uses it for 24h idempotency so accidental
+ * double-fires don't double-bill.
+ */
+async function reportPaygUsage({ stripeCustomerId, amountMicroUnits, identifier, eventName }) {
+    const stripe = await getClient();
+    return stripe.billing.meterEvents.create({
+        event_name: eventName,
+        identifier,
+        timestamp: Math.floor(Date.now() / 1000),
+        payload: {
+            stripe_customer_id: stripeCustomerId,
+            value: String(amountMicroUnits),
+        },
+    });
+}
+
+/**
  * Create a Stripe Checkout Session for a plan.
  * Supports both organization and consumer subscriptions.
  * 
@@ -201,6 +318,70 @@ async function createCheckoutSession({ plan, orgId, orgName, userId, subscriberT
     sessionParams.allow_promotion_codes = true;
 
     return stripe.checkout.sessions.create(sessionParams);
+}
+
+/**
+ * Create a Stripe Subscription directly with a trial period, without
+ * collecting a payment method up front. Used by the admin "Start Trial"
+ * flow so trials can be granted to an org/user without making them
+ * complete a Checkout first.
+ *
+ * If no payment method is added before the trial ends, Stripe will
+ * auto-cancel the subscription (`missing_payment_method: 'cancel'`).
+ *
+ * @param {object} options
+ * @param {object} options.plan - BeeFlow plan (must have stripe_price_id)
+ * @param {'organization'|'consumer'} options.subscriberType
+ * @param {string} options.subscriberId - org id or user id
+ * @param {string} [options.orgName] - used as customer.name when org
+ * @param {string} [options.userEmail] - used as customer.email
+ * @param {string} [options.stripeCustomerId] - reuse if already exists
+ * @param {number} options.trialDays
+ * @returns {{ stripeCustomerId: string, stripeSubscriptionId: string, trialEnd: string|null, status: string }}
+ */
+async function createTrialSubscription({ plan, subscriberType, subscriberId, orgName, userEmail, stripeCustomerId, trialDays }) {
+    const stripe = await getClient();
+
+    if (!plan.stripe_price_id) {
+        throw new Error('Plan has not been synced to Stripe yet. Sync the plan before starting a trial.');
+    }
+    if (!trialDays || trialDays <= 0) {
+        throw new Error('Plan has no trial_days configured.');
+    }
+
+    const metadata = {
+        beeflow_plan_id: plan.id,
+        beeflow_subscriber_type: subscriberType,
+    };
+    if (subscriberType === 'consumer') metadata.beeflow_user_id = subscriberId;
+    else metadata.beeflow_org_id = subscriberId;
+
+    let customerId = stripeCustomerId || null;
+    if (!customerId) {
+        const customer = await stripe.customers.create({
+            email: userEmail || undefined,
+            name: orgName || undefined,
+            metadata,
+        });
+        customerId = customer.id;
+    }
+
+    const subscription = await stripe.subscriptions.create({
+        customer: customerId,
+        items: [{ price: plan.stripe_price_id }],
+        trial_period_days: trialDays,
+        trial_settings: { end_behavior: { missing_payment_method: 'cancel' } },
+        payment_behavior: 'default_incomplete',
+        payment_settings: { save_default_payment_method: 'on_subscription' },
+        metadata,
+    });
+
+    return {
+        stripeCustomerId: customerId,
+        stripeSubscriptionId: subscription.id,
+        trialEnd: subscription.trial_end ? new Date(subscription.trial_end * 1000).toISOString() : null,
+        status: subscription.status,
+    };
 }
 
 /**
@@ -371,7 +552,11 @@ module.exports = {
     isEnabled,
     isTestMode,
     syncPlanToStripe,
+    ensurePaygMeter,
+    syncPaygPlanToStripe,
+    reportPaygUsage,
     createCheckoutSession,
+    createTrialSubscription,
     createPortalSession,
     constructWebhookEvent,
     createPromoCode,

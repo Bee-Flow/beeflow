@@ -78,6 +78,7 @@ async function upsertLicense({
     if (scope === 'consumer' && !userId) {
         throw new Error('upsertLicense: userId required for consumer scope');
     }
+    // scope='server' has no id binding — admin-issued exportable blob only.
 
     // Mark previous active licenses for this scope target as superseded.
     if (scope === 'organization') {
@@ -86,13 +87,15 @@ async function upsertLicense({
              WHERE organization_id = $1 AND id != $2 AND refresh_status NOT IN ('expired', 'revoked')`,
             [organizationId, licenseId]
         );
-    } else {
+    } else if (scope === 'consumer') {
         await run(
             `UPDATE license_keys SET refresh_status = 'expired', updated_at = NOW()
              WHERE user_id = $1 AND id != $2 AND refresh_status NOT IN ('expired', 'revoked')`,
             [userId, licenseId]
         );
     }
+    // No supersede sweep for scope='server' — server-scope rows are exportable
+    // artefacts, not the active license on this install.
 
     // Upsert by primary key. Newly activated licenses start as 'active' —
     // the RS256 signature is the proof of validity. The refresh scheduler
@@ -123,8 +126,11 @@ async function upsertLicense({
         ]
     );
 
-    await logLicenseAudit('license_activated', scope === 'organization' ? organizationId : userId, activatedBy, null, {
-        license_id: licenseId, tier, billing_interval: billingInterval, expires_at: expiresAt,
+    const auditTarget = scope === 'organization' ? organizationId
+        : scope === 'consumer' ? userId
+        : null; // server-scope: no binding target
+    await logLicenseAudit('license_activated', auditTarget, activatedBy, null, {
+        license_id: licenseId, scope, tier, billing_interval: billingInterval, expires_at: expiresAt,
     });
 
     return getLicenseById(licenseId);
@@ -254,6 +260,21 @@ async function markRevoked(licenseId, reason = null) {
         [licenseId]
     );
     await logLicenseAudit('license_revoked', lic.organizationId || lic.userId, null, null, { license_id: licenseId, reason });
+
+    // Session bust: without this, existing cookies still validate for up to
+    // 30 days. Tier resolution would catch the revocation on the next
+    // request, but the user remains technically authenticated. Forcing a
+    // re-login closes that window and matches the operator's intent.
+    try {
+        const { bustSessionsForOrg, bustSessionsForUser } = require('../auth/sessionCache');
+        if (lic.scope === 'organization' && lic.organizationId) {
+            await bustSessionsForOrg(lic.organizationId);
+        } else if (lic.scope === 'consumer' && lic.userId) {
+            await bustSessionsForUser(lic.userId);
+        }
+    } catch (e) {
+        console.warn('[License Store] markRevoked session bust failed:', e.message);
+    }
 }
 
 /**

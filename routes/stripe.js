@@ -224,7 +224,16 @@ router.post('/webhook', async (req, res) => {
         return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    console.log(`[Stripe Webhook] Received event: ${event.type} (${event.id})`);
+    // Idempotency: Stripe retries on 5xx/timeout, so we record event.id and
+    // skip duplicates. Insert wins → first delivery, conflict → already
+    // processed. We always return 200 so Stripe stops retrying.
+    const firstTime = await userStore.recordStripeEventProcessed(event.id, event.type);
+    if (!firstTime) {
+        console.log(`[Stripe Webhook] stripe.webhook.duplicate event_id=${event.id} type=${event.type}`);
+        return res.json({ received: true, duplicate: true });
+    }
+
+    console.log(`[Stripe Webhook] event_id=${event.id} type=${event.type}`);
 
     try {
         switch (event.type) {
@@ -240,6 +249,10 @@ router.post('/webhook', async (req, res) => {
                 await handleSubscriptionDeleted(event.data.object);
                 break;
 
+            case 'customer.subscription.trial_will_end':
+                await handleTrialWillEnd(event.data.object);
+                break;
+
             case 'invoice.paid':
                 await handleInvoicePaid(event.data.object);
                 break;
@@ -248,8 +261,20 @@ router.post('/webhook', async (req, res) => {
                 await handleInvoicePaymentFailed(event.data.object);
                 break;
 
+            case 'charge.refunded':
+                await handleChargeRefunded(event.data.object);
+                break;
+
+            case 'charge.dispute.created':
+                await handleChargeDisputeCreated(event.data.object);
+                break;
+
+            case 'customer.deleted':
+                await handleCustomerDeleted(event.data.object);
+                break;
+
             default:
-                console.log(`[Stripe Webhook] Unhandled event type: ${event.type}`);
+                console.log(`[Stripe Webhook] stripe.webhook.unhandled type=${event.type} event_id=${event.id}`);
         }
     } catch (err) {
         console.error(`[Stripe Webhook] Error handling ${event.type}:`, err);
@@ -321,7 +346,18 @@ async function handleCheckoutCompleted(session) {
             console.error(`[Stripe Webhook] ✗ Failed to assign consumer subscription to user ${userId}`);
         }
     } else {
-        const orgId = session.metadata?.beeflow_org_id || session.client_reference_id;
+        const metaOrgId = session.metadata?.beeflow_org_id || null;
+        const refOrgId = session.client_reference_id || null;
+        // Defence in depth: if both signals are present and disagree, refuse
+        // to assign the subscription. A mismatched metadata.beeflow_org_id
+        // could indicate a tampered checkout (e.g. crafted Stripe session
+        // with a different org's id) — better to fail loudly + audit.
+        if (metaOrgId && refOrgId && metaOrgId !== refOrgId) {
+            console.error(`[Stripe Webhook] stripe.checkout.metadata_mismatch ref=${refOrgId} meta=${metaOrgId} session_id=${session.id}`);
+            await userStore.logSubscriptionAudit('checkout_metadata_mismatch', 'organization', metaOrgId, 'stripe_webhook', null, { client_reference_id: refOrgId, metadata_org_id: metaOrgId, session_id: session.id });
+            return;
+        }
+        const orgId = metaOrgId || refOrgId;
         if (!orgId) {
             console.error('[Stripe Webhook] checkout.session.completed (org) missing org ID');
             return;
@@ -374,12 +410,14 @@ async function issueLicenseFromPlan({ scope, organizationId, userId, planId, ses
 async function handleSubscriptionUpdated(subscription) {
     const subscriberType = getSubscriberType(subscription.metadata);
 
+    // past_due no longer collapses to 'active' — customers behind on payments
+    // surface as past_due so dunning + cron suspension can take effect.
     const statusMap = {
         active: 'active',
-        past_due: 'active', // Keep active but flag payment status
-        trialing: 'active',
-        paused: 'suspended',
-        incomplete: 'active',
+        past_due: 'past_due',
+        trialing: 'trialing',
+        paused: 'paused',
+        incomplete: 'incomplete',
         incomplete_expired: 'cancelled',
         canceled: 'cancelled',
         unpaid: 'suspended',
@@ -402,13 +440,18 @@ async function handleSubscriptionUpdated(subscription) {
         stripe_subscription_id: subscription.id,
     };
 
-    // If plan changed, try to find the matching BeeFlow plan
+    // If plan changed, try to find the matching BeeFlow plan. Unmatched
+    // Stripe price ids are logged + audited rather than silently nulled —
+    // otherwise an unknown price leaves the local subscription orphaned.
     const priceId = subscription.items?.data?.[0]?.price?.id;
+    let planUnmatched = false;
     if (priceId) {
         const allPlans = await userStore.getAllPlans();
         const matchingPlan = allPlans.find(p => p.stripe_price_id === priceId);
         if (matchingPlan) {
             updateData.plan_id = matchingPlan.id;
+        } else {
+            planUnmatched = true;
         }
     }
 
@@ -423,19 +466,173 @@ async function handleSubscriptionUpdated(subscription) {
             console.warn('[Stripe Webhook] subscription.updated (consumer) missing beeflow_user_id');
             return;
         }
-        await userStore.setConsumerSubscription(userId, updateData);
-        await userStore.logSubscriptionAudit('update_subscription', 'consumer', userId, 'stripe_webhook', null, { stripe_status: subscription.status, beeflow_status: updateData.status });
-        console.log(`[Stripe Webhook] Consumer subscription updated for user ${userId}: ${subscription.status} → ${updateData.status}`);
+        const existing = await userStore.getConsumerSubscription(userId);
+        const override = userStore.isManualOverrideActive(existing);
+        const safeUpdate = override ? stripOverriddenFields(updateData) : updateData;
+        await userStore.setConsumerSubscription(userId, safeUpdate);
+        await userStore.logSubscriptionAudit('update_subscription', 'consumer', userId, 'stripe_webhook', null, { stripe_status: subscription.status, beeflow_status: safeUpdate.status, override_respected: override });
+        if (override) {
+            console.log(`[Stripe Webhook] stripe.webhook.override_respected scope=consumer user=${userId} until=${existing.manual_override_until} stripe_status=${subscription.status}`);
+            await userStore.logSubscriptionAudit('manual_override_respected', 'consumer', userId, 'stripe_webhook', null, { stripe_status: subscription.status, until: existing.manual_override_until });
+        }
+        if (planUnmatched) {
+            console.warn(`[Stripe Webhook] stripe.plan.unmatched scope=consumer user=${userId} price_id=${priceId} sub_id=${subscription.id}`);
+            await userStore.logSubscriptionAudit('plan_unmatched', 'consumer', userId, 'stripe_webhook', null, { price_id: priceId, sub_id: subscription.id });
+        }
+        console.log(`[Stripe Webhook] Consumer subscription updated for user ${userId}: ${subscription.status} → ${safeUpdate.status || '(unchanged)'}`);
     } else {
         const orgId = subscription.metadata?.beeflow_org_id;
         if (!orgId) {
             console.warn('[Stripe Webhook] subscription.updated (org) missing beeflow_org_id');
             return;
         }
-        await userStore.setOrgSubscription(orgId, updateData);
-        await userStore.logSubscriptionAudit('update_subscription', 'organization', orgId, 'stripe_webhook', null, { stripe_status: subscription.status, beeflow_status: updateData.status });
-        console.log(`[Stripe Webhook] Subscription updated for org ${orgId}: ${subscription.status} → ${updateData.status}`);
+        const existing = await userStore.getOrgSubscription(orgId);
+        const override = userStore.isManualOverrideActive(existing);
+        const safeUpdate = override ? stripOverriddenFields(updateData) : updateData;
+        await userStore.setOrgSubscription(orgId, safeUpdate);
+        await userStore.logSubscriptionAudit('update_subscription', 'organization', orgId, 'stripe_webhook', null, { stripe_status: subscription.status, beeflow_status: safeUpdate.status, override_respected: override });
+        if (override) {
+            console.log(`[Stripe Webhook] stripe.webhook.override_respected scope=org org=${orgId} until=${existing.manual_override_until} stripe_status=${subscription.status}`);
+            await userStore.logSubscriptionAudit('manual_override_respected', 'organization', orgId, 'stripe_webhook', null, { stripe_status: subscription.status, until: existing.manual_override_until });
+        }
+        if (planUnmatched) {
+            console.warn(`[Stripe Webhook] stripe.plan.unmatched scope=org org=${orgId} price_id=${priceId} sub_id=${subscription.id}`);
+            await userStore.logSubscriptionAudit('plan_unmatched', 'organization', orgId, 'stripe_webhook', null, { price_id: priceId, sub_id: subscription.id });
+        }
+        console.log(`[Stripe Webhook] Subscription updated for org ${orgId}: ${subscription.status} → ${safeUpdate.status || '(unchanged)'}`);
     }
+}
+
+// When a manual override is active, the webhook still writes Stripe-side
+// metadata (subscription_id, trial_end_date) but **must not** touch the
+// admin-controlled fields. Returns a shallow copy with status/plan_id/
+// payment_status stripped.
+function stripOverriddenFields(updateData) {
+    const out = { ...updateData };
+    delete out.status;
+    delete out.plan_id;
+    delete out.payment_status;
+    return out;
+}
+
+/**
+ * customer.subscription.trial_will_end — Stripe pings ~3 days before the trial
+ * ends. We persist an audit row so the daily notifications cron in Wave 4 can
+ * pick this up and email the customer. No email here yet (deferred).
+ */
+async function handleTrialWillEnd(subscription) {
+    const subscriberType = getSubscriberType(subscription.metadata);
+    const trialEndIso = subscription.trial_end ? new Date(subscription.trial_end * 1000).toISOString() : null;
+    if (subscriberType === 'consumer') {
+        const userId = subscription.metadata?.beeflow_user_id;
+        if (!userId) return;
+        await userStore.logSubscriptionAudit('trial_will_end', 'consumer', userId, 'stripe_webhook', null, { trial_end: trialEndIso, sub_id: subscription.id });
+        console.log(`[Stripe Webhook] stripe.trial.will_end scope=consumer user=${userId} trial_end=${trialEndIso}`);
+    } else {
+        const orgId = subscription.metadata?.beeflow_org_id;
+        if (!orgId) return;
+        await userStore.logSubscriptionAudit('trial_will_end', 'organization', orgId, 'stripe_webhook', null, { trial_end: trialEndIso, sub_id: subscription.id });
+        console.log(`[Stripe Webhook] stripe.trial.will_end scope=org org=${orgId} trial_end=${trialEndIso}`);
+    }
+}
+
+/**
+ * charge.refunded — flip the subscription's payment_status to 'refunded'.
+ * Match by stripe_subscription_id on the charge's invoice → subscription
+ * link, falling back to stripe_customer_id.
+ */
+async function handleChargeRefunded(charge) {
+    const subId = charge.invoice ? null : charge.subscription || null;
+    // charge.invoice is the typical path; resolve via stripe_subscription_id
+    // on the invoice. If we have no link, fall back to the customer.
+    let target = null;
+    if (subId) {
+        target = await findSubscriptionTargetBySubId(subId);
+    }
+    if (!target && charge.customer) {
+        target = await userStore.findSubscriptionByStripeCustomerId(charge.customer);
+    }
+    if (!target) {
+        console.warn(`[Stripe Webhook] charge.refunded could not locate subscription charge_id=${charge.id}`);
+        return;
+    }
+    const payload = { payment_status: 'refunded' };
+    if (target.scope === 'organization') {
+        await userStore.setOrgSubscription(target.id, payload);
+        await userStore.logSubscriptionAudit('refund_processed', 'organization', target.id, 'stripe_webhook', null, { charge_id: charge.id, amount_refunded: charge.amount_refunded });
+        console.log(`[Stripe Webhook] stripe.refund.processed scope=org org=${target.id} amount=${charge.amount_refunded}`);
+    } else {
+        await userStore.setConsumerSubscription(target.id, payload);
+        await userStore.logSubscriptionAudit('refund_processed', 'consumer', target.id, 'stripe_webhook', null, { charge_id: charge.id, amount_refunded: charge.amount_refunded });
+        console.log(`[Stripe Webhook] stripe.refund.processed scope=consumer user=${target.id} amount=${charge.amount_refunded}`);
+    }
+}
+
+/**
+ * charge.dispute.created — a chargeback was opened. Suspend the subscription
+ * defensively; restoration requires manual intervention after the dispute
+ * resolves.
+ */
+async function handleChargeDisputeCreated(dispute) {
+    let target = null;
+    if (dispute.charge) {
+        try {
+            const stripe = await stripeService.getClient();
+            const charge = await stripe.charges.retrieve(dispute.charge);
+            if (charge.customer) {
+                target = await userStore.findSubscriptionByStripeCustomerId(charge.customer);
+            }
+        } catch (e) {
+            console.warn('[Stripe Webhook] dispute charge retrieve failed:', e.message);
+        }
+    }
+    if (!target && dispute.customer) {
+        target = await userStore.findSubscriptionByStripeCustomerId(dispute.customer);
+    }
+    if (!target) {
+        console.warn(`[Stripe Webhook] charge.dispute.created could not locate subscription dispute_id=${dispute.id}`);
+        return;
+    }
+    const payload = { status: 'suspended', payment_status: 'disputed' };
+    if (target.scope === 'organization') {
+        await userStore.setOrgSubscription(target.id, payload);
+        await userStore.logSubscriptionAudit('dispute_opened', 'organization', target.id, 'stripe_webhook', null, { dispute_id: dispute.id, reason: dispute.reason, amount: dispute.amount });
+        console.log(`[Stripe Webhook] stripe.dispute.opened scope=org org=${target.id} dispute_id=${dispute.id} reason=${dispute.reason}`);
+    } else {
+        await userStore.setConsumerSubscription(target.id, payload);
+        await userStore.logSubscriptionAudit('dispute_opened', 'consumer', target.id, 'stripe_webhook', null, { dispute_id: dispute.id, reason: dispute.reason, amount: dispute.amount });
+        console.log(`[Stripe Webhook] stripe.dispute.opened scope=consumer user=${target.id} dispute_id=${dispute.id} reason=${dispute.reason}`);
+    }
+}
+
+/**
+ * customer.deleted — Stripe customer was removed (rare; usually triggered
+ * manually by an admin). Null the local stripe_customer_id so the next
+ * checkout creates a fresh customer instead of failing on an invalid id.
+ */
+async function handleCustomerDeleted(customer) {
+    const target = await userStore.findSubscriptionByStripeCustomerId(customer.id);
+    if (!target) return;
+    if (target.scope === 'organization') {
+        await userStore.clearStripeCustomerIdForOrg(target.id);
+        await userStore.logSubscriptionAudit('stripe_customer_deleted', 'organization', target.id, 'stripe_webhook', null, { stripe_customer_id: customer.id });
+        console.log(`[Stripe Webhook] stripe.customer.deleted scope=org org=${target.id} customer_id=${customer.id}`);
+    } else {
+        await userStore.clearStripeCustomerIdForConsumer(target.id);
+        await userStore.logSubscriptionAudit('stripe_customer_deleted', 'consumer', target.id, 'stripe_webhook', null, { stripe_customer_id: customer.id });
+        console.log(`[Stripe Webhook] stripe.customer.deleted scope=consumer user=${target.id} customer_id=${customer.id}`);
+    }
+}
+
+async function findSubscriptionTargetBySubId(stripeSubscriptionId) {
+    if (!stripeSubscriptionId) return null;
+    const orgs = await userStore.getAllOrgSubscriptions();
+    const orgMatch = orgs.find(s => s.stripe_subscription_id === stripeSubscriptionId);
+    if (orgMatch) return { scope: 'organization', id: orgMatch.organization_id };
+    const consumers = await userStore.getAllConsumerSubscriptions();
+    const consumerMatch = consumers.find(s => s.stripe_subscription_id === stripeSubscriptionId);
+    if (consumerMatch) return { scope: 'consumer', id: consumerMatch.user_id };
+    return null;
 }
 
 /**
@@ -494,52 +691,50 @@ async function handleSubscriptionDeletedForConsumer(userId, subscription) {
 }
 
 /**
- * invoice.paid — Payment succeeded
+ * invoice.paid — Payment succeeded. Resets the dunning counter so a
+ * subsequent failure starts fresh, and flips back to active/paid.
  */
 async function handleInvoicePaid(invoice) {
     const subId = invoice.subscription;
     if (!subId) return;
+    const target = await findSubscriptionTargetBySubId(subId);
+    if (!target) return;
 
-    // Check org subscriptions first, then consumer
-    const allOrgSubs = await userStore.getAllOrgSubscriptions();
-    const orgMatch = allOrgSubs.find(s => s.stripe_subscription_id === subId);
-    if (orgMatch) {
-        await userStore.setOrgSubscription(orgMatch.organization_id, { status: 'active', payment_status: 'paid' });
-        console.log(`[Stripe Webhook] Invoice paid for org ${orgMatch.organization_id}`);
-        return;
-    }
-
-    const allConsumerSubs = await userStore.getAllConsumerSubscriptions();
-    const consumerMatch = allConsumerSubs.find(s => s.stripe_subscription_id === subId);
-    if (consumerMatch) {
-        await userStore.setConsumerSubscription(consumerMatch.user_id, { status: 'active', payment_status: 'paid' });
-        console.log(`[Stripe Webhook] Invoice paid for consumer ${consumerMatch.user_id}`);
+    if (target.scope === 'organization') {
+        await userStore.setOrgSubscription(target.id, { status: 'active', payment_status: 'paid' });
+        await userStore.resetPaymentFailureForOrg(target.id);
+        console.log(`[Stripe Webhook] stripe.invoice.paid scope=org org=${target.id}`);
+    } else {
+        await userStore.setConsumerSubscription(target.id, { status: 'active', payment_status: 'paid' });
+        await userStore.resetPaymentFailureForConsumer(target.id);
+        console.log(`[Stripe Webhook] stripe.invoice.paid scope=consumer user=${target.id}`);
     }
 }
 
 /**
- * invoice.payment_failed — Payment failed
+ * invoice.payment_failed — Payment failed. Bump the dunning counter and
+ * stamp past_due_since on the first failure. The dunning scheduler in
+ * server/index.js sweeps past_due_since older than the grace window and
+ * suspends — that's where the actual feature lockout happens.
  */
 async function handleInvoicePaymentFailed(invoice) {
     const subId = invoice.subscription;
     if (!subId) return;
+    const target = await findSubscriptionTargetBySubId(subId);
+    if (!target) return;
 
-    // Check org subscriptions first, then consumer
-    const allOrgSubs = await userStore.getAllOrgSubscriptions();
-    const orgMatch = allOrgSubs.find(s => s.stripe_subscription_id === subId);
-    if (orgMatch) {
-        await userStore.setOrgSubscription(orgMatch.organization_id, { payment_status: 'failed' });
-        await userStore.logSubscriptionAudit('update_subscription', 'organization', orgMatch.organization_id, 'stripe_webhook', null, { payment_status: 'failed', invoice_id: invoice.id });
-        console.log(`[Stripe Webhook] Payment failed for org ${orgMatch.organization_id}`);
-        return;
-    }
-
-    const allConsumerSubs = await userStore.getAllConsumerSubscriptions();
-    const consumerMatch = allConsumerSubs.find(s => s.stripe_subscription_id === subId);
-    if (consumerMatch) {
-        await userStore.setConsumerSubscription(consumerMatch.user_id, { payment_status: 'failed' });
-        await userStore.logSubscriptionAudit('update_subscription', 'consumer', consumerMatch.user_id, 'stripe_webhook', null, { payment_status: 'failed', invoice_id: invoice.id });
-        console.log(`[Stripe Webhook] Payment failed for consumer ${consumerMatch.user_id}`);
+    if (target.scope === 'organization') {
+        await userStore.setOrgSubscription(target.id, { status: 'past_due', payment_status: 'failed' });
+        const updated = await userStore.recordPaymentFailureForOrg(target.id);
+        const attempt = updated?.payment_attempt_count ?? 0;
+        await userStore.logSubscriptionAudit('payment_attempt_failed', 'organization', target.id, 'stripe_webhook', null, { attempt_count: attempt, invoice_id: invoice.id });
+        console.log(`[Stripe Webhook] stripe.invoice.payment_failed scope=org org=${target.id} attempt=${attempt}`);
+    } else {
+        await userStore.setConsumerSubscription(target.id, { status: 'past_due', payment_status: 'failed' });
+        const updated = await userStore.recordPaymentFailureForConsumer(target.id);
+        const attempt = updated?.payment_attempt_count ?? 0;
+        await userStore.logSubscriptionAudit('payment_attempt_failed', 'consumer', target.id, 'stripe_webhook', null, { attempt_count: attempt, invoice_id: invoice.id });
+        console.log(`[Stripe Webhook] stripe.invoice.payment_failed scope=consumer user=${target.id} attempt=${attempt}`);
     }
 }
 

@@ -140,7 +140,16 @@ class MistralProvider extends BaseProvider {
         }
 
         console.log('[Mistral] SDK chat for model:', model);
-        const response = await client.chat.complete(params);
+        // Per-call timeout + retry policy. Mistral SDK retries by default on
+        // connection errors; when the retry path receives an already-consumed
+        // Request it surfaces as "Unexpected HTTP client error: TypeError:
+        // Failed to parse URL from [object Request]" — confusing and floods
+        // the logs. Callers (e.g. node-search cleanup) pass retries=none and
+        // a sensible timeout to avoid both the hangs and the noisy retry bug.
+        const requestOptions = {};
+        if (options.timeoutMs !== undefined) requestOptions.timeoutMs = options.timeoutMs;
+        if (options.retries !== undefined) requestOptions.retries = options.retries;
+        const response = await client.chat.complete(params, requestOptions);
 
         const message = response.choices?.[0]?.message;
         const { thinking, text } = this.parseContentBlocks(message?.content);

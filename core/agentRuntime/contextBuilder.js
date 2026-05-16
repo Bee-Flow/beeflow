@@ -62,6 +62,44 @@ Skip these unless there is a material update since the date shown. If you do inc
     const tz = messageMetadata?.timezone || 'UTC';
     systemPrompt += `\nNow: ${new Date().toLocaleString('sv-SE', { timeZone: tz, timeZoneName: 'short' })}`;
 
+    // ─── Dutch legal sources — citation discipline ──────────────
+    // When an agent has any Dutch-legal-sources tool available it's operating
+    // in legal-research mode. Inject hard rules against fabricating articles,
+    // ECLIs, CELEX or kamerstuk-nummers — the model must call a tool before
+    // quoting and must include the identifier in every citation.
+    const hasDutchLegal = Array.isArray(tools) && tools.some(t => {
+        const n = t?.function?.name || '';
+        return n.startsWith('rechtspraak_')
+            || n === 'format_citation'
+            || n.startsWith('eurlex_')
+            || n.startsWith('kamerstukken_')
+            || n === 'kamerstuk_get'
+            || n.startsWith('bekendmakingen_')
+            || n === 'bekendmaking_get'
+            || n.startsWith('tuchtrecht_');
+    });
+    if (hasDutchLegal) {
+        systemPrompt += `\n\n[NEDERLANDS JURIDISCH KADER ACTIEF]
+Je hebt toegang tot Nederlandse juridische bronnen. Beschikbare tools:
+- **rechtspraak_search / rechtspraak_get** — jurisprudentie (rechtspraak.nl Open Data)
+- **eurlex_search / eurlex_get** — EU-recht en HvJEU-arresten
+- **kamerstukken_search / kamerstuk_get** — parlementaire stukken (Tweede Kamer Open Data): MvT, amendementen, kamervragen, brieven regering. Onmisbaar voor wetsgeschiedenis-citatie.
+- **bekendmakingen_search / bekendmaking_get** — Staatsblad (vastgestelde wetten), Staatscourant (regelingen, AP-besluiten, AVV-CAO's), Tractatenblad (verdragen).
+- **tuchtrecht_search / tuchtrecht_get** — tuchtuitspraken tegen advocaten, notarissen, accountants, gerechtsdeurwaarders en BIG-beroepen.
+- **format_citation** — zet een losse verwijzing van de gebruiker (bv. "HR 17 mei 2024, 23/02169" of "hof Amsterdam 2023, 200.123.456") om naar het canonieke ECLI. Gebruik dit vóór je een rechtspraak-citaat overneemt zodat je nooit een verkeerde ECLI noteert.
+Daarnaast staat de systeem-KB "Nederlandse juridische bronnen" met de geconsolideerde kernwetten (BW, Awb, Rv, Wvk, AVG-uitvoeringswet) klaar voor wettekst.
+
+Regels (strikt):
+1. **Verzin nooit** een wetsartikel, ECLI, CELEX-id of kamerstuk-nummer. Twijfel je → roep eerst de juiste tool aan.
+2. Voor wettekst: gebruik de KB-resultaten of \`bekendmakingen_search\` voor recente regelingen; citeer alleen wat je daarin verifieerbaar terugleest, mét de BWB-deeplink of identifier.
+3. **rechtspraak_search is een metadata-filter, geen vrije-tekstzoekmachine.** Roep aan met \`rechtsgebied\` (bv. "civiel-personen-familie", "arbeidsrecht", "ondernemingsrecht", "bestuursrecht", "strafrecht") en/of \`instantie\` (bv. "Hoge Raad") plus een \`from\`/\`to\` datumbereik. De respons geeft ECLIs met de officiële inhoudsindicatie — filter daarop op trefwoord en pak via \`rechtspraak_get\` de volledige tekst.
+4. Voor EU-recht en HvJEU-arresten: gebruik eurlex_search → eurlex_get; citeer met CELEX-id (bv. 32016R0679 voor de AVG).
+5. Voor wetsgeschiedenis: roep \`kamerstukken_search\` met \`soort\` (bv. "Memorie van toelichting") en \`query\` aan; haal de tekst op met \`kamerstuk_get\` via de GUID. Citeer met DocumentNummer (bv. *Kamerstukken II 2024/25, 36 869, nr. 3 (MvT)*).
+6. Format citaten als: *Artikel 7:611 BW*, *ECLI:NL:HR:2024:1234*, *Vo (EU) 2016/679, art. 15*, *Kamerstukken II 2024/25, 36 869, nr. 3*, *Stcrt. 2024, 1234* — altijd met de bronlink uit de toolrespons.
+7. Lever drafts (memo, contract, pleitnota) in juridisch Nederlands. Vermijd jargon richting cliënten; richting juristen mag het technisch.
+8. Geef geen definitief juridisch advies aan eindcliënten. Output is altijd een concept dat door een advocaat moet worden gereviewd; sluit af met een korte aansprakelijkheidsdisclaimer wanneer het document voor een cliënt bedoeld is.`;
+    }
+
     // ─── Notebook context injection ─────────────────────────────
     // Two flags from the client:
     //   - notebookspaceAvailable: the Notebook panel exists (may be closed).

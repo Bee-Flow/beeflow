@@ -21,26 +21,38 @@ const { exec, getOne, run } = require('../db');
 // Beta Feature Registry
 // Add new features here. This is the single source of truth.
 // ──────────────────────────────────────────────
+// `licenseFeature` (optional): if set, this beta is COMPOUND-gated — both
+// the licence feature AND the beta flag must be true for the UI to show
+// the feature. /auth/my-permissions derives `canUseFeature` from this so
+// the frontend never has to reimplement the AND.
 const BETA_FEATURES = [
-    { id: 'meeting_notes', name: 'Meeting Notes', description: 'Audio transcription, meeting summaries, and action item extraction' },
-    { id: 'advanced_analytics', name: 'Advanced Analytics', description: 'Extended analytics dashboards and reporting' },
+    { id: 'meeting_notes', name: 'Meeting Notes', description: 'Audio transcription, meeting summaries, and action item extraction', licenseFeature: 'meeting_notes' },
+    { id: 'advanced_analytics', name: 'Advanced Analytics', description: 'Extended analytics dashboards and reporting', licenseFeature: 'advanced_analytics' },
     { id: 'ai_code_execution', name: 'AI Code Execution', description: 'Allow the AI agent to execute code in a sandboxed environment' },
-    { id: 'custom_themes', name: 'Custom Themes', description: 'Organization-level custom branding and theme support' },
-    { id: 'skills', name: 'Skills', description: 'Reusable instruction packs for consistent AI task execution' },
-    { id: 'itil_ticket_assistant', name: 'ITIL Ticket Assistant', description: 'Connect ITSM platforms (Jira, ServiceNow, Zendesk, Freshservice, TopDesk) and email mailboxes as knowledge base sources. Tickets + emails are turned into structured solution articles (Root Cause / Resolution) for agent self-service.' },
+    { id: 'custom_themes', name: 'Custom Themes', description: 'Organization-level custom branding and theme support', licenseFeature: 'custom_themes' },
+    { id: 'skills', name: 'Skills', description: 'Reusable instruction packs for consistent AI task execution', licenseFeature: 'skills' },
+    { id: 'itil_ticket_assistant', name: 'ITIL Ticket Assistant', description: 'Connect ITSM platforms (Jira, ServiceNow, Zendesk, Freshservice, TopDesk) and email mailboxes as knowledge base sources. Tickets + emails are turned into structured solution articles (Root Cause / Resolution) for agent self-service.', licenseFeature: 'ticket_assistant' },
     // Legacy alias — retained for one release. The initDB() migration in
     // ticketAssistantStore.js rewrites stored org beta_features from
     // 'email_knowledge_base' to 'itil_ticket_assistant' on boot; this entry
     // keeps membership lookups working during the transition window.
     { id: 'email_knowledge_base', name: 'Email Knowledge Base (deprecated)', description: 'Renamed to "ITIL Ticket Assistant". Existing enablements are auto-migrated.', aliasOf: 'itil_ticket_assistant', deprecated: true },
-    { id: 'voice_chat', name: 'Voice Chat (Beta)', description: 'Realtime voice conversation with direct chat or agents, powered by Mistral Voxtral (STT + TTS). Requires a configured Mistral API key.' },
-    { id: 'swarm', name: 'Swarm Agents', description: 'Multi-agent swarms (Deep Research, etc.) that run specialised AI workers in parallel phases and synthesise a single answer. Workers share findings via a Hive Mind notebook.' },
+    { id: 'voice_chat', name: 'Voice Chat (Beta)', description: 'Realtime voice conversation with direct chat or agents, powered by Mistral Voxtral (STT + TTS). Requires a configured Mistral API key.', licenseFeature: 'voice_chat' },
+    { id: 'swarm', name: 'Swarm Agents', description: 'Multi-agent swarms (Deep Research, etc.) that run specialised AI workers in parallel phases and synthesise a single answer. Workers share findings via a Hive Mind notebook.', licenseFeature: 'swarm' },
     { id: 'knowledge_bases_beta', name: 'Knowledge Bases (Beta badge)', description: 'Show a "beta" badge on the Knowledge Bases sidebar item. Cosmetic — does not gate access.' },
-    { id: 'webpages', name: 'Webpages', description: 'AI-built static webpages. Three-file projects (index.html / style.css / script.js) hosted in RustFS, with sandboxed live preview, auto-versioning, KB-grounded AI chat, and a one-click ZIP download.' },
-    { id: 'automations', name: 'Automations', description: 'Conversational no-code automation builder. Users describe an automation in chat; the AI assembles a typed DAG that mixes scheduled triggers, integration actions, AI reasoning steps, conditions, loops, and notifications. Includes dry-run preview, run history, and webhook + app-event triggers.' },
-    { id: 'agent_routines', name: 'Agent routines', description: 'Schedule recurring tasks that run through a specific agent. The routine fires the agent on a cron-like schedule with the full agent runtime (system prompt, attached skills, knowledge bases, integrations) and saves the result to a persistent chat thread.' },
-    { id: 'personal_access_tokens', name: 'Personal Access Tokens', description: 'Long-lived API tokens for external clients (Chrome extension, CLI, automation). Users in enabled orgs see a "API Tokens" entry in their personal settings and can generate / revoke tokens; the /api/pat endpoints are gated to enabled orgs only.' },
+    { id: 'webpages', name: 'Webpages', description: 'AI-built static webpages. Three-file projects (index.html / style.css / script.js) hosted in RustFS, with sandboxed live preview, auto-versioning, KB-grounded AI chat, and a one-click ZIP download.', licenseFeature: 'webpages' },
+    { id: 'automations', name: 'Automations', description: 'Conversational no-code automation builder. Users describe an automation in chat; the AI assembles a typed DAG that mixes scheduled triggers, integration actions, AI reasoning steps, conditions, loops, and notifications. Includes dry-run preview, run history, and webhook + app-event triggers.', licenseFeature: 'automations' },
+    { id: 'agent_routines', name: 'Agent routines', description: 'Schedule recurring tasks that run through a specific agent. The routine fires the agent on a cron-like schedule with the full agent runtime (system prompt, attached skills, knowledge bases, integrations) and saves the result to a persistent chat thread.', licenseFeature: 'agent_routines' },
+    { id: 'dutch_legal_sources', name: 'Dutch Legal Sources', description: 'Nederlandse juridische bronnen — geconsolideerde wetgeving (BW, Awb, Rv, Wvk, AVG-uitvoeringswet) als systeem-KB, plus tools voor jurisprudentie (rechtspraak.nl) en EU-recht (EUR-Lex / HvJEU) in het Nederlands. Bedoeld voor juridische agents die juristen helpen bij opstellen van adviezen, contracten en pleitnota’s. Alle bronnen zijn vrij te gebruiken (overheid open data).', freeForAllOrgs: true },
 ];
+
+function listBetaFeatures() {
+    return BETA_FEATURES.slice();
+}
+
+function listCompoundGatedFeatures() {
+    return BETA_FEATURES.filter(f => !!f.licenseFeature && !f.deprecated);
+}
 
 // -──────────────────────────────────────────────
 // Lazy migration — ensure the column exists (deferred until first use)
@@ -133,7 +145,14 @@ async function getUserBetaFeatures(userId, session = null) {
 
         // Intersection of the super-admin allow-list with the org-admin
         // "active" subset — both must include a feature for it to be
-        // available to users in the org.
+        // available to users in the org. Exception: features marked
+        // `freeForAllOrgs: true` skip the allow-list step — the org-admin
+        // active toggle is authoritative on its own. Used for fully free
+        // features (open-data sources etc.) where a separate super-admin
+        // grant per org is friction without security value.
+        const freeForAll = new Set(
+            BETA_FEATURES.filter(f => f.freeForAllOrgs).map(f => f.id)
+        );
         const featureSet = new Set();
         for (const orgId of orgIds) {
             const allowed = await getOrgBetaFeatures(orgId);
@@ -141,7 +160,8 @@ async function getUserBetaFeatures(userId, session = null) {
             try { active = await userStore.getOrgEnabledBetaFeatures(orgId); }
             catch (_) { active = []; }
             const activeSet = new Set(active);
-            for (const fid of allowed) {
+            const allowedSet = new Set([...allowed, ...freeForAll]);
+            for (const fid of allowedSet) {
                 if (activeSet.has(fid)) featureSet.add(fid);
             }
         }
@@ -197,6 +217,8 @@ function requireBetaFeature(featureId) {
 
 module.exports = {
     BETA_FEATURES,
+    listBetaFeatures,
+    listCompoundGatedFeatures,
     getOrgBetaFeatures,
     setOrgBetaFeatures,
     getUserBetaFeatures,

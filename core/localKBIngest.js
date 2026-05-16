@@ -955,12 +955,18 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
         }
 
         // ── Run vector search + FTS in parallel ─────────────────────
+        // System-managed KBs (e.g. dutch_legal_sources) write chunks under
+        // tenant_id='system'; org-managed KBs write under the caller's
+        // tenant_id. Access is already gated by `kbIds` upstream — the agent
+        // runtime only forwards KB ids the user is permitted to query — so
+        // accepting either tenant marker is safe and lets a single search
+        // span both org-owned and system-provisioned KBs.
         const vectorSearchPromise = (pgvectorAvailable && vectorStr)
             ? client.query(
                 `SELECT id, title, content, source_uri, document_id, chunk_id,
                         1 - (embedding <=> $1::vector) AS vec_score
                  FROM kb_chunks
-                 WHERE tenant_id = $2
+                 WHERE (tenant_id = $2 OR tenant_id = 'system')
                    AND knowledge_base_id = ANY($3::text[])
                  ORDER BY embedding <=> $1::vector
                  LIMIT $4`,
@@ -977,7 +983,7 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
                             ts_rank_cd(tsv, websearch_to_tsquery('simple', $1))
                         ) AS fts_score
                  FROM kb_chunks
-                 WHERE tenant_id = $2
+                 WHERE (tenant_id = $2 OR tenant_id = 'system')
                    AND knowledge_base_id = ANY($3::text[])
                    AND (
                        tsv @@ websearch_to_tsquery('dutch', $1)
@@ -1010,7 +1016,7 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
                                 ts_rank_cd(tsv, websearch_to_tsquery('simple', $1))
                             ) AS fts_score
                      FROM kb_chunks
-                     WHERE tenant_id = $2
+                     WHERE (tenant_id = $2 OR tenant_id = 'system')
                        AND knowledge_base_id = ANY($3::text[])
                        AND (
                            tsv @@ websearch_to_tsquery('dutch', $1)
@@ -1118,7 +1124,7 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
                          SELECT document_id, chunk_id FROM kb_chunks WHERE id = ANY($1::bigint[])
                      ) h ON c.document_id = h.document_id
                         AND c.chunk_id BETWEEN h.chunk_id - 1 AND h.chunk_id + 1
-                     WHERE c.tenant_id = $2
+                     WHERE (c.tenant_id = $2 OR c.tenant_id = 'system')
                        AND c.id != ALL($1::bigint[])
                      LIMIT 10`,
                     [results.map(r => r.id), tenantId]

@@ -353,6 +353,21 @@ async function invalidatePermissionCache(userId) {
 }
 
 /**
+ * Invalidate the user-existence cache used by requireAuth. Until this fires,
+ * the cached isAdmin / existence value can outlive the user's actual role
+ * by USER_CHECK_TTL (5s). Called from admin endpoints that promote/demote.
+ */
+async function invalidateUserExistenceCache(userId) {
+    if (!userId) return;
+    const r = getRedis();
+    if (r) {
+        try { await r.del(`bf:uex:${userId}`); } catch (_) { }
+    } else {
+        _userExistsCache.delete(userId);
+    }
+}
+
+/**
  * Invalidate every user's cached permission set. Used on group/role mutations
  * where the affected-user set isn't easily enumerable.
  */
@@ -612,5 +627,6 @@ module.exports = {
     assertUserCanUseOrg,
     validateSharedGroupsForOrg,
     invalidatePermissionCache,
-    invalidateAllPermissionCaches
+    invalidateAllPermissionCaches,
+    invalidateUserExistenceCache,
 };

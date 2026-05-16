@@ -219,7 +219,7 @@ ABSOLUTE RULES:
         if (kbIds.length > 0) {
             try {
                 const { quickKBSearch } = require('../../core/agentRuntime/knowledgeSearch');
-                const kbResults = await quickKBSearch(userId, kbIds, message, { topK: 6 });
+                const kbResults = await quickKBSearch(userId, kbIds, message, { topK: 6, session: req.session });
 
                 if (kbResults.length > 0) {
                     const kbText = kbResults.map((c, i) => {

@@ -562,6 +562,31 @@ async function getRecentRunsForUser(userId, { limit = 50 } = {}) {
     }));
 }
 
+/**
+ * Active (running / awaiting_approval) runs for a user. Powers the
+ * "● Running" dot in the routine list sidebar and the concurrent-run
+ * guard. Joins to automations so the caller can match by automationId
+ * without a second round-trip.
+ */
+async function getActiveRunsForUser(userId) {
+    await initDB();
+    const rows = await getAll(
+        `SELECT r.id, r.automation_id, r.status, r.started_at, r.trigger_kind
+           FROM automation_runs r
+          WHERE r.user_id = $1
+            AND r.status IN ('queued', 'running', 'awaiting_approval')
+          ORDER BY r.started_at DESC NULLS LAST`,
+        [userId],
+    );
+    return rows.map(r => ({
+        runId: r.id,
+        automationId: r.automation_id,
+        status: r.status,
+        startedAt: r.started_at ? new Date(r.started_at).toISOString() : null,
+        triggerKind: r.trigger_kind || null,
+    }));
+}
+
 async function updateRun(id, updates) {
     await initDB();
     const map = {
@@ -919,6 +944,7 @@ module.exports = {
     getRun,
     getRunsForAutomation,
     getRecentRunsForUser,
+    getActiveRunsForUser,
     updateRun,
     requestCancelRun,
     recordRunStep,

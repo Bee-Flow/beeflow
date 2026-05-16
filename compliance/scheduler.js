@@ -1,41 +1,75 @@
 /**
- * Compliance Scheduler — periodic runAll invocation for the default org.
+ * Compliance Scheduler — periodic runAll across every organization.
  *
- * For multi-tenant installs, the primary refresh mechanism is the on-demand
- * auto-run in routes/compliance.js (/overview triggers a sync run for the
- * caller's org on first visit, and a fire-and-forget refresh when data is
- * older than 6 hours). This scheduler is a belt-and-braces fallback for
- * single-tenant installs (orgId='default') where users may never open the
- * Compliance Hub but we still want fresh scan results in the background.
- *
- * To extend to per-tenant scheduling, iterate user organizations via
- * userStore and call runner.runAll(orgId) for each.
+ * Behaviour:
+ *   - 90 s after boot, kicks off the first sweep (lets PII / Guardrails come up first).
+ *   - Every 6 hours thereafter, iterates `userStore.getAllOrganizations()` and
+ *     runs all registered checks for each org sequentially. Sequential is
+ *     intentional — concurrent runs across many orgs would saturate the DB
+ *     pool (40 connections) and starve user-facing queries.
+ *   - Always includes orgId='default' so single-tenant installs and shared
+ *     fallbacks still get a scan.
  */
 
 const runner = require('./runner');
+const userStore = require('../stores/userStore');
 
 const SCHEDULER_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
 let _timer = null;
+let _running = false;
 
-function start(orgId = 'default') {
+async function _runAllOrgs() {
+    if (_running) {
+        console.log('[ComplianceScheduler] previous sweep still running — skipping');
+        return;
+    }
+    _running = true;
+    const started = Date.now();
+    try {
+        // Always include 'default' so single-tenant installs are covered.
+        const orgIds = new Set(['default']);
+        try {
+            const orgs = await userStore.getAllOrganizations();
+            for (const o of orgs || []) {
+                if (o?.id) orgIds.add(o.id);
+            }
+        } catch (e) {
+            console.warn('[ComplianceScheduler] could not list organizations:', e.message);
+        }
+        for (const orgId of orgIds) {
+            try {
+                await runner.runAll(orgId, { runType: 'scheduled' });
+            } catch (e) {
+                console.warn(`[ComplianceScheduler] org="${orgId}" run failed:`, e.message);
+            }
+        }
+        const ms = Date.now() - started;
+        console.log(`[ComplianceScheduler] sweep complete — ${orgIds.size} org(s) in ${ms} ms`);
+    } finally {
+        _running = false;
+    }
+}
+
+function start() {
     if (_timer) return;
-    // Initial delayed run (90s after boot so PII/Guard services come up first)
-    const initial = setTimeout(() => runner.runAll(orgId).catch(e =>
-        console.warn('[ComplianceScheduler] initial run failed:', e.message)
-    ), 90 * 1000);
+    const initial = setTimeout(() => {
+        _runAllOrgs().catch(e =>
+            console.warn('[ComplianceScheduler] initial sweep failed:', e.message)
+        );
+    }, 90 * 1000);
     if (initial.unref) initial.unref();
 
     _timer = setInterval(() => {
-        runner.runAll(orgId).catch(e =>
-            console.warn('[ComplianceScheduler] scheduled run failed:', e.message)
+        _runAllOrgs().catch(e =>
+            console.warn('[ComplianceScheduler] scheduled sweep failed:', e.message)
         );
     }, SCHEDULER_INTERVAL_MS);
     if (_timer.unref) _timer.unref();
-    console.log(`[ComplianceScheduler] Started for org="${orgId}" — interval ${SCHEDULER_INTERVAL_MS / 60000} min`);
+    console.log(`[ComplianceScheduler] Started — interval ${SCHEDULER_INTERVAL_MS / 60000} min, multi-tenant`);
 }
 
 function stop() {
     if (_timer) { clearInterval(_timer); _timer = null; }
 }
 
-module.exports = { start, stop };
+module.exports = { start, stop, _runAllOrgs };

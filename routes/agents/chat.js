@@ -5,10 +5,17 @@ const agentStore = require('../../stores/agentStore');
 const agentRuntime = require('../../core/agentRuntime');
 const { getAIConfig, getProviderForModel } = require('../../core/aiAgent');
 const configStore = require('../../stores/configStore');
-const { requirePermission } = require('../../auth');
+const { requirePermission, requireAuth } = require('../../auth');
 const MemoryStore = require('../../stores/memoryStore');
 const { resolveUserOrgIds } = require('../../auth');
 const { getEffectiveUserId, getUserAuth } = require('../../utils/routeHelpers');
+const { perUserRateLimit } = require('../../utils/perUserRateLimit');
+
+// LLM-backed helper endpoints (title generation, building description) are
+// gated to prevent unauthenticated cost blow-up. Stream chat has its own
+// concurrency cap below.
+const helperLimiter = perUserRateLimit({ windowMs: 60_000, max: 30 });
+const streamLimiter = perUserRateLimit({ windowMs: 60_000, max: 60 });
 
 const userStore = require('../../stores/userStore');
 const usageStore = require('../../stores/usageStore');
@@ -114,7 +121,7 @@ router.post('/:id/chat', async (req, res) => {
         const userAuth = await getUserAuth(req);
         const result = await agentRuntime.chatWithAgent(
             req.params.id,
-            req.session.user.id,
+            userId,
             message,
             userAuth
         );
@@ -163,7 +170,7 @@ router.get('/:id/embed', async (req, res) => {
 const checkSubscriptionLimits = checkSubLimits;
 
 // Streaming chat with agent (SSE)
-router.post('/:id/chat/stream', async (req, res) => {
+router.post('/:id/chat/stream', streamLimiter, async (req, res) => {
     const agent = await agentStore.getAgent(req.params.id);
 
     if (!agent) {
@@ -231,7 +238,7 @@ router.post('/:id/chat/stream', async (req, res) => {
             // Custom history override for thread context isolation
             history,
             // Message metadata for persistence (id, parentId, attachments, and conversationId)
-            { messageId, parentId, attachments, conversationId, ephemeral, notebookspaceContent: req.body.notebookspaceContent, notebookspaceSelection: req.body.notebookspaceSelection, notebookspaceAvailable: req.body.notebookspaceAvailable, sidePanelWebpage: req.body.sidePanelWebpage, signal: abortController.signal, userOrgId: userAuth.userOrgId, timezone: req.body.timezone, projectId: req.body.projectId, modelTier, activeSkillIds, orgId, reasoningEffort, memoryWriteEnabled: req.body.memoryWriteEnabled }
+            { messageId, parentId, attachments, conversationId, ephemeral, notebookspaceContent: req.body.notebookspaceContent, notebookspaceSelection: req.body.notebookspaceSelection, notebookspaceAvailable: req.body.notebookspaceAvailable, sidePanelWebpage: req.body.sidePanelWebpage, signal: abortController.signal, userOrgId: userAuth.userOrgId, timezone: req.body.timezone, projectId: req.body.projectId, modelTier, activeSkillIds, orgId, reasoningEffort, memoryWriteEnabled: req.body.memoryWriteEnabled, webSearchEnabled: req.body.webSearchEnabled }
         );
 
         // Skip all post-stream persistence for ephemeral embed chats
@@ -308,10 +315,14 @@ router.post('/:id/chat/stream', async (req, res) => {
 });
 
 // Generate thread title
-router.post('/thread/title', async (req, res) => {
+const MAX_TITLE_CONTENT_LEN = 32_000;
+router.post('/thread/title', requireAuth, helperLimiter, async (req, res) => {
     const { content } = req.body;
-    if (!content) {
+    if (typeof content !== 'string' || !content) {
         return res.status(400).json({ error: 'Content is required' });
+    }
+    if (content.length > MAX_TITLE_CONTENT_LEN) {
+        return res.status(413).json({ error: 'Content too large' });
     }
 
     try {
@@ -326,14 +337,29 @@ router.post('/thread/title', async (req, res) => {
 });
 
 // Describe what's being built from partial code (uses fast model)
-router.post('/describe-building', async (req, res) => {
+const MAX_DESCRIBE_CODE_LEN = 50_000;
+router.post('/describe-building', requireAuth, helperLimiter, async (req, res) => {
     const { code, language } = req.body;
-    if (!code) {
+    if (typeof code !== 'string' || !code) {
         return res.status(400).json({ error: 'Code is required' });
+    }
+    if (code.length > MAX_DESCRIBE_CODE_LEN) {
+        return res.status(413).json({ error: 'Code payload too large' });
     }
 
     try {
         const config = await getAIConfig();
+        // Defence-in-depth: refuse if the configured AI URL isn't a normal http(s)
+        // endpoint. Prevents accidental SSRF if the config is ever tenant-influenced.
+        let parsedAiUrl;
+        try {
+            parsedAiUrl = new URL(config.url);
+        } catch (_) {
+            return res.json({ description: 'Building an interactive application...' });
+        }
+        if (!/^https?:$/.test(parsedAiUrl.protocol)) {
+            return res.json({ description: 'Building an interactive application...' });
+        }
         const headers = {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${config.apiKey}`
@@ -342,13 +368,10 @@ router.post('/describe-building', async (req, res) => {
         // Use a fast model for quick descriptions
         const fastModel = 'Gemini 2.5 Flash-Lite - Fast';
 
-        // Take first 1500 chars of code to keep prompt short
-        const codePreview = code.slice(0, 1500);
-
         // Take the LAST 800 chars to see what's currently being generated
         const recentCode = code.slice(-800);
 
-        const response = await fetch(`${config.url}/v1/chat/completions`, {
+        const response = await fetch(`${config.url.replace(/\/+$/, '')}/v1/chat/completions`, {
             method: 'POST',
             headers,
             body: JSON.stringify({
@@ -384,7 +407,7 @@ router.post('/describe-building', async (req, res) => {
 });
 
 // Get conversation history
-router.get('/:id/history', async (req, res) => {
+router.get('/:id/history', helperLimiter, async (req, res) => {
     const agent = await agentStore.getAgent(req.params.id);
     if (!agent) {
         return res.status(404).json({ error: 'Agent not found' });
@@ -397,7 +420,7 @@ router.get('/:id/history', async (req, res) => {
 });
 
 // Clear conversation history
-router.delete('/:id/history', async (req, res) => {
+router.delete('/:id/history', helperLimiter, async (req, res) => {
     const userId = getEffectiveUserId(req);
 
     const agent = await agentStore.getAgent(req.params.id);

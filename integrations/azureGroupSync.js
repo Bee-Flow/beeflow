@@ -407,15 +407,21 @@ async function syncAzureGroupsToOrg(orgId) {
                                     passwordHash: '',
                                 };
 
-                                const created = await userStore.createUser(newUser);
-                                if (created) {
+                                const r1 = await userStore.createUserWithSeatCheck(newUser, { strict: false });
+                                if (r1.created) {
                                     details.push(`    + Created user "${displayName}" (${email}) [${userStatus}]`);
                                     syncedUserCount++;
+                                } else if (r1.reason === 'seat_cap') {
+                                    console.warn(`[AzureGroupSync] seat.cap.skipped org=${orgId} azure_user=${azureUserId} current=${r1.current} max=${r1.max}`);
+                                    details.push(`    ⚠ Skipped "${displayName}" — seat cap reached (${r1.current}/${r1.max})`);
                                 } else {
                                     newUser.id = `${userId}-${Date.now().toString(36)}`;
-                                    if (await userStore.createUser(newUser)) {
+                                    const r2 = await userStore.createUserWithSeatCheck(newUser, { strict: false });
+                                    if (r2.created) {
                                         details.push(`    + Created user "${displayName}" (${email}) as ${newUser.id} [${userStatus}]`);
                                         syncedUserCount++;
+                                    } else if (r2.reason === 'seat_cap') {
+                                        details.push(`    ⚠ Skipped "${displayName}" — seat cap reached`);
                                     } else {
                                         errors.push(`Failed to create user "${displayName}" — ID conflict`);
                                     }
@@ -495,15 +501,21 @@ async function syncAzureGroupsToOrg(orgId) {
                             passwordHash: '',
                         };
 
-                        const created = await userStore.createUser(newUser);
-                        if (created) {
+                        const r1 = await userStore.createUserWithSeatCheck(newUser, { strict: false });
+                        if (r1.created) {
                             details.push(`  + Created direct user "${displayName}" (${email}) [${userStatus}]`);
                             syncedUserCount++;
+                        } else if (r1.reason === 'seat_cap') {
+                            console.warn(`[AzureGroupSync] seat.cap.skipped org=${orgId} azure_user=${azureUserId} current=${r1.current} max=${r1.max}`);
+                            details.push(`  ⚠ Skipped direct user "${displayName}" — seat cap reached (${r1.current}/${r1.max})`);
                         } else {
                             newUser.id = `${userId}-${Date.now().toString(36)}`;
-                            if (await userStore.createUser(newUser)) {
+                            const r2 = await userStore.createUserWithSeatCheck(newUser, { strict: false });
+                            if (r2.created) {
                                 details.push(`  + Created direct user "${displayName}" (${email}) as ${newUser.id} [${userStatus}]`);
                                 syncedUserCount++;
+                            } else if (r2.reason === 'seat_cap') {
+                                details.push(`  ⚠ Skipped direct user "${displayName}" — seat cap reached`);
                             }
                         }
                     } else {

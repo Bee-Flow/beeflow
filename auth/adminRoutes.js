@@ -168,7 +168,10 @@ router.post('/users', requireOrgAdminForUser, async (req, res) => {
         return res.status(400).json({ error: 'Cannot create user "admin"' });
     }
 
-    // Check user count limit for target org
+    // Pre-flight UX hint — atomic enforcement happens inside
+    // createUserWithSeatCheck (which holds a row lock and re-counts inside
+    // the transaction). Without this hint the API still rejects but the
+    // user sees a generic create_failed.
     const targetOrgId = organizationId || null;
     if (targetOrgId) {
         const allUsers = await userStore.getAllUsers();
@@ -214,11 +217,20 @@ router.post('/users', requireOrgAdminForUser, async (req, res) => {
         organizationId: organizationId || ''
     };
 
-    if (await userStore.createUser(newUser)) {
-        console.log(`[Audit] ${req.session.user?.id || 'system'} created user '${username}' in org '${organizationId || 'none'}' with orgRole '${orgRole || 'none'}'`);
-        res.json({ success: true, user: { id: newUser.id, username, displayName, role } });
-    } else {
-        res.status(400).json({ error: 'User already exists' });
+    try {
+        const result = await userStore.createUserWithSeatCheck(newUser, { strict: true });
+        if (result.created) {
+            console.log(`[Audit] ${req.session.user?.id || 'system'} created user '${username}' in org '${organizationId || 'none'}' with orgRole '${orgRole || 'none'}'`);
+            return res.json({ success: true, user: { id: newUser.id, username, displayName, role } });
+        }
+        if (result.reason === 'duplicate_id') return res.status(400).json({ error: 'User already exists' });
+        return res.status(400).json({ error: result.error || 'User already exists' });
+    } catch (e) {
+        if (e instanceof userStore.SeatCapExceededError) {
+            return res.status(403).json({ error: 'seat_cap_exceeded', current: e.current, max: e.max });
+        }
+        console.error('[adminRoutes] createUser error:', e);
+        return res.status(500).json({ error: 'Failed to create user' });
     }
 });
 
@@ -260,6 +272,12 @@ router.put('/users/:id', requireOrgAdminForUser, async (req, res) => {
         console.log(`[Audit] ${req.session.user?.id || 'system'} updated user '${id}' — fields: ${changedFields.join(', ')}`);
         // Role / orgRole / group changes alter the user's effective permissions.
         await invalidatePermissionCache(id);
+        // Bust the requireAuth user-existence cache so a role demotion takes
+        // effect on the very next request instead of waiting USER_CHECK_TTL.
+        try {
+            const { invalidateUserExistenceCache } = require('./permissions');
+            await invalidateUserExistenceCache(id);
+        } catch (_) { /* optional helper */ }
         res.json({ success: true });
     } else {
         res.status(404).json({ error: 'User not found' });
@@ -278,6 +296,12 @@ router.delete('/users/:id', requireOrgAdminForUser, async (req, res) => {
         // Clear any stale permission cache for the deleted user so existing
         // sessions can't continue resolving against the cached snapshot.
         await invalidatePermissionCache(id);
+        try {
+            const { invalidateUserExistenceCache } = require('./permissions');
+            await invalidateUserExistenceCache(id);
+            const { bustSessionsForUser } = require('./sessionCache');
+            await bustSessionsForUser(id);
+        } catch (_) { /* optional */ }
         res.json({ success: true });
     } else {
         res.status(404).json({ error: 'User not found' });
@@ -1083,8 +1107,12 @@ async function resolveActiveFeaturesContext(req) {
 
     const org = await userStore.getOrganization(orgId);
 
-    // Beta allow-list = super admin's grant; active = org admin's subset.
-    const allowedBetaFeatures = await getOrgBetaFeatures(orgId);
+    // Beta allow-list = super admin's grant ∪ features marked `freeForAllOrgs`
+    // (open-data sources etc. where a per-org super-admin grant adds friction
+    // without security value — the org-admin active toggle is authoritative).
+    const grantedAllowList = await getOrgBetaFeatures(orgId);
+    const freeForAll = BETA_FEATURES.filter(f => f.freeForAllOrgs).map(f => f.id);
+    const allowedBetaFeatures = Array.from(new Set([...grantedAllowList, ...freeForAll]));
     const enabledBetaFeatures = await userStore.getOrgEnabledBetaFeatures(orgId);
 
     // Integration allow-list = super admin's enabledIntegrations (or global
@@ -1100,10 +1128,24 @@ async function resolveActiveFeaturesContext(req) {
     allowedIntegrations = allowedIntegrations.filter(id => !NC_ID_SET.has(id));
     const enabledIntegrations = await userStore.getOrgEnabledIntegrations(orgId);
 
+    // Intersect with plan caps. The org's subscription plan can further
+    // narrow what the super-admin allowed — anything outside the plan's
+    // allow-list is hidden from the org-admin UI entirely.
+    let planCappedBeta = allowedBetaFeatures;
+    let planCappedInt = allowedIntegrations;
+    try {
+        const { getOrgCaps, applyCap } = require('../services/planEntitlements');
+        const caps = await getOrgCaps(orgId);
+        planCappedBeta = applyCap(allowedBetaFeatures, caps.betaFeatures);
+        planCappedInt = applyCap(allowedIntegrations, caps.integrations);
+    } catch (e) {
+        console.warn('[ActiveFeatures] plan cap lookup failed:', e.message);
+    }
+
     return {
         orgId,
-        allowedBetaFeatures, enabledBetaFeatures,
-        allowedIntegrations, enabledIntegrations,
+        allowedBetaFeatures: planCappedBeta, enabledBetaFeatures,
+        allowedIntegrations: planCappedInt, enabledIntegrations,
         betaRegistry: BETA_FEATURES,
     };
 }
@@ -1146,9 +1188,15 @@ router.put('/me/active-features', requireAuth, async (req, res) => {
         let savedBeta = ctx.enabledBetaFeatures;
         let savedInt = ctx.enabledIntegrations;
 
+        // Plan caps — an org-admin cannot enable beyond what the plan allows.
+        // null cap = unrestricted (legacy plans without the column set).
+        const planEntitlements = require('../services/planEntitlements');
+        const caps = await planEntitlements.getOrgCaps(ctx.orgId);
+
         if (Array.isArray(betaEnabled)) {
             const allowedSet = new Set(ctx.allowedBetaFeatures);
-            const clean = Array.from(new Set(betaEnabled.filter(id => allowedSet.has(id))));
+            let clean = Array.from(new Set(betaEnabled.filter(id => allowedSet.has(id))));
+            clean = planEntitlements.applyCap(clean, caps.betaFeatures);
             if (!(await userStore.setOrgEnabledBetaFeatures(ctx.orgId, clean))) {
                 return res.status(500).json({ error: 'Failed to save beta features' });
             }
@@ -1157,7 +1205,8 @@ router.put('/me/active-features', requireAuth, async (req, res) => {
 
         if (Array.isArray(integrationsEnabled)) {
             const allowedSet = new Set(ctx.allowedIntegrations);
-            const clean = Array.from(new Set(integrationsEnabled.filter(id => allowedSet.has(id))));
+            let clean = Array.from(new Set(integrationsEnabled.filter(id => allowedSet.has(id))));
+            clean = planEntitlements.applyCap(clean, caps.integrations);
             if (!(await userStore.setOrgEnabledIntegrations(ctx.orgId, clean))) {
                 return res.status(500).json({ error: 'Failed to save integrations' });
             }
@@ -1167,6 +1216,25 @@ router.put('/me/active-features', requireAuth, async (req, res) => {
         res.json({ orgId: ctx.orgId, enabledBetaFeatures: savedBeta, enabledIntegrations: savedInt });
     } catch (e) {
         console.error('[ActiveFeatures] /me PUT error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ── Consumer beta-features (no org) ──────────────────────────────
+// Consumer accounts have no organisation, so /me/active-features above
+// returns an empty payload for them. Beta grants for consumer users are
+// configured deployment-wide in `default_consumer_beta_features` (super
+// admin only). This route exposes the resolved list so the personal
+// "Beta features" panel can render. Read-only — consumers cannot toggle.
+router.get('/me/consumer-features', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session?.user?.id;
+        if (!userId) return res.status(401).json({ error: 'Not authenticated' });
+        const raw = await require('../stores/configStore').getConfig('default_consumer_beta_features');
+        const allowedBetaFeatures = Array.isArray(raw) ? raw : [];
+        res.json({ allowedBetaFeatures, betaRegistry: BETA_FEATURES });
+    } catch (e) {
+        console.error('[ConsumerFeatures] GET error:', e.message);
         res.status(500).json({ error: e.message });
     }
 });

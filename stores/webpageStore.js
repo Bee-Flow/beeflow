@@ -128,6 +128,18 @@ async function initDB() {
         await exec(`CREATE INDEX IF NOT EXISTS idx_webpages_org_published ON webpages(organization_id, is_published)`);
     } catch (_) { /* columns already exist — fine */ }
 
+    // Runtime bridge grants — explicit allowlists for what the page's
+    // script.js can invoke on the platform via window.beeflowAI /
+    // beeflowAutomations / beeflowIntegrations. JSONB shape:
+    //   { ai: { enabled, groundOnPage, defaultTier? },
+    //     automations: [ { automationId, label? } ],
+    //     integrations: [ { tool, fixedArgs?, label? } ] }
+    // Calls run acts-as-author (uses the webpage owner's credentials), so
+    // this column is the sole opt-in surface; viewers cannot bypass it.
+    try {
+        await exec(`ALTER TABLE webpages ADD COLUMN IF NOT EXISTS bridge_grants JSONB DEFAULT '{"ai":{"enabled":true,"groundOnPage":true},"automations":[],"integrations":[]}'::jsonb`);
+    } catch (_) { /* column already exists — fine */ }
+
     // Multi-file support — arbitrary additional files under a webpage.
     // The three primary slots (index.html / style.css / script.js) keep their
     // dedicated columns and RustFS keys; this table stores everything else.
@@ -843,6 +855,7 @@ function mapWebpageRow(r) {
         thumbnailSha: r.thumbnail_sha256 || '',
         thumbnailSize: parseInt(r.thumbnail_size) || 0,
         sourceCount: parseInt(r.source_count) || 0,
+        bridgeGrants: parseJSON(r.bridge_grants, { ai: { enabled: true, groundOnPage: true }, automations: [], integrations: [] }),
         createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
         updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : null,
     };
@@ -991,6 +1004,88 @@ async function shouldAutoVersion(webpageId) {
     return elapsed >= AUTO_VERSION_DEBOUNCE_MS;
 }
 
+// ── Bridge grants (runtime API allowlist) ─────────────────────────────
+//
+// The webpage iframe's window.beeflowAI / .beeflowAutomations /
+// .beeflowIntegrations bridges run acts-as-author. This column is the
+// single source of truth for what the author has explicitly enabled.
+
+const DEFAULT_BRIDGE_GRANTS = {
+    ai: { enabled: true, groundOnPage: true },
+    automations: [],
+    integrations: [],
+};
+
+function normalizeBridgeGrants(raw) {
+    const out = { ai: { ...DEFAULT_BRIDGE_GRANTS.ai }, automations: [], integrations: [] };
+    if (raw && typeof raw === 'object') {
+        if (raw.ai && typeof raw.ai === 'object') {
+            out.ai.enabled = raw.ai.enabled !== false;
+            out.ai.groundOnPage = raw.ai.groundOnPage !== false;
+            if (typeof raw.ai.defaultTier === 'string') out.ai.defaultTier = raw.ai.defaultTier;
+        }
+        if (Array.isArray(raw.automations)) {
+            out.automations = raw.automations
+                .filter(e => e && typeof e.automationId === 'string')
+                .map(e => ({ automationId: e.automationId, ...(e.label ? { label: String(e.label) } : {}) }));
+        }
+        if (Array.isArray(raw.integrations)) {
+            out.integrations = raw.integrations
+                .filter(e => e && typeof e.tool === 'string')
+                .map(e => ({
+                    tool: e.tool,
+                    ...(e.fixedArgs && typeof e.fixedArgs === 'object' ? { fixedArgs: e.fixedArgs } : {}),
+                    ...(e.label ? { label: String(e.label) } : {}),
+                }));
+        }
+    }
+    return out;
+}
+
+async function getBridgeGrants(webpageId) {
+    await initDB();
+    const r = await getOne('SELECT bridge_grants FROM webpages WHERE id = $1', [webpageId]);
+    return normalizeBridgeGrants(r ? parseJSON(r.bridge_grants, null) : null);
+}
+
+/**
+ * Owner-only write. `patch` is a partial — any kind (`ai` / `automations` /
+ * `integrations`) you supply replaces the corresponding slice wholesale.
+ * To incrementally add/remove a single grant, read first, mutate, write.
+ */
+async function updateBridgeGrants(webpageId, userId, patch) {
+    await initDB();
+    const current = await getBridgeGrants(webpageId);
+    const merged = normalizeBridgeGrants({
+        ai: patch?.ai !== undefined ? patch.ai : current.ai,
+        automations: patch?.automations !== undefined ? patch.automations : current.automations,
+        integrations: patch?.integrations !== undefined ? patch.integrations : current.integrations,
+    });
+    const { rowCount } = await run(
+        `UPDATE webpages SET bridge_grants = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3`,
+        [JSON.stringify(merged), webpageId, userId]
+    );
+    if (rowCount === 0) return null;
+    return merged;
+}
+
+/**
+ * Check whether `kind` (`ai` / `automation` / `integration`) for `key` is
+ * granted on this webpage. Returns the grant entry (or `true` for ai) when
+ * allowed, `null` when not.
+ */
+async function checkGrant(webpageId, kind, key) {
+    const g = await getBridgeGrants(webpageId);
+    if (kind === 'ai') return g.ai.enabled ? g.ai : null;
+    if (kind === 'automation') {
+        return g.automations.find(e => e.automationId === key) || null;
+    }
+    if (kind === 'integration') {
+        return g.integrations.find(e => e.tool === key) || null;
+    }
+    return null;
+}
+
 module.exports = {
     SLOTS,
     VERSIONED_SLOTS,
@@ -1029,6 +1124,10 @@ module.exports = {
     validateExtraPath,
     isTextFile,
     guessMime,
+    // Runtime bridge grants
+    getBridgeGrants,
+    updateBridgeGrants,
+    checkGrant,
     // Sources
     addSource,
     getSources,
