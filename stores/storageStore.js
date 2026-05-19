@@ -17,7 +17,7 @@ const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const fs = require('fs');
 const path = require('path');
 
-const BUCKET = 'beeflow-media';
+const BUCKET = process.env.S3_BUCKET || 'beeflow-media';
 const DEFAULT_EXPIRY = 3600; // 1 hour
 
 let s3 = null;

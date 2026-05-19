@@ -11,8 +11,11 @@ const crypto = require('crypto');
 const kbStore = require('../stores/knowledgeBases');
 const configStore = require('../stores/configStore');
 const userStore = require('../stores/userStore');
-const { requireAuth, resolveUserOrgIds, requirePermission, hasPermission, assertUserCanUseOrg, validateSharedGroupsForOrg } = require('../auth');
+const { requireAuth, resolveUserOrgIds, requirePermission, hasPermission, assertUserCanUseOrg, validateSharedGroupsForOrg, requireActiveOrgForMutations } = require('../auth');
 const { getUserBetaFeatures } = require('../core/betaFeatures');
+
+// Block mutations when the caller's org is suspended/archived. Reads pass through.
+router.use(requireActiveOrgForMutations());
 
 // Beta-feature ids that map 1:1 to a system_slug on a system-managed KB. The
 // chat KB picker should only surface a system KB when the user's org has the
@@ -453,6 +456,7 @@ router.patch('/:id', requireAuth, requirePermission('manage_knowledge'), async (
             name, description, categoryId, icon,
             ...(cleanedContexts ? { usageContexts: cleanedContexts } : {}),
         });
+        kbStore.snapshotKBVersion(kb.id, getUserId(req), 'metadata_update').catch(() => {});
         res.json(updated);
     } catch (e) {
         console.error('[KB] Update error:', e.message);
@@ -494,6 +498,9 @@ router.patch('/:id/publish', requireAuth, async (req, res) => {
             return res.status(err.status || 500).json({ error: err.message });
         }
         const updated = await kbStore.setPublished(kb.id, !!isPublished, cleanedGroups);
+        // Snapshot for audit/rollback. Fire-and-forget — versioning failure
+        // must not unwind a successful publish.
+        kbStore.snapshotKBVersion(kb.id, userId, isPublished ? 'publish' : 'unpublish').catch(() => {});
         res.json({ success: true, kb: updated });
     } catch (e) {
         console.error('[KB] Publish error:', e.message);
@@ -589,13 +596,19 @@ router.post('/:id/documents/bulk-delete', requireAuth, requirePermission('manage
         const ids = Array.isArray(req.body?.documentIds) ? req.body.documentIds.slice(0, 200) : [];
         if (ids.length === 0) return res.status(400).json({ error: 'documentIds required' });
 
+        const userId = getUserId(req);
         let deleted = 0;
         const errors = [];
         for (const docId of ids) {
             try {
                 const doc = await kbStore.getDocument(docId);
                 if (!doc || doc.knowledge_base_id !== kb.id) continue;
-                await deleteDocumentChunks(kb.id, doc.id, kb.tenant_id);
+                // Snapshot happens inside kbStore.deleteDocument (called by
+                // deleteDocumentChunks). To preserve the per-user audit ID,
+                // explicitly call snapshot first with the user id; the store
+                // then skips its own redundant snapshot via skipSnapshot.
+                await kbStore.snapshotDocumentVersion(docId, userId).catch(() => {});
+                await deleteDocumentChunks(kb.id, doc.id, kb.tenant_id, { skipSnapshot: true });
                 deleted++;
             } catch (err) {
                 errors.push({ docId, error: err.message });
@@ -708,7 +721,9 @@ router.delete('/:id/documents/:docId', requireAuth, requirePermission('manage_kn
             return res.status(404).json({ error: 'Document not found' });
         }
 
-        await deleteDocumentChunks(kb.id, doc.id, kb.tenant_id);
+        // Snapshot with the user id, then have the store skip its own.
+        await kbStore.snapshotDocumentVersion(doc.id, getUserId(req)).catch(() => {});
+        await deleteDocumentChunks(kb.id, doc.id, kb.tenant_id, { skipSnapshot: true });
         res.json({ success: true });
     } catch (e) {
         console.error('[KB] Delete doc error:', e.message);

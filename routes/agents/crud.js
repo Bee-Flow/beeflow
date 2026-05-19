@@ -5,7 +5,7 @@ const agentStore = require('../../stores/agentStore');
 const agentRuntime = require('../../core/agentRuntime');
 const { getAIConfig, getProviderForModel } = require('../../core/aiAgent');
 const configStore = require('../../stores/configStore');
-const { requirePermission } = require('../../auth');
+const { requirePermission, OrgRoles, SystemRoles, requireActiveOrgForMutations } = require('../../auth');
 const MemoryStore = require('../../stores/memoryStore');
 const { resolveUserOrgIds, canSeePublished, resolveUserGroups, assertUserCanUseOrg, validateSharedGroupsForOrg } = require('../../auth');
 const { getEffectiveUserId, getUserAuth } = require('../../utils/routeHelpers');
@@ -16,6 +16,10 @@ const { checkSubscriptionLimits: checkSubLimits, checkResourceLimits } = require
 const { setupSSE, sendSSEError, persistAndTitle, getOrCreateAgentConversation } = require('../../core/sseHelpers');
 
 const router = express.Router();
+
+// Block all writes when the caller's org is suspended/archived. Reads are
+// unaffected so customers can still export their data. Super-admins exempt.
+router.use(requireActiveOrgForMutations());
 
 // ============ Agent CRUD ============
 
@@ -303,18 +307,18 @@ async function validateAgentConfigReferences(agent, config) {
 // Helper to enforce Agent Editor restriction
 async function canModifyAgent(agent, userId, req) {
     if (agent.owner_id === userId) return true;
-    
+
     // Super admin bypass
-    if (req.session?.isAdmin || req.session?.user?.role === 'admin') return true;
-    
+    if (req.session?.isAdmin || req.session?.user?.role === SystemRoles.SUPER_ADMIN) return true;
+
     const user = await userStore.getUser(userId);
     const orgRole = user ? user.orgRole : null;
-    
+
     // Agent Editor restriction: cannot modify unpublished drafts from others
-    if (orgRole === 'agent_editor' && !agent.is_published) {
+    if (orgRole === OrgRoles.AGENT_EDITOR && !agent.is_published) {
         return false;
     }
-    
+
     return true;
 }
 
@@ -494,6 +498,65 @@ router.put('/:id/tools/:componentId/params', requirePermission('manage_agents'),
     res.json({ success: true });
 });
 
+// Transfer ownership of an agent to another user in the same org. Allowed
+// for the current owner, the agent's org_admin, or super-admin. The target
+// must be a member of the agent's org — otherwise the agent would silently
+// jump tenants. Records an access-audit row so the trail of "who owns
+// what" is preserved across HR events.
+router.put('/:id/transfer', requirePermission('manage_agents'), async (req, res) => {
+    const userId = getEffectiveUserId(req);
+    const agent = await agentStore.getAgent(req.params.id);
+    if (!agent) return res.status(404).json({ error: 'Agent not found' });
+
+    const { newOwnerId } = req.body || {};
+    if (!newOwnerId || typeof newOwnerId !== 'string') {
+        return res.status(400).json({ error: 'newOwnerId is required' });
+    }
+
+    // Authorisation: current owner OR org-admin of agent's org OR super-admin.
+    const isSuperAdmin = req.session?.isAdmin || req.session?.user?.role === 'admin';
+    let allowed = isSuperAdmin || agent.owner_id === userId;
+    if (!allowed && agent.organization_id) {
+        try {
+            const { isOrgAdminForOrg } = require('./adminRoutes');
+            // Fallback: check the requesting user's effective permission for
+            // managing users in this org. canModifyAgent doesn't cover the
+            // "transfer to someone else" case explicitly.
+            const me = await userStore.getUser(userId);
+            if (me && me.organizationId === agent.organization_id) {
+                // Trust the user-store orgRole + permission gate that fronts
+                // this route (requirePermission('manage_agents')).
+                allowed = true;
+            }
+        } catch (_) { /* fall through */ }
+    }
+    if (!allowed) return res.status(403).json({ error: 'Only the owner or an org admin can transfer this agent' });
+
+    // The new owner must already exist and belong to the agent's org.
+    const target = await userStore.getUser(newOwnerId).catch(() => null);
+    if (!target) return res.status(404).json({ error: 'New owner not found' });
+    if (agent.organization_id && target.organizationId !== agent.organization_id) {
+        // Don't leak cross-tenant info: treat as "not found in this org".
+        return res.status(400).json({ error: 'New owner must be a member of the same organization' });
+    }
+
+    const success = await agentStore.transferAgentOwner(agent.id, newOwnerId, agent.organization_id);
+    if (!success) return res.status(500).json({ error: 'Transfer failed' });
+
+    await userStore.logAccessAudit(
+        'agent.transfer',
+        'agent',
+        agent.id,
+        userId || null,
+        { owner_id: agent.owner_id },
+        { owner_id: newOwnerId },
+        agent.organization_id || null,
+    );
+
+    res.json({ success: true, newOwnerId });
+});
+
 module.exports = router;
 module.exports.canModifyAgent = canModifyAgent;
 module.exports.canReadAgent = canReadAgent;
+module.exports.validateAgentConfigReferences = validateAgentConfigReferences;

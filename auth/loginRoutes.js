@@ -1085,6 +1085,27 @@ router.post('/signup', async (req, res) => {
             const invitationStore = require('../stores/invitationStore');
             await invitationStore.markAccepted(inviteToken);
             console.log(`[Signup] Invitation accepted for ${email} → org ${orgId}`);
+            // Audit the redemption: the new user, the issuer, the granted
+            // role/groups. Failures here mustn't block signup.
+            try {
+                await userStore.logAccessAudit(
+                    'invitation.redeem',
+                    'user',
+                    newUser.id,
+                    newUser.id,
+                    null,
+                    {
+                        invitation_id: inviteData.id,
+                        email: inviteData.email,
+                        invited_by: inviteData.invited_by,
+                        orgRole: inviteData.org_role || inviteData.orgRole,
+                        groups: inviteData.groups,
+                    },
+                    inviteData.organization_id || orgId || null,
+                );
+            } catch (auditErr) {
+                console.warn('[Signup] invitation.redeem audit failed:', auditErr.message);
+            }
         } catch (e) {
             console.error('[Signup] Failed to mark invitation as accepted:', e.message);
         }
@@ -1160,6 +1181,66 @@ router.get('/invite/:token', async (req, res) => {
         console.error('[Invite] Token validation error:', err);
         res.status(500).json({ valid: false, error: 'Server error' });
     }
+});
+
+// Invitation landing handler. The email link is `/api/auth/redeem-invite/<token>`
+// (path-style — the token is on the URL path, not in a query string). This
+// endpoint validates the token, stashes it in the session, and 302-redirects
+// to the SPA login route WITHOUT the token in the URL. That keeps the token
+// out of the browser address bar, the Referer header, and reverse-proxy
+// access logs after the redirect fires.
+router.get('/redeem-invite/:token', async (req, res) => {
+    const token = req.params.token;
+    const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}`;
+    try {
+        const invitationStore = require('../stores/invitationStore');
+        const invitation = await invitationStore.getInvitationByToken(token);
+        if (!invitation) {
+            return res.redirect(`${clientHost}/login?error=invite_expired`);
+        }
+        // Persist on the session — the SPA picks it up via GET /auth/pending-invite.
+        req.session.pendingInviteToken = token;
+        req.session.save(() => res.redirect(`${clientHost}/login?signup=1`));
+    } catch (err) {
+        console.error('[Invite] Redeem error:', err);
+        res.redirect(`${clientHost}/login?error=invite_error`);
+    }
+});
+
+// Read the invite token previously stashed by /redeem-invite. Returns the
+// resolved invitation payload (same shape as /invite/:token) plus the
+// underlying token so the signup flow can submit it. Token is one-shot:
+// reading clears the session entry so a refresh after signup doesn't
+// re-apply it.
+router.get('/pending-invite', async (req, res) => {
+    try {
+        const token = req.session?.pendingInviteToken;
+        if (!token) return res.json({ valid: false });
+        const invitationStore = require('../stores/invitationStore');
+        const invitation = await invitationStore.getInvitationByToken(token);
+        if (!invitation) {
+            delete req.session.pendingInviteToken;
+            return res.json({ valid: false, error: 'Invitation expired or invalid' });
+        }
+        const org = await userStore.getOrganization(invitation.organization_id);
+        res.json({
+            valid: true,
+            token,
+            email: invitation.email,
+            organizationId: invitation.organization_id,
+            orgName: org?.name || '',
+            orgLogo: org?.logo || null,
+            role: invitation.role,
+        });
+    } catch (err) {
+        console.error('[Invite] pending-invite error:', err);
+        res.status(500).json({ valid: false, error: 'Server error' });
+    }
+});
+
+router.post('/pending-invite/clear', async (req, res) => {
+    if (req.session?.pendingInviteToken) delete req.session.pendingInviteToken;
+    req.session.save(() => res.json({ ok: true }));
 });
 
 module.exports = router;

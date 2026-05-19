@@ -306,7 +306,11 @@ router.post('/auto-detect-settings', requireAuth, requirePermission('admin_compl
         let admins = [];
         try {
             admins = await getAll(
-                `SELECT email FROM users WHERE "organizationId" = $1 AND (role = 'admin' OR "orgRole" = 'admin')`,
+                // 'org_admin' is the canonical orgRole. The legacy 'admin'
+                // value is kept in the IN-list to cover historical rows
+                // that pre-date the rename (matches the normalisation in
+                // server/auth/permissions.js).
+                `SELECT email FROM users WHERE "organizationId" = $1 AND (role = 'admin' OR "orgRole" IN ('org_admin', 'admin'))`,
                 [orgId],
             );
         } catch { admins = []; }

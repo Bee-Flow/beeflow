@@ -283,10 +283,35 @@ async function scrubSkillFromAllAgents(orgId, skillId) {
     return scrubbed;
 }
 
+/**
+ * Reassign an agent's owner. Returns true on success, false if the agent
+ * doesn't exist or the new owner isn't in the agent's org (caller is
+ * responsible for that check too; we double-check here as a safety net).
+ *
+ * @param {string} agentId
+ * @param {string} newOwnerId
+ * @param {string} expectedOrgId  agent.organization_id (refuses if mismatch)
+ */
+async function transferAgentOwner(agentId, newOwnerId, expectedOrgId) {
+    await initDB();
+    const agent = await getOne('SELECT organization_id FROM agents WHERE id = $1', [agentId]);
+    if (!agent) return false;
+    if (expectedOrgId && agent.organization_id && agent.organization_id !== expectedOrgId) {
+        return false;
+    }
+    const { rowCount } = await run(
+        'UPDATE agents SET owner_id = $1, updated_at = NOW() WHERE id = $2',
+        [newOwnerId, agentId]
+    );
+    if (rowCount > 0 && agent.organization_id) _notifySync(agent.organization_id, agentId);
+    return rowCount > 0;
+}
+
 module.exports = {
     createAgent, getAgents, getAgent, updateAgent, deleteAgent, forceDeleteAgent,
     getPublishedAgents, setAgentPublished, getPublishedAgentsForUser,
     getAllAgents, getSystemAgents, ensurePlaceholderAgent,
     getAgentCategories, createAgentCategory, deleteAgentCategory,
     scrubSkillFromAllAgents,
+    transferAgentOwner,
 };

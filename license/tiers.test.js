@@ -46,25 +46,61 @@ const community = t.getFeaturesForTier('community');
 const enterprise = t.getFeaturesForTier('enterprise');
 const full = t.getFeaturesForTier('full');
 
-// Community is now the everything-the-product-does tier.
+// Community is the free self-hosted core: chat + KB + Nextcloud + multi-user
+// + agent routines + skills. Studio-class capabilities (voice, webpages,
+// automations, meeting notes, ticket assistant, notebooks, component
+// designer) were promoted to Enterprise in the tier tightening — see
+// docs/docs/licensing/tiers.md.
 assert.ok(community.includes('chat_basic'));
-assert.ok(community.includes('nextcloud_basic'));
-assert.ok(community.includes('automations'), 'community must include automations');
-assert.ok(community.includes('multi_user'), 'community must include multi_user');
-assert.ok(community.includes('voice_chat'), 'community must include voice_chat');
-assert.ok(community.includes('skills'), 'community must include skills');
-assert.ok(community.includes('meeting_notes'), 'community must include meeting_notes');
+assert.ok(community.includes('kb_local_small'));
 assert.ok(community.includes('kb_unlimited'), 'community must include kb_unlimited');
+assert.ok(community.includes('nextcloud_basic'));
+assert.ok(community.includes('nextcloud_oauth'));
+assert.ok(community.includes('single_user_login'));
+assert.ok(community.includes('multi_user'), 'community must include multi_user');
+assert.ok(community.includes('agent_routines'));
+assert.ok(community.includes('skills'), 'community must include skills');
+
+// Promoted to Enterprise — must NOT be in community.
+for (const f of [
+    'voice_chat',
+    'webpages',
+    'automations',
+    'meeting_notes',
+    'ticket_assistant',
+    'component_designer',
+    'notebooks',
+]) {
+    assert.ok(!community.includes(f), `community must NOT include promoted feature ${f}`);
+}
+
+// Compliance / admin / resale flags stay out of community.
 assert.ok(!community.includes('guardrails_dlp'), 'community must NOT include enterprise features');
 assert.ok(!community.includes('sso_saml'));
 assert.ok(!community.includes('white_label'));
 
-// Enterprise inherits community + adds compliance/admin.
+// Enterprise inherits community + adds the promoted Studio features + the
+// compliance/admin block.
 for (const f of community) assert.ok(enterprise.includes(f), `enterprise should inherit community feature ${f}`);
-assert.ok(enterprise.includes('guardrails_dlp'));
-assert.ok(enterprise.includes('compliance_hub_gdpr'));
-assert.ok(enterprise.includes('sso_saml'));
-assert.ok(enterprise.includes('audit_log_export'));
+for (const f of [
+    'voice_chat',
+    'webpages',
+    'automations',
+    'meeting_notes',
+    'ticket_assistant',
+    'component_designer',
+    'notebooks',
+    'guardrails_dlp',
+    'compliance_hub_gdpr',
+    'compliance_hub_aia',
+    'sso_saml',
+    'audit_log_export',
+    'custom_themes',
+    'swarm',
+    'advanced_analytics',
+]) {
+    assert.ok(enterprise.includes(f), `enterprise must include ${f}`);
+}
 assert.ok(!enterprise.includes('white_label'), 'enterprise must NOT include resale features');
 
 // Full inherits enterprise + adds resale/branding.
@@ -106,13 +142,27 @@ assert.strictEqual(t.getLimitsForTier('community').max_agents, -1, 'getLimitsFor
 
 // ── tierHasFeature ──────────────────────────────────────────────────────
 assert.strictEqual(t.tierHasFeature('community', 'chat_basic'), true);
-assert.strictEqual(t.tierHasFeature('community', 'automations'), true, 'automations is now community');
+assert.strictEqual(t.tierHasFeature('community', 'skills'), true);
+assert.strictEqual(t.tierHasFeature('community', 'agent_routines'), true);
+assert.strictEqual(t.tierHasFeature('community', 'automations'), false, 'automations is enterprise');
+assert.strictEqual(t.tierHasFeature('community', 'voice_chat'), false, 'voice_chat is enterprise');
+assert.strictEqual(t.tierHasFeature('community', 'webpages'), false);
+assert.strictEqual(t.tierHasFeature('community', 'meeting_notes'), false);
+assert.strictEqual(t.tierHasFeature('community', 'ticket_assistant'), false);
+assert.strictEqual(t.tierHasFeature('community', 'component_designer'), false);
+assert.strictEqual(t.tierHasFeature('community', 'notebooks'), false);
 assert.strictEqual(t.tierHasFeature('community', 'sso_saml'), false);
-assert.strictEqual(t.tierHasFeature('enterprise', 'automations'), true, 'enterprise inherits community');
+assert.strictEqual(t.tierHasFeature('enterprise', 'automations'), true, 'enterprise gets promoted features');
+assert.strictEqual(t.tierHasFeature('enterprise', 'voice_chat'), true);
+assert.strictEqual(t.tierHasFeature('enterprise', 'component_designer'), true);
+assert.strictEqual(t.tierHasFeature('enterprise', 'notebooks'), true);
 assert.strictEqual(t.tierHasFeature('enterprise', 'sso_saml'), true);
 assert.strictEqual(t.tierHasFeature('full', 'white_label'), true);
 assert.strictEqual(t.tierHasFeature('enterprise', 'white_label'), false);
 assert.strictEqual(t.tierHasFeature('pro', 'sso_saml'), true, 'legacy pro inherits enterprise features');
+assert.strictEqual(t.tierHasFeature('pro', 'automations'), true, 'legacy pro must keep automations via enterprise');
+assert.strictEqual(t.tierHasFeature('pro', 'notebooks'), true, 'legacy pro must keep notebooks via enterprise');
 assert.strictEqual(t.tierHasFeature('bogus', 'chat_basic'), true, 'invalid tier falls back to community');
+assert.strictEqual(t.tierHasFeature('bogus', 'automations'), false, 'invalid tier falls back to community (no enterprise features)');
 
 console.log('✓ license/tiers.test.js — all assertions passed');

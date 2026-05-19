@@ -526,8 +526,13 @@ async function ingestDocument(tenantId, kbId, content, title, sourceType, source
  * @param {string} kbId     — knowledge base ID
  * @param {string} docId    — document ID
  * @param {string} tenantId — user ID
+ * @param {object} opts     — optional flags
+ * @param {boolean} opts.skipSnapshot — caller has already snapshotted the
+ *   document version; skip the store-level snapshot to avoid a double-write.
+ *   Default false — background callers (reindex cleanup, etc.) always
+ *   snapshot via the store.
  */
-async function deleteDocumentChunks(kbId, docId, tenantId) {
+async function deleteDocumentChunks(kbId, docId, tenantId, { skipSnapshot = false } = {}) {
     // Clean up local kb_chunks (for Azure-path ingested docs)
     try {
         const { deleteChunksLocally } = require('./localKBIngest');
@@ -550,7 +555,7 @@ async function deleteDocumentChunks(kbId, docId, tenantId) {
         console.warn('[KBHelpers] Search-service chunk cleanup failed:', e.message);
     }
 
-    await kbStore.deleteDocument(docId);
+    await kbStore.deleteDocument(docId, { skipSnapshot });
     await kbStore.bumpKBVersion(kbId);
 }
 

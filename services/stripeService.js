@@ -23,8 +23,11 @@ async function getClient() {
     if (_client && _lastKeyHash === keyHash) return _client;
 
     const Stripe = require('stripe');
+    // Override via STRIPE_API_VERSION when validating a new Stripe API
+    // version against staging before rolling it out everywhere.
+    const apiVersion = process.env.STRIPE_API_VERSION || '2024-12-18.acacia';
     _client = new Stripe(key, {
-        apiVersion: '2024-12-18.acacia',
+        apiVersion,
         appInfo: { name: 'BeeFlow', version: '1.0.0' },
     });
     _lastKeyHash = keyHash;
@@ -262,6 +265,35 @@ async function reportPaygUsage({ stripeCustomerId, amountMicroUnits, identifier,
  * @param {string} [options.stripeCustomerId] - Existing Stripe customer ID
  * @returns {object} Stripe Checkout Session
  */
+// EU country code → Stripe tax_id `type` enum. The list covers every member
+// state. Other types (gb_vat, ch_vat, etc.) are inferred similarly when we
+// add support for those jurisdictions.
+const EU_VAT_COUNTRIES = new Set([
+    'AT', 'BE', 'BG', 'CY', 'CZ', 'DE', 'DK', 'EE', 'EL', 'GR', 'ES', 'FI',
+    'FR', 'HR', 'HU', 'IE', 'IT', 'LT', 'LU', 'LV', 'MT', 'NL', 'PL', 'PT',
+    'RO', 'SE', 'SI', 'SK',
+]);
+
+/**
+ * Normalise a user-entered VAT id and resolve the Stripe tax_id type that
+ * matches it. Returns {type, value} on success, null when the value is
+ * empty or doesn't look like a supported VAT id. Strips spaces and
+ * separators, uppercases, and validates the country prefix.
+ */
+function resolveStripeTaxId(rawVat) {
+    if (!rawVat || typeof rawVat !== 'string') return null;
+    const cleaned = rawVat.replace(/[\s\-_.]/g, '').toUpperCase();
+    if (cleaned.length < 4) return null;
+    const country = cleaned.slice(0, 2);
+    const body = cleaned.slice(2);
+    if (!/^[A-Z0-9+*]{2,15}$/.test(body)) return null;
+    if (EU_VAT_COUNTRIES.has(country)) return { type: 'eu_vat', value: cleaned };
+    if (country === 'GB') return { type: 'gb_vat', value: cleaned };
+    if (country === 'CH') return { type: 'ch_vat', value: cleaned };
+    if (country === 'NO') return { type: 'no_vat', value: cleaned };
+    return null;
+}
+
 async function createCheckoutSession({ plan, orgId, orgName, userId, subscriberType = 'organization', userEmail, successUrl, cancelUrl, stripeCustomerId }) {
     const stripe = await getClient();
 
@@ -305,9 +337,49 @@ async function createCheckoutSession({ plan, orgId, orgName, userId, subscriberT
         subscription_data: { metadata },
     };
 
-    // Re-use existing customer or pre-fill email
-    if (stripeCustomerId) {
-        sessionParams.customer = stripeCustomerId;
+    // For org checkouts, pre-attach the org's stored VAT to a Stripe customer
+    // so Stripe Tax can apply reverse charge (EU B2B) without making the
+    // org-admin re-enter the number during checkout. We only build/upgrade
+    // a customer when the VAT is parseable; otherwise we fall back to the
+    // existing email/customer flow and Stripe will collect the VAT inline.
+    let effectiveCustomerId = stripeCustomerId || null;
+    if (!isConsumer && orgId) {
+        try {
+            const userStore = require('../stores/userStore');
+            const org = await userStore.getOrganization(orgId);
+            const taxId = org ? resolveStripeTaxId(org.vat) : null;
+            if (taxId) {
+                if (!effectiveCustomerId) {
+                    const created = await stripe.customers.create({
+                        name: orgName || org?.name || undefined,
+                        email: userEmail || org?.email || undefined,
+                        metadata: { beeflow_org_id: orgId },
+                    });
+                    effectiveCustomerId = created.id;
+                }
+                // Attach the tax id (idempotent: list existing first; create
+                // only if missing). Failure to attach is non-fatal — the
+                // checkout still proceeds and Stripe's inline tax_id_collection
+                // will pick up the slack.
+                try {
+                    const existing = await stripe.customers.listTaxIds(effectiveCustomerId, { limit: 25 });
+                    const already = (existing?.data || []).some(t => t.value === taxId.value && t.type === taxId.type);
+                    if (!already) {
+                        await stripe.customers.createTaxId(effectiveCustomerId, taxId);
+                    }
+                } catch (e) {
+                    console.warn(`[Stripe] attaching VAT for org ${orgId} failed: ${e.message}`);
+                }
+            }
+        } catch (e) {
+            console.warn(`[Stripe] org VAT pre-attach skipped: ${e.message}`);
+        }
+    }
+
+    // Re-use existing customer (possibly just created above with VAT) or
+    // pre-fill email so Stripe creates one at checkout time.
+    if (effectiveCustomerId) {
+        sessionParams.customer = effectiveCustomerId;
     } else {
         sessionParams.customer_email = userEmail;
     }
@@ -323,7 +395,8 @@ async function createCheckoutSession({ plan, orgId, orgName, userId, subscriberT
         sessionParams.automatic_tax = { enabled: true };
         // Collect billing address so Stripe can calculate tax
         sessionParams.billing_address_collection = 'required';
-        // Allow B2B customers to enter VAT numbers
+        // Allow B2B customers to enter VAT numbers (covers customers we
+        // didn't pre-attach a VAT for above).
         sessionParams.tax_id_collection = { enabled: true };
     }
 
@@ -404,6 +477,18 @@ async function createTrialSubscription({ plan, subscriberType, subscriberId, org
  * @param {string} returnUrl - URL to return to after portal
  * @returns {object} Portal session with url
  */
+/**
+ * Synchronous lookup of a Stripe Checkout Session, expanding subscription +
+ * customer so the caller can render post-checkout state without waiting
+ * for the webhook. Used by GET /api/stripe/sessions/:id.
+ */
+async function retrieveCheckoutSession(sessionId) {
+    const stripe = await getClient();
+    return stripe.checkout.sessions.retrieve(sessionId, {
+        expand: ['subscription', 'customer'],
+    });
+}
+
 async function createPortalSession(stripeCustomerId, returnUrl) {
     const stripe = await getClient();
     return stripe.billingPortal.sessions.create({
@@ -613,6 +698,7 @@ module.exports = {
     createCheckoutSession,
     createTrialSubscription,
     createPortalSession,
+    retrieveCheckoutSession,
     syncSeatQuantityForOrg,
     constructWebhookEvent,
     createPromoCode,

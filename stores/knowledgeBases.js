@@ -81,6 +81,45 @@ async function initDB() {
             console.log('[KnowledgeBases] Backfilled is_published=TRUE for existing org KBs');
         } catch (e) { console.warn('[KnowledgeBases] Backfill failed:', e.message); }
     }
+    // ── KB versioning ──
+    // Two-tier history: kb_versions captures full metadata snapshots of the
+    // KB row on every meaningful edit (publish, rename, shared-group change);
+    // kb_document_versions captures document content right before a delete so
+    // an accidental drop can be recovered. Neither table is on the hot read
+    // path — they're written from mutation handlers and read only from
+    // admin/restore UIs.
+    await exec(`
+        CREATE TABLE IF NOT EXISTS kb_versions (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            kb_id UUID NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+            version_number INT NOT NULL,
+            snapshot JSONB NOT NULL,
+            changed_by TEXT,
+            change_reason TEXT,
+            created_at TIMESTAMPTZ DEFAULT now()
+        )
+    `);
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_kb_versions_kb ON kb_versions(kb_id, version_number DESC)`); } catch (_) { /* exists */ }
+    try { await exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_versions_unique ON kb_versions(kb_id, version_number)`); } catch (_) { /* exists */ }
+
+    await exec(`
+        CREATE TABLE IF NOT EXISTS kb_document_versions (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            document_id UUID NOT NULL,
+            knowledge_base_id UUID NOT NULL,
+            tenant_id TEXT NOT NULL,
+            title TEXT,
+            source_type TEXT,
+            source_uri TEXT,
+            content_hash TEXT,
+            payload JSONB,
+            deleted_by TEXT,
+            deleted_at TIMESTAMPTZ DEFAULT now()
+        )
+    `);
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_kb_doc_versions_kb ON kb_document_versions(knowledge_base_id, deleted_at DESC)`); } catch (_) { /* exists */ }
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_kb_doc_versions_doc ON kb_document_versions(document_id)`); } catch (_) { /* exists */ }
+
     // Org-level KB categories (mirrors agent_categories)
     await exec(`
         CREATE TABLE IF NOT EXISTS kb_categories (
@@ -635,8 +674,20 @@ const KnowledgeBasesStore = {
         return getOne('SELECT * FROM documents WHERE id = $1', [id]);
     },
 
-    deleteDocument: async (id) => {
+    deleteDocument: async (id, { deletedBy = null, skipSnapshot = false } = {}) => {
         await initDB();
+        // Snapshot first so the row can be recovered via listDeletedDocuments.
+        // The route handlers used to do this themselves; moving the call here
+        // guarantees the snapshot also runs for background callers (reindex
+        // cleanup, legacy bulk paths). Pass skipSnapshot:true when the caller
+        // has already snapshotted to avoid double-writes.
+        if (!skipSnapshot) {
+            try {
+                await KnowledgeBasesStore.snapshotDocumentVersion(id, deletedBy);
+            } catch (e) {
+                console.warn('[KnowledgeBases] deleteDocument: snapshot failed', e.message);
+            }
+        }
         await run('DELETE FROM documents WHERE id = $1', [id]);
         return true;
     },
@@ -703,6 +754,87 @@ const KnowledgeBasesStore = {
         await run(
             `DELETE FROM kb_favorites WHERE user_id = $1 AND kb_id = $2`,
             [userId, kbId]
+        );
+    },
+
+    // ── KB Versioning ───────────────────────────────────────────────────
+    // Snapshot the current state of a KB into kb_versions. Returns the new
+    // version number, or null on failure. Best-effort: a failed snapshot
+    // must never block the caller's mutation.
+    snapshotKBVersion: async (kbId, changedBy, changeReason = null) => {
+        await initDB();
+        try {
+            const kb = await getOne(`SELECT * FROM knowledge_bases WHERE id = $1`, [kbId]);
+            if (!kb) return null;
+            const next = await getOne(
+                `SELECT COALESCE(MAX(version_number), 0) + 1 AS v FROM kb_versions WHERE kb_id = $1`,
+                [kbId]
+            );
+            const versionNumber = next?.v || 1;
+            await run(
+                `INSERT INTO kb_versions (kb_id, version_number, snapshot, changed_by, change_reason)
+                 VALUES ($1, $2, $3, $4, $5)`,
+                [kbId, versionNumber, JSON.stringify(kb), changedBy || null, changeReason || null]
+            );
+            return versionNumber;
+        } catch (e) {
+            console.warn('[KnowledgeBases] snapshotKBVersion failed:', e.message);
+            return null;
+        }
+    },
+
+    listKBVersions: async (kbId, { limit = 50, offset = 0 } = {}) => {
+        await initDB();
+        return getAll(
+            `SELECT id, version_number, changed_by, change_reason, created_at
+             FROM kb_versions WHERE kb_id = $1
+             ORDER BY version_number DESC LIMIT $2 OFFSET $3`,
+            [kbId, limit, offset]
+        );
+    },
+
+    getKBVersion: async (kbId, versionNumber) => {
+        await initDB();
+        return getOne(
+            `SELECT * FROM kb_versions WHERE kb_id = $1 AND version_number = $2`,
+            [kbId, versionNumber]
+        );
+    },
+
+    // Snapshot a document BEFORE its row is deleted so a re-ingest can
+    // recover the original metadata. Chunks themselves live in the
+    // search-service; we record what's needed to reconstruct a re-ingest
+    // request (title, source URI, content hash). Best-effort.
+    snapshotDocumentVersion: async (documentId, deletedBy = null) => {
+        await initDB();
+        try {
+            const doc = await getOne(`SELECT * FROM documents WHERE id = $1`, [documentId]);
+            if (!doc) return null;
+            await run(
+                `INSERT INTO kb_document_versions
+                    (document_id, knowledge_base_id, tenant_id, title, source_type,
+                     source_uri, content_hash, payload, deleted_by)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+                [
+                    doc.id, doc.knowledge_base_id, doc.tenant_id,
+                    doc.title, doc.source_type, doc.source_uri,
+                    doc.content_hash, JSON.stringify(doc), deletedBy,
+                ]
+            );
+            return doc.id;
+        } catch (e) {
+            console.warn('[KnowledgeBases] snapshotDocumentVersion failed:', e.message);
+            return null;
+        }
+    },
+
+    listDeletedDocuments: async (kbId, { limit = 100 } = {}) => {
+        await initDB();
+        return getAll(
+            `SELECT id, document_id, title, source_type, source_uri, deleted_at, deleted_by
+             FROM kb_document_versions WHERE knowledge_base_id = $1
+             ORDER BY deleted_at DESC LIMIT $2`,
+            [kbId, limit]
         );
     },
 };

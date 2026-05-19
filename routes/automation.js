@@ -262,6 +262,12 @@ router.use(requireAuth);
 const { requireBetaFeature } = require('../core/betaFeatures');
 router.use(requireBetaFeature('automations'));
 
+// Block all writes when the caller's org is suspended/archived. Public webhook
+// routes above this point are intentionally not gated — they're inbound from
+// external services and have no session/org context.
+const { requireActiveOrgForMutations } = require('../auth');
+router.use(requireActiveOrgForMutations());
+
 // Catalog — auto-introspect existing TOOLS arrays.
 router.get('/catalog', async (req, res) => {
     try {

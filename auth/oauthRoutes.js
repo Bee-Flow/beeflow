@@ -218,11 +218,16 @@ router.get('/login', async (req, res) => {
         return res.redirect(`${returnTo}?error=oauth_not_configured`);
     }
 
+    // CSRF defense — the state must be high-entropy and validated on callback.
+    // `Math.random()` was both predictable and unread on the callback side.
+    const state = crypto.randomBytes(16).toString('hex');
+    req.session.legacyOAuthState = state;
+
     const authUrl = `${nextcloudUrl}/apps/oauth2/authorize?` + new URLSearchParams({
         response_type: 'code',
         client_id: clientId,
         redirect_uri: REDIRECT_URI,
-        state: Math.random().toString(36).substring(7)
+        state,
     }).toString();
 
     req.session.save(() => {
@@ -233,7 +238,7 @@ router.get('/login', async (req, res) => {
 
 // Legacy Nextcloud callback
 router.get('/callback', async (req, res) => {
-    const { code, error } = req.query;
+    const { code, error, state } = req.query;
     const config = await loadConfig();
     const { nextcloudUrl, clientId, clientSecret } = config.oauth || {};
 
@@ -244,6 +249,20 @@ router.get('/callback', async (req, res) => {
 
     const host = req.get('host');
     const REDIRECT_URI = `${req.protocol}://${host}/auth/callback`;
+
+    // Validate the CSRF state we issued at /login above. Compare in
+    // constant time and clear the session value either way so a leaked
+    // state can't be replayed.
+    const expectedState = req.session.legacyOAuthState;
+    delete req.session.legacyOAuthState;
+    if (!expectedState || typeof state !== 'string') {
+        return res.redirect(`${returnTo}?error=invalid_state`);
+    }
+    const a = Buffer.from(expectedState, 'utf8');
+    const b = Buffer.from(state, 'utf8');
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+        return res.redirect(`${returnTo}?error=invalid_state`);
+    }
 
     if (error) {
         console.error('OAuth error:', error);
@@ -447,6 +466,19 @@ router.get('/login/:provider', async (req, res) => {
     const state = crypto.randomBytes(16).toString('hex');
     req.session.oauthState = state;
 
+    // PKCE (RFC 7636) — generate a 32-byte verifier and its SHA-256 challenge
+    // so the token exchange is bound to this browser even if an attacker
+    // intercepts the auth code. Stash the verifier in the session (cleared
+    // on callback) and send the challenge with the authorize request. We
+    // emit PKCE for every provider that supports it (Google + Microsoft).
+    // Nextcloud's OAuth2 app supports PKCE since v22 — sending it is safe;
+    // servers that don't recognise the params ignore them.
+    const codeVerifier = crypto.randomBytes(32).toString('base64')
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64')
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    req.session.oauthCodeVerifier = codeVerifier;
+
     if (provider === 'google') {
         const providerConfig = config.providers?.google || {};
         if (!providerConfig.clientId) {
@@ -460,7 +492,9 @@ router.get('/login/:provider', async (req, res) => {
             scope: OAUTH_PROVIDERS.google.scopes.join(' '),
             state: state,
             access_type: 'offline',
-            prompt: 'consent'
+            prompt: 'consent',
+            code_challenge: codeChallenge,
+            code_challenge_method: 'S256',
         }).toString();
 
         req.session.save(() => {
@@ -490,7 +524,9 @@ router.get('/login/:provider', async (req, res) => {
             redirect_uri: REDIRECT_URI,
             scope: scopes,
             state: state,
-            response_mode: 'query'
+            response_mode: 'query',
+            code_challenge: codeChallenge,
+            code_challenge_method: 'S256',
         }).toString();
 
         console.log(`[OAuth/Microsoft] Auth URL: ${authUrl}`);
@@ -575,22 +611,30 @@ router.get('/callback/:provider', async (req, res) => {
     }
     const REDIRECT_URI = `${protocol}://${host}/auth/callback/${provider}`;
 
+    // PKCE verifier paired with the auth code by /login/:provider. One-shot:
+    // clear from the session whether the exchange succeeds or fails so a
+    // leaked auth code can't be replayed in another browser.
+    const codeVerifier = req.session.oauthCodeVerifier;
+    delete req.session.oauthCodeVerifier;
+
     try {
         let tokenData, user;
 
         if (provider === 'google') {
             const providerConfig = config.providers?.google || {};
 
+            const googleBody = {
+                grant_type: 'authorization_code',
+                code: code,
+                redirect_uri: REDIRECT_URI,
+                client_id: providerConfig.clientId,
+                client_secret: providerConfig.clientSecret,
+            };
+            if (codeVerifier) googleBody.code_verifier = codeVerifier;
             const tokenResponse = await fetch(OAUTH_PROVIDERS.google.tokenUrl, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body: new URLSearchParams({
-                    grant_type: 'authorization_code',
-                    code: code,
-                    redirect_uri: REDIRECT_URI,
-                    client_id: providerConfig.clientId,
-                    client_secret: providerConfig.clientSecret
-                }).toString()
+                body: new URLSearchParams(googleBody).toString()
             });
 
             if (!tokenResponse.ok) {
@@ -631,16 +675,18 @@ router.get('/callback/:provider', async (req, res) => {
             console.log(`[OAuth/Microsoft] tenantId: ${tenantId}`);
             console.log(`[OAuth/Microsoft] code length: ${(code || '').length}`);
 
+            const msBody = {
+                grant_type: 'authorization_code',
+                code: code,
+                redirect_uri: REDIRECT_URI,
+                client_id: providerConfig.clientId,
+                client_secret: providerConfig.clientSecret,
+            };
+            if (codeVerifier) msBody.code_verifier = codeVerifier;
             const tokenResponse = await fetch(tokenUrl, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body: new URLSearchParams({
-                    grant_type: 'authorization_code',
-                    code: code,
-                    redirect_uri: REDIRECT_URI,
-                    client_id: providerConfig.clientId,
-                    client_secret: providerConfig.clientSecret
-                }).toString()
+                body: new URLSearchParams(msBody).toString()
             });
 
             console.log(`[OAuth/Microsoft] Token response status: ${tokenResponse.status} ${tokenResponse.statusText}`);
@@ -1279,6 +1325,110 @@ router.post('/providers/:provider/test', requireAdmin, async (req, res) => {
 
     } else {
         res.status(404).json({ error: 'Unknown provider' });
+    }
+});
+
+// === Self-service OAuth credential management ===
+//
+// Lets a signed-in user inspect and revoke the long-lived OAuth credentials
+// the routine vault holds on their behalf. Revoking deletes the local row
+// AND calls the provider's revocation endpoint when one is known — so
+// background runners stop using the credential immediately, and Google /
+// Microsoft can clean up their issued tokens. Failures on the provider
+// side are logged but the local delete proceeds regardless (we'd rather
+// orphan a token in the provider than keep an unrevocable secret around).
+
+function _requireAuthedUser(req, res) {
+    if (!req.session?.user?.id) {
+        res.status(401).json({ error: 'Not authenticated' });
+        return null;
+    }
+    return req.session.user.id;
+}
+
+router.get('/integrations/credentials', async (req, res) => {
+    const userId = _requireAuthedUser(req, res);
+    if (!userId) return;
+    try {
+        const list = await routineCredentialStore.listProvidersForUser(userId);
+        res.json({ credentials: list });
+    } catch (e) {
+        console.error('[OAuth] list credentials failed:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Best-effort provider-side revocation. Each provider expects a slightly
+// different shape; failures are non-fatal so the local delete always
+// proceeds. Tokens are decrypted from the vault only inside this call.
+async function _revokeAtProvider(provider, accessToken) {
+    if (!accessToken) return { ok: false, reason: 'no_token' };
+    try {
+        if (provider === 'google') {
+            const r = await fetch('https://oauth2.googleapis.com/revoke', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: new URLSearchParams({ token: accessToken }).toString(),
+            });
+            return { ok: r.ok, status: r.status };
+        }
+        if (provider === 'microsoft') {
+            // Microsoft Graph doesn't expose a token-revoke endpoint for
+            // confidential clients. The closest official action is calling
+            // /me/revokeSignInSessions, but that requires the right scope.
+            // Document and skip — local delete still cuts off our access.
+            return { ok: false, reason: 'no_revoke_endpoint' };
+        }
+        if (provider === 'nextcloud') {
+            // Per-instance; we don't know the instance URL from inside this
+            // helper, and the Nextcloud OAuth2 app doesn't standardise a
+            // revocation endpoint. Skip.
+            return { ok: false, reason: 'no_revoke_endpoint' };
+        }
+        return { ok: false, reason: 'unknown_provider' };
+    } catch (e) {
+        return { ok: false, reason: e.message };
+    }
+}
+
+router.delete('/integrations/credentials/:provider', async (req, res) => {
+    const userId = _requireAuthedUser(req, res);
+    if (!userId) return;
+    const provider = String(req.params.provider || '').toLowerCase();
+    try {
+        const cred = await routineCredentialStore.getCredential(userId, provider);
+        if (!cred) return res.status(404).json({ error: 'Credential not found' });
+
+        // 1. Provider-side revoke (best-effort).
+        const providerResult = await _revokeAtProvider(provider, cred.accessToken);
+        if (!providerResult.ok) {
+            console.warn(`[OAuth] provider revoke userId=${userId} provider=${provider} skipped: ${providerResult.reason || providerResult.status}`);
+        }
+
+        // 2. Mark revoked first (so a partial failure leaves the row in a
+        // refusable state), then delete.
+        await routineCredentialStore.markRevoked(userId, provider).catch(() => {});
+        const deleted = await routineCredentialStore.deleteCredential(userId, provider);
+
+        // 3. Audit. Uses the access_audit_log added in C7 — same shape as
+        // credential.delete from configStore.
+        try {
+            const userStore = require('../stores/userStore');
+            await userStore.logAccessAudit(
+                'credential.revoke',
+                'oauth_credential',
+                `${userId}:${provider}`,
+                userId,
+                null,
+                { provider, provider_revoke_ok: providerResult.ok },
+                cred.orgId || null,
+            );
+        } catch (_) { /* non-fatal */ }
+
+        res.json({ success: deleted, providerRevokeAttempted: !!cred.accessToken, providerRevokeOk: providerResult.ok });
+    } catch (e) {
+        console.error('[OAuth] revoke credential failed:', e.message);
+        res.status(500).json({ error: e.message });
     }
 });
 

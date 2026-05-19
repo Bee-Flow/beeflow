@@ -4,7 +4,7 @@
  * Run: node server/core/dlp/__tests__/attachmentScanner.test.js
  *
  * Mocks the underlying PII detector so the test does not require Azure creds
- * or a running guard-service. We replace `detectPii` in the azurePiiDetection
+ * or a running guard-service. We replace `detectPii` in the piiDetection
  * module from inside Node's require cache.
  */
 
@@ -17,7 +17,7 @@ process.env.NODE_ENV = 'test';
 // We install a tiny mock that pretends to detect every email-like and
 // IBAN-like substring. The real Azure call would burn quota and need
 // network — both unacceptable for unit tests.
-const azurePii = require('../../azurePiiDetection');
+const azurePii = require('../../piiDetection');
 const realDetectPii = azurePii.detectPii;
 
 // `mockDelayMs` lets a single test inject artificial latency without

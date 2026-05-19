@@ -24,6 +24,72 @@ const path = require('path');
 const fs = require('fs');
 const userStore = require('../stores/userStore');
 
+// ── Canonical role + permission identifiers ──────────────────────────────────
+// String literals for these IDs are scattered across the codebase. New code
+// should import from here; old call sites are migrated opportunistically.
+// `LEGACY` aliases retain backwards-compat with rows that pre-date the
+// 'admin' → 'org_admin' rename (matches the runtime normaliser at
+// getUserPermissions ~ line 296).
+const OrgRoles = Object.freeze({
+    ORG_ADMIN: 'org_admin',
+    DPO: 'dpo',
+    AGENT_ADMIN: 'agent_admin',
+    AGENT_EDITOR: 'agent_editor',
+    MEMBER: 'member',
+    // Legacy: pre-rename org admins. Always compare with ORG_ADMIN_VARIANTS,
+    // never against this constant alone.
+    LEGACY_ADMIN: 'admin',
+});
+
+const ORG_ADMIN_VARIANTS = Object.freeze([OrgRoles.ORG_ADMIN, OrgRoles.LEGACY_ADMIN]);
+
+function isOrgAdminRole(orgRole) {
+    return ORG_ADMIN_VARIANTS.includes(orgRole);
+}
+
+// System role values on users.role. 'admin' is the super-admin / platform
+// root; 'user' is the default.
+const SystemRoles = Object.freeze({
+    SUPER_ADMIN: 'admin',
+    USER: 'user',
+});
+
+// Canonical permission IDs. Keys match the entries declared in
+// SYSTEM_PERMISSIONS below — adding a permission means appending it both
+// to SYSTEM_PERMISSIONS (for the discovery API) and this constants map
+// (for typesafe references from route code).
+const Permissions = Object.freeze({
+    ALL: 'all',
+    PAGE_CHAT: 'page_chat',
+    PAGE_SETTINGS: 'page_settings',
+    ADMIN_AGENTS: 'admin_agents',
+    ADMIN_AGENTS_CHAT: 'admin_agents_chat',
+    ADMIN_AGENTS_SYSTEM: 'admin_agents_system',
+    ADMIN_AGENTS_PIPELINE: 'admin_agents_pipeline',
+    ADMIN_COMPONENTS: 'admin_components',
+    ADMIN_AI_CONFIG: 'admin_ai_config',
+    ADMIN_SECURITY: 'admin_security',
+    ADMIN_MONITORING: 'admin_monitoring',
+    ADMIN_COMPLIANCE: 'admin_compliance',
+    ADMIN_SUBSCRIPTIONS: 'admin_subscriptions',
+    MANAGE_USERS: 'manage_users',
+    MANAGE_AGENTS: 'manage_agents',
+    MANAGE_SKILLS: 'manage_skills',
+    MANAGE_COMPONENTS: 'manage_components',
+    MANAGE_KNOWLEDGE: 'manage_knowledge',
+    MANAGE_APPS: 'manage_apps',
+    USE_NOTEBOOKS: 'use_notebooks',
+    USE_N8N_TOOLS: 'use_n8n_tools',
+    MODIFY_N8N_WORKFLOWS: 'modify_n8n_workflows',
+    // Org-role marker permissions (granted automatically by the matching
+    // orgRole; useful when code wants to test "does this user behave as an
+    // org_admin/agent_admin?" without coupling to the orgRole column).
+    ORG_ADMIN: 'org_admin',
+    AGENT_ADMIN: 'agent_admin',
+    AGENT_EDITOR: 'agent_editor',
+    DPO: 'dpo',
+});
+
 // System-wide permission definitions
 const SYSTEM_PERMISSIONS = [
     // ── Super ──
@@ -146,10 +212,94 @@ function saveConfig(config) {
 
 // Middleware to check authentication
 const { getRedis } = require('../db');
-const _userExistsCache = new Map(); // in-memory fallback when Redis unavailable
 const USER_CHECK_TTL = 5; // seconds
 const PERM_CACHE_TTL = 30; // seconds — permission cache TTL
-const _permCache = new Map(); // in-memory fallback for permission caching
+
+// Bounded in-memory caches. Both are pure fallbacks for when Redis is
+// unavailable; Redis remains the canonical store in cloud deployments. The
+// LRU bound protects multi-day single-node uptime against unbounded growth
+// when user counts run into the high thousands.
+const PERM_CACHE_MAX = parseInt(process.env.PERM_CACHE_MAX || '5000', 10);
+const USER_EXISTS_CACHE_MAX = parseInt(process.env.USER_EXISTS_CACHE_MAX || '5000', 10);
+function _makeBoundedMap(max) {
+    const m = new Map();
+    m.set = function(k, v) {
+        if (this.has(k)) Map.prototype.delete.call(this, k);
+        Map.prototype.set.call(this, k, v);
+        if (this.size > max) {
+            // Map preserves insertion order — oldest key is first.
+            const oldest = this.keys().next().value;
+            Map.prototype.delete.call(this, oldest);
+        }
+        return this;
+    };
+    return m;
+}
+const _userExistsCache = _makeBoundedMap(USER_EXISTS_CACHE_MAX);
+const _permCache = _makeBoundedMap(PERM_CACHE_MAX);
+
+// Degraded-state signal — flipped whenever getUserPermissions hits an
+// exception path. Stays true for 60s after the last failure so dashboards
+// can poll without seeing it bounce. See isPermissionLookupDegraded() below.
+let _lastPermLookupFailedAt = 0;
+
+// ─── Cross-node cache invalidation ───────────────────────────────────────────
+// Even with Redis as the cache backend, multi-node deploys can end up with
+// stale state in two ways:
+//   1. Without Redis: each node has its own `_permCache` Map and a delete on
+//      node A doesn't fan out.
+//   2. With Redis: a read on node B can complete between node A's mutation
+//      and node A's `r.del(...)`, so node B briefly held a stale value.
+// Publishing the user-id (or '*' for the bulk-clear case) onto a Redis pub/sub
+// channel makes every node drop its in-memory copy immediately. Best-effort:
+// pub/sub failures are logged and ignored — the existing Redis-key delete
+// remains the source of truth.
+const PERM_INVALIDATE_CHANNEL = 'bf:perms:invalidate';
+const UEX_INVALIDATE_CHANNEL = 'bf:uex:invalidate';
+let _subscriberStarted = false;
+
+function _ensureSubscriber() {
+    if (_subscriberStarted) return;
+    const r = getRedis();
+    if (!r || typeof r.duplicate !== 'function') return;
+    try {
+        const sub = r.duplicate();
+        sub.on('error', (e) => console.warn('[Auth] perm invalidate subscriber error:', e.message));
+        sub.subscribe(PERM_INVALIDATE_CHANNEL, UEX_INVALIDATE_CHANNEL, (err) => {
+            if (err) {
+                console.warn('[Auth] perm invalidate subscribe failed:', err.message);
+                return;
+            }
+            _subscriberStarted = true;
+        });
+        sub.on('message', (channel, message) => {
+            try {
+                if (channel === PERM_INVALIDATE_CHANNEL) {
+                    if (message === '*') _permCache.clear();
+                    else _permCache.delete(message);
+                } else if (channel === UEX_INVALIDATE_CHANNEL) {
+                    if (message === '*') _userExistsCache.clear();
+                    else _userExistsCache.delete(message);
+                }
+            } catch (e) {
+                console.warn('[Auth] perm invalidate handler error:', e.message);
+            }
+        });
+    } catch (e) {
+        console.warn('[Auth] perm invalidate subscriber setup failed:', e.message);
+    }
+}
+
+async function _publish(channel, message) {
+    const r = getRedis();
+    if (!r) return;
+    _ensureSubscriber();
+    try { await r.publish(channel, message); } catch (_) { /* non-fatal */ }
+}
+
+// Eagerly subscribe at module load if Redis is already up. If Redis comes up
+// later, the next mutation will trigger _ensureSubscriber() via _publish.
+setImmediate(() => { try { _ensureSubscriber(); } catch (_) { /* non-fatal */ } });
 
 const requireAuth = async (req, res, next) => {
     if (!req.session.isAuthenticated || !req.session.user) {
@@ -293,7 +443,7 @@ async function getUserPermissions(userId, session = null) {
         // accept both (see server/routes/ai/config.js requireOrgAdminForN8n),
         // but the permissions map only has 'org_admin' — resulting in zero
         // permissions for legacy admins. Normalise here.
-        const normaliseOrgRole = (r) => (r === 'admin' ? 'org_admin' : r);
+        const normaliseOrgRole = (r) => (r === OrgRoles.LEGACY_ADMIN ? OrgRoles.ORG_ADMIN : r);
 
         // Apply user's direct orgRole
         const userOrgRole = normaliseOrgRole(user.orgRole);
@@ -303,7 +453,25 @@ async function getUserPermissions(userId, session = null) {
             }
         }
 
-        // Apply group-level orgRoles (a group can grant a role to all its members)
+        // Apply group-level orgRoles (a group can grant a role to all its members).
+        //
+        // Why this exists: the canonical place to assign an orgRole is the
+        // `users.orgRole` column. The `groups.orgRole` column is a fan-out
+        // shortcut for "everyone in this group should also act as <role>"
+        // (e.g. an "ops" group that grants `dpo` to its members without
+        // editing each user). It is additive — a user's own orgRole and
+        // every group orgRole they're in all union into the permission set.
+        //
+        // Operational notes:
+        //   • Group orgRoles do NOT promote a user across org boundaries —
+        //     a group's organizationId scopes its members; cross-org
+        //     resolution still relies on the per-user orgRole + user.organizationId.
+        //   • Removing a member from a group invalidates their cached perms
+        //     via invalidateAllPermissionCaches (group mutations) or the
+        //     per-user invalidation when adminRoutes updates `users.groups`.
+        //   • The mechanism is rarely used today; left in place for orgs
+        //     that want to manage "all members of group X get DPO" without
+        //     editing per-user rows.
         for (const gid of groupIds) {
             const group = allGroups.find(g => g.id === gid);
             const groupOrgRole = normaliseOrgRole(group?.orgRole);
@@ -333,9 +501,21 @@ async function getUserPermissions(userId, session = null) {
 
         return result;
     } catch (err) {
-        console.error('[Auth] getUserPermissions error:', err);
+        // Genuine DB error → log loudly and bump the degraded-state metric
+        // so ops sees the silent "everyone is suddenly restricted" pattern.
+        // We still return the minimal fallback rather than 503 here, because
+        // many call sites use this for cosmetic UI gating; returning [] would
+        // hide the chat window. Routes that need a hard answer should call
+        // `hasPermission(userId, perm)` and on `false` decide whether to 403
+        // or 503 based on `_lastPermLookupFailedAt`.
+        _lastPermLookupFailedAt = Date.now();
+        console.error('[Auth] getUserPermissions degraded:', err);
         return ['page_chat'];
     }
+}
+
+function isPermissionLookupDegraded() {
+    return Date.now() - _lastPermLookupFailedAt < 60_000; // 1-min sticky
 }
 
 /**
@@ -344,12 +524,14 @@ async function getUserPermissions(userId, session = null) {
  */
 async function invalidatePermissionCache(userId) {
     if (!userId) return;
+    // Always clear locally — covers the in-memory fallback and any micro-
+    // cache window before pub/sub fans out.
+    _permCache.delete(userId);
     const r = getRedis();
     if (r) {
         try { await r.del(`bf:perms:${userId}`); } catch (_) { }
-    } else {
-        _permCache.delete(userId);
     }
+    await _publish(PERM_INVALIDATE_CHANNEL, String(userId));
 }
 
 /**
@@ -359,12 +541,12 @@ async function invalidatePermissionCache(userId) {
  */
 async function invalidateUserExistenceCache(userId) {
     if (!userId) return;
+    _userExistsCache.delete(userId);
     const r = getRedis();
     if (r) {
         try { await r.del(`bf:uex:${userId}`); } catch (_) { }
-    } else {
-        _userExistsCache.delete(userId);
     }
+    await _publish(UEX_INVALIDATE_CHANNEL, String(userId));
 }
 
 /**
@@ -374,19 +556,21 @@ async function invalidateUserExistenceCache(userId) {
 async function invalidateAllPermissionCaches() {
     _permCache.clear();
     const r = getRedis();
-    if (!r) return;
-    try {
-        let cursor = '0';
-        do {
-            const [next, keys] = await r.scan(cursor, 'MATCH', 'bf:perms:*', 'COUNT', 200);
-            cursor = next;
-            if (keys.length) {
-                try { await r.unlink(...keys); } catch (_) { try { await r.del(...keys); } catch (_) { } }
-            }
-        } while (cursor !== '0');
-    } catch (err) {
-        console.warn('[Auth] invalidateAllPermissionCaches scan failed:', err.message);
+    if (r) {
+        try {
+            let cursor = '0';
+            do {
+                const [next, keys] = await r.scan(cursor, 'MATCH', 'bf:perms:*', 'COUNT', 200);
+                cursor = next;
+                if (keys.length) {
+                    try { await r.unlink(...keys); } catch (_) { try { await r.del(...keys); } catch (_) { } }
+                }
+            } while (cursor !== '0');
+        } catch (err) {
+            console.warn('[Auth] invalidateAllPermissionCaches scan failed:', err.message);
+        }
     }
+    await _publish(PERM_INVALIDATE_CHANNEL, '*');
 }
 
 // Helper to check if user has a specific permission
@@ -479,6 +663,64 @@ const resolveUserOrgIds = async (req) => {
 };
 
 /**
+ * Block writes/operations when an organization is suspended. The check
+ * resolves the caller's primary org (or accepts an orgId override via
+ * req.params/[paramName] / req.body.organizationId for super-admin
+ * routes). Returns 402 with a stable error code so the frontend can
+ * surface a "Subscription paused" banner. Archived orgs trip a 410.
+ * Super-admins are exempt (they need to be able to admin a suspended
+ * org). Active orgs (or no-org consumer accounts) pass through.
+ */
+function requireActiveOrg(opts = {}) {
+    const paramName = opts.paramName || 'orgId';
+    return async (req, res, next) => {
+        try {
+            if (req.session?.isAdmin || req.session?.user?.role === SystemRoles.SUPER_ADMIN) return next();
+            let orgId = (req.params && req.params[paramName]) || (req.body && req.body.organizationId) || null;
+            if (!orgId) {
+                orgId = await resolvePrimaryOrgId(req);
+            }
+            if (!orgId) return next(); // consumer / no-org → not blocked
+            const org = await userStore.getOrganization(orgId);
+            if (!org) return next();
+            const status = org.status || 'active';
+            if (status === 'suspended') {
+                return res.status(402).json({
+                    error: 'org_suspended',
+                    message: 'Your organization is currently suspended. Please contact your administrator.',
+                });
+            }
+            if (status === 'archived') {
+                return res.status(410).json({
+                    error: 'org_archived',
+                    message: 'Your organization is archived and read-only.',
+                });
+            }
+            return next();
+        } catch (e) {
+            console.warn('[Auth] requireActiveOrg error:', e.message);
+            return next(); // fail-open: don't lock customers out on transient errors
+        }
+    };
+}
+
+/**
+ * Variant of `requireActiveOrg` that only enforces on non-GET/non-HEAD
+ * requests. Use as a top-level `router.use(...)` middleware so a suspended
+ * org can still read/export data but cannot mutate. The status check
+ * runs server-side; the suspension banner is rendered client-side from
+ * the 402 response.
+ */
+function requireActiveOrgForMutations(opts = {}) {
+    const inner = requireActiveOrg(opts);
+    return (req, res, next) => {
+        const m = req.method;
+        if (m === 'GET' || m === 'HEAD' || m === 'OPTIONS') return next();
+        return inner(req, res, next);
+    };
+}
+
+/**
  * Shared middleware factory: require org admin access for the org
  * specified by req.params[paramName].
  * Use this across all route files instead of local copies.
@@ -496,7 +738,7 @@ function requireOrgAdmin(paramName = 'id') {
         if (!userId) return res.status(403).json({ error: 'Organization admin access required' });
 
         const user = await userStore.getUser(userId);
-        if (!user || user.orgRole !== 'org_admin') {
+        if (!user || !isOrgAdminRole(user.orgRole)) {
             return res.status(403).json({ error: 'Organization admin access required' });
         }
 
@@ -629,4 +871,12 @@ module.exports = {
     invalidatePermissionCache,
     invalidateAllPermissionCaches,
     invalidateUserExistenceCache,
+    OrgRoles,
+    SystemRoles,
+    Permissions,
+    ORG_ADMIN_VARIANTS,
+    isOrgAdminRole,
+    requireActiveOrg,
+    requireActiveOrgForMutations,
+    isPermissionLookupDegraded,
 };

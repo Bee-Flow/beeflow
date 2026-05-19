@@ -121,6 +121,9 @@ module.exports = {
     // ── Skills cross-reference cleanup ───────────────────────────────────────
     scrubSkillFromAllAgents: agentCrud.scrubSkillFromAllAgents,
 
+    // ── Ownership transfer ───────────────────────────────────────────────────
+    transferAgentOwner: agentCrud.transferAgentOwner,
+
     // ── Agent Favorites ──────────────────────────────────────────────────────
     listAgentFavorites: agentFavorites.listFavorites,
     addAgentFavorite: agentFavorites.addFavorite,

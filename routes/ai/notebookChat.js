@@ -21,6 +21,7 @@ const { NOTEBOOK_DOC_TOOLS, NOTEBOOK_ADD_SOURCE_TOOL, executeNotebookDocTool } =
 const { AGENT_SEARCH_TOOLS, executeAgentSearchTool, isAgentSearchTool } = require('../../integrations/agentSearchTools');
 const { searchNotebookKB, executeNotebookKBSearchTool, NOTEBOOK_KB_SEARCH_TOOL } = require('../../core/notebookKnowledgeSearch');
 const { emitPhase, emitPhaseEnd } = require('../../core/agentRuntime/phaseEvents');
+const { checkSubscriptionLimits } = require('../../core/limits');
 
 
 function requireAuth(req, res, next) {
@@ -40,6 +41,17 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
     // Load notebook
     const notebook = await notebookStore.getNotebook(notebookId, userId);
     if (!notebook) return res.status(404).json({ error: 'Notebook not found' });
+
+    // ── Subscription limit enforcement ──
+    // Same pattern as /api/agents/:id/chat/stream — block AI calls past the
+    // org's monthly message/token/cost cap before any model runtime is invoked.
+    {
+        const { resolveUserOrgIds: _resolveOrgs } = require('../../auth');
+        const orgIds = await _resolveOrgs(req);
+        const limitOrgId = orgIds && orgIds.size > 0 ? Array.from(orgIds)[0] : null;
+        const limitError = await checkSubscriptionLimits(limitOrgId, 'chat', userId);
+        if (limitError) return res.status(402).json({ error: limitError });
+    }
 
     // Get sources for context
     const sources = await notebookStore.getSources(notebookId);
@@ -212,8 +224,41 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
         const DOCUMENT_CONTEXT_TOKENS = 20000;
         let documentContext = '';
         let documentTruncation = null; // { originalTokens, keptTokens, approxPagesCut }
+        // Privacy Shield — scan the notebook document body BEFORE it lands
+        // in the system prompt. Without this, PII inside the TipTap editor
+        // (names, BSNs, emails in a Wmo intake document) leaks directly to
+        // the model because the regular validateInputForPii() only scans
+        // the user/assistant message turns, not the system prompt.
+        let docPiiTokenMap = null;
+        let scannedDocumentContent = documentContent;
         if (documentContent && documentContent.trim() && documentContent !== '<p></p>') {
-            const fit = fitIntoTokenBudget(documentContent, DOCUMENT_CONTEXT_TOKENS);
+            try {
+                const docShield = userOrgForTiers
+                    ? await configStore.getConfig(`org_privacy_shield_${userOrgForTiers}`)
+                    : null;
+                if (docShield?.enabled) {
+                    const { scanAttachmentText } = require('../../core/dlp/attachmentScanner');
+                    const scanRes = await scanAttachmentText({
+                        text: documentContent,
+                        filename: 'notebook-document',
+                        orgShield: docShield,
+                        conversationId: notebookId,
+                    });
+                    if (scanRes && scanRes.action === 'tokenize' && scanRes.text) {
+                        scannedDocumentContent = scanRes.text;
+                        docPiiTokenMap = scanRes.tokenMap || null;
+                        const findingCount = Array.isArray(scanRes.findings) ? scanRes.findings.length : 0;
+                        if (findingCount > 0) {
+                            console.warn(`[NotebookChat] 🔒 Document content tokenized (${findingCount} PII spans)`);
+                        }
+                    }
+                }
+            } catch (docScanErr) {
+                console.warn('[NotebookChat] Document PII scan failed, falling back to raw content:', docScanErr.message);
+            }
+        }
+        if (scannedDocumentContent && scannedDocumentContent.trim() && scannedDocumentContent !== '<p></p>') {
+            const fit = fitIntoTokenBudget(scannedDocumentContent, DOCUMENT_CONTEXT_TOKENS);
             if (fit.truncated) {
                 documentTruncation = {
                     originalTokens: fit.originalTokens,
@@ -447,15 +492,23 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
         }
 
         // ── PII detection / tokenization (Privacy Shield) ──────────────
-        // Mirrors directChat: if the org's Privacy Shield has either Azure
-        // PII or Local Transformers.js PII enabled, run validateInputForPii
-        // on the last user message and apply tokenize/block actions.
+        // Mirrors directChat: if the org's Privacy Shield is enabled,
+        // run validateInputForPii on the last user message and apply
+        // tokenize/block actions. detectPii() calls the PII Guard service.
         let piiTokenMap = null;
         try {
             const orgShield = userOrgForTiers ? await configStore.getConfig(`org_privacy_shield_${userOrgForTiers}`) : null;
-            const orgPiiEnabled = !!(orgShield?.enabled && (orgShield?.azurePiiEnabled || orgShield?.localPiiEnabled !== false));
+            const orgPiiEnabled = !!orgShield?.enabled;
+            // Hydrate the conversation-scoped token map (keyed on notebookId
+            // here, matching the mergeTokenMap key below) before tokenisation
+            // runs so turn 2+ reuses tokens minted on turn 1 instead of
+            // leaking them to the LLM as literal text. Idempotent.
+            if (notebookId) {
+                try { await require('../../core/dlp/dlpRunner').getConversationTokenMapAsync(notebookId); }
+                catch (_) { /* hydration is best-effort */ }
+            }
             if (orgPiiEnabled) {
-                const { validateInputForPii } = require('../../core/azurePiiDetection');
+                const { validateInputForPii } = require('../../core/piiDetection');
                 const piiResult = await validateInputForPii(messages.slice(-3), orgPiiEnabled, orgShield);
                 if (piiResult && piiResult.tokenizedText) {
                     const lastMsg = messages[messages.length - 1];

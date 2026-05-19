@@ -21,7 +21,14 @@ const {
     assertUserCanUseOrg,
     validateSharedGroupsForOrg,
     invalidatePermissionCache,
-    invalidateAllPermissionCaches
+    invalidateAllPermissionCaches,
+    OrgRoles,
+    SystemRoles,
+    Permissions,
+    ORG_ADMIN_VARIANTS,
+    isOrgAdminRole,
+    requireActiveOrg,
+    requireActiveOrgForMutations,
 } = require('./permissions');
 const {
     canSeePublished,
@@ -56,4 +63,11 @@ module.exports = {
     canSeePublished,
     resolveUserGroups,
     resolveAudienceContext,
+    OrgRoles,
+    SystemRoles,
+    Permissions,
+    ORG_ADMIN_VARIANTS,
+    isOrgAdminRole,
+    requireActiveOrg,
+    requireActiveOrgForMutations,
 };

@@ -99,6 +99,16 @@ async function getInvitationsForOrg(organizationId) {
 }
 
 /**
+ * Get an invitation row by primary id. Used by the audit-trail snapshot
+ * on DELETE — the revoke path needs to record the original grant terms
+ * before mutating the row.
+ */
+async function getInvitationById(invitationId) {
+    await initDB();
+    return await getOne('SELECT * FROM invitations WHERE id = $1', [invitationId]);
+}
+
+/**
  * Delete (revoke) an invitation by ID.
  */
 async function deleteInvitation(invitationId) {
@@ -113,6 +123,7 @@ async function deleteInvitation(invitationId) {
 module.exports = {
     createInvitation,
     getInvitationByToken,
+    getInvitationById,
     markAccepted,
     getInvitationsForOrg,
     deleteInvitation,

@@ -89,8 +89,76 @@ function applyCap(requested, cap) {
     return intersect(cap, requested);
 }
 
+/**
+ * Walk every active org subscription and report any beta-feature or
+ * integration that the org has enabled but its current plan no longer
+ * caps. This happens when a plan's `allowed_*` is narrowed *after* an
+ * org has opted into a feature — the runtime keeps serving it because
+ * `applyCap` only fires at toggle time.
+ *
+ * Returns a summary; emits an `access_audit_log` row per drifting feature
+ * so compliance retains a record. Read-only by default — pass
+ * `{ trim: true }` to also save the trimmed lists back via
+ * setOrgEnabledBetaFeatures / setOrgEnabledIntegrations.
+ */
+async function auditPlanCapDrift({ trim = false } = {}) {
+    const store = userStore();
+    const subs = await store.getAllOrgSubscriptions().catch(() => []);
+    let scanned = 0;
+    let drifted = 0;
+    let trimmed = 0;
+    const drifts = [];
+
+    for (const sub of (subs || [])) {
+        if (!sub?.organization_id) continue;
+        if (sub.status !== 'active') continue;
+        scanned++;
+        const caps = await getOrgCaps(sub.organization_id).catch(() => ({ integrations: null, betaFeatures: null }));
+        const enabledIntegrations = await store.getOrgEnabledIntegrations(sub.organization_id).catch(() => []);
+        const enabledBeta = await store.getOrgEnabledBetaFeatures(sub.organization_id).catch(() => []);
+        const trimmedIntegrations = caps.integrations == null ? enabledIntegrations : intersect(caps.integrations, enabledIntegrations);
+        const trimmedBeta = caps.betaFeatures == null ? enabledBeta : intersect(caps.betaFeatures, enabledBeta);
+        const lostIntegrations = enabledIntegrations.filter(id => !trimmedIntegrations.includes(id));
+        const lostBeta = enabledBeta.filter(id => !trimmedBeta.includes(id));
+        if (lostIntegrations.length === 0 && lostBeta.length === 0) continue;
+
+        drifted++;
+        drifts.push({
+            orgId: sub.organization_id,
+            planId: sub.plan_id,
+            lostIntegrations,
+            lostBeta,
+        });
+
+        try {
+            await store.logAccessAudit(
+                'plan_cap_drift_detected',
+                'organization',
+                sub.organization_id,
+                'system',
+                { enabled_integrations: enabledIntegrations, enabled_beta_features: enabledBeta },
+                { plan_id: sub.plan_id, lost_integrations: lostIntegrations, lost_beta_features: lostBeta, trimmed: trim },
+                sub.organization_id,
+            );
+        } catch (_) { /* audit best-effort */ }
+
+        if (trim) {
+            try {
+                if (lostIntegrations.length > 0) await store.setOrgEnabledIntegrations(sub.organization_id, trimmedIntegrations);
+                if (lostBeta.length > 0) await store.setOrgEnabledBetaFeatures(sub.organization_id, trimmedBeta);
+                trimmed++;
+            } catch (e) {
+                console.warn(`[PlanCapDrift] trim failed for org=${sub.organization_id}: ${e.message}`);
+            }
+        }
+    }
+
+    return { scanned, drifted, trimmed, drifts };
+}
+
 module.exports = {
     applyPlanToOrg,
     getOrgCaps,
     applyCap,
+    auditPlanCapDrift,
 };

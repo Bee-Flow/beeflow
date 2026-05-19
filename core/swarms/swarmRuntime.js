@@ -293,7 +293,12 @@ async function runWorker({
             };
 
             try {
-                await model.adapter.stream(model.apiKey, model.apiUrl, model.modelId, messages, {
+                // Outbound-prompt guard — re-tokenise any real values that
+                // may have crept into the worker's context (memory, KB,
+                // hive block, …) before the LLM sees them. Idempotent.
+                const { applyTokenMapToMessages } = require('../dlp/applyTokenMapToOutbound');
+                const _guardedMessages = applyTokenMapToMessages({ conversationId, messages });
+                await model.adapter.stream(model.apiKey, model.apiUrl, model.modelId, _guardedMessages, {
                     maxTokens: WORKER_DEFAULT_MAX_TOKENS,
                     temperature: isSynthesiser ? 0.4 : 0.3,
                     tools: workerTools.length > 0 ? workerTools : undefined,

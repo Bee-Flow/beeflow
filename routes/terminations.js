@@ -9,7 +9,7 @@
 const express = require('express');
 const router = express.Router();
 const terminationStore = require('../stores/terminationStore');
-const { resolveUserOrgIds } = require('../auth');
+const { resolveUserOrgIds, isOrgAdminRole } = require('../auth');
 const userStore = require('../stores/userStore');
 
 function getDateFilters(daysParam) {
@@ -61,7 +61,7 @@ async function requireOwnOrgAdminScope(req, res, next) {
 
     if (!isSuperAdmin) {
         const user = await userStore.getUser(req.session.user.id);
-        if (!user || user.orgRole !== 'org_admin') {
+        if (!user || !isOrgAdminRole(user.orgRole)) {
             return res.status(403).json({ error: 'Organization admin access required' });
         }
     }

@@ -44,6 +44,16 @@ router.post('/chat/template/stream', requireAuth, async (req, res) => {
         return res.status(404).json({ error: 'Template not found' });
     }
 
+    // ── Subscription limit enforcement (mirrors /api/agents/:id/chat/stream) ──
+    {
+        const { checkSubscriptionLimits } = require('../../core/limits');
+        const { resolveUserOrgIds: _resolveOrgs } = require('../../auth');
+        const orgIds = await _resolveOrgs(req);
+        const limitOrgId = orgIds && orgIds.size > 0 ? Array.from(orgIds)[0] : null;
+        const limitError = await checkSubscriptionLimits(limitOrgId, 'chat', userId);
+        if (limitError) return res.status(402).json({ error: limitError });
+    }
+
     // Resolve user's org for EU-mode tier overrides
     const { resolveModelForTier, getTierConfig } = require('../../core/modelResolver');
     const { resolveUserOrgIds } = require('../../auth');

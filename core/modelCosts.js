@@ -38,6 +38,7 @@ function setModelCost(modelId, input, output) {
     const overrides = getCustomOverrides();
     overrides[modelId] = { input: Number(input), output: Number(output) };
     setCustomOverrides(overrides);
+    resetUpperBoundCache();
 }
 
 /**
@@ -47,9 +48,53 @@ function resetModelCost(modelId) {
     const overrides = getCustomOverrides();
     delete overrides[modelId];
     setCustomOverrides(overrides);
+    resetUpperBoundCache();
 }
 
 // ─── Lookups ─────────────────────────────────────────────────────────────────
+
+// Memoised upper-bound rates (most-expensive across all known models). Used
+// as a safe fallback for unknown models so customers calling a brand-new
+// model name aren't billed €0 until LiteLLM data lands. Re-computed lazily
+// once per process; cleared via `resetUpperBoundCache` (admin custom-override
+// edits invalidate it so a newly-added high-cost override is picked up).
+let _upperBoundCache = null;
+let _upperBoundComputedAt = 0;
+const _unknownModelWarned = new Set();
+
+function _computeUpperBound() {
+    try {
+        const all = getAllModelCosts(); // { name: { input, output } } including custom overrides
+        let maxInput = 0;
+        let maxOutput = 0;
+        for (const rates of Object.values(all)) {
+            if (Number.isFinite(rates?.input) && rates.input > maxInput) maxInput = rates.input;
+            if (Number.isFinite(rates?.output) && rates.output > maxOutput) maxOutput = rates.output;
+        }
+        if (maxInput <= 0 && maxOutput <= 0) return null;
+        return { input: maxInput, output: maxOutput };
+    } catch (_) { return null; }
+}
+
+function _getUpperBound() {
+    // 10-min TTL keeps the cache hot during normal traffic but lets a new
+    // pricing fetch (24h cycle) eventually flow in.
+    if (_upperBoundCache && (Date.now() - _upperBoundComputedAt) < 10 * 60_000) return _upperBoundCache;
+    _upperBoundCache = _computeUpperBound();
+    _upperBoundComputedAt = Date.now();
+    return _upperBoundCache;
+}
+
+function resetUpperBoundCache() {
+    _upperBoundCache = null;
+    _upperBoundComputedAt = 0;
+}
+
+function _warnUnknownModel(modelName) {
+    if (!modelName || _unknownModelWarned.has(modelName)) return;
+    _unknownModelWarned.add(modelName);
+    console.warn(`[ModelCosts] Unknown model '${modelName}' — using upper-bound rates; add it to pricing data or as a custom override.`);
+}
 
 /**
  * Get cost rates for a model (handles various ID formats).
@@ -125,8 +170,19 @@ function getCacheWriteMultiplier(model, ttl) {
  * @returns {number} cost in USD
  */
 function computeCost(model, promptTokens = 0, completionTokens = 0, cachedTokens = 0, cacheCreationTokens = 0, cacheTtl = null) {
-    const rates = getModelCost(model);
-    if (!rates) return 0;
+    let rates = getModelCost(model);
+    if (!rates) {
+        // Unknown model — fall back to the upper bound so we never silently
+        // charge €0 for a real API call. The customer is over-billed
+        // slightly until the model lands in the pricing data or an admin
+        // adds a custom override.
+        rates = _getUpperBound();
+        if (!rates) {
+            console.error(`[ModelCosts] No pricing data available (pricing fetch failed?); cost for '${model}' defaulting to 0.`);
+            return 0;
+        }
+        _warnUnknownModel(model);
+    }
     // Anthropic returns input_tokens NOT including cached_read or cache_creation.
     // Other providers include cached_tokens IN prompt_tokens. We treat
     // promptTokens as the canonical "uncached + cached + cache-write" sum and
@@ -145,8 +201,15 @@ function computeCost(model, promptTokens = 0, completionTokens = 0, cachedTokens
  * @returns {{ input_cost: number, output_cost: number }}
  */
 function computeCostSplit(model, promptTokens = 0, completionTokens = 0, cachedTokens = 0, cacheCreationTokens = 0, cacheTtl = null) {
-    const rates = getModelCost(model);
-    if (!rates) return { input_cost: 0, output_cost: 0 };
+    let rates = getModelCost(model);
+    if (!rates) {
+        rates = _getUpperBound();
+        if (!rates) {
+            console.error(`[ModelCosts] No pricing data available; split cost for '${model}' defaulting to 0.`);
+            return { input_cost: 0, output_cost: 0 };
+        }
+        _warnUnknownModel(model);
+    }
     const uncachedInput = Math.max(0, promptTokens - cachedTokens - cacheCreationTokens);
     const cacheReadRate = rates.input * getCacheDiscount(model);
     const cacheWriteRate = rates.input * getCacheWriteMultiplier(model, cacheTtl);

@@ -16,6 +16,11 @@ const { perUserRateLimit } = require('../../utils/perUserRateLimit');
 // concurrency cap below.
 const helperLimiter = perUserRateLimit({ windowMs: 60_000, max: 30 });
 const streamLimiter = perUserRateLimit({ windowMs: 60_000, max: 60 });
+// The embed metadata endpoint is public — without rate limiting an attacker
+// can enumerate agent IDs by scanning UUID prefixes. 100/min/IP is high
+// enough that any legitimate embed (one page-load = one call) stays well
+// under the limit while still bounding crawl rates.
+const embedLimiter = perUserRateLimit({ windowMs: 60_000, max: 100 });
 
 const userStore = require('../../stores/userStore');
 const usageStore = require('../../stores/usageStore');
@@ -117,6 +122,18 @@ router.post('/:id/chat', async (req, res) => {
         }
     }
 
+    // ── Subscription limit enforcement ──
+    // Mirrors the /chat/stream gate at line 213 so the legacy non-streaming
+    // endpoint can't be used to bypass monthly message/token/cost caps.
+    {
+        const orgIds = await resolveUserOrgIds(req);
+        const orgId = orgIds && orgIds.size > 0 ? Array.from(orgIds)[0] : null;
+        const limitError = await checkSubLimits(orgId, 'chat', userId);
+        if (limitError) {
+            return res.status(402).json({ error: limitError });
+        }
+    }
+
     try {
         const userAuth = await getUserAuth(req);
         const result = await agentRuntime.chatWithAgent(
@@ -134,17 +151,22 @@ router.post('/:id/chat', async (req, res) => {
 
 // ============ Embeddable Chat Widget ============
 
-// Get agent metadata for embed widget (no auth required — public endpoint)
-router.get('/:id/embed', async (req, res) => {
+// Get agent metadata for embed widget (no auth required — public endpoint).
+// Rate-limited to slow down ID enumeration; returns 404 on both "not found"
+// and "exists but not embeddable" so the response shape doesn't leak which
+// agent IDs exist.
+router.get('/:id/embed', embedLimiter, async (req, res) => {
     const agent = await agentStore.getAgent(req.params.id);
 
     if (!agent) {
         return res.status(404).json({ error: 'Agent not found' });
     }
 
-    // For regular agents: must be published AND embed_enabled
+    // For regular agents: must be published AND embed_enabled. Return 404
+    // (not 403) so an attacker probing IDs can't distinguish "exists but
+    // hidden" from "doesn't exist".
     if (!agent.is_published || !agent.embed_enabled) {
-        return res.status(403).json({ error: 'This agent is not available for embedding' });
+        return res.status(404).json({ error: 'Agent not found' });
     }
 
     // Parse starter_prompts

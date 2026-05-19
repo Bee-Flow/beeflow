@@ -20,7 +20,7 @@ const router = express.Router();
 const houseStyleStore = require('../stores/houseStyleStore');
 const houseStyleExtractor = require('../core/houseStyleExtractor');
 const userStore = require('../stores/userStore');
-const { resolveUserOrgIds } = require('../auth');
+const { resolveUserOrgIds, isOrgAdminRole } = require('../auth');
 
 const upload = multer({
     storage: multer.memoryStorage(),
@@ -45,7 +45,7 @@ async function isOrgAdmin(req, orgId) {
     if (!userId) return false;
     const user = await userStore.getUser(userId);
     if (!user) return false;
-    if (user.organizationId === orgId && user.orgRole === 'org_admin') return true;
+    if (user.organizationId === orgId && isOrgAdminRole(user.orgRole)) return true;
     let groupIds = [];
     if (Array.isArray(user.groups)) groupIds = user.groups;
     else { try { groupIds = JSON.parse(user.groups || '[]'); } catch (_) {} }

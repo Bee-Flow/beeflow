@@ -3,8 +3,6 @@
  *
  * Covers:
  *   • Azure Document Intelligence (Layout model)
- *   • Azure AI Content Safety (text analysis)
- *   • Azure PII Detection (Language API)
  *   • Azure OpenAI Embeddings
  *
  * Prices are estimates based on Azure published pricing (pay-as-you-go, S0 tier).
@@ -22,14 +20,6 @@ const DEFAULTS = {
     // Document Intelligence — Prebuilt Layout model
     // $10.00 / 1,000 pages → $0.01 per page
     doc_intelligence_per_page: 0.01,
-
-    // Content Safety — Text Analyze
-    // $0.75 / 1,000 text records (1 record = 1,000 chars)
-    content_safety_per_1k_chars: 0.00075,
-
-    // PII Detection (Azure AI Language)
-    // $0.56 / 1,000 text records (1 record = 1,000 chars)
-    pii_detection_per_1k_chars: 0.00056,
 
     // Azure OpenAI Embeddings (text-embedding-3-small)
     // $0.02 / 1M tokens → $0.00000002 per token
@@ -72,28 +62,6 @@ function computeDocIntelligenceCost(pageCount = 0) {
 }
 
 /**
- * Estimate cost for Azure Content Safety text analysis.
- * Azure bills per 1,000-character "text record" (rounded up).
- * @param {number} charCount — total characters analyzed
- * @returns {number} estimated cost in USD
- */
-function computeContentSafetyCost(charCount = 0) {
-    const textRecords = Math.ceil(charCount / 1000);
-    return textRecords * getRate('content_safety_per_1k_chars');
-}
-
-/**
- * Estimate cost for Azure PII Detection (Language API).
- * Azure bills per 1,000-character "text record" (rounded up).
- * @param {number} charCount — total characters analyzed
- * @returns {number} estimated cost in USD
- */
-function computePiiDetectionCost(charCount = 0) {
-    const textRecords = Math.ceil(charCount / 1000);
-    return textRecords * getRate('pii_detection_per_1k_chars');
-}
-
-/**
  * Estimate cost for Azure OpenAI Embeddings.
  * @param {number} tokenCount — total tokens embedded
  * @returns {number} estimated cost in USD
@@ -113,8 +81,6 @@ function getAllRates() {
 
 module.exports = {
     computeDocIntelligenceCost,
-    computeContentSafetyCost,
-    computePiiDetectionCost,
     computeEmbeddingCost,
     getAllRates,
     DEFAULTS,

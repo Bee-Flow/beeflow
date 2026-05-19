@@ -11,11 +11,11 @@ const { componentToTool, executeComponentTool } = require('../toolExecution');
 const { resolveAgentModel } = require('./modelResolver');
 const { getAgentTools } = require('./agentTools');
 const { processSystemPrompt } = require('../promptUtils');
-const { validateInput } = require('../moderation');
-const { validateInputForPii } = require('../azurePiiDetection');
+const { validateInputForPii } = require('../piiDetection');
 const { resolveOrgShield } = require('../orgShield');
 const dlpRunner = require('../dlp/dlpRunner');
 const { buildTokenPreservationAddendum } = require('../dlp/tokenPreservationPrompt');
+const { applyTokenMapToOutbound } = require('../dlp/applyTokenMapToOutbound');
 
 async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
     let agent = await agentStore.getAgent(agentId);
@@ -67,26 +67,18 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
         console.warn(`[ChatWithAgent] 🚨 Unicode smuggling stripped: ${unicodeResult.totalStripped} hidden chars`);
     }
 
-    if (agent.config?.llamaGuardEnabled || (await getAIConfig()).llamaGuardConfig?.enabled) {
-        console.log(`[AgentRuntime] Validating input with active guardrails...`);
-        const validationRequest = [
-            { role: 'system', content: systemPrompt },
-            ...messages
-        ];
-
-
-
-        // 2. Content moderation (Azure Content Safety)
-        await validateInput(validationRequest, agent.config?.llamaGuardEnabled);
-    }
+    // Content moderation (Hate/Violence/Sexual/Self-Harm) was removed when
+    // the Azure Content Safety backend was dropped. PII detection still
+    // runs in the block below.
 
     // ── PII Detection ─────────────────────────────────────────────────
     const aiConfigForPii = await getAIConfig();
     let piiTokenMap = null;
     const orgShield = await resolveOrgShield(agent.organization_id);
-    // PII gate: either Azure (cloud) or Local Transformers.js (in-process)
-    // satisfies it. detectPii() in azurePiiDetection.js handles the routing.
-    const orgPiiEnabled = !!(orgShield?.enabled && (orgShield?.azurePiiEnabled || orgShield?.localPiiEnabled !== false));
+    // PII gate: the shield's master `enabled` flag is the only switch.
+    // detectPii() in piiDetection.js routes between the in-process
+    // Transformers.js detector and the optional GLiNER guard service.
+    const orgPiiEnabled = !!orgShield?.enabled;
     if (aiConfigForPii?.piiDetectionEnabled || orgPiiEnabled) {
         try {
             const piiResult = await validateInputForPii(messages.slice(-3), orgPiiEnabled, orgShield);
@@ -142,9 +134,17 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
 
             // Use provider adapter for correct request body
             const adapter = getAdapter(null, apiUrl);
+            // Outbound-prompt guard — last-stop substitution of any real
+            // values that may have crept into the prompt via memory, KB,
+            // attachment hydration, or any other channel. Idempotent.
+            const _guarded = applyTokenMapToOutbound({
+                conversationId: conversation?.id,
+                systemPrompt,
+                messages: sanitize(messages),
+            });
             const requestBody = adapter.buildRequestBody(modelToUse, [
-                { role: 'system', content: systemPrompt },
-                ...sanitize(messages)
+                { role: 'system', content: _guarded.systemPrompt },
+                ..._guarded.messages
             ], {
                 maxTokens: 4000,
                 temperature: 0.7,

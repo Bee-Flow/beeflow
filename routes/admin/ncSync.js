@@ -140,8 +140,6 @@ router.post('/admin/:orgId/nc-onboarding/complete', requireAuth, checkOrgAdmin, 
             ...existingShield,
             enabled: shield.enabled !== false,
             scope: existingShield.scope || { userInput: true, agentOutput: true },
-            localPiiEnabled: shield.localPiiEnabled !== false,
-            azurePiiEnabled: !!existingShield.azurePiiEnabled, // unchanged by wizard
             piiDetectionAction: shield.piiDetectionAction === 'block' ? 'block' : 'tokenize',
             piiDetectionCategories: Array.isArray(shield.piiDetectionCategories) ? shield.piiDetectionCategories : [],
             piiDetectionConfidenceThreshold: typeof existingShield.piiDetectionConfidenceThreshold === 'number'

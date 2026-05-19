@@ -71,12 +71,18 @@ async function issueLicenseFromCheckout(args) {
         body = await resp.json().catch(() => ({}));
     } catch (e) {
         console.error('[License Issuance] callout failed:', e.message);
-        return null;
+        const err = new Error(`callout_failed: ${e.message}`);
+        err.code = 'callout_failed';
+        throw err;
     }
 
     if (!resp.ok || !body.token || !body.license_id) {
         console.error('[License Issuance] license server returned error', resp.status, body);
-        return null;
+        const err = new Error(`license_server_error: status=${resp.status}`);
+        err.code = 'license_server_error';
+        err.httpStatus = resp.status;
+        err.responseBody = body;
+        throw err;
     }
 
     // Activate locally so the user gets immediate access without manual paste.
@@ -90,6 +96,10 @@ async function issueLicenseFromCheckout(args) {
         console.log(`[License Issuance] ✓ Activated license ${body.license_id} for ${args.scope}=${args.organizationId || args.userId}`);
     } catch (e) {
         console.error('[License Issuance] verifyToken/activateLicense failed:', e.message);
+        const err = new Error(`activation_failed: ${e.message}`);
+        err.code = 'activation_failed';
+        err.licenseId = body.license_id;
+        throw err;
     }
 
     return { token: body.token, licenseId: body.license_id };

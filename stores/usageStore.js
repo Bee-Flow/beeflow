@@ -81,6 +81,29 @@ async function initDB() {
     try {
         await exec(`CREATE INDEX IF NOT EXISTS idx_usage_tool_name ON ai_usage_log(tool_name) WHERE tool_name IS NOT NULL`);
     } catch (e) { /* ignore */ }
+
+    // PAYG meter event outbox — durable queue for Stripe meter event delivery.
+    // The hot path inserts a row here instead of firing-and-forgetting to
+    // Stripe; a background drain worker (server/workers/paygDrain.js) picks
+    // them up, calls Stripe, and stamps delivered_at on success. Survives
+    // Stripe outages and process crashes without losing billing.
+    await exec(`
+        CREATE TABLE IF NOT EXISTS payg_meter_outbox (
+            id SERIAL PRIMARY KEY,
+            usage_log_id INTEGER NOT NULL,
+            stripe_customer_id TEXT NOT NULL,
+            event_name TEXT NOT NULL,
+            amount_micro_units BIGINT NOT NULL,
+            identifier TEXT NOT NULL UNIQUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_attempt_at TIMESTAMPTZ,
+            last_error TEXT,
+            delivered_at TIMESTAMPTZ
+        )
+    `);
+    await exec(`CREATE INDEX IF NOT EXISTS idx_payg_outbox_pending ON payg_meter_outbox(created_at) WHERE delivered_at IS NULL`);
+
     initialized = true;
 
 }
@@ -98,6 +121,10 @@ const _paygCache = new Map();
 const PAYG_CACHE_TTL_MS = 60_000;
 
 async function _resolvePaygTarget(organizationId, userId) {
+    // Self-hosted installs have no PAYG plan and no Stripe wiring. Skip the
+    // resolver entirely so the AI hot path is free of billing lookups when
+    // DEPLOYMENT_MODE is anything other than cloud.
+    if ((process.env.DEPLOYMENT_MODE || 'cloud') === 'self-hosted') return null;
     if (!organizationId && !userId) return null;
     const key = organizationId ? `org:${organizationId}` : `user:${userId}`;
     const hit = _paygCache.get(key);
@@ -108,14 +135,14 @@ async function _resolvePaygTarget(organizationId, userId) {
         if (organizationId) {
             row = await getOne(`
                 SELECT os.stripe_customer_id, os.status,
-                       sp.billing_model, sp.markup_percent, sp.stripe_meter_event_name
+                       sp.billing_model, sp.markup_percent, sp.stripe_meter_event_name, sp.currency
                   FROM organization_subscriptions os
              LEFT JOIN subscription_plans sp ON sp.id = os.plan_id
                  WHERE os.organization_id = $1`, [organizationId]);
         } else {
             row = await getOne(`
                 SELECT cs.stripe_customer_id, cs.status,
-                       sp.billing_model, sp.markup_percent, sp.stripe_meter_event_name
+                       sp.billing_model, sp.markup_percent, sp.stripe_meter_event_name, sp.currency
                   FROM consumer_subscriptions cs
              LEFT JOIN subscription_plans sp ON sp.id = cs.plan_id
                  WHERE cs.user_id = $1`, [userId]);
@@ -135,14 +162,42 @@ async function _resolvePaygTarget(organizationId, userId) {
         stripeCustomerId: row.stripe_customer_id,
         markupPercent: Number(row.markup_percent || 0),
         meterEventName: row.stripe_meter_event_name,
+        currency: (row.currency || 'EUR').toUpperCase(),
     } : null;
     _paygCache.set(key, { value, expiresAt: Date.now() + PAYG_CACHE_TTL_MS });
     return value;
 }
 
+// Per-subscriber currency cache for fixed-plan AI calls. PAYG calls already
+// learn the plan currency from `_resolvePaygTarget`; this is just for
+// fixed-plan and consumer-default callers so the USD→currency conversion
+// is applied uniformly across all rows. Shares the PAYG cache map: keys
+// are prefixed with `cur:` to avoid collision.
+async function _resolvePlanCurrency(organizationId, userId) {
+    if ((process.env.DEPLOYMENT_MODE || 'cloud') === 'self-hosted') return 'USD';
+    if (!organizationId && !userId) return 'EUR';
+    const key = organizationId ? `cur:org:${organizationId}` : `cur:user:${userId}`;
+    const hit = _paygCache.get(key);
+    if (hit && hit.expiresAt > Date.now()) return hit.value;
+    let currency = 'EUR';
+    try {
+        const row = organizationId
+            ? await getOne(`SELECT sp.currency FROM organization_subscriptions os LEFT JOIN subscription_plans sp ON sp.id = os.plan_id WHERE os.organization_id = $1`, [organizationId])
+            : await getOne(`SELECT sp.currency FROM consumer_subscriptions cs LEFT JOIN subscription_plans sp ON sp.id = cs.plan_id WHERE cs.user_id = $1`, [userId]);
+        if (row?.currency) currency = String(row.currency).toUpperCase();
+    } catch (e) {
+        console.error('[UsageStore] _resolvePlanCurrency query failed:', e.message);
+    }
+    _paygCache.set(key, { value: currency, expiresAt: Date.now() + PAYG_CACHE_TTL_MS });
+    return currency;
+}
+
 function invalidatePaygCache(organizationId, userId) {
     if (organizationId) _paygCache.delete(`org:${organizationId}`);
     if (userId) _paygCache.delete(`user:${userId}`);
+    // Both args null → clear the whole cache. Used by global config changes
+    // (FX rate updates) that affect every cached entry.
+    if (!organizationId && !userId) _paygCache.clear();
 }
 
 // ============ Logging ============
@@ -162,19 +217,69 @@ async function logUsage(entry) {
         const swarmRunId = entry.swarm_run_id || null;
         const model = entry.model || 'unknown';
         // Cache-aware cost: cached reads at provider discount, cache writes at
-        // TTL-specific premium (Anthropic 1.25× for 5m, 2× for 1h).
-        const cost = computeCost(model, promptTokens, completionTokens, cachedTokens, cacheCreationTokens, cacheTtl);
+        // TTL-specific premium (Anthropic 1.25× for 5m, 2× for 1h). USD —
+        // modelCosts works in LiteLLM's native USD per 1M tokens.
+        const costUsd = computeCost(model, promptTokens, completionTokens, cachedTokens, cacheCreationTokens, cacheTtl);
 
         // Resolve PAYG target up front (cached, <1ms after warmup) so we can
         // persist the marked-up `billed_cost` alongside the raw cost in a
         // single INSERT. Same target value is reused for the Stripe meter
         // event below, ensuring local history and Stripe stay in sync.
-        const paygTarget = (cost > 0)
+        const paygTarget = (costUsd > 0)
             ? await _resolvePaygTarget(entry.organization_id || null, entry.user_id || null).catch(err => {
                 console.error('[UsageStore] PAYG resolve failed:', err.message);
                 return null;
             })
             : null;
+
+        // Convert USD → plan currency. PAYG target carries the plan currency;
+        // for fixed-plan or no-subscription callers, fall back to a separate
+        // lightweight lookup. Stripe meter events report micro-units in the
+        // plan's currency, so the local cost columns must match.
+        let targetCurrency = 'USD';
+        if (costUsd > 0) {
+            if (paygTarget?.currency) {
+                targetCurrency = paygTarget.currency;
+            } else if (entry.organization_id || entry.user_id) {
+                targetCurrency = await _resolvePlanCurrency(entry.organization_id || null, entry.user_id || null).catch(() => 'EUR');
+            } else {
+                targetCurrency = 'EUR'; // matches subscription_plans.currency default
+            }
+        }
+        // FX lookup. For PAYG customers a silent fallback to 1.0 would bill
+        // the USD figure as if it were EUR (a 5–15 % under-bill or over-bill
+        // depending on the pair). When we have a paying customer on a
+        // non-USD currency and the rate provider fails, refuse to log so the
+        // caller surfaces "billing service degraded" instead of writing the
+        // wrong number to ai_usage_log. For non-PAYG callers, 1.0 is a safe
+        // reporting fallback — the column is informational only.
+        //
+        // The currency helper handles three layers of resilience:
+        //   1. 5-minute hot cache for the resolved rate
+        //   2. 24-hour last-good cache for transient configStore failures
+        //   3. `strict: true` (PAYG only) — throw on cache miss + lookup
+        //      failure, rather than silently substituting 1.0.
+        let fxRate = 1;
+        if (costUsd > 0 && targetCurrency !== 'USD') {
+            const currency = require('../core/currency');
+            try {
+                fxRate = await currency.getUsdToCurrencyRate(targetCurrency, { strict: !!paygTarget });
+            } catch (e) {
+                if (paygTarget) {
+                    // Re-throw so the LLM handler surfaces 503 to the user.
+                    throw e;
+                }
+                console.error(`[UsageStore] FX rate lookup failed for USD→${targetCurrency} (non-PAYG): ${e.message}`);
+                fxRate = 1;
+            }
+            if (fxRate == null || !isFinite(fxRate) || fxRate <= 0) {
+                if (paygTarget) {
+                    throw new Error(`fx_rate_unavailable: USD→${targetCurrency}`);
+                }
+                fxRate = 1;
+            }
+        }
+        const cost = costUsd * fxRate;
         const billedCost = paygTarget ? cost * (1 + paygTarget.markupPercent / 100) : null;
 
         const insertResult = await run(`
@@ -210,9 +315,11 @@ async function logUsage(entry) {
             console.log(`[UsageStore] 💰 Cache savings: ${cachedTokens} cached tokens (model: ${model})`);
         }
 
-        // PAYG meter reporting — fire-and-forget so the AI response path
-        // isn't blocked on Stripe. Failures are logged but never retried in
-        // v1 (a future v2 will introduce an outbox + drain job).
+        // PAYG meter reporting — enqueue in the outbox so a Stripe outage or
+        // process crash can't drop billing. The drain worker
+        // (server/workers/paygDrain.js) picks it up, retries with backoff,
+        // and stamps delivered_at on success. Identifier doubles as Stripe's
+        // idempotency key (24h window) and our local dedup key.
         if (paygTarget && billedCost > 0) {
             const insertedId = insertResult?.rows?.[0]?.id;
             if (insertedId !== undefined) {
@@ -222,18 +329,37 @@ async function logUsage(entry) {
                 const amountMicroUnits = Math.round(billedCost * 1_000_000);
                 if (amountMicroUnits > 0) {
                     const identifier = `usage_${insertedId}`;
+                    try {
+                        await run(
+                            `INSERT INTO payg_meter_outbox (usage_log_id, stripe_customer_id, event_name, amount_micro_units, identifier)
+                             VALUES ($1, $2, $3, $4, $5)
+                             ON CONFLICT (identifier) DO NOTHING`,
+                            [insertedId, paygTarget.stripeCustomerId, paygTarget.meterEventName, amountMicroUnits, identifier]
+                        );
+                    } catch (e) {
+                        console.error('[UsageStore] PAYG outbox enqueue failed:', e.message, { identifier });
+                    }
+                    // Best-effort happy-path: try once now. If it succeeds the
+                    // drain worker has nothing to do. If it fails or never
+                    // fires (process crash), the worker catches up.
                     setImmediate(() => {
-                        require('../services/stripeService').reportPaygUsage({
-                            stripeCustomerId: paygTarget.stripeCustomerId,
-                            amountMicroUnits,
-                            identifier,
-                            eventName: paygTarget.meterEventName,
-                        }).catch(err => console.error('[UsageStore] PAYG meter event failed:', err.message, { identifier }));
+                        try {
+                            require('../workers/paygDrain').drainOne(identifier).catch(() => {});
+                        } catch (_) { /* drain not yet loaded */ }
                     });
                 }
             }
         }
     } catch (e) {
+        // FX-rate failures for PAYG customers must propagate — the caller
+        // is responsible for failing the request rather than silently
+        // accepting a miscalculated bill. All other usage-log errors stay
+        // best-effort (logging must not break the chat path for fixed
+        // plans).
+        if (e && typeof e.message === 'string' && e.message.startsWith('fx_rate_unavailable:')) {
+            console.error('[UsageStore] PAYG usage rejected:', e.message);
+            throw e;
+        }
         console.error('[UsageStore] Failed to log usage:', e.message);
     }
 }

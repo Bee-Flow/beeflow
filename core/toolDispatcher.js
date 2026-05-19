@@ -102,23 +102,9 @@ async function executeTool(toolName, toolArgs, context = {}) {
         terminalCtx,
     } = context;
 
-    // ─── Media Gen Prompt Moderation ────────────────────────────
-    // Validate prompts for all media generation tools before dispatch
-    const MEDIA_GEN_TOOLS = ['generate_image', 'generate_video', 'generate_music', 'generate_song', 'generate_tts', 'generate_sfx'];
-    if (MEDIA_GEN_TOOLS.includes(toolName) && (toolArgs?.prompt || toolArgs?.text)) {
-        try {
-            const { validateInput } = require('./moderation');
-            const promptText = toolArgs.prompt || toolArgs.text;
-            await validateInput([{ role: 'user', content: promptText }], true);
-            console.log(`[ToolDispatcher] Media gen prompt passed moderation (${toolName})`);
-        } catch (guardErr) {
-            if (guardErr.message?.includes('Safety Violation')) {
-                console.warn(`[ToolDispatcher] Media gen prompt BLOCKED (${toolName}): ${guardErr.message}`);
-                return { error: `Content blocked — the prompt for ${toolName} was flagged by content safety. Please rephrase.` };
-            }
-            // Guard service unavailable — fail-open (already logged by moderation.js)
-        }
-    }
+    // Media-gen prompt moderation was removed when Azure Content Safety
+    // was dropped. The upstream media-gen providers (Azure OpenAI image,
+    // FAL, ElevenLabs) still apply their own safety filters.
 
     // ─── Terminal Tools (removed — module no longer exists) ────
     // Terminal container system has been removed from the platform
@@ -248,28 +234,26 @@ async function executeTool(toolName, toolArgs, context = {}) {
         return await executeGoogleGroupsTool(toolName, toolArgs, session);
     }
     if (isN8nWorkflowTool(toolName)) {
-        // Authoritative permission gate (defense-in-depth vs. the registration-time filter).
-        // Non-LLM callers (pipelines, schedules) also flow through here, so we must re-check.
+        // Read-only n8n tools are implicit for every member of an org with n8n
+        // configured (umbrella 'n8n' integration toggle gates injection). Only
+        // the write/execute bucket is permission-gated via modify_n8n_workflows.
+        // Non-LLM callers (pipelines, schedules) also flow through here, so we
+        // re-check writes as defense-in-depth vs. the registration-time filter.
         if (userId) {
             const requiredPerm = getN8nToolPermission(toolName);
-            const granted = await hasPermission(userId, requiredPerm, session);
-            if (!granted) {
-                const friendly = requiredPerm === 'modify_n8n_workflows'
-                    ? 'You do not have permission to modify n8n workflows. Ask your organisation admin to grant the "Modify n8n Workflows" permission.'
-                    : 'You do not have permission to use n8n tools. Ask your organisation admin to grant the "Use n8n Tools" permission.';
-                return { error: friendly };
+            if (requiredPerm === 'modify_n8n_workflows') {
+                const granted = await hasPermission(userId, requiredPerm, session);
+                if (!granted) {
+                    return { error: 'You do not have permission to modify n8n workflows. Ask your organisation admin to grant the "Modify n8n Workflows" permission.' };
+                }
             }
         }
         return await executeN8nWorkflowTool(toolName, toolArgs, orgId);
     }
     if (isN8nTool(toolName)) {
-        // Webhook-trigger tools require the base 'use_n8n_tools' permission.
-        if (userId) {
-            const granted = await hasPermission(userId, 'use_n8n_tools', session);
-            if (!granted) {
-                return { error: 'You do not have permission to run n8n workflows. Ask your organisation admin to grant the "Use n8n Tools" permission.' };
-            }
-        }
+        // Webhook-trigger tools are implicit for every member once the org has
+        // n8n configured — gated only by the umbrella 'n8n' integration toggle
+        // at injection time (see integrationTools.js).
         return await executeN8nTool(toolName, toolArgs, orgId, attachments);
     }
     if (isAgentSearchTool(toolName)) {

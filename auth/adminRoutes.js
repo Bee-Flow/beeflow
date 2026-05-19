@@ -12,9 +12,18 @@ const multer = require('multer');
 const router = express.Router();
 
 const userStore = require('../stores/userStore');
-const { loadConfig, saveConfig, requireAuth, requireAdmin, getUserPermissions, SYSTEM_PERMISSIONS, invalidatePermissionCache, invalidateAllPermissionCaches, resolveUserOrgIds } = require('./permissions');
+const { loadConfig, saveConfig, requireAuth, requireAdmin, getUserPermissions, SYSTEM_PERMISSIONS, invalidatePermissionCache, invalidateAllPermissionCaches, resolveUserOrgIds, isOrgAdminRole } = require('./permissions');
 const { rewrapUserDEKCompat, adminResetUser, getOrCreateUserDEKCompat } = require('./encryption');
 const { checkResourceLimits } = require('../core/limits');
+const { perUserRateLimit } = require('../utils/perUserRateLimit');
+
+// Invitation flood control. Two layered limits:
+//   • per-inviter:  20 invites / hour (rolling)
+//   • per-org/day:  200 invites total (we don't bother tracking per IP
+//     because invitations require an authenticated session)
+// Both run before the route handler so a malicious admin can't bypass by
+// rotating accounts within their org.
+const invitationInviterLimiter = perUserRateLimit({ windowMs: 60 * 60_000, max: 20 });
 
 /**
  * Check if the current user is an org admin for a given organization.
@@ -30,8 +39,8 @@ async function isOrgAdminForOrg(req, orgId) {
     const user = await userStore.getUser(userId);
     if (!user) return false;
 
-    // Must be org_admin role
-    if (user.orgRole !== 'org_admin') return false;
+    // Must be org_admin role (or legacy 'admin' value pre-rename)
+    if (!isOrgAdminRole(user.orgRole)) return false;
 
     // Must belong to the target org
     if (user.organizationId === orgId) return true;
@@ -221,6 +230,15 @@ router.post('/users', requireOrgAdminForUser, async (req, res) => {
         const result = await userStore.createUserWithSeatCheck(newUser, { strict: true });
         if (result.created) {
             console.log(`[Audit] ${req.session.user?.id || 'system'} created user '${username}' in org '${organizationId || 'none'}' with orgRole '${orgRole || 'none'}'`);
+            await userStore.logAccessAudit(
+                'user.create',
+                'user',
+                newUser.id,
+                req.session.user?.id || null,
+                null,
+                { username, displayName, role, orgRole: orgRole || '', organizationId: organizationId || null, groups: finalGroups },
+                organizationId || null,
+            );
             return res.json({ success: true, user: { id: newUser.id, username, displayName, role } });
         }
         if (result.reason === 'duplicate_id') return res.status(400).json({ error: 'User already exists' });
@@ -244,6 +262,13 @@ router.put('/users/:id', requireOrgAdminForUser, async (req, res) => {
             return res.status(400).json({ error: 'Cannot downgrade system admin' });
         }
     }
+
+    // Snapshot the user's access-relevant fields before mutation so the
+    // audit row captures the actual transition rather than just the new
+    // state. Failures here are non-fatal — auditing must not block the
+    // update.
+    let prevUser = null;
+    try { prevUser = await userStore.getUser(id); } catch (_) { prevUser = null; }
 
     const updates = { role, groups, displayName, firstName, lastName, email, phone, avatar, avatarType, orgRole, organizationId, status };
     if (password) {
@@ -270,6 +295,28 @@ router.put('/users/:id', requireOrgAdminForUser, async (req, res) => {
     if (await userStore.updateUser(id, updates)) {
         const changedFields = Object.keys(updates).filter(k => updates[k] !== undefined);
         console.log(`[Audit] ${req.session.user?.id || 'system'} updated user '${id}' — fields: ${changedFields.join(', ')}`);
+        // Capture only the access-relevant changes for audit (role, orgRole,
+        // groups, organizationId, status) — never log password material.
+        const ACCESS_FIELDS = ['role', 'orgRole', 'groups', 'organizationId', 'status'];
+        const oldVals = {};
+        const newVals = {};
+        for (const f of ACCESS_FIELDS) {
+            if (updates[f] === undefined) continue;
+            if (prevUser && JSON.stringify(prevUser[f]) === JSON.stringify(updates[f])) continue;
+            oldVals[f] = prevUser ? prevUser[f] : null;
+            newVals[f] = updates[f];
+        }
+        if (Object.keys(newVals).length > 0) {
+            await userStore.logAccessAudit(
+                'user.update',
+                'user',
+                id,
+                req.session.user?.id || null,
+                oldVals,
+                newVals,
+                (prevUser && prevUser.organizationId) || updates.organizationId || null,
+            );
+        }
         // Role / orgRole / group changes alter the user's effective permissions.
         await invalidatePermissionCache(id);
         // Bust the requireAuth user-existence cache so a role demotion takes
@@ -278,7 +325,27 @@ router.put('/users/:id', requireOrgAdminForUser, async (req, res) => {
             const { invalidateUserExistenceCache } = require('./permissions');
             await invalidateUserExistenceCache(id);
         } catch (_) { /* optional helper */ }
-        res.json({ success: true });
+
+        // Soft hint when the admin is assigning a *weaker* orgRole than the
+        // user already had. Not an error — admins legitimately demote — but
+        // the UI can show a confirm prompt before applying. The ranks come
+        // from orgRoles.json's effective-permission count (more permissions
+        // = "higher").
+        let hint = null;
+        if (updates.orgRole !== undefined && prevUser?.orgRole && updates.orgRole !== prevUser.orgRole) {
+            const RANK = { org_admin: 4, admin: 4, agent_admin: 3, agent_editor: 2, dpo: 2, member: 1, '': 0 };
+            const oldRank = RANK[prevUser.orgRole] ?? 1;
+            const newRank = RANK[updates.orgRole] ?? 1;
+            if (newRank < oldRank) {
+                hint = {
+                    kind: 'role_downgrade',
+                    from: prevUser.orgRole,
+                    to: updates.orgRole,
+                    message: `Note: '${updates.orgRole || 'no role'}' has fewer permissions than '${prevUser.orgRole}'. The user will lose access to some features immediately.`,
+                };
+            }
+        }
+        res.json({ success: true, ...(hint ? { hint } : {}) });
     } else {
         res.status(404).json({ error: 'User not found' });
     }
@@ -291,8 +358,28 @@ router.delete('/users/:id', requireOrgAdminForUser, async (req, res) => {
         return res.status(400).json({ error: 'Cannot delete system admin' });
     }
 
+    // Capture the user snapshot before destruction so the audit row records
+    // who was removed from which org.
+    let prevUser = null;
+    try { prevUser = await userStore.getUser(id); } catch (_) { prevUser = null; }
+
     if (await userStore.deleteUser(id)) {
         console.log(`[Audit] ${req.session.user?.id || 'system'} deleted user '${id}'`);
+        await userStore.logAccessAudit(
+            'user.delete',
+            'user',
+            id,
+            req.session.user?.id || null,
+            prevUser ? {
+                username: prevUser.username,
+                role: prevUser.role,
+                orgRole: prevUser.orgRole,
+                organizationId: prevUser.organizationId,
+                groups: prevUser.groups,
+            } : null,
+            null,
+            prevUser ? prevUser.organizationId : null,
+        );
         // Clear any stale permission cache for the deleted user so existing
         // sessions can't continue resolving against the cached snapshot.
         await invalidatePermissionCache(id);
@@ -447,6 +534,15 @@ router.post('/organizations', requireAdmin, async (req, res) => {
 
     if (await userStore.createOrganization(newOrg)) {
         console.log(`[Audit] ${req.session.user?.id || 'system'} created organization '${name}' (${id})`);
+        await userStore.logAccessAudit(
+            'org.create',
+            'organization',
+            id,
+            req.session.user?.id || null,
+            null,
+            { name, description: description || '', allowSignup: !!allowSignup },
+            id,
+        );
         res.json({ success: true, organization: newOrg });
     } else {
         res.status(400).json({ error: 'Organization already exists' });
@@ -506,7 +602,30 @@ router.put('/organizations/:id', requireOrgAdmin('id'), async (req, res) => {
         finalAllowedDomains = normalised;
     }
 
-    if (await userStore.updateOrganization(id, { name, description, tagline, address, email, phone, website, kvk, vat, logo, footerText, defaultGroups, allowSignup, authMethod: finalAuthMethod, enabledIntegrations: finalIntegrations, autoApproveSSO, allowedDomains: finalAllowedDomains })) {
+    const orgUpdates = { name, description, tagline, address, email, phone, website, kvk, vat, logo, footerText, defaultGroups, allowSignup, authMethod: finalAuthMethod, enabledIntegrations: finalIntegrations, autoApproveSSO, allowedDomains: finalAllowedDomains };
+    if (await userStore.updateOrganization(id, orgUpdates)) {
+        // Record only the access-relevant deltas. existing was loaded above
+        // for the authMethod check; reuse it.
+        const AUDIT_FIELDS = ['name', 'description', 'tagline', 'address', 'email', 'phone', 'website', 'kvk', 'vat', 'authMethod', 'enabledIntegrations', 'allowSignup', 'autoApproveSSO', 'allowedDomains', 'defaultGroups'];
+        const oldVals = {};
+        const newVals = {};
+        for (const f of AUDIT_FIELDS) {
+            if (orgUpdates[f] === undefined) continue;
+            if (existing && JSON.stringify(existing[f]) === JSON.stringify(orgUpdates[f])) continue;
+            oldVals[f] = existing ? existing[f] : null;
+            newVals[f] = orgUpdates[f];
+        }
+        if (Object.keys(newVals).length > 0) {
+            await userStore.logAccessAudit(
+                'org.update',
+                'organization',
+                id,
+                req.session.user?.id || null,
+                oldVals,
+                newVals,
+                id,
+            );
+        }
         res.json({ success: true });
     } else {
         res.status(404).json({ error: 'Organization not found' });
@@ -515,8 +634,21 @@ router.put('/organizations/:id', requireOrgAdmin('id'), async (req, res) => {
 
 router.delete('/organizations/:id', requireAdmin, async (req, res) => {
     const { id } = req.params;
+    // Snapshot the org row before the cascade so the audit trail captures
+    // what was destroyed (the row is gone after deleteOrganization).
+    let prevOrg = null;
+    try { prevOrg = await userStore.getOrganization(id); } catch (_) { prevOrg = null; }
     if (await userStore.deleteOrganization(id)) {
         console.log(`[Audit] ${req.session.user?.id || 'system'} deleted organization '${id}'`);
+        await userStore.logAccessAudit(
+            'org.delete',
+            'organization',
+            id,
+            req.session.user?.id || null,
+            prevOrg,
+            null,
+            id,
+        );
         res.json({ success: true });
     } else {
         res.status(404).json({ error: 'Organization not found' });
@@ -644,6 +776,15 @@ router.post('/groups', requireAuth, async (req, res) => {
 
     if (await userStore.createGroup(newGroup)) {
         console.log(`[Audit] ${userId || 'system'} created group '${name}' (${id}) in org '${orgId || 'global'}'`);
+        await userStore.logAccessAudit(
+            'group.create',
+            'group',
+            id,
+            userId || null,
+            null,
+            { name, permissions: newGroup.permissions, roles: newGroup.roles, allowedAgentTypes: newGroup.allowedAgentTypes },
+            orgId,
+        );
         res.json({ success: true, group: newGroup });
     } else {
         res.status(400).json({ error: 'Group already exists' });
@@ -697,8 +838,36 @@ router.put('/groups/:id', requireAuth, async (req, res) => {
         updates.orgRole = orgRole;
     }
 
+    // Snapshot the group so the audit row carries the before/after of the
+    // access-relevant fields, not just the new state.
+    let prevGroup = null;
+    try {
+        const all = await userStore.getAllGroups();
+        prevGroup = all.find(g => g.id === id) || null;
+    } catch (_) { prevGroup = null; }
+
     if (await userStore.updateGroup(id, updates)) {
         console.log(`[Audit] ${userId || 'system'} updated group '${id}' — fields: ${Object.keys(updates).filter(k => updates[k] !== undefined).join(', ')}`);
+        const AUDIT_FIELDS = ['permissions', 'roles', 'orgRole', 'allowedAgentTypes', 'allowedTiers', 'organizationId'];
+        const oldVals = {};
+        const newVals = {};
+        for (const f of AUDIT_FIELDS) {
+            if (updates[f] === undefined) continue;
+            if (prevGroup && JSON.stringify(prevGroup[f]) === JSON.stringify(updates[f])) continue;
+            oldVals[f] = prevGroup ? prevGroup[f] : null;
+            newVals[f] = updates[f];
+        }
+        if (Object.keys(newVals).length > 0) {
+            await userStore.logAccessAudit(
+                'group.update',
+                'group',
+                id,
+                userId || null,
+                oldVals,
+                newVals,
+                (prevGroup && prevGroup.organizationId) || updates.organizationId || null,
+            );
+        }
         // Permissions / roles / orgRole on the group change the effective
         // permission set of every member. Easiest safe bet: clear all.
         await invalidateAllPermissionCaches();
@@ -731,8 +900,31 @@ router.delete('/groups/:id', requireAuth, async (req, res) => {
         }
     }
 
+    // Snapshot before destructive delete so the audit trail records what was
+    // removed (the row is gone after deleteGroup).
+    let prevGroup = null;
+    try {
+        const all = await userStore.getAllGroups();
+        prevGroup = all.find(g => g.id === id) || null;
+    } catch (_) { prevGroup = null; }
+
     if (await userStore.deleteGroup(id)) {
         console.log(`[Audit] ${userId || 'system'} deleted group '${id}'`);
+        await userStore.logAccessAudit(
+            'group.delete',
+            'group',
+            id,
+            userId || null,
+            prevGroup ? {
+                name: prevGroup.name,
+                permissions: prevGroup.permissions,
+                roles: prevGroup.roles,
+                orgRole: prevGroup.orgRole,
+                organizationId: prevGroup.organizationId,
+            } : null,
+            null,
+            prevGroup ? prevGroup.organizationId : null,
+        );
         await invalidateAllPermissionCaches();
         res.json({ success: true });
     } else {
@@ -765,6 +957,15 @@ router.post('/roles', requireAdmin, async (req, res) => {
 
     if (await userStore.createRole(newRole)) {
         console.log(`[Audit] ${req.session.user?.id || 'system'} created role '${name}' (${id})`);
+        await userStore.logAccessAudit(
+            'role.create',
+            'role',
+            id,
+            req.session.user?.id || null,
+            null,
+            { name, description: newRole.description, permissions: newRole.permissions },
+            null,
+        );
         res.json({ success: true, role: newRole });
     } else {
         res.status(400).json({ error: 'Role already exists' });
@@ -775,7 +976,34 @@ router.put('/roles/:id', requireAdmin, async (req, res) => {
     const { id } = req.params;
     const { name, description, permissions } = req.body;
 
+    let prevRole = null;
+    try {
+        const all = await userStore.getAllRoles();
+        prevRole = all.find(r => r.id === id) || null;
+    } catch (_) { prevRole = null; }
+
     if (await userStore.updateRole(id, { name, description, permissions })) {
+        const AUDIT_FIELDS = ['name', 'description', 'permissions'];
+        const oldVals = {};
+        const newVals = {};
+        const incoming = { name, description, permissions };
+        for (const f of AUDIT_FIELDS) {
+            if (incoming[f] === undefined) continue;
+            if (prevRole && JSON.stringify(prevRole[f]) === JSON.stringify(incoming[f])) continue;
+            oldVals[f] = prevRole ? prevRole[f] : null;
+            newVals[f] = incoming[f];
+        }
+        if (Object.keys(newVals).length > 0) {
+            await userStore.logAccessAudit(
+                'role.update',
+                'role',
+                id,
+                req.session.user?.id || null,
+                oldVals,
+                newVals,
+                null,
+            );
+        }
         await invalidateAllPermissionCaches();
         res.json({ success: true });
     } else {
@@ -789,8 +1017,23 @@ router.delete('/roles/:id', requireAdmin, async (req, res) => {
         return res.status(400).json({ error: 'Cannot delete system roles' });
     }
 
+    let prevRole = null;
+    try {
+        const all = await userStore.getAllRoles();
+        prevRole = all.find(r => r.id === id) || null;
+    } catch (_) { prevRole = null; }
+
     if (await userStore.deleteRole(id)) {
         console.log(`[Audit] ${req.session.user?.id || 'system'} deleted role '${id}'`);
+        await userStore.logAccessAudit(
+            'role.delete',
+            'role',
+            id,
+            req.session.user?.id || null,
+            prevRole,
+            null,
+            null,
+        );
         await invalidateAllPermissionCaches();
         res.json({ success: true });
     } else {
@@ -808,11 +1051,7 @@ router.get('/permissions', requireAdmin, async (req, res) => {
 
 // === App Password Management ===
 
-router.get('/app-password-status', async (req, res) => {
-    if (!req.session.isAuthenticated) {
-        return res.json({ hasAppPassword: false, isNextcloudUser: false });
-    }
-
+router.get('/app-password-status', requireAuth, async (req, res) => {
     const userId = req.session.user?.id;
     if (!userId) {
         return res.json({ hasAppPassword: false, isNextcloudUser: false });
@@ -824,11 +1063,7 @@ router.get('/app-password-status', async (req, res) => {
     });
 });
 
-router.post('/create-app-password', async (req, res) => {
-    if (!req.session.isAuthenticated) {
-        return res.status(401).json({ error: 'Must be logged in' });
-    }
-
+router.post('/create-app-password', requireAuth, async (req, res) => {
     const accessToken = req.session.accessToken;
     const userId = req.session.user?.id;
 
@@ -890,11 +1125,7 @@ router.post('/create-app-password', async (req, res) => {
     }
 });
 
-router.post('/save-app-password', async (req, res) => {
-    if (!req.session.isAuthenticated) {
-        return res.status(401).json({ error: 'Must be logged in' });
-    }
-
+router.post('/save-app-password', requireAuth, async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) {
         return res.status(400).json({ error: 'Username and password are required' });
@@ -905,11 +1136,7 @@ router.post('/save-app-password', async (req, res) => {
     res.json({ success: true, message: 'App password saved securely' });
 });
 
-router.delete('/app-password', async (req, res) => {
-    if (!req.session.isAuthenticated) {
-        return res.status(401).json({ error: 'Must be logged in' });
-    }
-
+router.delete('/app-password', requireAuth, async (req, res) => {
     const userId = req.session.user?.id;
     await userStore.deleteAppPassword(userId);
     res.json({ success: true });
@@ -1185,6 +1412,10 @@ router.put('/me/active-features', requireAuth, async (req, res) => {
         const ctx = await resolveActiveFeaturesContext(req);
         if (!ctx.orgId) return res.status(400).json({ error: 'No organisation to update' });
 
+        // Snapshot the current enablement state so the audit row captures the
+        // actual transition rather than just the new value.
+        const prevBeta = Array.isArray(ctx.enabledBetaFeatures) ? [...ctx.enabledBetaFeatures] : [];
+        const prevInt = Array.isArray(ctx.enabledIntegrations) ? [...ctx.enabledIntegrations] : [];
         let savedBeta = ctx.enabledBetaFeatures;
         let savedInt = ctx.enabledIntegrations;
 
@@ -1213,6 +1444,30 @@ router.put('/me/active-features', requireAuth, async (req, res) => {
             savedInt = clean;
         }
 
+        // GDPR Art. 30 / SOC 2 — every entitlement mutation needs an audit row.
+        // Only fire when at least one of the lists actually changed.
+        const betaChanged = Array.isArray(betaEnabled) && JSON.stringify([...prevBeta].sort()) !== JSON.stringify([...savedBeta].sort());
+        const intChanged = Array.isArray(integrationsEnabled) && JSON.stringify([...prevInt].sort()) !== JSON.stringify([...savedInt].sort());
+        if (betaChanged || intChanged) {
+            const oldVals = {};
+            const newVals = {};
+            if (betaChanged) { oldVals.betaEnabled = prevBeta; newVals.betaEnabled = savedBeta; }
+            if (intChanged) { oldVals.integrationsEnabled = prevInt; newVals.integrationsEnabled = savedInt; }
+            try {
+                await userStore.logAccessAudit(
+                    'org.active_features.update',
+                    'organization',
+                    ctx.orgId,
+                    req.session.user?.id || null,
+                    oldVals,
+                    newVals,
+                    ctx.orgId,
+                );
+            } catch (e) {
+                console.warn('[ActiveFeatures] audit log failed:', e.message);
+            }
+        }
+
         res.json({ orgId: ctx.orgId, enabledBetaFeatures: savedBeta, enabledIntegrations: savedInt });
     } catch (e) {
         console.error('[ActiveFeatures] /me PUT error:', e.message);
@@ -1236,6 +1491,92 @@ router.get('/me/consumer-features', requireAuth, async (req, res) => {
     } catch (e) {
         console.error('[ConsumerFeatures] GET error:', e.message);
         res.status(500).json({ error: e.message });
+    }
+});
+
+// Self-service leave-org. Lets a member detach themselves from their
+// organisation. Anything they own that can't survive an unowned state
+// (agents — they have FK constraints, embed flows, etc.) is reassigned to
+// a target user the caller specifies, who must be an org_admin of the
+// same org. Sole-admin protection: if removing this user would leave the
+// org with zero org_admins (and they're an org_admin), the request is
+// rejected with 409 — the org would otherwise be unmanageable.
+router.post('/users/me/leave-org', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session?.user?.id;
+        if (!userId) return res.status(401).json({ error: 'Not authenticated' });
+
+        const me = await userStore.getUser(userId);
+        if (!me) return res.status(404).json({ error: 'User not found' });
+        const orgId = me.organizationId;
+        if (!orgId) return res.status(400).json({ error: 'You are not part of an organization' });
+
+        const { transferTo } = req.body || {};
+        if (!transferTo || typeof transferTo !== 'string') {
+            return res.status(400).json({ error: 'transferTo (user id) is required' });
+        }
+        const target = await userStore.getUser(transferTo);
+        if (!target || target.organizationId !== orgId) {
+            return res.status(400).json({ error: 'transferTo must be a user in your organization' });
+        }
+        const targetIsOrgAdmin = isOrgAdminRole(target.orgRole);
+        if (!targetIsOrgAdmin) {
+            return res.status(400).json({ error: 'transferTo must be an organization admin' });
+        }
+
+        // Sole-admin protection: count the org's admins excluding self.
+        const meIsOrgAdmin = isOrgAdminRole(me.orgRole);
+        if (meIsOrgAdmin) {
+            const { getAll } = require('../db');
+            const others = await getAll(
+                `SELECT COUNT(*)::int AS n FROM users WHERE "organizationId" = $1 AND id <> $2 AND "orgRole" IN ('org_admin', 'admin')`,
+                [orgId, userId],
+            );
+            if ((others?.[0]?.n ?? 0) === 0) {
+                return res.status(409).json({ error: 'You are the only organization admin. Promote another member before leaving.' });
+            }
+        }
+
+        // Re-parent owned agents to the target. Bulk update is fine here
+        // because we just verified target shares the org. Knowledge bases,
+        // skills, automations etc. would follow the same pattern — kept
+        // narrow to agents for this change; expand as ownership semantics
+        // are formalised for each surface.
+        const agentStore = require('../stores/agentStore');
+        try {
+            const { run } = require('../db');
+            await run(
+                'UPDATE agents SET owner_id = $1, updated_at = NOW() WHERE owner_id = $2 AND organization_id = $3',
+                [transferTo, userId, orgId],
+            );
+        } catch (e) {
+            console.warn('[LeaveOrg] agent reassignment failed:', e.message);
+        }
+
+        // Detach the user from the org. Keep the user row itself (don't
+        // delete) — they may want to keep their consumer-mode account.
+        await userStore.updateUser(userId, {
+            organizationId: '',
+            orgRole: '',
+            groups: [],
+        });
+
+        await invalidatePermissionCache(userId);
+
+        await userStore.logAccessAudit(
+            'user.leave_org',
+            'user',
+            userId,
+            userId,
+            { organizationId: orgId, orgRole: me.orgRole },
+            { transferTo },
+            orgId,
+        );
+
+        res.json({ success: true, transferredTo: transferTo });
+    } catch (err) {
+        console.error('[LeaveOrg] error:', err);
+        res.status(500).json({ error: err.message || 'Failed to leave organization' });
     }
 });
 
@@ -1286,8 +1627,40 @@ router.put('/default-integrations', requireAdmin, async (req, res) => {
 const invitationStore = require('../stores/invitationStore');
 const { sendInvitationEmail } = require('../utils/emailService');
 
+// Per-org daily cap. In-memory rolling 24h window keyed on orgId. Cheap,
+// resets on process restart (acceptable — the cap is anti-spam, not a hard
+// quota). For multi-node deploys, this is per-node; redis would be a future
+// upgrade if abuse patterns warrant it.
+const ORG_INVITE_DAILY_CAP = 200;
+const ORG_INVITE_WINDOW_MS = 24 * 60 * 60_000;
+const _orgInviteBuckets = new Map(); // orgId → [timestamps]
+function _checkOrgInviteCap(orgId) {
+    const now = Date.now();
+    const cutoff = now - ORG_INVITE_WINDOW_MS;
+    const arr = (_orgInviteBuckets.get(orgId) || []).filter(t => t > cutoff);
+    if (arr.length >= ORG_INVITE_DAILY_CAP) return false;
+    arr.push(now);
+    _orgInviteBuckets.set(orgId, arr);
+    return true;
+}
+
+// Per-email cooldown — protects an external email from being spammed
+// across rotating admin accounts. One hour between invitations to the
+// same lower-cased email. Keyed solely on the email so a hostile pair of
+// org admins can't take turns.
+const EMAIL_INVITE_COOLDOWN_MS = 60 * 60_000;
+const _lastInviteByEmail = new Map(); // lowercase email → last ts
+function _checkEmailInviteCooldown(email) {
+    if (!email) return true;
+    const k = String(email).toLowerCase().trim();
+    const last = _lastInviteByEmail.get(k) || 0;
+    if (Date.now() - last < EMAIL_INVITE_COOLDOWN_MS) return false;
+    _lastInviteByEmail.set(k, Date.now());
+    return true;
+}
+
 // Create invitation + send email
-router.post('/invitations', requireAuth, async (req, res) => {
+router.post('/invitations', requireAuth, invitationInviterLimiter, async (req, res) => {
     try {
         const { email, role } = req.body;
         if (!email) return res.status(400).json({ error: 'Email is required' });
@@ -1301,6 +1674,18 @@ router.post('/invitations', requireAuth, async (req, res) => {
         if (!orgId) return res.status(403).json({ error: 'You are not part of an organisation' });
         if (!(await isOrgAdminForOrg(req, orgId))) {
             return res.status(403).json({ error: 'Only organisation admins can send invitations' });
+        }
+
+        // Per-org daily cap. Sits after the auth checks so unauthenticated
+        // traffic doesn't pollute the bucket.
+        if (!_checkOrgInviteCap(orgId)) {
+            return res.status(429).json({ error: `Organisation invitation cap reached (${ORG_INVITE_DAILY_CAP} per 24h). Try again later.` });
+        }
+
+        // Per-recipient cooldown — prevents a target email from being
+        // spammed even across multiple admin accounts (and orgs).
+        if (!_checkEmailInviteCooldown(email)) {
+            return res.status(429).json({ error: 'This email was recently invited. Wait an hour before re-inviting.' });
         }
 
         // Check if user already exists with this email
@@ -1318,9 +1703,13 @@ router.post('/invitations', requireAuth, async (req, res) => {
         });
         if (!invitation) return res.status(500).json({ error: 'Failed to create invitation' });
 
-        // Build invite URL
+        // Build invite URL. Use the path-style redeem endpoint instead of
+        // `/login?invite=TOKEN` so the token never appears in the SPA URL
+        // bar, the Referer header, or reverse-proxy access logs after the
+        // 302 fires. The endpoint moves the token into the session and
+        // redirects to /login?signup=1.
         const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}`;
-        const inviteUrl = `${clientHost}/login?invite=${invitation.token}`;
+        const inviteUrl = `${clientHost}/api/auth/redeem-invite/${invitation.token}`;
 
         // Get org name and inviter display name
         const org = await userStore.getOrganization(orgId);
@@ -1340,6 +1729,16 @@ router.post('/invitations', requireAuth, async (req, res) => {
             console.error('[Invitations] Email send failed:', emailResult.error);
             // Still return the invitation — admin can share the link manually
         }
+
+        await userStore.logAccessAudit(
+            'invitation.create',
+            'invitation',
+            invitation.id,
+            userId || null,
+            null,
+            { email, role: role || 'user', emailSent: !!emailResult.success },
+            orgId,
+        );
 
         res.json({
             success: true,
@@ -1394,7 +1793,29 @@ router.delete('/invitations/:id', requireAuth, async (req, res) => {
             return res.status(403).json({ error: 'Only organisation admins can revoke invitations' });
         }
 
+        // Snapshot before destructive delete so the audit trail preserves the
+        // grant terms (role, groups, target email, issuer).
+        let prevInvite = null;
+        try { prevInvite = await invitationStore.getInvitationById(req.params.id); } catch (_) { prevInvite = null; }
+
         const revoked = await invitationStore.deleteInvitation(req.params.id);
+        if (revoked) {
+            await userStore.logAccessAudit(
+                'invitation.revoke',
+                'invitation',
+                req.params.id,
+                userId || null,
+                prevInvite ? {
+                    email: prevInvite.email,
+                    orgRole: prevInvite.org_role || prevInvite.orgRole,
+                    groups: prevInvite.groups,
+                    invited_by: prevInvite.invited_by,
+                    organization_id: prevInvite.organization_id,
+                } : null,
+                null,
+                user.organizationId,
+            );
+        }
         res.json({ success: revoked });
     } catch (err) {
         console.error('[Invitations] Revoke error:', err);

@@ -66,23 +66,15 @@ async function resolveOrgShield(orgId) {
             ? { userInput: !!shield.scope.userInput, agentOutput: !!shield.scope.agentOutput }
             : { userInput: true, agentOutput: true },
         action: shield.action || 'delete',
-        // PII detection settings
-        azurePiiEnabled: !!shield.azurePiiEnabled,
-        // In-process Transformers.js fallback (Apache-2.0 OpenAI Privacy Filter).
-        // Default true so a fresh server with no Azure config still detects PII.
-        localPiiEnabled: shield.localPiiEnabled !== false,
+        // PII detection — the master `enabled` flag above is the single switch.
+        // azurePiiEnabled / localPiiEnabled are kept on the persisted doc for
+        // backwards-compatibility (old saves still parse) but are not surfaced
+        // here and are ignored at runtime by piiDetection.js's gate.
         piiDetectionCategories: shield.piiDetectionCategories || [],
         piiDetectionConfidenceThreshold: shield.piiDetectionConfidenceThreshold,
         piiDetectionAction: shield.piiDetectionAction || globalConfig.piiDetectionAction || 'block',
-        // Content Safety
-        azureSeverityThreshold: shield.azureSeverityThreshold,
-        azureEnabledCategories: shield.azureEnabledCategories,
-        // Other features
-        moderationEnabled: !!shield.moderationEnabled,
-        // Exactly one provider runs per turn. If the stored value is missing
-        // or unknown, default to Azure Content Safety.
-        moderationProvider: shield.moderationProvider === 'azure' ? 'azure' : 'azure',
-        moderationCategories: shield.moderationCategories || [],
+        // Content moderation was removed; legacy fields stay on disk but
+        // are no longer surfaced here.
         euModeEnabled: !!shield.euModeEnabled,
         webSearchGuardEnabled: !!shield.webSearchGuardEnabled,
         disableSearchOnUpload: !!shield.disableSearchOnUpload,
@@ -117,14 +109,14 @@ async function resolveOrgShield(orgId) {
 }
 
 /**
- * Map stored legacy fields (`dlpEnabled`, `dlpMode`, `azurePiiEnabled`,
- * `piiDetectionAction`, …) onto the canonical Privacy fields
- * (`privacyScanEnabled`, `privacyAction`, `privacyScope`, `privacyFailureMode`).
+ * Map stored legacy fields (`dlpEnabled`, `dlpMode`, `piiDetectionAction`,
+ * …) onto the canonical Privacy fields (`privacyScanEnabled`,
+ * `privacyAction`, `privacyScope`, `privacyFailureMode`).
  *
  * Rules:
- *   - `privacyScanEnabled` = dlpEnabled OR azurePiiEnabled (either surfaces a scan)
- *   - `privacyAction` — if dlpMode is set (new feature), it wins; otherwise fall
- *     back to the legacy `piiDetectionAction` ('tokenize' → 'redact').
+ *   - `privacyScanEnabled` = dlpEnabled OR shield.enabled (the master flag)
+ *   - `privacyAction` — if dlpMode is set (new feature), it wins; otherwise
+ *     fall back to the legacy `piiDetectionAction` ('tokenize' → 'redact').
  *   - `privacyScope` = dlpScope ('external' by default)
  *   - `privacyFailureMode` = dlpFailureMode ('fail_closed' by default)
  *
@@ -145,7 +137,7 @@ function synthesizePrivacyFields(shield, orgId) {
         privacyAction = 'ask';
     }
 
-    const privacyScanEnabled = !!(shield.dlpEnabled || shield.azurePiiEnabled);
+    const privacyScanEnabled = !!(shield.dlpEnabled || shield.enabled);
     const migratedFromLegacy = !shield.privacyScanEnabled && privacyScanEnabled
         && !hasDlpMode && shield.piiDetectionAction;
     if (migratedFromLegacy) {
@@ -228,9 +220,6 @@ async function selfCheckOrgShields() {
         const fleet = {
             total: entries.length,
             shieldEnabled: 0,
-            moderationEnabled: 0,
-            providerLlama: 0,
-            providerAzure: 0,
             piiEnabled: 0,
             dlpEnabled: 0,
             privacyScanEnabled: 0,
@@ -244,10 +233,7 @@ async function selfCheckOrgShields() {
                 const resolved = await resolveOrgShield(orgId);
                 if (!resolved) continue; // shield disabled
                 fleet.shieldEnabled++;
-                if (resolved.moderationEnabled) fleet.moderationEnabled++;
-                if (resolved.moderationProvider === 'azure') fleet.providerAzure++;
-                else fleet.providerLlama++;
-                if (resolved.azurePiiEnabled) fleet.piiEnabled++;
+                if (resolved.enabled) fleet.piiEnabled++;
                 if (resolved.dlpEnabled) fleet.dlpEnabled++;
                 if (resolved.privacyScanEnabled) fleet.privacyScanEnabled++;
                 if (resolved.euModeEnabled) fleet.euMode++;
@@ -283,8 +269,7 @@ async function selfCheckOrgShields() {
         }
         console.log(
             `[OrgShieldSelfCheck] ${entries.length} shield(s) scanned — ${ok} OK, ${warnings} warning(s). ` +
-            `Fleet: shield=${fleet.shieldEnabled}/${fleet.total}, moderation=${fleet.moderationEnabled} ` +
-            `(llama=${fleet.providerLlama}, azure=${fleet.providerAzure}), ` +
+            `Fleet: shield=${fleet.shieldEnabled}/${fleet.total}, ` +
             `pii=${fleet.piiEnabled}, dlp=${fleet.dlpEnabled}, privacyScan=${fleet.privacyScanEnabled}, ` +
             `euMode=${fleet.euMode}, monitorIntegrations=${fleet.monitorIntegrations}, ` +
             `legacyShape=${fleet.legacyShape}.`
@@ -315,23 +300,18 @@ async function resolveUserShield(userId) {
     const shield = await configStore.getConfig(`user_privacy_shield_${userId}`);
     if (!shield?.enabled) return null;
 
-    const piiEnabled = !!shield.piiDetectionEnabled;
     return {
         enabled: true,
         rulesWithNames: [],
         stalenessWarnings: [],
         scope: { userInput: true, agentOutput: true },
         action: 'delete',
-        // PII — the user opted in via the consumer panel
-        azurePiiEnabled: piiEnabled,
-        localPiiEnabled: piiEnabled,
+        // PII — the user opted in via the consumer panel; the master
+        // `enabled` flag above propagates through the gate at request time.
         piiDetectionCategories: Array.isArray(shield.piiDetectionCategories) ? shield.piiDetectionCategories : [],
         piiDetectionConfidenceThreshold: typeof shield.piiDetectionConfidenceThreshold === 'number' ? shield.piiDetectionConfidenceThreshold : 0.7,
         piiDetectionAction: ['block', 'tokenize'].includes(shield.piiDetectionAction) ? shield.piiDetectionAction : 'tokenize',
-        // Moderation / DLP / web-search guard are org-only features
-        moderationEnabled: false,
-        moderationProvider: 'azure',
-        moderationCategories: [],
+        // DLP / web-search guard are org-only features
         euModeEnabled: !!shield.euModeEnabled,
         webSearchGuardEnabled: false,
         disableSearchOnUpload: !!shield.disableSearchOnUpload,

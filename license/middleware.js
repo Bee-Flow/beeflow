@@ -81,7 +81,14 @@ async function resolveBestTierForRequest(req) {
     // license revoke, role change) call invalidateCacheForOrg/User to expire
     // the entry early. Cached on req.session so it survives the request but
     // not future logins.
-    const cacheKey = `_lic:${u.id}`;
+    //
+    // The cache key weaves in the install-wide server-licence version
+    // counter. When a super-admin activates/deactivates a server-wide
+    // licence (server/license/index.js → bumpServerLicenseVersion), the
+    // counter increments and every existing session's cache key becomes
+    // stale on the next request — no session enumeration needed.
+    const serverVer = license.getServerLicenseVersion();
+    const cacheKey = `_lic:${u.id}:v${serverVer}`;
     if (req.session && req.session[cacheKey]) {
         const c = req.session[cacheKey];
         if (c.expiresAt > Date.now()) return c.value;

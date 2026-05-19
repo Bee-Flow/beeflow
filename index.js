@@ -129,7 +129,15 @@ console.log('[Sessions] Using PostgreSQL session store (persistent across deploy
 if (process.env.REDIS_URL) {
     try {
         const { createClient } = require('redis');
-        _sessionRedisClient = createClient({ url: process.env.REDIS_URL });
+        // Scaleway managed Redis uses an internal CA. Scope TLS validation
+        // skip to this client only (encryption stays on).
+        const _redisIsTls = process.env.REDIS_URL.startsWith('rediss://');
+        _sessionRedisClient = createClient({
+            url: process.env.REDIS_URL,
+            ...(_redisIsTls ? {
+                socket: { tls: true, rejectUnauthorized: process.env.REDIS_TLS_STRICT === '1' }
+            } : {})
+        });
         _sessionRedisClient.on('error', (err) => console.warn('[Sessions] Redis error:', err.message));
         _sessionRedisClient.connect().then(() => {
             console.log('[Sessions] Redis connected — activating session read-through cache');
@@ -272,7 +280,11 @@ storageStore.init().then(ok => {
 
 // ── Mount routes ──────────────────────────────────────────────────────────────
 app.use('/auth', authRouter);
-app.use('/components', componentsRouter);
+// Component Designer is enterprise-tier — same `requireFeature` middleware
+// the other gated routers use at L353+; inlined here because the
+// destructure that exposes it as `requireLicenseFeature` lives further
+// down (same pattern as /api/compliance on L304).
+app.use('/components', (req, res, next) => require('./license/middleware').requireFeature('component_designer')(req, res, next), componentsRouter);
 app.use('/ai', aiRouter);
 app.use('/workflow-ai', (req, res) => res.status(404).json({ error: 'Workflow AI removed' }));
 app.use('/', executeRouter);
@@ -307,21 +319,19 @@ app.use('/auth', require('./routes/webhooks/ncEvents'));
 app.use('/auth', require('./routes/admin/ncSync'));
 app.use('/auth', require('./routes/admin/ncIntegrations'));
 app.get('/api/guard/health', async (req, res) => {
-    // Optional Python guard-service sidecar — only probed when explicitly
-    // configured. With moderation moved to Azure Content Safety and PII to
-    // in-process Transformers.js, the sidecar is no longer required.
-    const guardUrl = process.env.GUARD_SERVICE_URL;
-    if (!guardUrl) return res.json({ status: 'not-configured' });
-    try {
-        const apiKey = process.env.SERVICES_API_KEY;
-        const resp = await fetch(`${guardUrl}/health`, {
-            headers: apiKey ? { 'X-API-Key': apiKey } : {},
-            signal: AbortSignal.timeout(3000),
-        });
-        if (resp.ok) return res.json(await resp.json());
-        res.json({ status: 'unavailable' });
-    } catch { res.json({ status: 'unavailable' }); }
+    // PII Guard service health probe. The guard is the only PII detector;
+    // when it's not installed this returns `not-configured` and the chat
+    // path fails open (PII detection is OFF). Endpoint resolution prefers
+    // configStore (admin install action), then env.
+    const { getGuardEndpoint } = require('./core/piiDetection');
+    const { probeGuardHealth } = require('./services/guardInstaller');
+    const endpoint = await getGuardEndpoint();
+    if (!endpoint.url) return res.json({ status: 'not-configured' });
+    const health = await probeGuardHealth(endpoint.url, endpoint.apiKey);
+    if (health) return res.json(health);
+    res.json({ status: 'unavailable' });
 });
+app.use('/api/admin/guard', require('./routes/guardInstall'));
 app.use('/api/subscriptions', require('./routes/subscriptions'));
 app.use('/api/stripe', require('./routes/stripe'));
 app.use('/api/billing', require('./routes/billing'));
@@ -370,8 +380,13 @@ const notebookFeatureGate = async (req, res, next) => {
     } catch (_) { /* allow on error — fail open */ }
     next();
 };
-app.use('/api/notebooks', notebookFeatureGate, require('./routes/notebooks'));
-app.use('/api/notebooks', notebookFeatureGate, require('./routes/notebookExport'));
+// Licence gate fires before notebookFeatureGate so the frontend gets the
+// actionable `feature_locked` body it already knows how to render; the
+// configStore.feature_notebooks_enabled flag remains as an operator
+// kill-switch for enterprise installs that want to disable the feature
+// per deployment.
+app.use('/api/notebooks', requireLicenseFeature('notebooks'), notebookFeatureGate, require('./routes/notebooks'));
+app.use('/api/notebooks', requireLicenseFeature('notebooks'), notebookFeatureGate, require('./routes/notebookExport'));
 // Webpages — gated per-organization via the beta-feature registry.
 const { requireBetaFeature: requireWebpagesBeta } = require('./core/betaFeatures');
 app.use('/api/webpages', requireLicenseFeature('webpages'), requireWebpagesBeta('webpages'), require('./routes/webpages'));
@@ -395,6 +410,7 @@ app.use('/api/email-kb',        requireLicenseFeature('ticket_assistant'), requi
 
 app.use('/', require('./routes/knowledge'));
 app.use('/api/kb', require('./routes/knowledgeBases'));
+app.use('/api/search', require('./routes/search'));
 app.use('/api/languages', require('./routes/admin/languageRoutes'));
 app.use('/api/icons', require('./routes/icons'));
 app.use('/api/branding', require('./routes/branding'));
@@ -427,6 +443,23 @@ app.listen(PORT, '0.0.0.0', () => {
     try {
         const dutchLawIngest = require('./services/dutchLawIngest');
         dutchLawIngest.seedIfMissing();
+        // Weekly refresh — re-fetch each BWB statute so amended legislation
+        // propagates to existing customers without an admin clicking
+        // "Refresh". Idempotent (content_hash dedup), runs in background.
+        // Configurable via SYSTEM_KB_REFRESH_INTERVAL_MS (default 7 days).
+        const SYSTEM_KB_REFRESH_INTERVAL_MS = parseInt(process.env.SYSTEM_KB_REFRESH_INTERVAL_MS || String(7 * 24 * 60 * 60 * 1000), 10);
+        const runSystemKBRefresh = () => {
+            try {
+                dutchLawIngest.refresh({ force: false });
+                console.log('[dutchLawIngest] Weekly refresh kicked off');
+            } catch (e) {
+                console.warn('[dutchLawIngest] Weekly refresh start failed:', e.message);
+            }
+        };
+        // First refresh fires 30 min after boot so the boot seed has time
+        // to settle, then repeats on the configured interval.
+        setTimeout(runSystemKBRefresh, 30 * 60 * 1000).unref();
+        setInterval(runSystemKBRefresh, SYSTEM_KB_REFRESH_INTERVAL_MS).unref();
     } catch (e) {
         console.warn('[dutchLawIngest] Boot auto-seed could not start:', e.message);
     }
@@ -445,12 +478,57 @@ app.listen(PORT, '0.0.0.0', () => {
         console.warn('[CpuPipelines] Warmup could not start:', e.message);
     }
 
+    // PII Guard model migration hint — non-blocking. If the configStore still
+    // records the older `urchade/gliner_multi_pii-v1` model, nudge the admin
+    // to reinstall the guard via the dashboard to pick up the newer Dutch +
+    // healthcare/finance fine-tune (E3-JSI/gliner-multi-pii-domains-v1).
+    setImmediate(async () => {
+        try {
+            const configStore = require('./stores/configStore');
+            const installedModel = await configStore.getConfig('pii_guard_model');
+            if (installedModel === 'urchade/gliner_multi_pii-v1') {
+                console.warn('[PiiGuard] Old model in config (urchade/gliner_multi_pii-v1). Reinstall the guard service from Admin → Guardrails for improved Dutch + medical recall (E3-JSI/gliner-multi-pii-domains-v1).');
+            }
+        } catch (_) { /* fail-quiet */ }
+    });
+
     // License refresh scheduler — periodic ping to license.beeflow.ai for
     // monthly licenses. Yearly/lifetime licenses are validated by JWT exp
     // and skip this loop. Disable with LICENSE_REFRESH_DISABLED=true.
     try { require('./license/refresh').start(); } catch (e) {
         console.warn('[License Refresh] Failed to start scheduler:', e.message);
     }
+
+    // Stripe configuration sanity check. If Stripe is enabled but the webhook
+    // signing secret is missing, every incoming webhook will be rejected with
+    // 400 — that's silent in production unless the admin actively watches
+    // webhook delivery logs. Surface it loudly at boot.
+    if ((process.env.DEPLOYMENT_MODE || 'cloud') !== 'self-hosted') {
+        (async () => {
+            try {
+                const stripeService = require('./services/stripeService');
+                const configStore = require('./stores/configStore');
+                if (await stripeService.isEnabled()) {
+                    const secret = await configStore.getSecret('stripe_webhook_secret');
+                    if (!secret) {
+                        console.error('[Stripe] WARNING: Stripe is enabled but stripe_webhook_secret is not configured — all incoming webhooks will be rejected with 400. Configure the signing secret in the Stripe admin UI.');
+                    }
+                }
+            } catch (e) {
+                console.warn('[Stripe] Startup config check failed:', e.message);
+            }
+        })();
+    }
+
+    // Trial-history backfill — idempotent one-shot that copies existing
+    // organizations.trial_used_at / users.trial_used_at into the durable
+    // trial_history table. After this runs once, the unique index makes
+    // subsequent boots a no-op. Non-blocking so a slow query never holds
+    // up boot.
+    setImmediate(() => {
+        require('./stores/userStore').backfillTrialHistory().catch(e =>
+            console.warn('[Server] trial_history backfill error:', e.message));
+    });
 
     // Dunning + trial-expiry schedulers. The dunning tick scans for orgs
     // that have been past_due longer than STRIPE_DUNNING_GRACE_DAYS and
@@ -476,6 +554,13 @@ app.listen(PORT, '0.0.0.0', () => {
                 if (r.orgs || r.consumers) {
                     console.log(`[TrialExpiry] suspended orgs=${r.orgs} consumers=${r.consumers}`);
                 }
+                // Also sweep `incomplete` subscriptions older than 14 days so
+                // a missed Stripe `incomplete_expired` webhook doesn't leave
+                // them stuck. Stripe's own grace window is 14 days.
+                const stale = await userStore.cancelStaleIncompleteSubscriptions(14);
+                if (stale.orgs || stale.consumers) {
+                    console.log(`[IncompleteCleanup] cancelled orgs=${stale.orgs} consumers=${stale.consumers}`);
+                }
             } catch (e) { console.error('[TrialExpiry] tick error:', e.message); }
         };
         setTimeout(runDunningTick, 60_000).unref();
@@ -487,19 +572,122 @@ app.listen(PORT, '0.0.0.0', () => {
         console.warn('[Server] Failed to start dunning/trial schedulers:', e.message);
     }
 
+    // Plan-cap drift audit. When a plan's `allowed_*` is narrowed *after*
+    // orgs have opted in, the runtime keeps serving the feature because
+    // `applyCap` only runs at toggle time. This daily sweep emits an
+    // audit row for every drifting (org, feature) pair so compliance has
+    // a record. Read-only by default; flip PLAN_CAP_AUTO_TRIM=true to
+    // also re-intersect and persist the trimmed list.
+    if ((process.env.DEPLOYMENT_MODE || 'cloud') !== 'self-hosted') {
+        try {
+            const PLAN_CAP_DRIFT_INTERVAL_MS = parseInt(process.env.PLAN_CAP_DRIFT_INTERVAL_MS || String(24 * 60 * 60 * 1000), 10);
+            const PLAN_CAP_AUTO_TRIM = process.env.PLAN_CAP_AUTO_TRIM === 'true';
+            const runPlanCapDrift = async ({ isBoot = false } = {}) => {
+                try {
+                    const r = await require('./services/planEntitlements').auditPlanCapDrift({ trim: PLAN_CAP_AUTO_TRIM });
+                    if (r.drifted > 0) {
+                        console.log(`[PlanCapDrift] scanned=${r.scanned} drifted=${r.drifted} trimmed=${r.trimmed} auto_trim=${PLAN_CAP_AUTO_TRIM}${isBoot ? ' boot=1' : ''}`);
+                        if (isBoot) {
+                            // Surface a single audit marker so post-deploy drift
+                            // is visible in compliance reports without grepping
+                            // logs.
+                            try {
+                                const userStore = require('./stores/userStore');
+                                await userStore.logAccessAudit(
+                                    'plan_cap_drift_detected_at_boot',
+                                    'system',
+                                    'plan_cap_drift',
+                                    'system',
+                                    null,
+                                    { scanned: r.scanned, drifted: r.drifted, trimmed: r.trimmed },
+                                    null,
+                                );
+                            } catch (_) { /* audit best-effort */ }
+                        }
+                    }
+                } catch (e) { console.error('[PlanCapDrift] tick error:', e.message); }
+            };
+            // Run once synchronously at boot so a deploy with a freshly
+            // narrowed plan surfaces drift immediately rather than waiting
+            // for the first scheduled tick. Awaited inside an IIFE so we
+            // don't block module init.
+            (async () => { try { await runPlanCapDrift({ isBoot: true }); } catch (_) {} })();
+            setInterval(() => runPlanCapDrift({ isBoot: false }), PLAN_CAP_DRIFT_INTERVAL_MS).unref();
+            console.log(`[Server] Plan-cap drift audit scheduled (interval=${PLAN_CAP_DRIFT_INTERVAL_MS}ms auto_trim=${PLAN_CAP_AUTO_TRIM})`);
+        } catch (e) {
+            console.warn('[Server] Failed to start plan-cap drift audit:', e.message);
+        }
+    }
+
+    // Stripe per-seat quantity drift sync. The customer.subscription.updated
+    // webhook normally echoes seat counts, but if an org adds/removes users
+    // without a Stripe event firing (NC group sync, admin DELETE),
+    // stripe_seat_quantity can drift below the local active-user count and
+    // the next invoice underbills. The sweep walks every per-seat org and
+    // pushes the current count to Stripe; idempotent (no-op when Stripe
+    // already matches local).
+    if ((process.env.DEPLOYMENT_MODE || 'cloud') !== 'self-hosted') {
+        try {
+            const SEAT_SYNC_INTERVAL_MS = parseInt(process.env.STRIPE_SEAT_SYNC_INTERVAL_MS || String(15 * 60 * 1000), 10);
+            const runSeatSync = async () => {
+                try {
+                    const us = require('./stores/userStore');
+                    const { syncSeatQuantityForOrg } = require('./services/stripeService');
+                    const subs = await us.getAllOrgSubscriptions();
+                    let synced = 0;
+                    for (const sub of (subs || [])) {
+                        if (!sub.organization_id || sub.status !== 'active') continue;
+                        if (!sub.stripe_subscription_id) continue;
+                        try {
+                            await syncSeatQuantityForOrg(sub.organization_id);
+                            synced++;
+                        } catch (e) {
+                            console.warn(`[SeatSync] org=${sub.organization_id} failed: ${e.message}`);
+                        }
+                    }
+                    if (synced > 0) console.log(`[SeatSync] checked ${synced} active per-seat orgs`);
+                } catch (e) { console.error('[SeatSync] tick error:', e.message); }
+            };
+            setTimeout(runSeatSync, 90_000).unref();
+            setInterval(runSeatSync, SEAT_SYNC_INTERVAL_MS).unref();
+            console.log(`[Server] Stripe seat-sync scheduler started (interval=${SEAT_SYNC_INTERVAL_MS}ms)`);
+        } catch (e) {
+            console.warn('[Server] Failed to start seat-sync scheduler:', e.message);
+        }
+    }
+
+    // PAYG meter event drain — durable Stripe meter event delivery. The
+    // hot path (usageStore.logUsage) enqueues into payg_meter_outbox; this
+    // tick drains pending rows with backoff. Self-hosted installs have no
+    // PAYG plan so the drain is a cheap empty scan there.
+    if ((process.env.DEPLOYMENT_MODE || 'cloud') !== 'self-hosted') {
+        try {
+            const PAYG_DRAIN_INTERVAL_MS = parseInt(process.env.PAYG_DRAIN_TICK_INTERVAL_MS || '30000', 10);
+            const runPaygDrain = async () => {
+                try {
+                    const r = await require('./workers/paygDrain').drainOnce();
+                    if (r.delivered || r.failed || r.hardFailed) {
+                        console.log(`[PaygDrain] delivered=${r.delivered} failed=${r.failed} hard_failed=${r.hardFailed}`);
+                    }
+                } catch (e) { console.error('[PaygDrain] tick error:', e.message); }
+            };
+            setTimeout(runPaygDrain, 30_000).unref();
+            setInterval(runPaygDrain, PAYG_DRAIN_INTERVAL_MS).unref();
+            console.log(`[Server] PAYG meter drain scheduler started (interval=${PAYG_DRAIN_INTERVAL_MS}ms)`);
+        } catch (e) {
+            console.warn('[Server] Failed to start PAYG drain scheduler:', e.message);
+        }
+    }
+
     // Non-invasive self-check of every org Privacy Shield blob. Logs warnings
     // for legacy shapes, orphaned regex collections, and invalid custom terms
     // so operators can spot guardrail drift in the startup log.
     const { selfCheckOrgShields } = require('./core/orgShield');
     selfCheckOrgShields().catch(err => console.warn('[OrgShieldSelfCheck] Error:', err.message));
 
-    // Background-warm the in-process PII model so the first user request
-    // doesn't pay model-download latency. Safe to call unconditionally;
-    // the loader fails open if the runtime can't reach HuggingFace.
-    if (process.env.LOCAL_PII_PREWARM !== 'false') {
-        const { warmLocalPii } = require('./core/localPiiDetection');
-        warmLocalPii();
-    }
+    // The previous in-process PII pre-warm has been removed — PII detection
+    // now runs only through the optional PII Guard service container, which
+    // owns its own model loading lifecycle.
 
     // Pre-warm the in-process Whisper-base CPU transcription model. Same
     // fail-open semantics; first upload doesn't pay the download tax.

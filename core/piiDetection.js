@@ -1,19 +1,21 @@
 /**
  * PII Detection — detect personally identifiable information in text
  *
- * PRIMARY:  Azure AI Text Analytics (when endpoint + key are configured)
- * FALLBACK: guard-service /pii endpoint (GLiNER multi PII v1, CPU)
+ * Single backend: the PII Guard service (GLiNER multi-PII), a Python sidecar
+ * installed via the admin dashboard. Runs locally — same Docker host, no
+ * outbound calls per request. Covers all 20 categories in the picker.
  *
- *   createClient() → Azure creds exist?
- *       YES → Azure Text Analytics (cloud)
- *       NO  → guard-service /pii (local CPU NER model)
+ * When the guard isn't installed, detectPii() returns null and the chat path
+ * fails open. The admin UI surfaces this state with "Install the PII Guard
+ * service to activate detection."
  *
- * SDK: @azure/ai-text-analytics
- * Auth: AzureKeyCredential from @azure/core-auth
- * Method: recognizePiiEntities
+ * Public surface: validateInputForPii, validateOutputForPii, detectPii,
+ * tokenizeText, restoreTokens, PII_CATEGORIES, ALL_PII_CATEGORY_IDS,
+ * LEGACY_CATEGORY_ALIASES, DEFAULT_PII_CONFIDENCE_THRESHOLD,
+ * getGuardEndpoint, invalidateGuardEndpointCache.
  */
 
-// Circular dep: azurePiiDetection ← aiAgent ← agentStore ← ... ← azurePiiDetection.
+// Circular dep: piiDetection ← aiAgent ← agentStore ← ... ← piiDetection.
 // During the cycle aiAgent.js does `module.exports = { ... }` at the END
 // (full object replacement). If we capture `require('./aiAgent')` at module
 // load, we get a snapshot of the EMPTY pre-cycle exports object that never
@@ -27,23 +29,50 @@ function getAIConfig() {
     return require('./aiAgent').getAIConfig();
 }
 const configStore = require('../stores/configStore');
-const { computePiiDetectionCost } = require('./azureServiceCosts');
-const azureServiceUsageStore = require('../stores/azureServiceUsageStore');
-const { detectPiiLocal } = require('./localPiiDetection');
 
-// ── PII service — optional Python sidecar running GLiNER multi PII v1 (Apache 2.0)
-// Only used when PII_SERVICE_URL is explicitly set in env. The default detector
-// path is now in-process Transformers.js (server/core/localPiiDetection.js)
-// followed by Azure Text Analytics if configured — neither requires a sidecar.
-// Set PII_SERVICE_API_KEY if the remote service requires API key auth.
-const PII_SERVICE_URL = process.env.PII_SERVICE_URL || null;
-const PII_SERVICE_API_KEY = process.env.PII_SERVICE_API_KEY || '';
+// ── Guard service endpoint resolution ────────────────────────────────────
+// Resolved at request time so an admin installing the guard from the
+// dashboard takes effect immediately (no server restart). Order of
+// precedence:
+//   1. configStore `pii_guard_url` / `pii_guard_api_key` (admin install action)
+//   2. env `PII_SERVICE_URL` / `PII_SERVICE_API_KEY` (legacy / k8s manifest)
+
+let _endpointCache = null;
+let _endpointCacheAt = 0;
+const ENDPOINT_CACHE_TTL_MS = 10_000;
+
+async function getGuardEndpoint() {
+    const now = Date.now();
+    if (_endpointCache && (now - _endpointCacheAt) < ENDPOINT_CACHE_TTL_MS) {
+        return _endpointCache;
+    }
+    let url = null;
+    let apiKey = '';
+    try {
+        url = await configStore.getConfig('pii_guard_url') || null;
+        if (url) {
+            apiKey = await configStore.getSecret('pii_guard_api_key') || '';
+        }
+    } catch (_) { /* fall through to env */ }
+    if (!url) {
+        url = process.env.PII_SERVICE_URL || null;
+        apiKey = process.env.PII_SERVICE_API_KEY || '';
+    }
+    _endpointCache = { url, apiKey };
+    _endpointCacheAt = now;
+    return _endpointCache;
+}
+
+function invalidateGuardEndpointCache() {
+    _endpointCache = null;
+    _endpointCacheAt = 0;
+}
 
 // Simple HTTP helper — no extra dependency beyond Node built-ins
 const http = require('http');
 const https = require('https');
 
-function httpPost(url, body) {
+function httpPost(url, body, apiKey) {
     return new Promise((resolve, reject) => {
         const parsed = new URL(url);
         const isHttps = parsed.protocol === 'https:';
@@ -53,8 +82,8 @@ function httpPost(url, body) {
             'Content-Type': 'application/json',
             'Content-Length': Buffer.byteLength(data),
         };
-        if (PII_SERVICE_API_KEY) {
-            headers['X-API-Key'] = PII_SERVICE_API_KEY;
+        if (apiKey) {
+            headers['X-API-Key'] = apiKey;
         }
         const options = {
             hostname: parsed.hostname,
@@ -83,16 +112,16 @@ function httpPost(url, body) {
 }
 
 /**
- * Detect PII using the CPU model via the PII service (GLiNER multi PII v1).
+ * Detect PII using the CPU model via the guard service (GLiNER multi-PII).
  * Maps response shapes back to the same format as detectPii().
  */
-async function detectPiiViaCpuModel(text, enabledCategories, confidenceThreshold) {
+async function detectPiiViaCpuModel(text, enabledCategories, confidenceThreshold, endpoint) {
     const body = {
         text,
         confidence_threshold: confidenceThreshold,
         enabled_categories: enabledCategories || null,
     };
-    const result = await httpPost(`${PII_SERVICE_URL}/pii`, body);
+    const result = await httpPost(`${endpoint.url}/pii`, body, endpoint.apiKey);
     // result = { hasPii, entities: [{ text, category, label, confidence, offset, length }] }
     const entities = (result.entities || []).map(e => ({
         text:        e.text,
@@ -139,14 +168,14 @@ function cacheSet(key, result) {
     cache.set(key, { result, timestamp: Date.now() });
 }
 
-// ── PII Categories (Azure AI Language — verified supported IDs) ──────
-// Only categories that are accepted by the Azure Text Analytics API as
-// categoriesFilter values or returned as entity.category results.
+// ── PII Categories ──────────────────────────────────────────────────────
+// Only categories the PII Guard service (GLiNER) can emit. Adding rows
+// here without a corresponding label mapping in
+// guard-service/app/services/pii.py means admins will see toggles that
+// silently never fire.
 const PII_CATEGORIES = {
     // Personal
     'Person':           { label: 'Person Name',          group: 'Personal',   icon: '👤' },
-    'PersonType':       { label: 'Person Type / Role',   group: 'Personal',   icon: '👥' },
-    'Age':              { label: 'Age',                  group: 'Personal',   icon: '🎂' },
     'DateOfBirth':      { label: 'Date of Birth',        group: 'Personal',   icon: '📅' },
 
     // Contact
@@ -158,55 +187,45 @@ const PII_CATEGORIES = {
     'CreditCardNumber':                    { label: 'Credit Card Number',  group: 'Financial',  icon: '💳' },
     'BankAccountNumber':                   { label: 'Bank Account Number', group: 'Financial',  icon: '🏦' },
     'InternationalBankingAccountNumber':   { label: 'IBAN',                group: 'Financial',  icon: '🌐' },
-    'ABARoutingNumber':                    { label: 'ABA Routing Number',  group: 'Financial',  icon: '🔢' },
-    'SWIFTCode':                           { label: 'SWIFT Code',          group: 'Financial',  icon: '🏧' },
 
     // Identity / Government
     'USSocialSecurityNumber':              { label: 'SSN (US)',            group: 'Identity',   icon: '🆔' },
-    'PassportNumber':                      { label: 'Passport Number',    group: 'Identity',   icon: '🛂' },
-    'DriversLicenseNumber':                { label: "Driver's License",   group: 'Identity',   icon: '🪪' },
+    'PassportNumber':                      { label: 'Passport Number',     group: 'Identity',   icon: '🛂' },
+    'DriversLicenseNumber':                { label: "Driver's License",    group: 'Identity',   icon: '🪪' },
 
     // Digital / Secrets
-    'IPAddress':                { label: 'IP Address',           group: 'Digital',    icon: '🌐' },
-    'URL':                      { label: 'URL',                  group: 'Digital',    icon: '🔗' },
-    'AzureDocumentDBAuthKey':   { label: 'Azure CosmosDB Key',   group: 'Digital',    icon: '☁️' },
-    'AzureStorageAccountKey':   { label: 'Azure Storage Key',    group: 'Digital',    icon: '☁️' },
+    'IPAddress':         { label: 'IP Address',     group: 'Digital',  icon: '🌐' },
+    'URL':               { label: 'URL',            group: 'Digital',  icon: '🔗' },
+    'ApiKeyOrSecret':    { label: 'API key / secret', group: 'Digital', icon: '🔑' },
 
     // Organization
     'Organization':   { label: 'Organization',   group: 'Organization',  icon: '🏢' },
 
-    // Netherlands 🇳🇱
-    'EUNationalIdentificationNumber': { label: 'BSN / National ID (EU)',  group: 'Netherlands',  icon: '🇳🇱' },
+    // EU / Netherlands — labels the GLiNER multi-PII model returns natively.
+    // No regex used; we trust the model's recall for these categories.
+    'NationalIdentificationNumber':  { label: 'National ID (BSN / DNI / NIE / codice fiscale / Steuer-ID / INSEE / rijksregister)', group: 'EU / Netherlands', icon: '🆔' },
+    'TaxIdentificationNumber':       { label: 'Tax ID (BTW / RSIN / VAT)',  group: 'EU / Netherlands', icon: '🧾' },
+    'HealthInsuranceNumber':         { label: 'Health Insurance Number',     group: 'EU / Netherlands', icon: '🏥' },
+    'MedicalCondition':              { label: 'Medical Condition',           group: 'EU / Netherlands', icon: '❤️‍🩹' },
+    'Medication':                    { label: 'Medication',                  group: 'EU / Netherlands', icon: '💊' },
+    'LicensePlateNumber':            { label: 'License Plate',               group: 'EU / Netherlands', icon: '🚗' },
 };
 
 const ALL_PII_CATEGORY_IDS = Object.keys(PII_CATEGORIES);
 
+// Legacy → canonical category aliases. Existing org Privacy Shield configs
+// may reference IDs from earlier releases; map them to the current canonical
+// ID so a rename never requires a config migration.
+const LEGACY_CATEGORY_ALIASES = {
+    'EUNationalIdentificationNumber': 'NationalIdentificationNumber',
+    // AzureStorageAccountKey collapsed to the generic ApiKeyOrSecret when
+    // the Azure PII backend was removed. Kept here so old shield configs
+    // that reference the Azure-branded id continue to resolve.
+    'AzureStorageAccountKey': 'ApiKeyOrSecret',
+};
+
 // Default confidence threshold for PII detection
 const DEFAULT_PII_CONFIDENCE_THRESHOLD = 0.7;
-
-// ── Client creation (reuses Content Safety endpoint + key) ───────────
-let _client = null;
-let _clientConfig = null;
-
-async function createClient() {
-    const endpoint = await configStore.getConfig('azure_content_safety_endpoint');
-    const apiKey = await configStore.getSecret('azure_content_safety_key');
-
-    if (!endpoint || !apiKey) {
-        return null;
-    }
-
-    // Cache client if config hasn't changed
-    const configKey = `${endpoint}:${apiKey}`;
-    if (_client && _clientConfig === configKey) {
-        return _client;
-    }
-
-    const { TextAnalyticsClient, AzureKeyCredential } = require('@azure/ai-text-analytics');
-    _client = new TextAnalyticsClient(endpoint, new AzureKeyCredential(apiKey));
-    _clientConfig = configKey;
-    return _client;
-}
 
 /**
  * Tokenize PII in text — replace each detected entity with a reversible token.
@@ -215,15 +234,36 @@ async function createClient() {
  *
  * Returns { tokenizedText, tokenMap } where tokenMap maps each token → real value.
  * Call restoreTokens(text, tokenMap) to reverse.
+ *
+ * When `existingTokenMap` is passed (the conversation's accumulated token map),
+ * the per-category counter is seeded from it and known values reuse their
+ * existing token. Without this, turn 2 of a redacted conversation would
+ * restart counters at 1 and silently overwrite turn 1's mappings — same value
+ * gets a duplicate token, two different values collide on the same token.
  */
-function tokenizeText(text, entities) {
+function tokenizeText(text, entities, existingTokenMap = null) {
     if (!entities || entities.length === 0) return { tokenizedText: text, tokenMap: {} };
+
+    // Seed counters + value→token reverse index from the conversation's
+    // accumulated map so subsequent turns extend instead of restart.
+    const counters = {};
+    const existingByValue = new Map();
+    if (existingTokenMap && typeof existingTokenMap === 'object') {
+        for (const [tok, real] of Object.entries(existingTokenMap)) {
+            const m = /^\[([a-z0-9_]+)_(\d+)\]$/.exec(tok);
+            if (!m) continue;
+            const cat = m[1];
+            const idx = parseInt(m[2], 10);
+            if (Number.isFinite(idx)) counters[cat] = Math.max(counters[cat] || 0, idx);
+            const dedupKey = `${cat}|${(real || '').trim()}`;
+            if (!existingByValue.has(dedupKey)) existingByValue.set(dedupKey, tok);
+        }
+    }
 
     // Sort by offset descending so we can splice from end without shifting offsets
     const sorted = [...entities].sort((a, b) => b.offset - a.offset);
     const tokenMap = {};
-    const counters = {};
-    // Dedup within a category: identical real values share one token. Without
+    // Dedup within a category (this call): identical real values share one token. Without
     // this, the same name appearing 5 times in an email becomes [person_2..6]
     // — five rows in the token-map UI, all pointing at "Jack". Match is
     // case-sensitive + whitespace-trimmed: "Jack" and "Jack " collapse, but
@@ -239,13 +279,18 @@ function tokenizeText(text, entities) {
         // so this change is backwards-compatible with any tokens still in flight.
         const catKey = (entity.category || 'data').toLowerCase().replace(/[^a-z0-9]/g, '_');
         const dedupKey = `${catKey}|${(entity.text || '').trim()}`;
-        let token = seenByCategory.get(dedupKey);
+        // Reuse priority: within-call dedup → conversation-wide reuse → mint fresh.
+        let token = seenByCategory.get(dedupKey) || existingByValue.get(dedupKey);
         if (!token) {
             counters[catKey] = (counters[catKey] || 0) + 1;
             token = `[${catKey}_${counters[catKey]}]`;
-            seenByCategory.set(dedupKey, token);
-            tokenMap[token] = entity.text;
         }
+        seenByCategory.set(dedupKey, token);
+        // Record every token used in this call (new or reused) so the caller's
+        // per-message tokenMap and the conv-map merge both stay complete — a
+        // reused token still needs to appear in the per-message map for the
+        // user-side restore path (_restoreTokensInMessages).
+        tokenMap[token] = entity.text;
         // Replace the exact span (using offset if available, else string replace)
         if (entity.offset !== undefined && entity.offset >= 0) {
             tokenized = tokenized.slice(0, entity.offset) + token + tokenized.slice(entity.offset + entity.length);
@@ -272,190 +317,45 @@ function restoreTokens(text, tokenMap) {
 }
 
 /**
- * Detect PII via Azure AI Language REST API.
- * Uses the /language/:analyze-text endpoint with PiiEntityRecognition kind.
- * This works with Azure AI Foundry / multi-service endpoints (same as Content Safety).
- */
-async function detectPiiViaRestApi(text, endpoint, apiKey, enabledCategories, confidenceThreshold) {
-    const url = `${endpoint.replace(/\/$/, '')}/language/:analyze-text?api-version=2023-04-01`;
-
-    const body = {
-        kind: 'PiiEntityRecognition',
-        parameters: {
-            modelVersion: 'latest',
-        },
-        analysisInput: {
-            documents: [
-                { id: '1', text }
-            ]
-        }
-    };
-
-    // NOTE: We do NOT send piiCategories to Azure — the API expects SCREAMING_SNAKE_CASE
-    // enum values (e.g. CREDIT_CARD_NUMBER) but our config stores PascalCase (CreditCardNumber).
-    // Instead, we let Azure scan for everything and post-filter the results server-side
-    // against the enabled categories. This is safer and decouples us from Azure's enum format.
-
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'Ocp-Apim-Subscription-Key': apiKey,
-        },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(30000),
-    });
-
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Azure Language API ${response.status}: ${errText}`);
-    }
-
-    const data = await response.json();
-    const doc = data.results?.documents?.[0];
-
-    // ── Track usage cost (fire-and-forget) ──
-    const charCount = text.length;
-    const cost = computePiiDetectionCost(charCount);
-    azureServiceUsageStore.logAzureServiceUsage({
-        service_type: 'pii_detection',
-        input_chars: charCount,
-        estimated_cost: cost,
-        source: 'unknown',
-    }).catch(() => {});
-    if (cost > 0) console.log(`[PiiDetection] 💰 Est. cost: $${cost.toFixed(6)} (${charCount} chars)`);
-
-    if (!doc) {
-        const errors = data.results?.errors;
-        if (errors?.length) {
-            throw new Error(`Azure Language API error: ${JSON.stringify(errors[0])}`);
-        }
-        throw new Error('Azure Language API returned no documents');
-    }
-
-    // Filter by confidence threshold
-    let detectedEntities = (doc.entities || [])
-        .filter(entity => entity.confidenceScore >= confidenceThreshold)
-        .map(entity => ({
-            text: entity.text,
-            category: entity.category,
-            subCategory: entity.subcategory || null,
-            confidence: entity.confidenceScore,
-            offset: entity.offset,
-            length: entity.length,
-            label: PII_CATEGORIES[entity.category]?.label || entity.category,
-        }));
-
-    // Post-filter: enforce enabled categories on the results
-    // Azure may ignore piiCategories or return extra categories
-    if (enabledCategories && enabledCategories.length > 0) {
-        const enabledSet = new Set(enabledCategories);
-        const before = detectedEntities.length;
-        detectedEntities = detectedEntities.filter(e => enabledSet.has(e.category));
-        if (before !== detectedEntities.length) {
-            console.log(`[PiiDetection] Post-filter: ${before} → ${detectedEntities.length} entities (filtered by ${enabledCategories.length} enabled categories)`);
-        }
-    }
-
-    return {
-        hasPii: detectedEntities.length > 0,
-        entities: detectedEntities,
-        redactedText: doc.redactedText || text,
-    };
-}
-
-/**
- * Detect PII entities in text.
- * Returns { hasPii, entities[] } or null on failure.
+ * Detect PII entities in text via the PII Guard service.
+ * Returns { hasPii, entities[] } or null when:
+ *   - the guard isn't installed (configStore `pii_guard_url` is unset), or
+ *   - the guard is unreachable / returns an error.
  *
- * Routing:
- *   - Azure Content Safety endpoint + key configured → REST API /language/:analyze-text
- *   - No Azure creds, `localPiiEnabled` on shield → in-process Transformers.js detector
- *   - No Azure creds, local disabled → CPU guard-service /pii endpoint (HTTP)
+ * Either failure mode fails open — the chat path still completes. The
+ * admin UI surfaces guard-not-installed state on the Privacy Shield page.
  */
 async function detectPii(text, enabledCategories = null, confidenceThreshold = DEFAULT_PII_CONFIDENCE_THRESHOLD) {
-    const endpoint = await configStore.getConfig('azure_content_safety_endpoint');
-    const apiKey = await configStore.getSecret('azure_content_safety_key');
-
-    if (endpoint && apiKey) {
-        return await detectPiiViaRestApi(text, endpoint, apiKey, enabledCategories, confidenceThreshold);
-    }
-
-    // No Azure creds — pick a CPU backend. Default to in-process Transformers.js
-    // unless an admin has explicitly disabled it on the org Privacy Shield.
-    const localEnabled = await isLocalPiiEnabled();
-
-    if (localEnabled) {
-        try {
-            const result = await detectPiiLocal(text, enabledCategories, confidenceThreshold);
-            if (result) return result;
-            // Model unavailable → fall through to guard-service HTTP path.
-            console.log('[PiiDetection] Local model unavailable, trying guard-service');
-        } catch (localErr) {
-            console.warn('[PiiDetection] Local model error:', localErr.message);
-        }
-    }
-
-    if (!PII_SERVICE_URL) {
-        // No external CPU sidecar configured — local Transformers.js was
-        // either disabled by the admin or the model failed to load. Fail
-        // open so the request still completes (caller has the option to
-        // refuse the request explicitly via piiDetectionAction).
+    const guardEndpoint = await getGuardEndpoint();
+    if (!guardEndpoint.url) {
+        console.log('[PiiDetection] guard endpoint not configured — install the PII Guard service to activate detection');
         return null;
     }
-
     try {
-        return await detectPiiViaCpuModel(text, enabledCategories, confidenceThreshold);
-    } catch (cpuErr) {
-        console.warn('[PiiDetection] guard-service unavailable:', cpuErr.message);
-        return null; // fail-open
+        return await detectPiiViaCpuModel(text, enabledCategories, confidenceThreshold, guardEndpoint);
+    } catch (err) {
+        console.warn('[PiiDetection] guard-service unavailable:', err.message);
+        return null;
     }
 }
 
-/**
- * Resolve the `localPiiEnabled` flag from any stored org Privacy Shield.
- * Returns true by default so a fresh install with no Azure config still
- * gets working PII detection out of the box. Admins disable via the
- * Privacy Shield panel.
- */
-async function isLocalPiiEnabled() {
-    try {
-        const all = await configStore.getAllConfig() || {};
-        for (const key of Object.keys(all)) {
-            if (!key.startsWith('org_privacy_shield_')) continue;
-            const shield = all[key];
-            if (shield && typeof shield.localPiiEnabled === 'boolean') {
-                return shield.localPiiEnabled;
-            }
-        }
-    } catch (_) { /* fail open */ }
-    return true;
-}
-
-/**
- * Validate user input for PII.
- *
- * Behaviour depends on piiDetectionAction config:
- *   'block'    — throws an error if PII found (existing behaviour)
- *   'tokenize' — returns { tokenizedText, tokenMap } replacing PII with tokens like [PII:iban:1]
- *
- * Returns null if PII detection is disabled or no PII found.
- * Returns { tokenizedText, tokenMap } when action=tokenize and PII is found.
- * Throws when action=block and PII is found.
- *
- * @param {Array} messages - Chat messages array
- * @param {boolean} [agentPiiEnabled=false] - Per-agent override
- */
 async function validateInputForPii(messages, agentPiiEnabled = false, orgShieldConfig = null) {
     const aiConfig = await getAIConfig();
 
     // Loud entry trace so admins can see PII gates firing in logs.
-    console.log(`[PiiDetection] validateInputForPii called: agentPiiEnabled=${agentPiiEnabled} aiCfgEnabled=${!!aiConfig.piiDetectionEnabled} shield={enabled:${!!orgShieldConfig?.enabled}, azurePii:${!!orgShieldConfig?.azurePiiEnabled}, localPii:${orgShieldConfig?.localPiiEnabled !== false}, action:${orgShieldConfig?.piiDetectionAction || 'default'}}`);
+    console.log(`[PiiDetection] validateInputForPii called: agentPiiEnabled=${agentPiiEnabled} aiCfgEnabled=${!!aiConfig.piiDetectionEnabled} shield={enabled:${!!orgShieldConfig?.enabled}, action:${orgShieldConfig?.piiDetectionAction || 'default'}}`);
 
-    // Check if PII detection is enabled
-    const piiEnabled = aiConfig.piiDetectionEnabled || agentPiiEnabled;
+    // PII detection switches on if any of:
+    //   1. Global AI config flag (admin-set via /ai/config)
+    //   2. Per-agent override (rare; specific agent configs)
+    //   3. Org Privacy Shield's master `enabled` flag — the only switch a
+    //      non-developer typically uses, exposed at /app/settings/organisation/privacy
+    const piiEnabled =
+        aiConfig.piiDetectionEnabled ||
+        agentPiiEnabled ||
+        !!orgShieldConfig?.enabled;
     if (!piiEnabled) {
-        console.log('[PiiDetection] gate=DISABLED (neither aiConfig nor agentPiiEnabled true)');
+        console.log('[PiiDetection] gate=DISABLED (aiConfig + agent + shield all off)');
         return null;
     }
 
@@ -516,14 +416,18 @@ async function validateInputForPii(messages, agentPiiEnabled = false, orgShieldC
         })();
         if (shieldConfig) {
             if (Array.isArray(shieldConfig.piiDetectionCategories) && shieldConfig.piiDetectionCategories.length > 0) {
-                enabledCategories = shieldConfig.piiDetectionCategories.filter(id => ALL_PII_CATEGORY_IDS.includes(id));
+                enabledCategories = shieldConfig.piiDetectionCategories
+                    .map(id => LEGACY_CATEGORY_ALIASES[id] || id)
+                    .filter(id => ALL_PII_CATEGORY_IDS.includes(id));
             }
             if (typeof shieldConfig.piiDetectionConfidenceThreshold === 'number') {
                 confidenceThreshold = shieldConfig.piiDetectionConfidenceThreshold;
             }
             console.log(`[PiiDetection] Using org shield: ${enabledCategories.length}/${ALL_PII_CATEGORY_IDS.length} categories (Email=${enabledCategories.includes('Email')}), confidence ≥ ${confidenceThreshold}`);
         } else if (aiConfig.piiDetectionCategories?.length > 0) {
-            enabledCategories = aiConfig.piiDetectionCategories.filter(id => ALL_PII_CATEGORY_IDS.includes(id));
+            enabledCategories = aiConfig.piiDetectionCategories
+                .map(id => LEGACY_CATEGORY_ALIASES[id] || id)
+                .filter(id => ALL_PII_CATEGORY_IDS.includes(id));
             console.log(`[PiiDetection] Using AI config: ${enabledCategories.length}/${ALL_PII_CATEGORY_IDS.length} categories, confidence ≥ ${confidenceThreshold}`);
         } else {
             console.log(`[PiiDetection] No org shield found, using all ${ALL_PII_CATEGORY_IDS.length} categories`);
@@ -534,7 +438,7 @@ async function validateInputForPii(messages, agentPiiEnabled = false, orgShieldC
 
     try {
         const result = await detectPii(inputText, enabledCategories, confidenceThreshold);
-        if (!result) return null; // No client configured, fail-open
+        if (!result) return null; // No detector available, fail-open
 
         const ms = Date.now() - start;
 
@@ -544,11 +448,11 @@ async function validateInputForPii(messages, agentPiiEnabled = false, orgShieldC
         if (!result.hasPii) {
             console.log(`[PiiDetection] ✅ Input clean | ${ms}ms | threshold ≥ ${confidenceThreshold}`);
             // A very common misconfiguration: admin slid the confidence threshold
-            // to 0.9+ which filters out almost every detection Azure returns for
-            // short prompts (typical confidence range: 0.70–0.85). Emit a loud
-            // hint when the prompt *looks* like it contains PII but the scan
-            // came back clean with a high threshold, so operators can diagnose
-            // the "PII works on dev but not on customer" class of tickets.
+            // to 0.9+ which filters out almost every detection for short prompts
+            // (typical confidence range: 0.70–0.85). Emit a loud hint when the
+            // prompt *looks* like it contains PII but the scan came back clean
+            // with a high threshold, so operators can diagnose the "PII works on
+            // dev but not on customer" class of tickets.
             if (confidenceThreshold >= 0.85) {
                 const looksLikeEmail = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/.test(inputText);
                 const looksLikePhone = /(?:\+?\d[\s-]?){8,}/.test(inputText);
@@ -559,7 +463,7 @@ async function validateInputForPii(messages, agentPiiEnabled = false, orgShieldC
                     if (looksLikeEmail) hints.push('email');
                     if (looksLikePhone) hints.push('phone');
                     if (looksLikeIban) hints.push('IBAN');
-                    console.warn(`[PiiDetection] ⚠️  Input contains likely PII (${hints.join(', ')}) but threshold is ${confidenceThreshold}. Azure typically returns 0.70–0.85 confidence for short texts; lower the threshold to 0.70 if you expect detections. (Org Privacy Shield → PII Detection → Confidence Threshold)`);
+                    console.warn(`[PiiDetection] ⚠️  Input contains likely PII (${hints.join(', ')}) but threshold is ${confidenceThreshold}. Detectors typically return 0.70–0.85 confidence for short texts; lower the threshold to 0.70 if you expect detections. (Org Privacy Shield → PII Detection → Confidence Threshold)`);
                 }
             }
             return null;
@@ -646,5 +550,8 @@ module.exports = {
     restoreTokens,
     PII_CATEGORIES,
     ALL_PII_CATEGORY_IDS,
+    LEGACY_CATEGORY_ALIASES,
     DEFAULT_PII_CONFIDENCE_THRESHOLD,
+    getGuardEndpoint,
+    invalidateGuardEndpointCache,
 };

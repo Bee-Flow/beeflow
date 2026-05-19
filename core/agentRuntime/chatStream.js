@@ -26,7 +26,6 @@ const { componentToTool, executeComponentTool, executeSystemTool, SYSTEM_TOOLS }
 const { resolveAgentModel } = require('./modelResolver');
 const { getAgentTools } = require('./agentTools');
 const { checkRegexPatterns } = require('../guardrails');
-const { validateInput } = require('../moderation');
 const { resolveOrgShield, mergeWithOrgShield } = require('../orgShield');
 const { processSystemPrompt } = require('../promptUtils');
 const { buildSystemPrompt } = require('./contextBuilder');
@@ -37,6 +36,7 @@ const { processAttachments } = require('./attachmentProcessor');
 const { hydrateHistoryAttachments } = require('./historyHydrator');
 const { compactMessages } = require('../compaction');
 const { buildTokenPreservationAddendum } = require('../dlp/tokenPreservationPrompt');
+const { applyTokenMapToOutbound } = require('../dlp/applyTokenMapToOutbound');
 
 // ─────────────────────────────────────────────────────────────────
 // Per-conversation write serializer.
@@ -311,7 +311,11 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         conversation = { id: `ephemeral-${Date.now()}`, agent_id: agentId, user_id: userId, messages: [] };
     } else if (messageMetadata.conversationId) {
         // Use the specific conversation
-        conversation = await agentStore.getConversationById(messageMetadata.conversationId, userAuth.encryptionKey);
+        // restore:false — keep [person_N]/[email_N] tokens in the history we hand
+        // to the LLM on follow-up turns so PII never re-leaks into the model
+        // context. UI fetch paths still default to restore:true so users see
+        // their original values.
+        conversation = await agentStore.getConversationById(messageMetadata.conversationId, userAuth.encryptionKey, { restore: false });
         if (!conversation) {
             // If conversation doesn't exist, create a new one
             conversation = await agentStore.getOrCreateConversation(agentId, userId, userAuth.encryptionKey);
@@ -522,14 +526,9 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         ? await configStore.getConfig(`org_privacy_shield_${agent.organization_id}`)
                         : null;
                     const aiCfg = await getAIConfig();
-                    // Scrub fires when EITHER PII detector is on. The detectPii()
-                    // routing in azurePiiDetection.js falls back from Azure to
-                    // the in-process Transformers.js model when only local is
-                    // enabled, so the scrub path itself doesn't care which one
-                    // ultimately runs — it just needs to know PII is being
-                    // detected at all.
-                    const piiOn = orgShieldForScrub?.azurePiiEnabled || (orgShieldForScrub?.localPiiEnabled !== false);
-                    const scrubEnabled = !!(orgShieldForScrub?.enabled && piiOn) || !!aiCfg?.piiDetectionEnabled;
+                    // Shield's master flag gates scrubbing; detectPii() calls
+                    // the PII Guard service when installed.
+                    const scrubEnabled = !!orgShieldForScrub?.enabled || !!aiCfg?.piiDetectionEnabled;
                     if (scrubEnabled) {
                         const { scrubMemoryContext } = require('../memory/scrubMemoryContext');
                         const { scrubbed, replacedCategories } = await scrubMemoryContext(memoryContext, orgShieldForScrub);
@@ -564,6 +563,17 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         buildSystemPrompt({ agent, tools, userId, messageMetadata, memoryContext, isStrictKnowledge, forceDynamicSkills: isStandardTier })
     );
 
+    // Hydrate the conversation-scoped PII token map from the DB before
+    // guardrails (which tokenise) or the streaming un-tokeniser (which
+    // restores). On turn 2+ the in-process Map is empty after a server
+    // restart or when the conversation moves to a new server pod — without
+    // this, a `[medication_1]` minted on turn 1 survives as literal text
+    // in every later assistant reply. Idempotent.
+    if (conversation?.id) {
+        try { await require('../dlp/dlpRunner').getConversationTokenMapAsync(conversation.id); }
+        catch (_) { /* hydration is best-effort */ }
+    }
+
     // ============ GUARDRAILS (before KB search — block early) ============
     const guardrailsResult = await withPhase(onEvent, 'guardrails', null, () =>
         runInputGuardrails({ agent, messages, userMessage, globalConfig, onEvent, userId, conversationId: conversation?.id, source: 'agent_stream', model: modelToUse })
@@ -580,7 +590,6 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     const webSearchGuardEnabled = guardrailsResult.webSearchGuardEnabled;
     const disableSearchOnUpload = guardrailsResult.disableSearchOnUpload;
     const webSearchGuardPiiCategories = guardrailsResult.webSearchGuardPiiCategories;
-    const orgShieldCategories = guardrailsResult.orgShieldCategories;
 
     // Filter out web search if org policy disables it on file uploads
     // Check both current attachments AND conversation history for past uploads
@@ -814,6 +823,10 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
     let _rawResponseBuffer = '';
     const _captureRaw = !!dlpShield?.showRawPayload;
     const RAW_BUFFER_MAX = 256 * 1024; // cap at 256 KB per turn, then truncate.
+    // Hoisted so the assistant-message build step can read which tokens were
+    // actually restored in this turn's response and surface the "Privacy
+    // protection" panel even when no new redaction fired.
+    let _ut = null;
     {
         const _dlpRunner = require('../dlp/dlpRunner');
         const _dlpConvMap = _dlpRunner.getConversationTokenMap(conversation?.id);
@@ -822,11 +835,11 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         // attachment scanner (which runs LATER in processAttachments) may add
         // tokens that still need to be reversed on the response stream. The
         // un-tokeniser uses a live getter so it picks up those late-added tokens.
-        const _piiMayFire = !!(dlpShield && (dlpShield.azurePiiEnabled || dlpShield.localPiiEnabled !== false));
+        const _piiMayFire = !!(dlpShield && dlpShield.enabled);
         const _shouldWrapUntokeniser = (_dlpConvMap && Object.keys(_dlpConvMap).length > 0) || _piiMayFire;
         if (_shouldWrapUntokeniser) {
             const { createUntokeniser } = require('../dlp/untokeniseStream');
-            const _ut = createUntokeniser(() => _dlpRunner.getConversationTokenMap(conversation?.id));
+            _ut = createUntokeniser(() => _dlpRunner.getConversationTokenMap(conversation?.id));
             const _rawOnEvent = onEvent;
             onEvent = (type, data) => {
                 if (type === 'content' && data && typeof data.text === 'string') {
@@ -964,7 +977,10 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
         if (!isEphemeral) {
             setImmediate(async () => {
                 try {
-                    const conv = await agentStore.getConversationById(conversation.id, userAuth.encryptionKey);
+                    // restore:false — we're about to write the array back via
+                    // updateConversation; the default would de-tokenize every
+                    // message and persist real values, breaking the round-trip.
+                    const conv = await agentStore.getConversationById(conversation.id, userAuth.encryptionKey, { restore: false });
                     if (conv && conv.messages) {
                         let lastUserIdx = -1;
                         for (let i = conv.messages.length - 1; i >= 0; i--) {
@@ -1298,10 +1314,19 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             let contentBuffer = '';
 
             if (useNativeAdapter) {
-                // Build OpenAI-format messages for the adapter's normalizeMessages
+                // Build OpenAI-format messages for the adapter's normalizeMessages.
+                // Funnel through the outbound-prompt guard so any real values
+                // smuggled in by memory/compaction/edit-retry/etc. get
+                // re-tokenised against the conv's known vault before the LLM
+                // ever sees them. Idempotent on already-tokenised content.
+                const _guarded = applyTokenMapToOutbound({
+                    conversationId: conversation?.id,
+                    systemPrompt: effectiveSystemPrompt,
+                    messages: sanitizeMessages(finalMessages),
+                });
                 const adapterMessages = [
-                    { role: 'system', content: effectiveSystemPrompt },
-                    ...sanitizeMessages(finalMessages)
+                    { role: 'system', content: _guarded.systemPrompt },
+                    ..._guarded.messages,
                 ];
 
                 const isThinkingModel = modelToUse.includes('magistral');
@@ -1481,9 +1506,16 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 // Detect reasoning models that need special handling
                 const isReasoningModel = /^o\d|^gpt-5/i.test(modelToUse);
                 const isRestrictedTemp = /^o\d|nano|^gpt-5/i.test(modelToUse);
+                // Outbound-prompt guard — same invariant as the native-adapter
+                // branch above. See applyTokenMapToOutbound.
+                const _guardedRaw = applyTokenMapToOutbound({
+                    conversationId: conversation?.id,
+                    systemPrompt: effectiveSystemPrompt,
+                    messages: sanitizeMessages(finalMessages),
+                });
                 const requestBody = {
                     model: modelToUse,
-                    messages: [{ role: 'system', content: effectiveSystemPrompt }, ...sanitizeMessages(finalMessages)],
+                    messages: [{ role: 'system', content: _guardedRaw.systemPrompt }, ..._guardedRaw.messages],
                     stream: true,
                     stream_options: { include_usage: true }
                 };
@@ -1759,42 +1791,10 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         }
                     }
 
-                    // Web Search Guard — validate agent_search queries through content moderation
-                    if (webSearchGuardEnabled && toolName === 'agent_search' && toolArgs?.query) {
-                        try {
-                            const searchMessages = [{ role: 'user', content: toolArgs.query }];
-                            await validateInput(searchMessages, true, orgShieldCategories);
-                            console.log(`[WebSearchGuard] Search query passed: "${toolArgs.query.substring(0, 80)}"`);
-                        } catch (guardError) {
-                            console.log(`[WebSearchGuard] Search query BLOCKED: "${toolArgs.query.substring(0, 80)}" — ${guardError.message}`);
-                            guardrailEventStore.logGuardrailEvent({
-                                organization_id: agent.organization_id || null,
-                                user_id: userId,
-                                agent_id: agentId,
-                                agent_name: agent.name,
-                                conversation_id: conversation?.id || null,
-                                violation_type: 'moderation',
-                                violation_categories: 'Web Search Guard',
-                                direction: 'input',
-                                action_taken: 'search_blocked',
-                                source: 'agent_stream',
-                                model: modelToUse,
-                            }).catch(() => {});
-                            onEvent('tool_end', { name: toolName, result: `[Web search blocked — query violates content policy]` });
-                            return {
-                                toolCall,
-                                toolName,
-                                toolArgs,
-                                finalToolResult: `[Web search blocked — the search query "${toolArgs.query}" was flagged by the safety guard. Please rephrase or use a different approach.]`,
-                                blocked: true
-                            };
-                        }
-                    }
-
                     // Web Search Guard — PII detection on search queries (always runs for monitoring)
                     if (webSearchGuardPiiCategories && toolName === 'agent_search' && toolArgs?.query) {
                         try {
-                            const { detectPii } = require('../azurePiiDetection');
+                            const { detectPii } = require('../piiDetection');
                             const piiResult = await detectPii(toolArgs.query, webSearchGuardPiiCategories);
                             if (piiResult?.hasPii) {
                                 const cats = [...new Set(piiResult.entities.map(e => e.label))].join(', ');
@@ -1989,7 +1989,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     // works for the AI), but the user-facing SSE replaces them
                     // with the real values from the conversation token map.
                     if (finalToolResult?._action === 'workspace_update') {
-                        const { restoreTokens } = require('../azurePiiDetection');
+                        const { restoreTokens } = require('../piiDetection');
                         const _convMapForWs = require('../dlp/dlpRunner').getConversationTokenMap(conversation?.id);
                         const rendered = restoreTokens(finalToolResult.content || '', _convMapForWs);
                         onEvent('workspace_update', { content: rendered });
@@ -2062,7 +2062,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                                 // PII scan: use Azure/CPU model with ALL categories, respect org confidence threshold
                                 let piiDetected = null;
                                 try {
-                                    const { detectPii } = require('../azurePiiDetection');
+                                    const { detectPii } = require('../piiDetection');
                                     const threshold = typeof shield.piiDetectionConfidenceThreshold === 'number'
                                         ? shield.piiDetectionConfidenceThreshold : 0.7;
                                     const piiResult = await detectPii(resultText.slice(0, 5000), null, threshold);
@@ -2139,61 +2139,10 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 }
             }
 
-            // Agent Output — AI Content Moderation (Guard Service)
-            // Regex guards are checked in real-time during streaming above;
-            // the Guard Service check runs post-stream on the full response.
-            if (fullResponse && !moderationViolation && !guardrailViolation) {
-                // Resolve org moderation scope for output check
-                const orgModerationEnabled = agent.organization_id
-                    ? await (async () => {
-                        const shield = await configStore.getConfig(`org_privacy_shield_${agent.organization_id}`);
-                        return shield?.enabled && shield?.moderationEnabled;
-                    })()
-                    : false;
-                const orgModerationScope = agent.organization_id
-                    ? await (async () => {
-                        const shield = await configStore.getConfig(`org_privacy_shield_${agent.organization_id}`);
-                        return shield?.enabled ? (shield.scope || { userInput: true, agentOutput: true }) : { userInput: true, agentOutput: true };
-                    })()
-                    : { userInput: true, agentOutput: true };
-                const outputModerationEnabled = (orgModerationEnabled && orgModerationScope.agentOutput) ||
-                    agent.config?.llamaGuardEnabled || globalConfig?.llamaGuardConfig?.enabled;
-
-                if (outputModerationEnabled) {
-                    try {
-                        const outputMessages = [{ role: 'assistant', content: fullResponse }];
-                        await validateInput(outputMessages, true, orgShieldCategories);
-                        console.log(`[AgentRuntime] AI moderation passed (agent output)`);
-                    } catch (guardError) {
-                        if (guardError.violationCodes) {
-                            let violationLabels = guardError.violationCodes;
-                            try {
-                                const parsed = JSON.parse(guardError.outcome);
-                                violationLabels = parsed.map(f => f.label || f.category);
-                            } catch (e) { /* use codes as-is */ }
-                            console.log(`[AgentRuntime] Agent output moderation violation: ${violationLabels.join(', ')}`);
-                            fullResponse = `⚠️ This response was blocked by content moderation (${violationLabels.join(', ')}). The AI's response contained content that violates organization safety policies.`;
-                            onEvent('content_replace', { text: fullResponse });
-                            moderationViolation = violationLabels.join(', ');
-
-                            // Log output moderation event (fire-and-forget)
-                            guardrailEventStore.logGuardrailEvent({
-                                organization_id: agent.organization_id || null,
-                                user_id: userId,
-                                agent_id: agentId,
-                                agent_name: agent.name,
-                                conversation_id: conversation?.id || null,
-                                violation_type: 'moderation',
-                                violation_categories: violationLabels.join(', '),
-                                direction: 'output',
-                                action_taken: 'soft_block',
-                                source: 'agent_stream',
-                                model: modelToUse,
-                            }).catch(() => {});
-                        }
-                    }
-                }
-            }
+            // Content moderation (Hate/Violence/Sexual/Self-Harm) was removed
+            // when the Azure Content Safety backend was dropped. PII detection
+            // runs via the GLiNER guard service, streamed through
+            // `untokeniseStream` rather than gated here.
 
             // Include parentId for thread persistence
             const assistantMsg = {
@@ -2214,7 +2163,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 // toolHistory is never fed back to the AI; it surfaces in the
                 // "How I got this answer" panel where the user wants real values.
                 try {
-                    const { restoreTokens } = require('../azurePiiDetection');
+                    const { restoreTokens } = require('../piiDetection');
                     const _convMapTH = require('../dlp/dlpRunner').getConversationTokenMap(conversation?.id);
                     if (Object.keys(_convMapTH).length > 0) {
                         for (const t of _toolHistory) {
@@ -2272,9 +2221,70 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 assistantMsg.thinking = _capText(_thinking);
             }
 
-            // Privacy / DLP — persist redaction metadata so the badge + "How I got
-            // this answer" panel survive a refresh. Raw response is captured live
-            // into _rawResponseBuffer above; copy it here before persistence.
+            // Privacy / DLP — surface restored tokens too. On turns where no new
+            // redaction fires (e.g. follow-up question with no PII), the AI's
+            // response can still echo tokens from earlier turns that the
+            // un-tokeniser swaps back to real values before the user sees them.
+            // Synthesise a tokenisationInfo from those substitutions so the
+            // "Privacy protection" panel still appears on the assistant message.
+            if (!_assistantTokenisationInfo && _ut && typeof _ut.getReplacedTokens === 'function') {
+                const _dlpRunnerForSynth = require('../dlp/dlpRunner');
+                const replaced = _ut.getReplacedTokens();
+                if (replaced && replaced.size > 0) {
+                    const tokenMap = {};
+                    const catSet = new Set();
+                    let totalCount = 0;
+                    for (const [token, info] of replaced) {
+                        tokenMap[token] = info.value;
+                        totalCount += info.count || 0;
+                        const m = /^\[([a-z0-9_]+)_\d+\]$/.exec(token);
+                        if (m) catSet.add(m[1]);
+                    }
+                    _assistantTokenisationInfo = {
+                        source: 'restored',
+                        action: 'restore',
+                        count: totalCount,
+                        categories: [...catSet],
+                        provider: modelToUse,
+                        automatic: true,
+                        tokenMap,
+                    };
+                    // Push the full info to the client so the badge + panel
+                    // render live, not only after refresh. The frontend merges
+                    // this into the in-memory assistant message.
+                    onEvent?.('tokenisation_info', _assistantTokenisationInfo);
+                } else {
+                    // No new redaction and no token echo in this reply, but if
+                    // the conversation has any tokens in its vault, surface the
+                    // protected-state badge so the user has continuous visual
+                    // confirmation that privacy is engaged for this chat.
+                    //
+                    // IMPORTANT: this is state, not action. We do NOT run PII
+                    // detection on the assistant's reply. The conv map below
+                    // was populated on earlier turns; the AI naturally echoes
+                    // tokens it was sent (or it doesn't, and the vault is
+                    // simply quiet this turn).
+                    const convMap = _dlpRunnerForSynth.getConversationTokenMap(conversation?.id) || {};
+                    const convEntries = Object.entries(convMap);
+                    if (convEntries.length > 0) {
+                        const catSet = new Set();
+                        for (const [tok] of convEntries) {
+                            const m = /^\[([a-z0-9_]+)_\d+\]$/.exec(tok);
+                            if (m) catSet.add(m[1]);
+                        }
+                        _assistantTokenisationInfo = {
+                            source: 'conversation_vault',
+                            action: 'protected',
+                            count: convEntries.length,
+                            categories: [...catSet],
+                            provider: modelToUse,
+                            automatic: true,
+                            tokenMap: Object.fromEntries(convEntries),
+                        };
+                        onEvent?.('tokenisation_info', _assistantTokenisationInfo);
+                    }
+                }
+            }
             if (_assistantTokenisationInfo) {
                 if (_captureRaw && _rawResponseBuffer) {
                     _assistantTokenisationInfo.rawResponse = _rawResponseBuffer;
@@ -2356,7 +2366,12 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     // (was setTimeout(5000) which raced with conversation save)
                     setImmediate(async () => {
                         try {
-                            const conv = await agentStore.getConversationById(conversation.id, userAuth.encryptionKey);
+                            // restore:false — same reason as the guardrail-violation
+                            // persistence path above: this block writes the array
+                            // back via updateConversation, and restoring tokens here
+                            // would silently overwrite tokenized content with real
+                            // values for the whole conversation.
+                            const conv = await agentStore.getConversationById(conversation.id, userAuth.encryptionKey, { restore: false });
                             if (conv && conv.messages) {
                                 // Find the LAST user message (more robust than index-based lookup)
                                 let lastUserIdx = -1;

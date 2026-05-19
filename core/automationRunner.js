@@ -684,8 +684,23 @@ async function execCode(step, ctx, runState, mode) {
         return { output: { _dryRun: true, skipped: 'code-step skipped in dry-run' } };
     }
     if (!sandbox.isAvailable()) throw new Error(`Code step unavailable: ${sandbox.loadError()}`);
+
+    // Two-layer gate. The global config flag is a platform kill-switch the
+    // super-admin can flip to disable code execution everywhere (e.g. during
+    // an incident). The per-org beta flag is what the org-level UI toggles
+    // and is what determines whether an individual customer can run code
+    // steps. Both must pass.
     const codeFlag = await configStore.getConfig('automation_code_step_enabled');
-    if (codeFlag !== true && codeFlag !== 'true') throw new Error('Code steps are disabled by org policy.');
+    if (codeFlag !== true && codeFlag !== 'true') {
+        throw new Error('Code steps are disabled platform-wide.');
+    }
+    if (ctx.orgId) {
+        const { orgHasBetaFeature } = require('./betaFeatures');
+        const orgAllowed = await orgHasBetaFeature(ctx.orgId, 'ai_code_execution');
+        if (!orgAllowed) {
+            throw new Error('Code steps are disabled by org policy.');
+        }
+    }
 
     const inputs = resolveInputs(step.inputs || {}, runState, { allowSecrets: false });
     // Secrets — only the names the step explicitly declared in inputs.secretKeys[].

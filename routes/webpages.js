@@ -33,7 +33,7 @@ const webpageDbStore = require('../stores/webpageDbStore');
 const { issuePreviewToken, requirePreviewToken } = require('../auth/webpagePreviewToken');
 const kbStore = require('../stores/knowledgeBases');
 const { resolveAudienceContext } = require('../auth/audience');
-const { hasPermission, validateSharedGroupsForOrg } = require('../auth');
+const { hasPermission, validateSharedGroupsForOrg, requireActiveOrgForMutations } = require('../auth');
 const userStore = require('../stores/userStore');
 const {
     ingestFileSource,
@@ -53,6 +53,9 @@ function requireAuth(req, res, next) {
 // Access control: the beta-feature gate at server/index.js (`requireBetaFeature('webpages')`)
 // is the single source of truth. The previous `requirePermission('use_webpages')` here was
 // redundant and blocked org members who had the beta enabled but not the legacy permission.
+
+// Block writes when the caller's org is suspended/archived.
+router.use(requireActiveOrgForMutations());
 
 // ── Webpage CRUD ──────────────────────────────────────────────────
 

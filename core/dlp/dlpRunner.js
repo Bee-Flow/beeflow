@@ -3,7 +3,7 @@
  * user's outbound prompt before it reaches an LLM.
  *
  * Combines three signal sources:
- *   - PII detection (existing: `server/core/azurePiiDetection.js`)
+ *   - PII detection (existing: `server/core/piiDetection.js`)
  *   - Custom sensitive terms (org-defined, `server/core/dlp/customTerms.js`)
  *   - Provider classification (external vs. internal)
  *
@@ -18,7 +18,7 @@
  * interactive path and the auto path in the same function.
  */
 
-const { detectPii, tokenizeText } = require('../azurePiiDetection');
+const { detectPii, tokenizeText } = require('../piiDetection');
 const { scanCustomTerms } = require('./customTerms');
 const { classifyProvider } = require('../providers/classification');
 
@@ -258,10 +258,15 @@ function _dedupeAndSort(findings) {
  * Returns { tokenizedText, tokenMap, summary } where summary is a compact
  * `{ category → count }` for logging and the UI.
  */
-function _tokeniseAll(text, findings) {
-    // `tokenizeText` from azurePiiDetection expects entities with offset/length/category/text.
+function _tokeniseAll(text, findings, conversationId = null) {
+    // Pass the conversation's accumulated token map so counters continue across
+    // turns and repeated values reuse their existing tokens. Without this,
+    // turn 2's [email_1] would silently overwrite turn 1's mapping in the
+    // merged conv map.
+    const existing = conversationId ? getConversationTokenMap(conversationId) : null;
+    // `tokenizeText` from piiDetection expects entities with offset/length/category/text.
     // Our normalised findings already match that shape.
-    const { tokenizedText, tokenMap } = tokenizeText(text, findings);
+    const { tokenizedText, tokenMap } = tokenizeText(text, findings, existing);
     const summary = findings.reduce((acc, f) => {
         const key = f.label || f.category;
         acc[key] = (acc[key] || 0) + 1;
@@ -325,10 +330,10 @@ async function scan({ messages, orgShieldConfig, orgId, conversationId, provider
         return { action: 'allow', findings: [], provider, redactedText: null, tokenMap: null, scanStatus: 'skipped', summary: {} };
     }
 
-    // Scan both sources in parallel.
-    // Either Azure or Local Transformers.js detector counts as "PII enabled"
-    // — detectPii() picks the right backend. localPiiEnabled defaults true.
-    const piiEnabled = !!(orgShieldConfig.azurePiiEnabled || orgShieldConfig.localPiiEnabled !== false);
+    // Scan both sources in parallel. detectPii() calls the PII Guard
+    // service (GLiNER); when the guard isn't installed it returns null
+    // and the scan completes without findings.
+    const piiEnabled = !!orgShieldConfig.enabled;
     const piiCategories = Array.isArray(orgShieldConfig.piiDetectionCategories) && orgShieldConfig.piiDetectionCategories.length > 0
         ? orgShieldConfig.piiDetectionCategories
         : null;
@@ -382,7 +387,7 @@ async function scan({ messages, orgShieldConfig, orgId, conversationId, provider
     }
 
     if (effectiveChoice === 'redact' || mode === 'auto_redact') {
-        const { tokenizedText, tokenMap, summary } = _tokeniseAll(text, all);
+        const { tokenizedText, tokenMap, summary } = _tokeniseAll(text, all, conversationId);
         _mergeIntoTokenMap(conversationId, tokenMap);
         _writeMapToDb(conversationId).catch(() => { /* logged in helper */ });
         return { action: 'redact', findings: all, provider, redactedText: tokenizedText, tokenMap, scanStatus: 'ok', summary };
@@ -403,7 +408,7 @@ async function scan({ messages, orgShieldConfig, orgId, conversationId, provider
  * tokenisation now that the user has said yes.
  */
 function applyRedactionChoice({ conversationId, text, findings }) {
-    const { tokenizedText, tokenMap, summary } = _tokeniseAll(text, findings);
+    const { tokenizedText, tokenMap, summary } = _tokeniseAll(text, findings, conversationId);
     _mergeIntoTokenMap(conversationId, tokenMap);
     _writeMapToDb(conversationId).catch(() => { /* logged in helper */ });
     return { tokenizedText, tokenMap, summary };

@@ -16,11 +16,11 @@ const { decryptMessages } = require('./messageEncryption');
 // through unchanged. Only used on the UI-display read path; the LLM
 // history loader passes restore=false so Claude keeps seeing tokens.
 // Lazy-require inside the function: same circular-dep reason as
-// azurePiiDetection.js→aiAgent — capturing a destructure at module load
+// piiDetection.js→aiAgent — capturing a destructure at module load
 // can grab a stale snapshot of the cycle's partial exports.
 function _restoreTokensInMessages(messages, convTokenMap = null) {
     if (!Array.isArray(messages)) return messages;
-    const restoreTokens = require('../../core/azurePiiDetection').restoreTokens;
+    const restoreTokens = require('../../core/piiDetection').restoreTokens;
     if (typeof restoreTokens !== 'function') return messages;
     const convMapHasEntries = convTokenMap && typeof convTokenMap === 'object' && Object.keys(convTokenMap).length > 0;
     return messages.map(m => {

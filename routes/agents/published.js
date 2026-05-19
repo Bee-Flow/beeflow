@@ -117,6 +117,24 @@ router.patch('/:id/publish', async (req, res) => {
         return res.status(e.status || 500).json({ error: e.message });
     }
 
+    // When flipping to published, re-validate every cross-reference in the
+    // agent's config. Owner may have lost access to a referenced KB or skill
+    // since the agent was drafted (group removed, KB unpublished, skill
+    // deleted). Publishing a stale config would surface as 403s at runtime
+    // for every consumer who tries to chat. Validate against the *owner*
+    // (not the requesting user) so an org-admin publishing on behalf of a
+    // demoted owner gets the right verdict.
+    if (isPublished) {
+        try {
+            const { validateAgentConfigReferences } = require('./crud');
+            if (validateAgentConfigReferences) {
+                await validateAgentConfigReferences(agent, agent.config || {});
+            }
+        } catch (e) {
+            return res.status(e.status || 400).json({ error: e.message });
+        }
+    }
+
     // Use agent.owner_id (not userId) so the SQL WHERE owner_id matches even when
     // a non-owner (org admin, agent admin) is toggling publish.
     const success = await agentStore.setAgentPublished(req.params.id, isPublished, agent.owner_id, cleanedGroups);

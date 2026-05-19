@@ -147,6 +147,16 @@ router.post('/chat/webpage/stream', requireAuth, async (req, res) => {
     const webpage = await webpageStore.getWebpage(webpageId, userId);
     if (!webpage) return res.status(404).json({ error: 'Webpage not found' });
 
+    // ── Subscription limit enforcement (mirrors /api/agents/:id/chat/stream) ──
+    {
+        const { checkSubscriptionLimits } = require('../../core/limits');
+        const { resolveUserOrgIds: _resolveOrgs } = require('../../auth');
+        const orgIds = await _resolveOrgs(req);
+        const limitOrgId = orgIds && orgIds.size > 0 ? Array.from(orgIds)[0] : null;
+        const limitError = await checkSubscriptionLimits(limitOrgId, 'chat', userId);
+        if (limitError) return res.status(402).json({ error: limitError });
+    }
+
     const sources = await webpageStore.getSources(webpageId);
     const readySources = sources.filter(s => s.status === 'ready');
 

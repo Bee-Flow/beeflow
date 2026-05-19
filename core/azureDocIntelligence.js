@@ -8,7 +8,7 @@
  * Auth: AzureKeyCredential from @azure/core-auth
  * API: 2024-11-30 GA (pinned — best Markdown quality)
  *
- * Config stored in configStore (same pattern as azurePiiDetection.js):
+ * Config stored in configStore (same pattern as piiDetection.js):
  *   - azure_doc_intelligence_endpoint (config)
  *   - azure_doc_intelligence_key (secret, encrypted at rest)
  *

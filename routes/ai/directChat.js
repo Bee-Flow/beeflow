@@ -37,6 +37,7 @@ const { WEBPAGE_DB_TOOLS, isDbTool, executeDbTool } = require('../../integration
 const { PROPOSE_WEBPAGE_PLAN_TOOL, executeProposeWebpagePlan } = require('../../integrations/webpagePlanTool');
 const guardrailEventStore = require('../../stores/guardrailEventStore');
 const { buildTokenPreservationAddendum } = require('../../core/dlp/tokenPreservationPrompt');
+const { applyTokenMapToMessages } = require('../../core/dlp/applyTokenMapToOutbound');
 
 /**
  * Strip bulky fields from tool results before they become LLM messages.
@@ -884,9 +885,9 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
                     const orgShieldForScrub = scrubOrgId
                         ? await configStore.getConfig(`org_privacy_shield_${scrubOrgId}`)
                         : null;
-                    // Either Azure or Local Transformers.js PII detector counts.
-                    const piiOn = orgShieldForScrub?.azurePiiEnabled || (orgShieldForScrub?.localPiiEnabled !== false);
-                    const scrubEnabled = !!(orgShieldForScrub?.enabled && piiOn)
+                    // Shield's master flag is the only switch for PII scrubbing;
+                    // detectPii() routes to whichever backend is available.
+                    const scrubEnabled = !!orgShieldForScrub?.enabled
                         || !!(await getAIConfig())?.piiDetectionEnabled;
                     if (scrubEnabled) {
                         const { scrubMemoryContext } = require('../../core/memory/scrubMemoryContext');
@@ -1385,7 +1386,22 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
             const _attUserOrgIds = await _resolveUserOrgIdsForAtt(req).catch(() => null);
             const _attUserOrgId = (_attUserOrgIds && _attUserOrgIds.size > 0) ? Array.from(_attUserOrgIds)[0] : null;
             const { resolveShieldFor: _resolvePsForAttachments } = require('../../core/orgShield');
-            const _psShield = await _resolvePsForAttachments({ orgId: _attUserOrgId, userId: req.session?.user?.id });
+            let _psShield = await _resolvePsForAttachments({ orgId: _attUserOrgId, userId: req.session?.user?.id });
+            // Super-admin edge case (mirrors the input-gate fallback further
+            // below): the seed admin account has no organizationId binding
+            // and the attachment scanner would otherwise silently no-op for
+            // them, so PDF/DOCX uploads leak unredacted to the model. Fall
+            // back to the sole org shield when exactly one exists.
+            if (!_psShield?.enabled && req.session?.isAdmin) {
+                try {
+                    const allCfg = await configStore.getAllConfig() || {};
+                    const shieldKeys = Object.keys(allCfg).filter(k => k.startsWith('org_privacy_shield_'));
+                    if (shieldKeys.length === 1 && allCfg[shieldKeys[0]]?.enabled) {
+                        _psShield = allCfg[shieldKeys[0]];
+                        console.log(`[DirectChat] Attachment scanner: super-admin fallback → sole org shield ${shieldKeys[0]}`);
+                    }
+                } catch (_) { /* non-fatal */ }
+            }
             const { scanAttachmentText: _scanAttText, AttachmentPrivacyBlock: _AttPiiBlock } = require('../../core/dlp/attachmentScanner');
             const _attachmentScanSummaries = [];
             // Local helper so the per-format branches below don't repeat the
@@ -1905,54 +1921,30 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
         // answer" panel survive a page refresh.
         let _userPrivacyMeta = null;
         let _assistantTokenisationInfo = null;
-        const orgShield = userOrgId ? await configStore.getConfig(`org_privacy_shield_${userOrgId}`) : null;
-        const globalModerationEnabled = (await getAIConfig()).llamaGuardConfig?.enabled;
-        const moderationEnabled = (orgShield?.enabled && orgShield?.moderationEnabled) || globalModerationEnabled;
-        const moderationScope = orgShield?.enabled ? (orgShield.scope || { userInput: true, agentOutput: true }) : { userInput: true, agentOutput: true };
-        const webSearchGuardEnabled = !!(orgShield?.enabled && orgShield?.webSearchGuardEnabled);
-        const moderationCategories = orgShield?.moderationCategories || null;
-
-        // Check user input with moderation (only if scope.userInput)
-        if (moderationEnabled && moderationScope.userInput) {
-            try {
-                const { validateInput } = require('../../core/moderation');
-                await validateInput(messages, true, moderationCategories);
-                console.log(`[DirectChat] AI moderation passed (user input)`);
-            } catch (guardError) {
-                if (guardError.violationCodes) {
-                    let violationLabels = guardError.violationCodes;
-                    try {
-                        const parsed = JSON.parse(guardError.outcome);
-                        violationLabels = parsed.map(f => f.label || f.category);
-                    } catch (e) { /* use codes as-is */ }
-                    send('guardrail_violation', {
-                        rules: violationLabels,
-                        autoDeleteSeconds: 5,
-                        outcome: guardError.outcome,
-                        categories: violationLabels
-                    });
-                    // Let the AI explain the violation instead of blocking
-                    moderationViolation = violationLabels.join(', ');
-                    console.log(`[DirectChat] Moderation violation detected: ${moderationViolation} — AI will respond`);
-
-                    // Log moderation event (fire-and-forget)
-                    guardrailEventStore.logGuardrailEvent({
-                        organization_id: userOrgId || null,
-                        user_id: userId,
-                        conversation_id: convId || null,
-                        violation_type: 'moderation',
-                        violation_categories: moderationViolation,
-                        direction: 'input',
-                        action_taken: 'soft_block',
-                        source: 'direct',
-                        model: modelId || null,
-                    }).catch(() => {});
-                } else {
-                    // Guard service error (not a violation) — fail-open, log and continue
-                    console.warn(`[DirectChat] Guard service error (fail-open): ${guardError.message}`);
-                }
+        // Resolve the org Privacy Shield. Normal case: look up by userOrgId.
+        // Super-admin edge case: req.session.isAdmin users may have no
+        // organizationId binding at all (organizationId === '' on the admin
+        // seed account). They still chat through this route, and need the
+        // shield to apply — otherwise PII detection / moderation / web
+        // search guard all silently no-op for the highest-privilege user.
+        // Fall back to the single org shield when exactly one exists; with
+        // multiple orgs we don't guess (would need a UI "act as org" picker).
+        let orgShield = userOrgId ? await configStore.getConfig(`org_privacy_shield_${userOrgId}`) : null;
+        if (!orgShield && req.session?.isAdmin) {
+            const allConfigs = await configStore.getAllConfig() || {};
+            const shieldKeys = Object.keys(allConfigs).filter(k => k.startsWith('org_privacy_shield_'));
+            if (shieldKeys.length === 1) {
+                orgShield = allConfigs[shieldKeys[0]];
+                console.log(`[DirectChat] Super-admin without org binding — using sole org shield ${shieldKeys[0]}`);
+            } else if (shieldKeys.length > 1) {
+                console.log(`[DirectChat] Super-admin without org binding and ${shieldKeys.length} shields exist — no shield applied (set organizationId on the admin user or add an org picker)`);
             }
         }
+        const webSearchGuardEnabled = !!(orgShield?.enabled && orgShield?.webSearchGuardEnabled);
+
+        // Content moderation (Hate/Violence/Sexual/Self-Harm) was removed when
+        // the Azure Content Safety backend was dropped. PII detection still
+        // runs further below.
 
         // Inject moderation violation context into system prompt so AI can explain
         if (moderationViolation) {
@@ -1992,14 +1984,26 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
         // Diagnostic: show why PII block may skip (orgShield may be null on
         // some paths — e.g. when userOrgId is not yet resolved). Print on
         // every turn so support can correlate to a specific convId.
-        console.log(`[DirectChat] PII gate: convId=${convId} orgShield=${orgShield ? 'present' : 'NULL'} enabled=${orgShield?.enabled} localPii=${orgShield?.localPiiEnabled} dlpWillHandleHere=${dlpWillHandleHere}`);
+        console.log(`[DirectChat] PII gate: convId=${convId} orgShield=${orgShield ? 'present' : 'NULL'} enabled=${orgShield?.enabled} dlpWillHandleHere=${dlpWillHandleHere}`);
+        // Hydrate the conversation-scoped PII token map from the DB before
+        // ANY downstream code reads it. Required for multi-turn correctness:
+        // on turn 2+, the streaming un-tokeniser, the system-prompt token
+        // preservation addendum, and the inbound-history retokeniser all
+        // consult the in-process map via getConversationTokenMap(), which
+        // returns {} when the map hasn't been hydrated. Without this, a
+        // `[medication_1]` minted on turn 1 survives as literal text in
+        // every later assistant reply. Idempotent — populates the in-process
+        // Map only when it's currently empty.
+        if (convId) {
+            try { await require('../../core/dlp/dlpRunner').getConversationTokenMapAsync(convId); }
+            catch (_) { /* hydration is best-effort */ }
+        }
         try {
             if (dlpWillHandleHere) throw { __skip: true };
-            const { validateInputForPii } = require('../../core/azurePiiDetection');
-            // Either Azure or Local Transformers.js PII detector satisfies
-            // the PII gate. detectPii() in azurePiiDetection.js routes
-            // between them automatically.
-            const orgPiiEnabled = !!(orgShield?.enabled && (orgShield?.azurePiiEnabled || orgShield?.localPiiEnabled !== false));
+            const { validateInputForPii } = require('../../core/piiDetection');
+            // The org Privacy Shield's master `enabled` flag is the only
+            // switch needed — detectPii() calls the PII Guard service.
+            const orgPiiEnabled = !!orgShield?.enabled;
             console.log(`[DirectChat] PII calling validateInputForPii: orgPiiEnabled=${orgPiiEnabled} msgCount=${messages.length} msgsSlice=${JSON.stringify(messages.slice(-3).map(m => ({role: m.role, contentType: typeof m.content, contentPreview: typeof m.content === 'string' ? m.content.slice(0, 50) : '(non-string)'}))).slice(0, 300)}`);
             let piiResult;
             try {
@@ -2678,7 +2682,7 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                     applySystemAppend(guard.systemAppend);
                     console.log(`[DirectChat pipeline] pre-check round=${toolCallRounds} active=${activatedSessionSkillIds.length} completed=${completedSessionSkillIds.length}/${sessionSkills.length} toolChoice=${guard.mode} roundsInStep=${roundsInCurrentStep}`);
                     result = await callAdapterWithFallback(
-                        (tc) => adapter.chat(apiKey, apiUrl, modelId, messages, {
+                        (tc) => adapter.chat(apiKey, apiUrl, modelId, applyTokenMapToMessages({ conversationId: convId, messages }), {
                             ...chatOptions,
                             tools: directChatTools,
                             toolChoice: tc,
@@ -2754,33 +2758,10 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                                         return { role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify({ error: 'Web search blocked — query violates content policy. Please rephrase.' }) };
                                     }
                                 }
-                                // 2. Content moderation on search query
-                                if (webSearchGuardEnabled) {
-                                    try {
-                                        const { validateInput } = require('../../core/moderation');
-                                        await validateInput([{ role: 'user', content: toolArgs.query }], true, moderationCategories);
-                                        console.log(`[DirectChat WebSearchGuard] Search query passed`);
-                                    } catch (guardErr) {
-                                        console.log(`[DirectChat WebSearchGuard] Search query BLOCKED: ${guardErr.message}`);
-                                        guardrailEventStore.logGuardrailEvent({
-                                            organization_id: userOrgId || null,
-                                            user_id: userId,
-                                            conversation_id: convId || null,
-                                            violation_type: 'moderation',
-                                            violation_categories: 'Web Search Guard',
-                                            direction: 'input',
-                                            action_taken: 'search_blocked',
-                                            source: 'direct',
-                                            model: modelId || null,
-                                        }).catch(() => {});
-                                        send('tool_end', { name: toolName, result: '[Web search blocked — query violates content policy]' });
-                                        return { role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify({ error: 'Web search blocked — query violates content policy. Please rephrase.' }) };
-                                    }
-                                }
-                                // 3. PII Detection on search query (always runs for monitoring)
+                                // 2. PII Detection on search query (always runs for monitoring)
                                 if (webSearchGuardPiiCategories && webSearchGuardPiiCategories.length > 0) {
                                     try {
-                                        const { detectPii } = require('../../core/azurePiiDetection');
+                                        const { detectPii } = require('../../core/piiDetection');
                                         const piiResult = await detectPii(toolArgs.query, webSearchGuardPiiCategories);
                                         if (piiResult?.hasPii) {
                                             const cats = [...new Set(piiResult.entities.map(e => e.label))].join(', ');
@@ -2929,7 +2910,7 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                                     // PII scan: use Azure/CPU model with ALL categories, respect org confidence threshold
                                     let piiDetected = null;
                                     try {
-                                        const { detectPii } = require('../../core/azurePiiDetection');
+                                        const { detectPii } = require('../../core/piiDetection');
                                         const threshold = typeof shield.piiDetectionConfidenceThreshold === 'number'
                                             ? shield.piiDetectionConfidenceThreshold : 0.7;
                                         const piiResult = await detectPii(resultText.slice(0, 5000), null, threshold);
@@ -3008,7 +2989,7 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                         // user-facing SSE payload gets `[person_N]` → real values
                         // restored from the conversation token map.
                         if (toolResult._action === 'workspace_update') {
-                            const { restoreTokens } = require('../../core/azurePiiDetection');
+                            const { restoreTokens } = require('../../core/piiDetection');
                             const _convMapForWs = require('../../core/dlp/dlpRunner').getConversationTokenMap(convId);
                             const rendered = restoreTokens(toolResult.content || '', _convMapForWs);
                             send('workspace_update', { content: rendered });
@@ -3175,7 +3156,7 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
         }
 
         try {
-            await adapter.stream(apiKey, apiUrl, modelId, messages, streamOptions, streamCallback);
+            await adapter.stream(apiKey, apiUrl, modelId, applyTokenMapToMessages({ conversationId: convId, messages }), streamOptions, streamCallback);
         } catch (streamErr) {
             const errMsg = String(streamErr?.error?.message || streamErr?.message || '');
             // Retry without previousResponseId if the error is about missing tool output
@@ -3188,7 +3169,7 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                 thinkingContent = '';
                 thinkingParts = [];
                 streamToolCalls = [];
-                await adapter.stream(apiKey, apiUrl, modelId, messages, streamOptions, streamCallback);
+                await adapter.stream(apiKey, apiUrl, modelId, applyTokenMapToMessages({ conversationId: convId, messages }), streamOptions, streamCallback);
             } else if (/invalid_request_message_order|Unexpected role|invalid.*tool_choice/i.test(errMsg)) {
                 // Pipeline-guard shape rejected by the provider — retry once
                 // with permissive toolChoice so the user's message goes through.
@@ -3197,7 +3178,7 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                 thinkingContent = '';
                 thinkingParts = [];
                 streamToolCalls = [];
-                await adapter.stream(apiKey, apiUrl, modelId, messages, { ...streamOptions, toolChoice: 'auto' }, streamCallback);
+                await adapter.stream(apiKey, apiUrl, modelId, applyTokenMapToMessages({ conversationId: convId, messages }), { ...streamOptions, toolChoice: 'auto' }, streamCallback);
             } else {
                 throw streamErr;
             }
@@ -3315,12 +3296,12 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                 };
                 fullContent = '';
                 try {
-                    await adapter.stream(apiKey, apiUrl, modelId, messages, kickOptions, followStreamCallback);
+                    await adapter.stream(apiKey, apiUrl, modelId, applyTokenMapToMessages({ conversationId: convId, messages }), kickOptions, followStreamCallback);
                 } catch (kickErr) {
                     const kMsg = String(kickErr?.error?.message || kickErr?.message || '');
                     if (/invalid_request_message_order|Unexpected role|invalid.*tool_choice/i.test(kMsg)) {
                         console.warn(`[DirectChat pipeline] Wrap-up rejected — retrying with toolChoice='auto'. Original: ${kMsg}`);
-                        await adapter.stream(apiKey, apiUrl, modelId, messages, { ...kickOptions, toolChoice: 'auto' }, followStreamCallback);
+                        await adapter.stream(apiKey, apiUrl, modelId, applyTokenMapToMessages({ conversationId: convId, messages }), { ...kickOptions, toolChoice: 'auto' }, followStreamCallback);
                     } else {
                         throw kickErr;
                     }
@@ -3393,33 +3374,10 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                                 return { role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify({ error: 'Web search blocked — query violates content policy. Please rephrase.' }) };
                             }
                         }
-                        // 2. Content moderation on search query
-                        if (webSearchGuardEnabled) {
-                            try {
-                                const { validateInput } = require('../../core/moderation');
-                                await validateInput([{ role: 'user', content: toolArgs.query }], true, moderationCategories);
-                                console.log(`[DirectChat WebSearchGuard] Streamed search query passed`);
-                            } catch (guardErr) {
-                                console.log(`[DirectChat WebSearchGuard] Streamed search query BLOCKED: ${guardErr.message}`);
-                                guardrailEventStore.logGuardrailEvent({
-                                    organization_id: userOrgId || null,
-                                    user_id: userId,
-                                    conversation_id: convId || null,
-                                    violation_type: 'moderation',
-                                    violation_categories: 'Web Search Guard',
-                                    direction: 'input',
-                                    action_taken: 'search_blocked',
-                                    source: 'direct',
-                                    model: modelId || null,
-                                }).catch(() => {});
-                                send('tool_end', { name: toolName, result: '[Web search blocked — query violates content policy]' });
-                                return { role: 'tool', tool_call_id: toolCall.id, content: JSON.stringify({ error: 'Web search blocked — query violates content policy. Please rephrase.' }) };
-                            }
-                        }
-                        // 3. PII Detection on search query (always runs for monitoring)
+                        // 2. PII Detection on search query (always runs for monitoring)
                         if (webSearchGuardPiiCategories && webSearchGuardPiiCategories.length > 0) {
                             try {
-                                const { detectPii } = require('../../core/azurePiiDetection');
+                                const { detectPii } = require('../../core/piiDetection');
                                 const piiResult = await detectPii(toolArgs.query, webSearchGuardPiiCategories);
                                 if (piiResult?.hasPii) {
                                     const cats = [...new Set(piiResult.entities.map(e => e.label))].join(', ');
@@ -3568,7 +3526,7 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                             // PII scan: use Azure/CPU model with ALL categories, respect org confidence threshold
                             let piiDetected = null;
                             try {
-                                const { detectPii } = require('../../core/azurePiiDetection');
+                                const { detectPii } = require('../../core/piiDetection');
                                 const threshold = typeof shield.piiDetectionConfidenceThreshold === 'number'
                                     ? shield.piiDetectionConfidenceThreshold : 0.7;
                                 const piiResult = await detectPii(resultText.slice(0, 5000), null, threshold);
@@ -3650,7 +3608,7 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                 // Emit workspace_update SSE event. Render-time un-tokenisation —
                 // see the matching block in the precheck loop above for rationale.
                 if (toolResult._action === 'workspace_update') {
-                    const { restoreTokens } = require('../../core/azurePiiDetection');
+                    const { restoreTokens } = require('../../core/piiDetection');
                     const _convMapForWs = require('../../core/dlp/dlpRunner').getConversationTokenMap(convId);
                     const rendered = restoreTokens(toolResult.content || '', _convMapForWs);
                     send('workspace_update', { content: rendered });
@@ -3688,14 +3646,14 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                 toolChoice: directChatTools.length > 0 ? followGuard.toolChoice : undefined,
             };
             try {
-                await adapter.stream(apiKey, apiUrl, modelId, messages, followStreamOptions, followStreamCallback);
+                await adapter.stream(apiKey, apiUrl, modelId, applyTokenMapToMessages({ conversationId: convId, messages }), followStreamOptions, followStreamCallback);
             } catch (followErr) {
                 const fMsg = String(followErr?.error?.message || followErr?.message || '');
                 if (/invalid_request_message_order|Unexpected role|invalid.*tool_choice/i.test(fMsg)) {
                     console.warn(`[DirectChat pipeline] Follow-up stream rejected — retrying with toolChoice='auto'. Original: ${fMsg}`);
                     fullContent = '';
                     streamToolCalls = [];
-                    await adapter.stream(apiKey, apiUrl, modelId, messages, { ...followStreamOptions, toolChoice: 'auto' }, followStreamCallback);
+                    await adapter.stream(apiKey, apiUrl, modelId, applyTokenMapToMessages({ conversationId: convId, messages }), { ...followStreamOptions, toolChoice: 'auto' }, followStreamCallback);
                 } else {
                     throw followErr;
                 }
@@ -3745,7 +3703,7 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
         // output check, memory extraction, title generation.
         let displayContent = fullContent;
         if (fullContent) {
-            const { restoreTokens } = require('../../core/azurePiiDetection');
+            const { restoreTokens } = require('../../core/piiDetection');
             const dlpRunner = require('../../core/dlp/dlpRunner');
             const convMap = dlpRunner.getConversationTokenMap(convId) || {};
             const mergedMap = { ...convMap, ...(piiTokenMap || {}) };
@@ -3786,41 +3744,10 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
             }
         }
 
-        // Check agent output with AI moderation (only if scope.agentOutput).
-        // Same rationale: moderation matches real-value content, not tokens.
-        if (moderationEnabled && moderationScope.agentOutput && displayContent && !moderationViolation) {
-            try {
-                const { validateInput } = require('../../core/moderation');
-                const outputMessages = [{ role: 'assistant', content: displayContent }];
-                await validateInput(outputMessages, true, moderationCategories);
-                console.log(`[DirectChat] AI moderation passed (agent output)`);
-            } catch (guardError) {
-                if (guardError.violationCodes) {
-                    let violationLabels = guardError.violationCodes;
-                    try {
-                        const parsed = JSON.parse(guardError.outcome);
-                        violationLabels = parsed.map(f => f.label || f.category);
-                    } catch (e) { /* use codes as-is */ }
-                    console.log(`[DirectChat] Agent output moderation violation: ${violationLabels.join(', ')}`);
-                    send('content_replace', { text: `⚠️ This response was blocked by content moderation (${violationLabels.join(', ')}). The AI's response contained content that violates organization safety policies.` });
-                    fullContent = '[Response blocked by content moderation]';
-                    displayContent = fullContent;
-
-                    // Log output moderation event (fire-and-forget)
-                    guardrailEventStore.logGuardrailEvent({
-                        organization_id: userOrgId || null,
-                        user_id: userId,
-                        conversation_id: convId || null,
-                        violation_type: 'moderation',
-                        violation_categories: violationLabels.join(', '),
-                        direction: 'output',
-                        action_taken: 'soft_block',
-                        source: 'direct',
-                        model: modelId || null,
-                    }).catch(() => {});
-                }
-            }
-        }
+        // Content moderation on agent output was removed when the Azure
+        // Content Safety backend was dropped. PII detection still runs on
+        // the user input above; output is streamed through `untokeniseStream`
+        // which restores PII tokens to real values for display.
 
         // ─── Conversation persistence ────────────────────────────
         if (!convId) {
@@ -3909,6 +3836,64 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                 }
                 _assistantTokenisationInfo.attachments = _turnAttachmentSummaries;
             }
+            // Surface restored tokens too — on turns where no new redaction
+            // fires but the AI's reply echoed tokens from earlier turns, the
+            // un-tokeniser swapped them back to real values before the user
+            // saw them. Synthesise the same shape the panel renders for fresh
+            // redactions so the badge still appears.
+            if (!_assistantTokenisationInfo && _streamUntok && typeof _streamUntok.getReplacedTokens === 'function') {
+                const replaced = _streamUntok.getReplacedTokens();
+                if (replaced && replaced.size > 0) {
+                    const tokenMap = {};
+                    const catSet = new Set();
+                    let totalCount = 0;
+                    for (const [token, info] of replaced) {
+                        tokenMap[token] = info.value;
+                        totalCount += info.count || 0;
+                        const m = /^\[([a-z0-9_]+)_\d+\]$/.exec(token);
+                        if (m) catSet.add(m[1]);
+                    }
+                    _assistantTokenisationInfo = {
+                        source: 'restored',
+                        action: 'restore',
+                        count: totalCount,
+                        categories: [...catSet],
+                        provider: modelId,
+                        automatic: true,
+                        tokenMap,
+                    };
+                    send('tokenisation_info', _assistantTokenisationInfo);
+                } else {
+                    // No token echo this turn — but if the conversation vault
+                    // has any entries, surface the protected-state badge so
+                    // the user gets continuous visual confirmation that
+                    // privacy is engaged for this chat.
+                    //
+                    // IMPORTANT: state, not action. No PII detection runs on
+                    // the AI's reply; the vault was populated on earlier
+                    // turns.
+                    const _dlpRunnerForSynth = require('../../core/dlp/dlpRunner');
+                    const convMap = _dlpRunnerForSynth.getConversationTokenMap(convId) || {};
+                    const convEntries = Object.entries(convMap);
+                    if (convEntries.length > 0) {
+                        const catSet = new Set();
+                        for (const [tok] of convEntries) {
+                            const m = /^\[([a-z0-9_]+)_\d+\]$/.exec(tok);
+                            if (m) catSet.add(m[1]);
+                        }
+                        _assistantTokenisationInfo = {
+                            source: 'conversation_vault',
+                            action: 'protected',
+                            count: convEntries.length,
+                            categories: [...catSet],
+                            provider: modelId,
+                            automatic: true,
+                            tokenMap: Object.fromEntries(convEntries),
+                        };
+                        send('tokenisation_info', _assistantTokenisationInfo);
+                    }
+                }
+            }
             savedMessages.push(userSave);
             const assistantSave = { role: 'assistant', content: fullContent, timestamp: new Date().toISOString() };
             // Persist the concrete model + tier so the "How I got this answer"
@@ -3963,7 +3948,7 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                 // user-render concern. Same applies to `query` / `find_text`
                 // values inside the recorded args.
                 try {
-                    const { restoreTokens } = require('../../core/azurePiiDetection');
+                    const { restoreTokens } = require('../../core/piiDetection');
                     const _convMapForToolHist = require('../../core/dlp/dlpRunner').getConversationTokenMap(convId);
                     if (Object.keys(_convMapForToolHist).length > 0) {
                         for (const t of collectedToolHistory) {
@@ -4047,7 +4032,7 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
             if (!moderationViolation && memoryWriteEnabled && tokenizedMessage && displayContent) {
                 try {
                     const { extractMemories } = require('../../core/memoryExtractor');
-                    const { restoreTokens } = require('../../core/azurePiiDetection');
+                    const { restoreTokens } = require('../../core/piiDetection');
                     const _convMapForMem = require('../../core/dlp/dlpRunner').getConversationTokenMap(convId);
                     const _userTextForMem = Object.keys(_convMapForMem).length > 0
                         ? restoreTokens(tokenizedMessage, _convMapForMem)
@@ -4492,7 +4477,7 @@ router.get('/direct/conversations/:id/workspace', requireAuth, async (req, res) 
         // in a later turn; this endpoint reaches the user, so swap them back
         // to real values. Async getter so an open-after-server-restart hits the
         // DB hydrate path in dlpRunner.
-        const { restoreTokens } = require('../../core/azurePiiDetection');
+        const { restoreTokens } = require('../../core/piiDetection');
         const _convMap = await require('../../core/dlp/dlpRunner').getConversationTokenMapAsync(req.params.id);
         res.json({
             content: restoreTokens(conv.workspace_content || '', _convMap),

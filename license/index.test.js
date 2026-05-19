@@ -25,8 +25,16 @@ process.env.LICENSE_PUBLIC_KEY = publicKey;
 const fakeStore = {
     _orgs: {},
     _users: {},
+    _server: null,
     async getActiveLicenseForOrg(orgId) { return this._orgs[orgId] || null; },
     async getActiveLicenseForUser(userId) { return this._users[userId] || null; },
+    async getActiveLicenseForServer() {
+        // Mirror the production query: only return when refreshStatus is not
+        // expired/revoked (test scenarios deactivate via flag mutation).
+        if (!this._server) return null;
+        if (this._server.refreshStatus === 'expired' || this._server.refreshStatus === 'revoked') return null;
+        return this._server;
+    },
     async getActiveLicensesForOrgs(orgIds = []) {
         const out = [];
         for (const id of orgIds) if (this._orgs[id]) out.push(this._orgs[id]);
@@ -48,12 +56,14 @@ const fakeStore = {
             metadata: args.metadata || {},
         };
         if (args.scope === 'organization') this._orgs[args.organizationId] = lic;
-        else this._users[args.userId] = lic;
+        else if (args.scope === 'consumer') this._users[args.userId] = lic;
+        else if (args.scope === 'server') this._server = lic;
         return lic;
     },
     async deactivateLicense(licenseId) {
         for (const o of Object.values(this._orgs)) if (o && o.id === licenseId) o.refreshStatus = 'expired';
         for (const u of Object.values(this._users)) if (u && u.id === licenseId) u.refreshStatus = 'expired';
+        if (this._server && this._server.id === licenseId) this._server.refreshStatus = 'expired';
         return true;
     },
     async logLicenseAudit() { /* noop */ },
@@ -130,7 +140,11 @@ const now = Math.floor(Date.now() / 1000);
     assert.strictEqual(status.source, 'default');
     assert.strictEqual(status.license, null);
     assert.ok(status.features.includes('chat_basic'));
-    assert.ok(status.features.includes('automations'), 'community ships with automations');
+    assert.ok(status.features.includes('skills'), 'community keeps skills');
+    assert.ok(status.features.includes('agent_routines'), 'community keeps agent routines');
+    assert.ok(!status.features.includes('automations'), 'automations was promoted to enterprise');
+    assert.ok(!status.features.includes('voice_chat'), 'voice_chat was promoted to enterprise');
+    assert.ok(!status.features.includes('notebooks'), 'notebooks is enterprise');
     assert.strictEqual(status.limits.max_users, -1, 'community is uncapped');
 
     // ── Activate a legacy Pro license → resolves as enterprise ─────────

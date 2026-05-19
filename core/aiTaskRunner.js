@@ -409,6 +409,30 @@ async function executeAgentRoutine(task, { manual = false } = {}) {
         if (!agent) throw new Error(`Linked agent ${task.agentId} no longer exists`);
         if (agent.owner_id !== task.userId) throw new Error('Routine agent owner mismatch — refusing to run');
 
+        // Per-org beta-feature gate. The HTTP create/edit surfaces already
+        // refuse to schedule routines without `agent_routines`, but an org
+        // that *had* the feature enabled and later disabled it would keep
+        // firing previously-scheduled routines without this check.
+        // FeatureServiceUnavailableError → don't burn the attempt; leave
+        // the task to be retried on the next tick (60s).
+        if (agent.organization_id) {
+            try {
+                const { orgHasBetaFeature } = require('./betaFeatures');
+                const allowed = await orgHasBetaFeature(agent.organization_id, 'agent_routines');
+                if (!allowed) {
+                    await aiTaskStore.markError(task.id, 'agent_routines beta disabled for organisation');
+                    console.log(`[AITaskRunner] skipped routine ${task.id} — agent_routines disabled for org ${agent.organization_id}`);
+                    return;
+                }
+            } catch (e) {
+                if (e && e.name === 'FeatureServiceUnavailableError') {
+                    console.warn(`[AITaskRunner] beta lookup degraded — deferring routine ${task.id}: ${e.message}`);
+                    return; // markRunning already set; ticks pick it back up on retry
+                }
+                throw e;
+            }
+        }
+
         // Resolve OAuth credentials for this routine. Default path: long-lived
         // encrypted vault (`routine_credentials`) with auto-refresh, so the
         // routine works even when the user is offline. The legacy

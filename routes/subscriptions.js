@@ -10,6 +10,17 @@ const usageStore = require('../stores/usageStore');
 const router = express.Router();
 const { hasPermission } = require('../auth/permissions');
 
+// Self-hosted installs use license keys, not Stripe subscriptions. Block the
+// entire subscriptions API up front so neither the admin Plans CRUD nor
+// per-org/consumer reads accidentally bleed cloud SaaS concepts into a
+// customer-run server. Cloud (DEPLOYMENT_MODE=cloud, default) is unchanged.
+router.use((req, res, next) => {
+    if ((process.env.DEPLOYMENT_MODE || 'cloud') === 'self-hosted') {
+        return res.status(404).json({ error: 'not_available_in_self_hosted', message: 'Subscriptions are a Bee Flow Cloud feature. Self-hosted installs use license keys.' });
+    }
+    next();
+});
+
 async function isSuperAdmin(req) {
     if (req.session?.isAdmin || req.session?.user?.role === 'admin') return true;
     // Check RBAC: user may have admin_subscriptions or all permission via groups/roles
@@ -371,9 +382,12 @@ router.put('/orgs/:orgId', async (req, res) => {
             delete payload.override_hours;
         }
 
-        const oldSub = await userStore.getOrgSubscription(req.params.orgId);
-        const ok = await userStore.setOrgSubscription(req.params.orgId, payload);
-        if (!ok) return res.status(400).json({ error: 'Failed to set subscription' });
+        // Atomic read-modify-write: serialises two admins racing on the same
+        // org and reports when this write displaced another admin's active
+        // override. Both attempts are then visible in the audit log.
+        const lockResult = await userStore.setOrgSubscriptionWithLock(req.params.orgId, payload);
+        if (!lockResult.ok) return res.status(400).json({ error: 'Failed to set subscription' });
+        const oldSub = lockResult.snapshot;
 
         // Propagate plan entitlements (integrations + beta features) when the
         // plan changes. Use 'intersect' on downgrade-style updates so admins
@@ -390,6 +404,21 @@ router.put('/orgs/:orgId', async (req, res) => {
         await userStore.logSubscriptionAudit(action, 'org_subscription', req.params.orgId, adminId, oldSub, payload);
         if (payload.manual_override_until !== undefined) {
             await userStore.logSubscriptionAudit('manual_override_set', 'org_subscription', req.params.orgId, adminId, null, { manual_override_until: payload.manual_override_until });
+        }
+        if (lockResult.displaced) {
+            // Surface the loser-of-race in audit so the previous admin's
+            // override timestamp + identity isn't silently lost.
+            await userStore.logSubscriptionAudit(
+                'manual_override_displaced',
+                'org_subscription',
+                req.params.orgId,
+                adminId,
+                {
+                    previous_override_by: oldSub.manual_override_by,
+                    previous_override_until: oldSub.manual_override_until,
+                },
+                { manual_override_until: payload.manual_override_until, manual_override_by: payload.manual_override_by },
+            );
         }
 
         const sub = await userStore.getOrgSubscription(req.params.orgId);
@@ -416,6 +445,88 @@ router.post('/orgs/:orgId/start-trial', async (req, res) => {
         }
         console.error('[Subscriptions] startOrgTrial error:', e);
         res.status(400).json({ error: e.message });
+    }
+});
+
+// POST /api/subscriptions/orgs/:orgId/reissue-license — manually re-attempt
+// the license server call for an existing org subscription. Use when a
+// previous issuance failed (the audit log will have a `license_issuance_failed`
+// row); calling this retries against the current subscription state.
+router.post('/orgs/:orgId/reissue-license', async (req, res) => {
+    try {
+        const orgId = req.params.orgId;
+        const sub = await userStore.getOrgSubscription(orgId);
+        if (!sub) return res.status(404).json({ error: 'No subscription found' });
+        const planId = sub.plan_id;
+        if (!planId) return res.status(400).json({ error: 'Subscription has no plan_id' });
+        const plan = await userStore.getPlan(planId);
+        const { issueLicenseFromCheckout, tierFromPlanName } = require('../license/issuance');
+        const tier = tierFromPlanName(plan?.name) || tierFromPlanName(plan?.description);
+        if (!tier) return res.status(400).json({ error: 'Plan does not map to a license tier' });
+        try {
+            const result = await issueLicenseFromCheckout({
+                scope: 'organization',
+                organizationId: orgId,
+                planId,
+                tier,
+                stripeCustomerId: sub.stripe_customer_id || null,
+                stripeSubscriptionId: sub.stripe_subscription_id || null,
+            });
+            await userStore.logSubscriptionAudit(
+                'license_issuance_succeeded', 'organization', orgId, getAdminId(req), null,
+                { plan_id: planId, tier, stripe_subscription_id: sub.stripe_subscription_id || null, license_id: result?.licenseId || null, manual: true }
+            );
+            res.json({ success: true, license_id: result?.licenseId || null });
+        } catch (e) {
+            await userStore.logSubscriptionAudit(
+                'license_issuance_failed', 'organization', orgId, getAdminId(req), null,
+                { plan_id: planId, error_code: e.code || null, error: String(e.message || e).slice(0, 500), stripe_subscription_id: sub.stripe_subscription_id || null, manual: true }
+            );
+            res.status(502).json({ error: e.message, code: e.code || null });
+        }
+    } catch (e) {
+        console.error('[Subscriptions] reissueLicense (org) error:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// POST /api/subscriptions/consumer/:userId/reissue-license — same as above for
+// individual / consumer subscriptions.
+router.post('/consumer/:userId/reissue-license', async (req, res) => {
+    try {
+        const userId = req.params.userId;
+        const sub = await userStore.getConsumerSubscription(userId);
+        if (!sub) return res.status(404).json({ error: 'No subscription found' });
+        const planId = sub.plan_id;
+        if (!planId) return res.status(400).json({ error: 'Subscription has no plan_id' });
+        const plan = await userStore.getPlan(planId);
+        const { issueLicenseFromCheckout, tierFromPlanName } = require('../license/issuance');
+        const tier = tierFromPlanName(plan?.name) || tierFromPlanName(plan?.description);
+        if (!tier) return res.status(400).json({ error: 'Plan does not map to a license tier' });
+        try {
+            const result = await issueLicenseFromCheckout({
+                scope: 'consumer',
+                userId,
+                planId,
+                tier,
+                stripeCustomerId: sub.stripe_customer_id || null,
+                stripeSubscriptionId: sub.stripe_subscription_id || null,
+            });
+            await userStore.logSubscriptionAudit(
+                'license_issuance_succeeded', 'consumer', userId, getAdminId(req), null,
+                { plan_id: planId, tier, stripe_subscription_id: sub.stripe_subscription_id || null, license_id: result?.licenseId || null, manual: true }
+            );
+            res.json({ success: true, license_id: result?.licenseId || null });
+        } catch (e) {
+            await userStore.logSubscriptionAudit(
+                'license_issuance_failed', 'consumer', userId, getAdminId(req), null,
+                { plan_id: planId, error_code: e.code || null, error: String(e.message || e).slice(0, 500), stripe_subscription_id: sub.stripe_subscription_id || null, manual: true }
+            );
+            res.status(502).json({ error: e.message, code: e.code || null });
+        }
+    } catch (e) {
+        console.error('[Subscriptions] reissueLicense (consumer) error:', e);
+        res.status(500).json({ error: e.message });
     }
 });
 
@@ -643,6 +754,67 @@ router.put('/trial-config', async (req, res) => {
         res.json(newCfg);
     } catch (e) {
         console.error('[Subscriptions] setTrialConfig error:', e);
+        res.status(400).json({ error: e.message });
+    }
+});
+
+// GET /api/subscriptions/license-issuance-failures — unresolved-only.
+// A "failure" is a `license_issuance_failed` audit row that does NOT have a
+// later `license_issuance_succeeded` row for the same target_id. Used by the
+// admin sidebar badge and the audit-view Retry UI. Returns the most recent
+// 50 failures with target metadata so the UI can render the list inline.
+router.get('/license-issuance-failures', async (req, res) => {
+    try {
+        const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 50));
+        const rows = await userStore.getUnresolvedLicenseIssuanceFailures(limit);
+        res.json(rows);
+    } catch (e) {
+        console.error('[Subscriptions] getUnresolvedLicenseIssuanceFailures error:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// GET /api/subscriptions/currency-rates — admin-configurable USD→X rates
+// applied at usage-log time to convert LiteLLM USD costs into the plan's
+// billing currency. Missing rates fall back to 1.0 (no conversion).
+router.get('/currency-rates', async (req, res) => {
+    try {
+        const currency = require('../core/currency');
+        res.json(await currency.getAllConfiguredRates());
+    } catch (e) {
+        console.error('[Subscriptions] getCurrencyRates error:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// PUT /api/subscriptions/currency-rates — body: { eur: 0.92, gbp: 0.78, ... }
+// Each value is a USD → <currency> multiplier. Persists via configStore
+// and audits the diff. Also clears the PAYG resolver cache so the next AI
+// call sees the new rate immediately rather than after the 60s TTL.
+router.put('/currency-rates', async (req, res) => {
+    try {
+        const currency = require('../core/currency');
+        const payload = req.body && typeof req.body === 'object' ? req.body : {};
+        const before = await currency.getAllConfiguredRates();
+        const applied = {};
+        for (const [code, rate] of Object.entries(payload)) {
+            if (typeof code !== 'string' || !/^[a-z]{3}$/i.test(code)) {
+                return res.status(400).json({ error: `Invalid currency code: ${code}` });
+            }
+            const numeric = Number(rate);
+            if (!Number.isFinite(numeric) || numeric <= 0) {
+                return res.status(400).json({ error: `Invalid rate for ${code}: ${rate}` });
+            }
+            const r = await currency.setUsdToCurrencyRate(code, numeric);
+            applied[r.currency.toLowerCase()] = r.rate;
+        }
+        // Drop any PAYG-cache entries so freshly converted rates take effect now.
+        try { require('../stores/usageStore').invalidatePaygCache(null, null); } catch (_) { /* circular-load safe */ }
+        const after = await currency.getAllConfiguredRates();
+        await userStore.logSubscriptionAudit('update_currency_rates', 'currency_rates', 'global', getAdminId(req), before, after);
+        res.json(after);
+    } catch (e) {
+        console.error('[Subscriptions] setCurrencyRates error:', e);
         res.status(400).json({ error: e.message });
     }
 });

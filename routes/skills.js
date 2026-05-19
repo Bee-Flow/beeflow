@@ -8,7 +8,10 @@ const express = require('express');
 const router = express.Router();
 const skillStore = require('../stores/skillStore');
 const userStore = require('../stores/userStore');
-const { requirePermission, validateSharedGroupsForOrg } = require('../auth');
+const { requirePermission, validateSharedGroupsForOrg, requireActiveOrgForMutations } = require('../auth');
+
+// Block all writes when the caller's org is suspended/archived.
+router.use(requireActiveOrgForMutations());
 
 // ── Auth guard (same pattern as other routes) ────────────────
 function requireAuth(req, res, next) {

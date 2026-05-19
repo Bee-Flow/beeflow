@@ -1,6 +1,5 @@
 const configStore = require('../../stores/configStore');
-const { validateInput } = require('../moderation');
-const { validateInputForPii } = require('../azurePiiDetection');
+const { validateInputForPii } = require('../piiDetection');
 const { resolveOrgShield, mergeWithOrgShield } = require('../orgShield');
 const { checkRegexPatterns } = require('../guardrails');
 const guardrailEventStore = require('../../stores/guardrailEventStore');
@@ -49,16 +48,10 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
         return await configStore.getConfig(`org_privacy_shield_${agent.organization_id}`);
     })();
 
-    const orgModerationEnabled = !!(orgShield?.enabled && orgShield?.moderationEnabled);
-    const orgModerationScope = orgShield?.enabled
-        ? (orgShield.scope || { userInput: true, agentOutput: true })
-        : { userInput: true, agentOutput: true };
-
     const webSearchGuardEnabled = !!(orgShield?.enabled && orgShield?.webSearchGuardEnabled) || !!agent.config?.webSearchGuardEnabled;
     const disableSearchOnUpload = !!(orgShield?.enabled && orgShield?.disableSearchOnUpload);
     const webSearchGuardPiiCategories = (orgShield?.enabled && Array.isArray(orgShield?.webSearchGuardPiiCategories) && orgShield.webSearchGuardPiiCategories.length > 0)
         ? orgShield.webSearchGuardPiiCategories : null;
-    const orgShieldCategories = orgShield?.moderationCategories || null;
 
     // Context for guardrail event logging
     const eventCtx = {
@@ -71,65 +64,16 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
         model: model || null,
     };
 
-    // Agent-level llamaGuard only fires when the org hasn't explicitly disabled moderation.
-    // If org has an active Privacy Shield with moderationEnabled=false, agent config is overridden.
-    const orgExplicitlyDisabled = orgShield?.enabled && orgShield.moderationEnabled === false;
-    const shouldCheckInputModeration = (orgModerationEnabled && orgModerationScope.userInput) ||
-        (!orgExplicitlyDisabled && (agent.config?.llamaGuardEnabled || globalConfig?.llamaGuardConfig?.enabled));
-    
-    if (shouldCheckInputModeration) {
-        try {
-            // Per-org provider override — Azure Content Safety
-            // runs per turn. When the org hasn't explicitly picked one, moderation.js falls
-            // back to the global `ai.moderationProvider` setting.
-            const preferredProvider = orgShield?.enabled ? orgShield.moderationProvider : null;
-            await validateInput(messages, agent.config?.llamaGuardEnabled, orgShieldCategories, preferredProvider);
-        } catch (guardError) {
-            console.error('[GuardrailsRunner] Guardrails Check Failed:', guardError.message);
-            if (guardError.violationCodes) {
-                let violationLabels = guardError.violationCodes;
-                try {
-                    const parsed = JSON.parse(guardError.outcome);
-                    violationLabels = parsed.map(f => f.label || f.category);
-                } catch (e) { /* ignore */ }
-                
-                if (onEvent) {
-                    onEvent('guardrail_violation', {
-                        rules: violationLabels,
-                        autoDeleteSeconds: 5,
-                        outcome: guardError.outcome,
-                        categories: violationLabels
-                    });
-                }
-                moderationViolation = violationLabels.join(', ');
-
-                // Log moderation event (fire-and-forget)
-                guardrailEventStore.logGuardrailEvent({
-                    ...eventCtx,
-                    violation_type: 'moderation',
-                    violation_categories: violationLabels.join(', '),
-                    direction: 'input',
-                    action_taken: 'hard_block',
-                }).catch(() => {});
-            }
-        }
-    }
-
     // ── PII Detection ─────────────────────────────────────────────────
-    // Runs independently of Azure Content Safety moderation.
-    // Uses Azure Text Analytics when configured, falls back to CPU model via guard service.
-    // Org-level PII gate: either Azure or Local (Transformers.js) satisfies
-    // it. detectPii() routes between them in azurePiiDetection.js.
-    const orgPiiEnabled = !!(orgShield?.enabled && (orgShield?.azurePiiEnabled || orgShield?.localPiiEnabled !== false));
-    // If the org shield is active and explicitly disables BOTH PII detectors, respect that
-    // over the global setting (mirrors the moderation "orgExplicitlyDisabled" pattern).
-    const orgExplicitlyDisabledPii = orgShield?.enabled && orgShield?.azurePiiEnabled === false && orgShield?.localPiiEnabled === false;
+    // Single backend: the PII Guard service (GLiNER). If the guard isn't
+    // installed, detectPii() returns null and the chat path fails open.
+    const orgPiiEnabled = !!orgShield?.enabled;
     // When the org has the interactive DLP gate enabled, skip the auto-tokenising
     // path here — the downstream dlpRunner call in chatStream.js will do the scan
     // and apply the user's chosen action (ask/redact/block). Running both leads to
     // double scans and conflicting actions.
     const dlpWillHandle = !!(orgShield?.enabled && orgShield?.dlpEnabled);
-    if (!dlpWillHandle && ((globalConfig?.piiDetectionEnabled && !orgExplicitlyDisabledPii) || orgPiiEnabled)) {
+    if (!dlpWillHandle && (globalConfig?.piiDetectionEnabled || orgPiiEnabled)) {
         try {
             const piiMessages = [
                 ...messages.slice(-3), // last few messages for context
@@ -163,7 +107,7 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
 
                 // Let the LLM know that the placeholders in the user's message are
                 // redaction tokens and it should echo them back unchanged. Match the
-                // format emitted by azurePiiDetection.js → `[email_1]`, `[phone_2]`, …
+                // format emitted by piiDetection.js → `[email_1]`, `[phone_2]`, …
                 if (messages[0]?.role === 'system' && typeof messages[0].content === 'string') {
                     const categoryList = [...new Set(piiResult.entities.map(e => e.label || e.category))].join(', ');
                     messages[0].content += `\n\n[PRIVACY MODE ACTIVE — strict rules (${categoryList}):
@@ -349,7 +293,6 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
         webSearchGuardEnabled,
         disableSearchOnUpload,
         webSearchGuardPiiCategories,
-        orgShieldCategories,
         userPrivacyMeta,
         assistantTokenisationInfo,
     };

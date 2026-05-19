@@ -268,9 +268,228 @@ async function sendWaitlistApprovedEmail({ email, displayName }) {
     });
 }
 
+/**
+ * Send a trial-ending warning email. Stripe fires
+ * `customer.subscription.trial_will_end` ~3 days before trial end. The
+ * caller is responsible for idempotency (use userStore.claimNotification).
+ *
+ * @param {{ email: string, displayName?: string, orgName?: string, trialEndIso: string, portalUrl: string }} opts
+ */
+async function sendTrialEndingEmail({ email, displayName, orgName, trialEndIso, portalUrl }) {
+    const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}`;
+    const logoUrl = `${clientHost}/bee-flow-logo.svg`;
+    const targetName = orgName || displayName || 'there';
+    const trialEnd = trialEndIso ? new Date(trialEndIso) : null;
+    const trialEndPretty = trialEnd ? trialEnd.toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' }) : 'soon';
+    const daysLeft = trialEnd ? Math.max(0, Math.ceil((trialEnd.getTime() - Date.now()) / (24 * 60 * 60 * 1000))) : null;
+    const daysLine = daysLeft != null ? `in ${daysLeft} day${daysLeft === 1 ? '' : 's'}` : 'soon';
+
+    const html = `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="margin:0;padding:0;background:#f5f5f5;font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f5f5f5;padding:48px 20px;">
+    <tr><td align="center">
+      <table width="520" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:16px;border:1px solid rgba(0,0,0,0.06);overflow:hidden;box-shadow:0 4px 12px rgba(0,0,0,0.05);">
+        <tr><td style="padding:36px 40px 28px;text-align:center;border-bottom:1px solid #f0f0f0;">
+          <img src="${logoUrl}" alt="BeeFlow" width="56" height="56" style="display:block;margin:0 auto 16px;border-radius:14px;" />
+          <h1 style="margin:0;font-size:22px;font-weight:700;color:#0f172a;letter-spacing:-0.3px;">Your trial ends ${daysLine}</h1>
+        </td></tr>
+        <tr><td style="padding:32px 40px 36px;">
+          <p style="margin:0 0 16px;font-size:15px;line-height:1.65;color:#334155;">
+            Hi <strong style="color:#0f172a;">${targetName}</strong>,
+          </p>
+          <p style="margin:0 0 16px;font-size:15px;line-height:1.65;color:#334155;">
+            Your BeeFlow trial ends on <strong style="color:#0f172a;">${trialEndPretty}</strong>. To keep your access without interruption, add a payment method now.
+          </p>
+          <p style="margin:0 0 28px;font-size:14px;line-height:1.6;color:#64748b;">
+            If you don't add a payment method, your subscription will be cancelled automatically when the trial ends.
+          </p>
+          <table width="100%" cellpadding="0" cellspacing="0">
+            <tr><td align="center">
+              <a href="${portalUrl}" target="_blank" style="display:inline-block;padding:14px 40px;background:#0f172a;color:#ffffff;font-size:15px;font-weight:600;text-decoration:none;border-radius:12px;">
+                Add Payment Method
+              </a>
+            </td></tr>
+          </table>
+        </td></tr>
+        <tr><td style="padding:20px 40px;text-align:center;background:#fafafa;border-top:1px solid #f0f0f0;">
+          <p style="margin:0;font-size:11px;color:#94a3b8;">
+            Sent by BeeFlow · <a href="${clientHost}" style="color:#6b7280;text-decoration:none;">${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}</a>
+          </p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`.trim();
+
+    const text = `Hi ${targetName},\n\nYour BeeFlow trial ends on ${trialEndPretty}. To keep your access without interruption, add a payment method now:\n\n${portalUrl}\n\nIf you don't add a payment method, your subscription will be cancelled automatically when the trial ends.`;
+
+    return sendServiceEmail({
+        to: email,
+        subject: `Your BeeFlow trial ends ${daysLine}`,
+        text,
+        html,
+    });
+}
+
+/**
+ * Shared branded shell. Most lifecycle emails share the same chrome
+ * (logo header, title, body, CTA, footer); this composer builds the HTML
+ * and plaintext so individual templates only specify the copy.
+ *
+ * @param {{ title: string, intro?: string, body: string, ctaLabel?: string, ctaUrl?: string, footer?: string }} parts
+ */
+function _renderEmailShell({ title, intro, body, ctaLabel, ctaUrl, footer }) {
+    const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}`;
+    const logoUrl = `${clientHost}/bee-flow-logo.svg`;
+    const cta = (ctaLabel && ctaUrl)
+        ? `
+        <table width="100%" cellpadding="0" cellspacing="0">
+            <tr><td align="center">
+              <a href="${ctaUrl}" target="_blank" style="display:inline-block;padding:14px 40px;background:#0f172a;color:#ffffff;font-size:15px;font-weight:600;text-decoration:none;border-radius:12px;">
+                ${ctaLabel}
+              </a>
+            </td></tr>
+        </table>`
+        : '';
+    const html = `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="margin:0;padding:0;background:#f5f5f5;font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f5f5f5;padding:48px 20px;">
+    <tr><td align="center">
+      <table width="520" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:16px;border:1px solid rgba(0,0,0,0.06);overflow:hidden;box-shadow:0 4px 12px rgba(0,0,0,0.05);">
+        <tr><td style="padding:36px 40px 28px;text-align:center;border-bottom:1px solid #f0f0f0;">
+          <img src="${logoUrl}" alt="BeeFlow" width="56" height="56" style="display:block;margin:0 auto 16px;border-radius:14px;" />
+          <h1 style="margin:0;font-size:22px;font-weight:700;color:#0f172a;letter-spacing:-0.3px;">${title}</h1>
+        </td></tr>
+        <tr><td style="padding:32px 40px 36px;">
+          ${intro ? `<p style="margin:0 0 16px;font-size:15px;line-height:1.65;color:#334155;">${intro}</p>` : ''}
+          <div style="margin:0 0 24px;font-size:15px;line-height:1.65;color:#334155;">${body}</div>
+          ${cta}
+          ${footer ? `<p style="margin:24px 0 0;font-size:12px;line-height:1.5;color:#94a3b8;">${footer}</p>` : ''}
+        </td></tr>
+        <tr><td style="padding:20px 40px;text-align:center;background:#fafafa;border-top:1px solid #f0f0f0;">
+          <p style="margin:0;font-size:11px;color:#94a3b8;">
+            Sent by BeeFlow · <a href="${clientHost}" style="color:#6b7280;text-decoration:none;">${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}</a>
+          </p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`.trim();
+    return html;
+}
+
+/**
+ * Payment failed — first failure. Stripe automatically retries per its
+ * Smart Retries schedule (typically 3, 5, 7 days). This email is the
+ * "heads up" to the customer so they can update their card before retries
+ * are exhausted and dunning takes the subscription past_due.
+ */
+async function sendPaymentFailedEmail({ email, displayName, orgName, portalUrl, attemptCount = 1 }) {
+    const targetName = orgName || displayName || 'there';
+    const html = _renderEmailShell({
+        title: 'Payment failed',
+        intro: `Hi <strong>${targetName}</strong>,`,
+        body: `Your most recent BeeFlow payment didn't go through${attemptCount > 1 ? ` (attempt ${attemptCount})` : ''}. Stripe will automatically retry over the next few days, but you can update your card now to avoid a service interruption.`,
+        ctaLabel: 'Update Payment Method',
+        ctaUrl: portalUrl,
+        footer: 'If you\'ve already updated your card, you can ignore this email.',
+    });
+    const text = `Hi ${targetName},\n\nYour most recent BeeFlow payment didn't go through${attemptCount > 1 ? ` (attempt ${attemptCount})` : ''}. Stripe will retry automatically. Update your card now to avoid a service interruption:\n\n${portalUrl}`;
+    return sendServiceEmail({
+        to: email,
+        subject: 'BeeFlow: Payment failed — please update your card',
+        text,
+        html,
+    });
+}
+
+/**
+ * Dunning grace-period warning. Sent when the dunning sweeper notices an
+ * org has been past_due for over half the grace window (default 7 days).
+ * Last chance before the subscription flips to suspended.
+ */
+async function sendDunningGraceWarningEmail({ email, displayName, orgName, portalUrl, graceDaysRemaining }) {
+    const targetName = orgName || displayName || 'there';
+    const html = _renderEmailShell({
+        title: 'Your subscription is at risk',
+        intro: `Hi <strong>${targetName}</strong>,`,
+        body: `Your BeeFlow account is past due. If we don\'t receive payment in the next <strong>${graceDaysRemaining} day${graceDaysRemaining === 1 ? '' : 's'}</strong>, AI access will be suspended.`,
+        ctaLabel: 'Resolve Now',
+        ctaUrl: portalUrl,
+        footer: 'Updating your payment method instantly reactivates Stripe retries.',
+    });
+    const text = `Hi ${targetName},\n\nYour BeeFlow account is past due. If we don't receive payment in the next ${graceDaysRemaining} day(s), AI access will be suspended.\n\nResolve now: ${portalUrl}`;
+    return sendServiceEmail({
+        to: email,
+        subject: `BeeFlow: ${graceDaysRemaining} day${graceDaysRemaining === 1 ? '' : 's'} until your subscription is suspended`,
+        text,
+        html,
+    });
+}
+
+/**
+ * Subscription suspended (post-dunning). Final-state email confirming AI
+ * access is blocked until payment is resolved.
+ */
+async function sendSubscriptionSuspendedEmail({ email, displayName, orgName, portalUrl }) {
+    const targetName = orgName || displayName || 'there';
+    const html = _renderEmailShell({
+        title: 'Subscription suspended',
+        intro: `Hi <strong>${targetName}</strong>,`,
+        body: 'Your BeeFlow subscription has been suspended because payment couldn\'t be collected. AI features are paused; existing chats and data remain intact. Update your payment method to reactivate.',
+        ctaLabel: 'Reactivate Subscription',
+        ctaUrl: portalUrl,
+    });
+    const text = `Hi ${targetName},\n\nYour BeeFlow subscription has been suspended because payment couldn't be collected. AI features are paused; your data is safe. Update your payment method to reactivate:\n\n${portalUrl}`;
+    return sendServiceEmail({
+        to: email,
+        subject: 'BeeFlow: Subscription suspended',
+        text,
+        html,
+    });
+}
+
+/**
+ * GDPR Art. 33 breach notification. Sent to the recipient list resolved by
+ * compliance.js (DPO + org admins). Free-form body so the compliance flow
+ * can include incident-specific details (categories of data, affected user
+ * count, mitigation steps) without a rigid template.
+ *
+ * @param {{ to: string | string[], incidentSummary: string, occurredAt: string, ackUrl?: string }} opts
+ */
+async function sendBreachNotificationEmail({ to, incidentSummary, occurredAt, ackUrl }) {
+    const html = _renderEmailShell({
+        title: 'Data incident notification',
+        body: `A security incident has been recorded that may affect your organization\'s data. <br/><br/><strong>Occurred:</strong> ${occurredAt}<br/><br/>${incidentSummary}`,
+        ctaLabel: ackUrl ? 'Open Incident Report' : null,
+        ctaUrl: ackUrl || null,
+        footer: 'This notification is sent in accordance with GDPR Art. 33 / 34. Please coordinate with your DPO before disclosing details outside your organization.',
+    });
+    const text = `Data incident notification.\n\nOccurred: ${occurredAt}\n\n${incidentSummary}\n\n${ackUrl ? `Open: ${ackUrl}` : ''}`;
+    return sendServiceEmail({
+        to,
+        subject: 'BeeFlow: Data incident notification',
+        text,
+        html,
+    });
+}
+
 module.exports = {
     getServiceEmailConfig,
     sendServiceEmail,
     sendInvitationEmail,
     sendWaitlistApprovedEmail,
+    sendTrialEndingEmail,
+    sendPaymentFailedEmail,
+    sendDunningGraceWarningEmail,
+    sendSubscriptionSuspendedEmail,
+    sendBreachNotificationEmail,
 };

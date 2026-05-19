@@ -1,61 +1,41 @@
 /**
- * Content Moderation — Azure Content Safety + GLiNER PII detection.
+ * Content Moderation — PII detection only.
  *
- * Single moderation path: Azure Content Safety. PII detection runs in parallel
- * via the guard-service /pii endpoint (GLiNER multi PII v1, Apache 2.0) with
- * Azure AI Text Analytics as an alternative when configured.
+ * Hate / Violence / Sexual / Self-Harm content moderation was removed when
+ * the only working backend (Azure Content Safety) was dropped. The
+ * `validateInput` / `validateOutput` exports remain so existing callers
+ * keep working; they now run only PII detection (when enabled).
+ *
+ * Re-introducing content moderation later means writing a new provider
+ * integration from scratch and re-adding the dispatch here.
  */
 
 const { getAIConfig } = require('./aiAgent');
-const { validateWithAzureContentSafety, validateOutputWithAzureContentSafety } = require('./azureContentSafety');
-const { validateInputForPii, validateOutputForPii } = require('./azurePiiDetection');
+const { validateInputForPii, validateOutputForPii } = require('./piiDetection');
 
 const DEFAULT_MODERATION_THRESHOLD = 0.7;
 
 /**
- * Validate user input — runs Azure Content Safety + optional PII detection.
+ * Validate user input — runs PII detection when enabled.
  *
  * @param {Array} messages - Chat messages array
- * @param {boolean} [agentModerationEnabled=false] - Per-agent override
- * @param {Array|null} [allowedCategories=null] - Only enforce these categories
- * @param {string|null} [_preferredProvider] - Reserved for future provider switching
- * @throws {Error} If content violates moderation policies (message starts with "Safety Violation")
+ * @param {boolean} [_agentModerationEnabled=false] - Reserved (legacy callers still pass it)
+ * @param {Array|null} [_allowedCategories=null] - Reserved (legacy moderation categories)
+ * @throws {Error} If PII is detected and the shield action is 'block'.
  */
-async function validateInput(messages, agentModerationEnabled = false, allowedCategories = null, _preferredProvider = null) {
+async function validateInput(messages, _agentModerationEnabled = false, _allowedCategories = null) {
     const aiConfig = await getAIConfig();
-
-    const checks = [validateWithAzureContentSafety(messages, agentModerationEnabled, allowedCategories)];
-
-    if (aiConfig.piiDetectionEnabled) {
-        checks.push(validateInputForPii(messages, false));
-    }
-
-    const results = await Promise.allSettled(checks);
-    for (const result of results) {
-        if (result.status === 'rejected') {
-            throw result.reason;
-        }
-    }
+    if (!aiConfig.piiDetectionEnabled) return;
+    await validateInputForPii(messages, false);
 }
 
 /**
- * Validate agent output — runs Azure Content Safety + optional PII detection.
+ * Validate agent output — runs PII detection when enabled.
  */
-async function validateOutput(content, allowedCategories = null, _preferredProvider = null) {
+async function validateOutput(content, _allowedCategories = null) {
     const aiConfig = await getAIConfig();
-
-    const checks = [validateOutputWithAzureContentSafety(content, allowedCategories)];
-
-    if (aiConfig.piiDetectionEnabled) {
-        checks.push(validateOutputForPii(content));
-    }
-
-    const results = await Promise.allSettled(checks);
-    for (const result of results) {
-        if (result.status === 'rejected') {
-            throw result.reason;
-        }
-    }
+    if (!aiConfig.piiDetectionEnabled) return;
+    await validateOutputForPii(content);
 }
 
 module.exports = {

@@ -74,7 +74,13 @@ if (process.env.REDIS_URL) {
             retryStrategy(times) {
                 if (times > 5) return null;
                 return Math.min(times * 200, 2000);
-            }
+            },
+            // Scaleway managed Redis uses an internal CA — encryption stays on,
+            // cert validation is scoped to this client only (not the whole
+            // process). Set REDIS_TLS_STRICT=1 once a CA bundle is wired in.
+            ...(process.env.REDIS_URL.startsWith('rediss://') ? {
+                tls: { rejectUnauthorized: process.env.REDIS_TLS_STRICT === '1' }
+            } : {})
         });
         _redis.client.on('error', (err) => {
             console.warn('[DB] Redis error:', err.message);

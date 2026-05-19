@@ -39,6 +39,8 @@ async function startOrgTrial(orgId, planId, { changedBy } = {}) {
     const org = await store.getOrganization(orgId);
     if (!org) throw new Error('Organization not found');
     if (org.trial_used_at) throw trialAlreadyUsed();
+    // Email-scoped: catches the delete-and-recreate bypass on the org row.
+    if (org.email && await store.hasEmailUsedTrial('organization', org.email)) throw trialAlreadyUsed();
 
     if (!(await stripe.isEnabled())) throw new Error('Stripe is not enabled');
 
@@ -69,6 +71,15 @@ async function startOrgTrial(orgId, planId, { changedBy } = {}) {
         console.warn(`[TrialService] applyPlanToOrg failed for ${orgId}:`, e.message);
     }
     await store.markTrialUsed('organization', orgId);
+    await store.recordTrialHistory({
+        scope: 'organization',
+        email: org.email,
+        subscriberId: orgId,
+        planId,
+        stripeCustomerId: trialResult.stripeCustomerId,
+        stripeSubscriptionId: trialResult.stripeSubscriptionId,
+        trialEndDate: trialResult.trialEnd,
+    });
     await store.logSubscriptionAudit('start_trial', 'org_subscription', orgId, changedBy || 'system', existing, {
         plan_id: planId,
         trial_end_date: trialResult.trialEnd,
@@ -88,6 +99,7 @@ async function startConsumerTrial(userId, planId, { changedBy } = {}) {
     const user = await store.getUser(userId);
     if (!user) throw new Error('User not found');
     if (user.trial_used_at) throw trialAlreadyUsed();
+    if (user.email && await store.hasEmailUsedTrial('consumer', user.email)) throw trialAlreadyUsed();
 
     if (!(await stripe.isEnabled())) throw new Error('Stripe is not enabled');
 
@@ -112,6 +124,15 @@ async function startConsumerTrial(userId, planId, { changedBy } = {}) {
         stripe_subscription_id: trialResult.stripeSubscriptionId,
     });
     await store.markTrialUsed('consumer', userId);
+    await store.recordTrialHistory({
+        scope: 'consumer',
+        email: user.email,
+        subscriberId: userId,
+        planId,
+        stripeCustomerId: trialResult.stripeCustomerId,
+        stripeSubscriptionId: trialResult.stripeSubscriptionId,
+        trialEndDate: trialResult.trialEnd,
+    });
     await store.logSubscriptionAudit('start_trial', 'consumer_subscription', userId, changedBy || 'system', existing, {
         plan_id: planId,
         trial_end_date: trialResult.trialEnd,

@@ -10,6 +10,37 @@ const userStore = require('../stores/userStore');
 const usageStore = require('../stores/usageStore');
 const license = require('../license');
 
+// One-shot 80 %-of-cap notification. Sends a single email to the org's
+// admin(s) per billing period. Idempotency is enforced via the
+// notifications_sent table — the key `(organization, orgId,
+// 'cost_threshold_80:<period>')` is unique. Failures are swallowed.
+async function _notifyCostThreshold(orgId, cap, current, periodKey) {
+    try {
+        const kind = `cost_threshold_80:${periodKey}`;
+        const claimed = await userStore.claimNotification(
+            'organization', orgId, kind,
+            null, { cap, current }
+        );
+        if (!claimed) return; // already sent this period
+
+        const { getAll } = require('../db');
+        const admins = await getAll(
+            `SELECT email FROM users WHERE "organizationId" = $1 AND (role = 'admin' OR "orgRole" IN ('org_admin', 'admin')) AND email IS NOT NULL AND email <> '' LIMIT 5`,
+            [orgId],
+        );
+        const recipients = (admins || []).map(a => a.email).filter(Boolean);
+        if (recipients.length === 0) return;
+
+        const { sendServiceEmail } = require('../utils/emailService');
+        const pct = Math.round((current / cap) * 100);
+        const subject = `Bee Flow: ${pct}% of your monthly cost limit reached`;
+        const text = `Your organization has used €${current.toFixed(2)} of the €${cap.toFixed(2)} monthly limit (${pct}%). When usage reaches 100%, AI calls will be blocked until the next billing period.\n\nContact your administrator to raise the cap if needed.`;
+        await sendServiceEmail({ to: recipients.join(', '), subject, text }).catch(() => {});
+    } catch (e) {
+        console.warn('[Limits] cost threshold notify failed:', e.message);
+    }
+}
+
 // ── Consumer account limits ──────────────────────────────────────────────────
 
 /**
@@ -112,6 +143,10 @@ async function checkConsumerResourceLimits(userId, resourceType, currentCount) {
  * @returns {Promise<string|null>} Error message if limit exceeded, null otherwise
  */
 async function checkSubscriptionLimits(orgId, agentType, userId = null) {
+    // Self-hosted installs don't have Stripe-backed subscriptions. Skip the
+    // whole limit-check stack so a misconfigured DEPLOYMENT_MODE can't
+    // silently activate cloud billing on a self-hosted server.
+    if ((process.env.DEPLOYMENT_MODE || 'cloud') === 'self-hosted') return null;
     if (!orgId) {
         // Consumer account — check per-user limits
         if (!userId) return null;
@@ -143,10 +178,27 @@ async function checkSubscriptionLimits(orgId, agentType, userId = null) {
         }
     }
 
-    // Check cost limit
+    // Check cost limit. For PAYG plans the billed_cost (post-markup) is the
+    // figure the customer actually pays, so prefer it when available; fall
+    // back to estimated_cost for fixed plans. The hard stop kicks in at
+    // 100 % and an idempotent 80 %-of-cap warning email is sent once per
+    // (orgId, billing-period) tuple. Both gates are keyed on the same
+    // billing window so the warning resets cleanly each period.
     if (limits.max_cost_per_month !== null && limits.max_cost_per_month !== undefined) {
-        if ((summary.total_estimated_cost || 0) >= limits.max_cost_per_month) {
-            return `Your organization has reached its monthly cost limit (\u20ac${limits.max_cost_per_month.toFixed(2)}). Please contact your administrator.`;
+        const billed = Number(summary.total_billed_cost || 0);
+        const estimated = Number(summary.total_estimated_cost || 0);
+        const cost = billed > 0 ? billed : estimated;
+        const cap = Number(limits.max_cost_per_month);
+        if (cost >= cap) {
+            return `Your organization has reached its monthly cost limit (\u20ac${cap.toFixed(2)}). Please contact your administrator.`;
+        }
+        if (cap > 0 && cost >= cap * 0.8) {
+            // Fire-and-forget 80 % warning, gated by claimNotification so a
+            // hot loop of chat requests doesn't fan out to N emails.
+            const periodKey = (period.startDate || '').slice(0, 10); // YYYY-MM-DD
+            setImmediate(() => {
+                _notifyCostThreshold(orgId, cap, cost, periodKey).catch(() => {});
+            });
         }
     }
 
@@ -208,6 +260,9 @@ async function checkResourceLimits(orgId, resourceType, currentCount, userId = n
         } catch (_) { /* license module unavailable — don't fail open in production but don't crash either */ }
     }
 
+    // Inclusive-cap convention: `max` means "you may have up to N", so the
+    // (N+1)th creation is blocked. Matches the seat-cap enforcement in
+    // userStore.createUserWithSeatCheck (FOR UPDATE COUNT ≥ max → block).
     if (max !== null && max !== undefined && currentCount >= max) {
         const labels = { users: 'users', agents: 'agents', knowledge_sources: 'knowledge sources' };
         return `Your organization has reached its limit of ${max} ${labels[resourceType]}. Please upgrade your plan or contact your administrator.`;

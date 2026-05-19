@@ -66,20 +66,17 @@ module.exports = {
                 : Object.keys(ai.regexGuardrails).length > 0));
 
         const piiEnabled =
-            !!shield.azurePiiEnabled ||
+            !!shield.enabled ||
             (Array.isArray(shield.piiDetectionCategories) && shield.piiDetectionCategories.length > 0) ||
             (Array.isArray(ai.piiDetectionCategories) && ai.piiDetectionCategories.length > 0);
 
-        const moderationEnabled =
-            !!shield.moderationEnabled ||
-            !!ai.moderationEnabled ||
-            !!ai.moderationProvider;
-
-        const configCoverage = [regexEnabled, piiEnabled, moderationEnabled].filter(Boolean).length;
+        // Content moderation was removed when the Azure Content Safety
+        // backend was dropped; only regex + PII signals remain.
+        const configCoverage = [regexEnabled, piiEnabled].filter(Boolean).length;
 
         let status;
-        if (configCoverage === 3) status = 'pass';
-        else if (configCoverage >= 1) status = 'warn';
+        if (configCoverage === 2) status = 'pass';
+        else if (configCoverage === 1) status = 'warn';
         else status = 'fail';
 
         // ── Activity signals (only meaningful if DLP is configured) ──
@@ -115,7 +112,6 @@ module.exports = {
             evidence: {
                 regex_guardrails: regexEnabled,
                 pii_detection: piiEnabled,
-                moderation: moderationEnabled,
                 source: shield.enabled ? 'org_privacy_shield' : 'global_ai_config',
                 window_days: 30,
                 total_events: stats.total_events || 0,

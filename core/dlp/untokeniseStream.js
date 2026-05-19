@@ -36,6 +36,13 @@ function createUntokeniser(tokenMapInput) {
     }
 
     let buffer = '';
+    // Tracks tokens that were actually substituted in this stream. The chat
+    // surface uses this so the "Privacy protection" panel still appears on
+    // turns where no new redaction fired but the response echoed tokens from
+    // earlier turns — e.g. the user asks a follow-up question and the AI
+    // refers back to `[email_1]` which is restored to the real address before
+    // the user sees it. Map<token, { count, value }>.
+    const replacedTokens = new Map();
 
     function replaceAll(text) {
         if (!text) return text;
@@ -44,7 +51,16 @@ function createUntokeniser(tokenMapInput) {
         let out = text;
         for (const [token, original] of Object.entries(map)) {
             if (out.indexOf(token) === -1) continue;
-            out = out.split(token).join(original);
+            const parts = out.split(token);
+            const count = parts.length - 1;
+            if (count > 0) {
+                const existing = replacedTokens.get(token);
+                replacedTokens.set(token, {
+                    count: (existing?.count || 0) + count,
+                    value: original,
+                });
+            }
+            out = parts.join(original);
         }
         return out;
     }
@@ -92,7 +108,15 @@ function createUntokeniser(tokenMapInput) {
         return tail;
     }
 
-    return { push, flush, hasAny };
+    /**
+     * Returns the tokens that were actually substituted during the stream.
+     * Shape: Map<token, { count, value }>. Empty when nothing was replaced.
+     */
+    function getReplacedTokens() {
+        return replacedTokens;
+    }
+
+    return { push, flush, hasAny, getReplacedTokens };
 }
 
 module.exports = { createUntokeniser };

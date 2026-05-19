@@ -6,7 +6,7 @@
 const express = require('express');
 const agentStore = require('../stores/agentStore');
 const memoryStore = require('../stores/memoryStore');
-const { getEffectiveUserId } = require('./agents');
+const { requireAuth, requirePermission } = require('../auth/permissions');
 
 const router = express.Router();
 
@@ -30,14 +30,14 @@ const REPORT_TYPES = [
 ];
 
 // Get available report types
-router.get('/types', async (req, res) => {
+router.get('/types', requireAuth, async (req, res) => {
     res.json(REPORT_TYPES);
 });
 
 // Generate a specific report
-router.get('/:type', async (req, res) => {
+router.get('/:type', requireAuth, requirePermission('admin_monitoring'), async (req, res) => {
     const { type } = req.params;
-    const userId = getEffectiveUserId(req);
+    const userId = req.session.user.id;
 
     try {
         let reportData;

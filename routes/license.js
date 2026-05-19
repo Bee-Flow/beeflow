@@ -17,7 +17,22 @@ const router = express.Router();
 const rateLimit = require('express-rate-limit');
 
 const license = require('../license');
-const { hasPermission, resolveUserOrgIds } = require('../auth/permissions');
+const { hasPermission, resolveUserOrgIds, OrgRoles, SystemRoles, Permissions, isOrgAdminRole } = require('../auth/permissions');
+
+// Self-host detection — server-wide licence activation is gated to
+// self-hosted installs by default so a staff super-admin on cloud
+// cannot accidentally re-tier every tenant in one click.
+// LICENSE_ALLOW_SERVER_SCOPE_ON_CLOUD=true is an escape hatch (off by
+// default) for the edge case where Bee Flow runs as a single-tenant
+// managed-cloud deployment.
+function isServerScopeAllowed() {
+    if (process.env.LICENSE_ALLOW_SERVER_SCOPE_ON_CLOUD === 'true') return true;
+    return (process.env.DEPLOYMENT_MODE || 'cloud') === 'self-hosted';
+}
+
+function isSuperAdmin(req) {
+    return !!(req.session?.isAdmin || req.session?.user?.role === SystemRoles.SUPER_ADMIN);
+}
 
 // Rate-limit license status and activation. /status is polled by the UI on
 // every page load; activation is a low-frequency operation but a useful
@@ -46,12 +61,12 @@ function getUserId(req) {
 }
 
 async function isOrgAdmin(req) {
-    if (req.session?.isAdmin || req.session?.user?.role === 'admin') return true;
+    if (req.session?.isAdmin || req.session?.user?.role === SystemRoles.SUPER_ADMIN) return true;
     const userId = getUserId(req);
     if (!userId) return false;
-    if (req.session?.user?.orgRole === 'org_admin') return true;
+    if (isOrgAdminRole(req.session?.user?.orgRole)) return true;
     try {
-        return await hasPermission(userId, 'admin_subscriptions', req.session);
+        return await hasPermission(userId, Permissions.ADMIN_SUBSCRIPTIONS, req.session);
     } catch (_) { return false; }
 }
 
@@ -93,7 +108,14 @@ router.get('/status', licenseLimiter, async (req, res) => {
 });
 
 // ── POST /activate ──────────────────────────────────────────────────────
-// body: { token: '<jwt>', scope?: 'organization' | 'consumer' }
+// body: { token: '<jwt>', scope?: 'organization' | 'consumer' | 'server' }
+//
+// scope='server' applies the licence install-wide. It requires:
+//   - super-admin caller (session.isAdmin or role='admin')
+//   - DEPLOYMENT_MODE=self-hosted (or LICENSE_ALLOW_SERVER_SCOPE_ON_CLOUD=true)
+//   - tier ≥ enterprise — a community-tier server licence is meaningless
+//     (community is the default floor for every install). We refuse it
+//     up-front rather than persist a row that does nothing.
 router.post('/activate', licenseLimiter, async (req, res) => {
     try {
         const { token, scope } = req.body || {};
@@ -102,6 +124,45 @@ router.post('/activate', licenseLimiter, async (req, res) => {
         }
         const orgId = getOrgId(req);
         const userId = getUserId(req);
+
+        // Server-scope branch. Gated by self-host + super-admin checks; the
+        // tier-floor check happens after activation by inspecting the
+        // returned shape (we let activateLicense parse the token first
+        // because that's where verification lives).
+        if (scope === 'server') {
+            if (!isServerScopeAllowed()) {
+                return res.status(403).json({
+                    error: 'server_scope_cloud_blocked',
+                    message: 'Server-wide licences are only supported on self-hosted deployments.',
+                });
+            }
+            if (!isSuperAdmin(req)) {
+                return res.status(403).json({
+                    error: 'super_admin_required',
+                    message: 'Only super-admins can apply a server-wide licence.',
+                });
+            }
+            const activated = await license.activateLicense({
+                token,
+                organizationId: null,
+                userId: null,
+                scope: 'server',
+                activatedBy: userId,
+            });
+            // R2 from the plan: refuse community-tier server licences —
+            // they're indistinguishable from "no licence" and just confuse
+            // operators. Roll back the row we just inserted.
+            if (license.tiers.normalizeTier(activated.tier) === license.COMMUNITY_FALLBACK) {
+                await license.deactivateLicenseForScope({ scope: 'server', deactivatedBy: userId });
+                return res.status(400).json({
+                    error: 'community_server_license_pointless',
+                    message: 'A community-tier server licence has no effect (community is the default floor).',
+                });
+            }
+            const status = await license.getLicenseStatus({ organizationId: orgId, userId });
+            return res.json({ activated, status });
+        }
+
         const resolvedScope = scope === 'consumer' || !orgId ? 'consumer' : 'organization';
 
         if (resolvedScope === 'organization') {
@@ -195,10 +256,27 @@ router.get('/health', async (req, res) => {
 });
 
 // ── DELETE /deactivate ──────────────────────────────────────────────────
+// Query: ?scope=server removes the install-wide server licence. Same
+// super-admin + self-host gates as activate. Org/consumer scope follows
+// the legacy "infer from session" rule.
 router.delete('/deactivate', async (req, res) => {
     try {
         const orgId = getOrgId(req);
         const userId = getUserId(req);
+        if (req.query?.scope === 'server') {
+            if (!isServerScopeAllowed()) {
+                return res.status(403).json({ error: 'server_scope_cloud_blocked' });
+            }
+            if (!isSuperAdmin(req)) {
+                return res.status(403).json({ error: 'super_admin_required' });
+            }
+            const ok = await license.deactivateLicenseForScope({
+                scope: 'server',
+                deactivatedBy: userId,
+            });
+            if (!ok) return res.status(404).json({ error: 'No active server licence to deactivate' });
+            return res.json({ success: true, scope: 'server' });
+        }
         if (orgId && !(await isOrgAdmin(req))) {
             return res.status(403).json({ error: 'Admin required for organization license' });
         }

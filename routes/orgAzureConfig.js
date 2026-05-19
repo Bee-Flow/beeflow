@@ -11,7 +11,7 @@ const router = express.Router();
 const configStore = require('../stores/configStore');
 const userStore = require('../stores/userStore');
 const { resolveUserOrgIds } = require('../auth');
-const { loadConfig, saveConfig } = require('../auth/permissions');
+const { loadConfig, saveConfig, OrgRoles, SystemRoles, Permissions } = require('../auth/permissions');
 const { syncAzureGroupsToOrg, getSyncSettings, setSyncSettings, getSyncStatus } = require('../integrations/azureGroupSync');
 
 function requireAuth(req, res, next) {
@@ -25,7 +25,7 @@ function requireAuth(req, res, next) {
  */
 async function isOrgAdmin(req, orgId) {
     // Platform super admin
-    if (req.session?.isAdmin || req.session?.user?.role === 'admin') return true;
+    if (req.session?.isAdmin || req.session?.user?.role === SystemRoles.SUPER_ADMIN) return true;
 
     const userId = req.session?.user?.id;
     if (!userId) return false;
@@ -34,7 +34,7 @@ async function isOrgAdmin(req, orgId) {
     if (!user) return false;
 
     // Check orgRole directly
-    if (user.organizationId === orgId && user.orgRole === 'org_admin') return true;
+    if (user.organizationId === orgId && user.orgRole === OrgRoles.ORG_ADMIN) return true;
 
     let groupIds = [];
     if (Array.isArray(user.groups)) groupIds = user.groups;
@@ -46,8 +46,8 @@ async function isOrgAdmin(req, orgId) {
         if (group?.organizationId === orgId) {
             const perms = Array.isArray(group.permissions) ? group.permissions : [];
             const roles = Array.isArray(group.roles) ? group.roles : [];
-            if (perms.includes('all') || perms.includes('admin') ||
-                roles.includes('admin') || roles.includes('org_admin')) {
+            if (perms.includes(Permissions.ALL) || perms.includes(SystemRoles.SUPER_ADMIN) ||
+                roles.includes(SystemRoles.SUPER_ADMIN) || roles.includes(OrgRoles.ORG_ADMIN)) {
                 return true;
             }
         }
@@ -102,10 +102,6 @@ router.get('/:orgId', requireAuth, async (req, res) => {
         };
         if (!chatModelTiers.writer) chatModelTiers.writer = { modelId: '', label: 'Writer' };
 
-        // Content Safety — global keys
-        const contentSafetyEndpoint = await configStore.getConfig('azure_content_safety_endpoint') || '';
-        const contentSafetyKey = await configStore.getSecret('azure_content_safety_key');
-
         // Azure Document Processing
         const azureDocEndpoint = await configStore.getConfig('azure_doc_intelligence_endpoint') || '';
         const azureDocKey = await configStore.getSecret('azure_doc_intelligence_key');
@@ -130,14 +126,6 @@ router.get('/:orgId', requireAuth, async (req, res) => {
 
             // Chat Model Tiers
             chatModelTiers,
-
-            // Content Safety
-            contentSafetyEndpoint,
-            hasContentSafetyKey: !!contentSafetyKey,
-            contentSafetyKeyMasked: maskSecret(contentSafetyKey),
-            contentSafetySeverityThreshold: config.azureContentSafetySeverityThreshold ?? 2,
-            contentSafetyCategories: config.azureContentSafetyCategories || null,
-            moderationProvider: config.moderationProvider || 'azure',
 
             // PII Detection
             piiDetectionEnabled: config.piiDetectionEnabled === true || config.piiDetectionEnabled === 'true',
@@ -204,25 +192,6 @@ router.put('/:orgId', requireAuth, async (req, res) => {
                 };
                 await configStore.setConfig('chat_model_tiers', tiers);
             }
-        }
-
-        if (section === 'contentSafety') {
-            const { contentSafetyEndpoint, contentSafetyKey, contentSafetySeverityThreshold, contentSafetyCategories, moderationProvider } = req.body;
-            if (contentSafetyEndpoint !== undefined) await configStore.setConfig('azure_content_safety_endpoint', contentSafetyEndpoint || '');
-            if (contentSafetyKey !== undefined) await configStore.setSecret('azure_content_safety_key', contentSafetyKey || '');
-
-            // These are stored in the ai blob
-            const config = await getAIConfig();
-            if (contentSafetySeverityThreshold !== undefined) config.azureContentSafetySeverityThreshold = contentSafetySeverityThreshold;
-            if (contentSafetyCategories !== undefined) config.azureContentSafetyCategories = contentSafetyCategories;
-            if (moderationProvider !== undefined) config.moderationProvider = moderationProvider;
-            
-            // Auto-switch to azure provider if endpoint is set and moderationProvider wasn't explicitly passed
-            if (contentSafetyEndpoint && moderationProvider === undefined && config.moderationProvider !== 'azure') {
-                config.moderationProvider = 'azure';
-            }
-            
-            await configStore.setConfig('ai', config);
         }
 
         if (section === 'piiDetection') {

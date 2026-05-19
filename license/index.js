@@ -35,6 +35,62 @@ function getUserStore() {
     return _userStore;
 }
 
+// ── Server-wide licence override ────────────────────────────────────────
+//
+// A super-admin on a self-hosted install can activate ONE licence row
+// with scope='server' and no org/user binding. While such a row is
+// active, every per-org and per-user tier lookup short-circuits to that
+// row's tier — the whole install runs at one tier.
+//
+// `_serverTierCache` memoises the lookup with a short TTL so the override
+// adds at most one DB hit every N seconds, not one per request.
+//
+// `_serverLicenseVersion` is bumped on every activate/deactivate so the
+// per-request resolution cache key in license/middleware.js can be
+// invalidated install-wide without enumerating sessions. Middleware
+// reads it via getServerLicenseVersion() and weaves it into its cache
+// key — a bump immediately rotates every entry.
+const SERVER_TIER_CACHE_TTL_MS = parseInt(process.env.LICENSE_SERVER_TIER_CACHE_TTL_MS || '30000', 10);
+let _serverTierCache = { expiresAt: 0, tier: COMMUNITY_FALLBACK, license: null };
+let _serverLicenseVersion = 0;
+
+function getServerLicenseVersion() {
+    return _serverLicenseVersion;
+}
+
+function bumpServerLicenseVersion() {
+    _serverLicenseVersion += 1;
+    _serverTierCache = { expiresAt: 0, tier: COMMUNITY_FALLBACK, license: null };
+}
+
+/**
+ * Resolve the currently active server-wide licence. Returns
+ * `{ tier, license }` — tier is COMMUNITY_FALLBACK when no server row
+ * is active or the row is expired/revoked. The licence object is the
+ * raw row (with rawToken stripped on its way to public shapes).
+ */
+async function _getServerLicenseSnapshot() {
+    const now = Date.now();
+    if (_serverTierCache.expiresAt > now) return _serverTierCache;
+    let license = null;
+    try {
+        license = await store.getActiveLicenseForServer();
+    } catch (e) {
+        // Missing table during cold start is benign — fall through to
+        // community. Anything else surfaces to the caller via the next
+        // resolver call (which logs).
+        if (!(e && e.code === '42P01')) throw e;
+    }
+    const tier = resolveTierFromLicense(license);
+    _serverTierCache = { expiresAt: now + SERVER_TIER_CACHE_TTL_MS, tier, license };
+    return _serverTierCache;
+}
+
+async function getServerLicenseTier() {
+    const snap = await _getServerLicenseSnapshot();
+    return snap.tier;
+}
+
 /**
  * Resolve the effective tier for an organization. Returns 'community' when
  * no usable license is present.
@@ -46,6 +102,9 @@ function getUserStore() {
  *      flow without requiring a deployed JWT license-server.
  */
 async function getTierForOrg(organizationId) {
+    // Server-wide licence overrides per-org rows when active.
+    const serverTier = await getServerLicenseTier();
+    if (serverTier !== COMMUNITY_FALLBACK) return serverTier;
     if (!organizationId) return COMMUNITY_FALLBACK;
     const lic = await store.getActiveLicenseForOrg(organizationId);
     const licTier = resolveTierFromLicense(lic);
@@ -55,6 +114,9 @@ async function getTierForOrg(organizationId) {
 }
 
 async function getTierForUser(userId) {
+    // Server-wide licence overrides per-user rows when active.
+    const serverTier = await getServerLicenseTier();
+    if (serverTier !== COMMUNITY_FALLBACK) return serverTier;
     if (!userId) return COMMUNITY_FALLBACK;
     const lic = await store.getActiveLicenseForUser(userId);
     const licTier = resolveTierFromLicense(lic);
@@ -73,6 +135,9 @@ async function getTierForUser(userId) {
  * Includes subscription-derived tiers for SaaS orgs without a license_keys row.
  */
 async function getBestTierForOrgs(orgIds = []) {
+    // Server-wide licence wins outright when active; skip the org sweep.
+    const serverTier = await getServerLicenseTier();
+    if (serverTier !== COMMUNITY_FALLBACK) return serverTier;
     if (!Array.isArray(orgIds) || orgIds.length === 0) return COMMUNITY_FALLBACK;
     const licenses = await store.getActiveLicensesForOrgs(orgIds);
     let best = COMMUNITY_FALLBACK;
@@ -184,6 +249,22 @@ async function resolveTier(scope) {
  *   4. Community fallback.
  */
 async function getLicenseStatus({ organizationId = null, userId = null, orgIds = null } = {}) {
+    // Server-wide licence overrides everything else. Render a status that
+    // tells the per-org UI exactly that via `serverOverride: true`.
+    const serverSnap = await _getServerLicenseSnapshot();
+    if (serverSnap.tier !== COMMUNITY_FALLBACK && serverSnap.license) {
+        return {
+            tier: serverSnap.tier,
+            source: 'license_key',
+            scope: 'server',
+            license: publicLicenseShape(serverSnap.license),
+            subscription: null,
+            features: tiers.getFeaturesForTier(serverSnap.tier),
+            limits: tiers.getLimitsForTier(serverSnap.tier),
+            serverOverride: true,
+        };
+    }
+
     let lic = null;
     let scope = null;
 
@@ -309,7 +390,7 @@ function publicLicenseShape(lic) {
  * Activate a license: verify the token, then persist it. Returns the
  * activated license row (without raw_token). Throws on verification failure.
  */
-async function activateLicense({ token, organizationId = null, userId = null, activatedBy = null }) {
+async function activateLicense({ token, organizationId = null, userId = null, activatedBy = null, scope: explicitScope = null }) {
     // Admin-issued blob path — no JWT verify, trust comes from the activate
     // endpoint's existing admin/org-admin gate.
     if (typeof token === 'string' && token.startsWith(adminIssuance.BLOB_PREFIX)) {
@@ -342,7 +423,13 @@ async function activateLicense({ token, organizationId = null, userId = null, ac
         // honours it. Otherwise customers couldn't activate a Full-tier
         // license unless they set the env var locally too.
 
-        const blobScope = userId ? 'consumer' : 'organization';
+        // Explicit `scope: 'server'` from the caller takes precedence over
+        // the legacy "infer from userId" rule. Used by the super-admin
+        // server-wide activate path; everything else still falls through.
+        let blobScope;
+        if (explicitScope === 'server') blobScope = 'server';
+        else if (userId) blobScope = 'consumer';
+        else blobScope = 'organization';
         const orgIdResolved = blobScope === 'organization' ? (organizationId || decoded.organization_id || null) : null;
         const userIdResolved = blobScope === 'consumer' ? (userId || null) : null;
         if (blobScope === 'organization' && !orgIdResolved) {
@@ -369,6 +456,7 @@ async function activateLicense({ token, organizationId = null, userId = null, ac
             activatedBy,
             metadata: decoded.metadata || {},
         });
+        if (blobScope === 'server') bumpServerLicenseVersion();
         return publicLicenseShape(lic);
     }
 
@@ -381,7 +469,10 @@ async function activateLicense({ token, organizationId = null, userId = null, ac
     const p = result.payload;
 
     // Bind scope: prefer explicit args, fall back to claim 'sub'.
-    const scope = userId ? 'consumer' : 'organization';
+    let scope;
+    if (explicitScope === 'server') scope = 'server';
+    else if (userId) scope = 'consumer';
+    else scope = 'organization';
     const orgIdResolved = scope === 'organization' ? (organizationId || p.sub || null) : null;
     const userIdResolved = scope === 'consumer' ? (userId || p.sub || null) : null;
 
@@ -413,6 +504,7 @@ async function activateLicense({ token, organizationId = null, userId = null, ac
             refresh_required_after: p.refresh_required_after || null,
         },
     });
+    if (scope === 'server') bumpServerLicenseVersion();
     return publicLicenseShape(lic);
 }
 
@@ -436,13 +528,27 @@ async function getMaxSeatsForOrg(organizationId) {
 
 /**
  * Deactivate (mark expired) the currently active license for the given scope.
+ *
+ * Passing `scope: 'server'` (or `organizationId` and `userId` both falsy
+ * along with `scope: 'server'`) targets the server-wide override row.
+ * Org/user lookups are unchanged for backward compatibility.
  */
-async function deactivateLicenseForScope({ organizationId = null, userId = null, deactivatedBy = null } = {}) {
+async function deactivateLicenseForScope({ organizationId = null, userId = null, deactivatedBy = null, scope = null } = {}) {
     let lic = null;
-    if (organizationId) lic = await store.getActiveLicenseForOrg(organizationId);
-    else if (userId) lic = await store.getActiveLicenseForUser(userId);
+    if (scope === 'server') {
+        lic = await store.getActiveLicenseForServer();
+    } else if (organizationId) {
+        lic = await store.getActiveLicenseForOrg(organizationId);
+    } else if (userId) {
+        lic = await store.getActiveLicenseForUser(userId);
+    }
     if (!lic) return false;
-    return store.deactivateLicense(lic.id, deactivatedBy);
+    const ok = await store.deactivateLicense(lic.id, deactivatedBy);
+    // Bump the install-wide version so every cached per-request resolution
+    // re-resolves on the next call (server licence vanished — every org
+    // needs to fall back to its own row).
+    if (ok && lic.scope === 'server') bumpServerLicenseVersion();
+    return ok;
 }
 
 module.exports = {
@@ -455,9 +561,12 @@ module.exports = {
     hasTier,
     getLicenseStatus,
     getMaxSeatsForOrg,
+    getServerLicenseTier,
+    getServerLicenseVersion,
     // mutation
     activateLicense,
     deactivateLicenseForScope,
+    bumpServerLicenseVersion, // exposed for tests + manual cache busting
     // helpers (exposed for tests)
     resolveTierFromSubscription,
     // re-exports for convenience

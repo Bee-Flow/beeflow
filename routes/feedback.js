@@ -4,7 +4,7 @@
 
 const express = require('express');
 const feedbackStore = require('../stores/feedbackStore');
-const { resolveUserOrgIds } = require('../auth');
+const { resolveUserOrgIds, isOrgAdminRole } = require('../auth');
 const userStore = require('../stores/userStore');
 const { getAll } = require('../db');
 
@@ -27,7 +27,7 @@ async function requireOwnOrgAdmin(req, res, next) {
     }
 
     const user = await userStore.getUser(req.session.user.id);
-    if (!user || user.orgRole !== 'org_admin') {
+    if (!user || !isOrgAdminRole(user.orgRole)) {
         return res.status(403).json({ error: 'Organization admin access required' });
     }
     req.scopedOrgId = orgId;

@@ -53,7 +53,7 @@ async function scrubMemoryContext(text, orgShield = null) {
 
     try {
         const { detectPii, ALL_PII_CATEGORY_IDS, DEFAULT_PII_CONFIDENCE_THRESHOLD } =
-            require('../azurePiiDetection');
+            require('../piiDetection');
 
         // Respect the org's category selection and threshold; fall back to
         // platform defaults. Deliberately lower the threshold slightly so we

@@ -9,7 +9,7 @@ const express = require('express');
 const router = express.Router();
 const configStore = require('../stores/configStore');
 const userStore = require('../stores/userStore');
-const { resolveUserOrgIds } = require('../auth');
+const { resolveUserOrgIds, isOrgAdminRole } = require('../auth');
 
 function requireAuth(req, res, next) {
     if (req.session && req.session.user) return next();
@@ -32,7 +32,7 @@ async function isOrgAdmin(req, orgId) {
     if (!user) return false;
 
     // Check user's direct orgRole (set when user creates or is assigned to an org)
-    if (user.organizationId === orgId && user.orgRole === 'org_admin') return true;
+    if (user.organizationId === orgId && isOrgAdminRole(user.orgRole)) return true;
 
     let groupIds = [];
     if (Array.isArray(user.groups)) groupIds = user.groups;
@@ -68,12 +68,7 @@ router.get('/:orgId', requireAuth, async (req, res) => {
             collectionIds: [],
             scope: { userInput: true, agentOutput: true },
             action: 'delete',
-            moderationEnabled: false,
             euModeEnabled: false,
-            azurePiiEnabled: false,
-            localPiiEnabled: true,
-            azureSeverityThreshold: 2,
-            azureEnabledCategories: ['Hate', 'Violence', 'Sexual', 'SelfHarm'],
             piiDetectionCategories: [],
             piiDetectionConfidenceThreshold: 0.7,
             piiDetectionAction: 'block',
@@ -83,12 +78,6 @@ router.get('/:orgId', requireAuth, async (req, res) => {
 
         // Also pull current global AI config values so the UI stays in sync
         const aiBlob = await configStore.getConfig('ai') || {};
-        if (!config.azureSeverityThreshold && config.azureSeverityThreshold !== 0) {
-            config.azureSeverityThreshold = aiBlob.azureContentSafetySeverityThreshold ?? 2;
-        }
-        if (!config.azureEnabledCategories?.length) {
-            config.azureEnabledCategories = aiBlob.azureContentSafetyCategories || ['Hate', 'Violence', 'Sexual', 'SelfHarm'];
-        }
         if (!config.piiDetectionCategories?.length) {
             config.piiDetectionCategories = aiBlob.piiDetectionCategories || [];
         }
@@ -125,7 +114,7 @@ router.put('/:orgId', requireAuth, async (req, res) => {
             return res.status(403).json({ error: 'Only organization admins can manage the privacy shield' });
         }
 
-        const { enabled, collectionIds, scope, action, moderationEnabled, moderationProvider, moderationCategories, euModeEnabled, webSearchGuardEnabled, disableSearchOnUpload, azurePiiEnabled, localPiiEnabled, azureSeverityThreshold, azureEnabledCategories, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionAction, webSearchGuardPiiCategories, monitorIntegrations,
+        const { enabled, collectionIds, scope, action, euModeEnabled, webSearchGuardEnabled, disableSearchOnUpload, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionAction, webSearchGuardPiiCategories, monitorIntegrations,
             // DLP
             dlpEnabled, dlpScope, dlpMode, dlpFailureMode, dlpAllowlistedHosts, customSensitiveTerms,
             // Transparency
@@ -173,20 +162,9 @@ router.put('/:orgId', requireAuth, async (req, res) => {
                 agentOutput: scope ? !!scope.agentOutput : true,
             },
             action: action === 'redact' ? 'redact' : 'delete',
-            moderationEnabled: !!moderationEnabled,
-            // Exactly one moderation provider may run per turn. Default to the
-            // Azure Content Safety is the only supported provider.
-            moderationProvider: moderationProvider === 'azure' ? 'azure' : 'azure',
-            moderationCategories: Array.isArray(moderationCategories) ? moderationCategories : [],
             euModeEnabled: !!euModeEnabled,
             webSearchGuardEnabled: !!webSearchGuardEnabled,
             disableSearchOnUpload: !!disableSearchOnUpload,
-            azurePiiEnabled: !!azurePiiEnabled,
-            // In-process Transformers.js detector. Default true (opt-out) so
-            // a fresh server with no Azure creds still detects PII out of the box.
-            localPiiEnabled: localPiiEnabled !== false,
-            azureSeverityThreshold: typeof azureSeverityThreshold === 'number' ? azureSeverityThreshold : 2,
-            azureEnabledCategories: Array.isArray(azureEnabledCategories) ? azureEnabledCategories : ['Hate', 'Violence', 'Sexual', 'SelfHarm'],
             piiDetectionCategories: Array.isArray(piiDetectionCategories) ? piiDetectionCategories : [],
             piiDetectionConfidenceThreshold: typeof piiDetectionConfidenceThreshold === 'number' ? piiDetectionConfidenceThreshold : 0.7,
             piiDetectionAction: ['block', 'tokenize', 'warn'].includes(piiDetectionAction) ? piiDetectionAction : 'block',
@@ -246,13 +224,11 @@ router.get('/:orgId/effective', requireAuth, async (req, res) => {
         const resolved = await resolveOrgShield(orgId);
         const summary = resolved ? {
             shieldEnabled: resolved.enabled,
-            moderationEnabled: resolved.moderationEnabled,
-            moderationProvider: resolved.moderationProvider,
-            piiEnabled: resolved.azurePiiEnabled,
+            piiEnabled: resolved.enabled,
             piiCategoriesCount: (resolved.piiDetectionCategories || []).length,
             piiConfidenceThreshold: resolved.piiDetectionConfidenceThreshold,
             piiConfidenceWarning: resolved.piiDetectionConfidenceThreshold >= 0.85
-                ? 'Threshold is unusually high; Azure may return detections below this value. Lower to 0.70 if PII does not fire.'
+                ? 'Threshold is unusually high; the detector may return scores below this value. Lower to 0.70 if PII does not fire.'
                 : null,
             dlpEnabled: resolved.dlpEnabled,
             privacyScanEnabled: resolved.privacyScanEnabled,

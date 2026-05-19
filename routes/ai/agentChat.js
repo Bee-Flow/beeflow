@@ -14,11 +14,23 @@ const {
 } = require('../../core/aiAgent');
 const { getAvailableComponents } = require('../../core/agentRuntime');
 const componentManager = require('../../core/componentManager');
+const { requireAuth } = require('../../auth');
+const { checkSubscriptionLimits } = require('../../core/limits');
+const { resolveUserOrgIds } = require('../../auth');
+
+// Resolve the caller's primary org for quota checks, mirroring the helper
+// used in /agents/:id/chat/stream.
+async function _resolveLimitOrg(req) {
+    try {
+        const orgIds = await resolveUserOrgIds(req);
+        return orgIds && orgIds.size > 0 ? Array.from(orgIds)[0] : null;
+    } catch (_) { return null; }
+}
 
 const COMPONENTS_DIR = path.resolve(__dirname, '../../../components');
 
 // Chat with AI agent (standard JSON response)
-router.post('/chat', async (req, res) => {
+router.post('/chat', requireAuth, async (req, res) => {
     try {
         const sessionId = req.sessionID || 'default';
         const { message, tools, context } = req.body;
@@ -26,6 +38,11 @@ router.post('/chat', async (req, res) => {
         if (!message) {
             return res.status(400).json({ error: 'Message is required' });
         }
+
+        const userId = req.session.user.id;
+        const limitOrgId = await _resolveLimitOrg(req);
+        const limitError = await checkSubscriptionLimits(limitOrgId, 'chat', userId);
+        if (limitError) return res.status(402).json({ error: limitError });
 
         const agent = getOrCreateAgent(sessionId);
         const response = await agent.chat(message, tools, context);
@@ -38,13 +55,18 @@ router.post('/chat', async (req, res) => {
 });
 
 // Chat with AI agent — SSE streaming with real-time progress
-router.post('/chat-stream', async (req, res) => {
+router.post('/chat-stream', requireAuth, async (req, res) => {
     const sessionId = req.sessionID || 'default';
     const { message, tools, context } = req.body;
 
     if (!message) {
         return res.status(400).json({ error: 'Message is required' });
     }
+
+    const userId = req.session.user.id;
+    const limitOrgId = await _resolveLimitOrg(req);
+    const limitError = await checkSubscriptionLimits(limitOrgId, 'chat', userId);
+    if (limitError) return res.status(402).json({ error: limitError });
 
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',

@@ -179,7 +179,7 @@ router.get('/:id/conversations/:convId/workspace', async (req, res) => {
     // Render-time un-tokenisation — stored content keeps raw tokens so the
     // AI can re-read them via notebook_read; the user-facing API restores
     // them to real values. Mirror of directChat.js workspace GET.
-    const { restoreTokens } = require('../../core/azurePiiDetection');
+    const { restoreTokens } = require('../../core/piiDetection');
     const _convMap = await require('../../core/dlp/dlpRunner').getConversationTokenMapAsync(req.params.convId);
     res.json({
         content: restoreTokens(conversation.workspace_content || '', _convMap),

@@ -93,9 +93,22 @@ async function upsertLicense({
              WHERE user_id = $1 AND id != $2 AND refresh_status NOT IN ('expired', 'revoked')`,
             [userId, licenseId]
         );
+    } else if (scope === 'server' && !organizationId && !userId) {
+        // Server-scope rows are now BOTH exportable artefacts AND the active
+        // server-wide licence on this install (super-admin can apply one via
+        // POST /api/license/activate {scope:'server'}). Only one active row
+        // at a time — supersede older server-scope rows so the resolver's
+        // "highest issued" query always returns the latest activation.
+        // Skip the sweep when an admin-issued blob with scope='server' is
+        // re-bound to an org on import (still scope='server' historically
+        // in early adminIssuance paths; new code uses scope='organization').
+        await run(
+            `UPDATE license_keys SET refresh_status = 'expired', updated_at = NOW()
+             WHERE scope = 'server' AND organization_id IS NULL AND user_id IS NULL
+               AND id != $1 AND refresh_status NOT IN ('expired', 'revoked')`,
+            [licenseId]
+        );
     }
-    // No supersede sweep for scope='server' — server-scope rows are exportable
-    // artefacts, not the active license on this install.
 
     // Upsert by primary key. Newly activated licenses start as 'active' —
     // the RS256 signature is the proof of validity. The refresh scheduler
@@ -166,6 +179,29 @@ async function getActiveLicenseForUser(userId) {
            AND refresh_status NOT IN ('expired', 'revoked')
          ORDER BY issued_at DESC LIMIT 1`,
         [userId]
+    );
+    return rowToLicense(row);
+}
+
+/**
+ * Server-wide licence: a single unbound row (organization_id IS NULL AND
+ * user_id IS NULL) with scope='server'. When present and active, the
+ * resolver treats this as the authoritative tier for the whole install,
+ * overriding every per-org and per-user row. Returns null when no active
+ * server-scope row exists.
+ *
+ * Only ONE active server row should ever exist; upsertLicense supersedes
+ * older server rows via a sweep added alongside this getter.
+ */
+async function getActiveLicenseForServer() {
+    const row = await getOne(
+        `SELECT * FROM license_keys
+         WHERE scope = 'server'
+           AND organization_id IS NULL
+           AND user_id IS NULL
+           AND refresh_status NOT IN ('expired', 'revoked')
+         ORDER BY issued_at DESC LIMIT 1`,
+        []
     );
     return rowToLicense(row);
 }
@@ -351,6 +387,7 @@ module.exports = {
     getLicenseById,
     getActiveLicenseForOrg,
     getActiveLicenseForUser,
+    getActiveLicenseForServer,
     getActiveLicensesForOrgs,
     getLicensesNeedingRefresh,
     markRefreshSuccess,

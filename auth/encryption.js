@@ -38,7 +38,30 @@ const SALT_LENGTH = 32;
 const DEK_LENGTH = 32;
 const RECOVERY_KEY_LENGTH = 32;
 
-// Argon2id parameters (OWASP recommended, upgraded for 2026)
+// Argon2id parameters — OWASP "Password Storage Cheat Sheet" 2026 profile.
+//
+// We use the "high-memory / moderate-time" tradeoff:
+//   • memoryCost = 131_072 KiB = 128 MiB
+//   • timeCost   = 4 iterations
+//   • parallelism = 4 lanes
+//   • hashLength = 32 bytes (256-bit DEK)
+//
+// Why these numbers:
+//   • Argon2id resists both GPU/ASIC brute-force (high memory) and side-
+//     channel leakage (id variant). OWASP recommends m≥19 MiB; we go to
+//     128 MiB because (a) interactive auth happens at most O(login/day)
+//     so the ~250–400 ms cost per hash is acceptable, and (b) the higher
+//     memory floor multiplies attacker hardware cost ~6× over the 19 MiB
+//     baseline.
+//   • timeCost=4 + parallelism=4 is the lower of the two OWASP-suggested
+//     profiles for this memory level; raising timeCost trades latency we
+//     don't have for marginal extra brute-force resistance.
+//   • hashLength=32 produces a key suitable for AES-256-GCM (the rest of
+//     this module uses it as a KEK that wraps random per-user DEKs).
+//
+// Don't lower these without a written threat-model review. If you raise
+// them, update ARGON2_OPTIONS_LEGACY too so existing users can still
+// unlock with their stored params before being re-hashed on success.
 const ARGON2_OPTIONS = {
     type: argon2.argon2id,
     memoryCost: 131072,     // 128 MB

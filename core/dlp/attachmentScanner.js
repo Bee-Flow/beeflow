@@ -16,8 +16,8 @@
  */
 
 const crypto = require('crypto');
-const { detectPii, tokenizeText, ALL_PII_CATEGORY_IDS } = require('../azurePiiDetection');
-const { mergeTokenMap } = require('./dlpRunner');
+const { detectPii, tokenizeText, ALL_PII_CATEGORY_IDS } = require('../piiDetection');
+const { mergeTokenMap, getConversationTokenMap } = require('./dlpRunner');
 
 // Cap the number of pages we scan per attachment. Past this, we mark the
 // summary as `overflow=true` and let the text through unredacted (paired
@@ -49,8 +49,7 @@ function _policyTag(orgShield) {
     const cats = Array.isArray(orgShield?.piiDetectionCategories) ? orgShield.piiDetectionCategories.slice().sort().join(',') : '';
     const t = orgShield?.piiDetectionConfidenceThreshold ?? '';
     const a = orgShield?.piiDetectionAction || orgShield?.privacyAction || '';
-    const az = orgShield?.azurePiiEnabled ? 'az' : 'lc';
-    return `${az}|${a}|${t}|${cats}`;
+    return `${a}|${t}|${cats}`;
 }
 
 function _cacheKey(text, orgShield) {
@@ -102,9 +101,8 @@ function _resolveThreshold(orgShield) {
 
 function _piiEnabled(orgShield) {
     if (!orgShield) return false;
-    // Either backend counts as "PII detection on". localPiiEnabled defaults
-    // to true on resolved shields (see orgShield.js L73).
-    return !!(orgShield.azurePiiEnabled || orgShield.localPiiEnabled !== false);
+    // Shield's master flag is the only switch for PII scanning.
+    return !!orgShield.enabled;
 }
 
 /**
@@ -296,7 +294,12 @@ async function scanAttachmentText({ text, pages, filename, orgShield, conversati
     }
 
     // Tokenise. Use the flat text since findings carry flat offsets.
-    const { tokenizedText, tokenMap } = tokenizeText(text, findings);
+    // Seed with the conversation's accumulated map so attachment tokens
+    // continue the per-category counter and known values reuse existing tokens
+    // (avoids two different bank-account numbers both getting [bankaccount_1]
+    // when a second attachment is uploaded later in the same conversation).
+    const existing = conversationId ? getConversationTokenMap(conversationId) : null;
+    const { tokenizedText, tokenMap } = tokenizeText(text, findings, existing);
     if (conversationId) {
         mergeTokenMap(conversationId, tokenMap);
     }

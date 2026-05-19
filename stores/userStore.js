@@ -140,13 +140,55 @@ async function initDB() {
             old_values TEXT,
             new_values TEXT,
             created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+
+        -- Persistent audit trail for access-control changes (users, roles,
+        -- groups, invitations, orgs). Mirrors subscription_audit_log but
+        -- keeps the row count off the billing path. Querying by
+        -- (organization_id, created_at) covers the "show me who changed
+        -- access in org X over the last 90 days" GDPR Art. 30 / SOC 2 case.
+        CREATE TABLE IF NOT EXISTS access_audit_log (
+            id TEXT PRIMARY KEY,
+            action TEXT NOT NULL,
+            target_type TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            organization_id TEXT,
+            changed_by TEXT,
+            old_values TEXT,
+            new_values TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+
+        -- One-shot notification ledger. Anything that is "send this email
+        -- exactly once for this subscription/event" — trial-ending warnings,
+        -- payment-failed notices, dunning warnings, breach notifications —
+        -- registers a row keyed on (target_type, target_id, kind). The
+        -- UNIQUE constraint is the idempotency primitive; re-delivered
+        -- webhooks attempt the insert and bail on conflict.
+        CREATE TABLE IF NOT EXISTS notifications_sent (
+            id TEXT PRIMARY KEY,
+            target_type TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            recipient TEXT,
+            payload TEXT,
+            sent_at TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE (target_type, target_id, kind)
         )
     `);
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_access_audit_log_org_time ON access_audit_log (organization_id, created_at DESC)`); } catch (_) { /* exists */ }
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_access_audit_log_target ON access_audit_log (target_type, target_id, created_at DESC)`); } catch (_) { /* exists */ }
 
     // ── Column migrations (safe for existing DBs) ─────────────────────────────
     try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS "activeIconPackId" TEXT`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "autoApproveSSO" TEXT DEFAULT '0'`); } catch (e) { /* column already exists */ }
+    // Org lifecycle state. 'active' is the default; 'suspended' blocks all
+    // mutations (read-only) and is used for payment disputes / ToS holds;
+    // 'archived' hides the org from listings and locks reads to owners.
+    // Hard-delete remains a separate (irreversible) action.
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "status" TEXT DEFAULT 'active'`); } catch (e) { /* column already exists */ }
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_orgs_status ON organizations(status) WHERE status <> 'active'`); } catch (e) { /* index already exists */ }
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "enabledIntegrations" TEXT DEFAULT NULL`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "allowed_domains" TEXT DEFAULT NULL`); } catch (e) { /* column already exists */ }
     // Org-admin "active" subsets of the super-admin allow-lists. The super
@@ -272,6 +314,26 @@ async function initDB() {
     // after cancelling the first.
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS trial_used_at TIMESTAMPTZ`); } catch (e) { }
     try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_used_at TIMESTAMPTZ`); } catch (e) { }
+    // Trial history — email-scoped, all-time. The trial_used_at column on
+    // orgs/users is ephemeral (gone when the row is hard-deleted), so a
+    // delete-and-recreate with the same email defeats the one-shot gate.
+    // This table is the durable enforcement: a (scope, email) pair can
+    // appear at most once, ever.
+    await exec(`
+        CREATE TABLE IF NOT EXISTS trial_history (
+            id SERIAL PRIMARY KEY,
+            scope TEXT NOT NULL CHECK (scope IN ('organization','consumer')),
+            email_normalized TEXT NOT NULL,
+            subscriber_id TEXT,
+            plan_id TEXT,
+            stripe_customer_id TEXT,
+            stripe_subscription_id TEXT,
+            trial_started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            trial_end_date TIMESTAMPTZ
+        )
+    `);
+    await exec(`CREATE UNIQUE INDEX IF NOT EXISTS uniq_trial_history_scope_email ON trial_history(scope, email_normalized)`);
+    await exec(`CREATE INDEX IF NOT EXISTS idx_trial_history_customer ON trial_history(stripe_customer_id) WHERE stripe_customer_id IS NOT NULL`);
     // Plan-bound integrations + beta-feature allow-lists. Both act as a cap
     // (org cannot enable anything not in this list) AND a default-on bundle
     // applied when the plan is assigned. NULL = unrestricted (legacy plans).
@@ -308,6 +370,15 @@ async function initDB() {
     try { await exec(`UPDATE subscription_plans SET tier = 'enterprise' WHERE tier IS NULL AND LOWER(name) LIKE '%enterprise%'`); } catch (e) { }
     try { await exec(`UPDATE subscription_plans SET tier = 'pro'        WHERE tier IS NULL AND LOWER(name) LIKE '%pro%'`); } catch (e) { }
     try { await exec(`UPDATE subscription_plans SET tier = 'community'  WHERE tier IS NULL AND (LOWER(name) LIKE '%community%' OR name = '__consumer_default__')`); } catch (e) { }
+    // 'community' and 'full' are license-key tier concepts, not subscription
+    // tiers. Strip them from subscription_plans so the cloud catalogue stays
+    // clean; tier resolution still falls back to the community floor for
+    // free/null-tier subscriptions, so behaviour is preserved.
+    try {
+        const result = await run(`UPDATE subscription_plans SET tier = NULL WHERE tier IN ('community', 'full') AND name <> '__consumer_default__'`);
+        const n = result?.rowCount ?? 0;
+        if (n > 0) console.log(`[UserStore] migrated ${n} subscription plan(s) off license-only tiers (community/full → NULL)`);
+    } catch (e) { /* non-fatal */ }
     // Auto-migrate legacy __consumer_default__ plan
     try { await exec(`UPDATE subscription_plans SET plan_type = 'consumer' WHERE name = '__consumer_default__' AND (plan_type IS NULL OR plan_type = 'organization')`); } catch (e) { }
     // Consumer subscriptions table (per-user, org-less)
@@ -640,6 +711,12 @@ async function deleteUser(userId) {
     try { await run('DELETE FROM agent_conversations WHERE user_id = $1', [userId]); } catch (e) { /* table may not exist */ }
     try { await run('DELETE FROM direct_conversations WHERE user_id = $1', [userId]); } catch (e) { /* table may not exist */ }
     try { await run('DELETE FROM execution_history WHERE user_id = $1', [userId]); } catch (e) { /* table may not exist */ }
+    // OAuth refresh tokens for long-running routines. If we leave these
+    // behind, the encrypted secret is still in the DB after user delete,
+    // and a future user with the same id (rare but possible) could inherit
+    // it. App passwords live on the users row itself and are dropped by
+    // the DELETE FROM users above.
+    try { await run('DELETE FROM routine_credentials WHERE user_id = $1', [userId]); } catch (e) { /* table may not exist */ }
     // Projects: drop the user's owned projects (cascades shares + activity via FK)
     // and remove any shares that target this user directly.
     try { await run('DELETE FROM projects WHERE owner_id = $1', [userId]); } catch (e) { /* table may not exist */ }
@@ -769,6 +846,24 @@ async function createOrganization(orgData) {
         setImmediate(() => {
             require('../services/trialService').maybeAutoGrantOrgTrial(id);
         });
+        // Pre-generate the outbound webhook signing key so the very first
+        // outbound webhook for this org carries a valid signature. Lazy
+        // generation in webhookSigner.js remains as a safety net, but should
+        // not be the primary path. Failures here are logged and ignored —
+        // the lazy generator will fill in.
+        setImmediate(async () => {
+            try {
+                const configStore = require('./configStore');
+                const key = `org_webhook_signing_key_${id}`;
+                const existing = await configStore.getSecret(key).catch(() => null);
+                if (existing && typeof existing === 'string' && existing.length >= 32) return;
+                const crypto = require('crypto');
+                const fresh = crypto.randomBytes(32).toString('hex');
+                await configStore.setSecret(key, fresh, { auditCtx: { actor: 'system', org: id } }).catch(() => {});
+            } catch (e) {
+                console.warn('[UserStore] failed to pre-generate webhook signing key:', e.message);
+            }
+        });
         return true;
     } catch (e) { console.error(e); return false; }
 }
@@ -777,7 +872,7 @@ async function updateOrganization(orgId, updates) {
     await initDB();
     const ex = await getOne('SELECT id FROM organizations WHERE id = $1', [orgId]);
     if (!ex) return false;
-    const colMap = { name: 'name', description: 'description', tagline: 'tagline', address: 'address', email: 'email', phone: 'phone', website: 'website', kvk: 'kvk', vat: 'vat', logo: 'logo', footerText: 'footerText', authMethod: 'authMethod', connectorCallbackUrl: 'connector_callback_url', ncSyncMode: 'nc_sync_mode', ncNewUserDefaultStatus: 'nc_new_user_default_status', ncLastSyncAt: 'nc_last_sync_at', ncInstanceId: 'nc_instance_id', ncBaseUrl: 'nc_base_url', ncAdminUid: 'nc_admin_uid', ncProvisionedAt: 'nc_provisioned_at', ncOnboardingCompletedAt: 'nc_onboarding_completed_at', deploymentMode: 'deployment_mode', selectedPlanId: 'selected_plan_id' };
+    const colMap = { name: 'name', description: 'description', tagline: 'tagline', address: 'address', email: 'email', phone: 'phone', website: 'website', kvk: 'kvk', vat: 'vat', logo: 'logo', footerText: 'footerText', authMethod: 'authMethod', connectorCallbackUrl: 'connector_callback_url', ncSyncMode: 'nc_sync_mode', ncNewUserDefaultStatus: 'nc_new_user_default_status', ncLastSyncAt: 'nc_last_sync_at', ncInstanceId: 'nc_instance_id', ncBaseUrl: 'nc_base_url', ncAdminUid: 'nc_admin_uid', ncProvisionedAt: 'nc_provisioned_at', ncOnboardingCompletedAt: 'nc_onboarding_completed_at', deploymentMode: 'deployment_mode', selectedPlanId: 'selected_plan_id', status: 'status' };
     const updateMap = {};
     for (const [k, v] of Object.entries(colMap)) { if (updates[k] !== undefined) updateMap[k] = updates[k]; }
     if (updates.defaultGroups !== undefined) updateMap.defaultGroups = JSON.stringify(updates.defaultGroups);
@@ -848,7 +943,17 @@ async function deleteOrganization(orgId) {
 
     try { await run('DELETE FROM groups WHERE "organizationId" = $1', [orgId]); } catch (e) { }
     try { await run('DELETE FROM organization_subscriptions WHERE organization_id = $1', [orgId]); } catch (e) { }
-    try { const configStore = require('./configStore'); await configStore.deleteConfig(`org_privacy_shield_${orgId}`); } catch (e) { }
+    // Wipe every per-org row in the config store. Pre-M3 this was a curated
+    // list of known suffixes (privacy shield only); now that secrets are
+    // keyed under `org_<orgId>_*` consistently, delete everything matching.
+    try {
+        const { rowCount: cfgDeleted } = await run(`DELETE FROM config WHERE key LIKE $1`, [`org_${orgId}_%`]);
+        if (cfgDeleted > 0) console.log(`[UserStore] Deleted ${cfgDeleted} per-org config row(s) for '${orgId}'`);
+        const configStore = require('./configStore');
+        // Legacy suffix pattern (`org_privacy_shield_<id>`) — keep deleting
+        // by exact key for one release window so older deploys clean up.
+        await configStore.deleteConfig(`org_privacy_shield_${orgId}`);
+    } catch (e) { console.warn('[UserStore] config cleanup for org failed:', e.message); }
 
     try {
         const orgAgents = await getAll('SELECT id FROM agents WHERE organization_id = $1', [orgId]);
@@ -1244,8 +1349,12 @@ async function createPlan(data) {
     if (!data.name || typeof data.name !== 'string' || !data.name.trim()) {
         throw new Error('Plan name is required');
     }
-    if (data.tier !== undefined && data.tier !== null && data.tier !== '' && !['community', 'pro', 'enterprise', 'full'].includes(data.tier)) {
-        throw new Error(`Invalid tier: ${data.tier}`);
+    if (data.tier !== undefined && data.tier !== null && data.tier !== '' && !['pro', 'enterprise'].includes(data.tier)) {
+        // 'community' and 'full' are reserved for license-key activations on
+        // self-hosted installs. Cloud subscription plans use 'pro',
+        // 'enterprise', or NULL (Free); the resolver's community floor still
+        // covers NULL-tier subscribers transparently.
+        throw new Error(`Invalid tier '${data.tier}' for subscription plan. Allowed: 'pro', 'enterprise', or empty. ('community' and 'full' are license-key only.)`);
     }
     if (data.tier === '') data.tier = null;
     const id = data.id || crypto.randomUUID();
@@ -1314,8 +1423,8 @@ async function updatePlan(planId, data) {
         if (data.nc_recommended !== undefined) updateMap.nc_recommended = !!data.nc_recommended;
         if (data.tagline !== undefined) updateMap.tagline = data.tagline;
         if (data.tier !== undefined) {
-            if (data.tier !== null && data.tier !== '' && !['community', 'pro', 'enterprise', 'full'].includes(data.tier)) {
-                throw new Error(`Invalid tier: ${data.tier}`);
+            if (data.tier !== null && data.tier !== '' && !['pro', 'enterprise'].includes(data.tier)) {
+                throw new Error(`Invalid tier '${data.tier}' for subscription plan. Allowed: 'pro', 'enterprise', or empty. ('community' and 'full' are license-key only.)`);
             }
             updateMap.tier = data.tier === '' ? null : data.tier;
         }
@@ -1449,13 +1558,20 @@ function getBillingPeriod(sub) {
     if (sub?.billing_cycle_start) {
         const cycleStart = new Date(sub.billing_cycle_start);
         const cycleDay = cycleStart.getDate();
-        // Find current period start
-        let periodStart = new Date(now.getFullYear(), now.getMonth(), cycleDay);
+        // Clamp the cycle day to the target month's last day. `new Date(y, m, d)`
+        // silently rolls forward when d > month length (e.g. Feb 31 → Mar 3),
+        // which would attribute Feb usage to March for any subscription billing
+        // on the 29th/30th/31st.
+        const clampedDate = (y, m, d) => {
+            const last = new Date(y, m + 1, 0).getDate();
+            return new Date(y, m, Math.min(d, last));
+        };
+        let periodStart = clampedDate(now.getFullYear(), now.getMonth(), cycleDay);
         if (periodStart > now) {
-            // We haven't reached the cycle day this month, so period started last month
-            periodStart = new Date(now.getFullYear(), now.getMonth() - 1, cycleDay);
+            // Haven't reached the cycle day this month — period started last month.
+            periodStart = clampedDate(now.getFullYear(), now.getMonth() - 1, cycleDay);
         }
-        const periodEnd = new Date(periodStart.getFullYear(), periodStart.getMonth() + 1, cycleDay);
+        const periodEnd = clampedDate(periodStart.getFullYear(), periodStart.getMonth() + 1, cycleDay);
         return { startDate: periodStart.toISOString(), endDate: periodEnd.toISOString() };
     }
     // Fallback: calendar month
@@ -1594,6 +1710,58 @@ async function hasOrgUsedTrial(orgId) {
     return !!(r && r.trial_used_at);
 }
 
+// Email-scoped trial history check. Durable across delete + recreate of the
+// same orgs/users so the trial gate survives row deletion. Caller normalises
+// case + trims; we mirror the same normalisation in INSERT and SELECT.
+async function hasEmailUsedTrial(scope, email) {
+    await initDB();
+    if (!email) return false;
+    const norm = String(email).trim().toLowerCase();
+    if (!norm) return false;
+    const row = await getOne(
+        `SELECT 1 FROM trial_history WHERE scope = $1 AND email_normalized = $2 LIMIT 1`,
+        [scope, norm]
+    );
+    return !!row;
+}
+
+async function recordTrialHistory({ scope, email, subscriberId, planId, stripeCustomerId, stripeSubscriptionId, trialEndDate } = {}) {
+    await initDB();
+    if (!email || !scope) return;
+    const norm = String(email).trim().toLowerCase();
+    if (!norm) return;
+    await run(
+        `INSERT INTO trial_history (scope, email_normalized, subscriber_id, plan_id, stripe_customer_id, stripe_subscription_id, trial_end_date)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (scope, email_normalized) DO NOTHING`,
+        [scope, norm, subscriberId || null, planId || null, stripeCustomerId || null, stripeSubscriptionId || null, trialEndDate || null]
+    );
+}
+
+// Idempotent one-shot backfill: for every existing org/user with a non-null
+// `trial_used_at` that doesn't yet have a trial_history row, insert one.
+// Run after initDB(); safe to call on every boot — the unique index makes
+// it a no-op once populated.
+async function backfillTrialHistory() {
+    await initDB();
+    try {
+        await run(`
+            INSERT INTO trial_history (scope, email_normalized, subscriber_id, trial_started_at)
+            SELECT 'organization', LOWER(TRIM(email)), id, trial_used_at
+              FROM organizations
+             WHERE trial_used_at IS NOT NULL AND email IS NOT NULL AND TRIM(email) <> ''
+            ON CONFLICT (scope, email_normalized) DO NOTHING`);
+        await run(`
+            INSERT INTO trial_history (scope, email_normalized, subscriber_id, trial_started_at)
+            SELECT 'consumer', LOWER(TRIM(email)), id, trial_used_at
+              FROM users
+             WHERE trial_used_at IS NOT NULL AND email IS NOT NULL AND TRIM(email) <> ''
+            ON CONFLICT (scope, email_normalized) DO NOTHING`);
+    } catch (e) {
+        console.warn('[UserStore] backfillTrialHistory failed:', e.message);
+    }
+}
+
 async function hasUserUsedTrial(userId) {
     await initDB();
     const r = await getOne('SELECT trial_used_at FROM users WHERE id = $1', [userId]);
@@ -1612,6 +1780,70 @@ async function logSubscriptionAudit(action, targetType, targetId, changedBy, old
     } catch (e) { console.error('[UserStore] Audit log error:', e.message); }
 }
 
+// Try to claim a one-shot notification slot. Returns true if this caller
+// is the one that gets to send (row inserted); false if the (target,
+// kind) tuple has already been claimed. The ON CONFLICT DO NOTHING +
+// rowCount check is the atomic primitive — no race between webhook
+// retries.
+async function claimNotification(targetType, targetId, kind, recipient = null, payload = null) {
+    try {
+        await initDB();
+        const id = crypto.randomUUID();
+        const result = await run(
+            `INSERT INTO notifications_sent (id, target_type, target_id, kind, recipient, payload)
+             VALUES ($1,$2,$3,$4,$5,$6)
+             ON CONFLICT (target_type, target_id, kind) DO NOTHING`,
+            [id, targetType, targetId, kind, recipient, payload ? JSON.stringify(payload) : null]
+        );
+        return (result?.rowCount ?? 0) > 0;
+    } catch (e) {
+        console.error('[UserStore] claimNotification error:', e.message);
+        return false;
+    }
+}
+
+// Access-control audit logger. Best-effort: writes a row to the access
+// audit table and never throws on failure (logging must not break the
+// caller's mutation). Pass the organization_id when known so org-scoped
+// queries can find the row; pass null for global super-admin events.
+async function logAccessAudit(action, targetType, targetId, changedBy, oldValues, newValues, organizationId = null) {
+    try {
+        await initDB();
+        const id = crypto.randomUUID();
+        await run(
+            `INSERT INTO access_audit_log (id, action, target_type, target_id, organization_id, changed_by, old_values, new_values)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+            [
+                id,
+                action,
+                targetType,
+                targetId,
+                organizationId,
+                changedBy || 'system',
+                oldValues ? JSON.stringify(oldValues) : null,
+                newValues ? JSON.stringify(newValues) : null,
+            ]
+        );
+    } catch (e) { console.error('[UserStore] Access audit log error:', e.message); }
+}
+
+async function getAccessAuditLog(opts = {}) {
+    await initDB();
+    const { targetType, targetId, organizationId, limit = 50, offset = 0 } = opts;
+    let sql = 'SELECT * FROM access_audit_log';
+    const params = [];
+    const conditions = [];
+    let idx = 1;
+    if (targetType) { conditions.push(`target_type = $${idx++}`); params.push(targetType); }
+    if (targetId) { conditions.push(`target_id = $${idx++}`); params.push(targetId); }
+    if (organizationId) { conditions.push(`organization_id = $${idx++}`); params.push(organizationId); }
+    if (conditions.length > 0) sql += ' WHERE ' + conditions.join(' AND ');
+    sql += ` ORDER BY created_at DESC LIMIT $${idx++} OFFSET $${idx++}`;
+    params.push(limit, offset);
+    const rows = await getAll(sql, params);
+    return rows.map(r => ({ ...r, old_values: parseJSON(r.old_values, null), new_values: parseJSON(r.new_values, null) }));
+}
+
 async function getAuditLog(opts = {}) {
     await initDB();
     const { targetType, targetId, limit = 50, offset = 0 } = opts;
@@ -1625,6 +1857,29 @@ async function getAuditLog(opts = {}) {
     sql += ` ORDER BY created_at DESC LIMIT $${idx++} OFFSET $${idx++}`;
     params.push(limit, offset);
     const rows = await getAll(sql, params);
+    return rows.map(r => ({ ...r, old_values: parseJSON(r.old_values, null), new_values: parseJSON(r.new_values, null) }));
+}
+
+// `license_issuance_failed` rows for which the same (target_type, target_id)
+// pair has NO later `license_issuance_succeeded` row. Drives the admin
+// sidebar badge and the audit-view Retry button. Bounded by `limit` for the
+// list view; counters get the row count back from the same query.
+async function getUnresolvedLicenseIssuanceFailures(limit = 50) {
+    await initDB();
+    const rows = await getAll(
+        `SELECT f.* FROM subscription_audit_log f
+          WHERE f.action = 'license_issuance_failed'
+            AND NOT EXISTS (
+              SELECT 1 FROM subscription_audit_log s
+               WHERE s.action = 'license_issuance_succeeded'
+                 AND s.target_type = f.target_type
+                 AND s.target_id = f.target_id
+                 AND s.created_at > f.created_at
+            )
+          ORDER BY f.created_at DESC
+          LIMIT $1`,
+        [Math.max(1, Number(limit) || 50)]
+    );
     return rows.map(r => ({ ...r, old_values: parseJSON(r.old_values, null), new_values: parseJSON(r.new_values, null) }));
 }
 
@@ -1702,6 +1957,7 @@ async function recordPaymentFailureForOrg(orgId) {
           WHERE organization_id = $1`,
         [orgId, new Date().toISOString()]
     );
+    try { require('./usageStore').invalidatePaygCache(orgId, null); } catch (_) { /* circular-load safe */ }
     const row = await getOne(
         'SELECT payment_attempt_count, past_due_since FROM organization_subscriptions WHERE organization_id = $1',
         [orgId]
@@ -1720,6 +1976,7 @@ async function recordPaymentFailureForConsumer(userId) {
           WHERE user_id = $1`,
         [userId, new Date().toISOString()]
     );
+    try { require('./usageStore').invalidatePaygCache(null, userId); } catch (_) { /* circular-load safe */ }
     const row = await getOne(
         'SELECT payment_attempt_count, past_due_since FROM consumer_subscriptions WHERE user_id = $1',
         [userId]
@@ -1737,6 +1994,7 @@ async function resetPaymentFailureForOrg(orgId) {
           WHERE organization_id = $1`,
         [orgId, new Date().toISOString()]
     );
+    try { require('./usageStore').invalidatePaygCache(orgId, null); } catch (_) { /* circular-load safe */ }
 }
 
 async function resetPaymentFailureForConsumer(userId) {
@@ -1749,6 +2007,7 @@ async function resetPaymentFailureForConsumer(userId) {
           WHERE user_id = $1`,
         [userId, new Date().toISOString()]
     );
+    try { require('./usageStore').invalidatePaygCache(null, userId); } catch (_) { /* circular-load safe */ }
 }
 
 // Run a sweep that suspends any org/consumer sub whose past_due_since is
@@ -1775,6 +2034,7 @@ async function suspendPastDueSubscriptions(graceDays = 7) {
                   WHERE organization_id = $1`,
                 [row.organization_id, new Date().toISOString()]
             );
+            try { require('./usageStore').invalidatePaygCache(row.organization_id, null); } catch (_) { /* circular-load safe */ }
             await logSubscriptionAudit(
                 'dunning_suspend', 'organization', row.organization_id, 'system', null,
                 { reason: 'past_due_grace_exceeded', attempt_count: row.payment_attempt_count, past_due_since: row.past_due_since, grace_days: graceDays }
@@ -1800,6 +2060,7 @@ async function suspendPastDueSubscriptions(graceDays = 7) {
                   WHERE user_id = $1`,
                 [row.user_id, new Date().toISOString()]
             );
+            try { require('./usageStore').invalidatePaygCache(null, row.user_id); } catch (_) { /* circular-load safe */ }
             await logSubscriptionAudit(
                 'dunning_suspend', 'consumer', row.user_id, 'system', null,
                 { reason: 'past_due_grace_exceeded', attempt_count: row.payment_attempt_count, past_due_since: row.past_due_since, grace_days: graceDays }
@@ -1836,6 +2097,7 @@ async function expireOverdueTrials() {
                   WHERE organization_id = $1`,
                 [row.organization_id, nowIso]
             );
+            try { require('./usageStore').invalidatePaygCache(row.organization_id, null); } catch (_) { /* circular-load safe */ }
             await logSubscriptionAudit(
                 'trial_expired', 'organization', row.organization_id, 'system', null,
                 { trial_end_date: row.trial_end_date, transitioned_to: 'suspended' }
@@ -1862,6 +2124,7 @@ async function expireOverdueTrials() {
                   WHERE user_id = $1`,
                 [row.user_id, nowIso]
             );
+            try { require('./usageStore').invalidatePaygCache(null, row.user_id); } catch (_) { /* circular-load safe */ }
             await logSubscriptionAudit(
                 'trial_expired', 'consumer', row.user_id, 'system', null,
                 { trial_end_date: row.trial_end_date, transitioned_to: 'suspended' }
@@ -1874,6 +2137,54 @@ async function expireOverdueTrials() {
     return { orgs: orgsExpiring.length, consumers: consumersExpiring.length };
 }
 
+// Stripe transitions a subscription from `incomplete` → `incomplete_expired`
+// after ~14 days when no payment method is added. If that webhook is missed
+// (Stripe outage, misconfig), the local row stays `incomplete` forever and
+// admins see a stuck subscription. Sweep + flip to `cancelled` matches
+// Stripe's own expiry semantics. Idempotent and safe to call from a tick.
+async function cancelStaleIncompleteSubscriptions(thresholdDays = 14) {
+    await initDB();
+    const cutoffIso = new Date(Date.now() - Math.max(0, Number(thresholdDays)) * 86400 * 1000).toISOString();
+
+    const orgs = await getAll(
+        `SELECT organization_id FROM organization_subscriptions
+          WHERE status = 'incomplete' AND created_at < $1`,
+        [cutoffIso]
+    );
+    for (const r of orgs) {
+        try {
+            // setOrgSubscription validates status, audits via the column-update
+            // path, and busts the PAYG cache; reuse it for consistency.
+            await setOrgSubscription(r.organization_id, { status: 'cancelled', payment_status: 'failed' });
+            await logSubscriptionAudit(
+                'cancel_stale_incomplete', 'organization', r.organization_id, 'system', null,
+                { threshold_days: thresholdDays }
+            );
+        } catch (e) {
+            console.error('[UserStore] cancelStaleIncompleteSubscriptions org error:', r.organization_id, e.message);
+        }
+    }
+
+    const consumers = await getAll(
+        `SELECT user_id FROM consumer_subscriptions
+          WHERE status = 'incomplete' AND created_at < $1`,
+        [cutoffIso]
+    );
+    for (const r of consumers) {
+        try {
+            await setConsumerSubscription(r.user_id, { status: 'cancelled', payment_status: 'failed' });
+            await logSubscriptionAudit(
+                'cancel_stale_incomplete', 'consumer', r.user_id, 'system', null,
+                { threshold_days: thresholdDays }
+            );
+        } catch (e) {
+            console.error('[UserStore] cancelStaleIncompleteSubscriptions consumer error:', r.user_id, e.message);
+        }
+    }
+
+    return { orgs: orgs.length, consumers: consumers.length };
+}
+
 // Returns true if the subscription has a manual_override_until in the
 // future. The Stripe webhook checks this before writing status/plan_id so
 // admin-set state isn't immediately clobbered by a Stripe update.
@@ -1881,6 +2192,142 @@ function isManualOverrideActive(sub) {
     if (!sub || !sub.manual_override_until) return false;
     const t = new Date(sub.manual_override_until).getTime();
     return Number.isFinite(t) && t > Date.now();
+}
+
+// Override-aware atomic update. The naive pattern
+//   const sub = await getOrgSubscription(orgId);
+//   const safe = isManualOverrideActive(sub) ? stripOverridden(data) : data;
+//   await setOrgSubscription(orgId, safe);
+// is a TOCTOU — two concurrent webhooks both see override=false, both write.
+// This wrapper resolves the override decision while the row is row-locked
+// (FOR UPDATE), so concurrent webhooks serialise and the override state
+// they see matches the state at the moment of their write.
+//
+// `fullUpdate`     — the update payload to apply when no override is active.
+// `strippedUpdate` — the update payload to apply when override is active
+//                    (typically the full payload with status / plan_id /
+//                    payment_status removed; the caller knows which fields
+//                    are admin-controlled).
+//
+// Returns { applied: 'full'|'stripped'|'none', overrideActive: bool }.
+/**
+ * Atomically apply an admin-initiated subscription update. Wraps the
+ * read-modify-write in a SELECT … FOR UPDATE so two admins racing on the
+ * same org serialise rather than last-write-wins. Returns the pre-image
+ * snapshot for the caller's audit row, plus a `displaced` flag set when
+ * this write overwrote a still-active override set by a different admin
+ * within the last 60 seconds (the loser of the race).
+ *
+ * @param {string} orgId
+ * @param {object} payload  fields to write through to setOrgSubscription
+ */
+async function setOrgSubscriptionWithLock(orgId, payload) {
+    await initDB();
+    const client = await getClient();
+    let snapshot = null;
+    let displaced = false;
+    try {
+        await client.query('BEGIN');
+        const lockResult = await client.query(
+            'SELECT * FROM organization_subscriptions WHERE organization_id = $1 FOR UPDATE',
+            [orgId]
+        );
+        if (lockResult.rowCount > 0) {
+            snapshot = lockResult.rows[0];
+            // Race detection: if a different admin set an override within the
+            // last 60 seconds and this write changes manual_override_*, the
+            // existing override is being clobbered. Surface that to the
+            // caller so both attempts can be audited.
+            const prevOverrideBy = snapshot.manual_override_by;
+            const prevOverrideUntil = snapshot.manual_override_until;
+            const newOverrideBy = payload.manual_override_by;
+            const isNewOverrideRequest = Object.prototype.hasOwnProperty.call(payload, 'manual_override_until');
+            if (
+                isNewOverrideRequest &&
+                prevOverrideBy &&
+                prevOverrideUntil &&
+                new Date(prevOverrideUntil).getTime() > Date.now() &&
+                prevOverrideBy !== newOverrideBy
+            ) {
+                displaced = true;
+            }
+        }
+        await client.query('COMMIT');
+    } catch (e) {
+        try { await client.query('ROLLBACK'); } catch (_) { /* ignore */ }
+        throw e;
+    } finally {
+        client.release();
+    }
+    const ok = await setOrgSubscription(orgId, payload);
+    return { ok, snapshot, displaced };
+}
+
+async function setOrgSubscriptionRespectingOverride(orgId, fullUpdate, strippedUpdate) {
+    await initDB();
+    const client = await getClient();
+    let overrideActive = false;
+    try {
+        await client.query('BEGIN');
+        const lockResult = await client.query(
+            'SELECT manual_override_until FROM organization_subscriptions WHERE organization_id = $1 FOR UPDATE',
+            [orgId]
+        );
+        if (lockResult.rowCount === 0) {
+            // No existing row — setOrgSubscription will INSERT. We can't
+            // lock a row that doesn't exist; concurrent inserts will collide
+            // on the org id and the second one will fall through to the
+            // update branch on its retry. Safe to release the txn here.
+            await client.query('COMMIT');
+        } else {
+            const until = lockResult.rows[0].manual_override_until;
+            overrideActive = !!until && new Date(until).getTime() > Date.now();
+            await client.query('COMMIT');
+        }
+    } catch (e) {
+        try { await client.query('ROLLBACK'); } catch (_) { /* ignore */ }
+        throw e;
+    } finally {
+        client.release();
+    }
+    const payload = overrideActive ? strippedUpdate : fullUpdate;
+    // Empty payload (stripped removed everything) → don't write.
+    if (!payload || Object.keys(payload).length === 0) {
+        return { applied: 'none', overrideActive };
+    }
+    await setOrgSubscription(orgId, payload);
+    return { applied: overrideActive ? 'stripped' : 'full', overrideActive };
+}
+
+async function setConsumerSubscriptionRespectingOverride(userId, fullUpdate, strippedUpdate) {
+    await initDB();
+    const client = await getClient();
+    let overrideActive = false;
+    try {
+        await client.query('BEGIN');
+        const lockResult = await client.query(
+            'SELECT manual_override_until FROM consumer_subscriptions WHERE user_id = $1 FOR UPDATE',
+            [userId]
+        );
+        if (lockResult.rowCount === 0) {
+            await client.query('COMMIT');
+        } else {
+            const until = lockResult.rows[0].manual_override_until;
+            overrideActive = !!until && new Date(until).getTime() > Date.now();
+            await client.query('COMMIT');
+        }
+    } catch (e) {
+        try { await client.query('ROLLBACK'); } catch (_) { /* ignore */ }
+        throw e;
+    } finally {
+        client.release();
+    }
+    const payload = overrideActive ? strippedUpdate : fullUpdate;
+    if (!payload || Object.keys(payload).length === 0) {
+        return { applied: 'none', overrideActive };
+    }
+    await setConsumerSubscription(userId, payload);
+    return { applied: overrideActive ? 'stripped' : 'full', overrideActive };
 }
 
 // Locate a subscription row by stripe_customer_id so customer.deleted can
@@ -2058,13 +2505,17 @@ module.exports = {
     getAllPlans, getPlan, createPlan, updatePlan, deletePlan,
     getAllOrgSubscriptions, getOrgSubscription, setOrgSubscription, deleteOrgSubscription, getEffectiveLimits, getActiveSeatCount,
     getConsumerSubscription, setConsumerSubscription, deleteConsumerSubscription, getAllConsumerSubscriptions,
-    getBillingPeriod, logSubscriptionAudit, getAuditLog,
+    getBillingPeriod, logSubscriptionAudit, getAuditLog, getUnresolvedLicenseIssuanceFailures,
+    logAccessAudit, getAccessAuditLog, claimNotification,
     markTrialUsed, hasOrgUsedTrial, hasUserUsedTrial,
+    hasEmailUsedTrial, recordTrialHistory, backfillTrialHistory,
     recordStripeEventProcessed,
     recordPaymentFailureForOrg, recordPaymentFailureForConsumer,
     resetPaymentFailureForOrg, resetPaymentFailureForConsumer,
-    suspendPastDueSubscriptions, expireOverdueTrials,
+    suspendPastDueSubscriptions, expireOverdueTrials, cancelStaleIncompleteSubscriptions,
     findSubscriptionByStripeCustomerId, clearStripeCustomerIdForOrg, clearStripeCustomerIdForConsumer,
     isManualOverrideActive,
+    setOrgSubscriptionRespectingOverride, setConsumerSubscriptionRespectingOverride,
+    setOrgSubscriptionWithLock,
     claimNotificationSlot, getDunningCounts,
 };

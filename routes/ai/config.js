@@ -62,12 +62,6 @@ router.get('/config', async (req, res) => {
         hasGoogleMapsKey: !!(await configStore.getSecret('google_maps_api_key')),
         hasLinkedInConfig: !!(await configStore.getSecret('linkedin_client_id')) && !!(await configStore.getSecret('linkedin_client_secret')),
         regexGuardrails: config.regexGuardrails || null,
-        llamaGuardConfig: config.llamaGuardConfig || null,
-        moderationProvider: config.moderationProvider || 'azure',
-        hasAzureContentSafetyEndpoint: !!(await configStore.getConfig('azure_content_safety_endpoint')),
-        hasAzureContentSafetyKey: !!(await configStore.getSecret('azure_content_safety_key')),
-        azureContentSafetySeverityThreshold: config.azureContentSafetySeverityThreshold ?? 2,
-        azureContentSafetyCategories: config.azureContentSafetyCategories || null,
         piiDetectionEnabled: config.piiDetectionEnabled || false,
         piiDetectionCategories: config.piiDetectionCategories || null,
         piiDetectionConfidenceThreshold: config.piiDetectionConfidenceThreshold ?? 0.7,
@@ -147,7 +141,7 @@ router.post('/config', requireAuth, async (req, res) => {
     if (!(await isAdminUser(req))) {
         return res.status(403).json({ error: 'Admin access required' });
     }
-    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, llamaGuardConfig, moderationProvider, azureContentSafetyEndpoint, azureContentSafetyKey, azureContentSafetySeverityThreshold, azureContentSafetyCategories, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionScope, piiDetectionAction, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing, serviceEmailAddress, serviceEmailPassword, serviceEmailDisplayName, azureSpeechKey, azureSpeechRegion, transcriptionProvider, notebooksEnabled, projectsEnabled, askAiEnabled, exportEnabled, openInNotebookEnabled, notebooksMenuEnabled, azureRerankerEndpoint, azureRerankerKey, azureRerankerModel, stripeSecretKey, stripeWebhookSecret, stripePublishableKey, stripeEnabled, stripeTaxEnabled, stripeTaxCountry } = req.body;
+    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionScope, piiDetectionAction, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing, serviceEmailAddress, serviceEmailPassword, serviceEmailDisplayName, azureSpeechKey, azureSpeechRegion, transcriptionProvider, notebooksEnabled, projectsEnabled, askAiEnabled, exportEnabled, openInNotebookEnabled, notebooksMenuEnabled, azureRerankerEndpoint, azureRerankerKey, azureRerankerModel, stripeSecretKey, stripeWebhookSecret, stripePublishableKey, stripeEnabled, stripeTaxEnabled, stripeTaxCountry } = req.body;
     const existing = await getAIConfig();
 
     if (allowedModelsByAgentType !== undefined) {
@@ -158,12 +152,6 @@ router.post('/config', requireAuth, async (req, res) => {
     }
     if (azureModels !== undefined) {
         await configStore.setConfig('azure_models', azureModels || '');
-    }
-    if (azureContentSafetyEndpoint !== undefined) {
-        await configStore.setConfig('azure_content_safety_endpoint', azureContentSafetyEndpoint || '');
-    }
-    if (azureContentSafetyKey !== undefined) {
-        await configStore.setSecret('azure_content_safety_key', azureContentSafetyKey || '');
     }
     if (agentSearchUrl !== undefined) {
         await configStore.setConfig('agent_search_url', agentSearchUrl || '');
@@ -347,10 +335,6 @@ router.post('/config', requireAuth, async (req, res) => {
         azureApiVersion: azureApiVersion !== undefined ? azureApiVersion : undefined,
         lakeraApiKey: lakeraApiKey !== undefined ? lakeraApiKey : undefined,
         regexGuardrails: regexGuardrails !== undefined ? regexGuardrails : existing.regexGuardrails,
-        llamaGuardConfig: llamaGuardConfig !== undefined ? llamaGuardConfig : existing.llamaGuardConfig,
-        moderationProvider: moderationProvider !== undefined ? moderationProvider : existing.moderationProvider,
-        azureContentSafetySeverityThreshold: azureContentSafetySeverityThreshold !== undefined ? azureContentSafetySeverityThreshold : existing.azureContentSafetySeverityThreshold,
-        azureContentSafetyCategories: azureContentSafetyCategories !== undefined ? azureContentSafetyCategories : existing.azureContentSafetyCategories,
         piiDetectionEnabled: piiDetectionEnabled !== undefined ? piiDetectionEnabled : existing.piiDetectionEnabled,
         piiDetectionCategories: piiDetectionCategories !== undefined ? piiDetectionCategories : existing.piiDetectionCategories,
         piiDetectionConfidenceThreshold: piiDetectionConfidenceThreshold !== undefined ? piiDetectionConfidenceThreshold : existing.piiDetectionConfidenceThreshold,

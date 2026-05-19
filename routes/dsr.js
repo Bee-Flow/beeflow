@@ -57,7 +57,10 @@ router.post('/requests', publicSubmitLimiter, async (req, res) => {
         // chill legitimate users out of the DSR channel.
         const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.subject_email);
         if (!emailOk) return res.status(400).json({ error: 'subject_email is not a valid email address' });
-        const orgId = body.organization_id || await _resolveOrgIdFromSubject(body.subject_email);
+        // Always derive org from the subject's email — never trust a client-supplied
+        // organization_id on this public endpoint, or attackers can file fraudulent
+        // DSRs against any org.
+        const orgId = await _resolveOrgIdFromSubject(body.subject_email);
         const sourceIp = req.headers['x-forwarded-for']?.toString().split(',')[0]?.trim()
             || req.socket?.remoteAddress
             || null;

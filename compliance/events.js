@@ -52,7 +52,9 @@ async function _notifyAdmins(orgId, category, title, message) {
     try {
         const { getAll } = require('../db');
         const rows = await getAll(
-            `SELECT id FROM users WHERE "organizationId" = $1 AND (role = 'admin' OR "orgRole" = 'admin')`,
+            // 'org_admin' is canonical; legacy 'admin' kept for orgs that
+            // pre-date the rename (matches permissions.js normalisation).
+            `SELECT id FROM users WHERE "organizationId" = $1 AND (role = 'admin' OR "orgRole" IN ('org_admin', 'admin'))`,
             [orgId],
         );
         for (const u of rows || []) {
