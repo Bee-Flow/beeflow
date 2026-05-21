@@ -294,6 +294,16 @@ function resolveStripeTaxId(rawVat) {
     return null;
 }
 
+// Anchor every new subscription's billing cycle to the 1st of next month
+// (UTC). Stripe automatically pro-rates the partial period from "now" to
+// the anchor, so the first invoice reflects only the days actually used —
+// and every org/consumer renews on the same calendar day regardless of
+// when they signed up.
+function computeBillingCycleAnchor() {
+    const now = new Date();
+    return Math.floor(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1) / 1000);
+}
+
 async function createCheckoutSession({ plan, orgId, orgName, userId, subscriberType = 'organization', userEmail, successUrl, cancelUrl, stripeCustomerId }) {
     const stripe = await getClient();
 
@@ -387,6 +397,16 @@ async function createCheckoutSession({ plan, orgId, orgName, userId, subscriberT
     // Apply trial period if plan has trial days
     if (plan.trial_days && plan.trial_days > 0) {
         sessionParams.subscription_data.trial_period_days = plan.trial_days;
+    } else {
+        // Anchor the billing cycle to a stable monthly date (1st of next
+        // month UTC) so every paying subscription renews on the same day.
+        // Stripe rejects billing_cycle_anchor together with
+        // trial_period_days (the trial end IS the implicit anchor), so we
+        // only set it when there's no trial. `create_prorations` makes
+        // Stripe issue a partial-period charge between "now" and the
+        // anchor — relevant for per-seat plans entering mid-cycle.
+        sessionParams.subscription_data.billing_cycle_anchor = computeBillingCycleAnchor();
+        sessionParams.subscription_data.proration_behavior = 'create_prorations';
     }
 
     // Tax collection

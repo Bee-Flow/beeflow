@@ -47,6 +47,7 @@
     "dockerode": "^4.0.12",
     "docx": "^9.6.1",
     "docxtemplater": "^3.68.3",
+    "dompurify": "^3.4.5",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
     "express-rate-limit": "^8.5.1",

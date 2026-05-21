@@ -1,9 +1,10 @@
 /**
  * Voxtral STT — Speech-to-Text via Mistral's audio transcription endpoint.
  *
- * Uses the Mistral REST API `/v1/audio/transcriptions` (model: voxtral-mini-2507
- * or voxtral-small-2507). The endpoint accepts multipart/form-data with the
- * audio file and returns a JSON transcript.
+ * Uses the Mistral REST API `/v1/audio/transcriptions` (model:
+ * voxtral-mini-2602 — Voxtral Transcribe 2 batch, released Feb 2026).
+ * The endpoint accepts multipart/form-data with the audio file and
+ * returns a JSON transcript.
  *
  * Per-turn usage (v1 Beta):
  *   transcribe(apiKey, audioBuffer, { mime, language }) → { text, language, duration }
@@ -16,7 +17,7 @@
 const FormData = require('form-data');
 
 const MISTRAL_API_BASE = 'https://api.mistral.ai';
-const DEFAULT_STT_MODEL = 'voxtral-mini-2507';
+const DEFAULT_STT_MODEL = 'voxtral-mini-2602';
 
 /**
  * Transcribe an audio buffer via Voxtral.

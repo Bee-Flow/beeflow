@@ -27,6 +27,7 @@
  *     PATCH  /api/cms/sites/:siteId                            { name } — rename
  *     DELETE /api/cms/sites/:siteId                            delete site + cascade
  *     PUT    /api/cms/sites/:siteId/live                       { live } — set/clear live
+ *     POST   /api/cms/sites/:siteId/duplicate                  deep-copy → new version
  *
  *   ADMIN — per-site content (mounted on both /admin and /sites/:siteId):
  *     GET    .../site                                          full editor payload (legacy)
@@ -60,12 +61,32 @@ const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const path = require('path');
+const bodyParser = require('body-parser');
 
 const cmsStore = require('../stores/cmsStore');
 const configStore = require('../stores/configStore');
 const languageStore = require('../stores/languageStore');
 const storageStore = require('../stores/storageStore');
 const { hasPermission } = require('../auth/permissions');
+const { perUserRateLimit } = require('../utils/perUserRateLimit');
+const { sanitizeSvg } = require('../utils/svgSanitizer');
+
+// Per-route body parser for /sites/import — caps the JSON payload at
+// 2 MB. The global parser is 20 MB which is fine for chat/agent runs
+// but too permissive for site imports (a real export is well under
+// 500 KB). Caps memory pressure when a compromised admin session sends
+// a deeply-nested or zip-bombed JSON.
+const importJsonParser = bodyParser.json({ limit: '2mb' });
+
+// Rate limiters for write-heavy admin endpoints. The threat model is a
+// compromised admin session, not anonymous abuse — but a stolen session
+// shouldn't be able to exhaust storage / DB capacity in seconds. Per-
+// user windows are intentionally generous so a legit power user editing
+// a site is never rate-limited.
+const uploadLimiter    = perUserRateLimit({ windowMs: 60_000, max: 60 });
+const importLimiter    = perUserRateLimit({ windowMs: 60_000, max: 10 });
+const duplicateLimiter = perUserRateLimit({ windowMs: 60_000, max: 20 });
+const publishLimiter   = perUserRateLimit({ windowMs: 60_000, max: 30 });
 
 // ── Live-site selection ──────────────────────────────────────────
 //
@@ -175,14 +196,53 @@ async function attachSiteIdFromParam(req, res, next) {
     }
 }
 
+// Accepted MIME types for the CMS uploader. Images cover the regular
+// hero/feature/logo case; image/gif + image/apng + image/webp cover
+// animated graphics; video/mp4 + video/webm cover the "silent loop"
+// video kind used by Media + Text. Anything outside this list is
+// rejected as 400 by the wrapper middleware below (NOT 500 — fileFilter
+// errors used to bubble up uncaught and surface as a generic Internal
+// Server Error).
+//
+// SVG is accepted, but only after server-side sanitization (see
+// handleUpload below). The asset endpoint serves the cleaned bytes
+// inline with a strict CSP; unsanitized legacy SVGs are still
+// force-downloaded by the isScriptableMime branch.
+const UPLOAD_MIME_WHITELIST = new Set([
+    'image/jpeg',
+    'image/png',
+    'image/gif',
+    'image/webp',
+    'image/apng',
+    'image/svg+xml',
+    'video/mp4',
+    'video/webm',
+]);
+
 const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 5 * 1024 * 1024 },
+    // 25 MB ceiling — high enough for short demo-loop MP4s / animated GIFs
+    // (the typical sim.ai-style screen recording is well under this), low
+    // enough that we don't silently accept multi-hundred-MB uploads.
+    limits: { fileSize: 25 * 1024 * 1024 },
     fileFilter: (req, file, cb) => {
-        if (file.mimetype.startsWith('image/')) cb(null, true);
-        else cb(new Error('Only image uploads are allowed'));
+        if (UPLOAD_MIME_WHITELIST.has(file.mimetype)) cb(null, true);
+        else cb(new Error(`Unsupported file type: ${file.mimetype}`));
     },
 });
+
+// Wrap upload.single('file') so multer errors (LIMIT_FILE_SIZE, fileFilter
+// rejections) come back as 400 with a useful message instead of the
+// default 500 the upstream client sees today.
+function uploadFile(req, res, next) {
+    upload.single('file')(req, res, (err) => {
+        if (!err) return next();
+        const message = err.code === 'LIMIT_FILE_SIZE'
+            ? 'File too large (max 25 MB)'
+            : (err.message || 'Upload rejected');
+        res.status(400).json({ error: message });
+    });
+}
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -279,6 +339,11 @@ function synthesizeLegacyContent(eff) {
     // needed). The renderer reads initialContent.design for non-preview
     // mounts; preview mode still uses the postMessage payload's design.
     if (eff.design) out.design = eff.design;
+    // Per-page chrome visibility. Stored on the page index entry by
+    // updatePageMeta; the renderer hides Header/Footer when set. Default
+    // false so pages that pre-date the flag still show both.
+    out.hideHeader = !!eff.page?.hideHeader;
+    out.hideFooter = !!eff.page?.hideFooter;
     const enabledBlocks = (eff.page?.blocks || []).filter(b => b.enabled !== false);
     out.blocks = enabledBlocks.map(b => ({
         id: b.id,
@@ -358,8 +423,8 @@ async function deleteSiteLocale(req, res) {
 
 async function postPage(req, res) {
     try {
-        const { slug, title, copyFromId } = req.body || {};
-        const result = await cmsStore.createPage(req.siteId, { slug, title, copyFromId });
+        const { slug, title, copyFromId, templateId } = req.body || {};
+        const result = await cmsStore.createPage(req.siteId, { slug, title, copyFromId, templateId });
         res.json({ success: true, ...result });
     } catch (err) { res.status(400).json({ error: err.message }); }
 }
@@ -390,6 +455,52 @@ async function putPageHomepage(req, res) {
 async function deletePageHandler(req, res) {
     try {
         await cmsStore.removePage(req.siteId, req.params.id);
+        res.json({ success: true });
+    } catch (err) { res.status(400).json({ error: err.message }); }
+}
+
+// ── Page templates (global, org-wide) ────────────────────────────────
+// The "apply" path doesn't need its own endpoint — callers pass
+// templateId on POST /pages and the store walks the template's blocks
+// into the new page with fresh block ids.
+async function listTemplates(req, res) {
+    try {
+        const templates = await cmsStore.getTemplates();
+        // Strip block payloads from the list response — they can be large
+        // and the list view only needs name/description/blockCount/date.
+        // The blocks land in the new page via templateId on POST /pages,
+        // so the client never needs the blocks array on the list.
+        const summary = templates.map(t => ({
+            id:          t.id,
+            name:        t.name,
+            description: t.description || '',
+            createdAt:   t.createdAt,
+            blockCount:  Array.isArray(t.blocks) ? t.blocks.length : 0,
+        }));
+        res.json({ templates: summary });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+}
+
+async function postTemplate(req, res) {
+    try {
+        const { name, description, blocks } = req.body || {};
+        const entry = await cmsStore.saveTemplate({ name, description, blocks });
+        res.json({
+            success: true,
+            template: {
+                id:          entry.id,
+                name:        entry.name,
+                description: entry.description || '',
+                createdAt:   entry.createdAt,
+                blockCount:  Array.isArray(entry.blocks) ? entry.blocks.length : 0,
+            },
+        });
+    } catch (err) { res.status(400).json({ error: err.message }); }
+}
+
+async function deleteTemplateHandler(req, res) {
+    try {
+        await cmsStore.deleteTemplate(req.params.id);
         res.json({ success: true });
     } catch (err) { res.status(400).json({ error: err.message }); }
 }
@@ -431,6 +542,49 @@ async function deletePageLocale(req, res) {
 
 // Site-CRUD handlers (no /admin equivalent).
 
+// Export the active site as a downloadable JSON file. The handler reads
+// the full project doc + every PageDoc via cmsStore.exportSite, then
+// streams it back with a Content-Disposition header so the browser
+// triggers a file save dialog.
+async function exportSiteHandler(req, res) {
+    try {
+        const payload = await cmsStore.exportSite(req.siteId);
+        const safeName = (payload.site?.name || 'site')
+            .toLowerCase()
+            .replace(/[^a-z0-9-]+/g, '-')
+            .replace(/^-+|-+$/g, '')
+            .slice(0, 40) || 'site';
+        const dateStr = new Date().toISOString().slice(0, 10);    // YYYY-MM-DD
+        const filename = `site-${safeName}-${dateStr}.json`;
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        // Pretty-print so diffs against re-exports are reviewable. The
+        // file is small enough (a few hundred KB max in practice) that
+        // the size overhead doesn't matter.
+        res.send(JSON.stringify(payload, null, 2));
+    } catch (err) {
+        console.error('[CMS] export error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+}
+
+// Import a site from an export payload. Generates fresh ids for the
+// site, every page, and every block — re-import is always safe and
+// never collides with existing data.
+async function importSiteHandler(req, res) {
+    try {
+        const exportData = req.body;
+        if (!exportData || typeof exportData !== 'object') {
+            return res.status(400).json({ error: 'Request body must be a JSON object' });
+        }
+        const result = await cmsStore.importSite(exportData);
+        res.status(201).json(result);
+    } catch (err) {
+        console.error('[CMS] import error:', err.message);
+        res.status(400).json({ error: err.message });
+    }
+}
+
 async function listSitesHandler(req, res) {
     try {
         const [sites, liveSiteId] = await Promise.all([
@@ -457,6 +611,16 @@ async function renameSiteHandler(req, res) {
         }
         const updated = await cmsStore.renameProject(req.siteId, name.trim());
         res.json({ success: true, site: updated });
+    } catch (err) { res.status(400).json({ error: err.message }); }
+}
+
+// Duplicate a site into a new version of the same version group. Deep-
+// copies the SiteDoc + every PageDoc + every block with fresh ids. The
+// copy is never live — live stays on whatever cms_live_site_id points at.
+async function duplicateSiteHandler(req, res) {
+    try {
+        const created = await cmsStore.duplicateProject(req.siteId);
+        res.status(201).json(created);
     } catch (err) { res.status(400).json({ error: err.message }); }
 }
 
@@ -553,7 +717,21 @@ async function handleUpload(req, res) {
         const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}-${safeBase}${ext}`;
         const key = `cms/${filename}`;
 
-        await storageStore.uploadFile(key, req.file.buffer, req.file.mimetype);
+        // SVGs are sanitized server-side (script / on*= / external href
+        // stripped). Only the cleaned bytes ever reach storage, and we
+        // tag the object as `sanitized` so the asset endpoint knows it
+        // can serve it inline instead of force-downloading. A bad SVG
+        // (parse fails, no <svg> root) returns 400 here.
+        let body = req.file.buffer;
+        let metadata = null;
+        if (req.file.mimetype === 'image/svg+xml') {
+            const clean = sanitizeSvg(req.file.buffer);
+            if (!clean) return res.status(400).json({ error: 'Invalid or unsafe SVG' });
+            body = clean;
+            metadata = { sanitized: '1' };
+        }
+
+        await storageStore.uploadFile(key, body, req.file.mimetype, metadata);
 
         const url = `/api/cms/asset/${key.split('/').map(encodeURIComponent).join('/')}`;
         res.json({ success: true, key, url });
@@ -651,14 +829,49 @@ router.get('/site', async (req, res) => {
     }
 });
 
+// MIME types that browsers would happily execute as script in the page
+// origin if served inline. The upload whitelist already blocks new
+// SVG/HTML uploads, but pre-existing assets and any future expansion of
+// the whitelist must NOT be able to surprise us — so we force-download
+// these by setting Content-Disposition: attachment regardless of what
+// the storage layer reports.
+const SCRIPTABLE_MIME_PREFIXES = ['image/svg', 'text/html', 'text/xml', 'application/xhtml', 'application/xml'];
+function isScriptableMime(mime) {
+    if (typeof mime !== 'string') return false;
+    const lower = mime.toLowerCase();
+    return SCRIPTABLE_MIME_PREFIXES.some(p => lower.startsWith(p));
+}
+
 router.get(/^\/asset\/(.+)$/, async (req, res) => {
     try {
         const key = req.params[0];
         if (!key.startsWith('cms/')) return res.status(404).json({ error: 'Not found' });
         if (!storageStore.isAvailable()) return res.status(503).json({ error: 'Storage unavailable' });
 
-        const { stream, contentType, contentLength } = await storageStore.streamFile(key);
-        res.setHeader('Content-Type', contentType);
+        const { stream, contentType, contentLength, metadata } = await storageStore.streamFile(key);
+        const sanitized = metadata && (metadata.sanitized === '1' || metadata.Sanitized === '1');
+
+        // Defense in depth: if the stored Content-Type would execute in
+        // the browser when served inline (SVG, HTML, XML), force the
+        // browser to download it — UNLESS it's a sanitized SVG, in which
+        // case we serve it inline with a strict CSP that blocks scripts
+        // and external network fetches even if the sanitizer ever
+        // misses something. Legacy SVGs without the `sanitized` flag
+        // still force-download.
+        if (isScriptableMime(contentType)) {
+            if (sanitized && /^image\/svg/i.test(contentType)) {
+                res.setHeader('Content-Type', 'image/svg+xml');
+                res.setHeader('Content-Security-Policy',
+                    "default-src 'none'; style-src 'unsafe-inline'");
+                res.setHeader('X-Content-Type-Options', 'nosniff');
+            } else {
+                res.setHeader('Content-Type', 'application/octet-stream');
+                res.setHeader('Content-Disposition', 'attachment');
+                res.setHeader('X-Content-Type-Options', 'nosniff');
+            }
+        } else {
+            res.setHeader('Content-Type', contentType);
+        }
         if (contentLength) res.setHeader('Content-Length', contentLength);
         res.setHeader('Cache-Control', 'public, max-age=3600');
         stream.pipe(res);
@@ -698,14 +911,20 @@ router.put('/admin/pages/:id', putPage);
 
 // Publish — same handler as the multi-site route, scoped to the bridge's
 // default site.
-router.post('/admin/publish', postSitePublish);
+router.post('/admin/publish', publishLimiter, postSitePublish);
 
 // Org-wide flags (not per-site — only available here).
 router.put('/admin/enabled', putEnabled);
 router.put('/admin/default-locale', putDefaultLocale);
 
 // File uploads (org-wide bucket prefix).
-router.post('/admin/upload', upload.single('file'), handleUpload);
+router.post('/admin/upload', uploadLimiter, uploadFile, handleUpload);
+
+// Page templates — global, shared across all sites. List/save/delete
+// only; "apply" happens implicitly by passing `templateId` to POST page.
+router.get('/admin/templates',        listTemplates);
+router.post('/admin/templates',       postTemplate);
+router.delete('/admin/templates/:id', deleteTemplateHandler);
 
 // ══════════════════════════════════════════════════════════════════
 // ADMIN — /sites and /sites/:siteId/* (explicit multi-site)
@@ -716,6 +935,10 @@ router.use('/sites', requireAdmin);
 // Site-CRUD (no siteId yet, no attachSiteIdFromParam needed).
 router.get('/sites', listSitesHandler);
 router.post('/sites', createSiteHandler);
+// IMPORTANT: `/sites/import` must register BEFORE the siteId param
+// middleware below — otherwise `import` gets matched as a siteId and
+// rejected by the `pj_[a-f0-9]+` format check.
+router.post('/sites/import', importLimiter, importJsonParser, importSiteHandler);
 
 // Validate :siteId for everything below before running handlers.
 router.use('/sites/:siteId', attachSiteIdFromParam);
@@ -738,14 +961,24 @@ router.delete('/sites/:siteId/site/locale/:locale', deleteSiteLocale);
 // Page graph for the sitemap diagram.
 router.get('/sites/:siteId/graph', getGraph);
 
+// Site export — returns a JSON file (Content-Disposition: attachment)
+// containing the full SiteDoc + every PageDoc + blocks. The
+// counterpart `POST /sites/import` (registered earlier, before the
+// siteId middleware) restores an export into a fresh siteId.
+router.get('/sites/:siteId/export', exportSiteHandler);
+
 // Per-site Live toggle — mutually exclusive across projects (only one
 // can be live at a time; setting one live takes the previous one offline).
 router.put('/sites/:siteId/live', putSiteLive);
 
+// Duplicate a site into a new version (same versionGroupId, next "v{n}"
+// name). Returns the new site's { id, name, versionGroupId, versionName }.
+router.post('/sites/:siteId/duplicate', duplicateLimiter, duplicateSiteHandler);
+
 // Publish — snapshot the current draft into cms_published_{siteId}. The
 // public /api/cms/site route reads from this snapshot, so visitors only
 // see content the user has explicitly published.
-router.post('/sites/:siteId/publish', postSitePublish);
+router.post('/sites/:siteId/publish', publishLimiter, postSitePublish);
 
 // Site-level operations on the SiteDoc itself.
 router.get('/sites/:siteId', getSitePayload);

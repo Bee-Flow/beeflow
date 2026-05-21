@@ -48,6 +48,46 @@ const upload = multer({
 const llmClient = require('../core/llmClient');
 
 /**
+ * Resolve the user's group IDs from userStore — used to filter published
+ * transcriptions by `shared_groups`. Mirrors `resolveUserGroups` in
+ * `server/routes/knowledgeBases.js`.
+ */
+async function resolveUserGroupIds(req) {
+    const userId = req.session?.user?.id;
+    if (!userId) return [];
+    try {
+        const userStore = require('../stores/userStore');
+        const user = await userStore.getUser(userId);
+        if (!user) return [];
+        if (Array.isArray(user.groups)) return user.groups;
+        if (typeof user.groups === 'string') {
+            try { return JSON.parse(user.groups || '[]'); } catch { return []; }
+        }
+    } catch (_) { /* ignore */ }
+    return [];
+}
+
+/**
+ * Resolve the user's full read-access context for transcription queries:
+ * org IDs they belong to (for org-scoped published rows) and group IDs
+ * (for `shared_groups` filtering).
+ */
+async function resolveAccessContext(req) {
+    const { resolveUserOrgIds } = require('../auth');
+    const orgIdsSet = await resolveUserOrgIds(req);
+    // Super admin → orgIdsSet is null. Pass through a sentinel that allows all
+    // by combining the user's actual orgs (best effort) with an org-agnostic
+    // path inside the store. For simplicity, super admins still see their own
+    // + their primary org's published items; cross-org snooping isn't a
+    // supported flow in the UI.
+    const orgIds = orgIdsSet === null
+        ? []
+        : Array.from(orgIdsSet || []);
+    const userGroupIds = await resolveUserGroupIds(req);
+    return { orgIds, userGroupIds, isSuperAdmin: orgIdsSet === null };
+}
+
+/**
  * Resolve the user's organization ID from a request for EU-mode tier overrides.
  */
 async function resolveUserOrgFromReq(req) {
@@ -449,7 +489,8 @@ router.get('/', requireAuth, async (req, res) => {
         const userId = req.session.user.id;
         const limit = Math.min(parseInt(req.query.limit) || 50, 100);
         const offset = parseInt(req.query.offset) || 0;
-        const transcriptions = await transcriptionStore.getTranscriptions(userId, { limit, offset });
+        const { orgIds, userGroupIds, isSuperAdmin } = await resolveAccessContext(req);
+        const transcriptions = await transcriptionStore.getTranscriptions(userId, { limit, offset, orgIds, userGroupIds, isSuperAdmin });
         res.json({ transcriptions });
     } catch (err) {
         console.error('[Transcriptions] List error:', err.message);
@@ -462,7 +503,8 @@ router.get('/', requireAuth, async (req, res) => {
 router.get('/:id', requireAuth, async (req, res) => {
     try {
         const userId = req.session.user.id;
-        const transcription = await transcriptionStore.getTranscription(req.params.id, userId);
+        const { orgIds, userGroupIds, isSuperAdmin } = await resolveAccessContext(req);
+        const transcription = await transcriptionStore.getTranscription(req.params.id, userId, { orgIds, userGroupIds, isSuperAdmin });
         if (!transcription) return res.status(404).json({ error: 'Transcription not found' });
         res.json(transcription);
     } catch (err) {
@@ -519,6 +561,11 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
         console.log(`[Transcriptions] Transcribing "${fileName}" (${(fileContent.length / (1024 * 1024)).toFixed(1)} MB) via ${provider} for user ${userId} (${userName || 'unknown'})`);
 
         let response;
+        // Tracks an automatic engine switch (e.g. local → voxtral when an upload
+        // exceeds the on-device CPU model's duration cap). Surfaced in the
+        // success payload so the UI can show a soft "transcribed via cloud
+        // instead" note rather than failing the upload.
+        let providerFallback = null;
 
         if (provider === 'local') {
             // ── In-process Whisper-base on CPU (privacy / no-cloud path) ──
@@ -535,20 +582,42 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
                 response = { text: local.text, segments: local.segments };
             } catch (err) {
                 if (err.code === 'local_whisper_too_long') {
-                    try { fs.unlinkSync(req.file.path); } catch (_) {}
-                    return res.status(400).json({
-                        error: err.message + '. Use a cloud provider for longer recordings.',
-                        code: err.code,
-                    });
-                }
-                throw err;
-            }
+                    // Try to fall back to a configured cloud provider so the
+                    // upload doesn't dead-end. Voxtral is preferred (no extra
+                    // setup once a Mistral key is present); WhisperX is the
+                    // self-hosted alternative if it's configured.
+                    const mistralKey = await configStore.getSecret('mistral_api_key');
+                    const whisperxUrl = await configStore.getConfig('whisperx_url');
+                    const azureKey = await configStore.getSecret('azure_speech_key');
+                    const azureRegion = await configStore.getConfig('azure_speech_region');
+                    let cloud = null;
+                    if (mistralKey) cloud = 'voxtral';
+                    else if (whisperxUrl) cloud = 'whisperx';
+                    else if (azureKey && azureRegion) cloud = 'azure';
 
-        } else if (provider === 'whisperx') {
+                    if (cloud) {
+                        console.log(`[Transcriptions] Local cap exceeded — falling back to ${cloud}`);
+                        providerFallback = { from: 'local', to: cloud, reason: 'too_long', message: err.message };
+                        provider = cloud;
+                        // Fall through to the cloud branch below.
+                    } else {
+                        try { fs.unlinkSync(req.file.path); } catch (_) {}
+                        return res.status(413).json({
+                            error: err.message + '. No cloud provider is configured — ask an admin to enable Voxtral, WhisperX or Azure, or split the recording.',
+                            code: 'local_whisper_too_long_no_fallback',
+                        });
+                    }
+                } else {
+                    throw err;
+                }
+            }
+        }
+
+        if (!response && provider === 'whisperx') {
             // ── WhisperX (self-hosted) ───────────────────────
             response = await transcribeWithWhisperX(req.file.path, fileName, language, contextTerms);
 
-        } else if (provider === 'azure') {
+        } else if (!response && provider === 'azure') {
             // ── Azure AI Speech (SDK ConversationTranscriber) ────────
             const azureKey = await configStore.getSecret('azure_speech_key');
             const azureRegion = await configStore.getConfig('azure_speech_region');
@@ -668,7 +737,7 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
                 })),
             };
 
-        } else if (provider === 'whisper_azure') {
+        } else if (!response && provider === 'whisper_azure') {
             // ── Azure Whisper Batch (REST API v3.2) ─────────────────
             const { executeTranscriptionTool } = require('../integrations/transcriptionTools');
             const whisperResult = await executeTranscriptionTool('transcribe_audio', {
@@ -697,7 +766,7 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
             const actionItemsW = await extractActionItems(whisperResult.transcript, language, userOrgId);
 
             const savedW = await transcriptionStore.createTranscription({
-                userId, title: titleW, fileName, language,
+                userId, organizationId: userOrgId, title: titleW, fileName, language,
                 durationSeconds: whisperResult.durationSeconds || 0,
                 speakerCount: (whisperResult.speakers || []).length,
                 segmentCount: (whisperResult.segments || []).length,
@@ -720,7 +789,7 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
                 summary: summaryW, actionItems: actionItemsW,
             });
 
-        } else {
+        } else if (!response) {
             // ── Voxtral (cloud, default) ─────────────────────
             const apiKey = await configStore.getSecret('mistral_api_key');
             if (!apiKey) {
@@ -851,6 +920,7 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
         // Save to DB
         const saved = await transcriptionStore.createTranscription({
             userId,
+            organizationId: userOrgId,
             title,
             fileName,
             language,
@@ -882,6 +952,7 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
             segments: merged,
             summary,
             actionItems,
+            providerFallback,
         });
 
     } catch (err) {
@@ -906,6 +977,7 @@ router.post('/', requireAuth, upload.single('audio'), async (req, res) => {
         try {
             const saved = await transcriptionStore.createTranscription({
                 userId,
+                organizationId: userOrgId,
                 title: req.body.title || req.file?.originalname || 'Failed Transcription',
                 fileName: req.file?.originalname || 'unknown',
                 language: req.body.language || 'nl',
@@ -927,8 +999,10 @@ router.post('/:id/reprocess', requireAuth, async (req, res) => {
     try {
         const userId = req.session.user.id;
         const userOrgId = await resolveUserOrgFromReq(req);
-        const transcription = await transcriptionStore.getTranscription(req.params.id, userId);
+        const { orgIds, userGroupIds, isSuperAdmin } = await resolveAccessContext(req);
+        const transcription = await transcriptionStore.getTranscription(req.params.id, userId, { orgIds, userGroupIds, isSuperAdmin });
         if (!transcription) return res.status(404).json({ error: 'Not found' });
+        if (!transcription.isOwner) return res.status(403).json({ error: 'Only the owner can reprocess' });
         if (!transcription.audioPath || !fs.existsSync(transcription.audioPath)) {
             return res.status(400).json({ error: 'Saved audio not found. Cannot reprocess — please upload again.' });
         }
@@ -1058,16 +1132,52 @@ router.post('/:id/reprocess', requireAuth, async (req, res) => {
 router.get('/:id/audio', requireAuth, async (req, res) => {
     try {
         const userId = req.session.user.id;
-        const transcription = await transcriptionStore.getTranscription(req.params.id, userId);
+        const { orgIds, userGroupIds, isSuperAdmin } = await resolveAccessContext(req);
+        const transcription = await transcriptionStore.getTranscription(req.params.id, userId, { orgIds, userGroupIds, isSuperAdmin });
         if (!transcription) return res.status(404).json({ error: 'Not found' });
         if (!transcription.audioPath || !fs.existsSync(transcription.audioPath)) {
             return res.status(404).json({ error: 'Audio file not available' });
         }
-        const ext = path.extname(transcription.audioPath).toLowerCase();
+        const audioPath = transcription.audioPath;
+        const ext = path.extname(audioPath).toLowerCase();
         const mimeMap = { '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.m4a': 'audio/mp4', '.ogg': 'audio/ogg', '.webm': 'audio/webm', '.flac': 'audio/flac', '.aac': 'audio/aac', '.mp4': 'audio/mp4' };
-        res.setHeader('Content-Type', mimeMap[ext] || 'audio/mpeg');
-        res.setHeader('Content-Disposition', `inline; filename="${transcription.fileName || 'audio' + ext}"`);
-        fs.createReadStream(transcription.audioPath).pipe(res);
+        const contentType = mimeMap[ext] || 'audio/mpeg';
+        const stat = fs.statSync(audioPath);
+        const fileSize = stat.size;
+        const fileName = transcription.fileName || `audio${ext}`;
+
+        // HTML5 <audio> elements seek/scrub via byte-range requests. Some
+        // formats (notably webm/mp4/m4a) refuse to play without
+        // `206 Partial Content` + `Accept-Ranges: bytes`. Honour Range
+        // headers properly so seeking + playback work in every browser.
+        res.setHeader('Accept-Ranges', 'bytes');
+        res.setHeader('Content-Type', contentType);
+        res.setHeader('Content-Disposition', `inline; filename="${fileName}"`);
+        res.setHeader('Cache-Control', 'private, max-age=3600');
+
+        const range = req.headers.range;
+        if (range) {
+            const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+            if (!match) {
+                res.setHeader('Content-Range', `bytes */${fileSize}`);
+                return res.status(416).end();
+            }
+            const start = match[1] ? parseInt(match[1], 10) : 0;
+            const end = match[2] ? parseInt(match[2], 10) : fileSize - 1;
+            if (Number.isNaN(start) || Number.isNaN(end) || start > end || end >= fileSize) {
+                res.setHeader('Content-Range', `bytes */${fileSize}`);
+                return res.status(416).end();
+            }
+            res.status(206);
+            res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
+            res.setHeader('Content-Length', String(end - start + 1));
+            fs.createReadStream(audioPath, { start, end }).pipe(res);
+            return;
+        }
+
+        // No range header — full file.
+        res.setHeader('Content-Length', String(fileSize));
+        fs.createReadStream(audioPath).pipe(res);
     } catch (err) {
         console.error('[Transcriptions] Audio serve error:', err.message);
         res.status(500).json({ error: 'Failed to serve audio' });
@@ -1103,8 +1213,10 @@ router.post('/:id/regenerate-summary', requireAuth, async (req, res) => {
         const userId = req.session.user.id;
         const userOrgId = await resolveUserOrgFromReq(req);
         const { template = 'general' } = req.body;
-        const transcription = await transcriptionStore.getTranscription(req.params.id, userId);
+        const { orgIds, userGroupIds, isSuperAdmin } = await resolveAccessContext(req);
+        const transcription = await transcriptionStore.getTranscription(req.params.id, userId, { orgIds, userGroupIds, isSuperAdmin });
         if (!transcription) return res.status(404).json({ error: 'Not found' });
+        if (!transcription.isOwner) return res.status(403).json({ error: 'Only the owner can regenerate the summary' });
         if (!transcription.transcript) return res.status(400).json({ error: 'No transcript available' });
 
         const templatePrompt = SUMMARY_TEMPLATES[template] || SUMMARY_TEMPLATES.general;
@@ -1136,7 +1248,8 @@ router.get('/:id/export', requireAuth, async (req, res) => {
     try {
         const userId = req.session.user.id;
         const format = req.query.format || 'md';
-        const transcription = await transcriptionStore.getTranscription(req.params.id, userId);
+        const { orgIds, userGroupIds, isSuperAdmin } = await resolveAccessContext(req);
+        const transcription = await transcriptionStore.getTranscription(req.params.id, userId, { orgIds, userGroupIds, isSuperAdmin });
         if (!transcription) return res.status(404).json({ error: 'Not found' });
 
         const title = transcription.title || 'Meeting Notes';
@@ -1182,47 +1295,156 @@ router.delete('/:id', requireAuth, async (req, res) => {
     }
 });
 
-// ── Share/unshare transcription ──────────────────────────
+// ── Publish to org / groups ──────────────────────────────
+//
+// Mirrors the publish model used by Knowledge Bases:
+//   - `isPublished: false`            → Personal (only the owner)
+//   - `isPublished: true, []`         → Entire organisation
+//   - `isPublished: true, [gid…]`     → Specific org groups
+//
+// Owner-only. Validates that supplied group IDs belong to the owner's org.
 
-router.post('/:id/share', requireAuth, async (req, res) => {
+router.patch('/:id/publish', requireAuth, async (req, res) => {
     try {
         const userId = req.session.user.id;
-        const { userIds } = req.body; // Array of user IDs to share with
-        if (!Array.isArray(userIds)) return res.status(400).json({ error: 'userIds must be an array' });
+        const { isPublished, sharedGroups } = req.body;
+        if (typeof isPublished !== 'boolean') {
+            return res.status(400).json({ error: 'isPublished must be a boolean' });
+        }
+        if (sharedGroups !== undefined && !Array.isArray(sharedGroups)) {
+            return res.status(400).json({ error: 'sharedGroups must be an array' });
+        }
 
-        // Only the owner can share
-        const transcription = await transcriptionStore.getTranscription(req.params.id, userId);
+        const { orgIds, userGroupIds, isSuperAdmin } = await resolveAccessContext(req);
+        const transcription = await transcriptionStore.getTranscription(req.params.id, userId, { orgIds, userGroupIds, isSuperAdmin });
         if (!transcription) return res.status(404).json({ error: 'Not found' });
-        if (!transcription.isOwner) return res.status(403).json({ error: 'Only the owner can share' });
+        if (!transcription.isOwner) return res.status(403).json({ error: 'Only the owner can change publish status' });
 
-        // Merge new userIds with existing shared_with (deduplicated)
-        const existing = transcription.sharedWith || [];
-        const merged = [...new Set([...existing, ...userIds])].filter(id => id !== userId);
+        // Validate the supplied group IDs against the transcription's org so
+        // a user can't accidentally publish to another org's groups.
+        const orgIdForValidation = transcription.organizationId || await resolveUserOrgFromReq(req);
+        let cleanedGroups = [];
+        if (isPublished && Array.isArray(sharedGroups) && sharedGroups.length > 0) {
+            if (!orgIdForValidation) {
+                return res.status(400).json({ error: 'Cannot publish: no organization context for this transcription.' });
+            }
+            const { validateSharedGroupsForOrg } = require('../auth');
+            try {
+                cleanedGroups = await validateSharedGroupsForOrg(orgIdForValidation, sharedGroups);
+            } catch (err) {
+                return res.status(400).json({ error: err.message || 'Invalid shared groups' });
+            }
+        }
 
-        await transcriptionStore.updateTranscription(req.params.id, userId, { sharedWith: merged });
-        res.json({ success: true, sharedWith: merged });
+        await transcriptionStore.setPublished(req.params.id, userId, isPublished, cleanedGroups);
+        res.json({ success: true, isPublished, sharedGroups: cleanedGroups });
     } catch (err) {
-        console.error('[Transcriptions] Share error:', err.message);
-        res.status(500).json({ error: 'Failed to share' });
+        console.error('[Transcriptions] Publish error:', err.message);
+        res.status(500).json({ error: 'Failed to update publish status' });
     }
 });
 
-router.post('/:id/unshare', requireAuth, async (req, res) => {
+// ── Edit speakers (rename + merge) ───────────────────────
+//
+// Atomic edit operation. Payload:
+//   { renames: { "Charles": "Tjalle" },
+//     merges:  [{ from: ["Tjalle", "Charles"], into: "Tjalle" }] }
+//
+// Merges run first (collapse multiple speaker IDs into one), then renames
+// (straight rename across all remaining speaker IDs). The transcript
+// string is rebuilt from segments so it stays in sync with the labels.
+// Owner-only.
+
+router.patch('/:id/speakers', requireAuth, async (req, res) => {
     try {
         const userId = req.session.user.id;
-        const { userIds } = req.body;
-        if (!Array.isArray(userIds)) return res.status(400).json({ error: 'userIds must be an array' });
+        const { renames = {}, merges = [] } = req.body || {};
+        if (renames && typeof renames !== 'object') {
+            return res.status(400).json({ error: 'renames must be an object' });
+        }
+        if (merges && !Array.isArray(merges)) {
+            return res.status(400).json({ error: 'merges must be an array' });
+        }
 
-        const transcription = await transcriptionStore.getTranscription(req.params.id, userId);
+        const { orgIds, userGroupIds, isSuperAdmin } = await resolveAccessContext(req);
+        const transcription = await transcriptionStore.getTranscription(req.params.id, userId, { orgIds, userGroupIds, isSuperAdmin });
         if (!transcription) return res.status(404).json({ error: 'Not found' });
-        if (!transcription.isOwner) return res.status(403).json({ error: 'Only the owner can manage sharing' });
+        if (!transcription.isOwner) return res.status(403).json({ error: 'Only the owner can edit speakers' });
 
-        const remaining = (transcription.sharedWith || []).filter(id => !userIds.includes(id));
-        await transcriptionStore.updateTranscription(req.params.id, userId, { sharedWith: remaining });
-        res.json({ success: true, sharedWith: remaining });
+        // Build a single name-mapping pass. For each merge, every `from`
+        // name maps to `into`. Then apply renames on top. Order matters:
+        // merge first so a subsequent rename of the merged identity also
+        // moves any leftover references that were already pointing at it.
+        const mapping = new Map();
+        for (const merge of merges) {
+            const into = String(merge?.into || '').trim();
+            const from = Array.isArray(merge?.from) ? merge.from : [];
+            if (!into || from.length === 0) continue;
+            for (const name of from) {
+                if (typeof name === 'string' && name.trim()) {
+                    mapping.set(name, into);
+                }
+            }
+        }
+        for (const [oldName, newName] of Object.entries(renames)) {
+            if (typeof newName !== 'string' || !newName.trim()) continue;
+            const trimmed = newName.trim();
+            // If the oldName was itself the target of a merge, follow the chain.
+            mapping.set(oldName, trimmed);
+            // Also update any existing mapping VALUES that pointed to oldName.
+            for (const [k, v] of mapping.entries()) {
+                if (v === oldName) mapping.set(k, trimmed);
+            }
+        }
+
+        const remap = (name) => mapping.get(name) || name;
+
+        // Rewrite segments.
+        const segments = (transcription.segments || []).map(seg => ({
+            ...seg,
+            speaker: remap(seg.speaker || seg.speakerId),
+        }));
+
+        // Rebuild speakers list — collapse duplicates that now share a name.
+        const collected = {};
+        for (const s of (transcription.speakers || [])) {
+            const newId = remap(s.id);
+            if (!collected[newId]) {
+                collected[newId] = { id: newId, speakingSeconds: 0, segments: 0 };
+            }
+            collected[newId].speakingSeconds += Number(s.speakingSeconds || 0);
+            collected[newId].segments += Number(s.segments || 0);
+        }
+        const fmtTime = (secs) => {
+            if (secs == null) return '00:00';
+            const h = Math.floor(secs / 3600);
+            const m = Math.floor((secs % 3600) / 60);
+            const s = Math.floor(secs % 60);
+            if (h > 0) return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+            return `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+        };
+        const speakers = Object.values(collected).map(s => ({
+            ...s,
+            speakingTime: fmtTime(s.speakingSeconds),
+        }));
+
+        // Rebuild the transcript string from segments so it stays in sync
+        // with the new labels. Matches the format used at create time.
+        const transcript = segments
+            .map(s => `[${s.speaker}] ${fmtTime(s.start)} - ${fmtTime(s.end)}: ${s.text || ''}`)
+            .join('\n');
+
+        await transcriptionStore.updateTranscription(req.params.id, userId, {
+            segments,
+            speakers,
+            transcript,
+        });
+
+        const updated = await transcriptionStore.getTranscription(req.params.id, userId, { orgIds, userGroupIds, isSuperAdmin });
+        res.json(updated);
     } catch (err) {
-        console.error('[Transcriptions] Unshare error:', err.message);
-        res.status(500).json({ error: 'Failed to unshare' });
+        console.error('[Transcriptions] Speaker edit error:', err.message);
+        res.status(500).json({ error: 'Failed to update speakers' });
     }
 });
 
@@ -1437,7 +1659,7 @@ router.post('/from-nextcloud', requireAuth, async (req, res) => {
         catch (_) { try { fs.unlinkSync(tmpPath); } catch (_) {} }
 
         const saved = await transcriptionStore.createTranscription({
-            userId, title, fileName, language,
+            userId, organizationId: userOrgId, title, fileName, language,
             durationSeconds: Math.round(totalDuration),
             speakerCount: speakers.length, segmentCount: merged.length,
             fullText: response.text || '', transcript, segments: merged, speakers,

@@ -361,11 +361,10 @@ async function seedAll({ force = false, bwbIds = null } = {}) {
 /**
  * Boot helper. Safe to call from server start-up:
  *   - Async / non-blocking — kicks off the seed in the background and returns.
- *   - Resume-aware: runs seedAll whenever the KB is missing any statute from
- *     the catalogue. Combined with the source_uri pre-check in ingestOne,
- *     this makes re-boots after a crashed/interrupted seed (e.g. SIGINT
- *     during deploy) automatically pick up the remaining statutes without
- *     re-downloading the ones already in the DB.
+ *   - Runs seedAll only when the KB has zero documents. Any non-zero state
+ *     (including partial seeds where a statute permanently fails to parse) is
+ *     left alone so deploys don't repeatedly re-attempt the same fetches.
+ *     Use admin "Refresh now" to resume a partial seed or re-ingest.
  *   - Logs progress; never throws.
  */
 function seedIfMissing() {
@@ -376,15 +375,11 @@ function seedIfMissing() {
                 const all = await kbStore.listSystemKBs();
                 const found = all.find(k => k.id === kb.id);
                 const docCount = Number(found?.document_count || 0);
-                if (docCount >= STATUTES.length) {
-                    console.log(`[dutchLawIngest] Boot: KB fully seeded (${docCount}/${STATUTES.length} docs); skipping auto-seed. Use admin "Refresh now" to re-ingest.`);
+                if (docCount > 0) {
+                    console.log(`[dutchLawIngest] Boot: KB already has ${docCount}/${STATUTES.length} docs; skipping auto-seed. Use admin "Refresh now" to resume or re-ingest.`);
                     return;
                 }
-                if (docCount > 0) {
-                    console.log(`[dutchLawIngest] Boot: KB partially seeded (${docCount}/${STATUTES.length}); resuming...`);
-                } else {
-                    console.log('[dutchLawIngest] Boot: seeding system KB in background...');
-                }
+                console.log('[dutchLawIngest] Boot: KB empty, seeding in background...');
             } else {
                 console.log('[dutchLawIngest] Boot: seeding system KB in background...');
             }

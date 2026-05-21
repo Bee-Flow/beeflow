@@ -568,18 +568,6 @@ async function buildToolHint(tools, userId = null) {
     }
     console.log(`[MCP-DEBUG] buildToolHint final integrations: [${integrations.join(', ')}]`);
 
-    // Inject email writing style profile when gmail or outlook tools are active
-    if (userId && (tools.some(t => t.function.name.startsWith('gmail_')) || tools.some(t => t.function.name.startsWith('outlook_')))) {
-        try {
-            const toneProfile = await configStore.getConfig(`email_tone_profile_user_${userId}`);
-            if (toneProfile) {
-                hint += `\n\n[EMAIL WRITING STYLE — ALREADY LOADED]\nYou already have the user's writing style profile below. Do NOT search for it — just apply it directly when composing, replying to, or drafting any email. Write as if you ARE this person. Match their language, tone, greetings, sign-offs, sentence structure, and vocabulary exactly:\n\n${toneProfile}\n\n[END OF WRITING STYLE — apply this immediately when writing emails, no need to fetch it]`;
-            }
-        } catch (e) {
-            // Ignore — tone profile not available
-        }
-    }
-
     return hint;
 }
 

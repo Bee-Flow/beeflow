@@ -24,9 +24,15 @@ COPY package*.json ./
 RUN --mount=type=cache,target=/root/.npm \
     npm install --omit=dev --no-audit --no-fund --prefer-offline
 
-# Install Playwright Chromium for document rendering (PDF generation)
-RUN --mount=type=cache,target=/root/.cache/ms-playwright \
-    npx playwright install-deps chromium && npx playwright install chromium
+# Install Playwright Chromium for document rendering (PDF generation) and
+# the Tests Studio explore-mode / suite-mode runs. The browser binaries must
+# live in the final image, NOT a buildkit cache mount — a cache mount is only
+# present during build, so cached browsers would vanish at runtime. We also
+# pin a stable cache path via PLAYWRIGHT_BROWSERS_PATH so dev bind-mounts
+# can't shadow it.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN npx playwright install-deps chromium \
+    && npx playwright install chromium
 
 # Copy server source
 COPY . .

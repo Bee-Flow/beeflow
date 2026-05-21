@@ -141,10 +141,14 @@ const now = Math.floor(Date.now() / 1000);
     assert.strictEqual(status.license, null);
     assert.ok(status.features.includes('chat_basic'));
     assert.ok(status.features.includes('skills'), 'community keeps skills');
-    assert.ok(status.features.includes('agent_routines'), 'community keeps agent routines');
+    assert.ok(!status.features.includes('agent_routines'), 'agent_routines promoted to enterprise (second wave)');
     assert.ok(!status.features.includes('automations'), 'automations was promoted to enterprise');
     assert.ok(!status.features.includes('voice_chat'), 'voice_chat was promoted to enterprise');
     assert.ok(!status.features.includes('notebooks'), 'notebooks is enterprise');
+    assert.ok(!status.features.includes('projects'), 'projects was promoted to enterprise (second wave)');
+    assert.ok(!status.features.includes('pii_tokenize'), 'pii_tokenize is enterprise (second wave)');
+    assert.ok(!status.features.includes('web_search_guard'), 'web_search_guard is enterprise (second wave)');
+    assert.ok(!status.features.includes('advanced_usage_monitoring'), 'advanced_usage_monitoring is enterprise (second wave)');
     assert.strictEqual(status.limits.max_users, -1, 'community is uncapped');
 
     // ── Activate a legacy Pro license → resolves as enterprise ─────────

@@ -47,10 +47,11 @@ const enterprise = t.getFeaturesForTier('enterprise');
 const full = t.getFeaturesForTier('full');
 
 // Community is the free self-hosted core: chat + KB + Nextcloud + multi-user
-// + agent routines + skills. Studio-class capabilities (voice, webpages,
-// automations, meeting notes, ticket assistant, notebooks, component
-// designer) were promoted to Enterprise in the tier tightening — see
-// docs/docs/licensing/tiers.md.
+// + skills. Studio-class capabilities (voice, webpages, automations, agent
+// routines, meeting notes, ticket assistant, notebooks, component designer,
+// projects), the advanced Privacy Shield modes (tokenize PII, web-search
+// guard), and the non-overview Usage tabs were promoted to Enterprise in
+// the tier tightening — see docs/docs/licensing/tiers.md.
 assert.ok(community.includes('chat_basic'));
 assert.ok(community.includes('kb_local_small'));
 assert.ok(community.includes('kb_unlimited'), 'community must include kb_unlimited');
@@ -58,7 +59,6 @@ assert.ok(community.includes('nextcloud_basic'));
 assert.ok(community.includes('nextcloud_oauth'));
 assert.ok(community.includes('single_user_login'));
 assert.ok(community.includes('multi_user'), 'community must include multi_user');
-assert.ok(community.includes('agent_routines'));
 assert.ok(community.includes('skills'), 'community must include skills');
 
 // Promoted to Enterprise — must NOT be in community.
@@ -66,10 +66,15 @@ for (const f of [
     'voice_chat',
     'webpages',
     'automations',
+    'agent_routines',
     'meeting_notes',
     'ticket_assistant',
     'component_designer',
     'notebooks',
+    'projects',
+    'pii_tokenize',
+    'web_search_guard',
+    'advanced_usage_monitoring',
 ]) {
     assert.ok(!community.includes(f), `community must NOT include promoted feature ${f}`);
 }
@@ -86,10 +91,15 @@ for (const f of [
     'voice_chat',
     'webpages',
     'automations',
+    'agent_routines',
     'meeting_notes',
     'ticket_assistant',
     'component_designer',
     'notebooks',
+    'projects',
+    'pii_tokenize',
+    'web_search_guard',
+    'advanced_usage_monitoring',
     'guardrails_dlp',
     'compliance_hub_gdpr',
     'compliance_hub_aia',
@@ -143,7 +153,7 @@ assert.strictEqual(t.getLimitsForTier('community').max_agents, -1, 'getLimitsFor
 // ── tierHasFeature ──────────────────────────────────────────────────────
 assert.strictEqual(t.tierHasFeature('community', 'chat_basic'), true);
 assert.strictEqual(t.tierHasFeature('community', 'skills'), true);
-assert.strictEqual(t.tierHasFeature('community', 'agent_routines'), true);
+assert.strictEqual(t.tierHasFeature('community', 'agent_routines'), false, 'agent_routines is now enterprise');
 assert.strictEqual(t.tierHasFeature('community', 'automations'), false, 'automations is enterprise');
 assert.strictEqual(t.tierHasFeature('community', 'voice_chat'), false, 'voice_chat is enterprise');
 assert.strictEqual(t.tierHasFeature('community', 'webpages'), false);
@@ -151,17 +161,28 @@ assert.strictEqual(t.tierHasFeature('community', 'meeting_notes'), false);
 assert.strictEqual(t.tierHasFeature('community', 'ticket_assistant'), false);
 assert.strictEqual(t.tierHasFeature('community', 'component_designer'), false);
 assert.strictEqual(t.tierHasFeature('community', 'notebooks'), false);
+assert.strictEqual(t.tierHasFeature('community', 'projects'), false, 'projects is now enterprise');
+assert.strictEqual(t.tierHasFeature('community', 'pii_tokenize'), false);
+assert.strictEqual(t.tierHasFeature('community', 'web_search_guard'), false);
+assert.strictEqual(t.tierHasFeature('community', 'advanced_usage_monitoring'), false);
 assert.strictEqual(t.tierHasFeature('community', 'sso_saml'), false);
 assert.strictEqual(t.tierHasFeature('enterprise', 'automations'), true, 'enterprise gets promoted features');
+assert.strictEqual(t.tierHasFeature('enterprise', 'agent_routines'), true);
 assert.strictEqual(t.tierHasFeature('enterprise', 'voice_chat'), true);
 assert.strictEqual(t.tierHasFeature('enterprise', 'component_designer'), true);
 assert.strictEqual(t.tierHasFeature('enterprise', 'notebooks'), true);
+assert.strictEqual(t.tierHasFeature('enterprise', 'projects'), true);
+assert.strictEqual(t.tierHasFeature('enterprise', 'pii_tokenize'), true);
+assert.strictEqual(t.tierHasFeature('enterprise', 'web_search_guard'), true);
+assert.strictEqual(t.tierHasFeature('enterprise', 'advanced_usage_monitoring'), true);
 assert.strictEqual(t.tierHasFeature('enterprise', 'sso_saml'), true);
 assert.strictEqual(t.tierHasFeature('full', 'white_label'), true);
 assert.strictEqual(t.tierHasFeature('enterprise', 'white_label'), false);
 assert.strictEqual(t.tierHasFeature('pro', 'sso_saml'), true, 'legacy pro inherits enterprise features');
 assert.strictEqual(t.tierHasFeature('pro', 'automations'), true, 'legacy pro must keep automations via enterprise');
 assert.strictEqual(t.tierHasFeature('pro', 'notebooks'), true, 'legacy pro must keep notebooks via enterprise');
+assert.strictEqual(t.tierHasFeature('pro', 'agent_routines'), true, 'legacy pro must keep agent_routines via enterprise');
+assert.strictEqual(t.tierHasFeature('pro', 'projects'), true, 'legacy pro must keep projects via enterprise');
 assert.strictEqual(t.tierHasFeature('bogus', 'chat_basic'), true, 'invalid tier falls back to community');
 assert.strictEqual(t.tierHasFeature('bogus', 'automations'), false, 'invalid tier falls back to community (no enterprise features)');
 

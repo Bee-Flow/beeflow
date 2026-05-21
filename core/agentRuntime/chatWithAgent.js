@@ -25,7 +25,7 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
     }
 
     // Get the model to use - supports tier-based selection (tier:auto, tier:fast, etc.)
-    const modelToUse = await resolveAgentModel(agent.model, userMessage, { ...(await getAIConfig()), organizationId: agent.organization_id, userOrgId: userAuth?.userOrgId });
+    const modelToUse = await resolveAgentModel(agent.model, userMessage, { ...(await getAIConfig()), organizationId: agent.organization_id, userOrgId: userAuth?.userOrgId }, { userId, session: userAuth?.session });
 
     // Get the correct provider config for this model
     const config = await getProviderForModel(modelToUse);

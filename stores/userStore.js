@@ -183,6 +183,10 @@ async function initDB() {
     try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS "activeIconPackId" TEXT`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "autoApproveSSO" TEXT DEFAULT '0'`); } catch (e) { /* column already exists */ }
+    // Pooled vs per-user AI-usage budget. '1' = org-wide pool (default,
+    // matches legacy behaviour); '0' = cost cap is split evenly across
+    // active seats so each user gets their own slice.
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "usage_pooled" TEXT DEFAULT '1'`); } catch (e) { /* column already exists */ }
     // Org lifecycle state. 'active' is the default; 'suspended' blocks all
     // mutations (read-only) and is used for payment disputes / ToS holds;
     // 'archived' hides the org from listings and locks reads to owners.
@@ -790,6 +794,9 @@ function parseOrg(o) {
         defaultGroups: parseJSON(o.defaultGroups, []),
         allowSignup: o.allowSignup === '1' || o.allowSignup === true,
         autoApproveSSO: o.autoApproveSSO === '1' || o.autoApproveSSO === true,
+        // Default '1' = pooled (matches legacy behaviour) when the column
+        // is null on rows older than the migration.
+        usagePooled: (o.usage_pooled ?? '1') !== '0',
         allowedDomains: parseJSON(o.allowed_domains, []),
         ncSyncGroups: parseJSON(o.nc_sync_groups, []),
         ncSyncExcludedGroups: parseJSON(o.nc_sync_excluded_groups, []),
@@ -878,11 +885,12 @@ async function updateOrganization(orgId, updates) {
     if (updates.defaultGroups !== undefined) updateMap.defaultGroups = JSON.stringify(updates.defaultGroups);
     if (updates.allowSignup !== undefined) updateMap.allowSignup = updates.allowSignup ? '1' : '0';
     if (updates.autoApproveSSO !== undefined) updateMap.autoApproveSSO = updates.autoApproveSSO ? '1' : '0';
+    if (updates.usagePooled !== undefined) updateMap.usage_pooled = updates.usagePooled ? '1' : '0';
     if (updates.enabledIntegrations !== undefined) updateMap.enabledIntegrations = updates.enabledIntegrations === null ? null : JSON.stringify(updates.enabledIntegrations);
     if (updates.allowedDomains !== undefined) updateMap.allowed_domains = updates.allowedDomains === null ? null : JSON.stringify(updates.allowedDomains);
     if (updates.ncSyncGroups !== undefined) updateMap.nc_sync_groups = JSON.stringify(updates.ncSyncGroups);
     if (updates.ncSyncExcludedGroups !== undefined) updateMap.nc_sync_excluded_groups = JSON.stringify(updates.ncSyncExcludedGroups);
-    const fullColMap = { ...colMap, defaultGroups: 'defaultGroups', allowSignup: 'allowSignup', autoApproveSSO: 'autoApproveSSO', enabledIntegrations: 'enabledIntegrations', allowed_domains: 'allowed_domains', nc_sync_groups: 'nc_sync_groups', nc_sync_excluded_groups: 'nc_sync_excluded_groups' };
+    const fullColMap = { ...colMap, defaultGroups: 'defaultGroups', allowSignup: 'allowSignup', autoApproveSSO: 'autoApproveSSO', usage_pooled: 'usage_pooled', enabledIntegrations: 'enabledIntegrations', allowed_domains: 'allowed_domains', nc_sync_groups: 'nc_sync_groups', nc_sync_excluded_groups: 'nc_sync_excluded_groups' };
     try {
         const q = dynamicUpdate('organizations', orgId, updateMap, fullColMap);
         if (q) await run(q.sql, q.params);

@@ -3,13 +3,14 @@
  */
 const { resolveModelId } = require('../aiAgent');
 const configStore = require('../../stores/configStore');
+const { getPermittedTierKeys } = require('../userTiers');
 
-async function resolveAgentModel(agentModel, userMessage, globalConfig) {
+async function resolveAgentModel(agentModel, userMessage, globalConfig, userContext = null) {
     // Not a tier-based model — force tier:auto resolution
     if (!agentModel || !agentModel.startsWith('tier:')) {
         console.log(`[AgentRuntime] Model "${agentModel || 'none'}" is not tier-based, resolving as tier:auto`);
         // Recurse with tier:auto to use the tier system
-        return resolveAgentModel('tier:auto', userMessage, globalConfig);
+        return resolveAgentModel('tier:auto', userMessage, globalConfig, userContext);
     }
 
     const tierName = agentModel.substring(5); // strip 'tier:'
@@ -44,16 +45,36 @@ async function resolveAgentModel(agentModel, userMessage, globalConfig) {
         return resolveModelId(globalConfig.model);
     }
 
-    // Auto tier — use unified classifier (LLM + heuristic fallback)
+    // Auto tier — restrict the classifier to tiers the user is permitted to use,
+    // so it can't pick a premium tier (e.g. Flow/standard) the user lacks access to.
+    let classifierTiers = tiers;
+    if (userContext?.userId) {
+        try {
+            const permitted = await getPermittedTierKeys({
+                userId: userContext.userId,
+                session: userContext.session,
+            });
+            const filtered = {};
+            for (const [key, value] of Object.entries(tiers)) {
+                if (permitted.has(key)) filtered[key] = value;
+            }
+            // Always keep `fast` available as the safety-net fallback below.
+            if (!filtered.fast && tiers.fast) filtered.fast = tiers.fast;
+            classifierTiers = filtered;
+        } catch (err) {
+            console.log(`[AgentRuntime] Could not load permitted tiers for user ${userContext.userId}: ${err.message}`);
+        }
+    }
+
     try {
         const { classifyWithLLM } = require('../promptClassifier');
-        const result = await classifyWithLLM(userMessage, tiers);
-        const model = tiers[result.tier]?.modelId || tiers.fast?.modelId || resolveModelId(globalConfig.model);
+        const result = await classifyWithLLM(userMessage, classifierTiers);
+        const model = classifierTiers[result.tier]?.modelId || classifierTiers.fast?.modelId || tiers.fast?.modelId || resolveModelId(globalConfig.model);
         console.log(`[AgentRuntime] Auto: tier="${result.tier}" → model: ${model} (${result.method}: ${result.reason})`);
         return model;
     } catch (err) {
         console.log(`[AgentRuntime] Auto classification failed: ${err.message}, using default`);
-        return tiers.fast?.modelId || resolveModelId(globalConfig.model);
+        return classifierTiers.fast?.modelId || tiers.fast?.modelId || resolveModelId(globalConfig.model);
     }
 }
 

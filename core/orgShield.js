@@ -7,6 +7,55 @@
 
 const configStore = require('../stores/configStore');
 
+// ── Tier-driven shield clamps ─────────────────────────────────────────
+//
+// The licence-aware Privacy Shield clamps in server/routes/orgPrivacyShield.js
+// stop tokenize / web-search-guard from being SAVED on community tier.
+// This helper applies the same clamps when the runtime READS a stored
+// row directly via configStore — covers stale pre-clamp rows and the
+// guardrailsRunner / piiDetection read paths that bypass the route's
+// GET handler.
+//
+// Lazy-required to avoid a circular import (license → store/userStore →
+// orgShield is a possible chain through future hot-path additions).
+let _license = null;
+function _licenseModule() {
+    if (!_license) _license = require('../license');
+    return _license;
+}
+
+/**
+ * Mutates `shield` in-place to enforce tier-driven clamps:
+ *   - `pii_tokenize` missing → piiDetectionAction → 'block'
+ *   - `web_search_guard` missing → webSearchGuardEnabled = false,
+ *                                  webSearchGuardPiiCategories = []
+ *
+ * Safe to call with null/undefined; no-op when nothing to clamp.
+ * Fails closed: any resolver error falls back to community-tier clamps
+ * (strictest), matching server/routes/orgPrivacyShield.js _tierClamps.
+ */
+async function applyTierClampsToShield(shield, { organizationId, userId } = {}) {
+    if (!shield || typeof shield !== 'object') return shield;
+    let hasPiiTokenize = false;
+    let hasWebSearchGuard = false;
+    try {
+        const lic = _licenseModule();
+        const tier = await lic.resolveTier({ organizationId, userId });
+        hasPiiTokenize = lic.tiers.tierHasFeature(tier, 'pii_tokenize');
+        hasWebSearchGuard = lic.tiers.tierHasFeature(tier, 'web_search_guard');
+    } catch (_) {
+        // fail closed — leave both `false`, strictest clamps apply
+    }
+    if (!hasPiiTokenize && shield.piiDetectionAction && shield.piiDetectionAction !== 'block') {
+        shield.piiDetectionAction = 'block';
+    }
+    if (!hasWebSearchGuard) {
+        shield.webSearchGuardEnabled = false;
+        shield.webSearchGuardPiiCategories = [];
+    }
+    return shield;
+}
+
 /**
  * Resolve org privacy shield rules for a given organization ID.
  * Returns null if no shield is configured or enabled.
@@ -19,6 +68,11 @@ async function resolveOrgShield(orgId) {
 
     const shield = await configStore.getConfig(`org_privacy_shield_${orgId}`);
     if (!shield?.enabled) return null;
+
+    // Apply tier-driven clamps before any further resolution so a
+    // pre-clamp stored row can't sneak a tokenize PII action or active
+    // Web Search Guard past the licence on a community install.
+    await applyTierClampsToShield(shield, { organizationId: orgId });
 
     // Need global regex config to resolve collection IDs to actual rules
     const { getAIConfig } = require('./aiAgent');
@@ -344,4 +398,4 @@ async function resolveShieldFor({ orgId, userId }) {
     return resolveUserShield(userId);
 }
 
-module.exports = { resolveOrgShield, resolveUserShield, resolveShieldFor, mergeWithOrgShield, selfCheckOrgShields };
+module.exports = { resolveOrgShield, resolveUserShield, resolveShieldFor, mergeWithOrgShield, selfCheckOrgShields, applyTierClampsToShield };

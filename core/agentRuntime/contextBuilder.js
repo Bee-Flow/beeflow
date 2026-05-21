@@ -126,13 +126,19 @@ Org Word/DOCX kantoorstijl "${houseStyle.name}" wordt automatisch toegepast bij 
 
     if (messageMetadata?.notebookspaceAvailable) {
         systemPrompt += `\n\n[NOTEBOOK CAPABILITY]
-A Notebook panel is available in the user's UI. For long-form output the user is likely to keep or edit — memos, notes, letters, briefs, reports, articles, plans, code files, meeting notes — write the document into the notebook by calling notebook_write. The panel auto-opens when you write. Tools:
+A Notebook panel is available in the user's UI. Tools:
 - notebook_read: Read content. Modes: "outline" (default—headings+stats), "section" (one section by heading), "search" (find text), "full" (entire doc). Use outline first, then section/search for targeted access.
 - notebook_write: Replace ALL content (for new documents or full rewrites). Write in Markdown.
 - notebook_replace: Replace a SPECIFIC portion (find_text + replace_text). Preferred for partial edits.
 - notebook_insert: Add content at "start", "end", or "after" a heading.
 
-CRITICAL: When you use a notebook tool, do NOT also write the document text in your chat reply. Acknowledge briefly (one short sentence) and stop — the user reads the result in the Notebook panel. Use Markdown inside the notebook for headings, bold, tables, lists, code blocks.`;
+CRITICAL — WHEN TO WRITE TO THE NOTEBOOK:
+- Only call notebook_write, notebook_replace, or notebook_insert when the user has EXPLICITLY asked you to put something in the notebook (e.g. "save this to the notebook", "schrijf dit in het notebook", "zet in mijn notitie", "add to the document", "write the report in the notebook", "noteer dit", "draft a letter in the notebook").
+- Mere requests to "write", "draft", "summarise", "translate", "rewrite", "explain", or produce long-form content are NOT a notebook request — reply in chat instead. The user will explicitly ask if they want it in the notebook.
+- If unsure whether the user wants the output in the notebook, do NOT write to it. Reply in chat and ask, or just answer in chat.
+- The notebook is the user's document — never overwrite, append to, or modify it without an explicit instruction to do so.
+
+When you DO use a notebook tool (after an explicit request), do NOT also write the document text in your chat reply. Acknowledge briefly (one short sentence) and stop — the user reads the result in the Notebook panel. Use Markdown inside the notebook for headings, bold, tables, lists, code blocks.`;
     }
     if (messageMetadata?.notebookspaceContent !== undefined) {
         systemPrompt += `\n\n[NOTEBOOK OPEN]

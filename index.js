@@ -295,9 +295,26 @@ app.use('/reports', reportsRouter);
 app.use('/apps', appsRouter);
 
 app.use('/versions', require('./routes/versions'));
-app.use('/api/usage', require('./routes/usage'));
-app.use('/api/terminations', require('./routes/terminations'));
-app.use('/api/feedback', require('./routes/feedback'));
+// The non-Overview Usage & Monitoring tabs (Safety / Integrations / Azure
+// services) sit on `/api/usage/{guardrails,integrations,azure-services}/*`
+// and require `advanced_usage_monitoring` (enterprise+). The Overview tab
+// hits other paths (/summary, /timeline, /users, etc.) which stay free.
+// We inject a path-aware gate that runs only for the gated sub-prefixes
+// — the same /api/usage router serves both. `requireFeature` is
+// destructured further down (L340), so we lazy-require it here.
+const _ADV_USAGE_PREFIXES = ['/guardrails', '/integrations', '/azure-services'];
+const _advUsagePrefixGate = (req, res, next) => {
+    const path = req.path || '';
+    const hit = _ADV_USAGE_PREFIXES.some(p => path === p || path.startsWith(p + '/'));
+    if (!hit) return next();
+    return require('./license/middleware').requireFeature('advanced_usage_monitoring')(req, res, next);
+};
+app.use('/api/usage', _advUsagePrefixGate, require('./routes/usage'));
+// /api/terminations and /api/feedback back the Terminations + Feedback
+// usage tabs — same advanced-monitoring gate, applied at the mount.
+const _advUsageGate = (req, res, next) => require('./license/middleware').requireFeature('advanced_usage_monitoring')(req, res, next);
+app.use('/api/terminations', _advUsageGate, require('./routes/terminations'));
+app.use('/api/feedback', _advUsageGate, require('./routes/feedback'));
 app.use('/api/client-errors', require('./routes/clientErrors'));
 app.use('/api/web-vitals', require('./routes/webVitals'));
 app.use('/api/csp-report', require('./routes/cspReport'));
@@ -351,7 +368,12 @@ const projectFeatureGate = async (req, res, next) => {
     } catch (_) { /* allow on error — fail open */ }
     next();
 };
-app.use('/api/projects', projectFeatureGate, require('./routes/projects'));
+// Licence gate fires BEFORE the configStore feature gate so a community
+// user sees the actionable `feature_locked` upgrade body rather than the
+// less informative "Projects feature is disabled" string. The configStore
+// gate remains as an operator override for enterprise installs that want
+// to disable Projects per deployment.
+app.use('/api/projects', requireLicenseFeature('projects'), projectFeatureGate, require('./routes/projects'));
 app.use('/api/reminders', require('./routes/reminders'));
 app.use('/api/ai-tasks', require('./routes/aiTasks'));
 app.use('/api/automation/builder', requireLicenseFeature('automations'), require('./routes/ai/automationBuilder'));
@@ -398,7 +420,6 @@ app.use('/api/webpages-preview', require('./routes/webpagesPreview'));
 // Meeting Notes beta feature gate
 const { requireBetaFeature } = require('./core/betaFeatures');
 app.use('/api/transcriptions', requireLicenseFeature('meeting_notes'), requireBetaFeature('meeting_notes'), require('./routes/transcriptions'));
-app.use('/api/meet-bot', requireLicenseFeature('meeting_notes'), requireBetaFeature('meeting_notes'), require('./routes/meetBot'));
 app.use('/api/skills', requireLicenseFeature('skills'), requireBetaFeature('skills'), require('./routes/skills'));
 // ITIL Ticket Assistant (formerly Email Knowledge Base). Both mount paths point
 // to the same router while the `email_knowledge_base` beta-flag alias is live;
@@ -407,6 +428,15 @@ app.use('/api/skills', requireLicenseFeature('skills'), requireBetaFeature('skil
 const ticketAssistantRouter = require('./routes/ticketAssistant');
 app.use('/api/ticket-assistant', requireLicenseFeature('ticket_assistant'), requireBetaFeature('itil_ticket_assistant'), ticketAssistantRouter);
 app.use('/api/email-kb',        requireLicenseFeature('ticket_assistant'), requireBetaFeature('itil_ticket_assistant'), ticketAssistantRouter);
+
+// Customer Support — Bee Flow's own AI-first support inbox. Mounted publicly
+// (no license/beta gate) because the POST /threads endpoint accepts anonymous
+// submissions from the marketing site; staff-only endpoints enforce
+// admin_support inside the router.
+app.use('/api/support', require('./routes/support'));
+
+// Tests Studio — Playwright generation + runs. Beta-gated + enterprise feature.
+app.use('/api/tests', requireLicenseFeature('playwright_tests'), requireBetaFeature('playwright_tests'), require('./routes/tests'));
 
 app.use('/', require('./routes/knowledge'));
 app.use('/api/kb', require('./routes/knowledgeBases'));
@@ -679,6 +709,24 @@ app.listen(PORT, '0.0.0.0', () => {
         }
     }
 
+    // Playwright test-run drain — claims test_run_jobs outbox rows and spawns
+    // Playwright. Same outbox + backoff pattern as PAYG drain. Self-hosted
+    // installs run it too — Playwright is local; nothing depends on cloud.
+    try {
+        const TEST_RUN_DRAIN_INTERVAL_MS = parseInt(process.env.PLAYWRIGHT_DRAIN_TICK_INTERVAL_MS || '15000', 10);
+        const runTestDrain = async () => {
+            try {
+                const r = await require('./workers/testRunner').drainOnce();
+                if (r?.processed) console.log(`[TestRunner] processed=${r.processed}`);
+            } catch (e) { console.error('[TestRunner] tick error:', e.message); }
+        };
+        setTimeout(runTestDrain, 20_000).unref();
+        setInterval(runTestDrain, TEST_RUN_DRAIN_INTERVAL_MS).unref();
+        console.log(`[Server] Playwright test-run drain scheduler started (interval=${TEST_RUN_DRAIN_INTERVAL_MS}ms)`);
+    } catch (e) {
+        console.warn('[Server] Failed to start test-run drain scheduler:', e.message);
+    }
+
     // Non-invasive self-check of every org Privacy Shield blob. Logs warnings
     // for legacy shapes, orphaned regex collections, and invalid custom terms
     // so operators can spot guardrail drift in the startup log.
@@ -703,9 +751,59 @@ app.listen(PORT, '0.0.0.0', () => {
     require('./jobs/memoryRetentionEnforcer').start();
 
     // Seed system agents into the database (explicit lifecycle call, not a require() side-effect)
-    const { seedSystemAgents } = require('./stores/agent/systemAgents');
+    const { seedSystemAgents, SYSTEM_AGENT_IDS } = require('./stores/agent/systemAgents');
     seedSystemAgents()
-        .then(() => console.log('[Server] System agents seeded'))
+        .then(async () => {
+            console.log('[Server] System agents seeded');
+            // Point the support AI responder at the seeded Bee Flow Support
+            // singleton — keeps the existing `configStore.support_ai_agent_id`
+            // contract working without admins having to paste a UUID.
+            try {
+                const configStore = require('./stores/configStore');
+                const current = await configStore.getConfig('support_ai_agent_id');
+                if (current !== SYSTEM_AGENT_IDS.BEE_FLOW_SUPPORT) {
+                    await configStore.setConfig('support_ai_agent_id', SYSTEM_AGENT_IDS.BEE_FLOW_SUPPORT);
+                    console.log('[Server] support_ai_agent_id pointed at Bee Flow Support singleton');
+                }
+            } catch (e) {
+                console.warn('[Server] Could not sync support_ai_agent_id:', e.message);
+            }
+            // Sanity check — if the seed failed silently or someone DELETE'd
+            // the row, every support thread will escalate. Surface this as a
+            // warning so operators see it without having to inspect the DB.
+            try {
+                const agentStore = require('./stores/agentStore');
+                const configStore = require('./stores/configStore');
+                const { pool } = require('./db');
+                const agent = await agentStore.getAgent(SYSTEM_AGENT_IDS.BEE_FLOW_SUPPORT);
+                if (!agent) {
+                    console.warn('[Support] WARN: Bee Flow Support agent missing after seed; AI auto-responder will escalate every thread until reseeded.');
+                } else if (agent.model && agent.model.startsWith('tier:')) {
+                    // Self-healing: if the configured tier has no modelId in this
+                    // environment, every support thread would escalate with an
+                    // unhelpful "model not found" error. Auto-fallback to a tier
+                    // that IS configured. Picks the first tier with a non-empty
+                    // modelId in the order: fast → standard → thinking → writer → pro.
+                    const tierName = agent.model.slice(5);
+                    const tiers = (await configStore.getConfig('chat_model_tiers')) || {};
+                    const configured = (t) => tiers[t]?.modelId && String(tiers[t].modelId).trim().length > 0;
+                    if (tierName !== 'auto' && !configured(tierName)) {
+                        const fallback = ['fast', 'standard', 'thinking', 'writer', 'pro'].find(configured);
+                        if (fallback) {
+                            await pool.query(
+                                `UPDATE agents SET model = $1, updated_at = now() WHERE id = $2`,
+                                [`tier:${fallback}`, SYSTEM_AGENT_IDS.BEE_FLOW_SUPPORT]
+                            );
+                            console.warn(`[Support] Re-pointed Bee Flow Support from tier:${tierName} (no modelId configured) to tier:${fallback}.`);
+                        } else {
+                            console.warn(`[Support] WARN: tier:${tierName} has no modelId AND no other tier is configured. Configure at least one tier in Admin → AI Config → Model tiers, then update the support agent.`);
+                        }
+                    }
+                }
+            } catch (e) {
+                console.warn('[Support] WARN: Bee Flow Support agent check failed:', e.message);
+            }
+        })
         .catch(err => console.error('[Server] System agents seed failed:', err.message));
     // Initialize MCP server connections (non-blocking)
     try {
@@ -737,6 +835,32 @@ app.listen(PORT, '0.0.0.0', () => {
         startTicketAssistantSync();
     } catch (err) {
         console.warn('[Server] Ticket Assistant sync engine load failed:', err.message);
+    }
+    // Customer Support SLA watcher — every 15 minutes, ping staff about
+    // awaiting_agent threads with no first-response after 60 minutes.
+    try {
+        const supportStore = require('./stores/supportStore');
+        const supportRoute = require('./routes/support');
+        const _seenSla = new Map(); // threadId → last-warned timestamp
+        setInterval(async () => {
+            try {
+                const stale = await supportStore.findSlaAtRiskThreads({ olderThanMinutes: 60 });
+                for (const t of stale) {
+                    const last = _seenSla.get(t.id) || 0;
+                    if (Date.now() - last < 60 * 60 * 1000) continue; // warn at most hourly
+                    _seenSla.set(t.id, Date.now());
+                    await supportRoute.notifyStaff({
+                        title: `SLA at risk: ${t.subject}`,
+                        message: `Awaiting agent for >1h — ${t.requester_email}`,
+                        threadId: t.id,
+                    });
+                }
+            } catch (e) {
+                console.warn('[Server] Support SLA watcher tick error:', e.message);
+            }
+        }, 15 * 60 * 1000);
+    } catch (err) {
+        console.warn('[Server] Support SLA watcher load failed:', err.message);
     }
     // NC user/group sync backstop — covers gaps when real-time webhooks miss
     try {

@@ -13,12 +13,14 @@
  * Default state for a fresh, unactivated install is `community` — the system
  * must remain usable with no license key present. Community ships the free
  * self-hosted core: chat with agents, knowledge bases (local, vector, hybrid,
- * reranked), Nextcloud connector, multi-user with groups, agent routines,
- * skills marketplace. Enterprise layers Studio-class capabilities (voice
- * chat, webpages, automations, meeting notes, ticket assistant, notebooks,
- * component designer) on top, plus compliance / SSO / audit / themes /
- * swarm / analytics — and beta features in general are an enterprise+
- * benefit (enforced in core/betaFeatures.js).
+ * reranked), Nextcloud connector, multi-user with groups, and the skills
+ * marketplace. Enterprise layers Studio-class capabilities (voice chat,
+ * webpages, automations, agent routines, meeting notes, ticket assistant,
+ * notebooks, component designer, projects) on top, plus the advanced
+ * Privacy Shield modes (tokenize PII, web-search guard), the non-overview
+ * Usage & Monitoring tabs, and compliance / SSO / audit / themes / swarm
+ * / analytics — and beta features in general are an enterprise+ benefit
+ * (enforced in core/betaFeatures.js).
  *
  * The previous `pro` tier mapped to a roughly Studio-equivalent feature set.
  * Its features now live in `enterprise`; old `tier: 'pro'` JWTs and admin
@@ -70,7 +72,6 @@ const TIER_FEATURES = {
         'nextcloud_oauth',
         'single_user_login',
         'multi_user',
-        'agent_routines',
         'skills',
     ],
     enterprise: [
@@ -81,10 +82,19 @@ const TIER_FEATURES = {
         'voice_chat',
         'webpages',
         'automations',
+        'agent_routines',
         'meeting_notes',
         'ticket_assistant',
         'component_designer',
         'notebooks',
+        'projects',
+        'playwright_tests',
+        // Privacy Shield clamps + Usage tabs — second wave. The licence
+        // flag is the source of truth for the routes; orgPrivacyShield.js
+        // and the four /api/usage sub-routes enforce these gates.
+        'pii_tokenize',
+        'web_search_guard',
+        'advanced_usage_monitoring',
         // Compliance / admin block (unchanged).
         'guardrails_dlp',
         'compliance_hub_gdpr',

@@ -42,10 +42,18 @@ async function runInputGuardrails({ agent, messages, userMessage, globalConfig, 
         }).catch(() => {});
     }
 
-    // Read org shield config once (was previously read 3 times)
+    // Read org shield config once (was previously read 3 times). Tier
+    // clamps are applied to the raw row so that stale pre-clamp data
+    // (e.g. `webSearchGuardEnabled: true` saved before the second-wave
+    // tightening) cannot enforce on a community install. This is the
+    // direct-configStore read path that bypasses the orgPrivacyShield
+    // route's GET handler — defence-in-depth.
+    const { applyTierClampsToShield } = require('../orgShield');
     const orgShield = await (async () => {
         if (!agent.organization_id) return null;
-        return await configStore.getConfig(`org_privacy_shield_${agent.organization_id}`);
+        const shield = await configStore.getConfig(`org_privacy_shield_${agent.organization_id}`);
+        if (shield) await applyTierClampsToShield(shield, { organizationId: agent.organization_id, userId });
+        return shield;
     })();
 
     const webSearchGuardEnabled = !!(orgShield?.enabled && orgShield?.webSearchGuardEnabled) || !!agent.config?.webSearchGuardEnabled;

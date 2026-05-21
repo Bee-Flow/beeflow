@@ -153,7 +153,13 @@ async function checkSubscriptionLimits(orgId, agentType, userId = null) {
         return checkConsumerLimits(userId, agentType);
     }
     const limits = await userStore.getEffectiveLimits(orgId);
-    if (!limits) return null; // No subscription = no limits
+    if (!limits) {
+        // No active subscription on cloud — block all paid surfaces. The
+        // UI redirects org admins to the License page where they can pick
+        // a plan; everyone else gets this 403 message until an admin
+        // subscribes. Self-hosted is short-circuited above.
+        return 'Your organization does not have an active subscription. Ask an organisation admin to choose a plan in Settings → Organisation → License & Usage.';
+    }
 
     // Suspended or cancelled orgs are fully blocked
     if (limits.status === 'suspended') return 'Your organization\'s subscription is suspended. Please contact your administrator.';
@@ -163,6 +169,15 @@ async function checkSubscriptionLimits(orgId, agentType, userId = null) {
     const sub = await userStore.getOrgSubscription(orgId);
     const period = userStore.getBillingPeriod(sub);
     const summary = await usageStore.getUsageSummary({ startDate: period.startDate, endDate: new Date().toISOString(), organizationId: orgId });
+
+    // Resolve pooled vs per-user budget mode for this org. '1' = pooled
+    // (legacy default); '0' = each active seat gets cap / seats as their
+    // personal slice. Failure to load the row falls back to pooled.
+    let pooled = true;
+    try {
+        const org = await userStore.getOrganization(orgId);
+        pooled = (org?.usage_pooled ?? '1') !== '0' && org?.usagePooled !== false;
+    } catch (_) { /* keep pooled = true */ }
 
     // Check total messages limit
     if (limits.max_messages_per_month !== null && limits.max_messages_per_month !== undefined) {
@@ -184,13 +199,30 @@ async function checkSubscriptionLimits(orgId, agentType, userId = null) {
     // 100 % and an idempotent 80 %-of-cap warning email is sent once per
     // (orgId, billing-period) tuple. Both gates are keyed on the same
     // billing window so the warning resets cleanly each period.
+    //
+    // When the org runs in per-user mode (`usage_pooled = '0'`), each user
+    // gets cap / max(active_seats, 1) as a personal slice. The org-wide
+    // warning email still fires off the pooled total at 80 % so the admin
+    // sees plan-wide pressure regardless of mode.
     if (limits.max_cost_per_month !== null && limits.max_cost_per_month !== undefined) {
         const billed = Number(summary.total_billed_cost || 0);
         const estimated = Number(summary.total_estimated_cost || 0);
         const cost = billed > 0 ? billed : estimated;
         const cap = Number(limits.max_cost_per_month);
-        if (cost >= cap) {
-            return `Your organization has reached its monthly cost limit (\u20ac${cap.toFixed(2)}). Please contact your administrator.`;
+        if (pooled) {
+            if (cost >= cap) {
+                return `Your organization has reached its monthly cost limit (\u20ac${cap.toFixed(2)}). Please contact your administrator.`;
+            }
+        } else if (userId) {
+            const seats = Math.max(1, await userStore.getActiveSeatCount(orgId).catch(() => 1));
+            const perUserCap = cap / seats;
+            const uSummary = await usageStore.getUsageSummary({ startDate: period.startDate, endDate: new Date().toISOString(), organizationId: orgId, userId });
+            const uBilled = Number(uSummary?.total_billed_cost || 0);
+            const uEstimated = Number(uSummary?.total_estimated_cost || 0);
+            const uCost = uBilled > 0 ? uBilled : uEstimated;
+            if (uCost >= perUserCap) {
+                return `You have reached your personal AI usage budget for this period (\u20ac${perUserCap.toFixed(2)}). Pooled usage is disabled \u2014 contact your administrator.`;
+            }
         }
         if (cap > 0 && cost >= cap * 0.8) {
             // Fire-and-forget 80 % warning, gated by claimNotification so a

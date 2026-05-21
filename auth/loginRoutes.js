@@ -107,7 +107,6 @@ router.get('/setup-status', async (req, res) => {
     const isOAuthConfigured = !!(config.oauth.clientId && config.oauth.clientSecret);
     const isGoogleConfigured = !!(config.providers?.google?.clientId && config.providers?.google?.clientSecret);
     const isMicrosoftConfigured = !!(config.providers?.microsoft?.clientId && config.providers?.microsoft?.clientSecret);
-    console.log('[Auth] setup-status — google providers config:', JSON.stringify(config.providers?.google ? { clientId: !!config.providers.google.clientId, clientSecret: !!config.providers.google.clientSecret } : 'none'));
     // Expose server URL so frontend can redirect OAuth directly to the backend
     // (bypassing the frontend nginx proxy which strips Set-Cookie from 302s)
     const serverUrl = process.env.SERVER_PUBLIC_HOST

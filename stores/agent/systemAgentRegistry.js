@@ -109,6 +109,23 @@ const REGISTRY = [
         defaultModel: null,
         alwaysUpdate: true,
     },
+    {
+        id: 'system-bee-flow-support',
+        name: 'Bee Flow Support',
+        description: 'AI-first customer-support agent that answers Bee Flow customer threads',
+        promptFile: 'bee-flow-support.md',
+        // `tier:fast` is the only tier that's guaranteed to have a configured
+        // modelId on a fresh install (the AI Config admin requires it before
+        // the chat tab works at all). Other tiers (thinking/writer/pro) are
+        // opt-in extras admins set up later — picking them as the default
+        // would break support replies on environments that haven't filled
+        // those out yet. Admins can still pick any tier in the Support → AI
+        // configuration panel after install.
+        defaultModel: 'tier:fast',
+        // Singleton edited via the admin Support → AI configuration panel;
+        // never overwrite admin edits at boot.
+        alwaysUpdate: false,
+    },
 ];
 
 // ── Derived constants ────────────────────────────────────────────────────────

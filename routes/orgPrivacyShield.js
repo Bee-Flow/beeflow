@@ -11,6 +11,70 @@ const configStore = require('../stores/configStore');
 const userStore = require('../stores/userStore');
 const { resolveUserOrgIds, isOrgAdminRole } = require('../auth');
 
+// Lazy-required to avoid pulling the licence module into the route's
+// import chain at boot. Licence module depends on stores/userStore which
+// some test fixtures stub — keeping this lazy preserves backward compat.
+let _license = null;
+function _licenseModule() {
+    if (!_license) _license = require('../license');
+    return _license;
+}
+
+/**
+ * Returns the tier-driven clamps that apply to a privacy-shield config
+ * for the given org. Resolves the tier (via the licence resolver, which
+ * already honours the server-wide override) and returns the set of
+ * fields that need clamping.
+ *
+ *   - `pii_tokenize` missing → piiDetectionAction must be 'block'
+ *   - `web_search_guard` missing → webSearchGuardEnabled = false,
+ *                                  webSearchGuardPiiCategories = []
+ *
+ * Returns { tier, hasPiiTokenize, hasWebSearchGuard }.
+ */
+async function _tierClamps({ organizationId, userId }) {
+    try {
+        const lic = _licenseModule();
+        const tier = await lic.resolveTier({ organizationId, userId });
+        return {
+            tier,
+            hasPiiTokenize: lic.tiers.tierHasFeature(tier, 'pii_tokenize'),
+            hasWebSearchGuard: lic.tiers.tierHasFeature(tier, 'web_search_guard'),
+        };
+    } catch (e) {
+        // Fail closed: if tier resolution breaks we clamp to the
+        // strictest community-tier behaviour. Prevents an upgrade from
+        // accidentally getting downgraded; the affected admin sees the
+        // clamped values, retries, and gets the real ones.
+        console.warn('[OrgPrivacyShield] tier resolve failed, applying community clamps:', e.message);
+        return { tier: 'community', hasPiiTokenize: false, hasWebSearchGuard: false };
+    }
+}
+
+/**
+ * In-place clamp of a stored config blob to the tier's allowed values.
+ * Returns the list of fields that had to be clamped so the caller can
+ * surface a `clamped_fields` marker in the response.
+ */
+function _applyTierClamps(config, { hasPiiTokenize, hasWebSearchGuard }) {
+    const clamped = [];
+    if (!hasPiiTokenize && config.piiDetectionAction && config.piiDetectionAction !== 'block') {
+        config.piiDetectionAction = 'block';
+        clamped.push('piiDetectionAction');
+    }
+    if (!hasWebSearchGuard) {
+        if (config.webSearchGuardEnabled) {
+            config.webSearchGuardEnabled = false;
+            clamped.push('webSearchGuardEnabled');
+        }
+        if (Array.isArray(config.webSearchGuardPiiCategories) && config.webSearchGuardPiiCategories.length > 0) {
+            config.webSearchGuardPiiCategories = [];
+            clamped.push('webSearchGuardPiiCategories');
+        }
+    }
+    return clamped;
+}
+
 function requireAuth(req, res, next) {
     if (req.session && req.session.user) return next();
     res.status(401).json({ error: 'Unauthorized' });
@@ -99,7 +163,22 @@ router.get('/:orgId', requireAuth, async (req, res) => {
             }
         } catch (_) { /* non-fatal */ }
 
-        res.json(config);
+        // Tier-driven clamps: a community-tier read of a stored config
+        // that pre-dates the tightening must surface the EFFECTIVE values
+        // the runtime will honour, not the stale-stored ones — otherwise
+        // the admin UI shows "tokenize" while the backend silently treats
+        // PII as block-only. We don't rewrite the stored row; we only
+        // clamp the response payload. Deep-clone first so we never mutate
+        // the (potentially shared) configStore reference.
+        const clamps = await _tierClamps({ organizationId: orgId, userId: req.session?.user?.id });
+        const responseConfig = JSON.parse(JSON.stringify(config));
+        const clampedFields = _applyTierClamps(responseConfig, clamps);
+        if (clampedFields.length > 0) {
+            responseConfig.clamped_fields = clampedFields;
+            responseConfig.clamped_tier = clamps.tier;
+        }
+
+        res.json(responseConfig);
     } catch (e) {
         console.error('[OrgPrivacyShield] GET error:', e);
         res.status(500).json({ error: e.message });
@@ -182,6 +261,17 @@ router.put('/:orgId', requireAuth, async (req, res) => {
             updatedBy: req.session.user.id,
         };
 
+        // Tier-driven clamps: on community tier we force
+        // piiDetectionAction → 'block' and webSearchGuardEnabled → false
+        // BEFORE persisting, so the stored row matches what the runtime
+        // will honour. Enterprise+ (or a server-wide override) passes
+        // through unchanged. The clamp persists in the row: when the
+        // customer later upgrades the value stays 'block' and they must
+        // re-pick 'tokenize' to opt in — safer default after an upgrade
+        // than silently re-enabling a stricter mode.
+        const clamps = await _tierClamps({ organizationId: orgId, userId: req.session?.user?.id });
+        const clampedFields = _applyTierClamps(config, clamps);
+
         await configStore.setConfig(`org_privacy_shield_${orgId}`, config);
 
         // Nudge the in-process custom-terms cache so the next request picks up the new regex.
@@ -195,11 +285,16 @@ router.put('/:orgId', requireAuth, async (req, res) => {
         // the sync-write served no purpose. It was removed in the Privacy
         // Shield redesign. See plan: /home/tom/.claude/plans/quirky-wondering-pond.md
 
-        console.log(`[OrgPrivacyShield] Saved config for org ${orgId} by ${req.session.user.id}${termErrors.length ? ` (with ${termErrors.length} invalid term(s))` : ''}`);
+        console.log(`[OrgPrivacyShield] Saved config for org ${orgId} by ${req.session.user.id}${termErrors.length ? ` (with ${termErrors.length} invalid term(s))` : ''}${clampedFields.length ? ` (clamped ${clampedFields.join(',')} for tier=${clamps.tier})` : ''}`);
         // If some custom terms failed, the rest of the shield and the valid
         // terms are still persisted. The client shows per-term errors from
         // `termErrors` and keeps the user's other edits in place.
-        res.json({ ok: true, config, termErrors });
+        const response = { ok: true, config, termErrors };
+        if (clampedFields.length > 0) {
+            response.clamped_fields = clampedFields;
+            response.clamped_tier = clamps.tier;
+        }
+        res.json(response);
     } catch (e) {
         console.error('[OrgPrivacyShield] PUT error:', e);
         res.status(500).json({ error: e.message });

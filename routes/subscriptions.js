@@ -21,9 +21,14 @@ router.use((req, res, next) => {
     next();
 });
 
+// Operational gate for write routes (plan CRUD, audit, etc.). Honours the
+// hardcoded "admin" account plus any RBAC grant of admin_subscriptions /
+// `all`. Do NOT use this to decide whether a payload should be redacted —
+// privacy decisions live next to their response builders and use a
+// strict-id check instead, because `hasPermission(_, 'admin_subscriptions')`
+// short-circuits truthy for anyone holding the `all` wildcard.
 async function isSuperAdmin(req) {
-    if (req.session?.isAdmin || req.session?.user?.role === 'admin') return true;
-    // Check RBAC: user may have admin_subscriptions or all permission via groups/roles
+    if (req.session?.user?.id === 'admin') return true;
     const userId = req.session?.user?.id;
     if (!userId) return false;
     return await hasPermission(userId, 'admin_subscriptions', req.session);
@@ -303,6 +308,10 @@ router.get('/orgs', async (req, res) => {
                 usage = await usageStore.getUsageSummary({ startDate: period.startDate, endDate: new Date().toISOString(), organizationId: sub.organization_id });
             } catch (_) { }
 
+            const plan = sub.plan_id ? await userStore.getPlan(sub.plan_id) : null;
+            const markup = Number(plan?.markup_percent) || 0;
+            const billedCost = (Number(usage.total_estimated_cost) || 0) * (1 + markup / 100);
+
             result.push({
                 ...sub,
                 org_name: org?.name || 'Unknown',
@@ -312,7 +321,7 @@ router.get('/orgs', async (req, res) => {
                 current_usage: {
                     messages: usage.total_calls || 0,
                     tokens: usage.total_tokens || 0,
-                    cost: usage.estimated_cost || 0,
+                    cost: billedCost,
                 }
             });
         }
@@ -337,15 +346,79 @@ router.get('/orgs/:orgId', async (req, res) => {
             usage = await usageStore.getUsageSummary({ startDate: period.startDate, endDate: new Date().toISOString(), organizationId: req.params.orgId });
         } catch (_) { }
 
+        const plan = sub.plan_id ? await userStore.getPlan(sub.plan_id) : null;
+        const markup = Number(plan?.markup_percent) || 0;
+        const rawCost = Number(usage.total_estimated_cost) || 0;
+        const billedCost = rawCost * (1 + markup / 100);
+
+        // Effective cost cap: explicit subscription override > plan-price ×
+        // seats (or flat plan price) > unlimited. Customers see this as
+        // their AI-usage ceiling; markup stays internal so the cap aligns
+        // with what they actually pay each cycle.
+        // Prefer the live active-user count so seat changes show up
+        // immediately on the customer's License page; Stripe still catches
+        // up via the existing 15-min sync timer.
+        let seatQty;
+        try {
+            seatQty = Math.max(1, await userStore.getActiveSeatCount(req.params.orgId));
+        } catch (_) {
+            seatQty = Number(sub.stripe_seat_quantity) || Number(effective?.seat_count) || 1;
+        }
+        const planPrice = Number(plan?.price) || 0;
+        const isPerSeat = !!plan?.per_seat;
+        const derivedCap = planPrice > 0
+            ? (isPerSeat ? planPrice * seatQty : planPrice)
+            : null;
+        const explicitCap = Number(effective?.max_cost_per_month);
+        const effectiveCostCap = (Number.isFinite(explicitCap) && explicitCap > 0)
+            ? explicitCap
+            : derivedCap;
+        if (effectiveCostCap != null) {
+            effective.max_cost_per_month = effectiveCostCap;
+        }
+
+        // Pooled / per-user toggle lives on the organization row. '1' is
+        // the pre-migration default (pooled). When per-user, the client
+        // renders an additional slice (`per_user_cap`) per active seat so
+        // the dashboard can show personal budgets.
+        let usagePooled = true;
+        try {
+            const orgRow = await userStore.getOrganization(req.params.orgId);
+            usagePooled = (orgRow?.usage_pooled ?? '1') !== '0' && orgRow?.usagePooled !== false;
+        } catch (_) { /* keep default = true */ }
+
+        const billing = plan ? {
+            plan_price: planPrice || null,
+            plan_currency: plan.currency || 'EUR',
+            billing_interval: plan.billing_interval || 'monthly',
+            per_seat: isPerSeat,
+            seat_quantity: isPerSeat ? seatQty : null,
+            subscription_total: planPrice > 0
+                ? (isPerSeat ? planPrice * seatQty : planPrice)
+                : 0,
+            usage_pooled: usagePooled,
+            per_user_cap: !usagePooled
+                && Number.isFinite(Number(effective?.max_cost_per_month))
+                && Number(effective.max_cost_per_month) > 0
+                ? Number(effective.max_cost_per_month) / Math.max(1, seatQty)
+                : null,
+        } : null;
+
+        // Privacy gate (not the operational permission used elsewhere): raw
+        // tokens / messages are only returned to the hardcoded platform
+        // operator account. Everyone else — including admin_subscriptions
+        // RBAC holders and org admins — gets the marked-up cost only.
+        const isPlatformOperator = req.session?.user?.id === 'admin';
+        const currentUsage = isPlatformOperator
+            ? { messages: usage.total_calls || 0, tokens: usage.total_tokens || 0, cost: billedCost }
+            : { cost: billedCost };
+
         res.json({
             ...sub,
             effective_limits: effective,
             billing_period: period,
-            current_usage: {
-                messages: usage.total_calls || 0,
-                tokens: usage.total_tokens || 0,
-                cost: usage.estimated_cost || 0,
-            }
+            billing,
+            current_usage: currentUsage,
         });
     } catch (e) {
         console.error('[Subscriptions] getOrgSub error:', e);
@@ -642,13 +715,26 @@ router.get('/consumer/usage', async (req, res) => {
         const summary = await usageStore.getUsageSummary({ startDate, endDate, userId });
         const byType = await usageStore.getUsageByAgentType({ startDate, endDate, userId });
 
+        const markup = Number(activePlan?.markup_percent) || 0;
+        const billedFactor = 1 + markup / 100;
+        const billedCost = (Number(summary.total_estimated_cost) || 0) * billedFactor;
+        const redactedByType = (byType || []).map(t => {
+            const row = { ...t };
+            row.billed_cost = (Number(row.estimated_cost) || 0) * billedFactor;
+            delete row.estimated_cost;
+            delete row.total_calls;
+            delete row.calls;
+            delete row.total_tokens;
+            delete row.prompt_tokens;
+            delete row.completion_tokens;
+            return row;
+        });
+
         res.json({
             limits,
             usage: {
-                total_calls: summary.total_calls || 0,
-                total_tokens: summary.total_tokens || 0,
-                total_estimated_cost: summary.total_estimated_cost || 0,
-                by_type: byType || [],
+                total_billed_cost: billedCost,
+                by_type: redactedByType,
             },
             billing_period: {
                 start: startDate,

@@ -28,6 +28,8 @@ const EXTRA_PROMPT_IDS = [
     'report-writer',
     'page-renderer',
     'app-testing-report',
+    'test-generator',
+    'test-explorer',
     'verwerkersovereenkomst-renderer',
     'verwerkersovereenkomst-reviewer',
 ];
@@ -38,6 +40,8 @@ const EXTRA_PROMPT_LABELS = {
     'report-writer': 'Report Writer',
     'page-renderer': 'Page Renderer',
     'app-testing-report': 'App Testing Report Writer',
+    'test-generator': 'Test Generator (Playwright)',
+    'test-explorer': 'Test Explorer (Playwright)',
     'verwerkersovereenkomst-renderer': 'Verwerkersovereenkomst Renderer',
     'verwerkersovereenkomst-reviewer': 'Verwerkersovereenkomst Reviewer',
 };
@@ -61,6 +65,8 @@ const PROMPT_CATEGORIES = {
         'report-writer',
         'page-renderer',
         'app-testing-report',
+        'test-generator',
+        'test-explorer',
         'verwerkersovereenkomst-renderer',
         'verwerkersovereenkomst-reviewer',
     ],
@@ -74,6 +80,8 @@ const MD_PROMPT_PATHS = {
     'report-writer': path.join(__dirname, '..', '..', 'prompts', 'report-writer-prompt.md'),
     'page-renderer': path.join(__dirname, '..', '..', 'prompts', 'page-renderer-prompt.md'),
     'app-testing-report': path.join(__dirname, '..', '..', 'prompts', 'app-testing-report-writer-prompt.md'),
+    'test-generator': path.join(__dirname, '..', '..', 'prompts', 'test-generator-prompt.md'),
+    'test-explorer': path.join(__dirname, '..', '..', 'prompts', 'test-explorer-prompt.md'),
     'verwerkersovereenkomst-renderer': path.join(__dirname, '..', '..', 'prompts', 'verwerkersovereenkomst-renderer-prompt.md'),
     'verwerkersovereenkomst-reviewer': path.join(__dirname, '..', '..', 'prompts', 'verwerkersovereenkomst-reviewer-prompt.md'),
 };

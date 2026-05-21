@@ -557,7 +557,7 @@ router.get('/organizations/:id', requireOrgAdmin('id'), async (req, res) => {
 
 router.put('/organizations/:id', requireOrgAdmin('id'), async (req, res) => {
     const { id } = req.params;
-    const { name, description, tagline, address, email, phone, website, kvk, vat, logo, footerText, defaultGroups, allowSignup, authMethod, enabledIntegrations, autoApproveSSO, allowedDomains } = req.body;
+    const { name, description, tagline, address, email, phone, website, kvk, vat, logo, footerText, defaultGroups, allowSignup, authMethod, enabledIntegrations, autoApproveSSO, allowedDomains, usagePooled } = req.body;
 
     // authMethod can only be set once — if already set, ignore any change
     const existing = await userStore.getOrganization(id);
@@ -602,11 +602,11 @@ router.put('/organizations/:id', requireOrgAdmin('id'), async (req, res) => {
         finalAllowedDomains = normalised;
     }
 
-    const orgUpdates = { name, description, tagline, address, email, phone, website, kvk, vat, logo, footerText, defaultGroups, allowSignup, authMethod: finalAuthMethod, enabledIntegrations: finalIntegrations, autoApproveSSO, allowedDomains: finalAllowedDomains };
+    const orgUpdates = { name, description, tagline, address, email, phone, website, kvk, vat, logo, footerText, defaultGroups, allowSignup, authMethod: finalAuthMethod, enabledIntegrations: finalIntegrations, autoApproveSSO, allowedDomains: finalAllowedDomains, usagePooled };
     if (await userStore.updateOrganization(id, orgUpdates)) {
         // Record only the access-relevant deltas. existing was loaded above
         // for the authMethod check; reuse it.
-        const AUDIT_FIELDS = ['name', 'description', 'tagline', 'address', 'email', 'phone', 'website', 'kvk', 'vat', 'authMethod', 'enabledIntegrations', 'allowSignup', 'autoApproveSSO', 'allowedDomains', 'defaultGroups'];
+        const AUDIT_FIELDS = ['name', 'description', 'tagline', 'address', 'email', 'phone', 'website', 'kvk', 'vat', 'authMethod', 'enabledIntegrations', 'allowSignup', 'autoApproveSSO', 'allowedDomains', 'defaultGroups', 'usagePooled'];
         const oldVals = {};
         const newVals = {};
         for (const f of AUDIT_FIELDS) {
@@ -1337,9 +1337,11 @@ async function resolveActiveFeaturesContext(req) {
     // Beta allow-list = super admin's grant ∪ features marked `freeForAllOrgs`
     // (open-data sources etc. where a per-org super-admin grant adds friction
     // without security value — the org-admin active toggle is authoritative).
+    // The grant overrides the plan cap below; only the freeForAll defaults
+    // are capped. An explicit super-admin grant is an authoritative decision
+    // that the plan template's ceiling should not silently undo.
     const grantedAllowList = await getOrgBetaFeatures(orgId);
     const freeForAll = BETA_FEATURES.filter(f => f.freeForAllOrgs).map(f => f.id);
-    const allowedBetaFeatures = Array.from(new Set([...grantedAllowList, ...freeForAll]));
     const enabledBetaFeatures = await userStore.getOrgEnabledBetaFeatures(orgId);
 
     // Integration allow-list = super admin's enabledIntegrations (or global
@@ -1355,23 +1357,27 @@ async function resolveActiveFeaturesContext(req) {
     allowedIntegrations = allowedIntegrations.filter(id => !NC_ID_SET.has(id));
     const enabledIntegrations = await userStore.getOrgEnabledIntegrations(orgId);
 
-    // Intersect with plan caps. The org's subscription plan can further
-    // narrow what the super-admin allowed — anything outside the plan's
-    // allow-list is hidden from the org-admin UI entirely.
-    let planCappedBeta = allowedBetaFeatures;
+    // Plan cap applies to plan-driven defaults (freeForAll) and to
+    // integrations. Explicit super-admin beta grants override the cap —
+    // if a platform admin granted a beta to this org, it surfaces here
+    // regardless of the plan template's ceiling.
+    let planCappedFreeForAll = freeForAll;
     let planCappedInt = allowedIntegrations;
     try {
         const { getOrgCaps, applyCap } = require('../services/planEntitlements');
         const caps = await getOrgCaps(orgId);
-        planCappedBeta = applyCap(allowedBetaFeatures, caps.betaFeatures);
+        planCappedFreeForAll = applyCap(freeForAll, caps.betaFeatures);
         planCappedInt = applyCap(allowedIntegrations, caps.integrations);
     } catch (e) {
         console.warn('[ActiveFeatures] plan cap lookup failed:', e.message);
     }
+    const allowedBetaFeatures = Array.from(
+        new Set([...grantedAllowList, ...planCappedFreeForAll])
+    );
 
     return {
         orgId,
-        allowedBetaFeatures: planCappedBeta, enabledBetaFeatures,
+        allowedBetaFeatures, enabledBetaFeatures,
         allowedIntegrations: planCappedInt, enabledIntegrations,
         betaRegistry: BETA_FEATURES,
     };
@@ -1425,9 +1431,11 @@ router.put('/me/active-features', requireAuth, async (req, res) => {
         const caps = await planEntitlements.getOrgCaps(ctx.orgId);
 
         if (Array.isArray(betaEnabled)) {
+            // ctx.allowedBetaFeatures is already the authoritative ceiling:
+            // super-admin grants override the plan cap, and freeForAll
+            // defaults are pre-intersected with the cap. No second cap pass.
             const allowedSet = new Set(ctx.allowedBetaFeatures);
-            let clean = Array.from(new Set(betaEnabled.filter(id => allowedSet.has(id))));
-            clean = planEntitlements.applyCap(clean, caps.betaFeatures);
+            const clean = Array.from(new Set(betaEnabled.filter(id => allowedSet.has(id))));
             if (!(await userStore.setOrgEnabledBetaFeatures(ctx.orgId, clean))) {
                 return res.status(500).json({ error: 'Failed to save beta features' });
             }

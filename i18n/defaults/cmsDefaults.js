@@ -239,6 +239,47 @@ const BLOCK_DEFAULTS = {
         },
         secondaryCta:      null,                        // null | { label, link: { kind, ... } }
     },
+    // Live Component — pasted HTML/CSS/JS rendered in a sandboxed iframe.
+    // `layout` picks the column structure ('full' | 'two-components' |
+    // 'component-text' | 'component-cta'). CTA is a nested
+    // { enabled, label, link, style } blob — same shape as the Hero
+    // primary/secondary CTAs and the LinkField persistence format.
+    'live-component': {
+        layout:    'full',
+        code:      '',
+        codeRight: '',
+        heading:   '',
+        body:      '',
+        // Per-field typography overrides. Empty / 0 = inherit: the
+        // renderer applies the `content-el-heading` class, so by default
+        // the heading renders at the Content block's main-heading scale
+        // (clamp 1.6–2.25rem, weight 700) — not the smaller subheading
+        // scale. Concrete values set in the editor override these.
+        headingStyle: { fontFamily: '', fontSize: 0, fontWeight: 0, color: '' },
+        bodyStyle:    { fontFamily: '', fontSize: 0, fontWeight: 0, color: '' },
+        cta: {
+            enabled: true,
+            label:   'Get started',
+            link:    { kind: 'external', url: '', newTab: false },
+            style:   'primary',
+        },
+    },
+
+    // Pricing — dynamic. Plans come from /api/billing/public-plans;
+    // the admin chooses an audience (planType) and toggle defaults
+    // here. Kept in sync with the admin panel's BLOCK_DEFAULTS in
+    // editors.jsx.
+    pricing: {
+        heading: 'Pricing',
+        subheading: '',
+        planType: 'organization',
+        enableToggle: true,
+        defaultInterval: 'monthly',
+        toggleLabelMonthly: 'Maandelijks',
+        toggleLabelYearly: 'Jaarlijks',
+        ctaLabel: 'Kies plan',
+        emptyText: 'Geen plannen beschikbaar',
+    },
 };
 
 // ── Block type catalogue (drives the "Add block" picker) ─────────────
@@ -256,6 +297,8 @@ const BLOCK_TYPES = [
     { type: 'techStats',    label: 'Stats',          icon: 'BarChart3',   category: 'Content' },
     { type: 'cta',          label: 'Call to action', icon: 'Target',           category: 'Conversion' },
     { type: 'cta-banner',   label: 'CTA Banner',     icon: 'Rocket',           category: 'Conversion' },
+    { type: 'live-component', label: 'Live Component', icon: 'Code',           category: 'Content' },
+    { type: 'pricing',      label: 'Pricing',        icon: 'CreditCard',    category: 'Conversion' },
 ];
 
 const BLOCK_TYPE_IDS = BLOCK_TYPES.map(t => t.type);

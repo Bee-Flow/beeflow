@@ -200,9 +200,13 @@ async function copyObject(sourceKey, destKey) {
  * @param {string} key - S3 object key (use buildKey() to generate)
  * @param {Buffer} buffer - File content
  * @param {string} contentType - MIME type (e.g. 'image/png', 'video/mp4')
+ * @param {Object} [metadata] - Optional flat string map persisted alongside
+ *   the object. In S3 mode it lands in user-defined metadata (returned by
+ *   HEAD/GET as `x-amz-meta-*`). In local mode it's written to a `.tags`
+ *   sidecar next to the bytes. Used today to flag SVGs as sanitized.
  * @returns {{ key: string }} Uploaded object key
  */
-async function uploadFile(key, buffer, contentType) {
+async function uploadFile(key, buffer, contentType, metadata = null) {
     if (mode === 'local') {
         const filePath = localPathFor(key);
         fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -212,6 +216,10 @@ async function uploadFile(key, buffer, contentType) {
         if (contentType) {
             try { fs.writeFileSync(filePath + '.meta', String(contentType), 'utf8'); }
             catch (_) { /* non-fatal — extension fallback covers this */ }
+        }
+        if (metadata && typeof metadata === 'object' && Object.keys(metadata).length > 0) {
+            try { fs.writeFileSync(filePath + '.tags', JSON.stringify(metadata), 'utf8'); }
+            catch (_) { /* non-fatal */ }
         }
         console.log(`[StorageStore:local] Uploaded: ${key} (${(buffer.length / 1024).toFixed(1)} KB)`);
         return { key };
@@ -223,6 +231,9 @@ async function uploadFile(key, buffer, contentType) {
         Key: key,
         Body: buffer,
         ContentType: contentType,
+        ...(metadata && typeof metadata === 'object' && Object.keys(metadata).length > 0
+            ? { Metadata: metadata }
+            : {}),
     }));
 
     console.log(`[StorageStore] Uploaded: ${key} (${(buffer.length / 1024).toFixed(1)} KB)`);
@@ -261,6 +272,7 @@ async function deleteFile(key) {
         const filePath = localPathFor(key);
         try { fs.unlinkSync(filePath); } catch (e) { if (e.code !== 'ENOENT') throw e; }
         try { fs.unlinkSync(filePath + '.meta'); } catch (_) { /* ignore */ }
+        try { fs.unlinkSync(filePath + '.tags'); } catch (_) { /* ignore */ }
         console.log(`[StorageStore:local] Deleted: ${key}`);
         return;
     }
@@ -277,7 +289,10 @@ async function deleteFile(key) {
 /**
  * Stream a file from RustFS.
  * @param {string} key - S3 object key
- * @returns {{ stream: Readable, contentType: string, contentLength: number }}
+ * @returns {{ stream: Readable, contentType: string, contentLength: number, metadata: Object }}
+ *   `metadata` is the same flat string map passed to uploadFile (read back
+ *   from S3 user-metadata or the .tags sidecar). Always an object — empty
+ *   when nothing was stored.
  */
 async function streamFile(key) {
     if (mode === 'local') {
@@ -305,10 +320,17 @@ async function streamFile(key) {
             const ext = path.extname(filePath).toLowerCase();
             if (MIME_BY_EXT[ext]) contentType = MIME_BY_EXT[ext];
         }
+        let metadata = {};
+        try {
+            const raw = fs.readFileSync(filePath + '.tags', 'utf8');
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed === 'object') metadata = parsed;
+        } catch (_) { /* no sidecar */ }
         return {
             stream: fs.createReadStream(filePath),
             contentType,
             contentLength: stat.size,
+            metadata,
         };
     }
     if (!s3) throw new Error('StorageStore not initialized');
@@ -322,6 +344,7 @@ async function streamFile(key) {
         stream: response.Body,
         contentType: response.ContentType || 'application/octet-stream',
         contentLength: response.ContentLength,
+        metadata: response.Metadata || {},
     };
 }
 

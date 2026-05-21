@@ -1,8 +1,84 @@
 const express = require('express');
 const router = express.Router();
 const usageStore = require('../stores/usageStore');
+const userStore = require('../stores/userStore');
 const { resolveUserOrgIds } = require('../auth');
 const { computeCostSplit } = require('../core/modelCosts');
+
+// Resolve the markup factor to apply when redacting customer-facing usage
+// responses. Admin callers see raw figures; org / consumer callers see
+// total_estimated_cost × (1 + markup_percent/100) and have token / message
+// counts stripped from the payload.
+async function getCustomerMarkup(req) {
+    try {
+        const orgIds = await resolveUserOrgIds(req);
+        if (orgIds === null || orgIds.size === 0) {
+            const userId = req.session?.user?.id;
+            const sub = userId ? await userStore.getConsumerSubscription(userId) : null;
+            if (sub?.plan_id) {
+                const plan = await userStore.getPlan(sub.plan_id);
+                return Number(plan?.markup_percent) || 0;
+            }
+            return 0;
+        }
+        const orgId = Array.from(orgIds)[0];
+        const sub = await userStore.getOrgSubscription(orgId);
+        if (sub?.plan_id) {
+            const plan = await userStore.getPlan(sub.plan_id);
+            return Number(plan?.markup_percent) || 0;
+        }
+    } catch (_) { /* fall through */ }
+    return 0;
+}
+
+async function isAdminCaller(req) {
+    // Privacy gate, not an operational permission: only the hardcoded
+    // platform-operator account ("admin" credential from loginRoutes) sees
+    // raw token/message counts and estimated_cost. Everyone else — org
+    // admins, RBAC role-holders with `all`, every customer — gets the
+    // redacted, marked-up cost-only view. Delegating this via the standard
+    // hasPermission helper is a leak because `all` resolves any permission
+    // query truthy, and org admins routinely receive `all` via their role.
+    return req.session?.user?.id === 'admin';
+}
+
+// Strip token / message-count fields from a row and replace estimated_cost
+// with marked-up billed_cost. Used to scrub the customer-facing Gebruik &
+// Monitoring responses so usage* markup is the only AI figure customers see.
+const TOKEN_FIELDS = ['total_calls', 'calls', 'total_tokens', 'tokens', 'prompt_tokens', 'completion_tokens',
+    'cached_tokens', 'cache_creation_tokens', 'reasoning_tokens',
+    'total_prompt_tokens', 'total_completion_tokens', 'total_cached_tokens',
+    'total_cache_creation_tokens', 'total_reasoning_tokens',
+    'input_cost', 'output_cost', 'total_input_cost', 'total_output_cost',
+    'azure_services_total_cost', 'billed_calls', 'avg_duration_ms',
+    'unique_models', 'unique_agents'];
+
+function redactRow(row, factor) {
+    if (!row || typeof row !== 'object') return row;
+    const out = { ...row };
+    const rawCost = Number(out.estimated_cost ?? out.total_estimated_cost ?? out.total_cost) || 0;
+    out.billed_cost = rawCost * factor;
+    for (const f of TOKEN_FIELDS) delete out[f];
+    delete out.estimated_cost;
+    delete out.total_estimated_cost;
+    delete out.total_cost;
+    return out;
+}
+
+function redactRows(rows, factor) {
+    return (rows || []).map(r => redactRow(r, factor));
+}
+
+// Apply customer redaction unless the caller is an admin. Use as the last
+// step before res.json — returns the redacted payload (or the original).
+async function maybeRedact(req, payload, kind) {
+    if (await isAdminCaller(req)) return payload;
+    const markup = await getCustomerMarkup(req);
+    const factor = 1 + markup / 100;
+    if (kind === 'summary') return redactRow(payload, factor);
+    if (kind === 'rows') return redactRows(payload, factor);
+    return payload;
+}
 
 // Helper to parse days filter
 function getDateFilters(daysParam = '30') {
@@ -106,13 +182,14 @@ router.get('/summary', async (req, res) => {
             const azSummary = await azSvcStore.getAzureServiceSummary(req.usageFilters);
             azure_services_total_cost = azSummary?.total_cost || 0;
         } catch (_) {}
-        res.json({
+        const fullPayload = {
             ...(summary || { total_calls: 0, total_tokens: 0, total_estimated_cost: 0, total_prompt_tokens: 0, total_completion_tokens: 0 }),
             total_input_cost,
             total_output_cost,
             azure_services_total_cost,
             combined_total_cost: (summary?.total_estimated_cost || 0) + azure_services_total_cost,
-        });
+        };
+        res.json(await maybeRedact(req, fullPayload, 'summary'));
     } catch (err) {
         console.error('[Usage API] /summary error:', err.message);
         res.status(500).json({ error: 'Failed to fetch usage summary' });
@@ -124,7 +201,7 @@ router.get('/timeline', async (req, res) => {
     try {
         const interval = req.query.interval === 'hour' ? 'hour' : 'day';
         const timeline = await usageStore.getUsageTimeline(req.usageFilters, interval);
-        res.json(timeline || []);
+        res.json(await maybeRedact(req, timeline || [], 'rows'));
     } catch (err) {
         console.error('[Usage API] /timeline error:', err.message);
         res.status(500).json({ error: 'Failed to fetch timeline data' });
@@ -136,7 +213,7 @@ router.get('/cost-timeline', async (req, res) => {
     try {
         const interval = req.query.interval === 'hour' ? 'hour' : 'day';
         const data = await usageStore.getCostTimeline(req.usageFilters, interval);
-        res.json(data || []);
+        res.json(await maybeRedact(req, data || [], 'rows'));
     } catch (err) {
         console.error('[Usage API] /cost-timeline error:', err.message);
         res.status(500).json({ error: 'Failed to fetch cost timeline data' });
@@ -148,7 +225,7 @@ router.get('/users', async (req, res) => {
     try {
         const usersUsage = await usageStore.getUsageByUser(req.usageFilters);
         const userMap = await getUserMap();
-        res.json((usersUsage || []).map(u => withUser(u, userMap)));
+        res.json(await maybeRedact(req, (usersUsage || []).map(u => withUser(u, userMap)), 'rows'));
     } catch (err) {
         console.error('[Usage API] /users error:', err.message);
         res.status(500).json({ error: 'Failed to fetch user usage' });
@@ -159,7 +236,7 @@ router.get('/by-user', async (req, res) => {
     try {
         const usersUsage = await usageStore.getUsageByUser(req.usageFilters);
         const userMap = await getUserMap();
-        res.json((usersUsage || []).map(u => withUser(u, userMap)));
+        res.json(await maybeRedact(req, (usersUsage || []).map(u => withUser(u, userMap)), 'rows'));
     } catch (err) {
         console.error('[Usage API] /by-user error:', err.message);
         res.status(500).json({ error: 'Failed to fetch user usage' });
@@ -170,7 +247,7 @@ router.get('/by-user', async (req, res) => {
 router.get('/sources', async (req, res) => {
     try {
         const sources = await usageStore.getUsageBySource(req.usageFilters);
-        res.json(sources || []);
+        res.json(await maybeRedact(req, sources || [], 'rows'));
     } catch (err) {
         console.error('[Usage API] /sources error:', err.message);
         res.status(500).json({ error: 'Failed to fetch source usage' });
@@ -181,7 +258,7 @@ router.get('/sources', async (req, res) => {
 router.get('/agents', async (req, res) => {
     try {
         const agents = await usageStore.getUsageByAgent(req.usageFilters);
-        res.json(enrichWithCostSplit(agents));
+        res.json(await maybeRedact(req, enrichWithCostSplit(agents), 'rows'));
     } catch (err) {
         console.error('[Usage API] /agents error:', err.message);
         res.status(500).json({ error: 'Failed to fetch agent usage' });
@@ -191,7 +268,7 @@ router.get('/agents', async (req, res) => {
 router.get('/by-agent', async (req, res) => {
     try {
         const agents = await usageStore.getUsageByAgent(req.usageFilters);
-        res.json(enrichWithCostSplit(agents));
+        res.json(await maybeRedact(req, enrichWithCostSplit(agents), 'rows'));
     } catch (err) {
         console.error('[Usage API] /by-agent error:', err.message);
         res.status(500).json({ error: 'Failed to fetch agent usage' });
@@ -202,7 +279,7 @@ router.get('/by-agent', async (req, res) => {
 router.get('/models', async (req, res) => {
     try {
         const models = await usageStore.getUsageByModel(req.usageFilters);
-        res.json(enrichWithCostSplit(models));
+        res.json(await maybeRedact(req, enrichWithCostSplit(models), 'rows'));
     } catch (err) {
         console.error('[Usage API] /models error:', err.message);
         res.status(500).json({ error: 'Failed to fetch model usage' });
@@ -212,7 +289,7 @@ router.get('/models', async (req, res) => {
 router.get('/by-model', async (req, res) => {
     try {
         const models = await usageStore.getUsageByModel(req.usageFilters);
-        res.json(enrichWithCostSplit(models));
+        res.json(await maybeRedact(req, enrichWithCostSplit(models), 'rows'));
     } catch (err) {
         console.error('[Usage API] /by-model error:', err.message);
         res.status(500).json({ error: 'Failed to fetch model usage' });
@@ -223,7 +300,7 @@ router.get('/by-model', async (req, res) => {
 router.get('/by-conversation', async (req, res) => {
     try {
         const data = await usageStore.getUsageByConversation(req.usageFilters);
-        res.json(data || []);
+        res.json(await maybeRedact(req, data || [], 'rows'));
     } catch (err) {
         console.error('[Usage API] /by-conversation error:', err.message);
         res.status(500).json({ error: 'Failed to fetch conversation usage' });
@@ -235,7 +312,7 @@ router.get('/by-conversation', async (req, res) => {
 router.get('/by-swarm-run', async (req, res) => {
     try {
         const data = await usageStore.getUsageBySwarmRun(req.usageFilters);
-        res.json(data || []);
+        res.json(await maybeRedact(req, data || [], 'rows'));
     } catch (err) {
         console.error('[Usage API] /by-swarm-run error:', err.message);
         res.status(500).json({ error: 'Failed to fetch swarm run usage' });
@@ -246,7 +323,7 @@ router.get('/by-swarm-run', async (req, res) => {
 router.get('/tools', async (req, res) => {
     try {
         const tools = await usageStore.getToolUsage(req.usageFilters);
-        res.json(tools || []);
+        res.json(await maybeRedact(req, tools || [], 'rows'));
     } catch (err) {
         console.error('[Usage API] /tools error:', err.message);
         res.status(500).json({ error: 'Failed to fetch tool usage' });
@@ -258,7 +335,7 @@ router.get('/recent', async (req, res) => {
     try {
         const limit = parseInt(req.query.limit, 10) || 100;
         const data = await usageStore.getRecentCalls(limit, req.usageFilters);
-        res.json(data || []);
+        res.json(await maybeRedact(req, data || [], 'rows'));
     } catch (err) {
         console.error('[Usage API] /recent error:', err.message);
         res.status(500).json({ error: 'Failed to fetch recent calls' });
@@ -302,7 +379,7 @@ router.get('/organizations', async (req, res) => {
 router.get('/models-by-agent', async (req, res) => {
     try {
         const data = await usageStore.getUsageByModelAndAgent(req.usageFilters);
-        res.json(enrichWithCostSplit(data));
+        res.json(await maybeRedact(req, enrichWithCostSplit(data), 'rows'));
     } catch (err) {
         console.error('[Usage API] /models-by-agent error:', err.message);
         res.status(500).json({ error: 'Failed to fetch model-agent data' });
@@ -314,7 +391,7 @@ router.get('/models-by-user', async (req, res) => {
     try {
         const data = await usageStore.getUsageByModelAndUser(req.usageFilters);
         const userMap = await getUserMap();
-        res.json(enrichWithCostSplit(data).map(row => withUser(row, userMap)));
+        res.json(await maybeRedact(req, enrichWithCostSplit(data).map(row => withUser(row, userMap)), 'rows'));
     } catch (err) {
         console.error('[Usage API] /models-by-user error:', err.message);
         res.status(500).json({ error: 'Failed to fetch model-user data' });

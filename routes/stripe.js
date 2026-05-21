@@ -614,6 +614,19 @@ async function handleSubscriptionUpdated(subscription) {
         updateData.stripe_seat_quantity = billedQuantity;
     }
 
+    // Mirror Stripe's current billing-period start so the internal usage
+    // window (getBillingPeriod in userStore) lines up with the date the
+    // customer is actually invoiced for. After a checkout that set
+    // billing_cycle_anchor, this is the anchor; after a plan change it is
+    // the new period start. Falling back to billing_cycle_anchor covers
+    // pre-renewal subs where current_period_start has not yet advanced.
+    const periodStart = subscription.current_period_start
+        || subscription.billing_cycle_anchor
+        || null;
+    if (periodStart) {
+        updateData.billing_cycle_start = new Date(periodStart * 1000).toISOString();
+    }
+
     // If plan changed, try to find the matching BeeFlow plan. Unmatched
     // Stripe price ids are logged + audited rather than silently nulled —
     // otherwise an unknown price leaves the local subscription orphaned.

@@ -72,6 +72,7 @@ const Permissions = Object.freeze({
     ADMIN_MONITORING: 'admin_monitoring',
     ADMIN_COMPLIANCE: 'admin_compliance',
     ADMIN_SUBSCRIPTIONS: 'admin_subscriptions',
+    ADMIN_SUPPORT: 'admin_support',
     MANAGE_USERS: 'manage_users',
     MANAGE_AGENTS: 'manage_agents',
     MANAGE_SKILLS: 'manage_skills',
@@ -110,6 +111,7 @@ const SYSTEM_PERMISSIONS = [
     { id: 'admin_monitoring', name: 'Monitoring', description: 'Admin: Usage & cost monitoring', group: 'admin' },
     { id: 'admin_compliance', name: 'Compliance', description: 'Admin: GDPR & AI Act monitoring, DSR, ROPA, audit reports', group: 'admin' },
     { id: 'admin_subscriptions', name: 'Subscriptions', description: 'Admin: Subscription management', group: 'admin' },
+    { id: 'admin_support', name: 'Customer Support', description: 'Admin: Bee Flow customer-support inbox (triage, reply, resolve)', group: 'admin' },
 
     // ── Actions ──
     { id: 'manage_users', name: 'Manage Users', description: 'Create, edit, and delete users', group: 'actions' },

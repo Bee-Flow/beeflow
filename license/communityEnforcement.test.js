@@ -22,10 +22,16 @@ const FEATURES = [
     'voice_chat',
     'webpages',
     'automations',
+    'agent_routines',
     'meeting_notes',
     'ticket_assistant',
     'component_designer',
     'notebooks',
+    'projects',
+    'pii_tokenize',
+    'web_search_guard',
+    'advanced_usage_monitoring',
+    'playwright_tests',
 ];
 
 const RESOLUTION_TTL_MS = 60_000;
@@ -96,9 +102,10 @@ async function runGate(featureName, tier) {
     }
 
     // ── Community keeps the core: chat_basic / skills / kb_unlimited
-    //    / agent_routines / multi_user / nextcloud_basic must NOT
-    //    fall behind the gate. ──────────────────────────────────────────
-    for (const feature of ['chat_basic', 'skills', 'kb_unlimited', 'agent_routines', 'multi_user', 'nextcloud_basic']) {
+    //    / multi_user / nextcloud_basic must NOT fall behind the gate.
+    //    (agent_routines, projects, pii_tokenize, web_search_guard and
+    //    advanced_usage_monitoring were promoted in the second wave.)
+    for (const feature of ['chat_basic', 'skills', 'kb_unlimited', 'multi_user', 'nextcloud_basic']) {
         const { res, calledNext } = await runGate(feature, 'community');
         assert.strictEqual(calledNext, true, `${feature}: community must keep this`);
         assert.strictEqual(res.statusCode, null, `${feature}: community core must not 403`);

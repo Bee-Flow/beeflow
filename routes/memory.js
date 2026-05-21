@@ -8,8 +8,14 @@ const memoryStore = require('../stores/memoryStore');
 const projectStore = require('../stores/projectStore');
 const { resolveUserGroups } = require('../auth');
 const { getEffectiveUserId } = require('./agents');
+const { extractJSON } = require('../pipeline/llmHelpers');
+const llmClient = require('../core/llmClient');
+const { resolveModelForTier, getTierConfig } = require('../core/modelResolver');
 
 const router = express.Router();
+
+const MAX_IMPORT_BYTES = 50_000;
+const VALID_TYPES = new Set(['instruction', 'person', 'project', 'preference', 'workflow', 'fact', 'context']);
 
 // Memory type definitions
 const MEMORY_TYPES = [
@@ -84,6 +90,19 @@ router.get('/', async (req, res) => {
         });
     } catch (error) {
         console.error('Failed to get memories:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// User-global memory stats (total + type distribution + importance buckets).
+// Must be registered before `/:id` or Express will route "stats" as an id.
+router.get('/stats', async (req, res) => {
+    const userId = getEffectiveUserId(req);
+    try {
+        const stats = await memoryStore.getMemoryStats(userId);
+        res.json(stats);
+    } catch (error) {
+        console.error('Failed to get memory stats:', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -225,6 +244,78 @@ router.get('/export/all', async (req, res) => {
         res.setHeader('Content-Disposition', 'attachment; filename=memories.json');
         res.json({ exportDate: new Date().toISOString(), userId, memories });
     } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Import memories from pasted text (e.g. an export from another AI provider).
+// Uses the fast-tier LLM to extract a typed list of memories from free-form
+// text, then inserts each one through the normal createMemory path.
+router.post('/import', async (req, res) => {
+    const userId = getEffectiveUserId(req);
+    const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
+
+    if (!text) return res.status(400).json({ error: 'text is required' });
+    if (Buffer.byteLength(text, 'utf8') > MAX_IMPORT_BYTES) {
+        return res.status(400).json({ error: `text exceeds ${MAX_IMPORT_BYTES} byte limit` });
+    }
+
+    try {
+        const userOrgId = req.user?.organizationId || null;
+        const modelId = await resolveModelForTier('tier:fast', { userOrgId, userId, fallbackTier: 'fast' });
+        const tierConfig = await getTierConfig('fast', { userOrgId, userId });
+
+        const systemPrompt = `You extract structured memories from free-form text exported from an AI assistant.
+
+Return ONLY a JSON object of the form {"memories": [{"type": "...", "content": "..."}]}.
+
+"type" must be exactly one of: instruction, person, project, preference, workflow, fact, context.
+- instruction: standing instructions (always/never do X)
+- person: people the user knows or works with
+- project: projects, tech stacks, URLs
+- preference: settings, formatting, tone preferences
+- workflow: how the user likes to work
+- fact: specific facts about the user or their work
+- context: general background context
+If unsure, use "fact".
+
+"content" must be a single concise sentence in the user's voice, preserving their wording where possible. One memory per distinct fact — do not bundle multiple facts into one entry. Skip filler text, greetings, and meta-commentary. If nothing useful can be extracted, return {"memories": []}.`;
+
+        const messages = [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: `Extract memories from this text:\n\n${text}` },
+        ];
+
+        const result = await llmClient.chat(modelId, messages, {
+            temperature: tierConfig?.temperature ?? 0.2,
+            maxTokens: Math.min(tierConfig?.maxTokens ?? 2000, 4000),
+            budgetTokens: 0,
+            reasoningEffort: 'none',
+        });
+
+        const parsed = extractJSON(result?.content || '');
+        const items = Array.isArray(parsed?.memories) ? parsed.memories : [];
+
+        let imported = 0;
+        let skipped = 0;
+        const inserted = [];
+        for (const item of items) {
+            const type = VALID_TYPES.has(item?.type) ? item.type : 'fact';
+            const content = typeof item?.content === 'string' ? item.content.trim() : '';
+            if (!content) { skipped++; continue; }
+            try {
+                await memoryStore.createMemory(userId, null, type, content);
+                imported++;
+                inserted.push({ type, content });
+            } catch (e) {
+                skipped++;
+                console.warn('[memory/import] insert failed:', e.message);
+            }
+        }
+
+        res.json({ imported, skipped, items: inserted });
+    } catch (error) {
+        console.error('Memory import failed:', error);
         res.status(500).json({ error: error.message });
     }
 });

@@ -43,6 +43,11 @@ const KEY_PROJECT_PFX     = 'cms_project_';                  // cms_project_{sit
 const KEY_LOCALE_INFIX    = '_locale_';                      // ..._locale_{xx}
 const KEY_PAGE_INFIX      = '_page_';                        // cms_project_{siteId}_page_{pageId}
 const KEY_PUBLISHED_PFX   = 'cms_published_';                // cms_published_{siteId} — last-published snapshot
+// Templates are GLOBAL — not scoped to a site. A template saved from one
+// site can be applied when creating a new page in any site. Stored under
+// a single top-level key as an array; the writes are full-list replace
+// so there is no race window where a partial entry can land.
+const KEY_TEMPLATES       = 'cms_templates';
 
 // SITE_VERSION 3: header now supports a `ctas` array (multiple action
 // buttons with style: primary/secondary/ghost/link) instead of a single
@@ -180,6 +185,11 @@ async function listProjects() {
     return index.projects.map(p => ({
         id: p.id,
         name: p.name || 'Untitled site',
+        // Versioning fields. Backfilled here for index entries that
+        // pre-date versioning: such a site is its own version group
+        // (groupId = its id) and is named "v1".
+        versionGroupId: p.versionGroupId || p.id,
+        versionName: p.versionName || 'v1',
         createdAt: p.createdAt || null,
         updatedAt: p.updatedAt || null,
     }));
@@ -192,6 +202,10 @@ function emptySite(siteId, name) {
         version: SITE_VERSION,
         id: siteId,
         name: name || 'Untitled site',
+        // A brand-new site founds its own version group. Duplicates copy
+        // this groupId so every version of a site shares one identifier.
+        versionGroupId: siteId,
+        versionName: 'v1',
         homepageId: null,
         pages: [],
         header: clone(SITE_DEFAULTS.header),
@@ -218,6 +232,8 @@ async function createProject({ name } = {}) {
     index.projects.push({
         id: siteId,
         name: site.name,
+        versionGroupId: site.versionGroupId,
+        versionName: site.versionName,
         createdAt: now,
         updatedAt: now,
     });
@@ -303,6 +319,16 @@ async function getProject(siteId) {
         }
     }
 
+    // Versioning fields — ensured lazily so sites stored before versioning
+    // existed still resolve a groupId. Such a site is its own group
+    // (groupId = its id), named "v1". Persisted on the next setProject.
+    if (typeof v.versionGroupId !== 'string' || !v.versionGroupId) {
+        v.versionGroupId = v.id;
+    }
+    if (typeof v.versionName !== 'string' || !v.versionName) {
+        v.versionName = 'v1';
+    }
+
     return v;
 }
 
@@ -314,6 +340,15 @@ async function setProject(siteId, site) {
         version: SITE_VERSION,
         id: siteId,
         name: typeof site.name === 'string' && site.name ? site.name : 'Untitled site',
+        // Versioning: groupId is immutable once set (falls back to this
+        // site's own id for sites that pre-date versioning); versionName
+        // is a free-form label ("v1", "v2", …) capped to a sane length.
+        versionGroupId: (typeof site.versionGroupId === 'string' && /^pj_[a-f0-9]+$/.test(site.versionGroupId))
+            ? site.versionGroupId
+            : siteId,
+        versionName: (typeof site.versionName === 'string' && site.versionName.trim())
+            ? site.versionName.trim().slice(0, 40)
+            : 'v1',
         homepageId: site.homepageId || null,
         pages: Array.isArray(site.pages) ? site.pages.map(sanitizePageIndexEntry).filter(Boolean) : [],
         header: isPlainObject(site.header) ? site.header : clone(SITE_DEFAULTS.header),
@@ -336,6 +371,10 @@ async function setProject(siteId, site) {
     const entry = index.projects.find(p => p.id === siteId);
     if (entry) {
         entry.name = sanitized.name;
+        // Mirror versioning fields onto the index entry so listProjects()
+        // can build the version switcher without reading every SiteDoc.
+        entry.versionGroupId = sanitized.versionGroupId;
+        entry.versionName = sanitized.versionName;
         entry.updatedAt = new Date().toISOString();
         await setProjectsIndex(index);
     }
@@ -366,6 +405,102 @@ async function renameProject(siteId, name) {
     if (!site) throw new Error('Project not found');
     site.name = name;
     return setProject(siteId, site);
+}
+
+/**
+ * Duplicate a project into a new version of the same version group.
+ *
+ * Deep-copies the SiteDoc, every PageDoc, and every block — all with
+ * fresh ids — and rewrites internal `{kind:'page', pageId}` link
+ * references (header / footer chrome + block content) to the cloned
+ * page ids so the copy's links stay self-contained.
+ *
+ * The new site shares the source's `versionGroupId`, is named the next
+ * free "v{n}" within that group, and is NOT made live (live is the
+ * single global cms_live_site_id, untouched here).
+ */
+async function duplicateProject(sourceSiteId) {
+    const source = await getProject(sourceSiteId);
+    if (!source) throw new Error('Project not found');
+
+    const newSiteId = newId('pj');
+    const now = new Date().toISOString();
+    const versionGroupId = source.versionGroupId || sourceSiteId;
+
+    // Pre-allocate the old→new page id mapping so links can be rewritten
+    // before any PageDoc is written.
+    const pageIdMap = new Map();
+    for (const entry of source.pages || []) {
+        if (entry && entry.id) pageIdMap.set(entry.id, newId('pg'));
+    }
+
+    // Rewrite {kind:'page', pageId} references onto the cloned page ids.
+    // Non-page links and primitives pass through untouched.
+    const remap = (node) => {
+        if (Array.isArray(node)) return node.map(remap);
+        if (!isPlainObject(node)) return node;
+        if (node.kind === 'page' && node.pageId && pageIdMap.has(node.pageId)) {
+            return { ...node, pageId: pageIdMap.get(node.pageId) };
+        }
+        const out = {};
+        for (const [k, v] of Object.entries(node)) out[k] = remap(v);
+        return out;
+    };
+
+    // Next free "v{n}" label within the group — max existing suffix + 1.
+    const index = await getProjectsIndex();
+    let maxN = 0;
+    for (const p of index.projects) {
+        if ((p.versionGroupId || p.id) !== versionGroupId) continue;
+        const m = /^v(\d+)$/.exec(p.versionName || 'v1');
+        maxN = Math.max(maxN, m ? parseInt(m[1], 10) : 1);
+    }
+    const versionName = `v${maxN + 1}`;
+
+    const newSite = {
+        version: SITE_VERSION,
+        id: newSiteId,
+        name: source.name,
+        versionGroupId,
+        versionName,
+        homepageId: source.homepageId ? (pageIdMap.get(source.homepageId) || null) : null,
+        pages: (source.pages || [])
+            .filter(e => e && pageIdMap.has(e.id))
+            .map(e => ({ ...clone(e), id: pageIdMap.get(e.id) })),
+        header: remap(clone(source.header || {})),
+        footer: remap(clone(source.footer || {})),
+        design: clone(source.design || {}),
+    };
+    await configStore.setConfig(projectKey(newSiteId), newSite);
+
+    // Deep-copy each PageDoc with a fresh page id + fresh block ids,
+    // remapping any internal page links inside block content too.
+    for (const entry of source.pages || []) {
+        const doc = await getPage(sourceSiteId, entry.id);
+        if (!doc) continue;
+        const newPageId = pageIdMap.get(entry.id);
+        await setPage(newSiteId, {
+            ...clone(doc),
+            id: newPageId,
+            blocks: (doc.blocks || []).map(b => ({
+                ...clone(b),
+                id: newId('blk'),
+                content: isPlainObject(b.content) ? remap(b.content) : (b.content || {}),
+            })),
+        });
+    }
+
+    index.projects.push({
+        id: newSiteId,
+        name: newSite.name,
+        versionGroupId,
+        versionName,
+        createdAt: now,
+        updatedAt: now,
+    });
+    await setProjectsIndex(index);
+
+    return { id: newSiteId, name: newSite.name, versionGroupId, versionName, createdAt: now, updatedAt: now };
 }
 
 function sanitizePageIndexEntry(entry) {
@@ -510,7 +645,7 @@ async function deletePageLocaleOverride(siteId, pageId, locale) {
 
 // ── Page-list operations (mutate site doc atomically) ────────────────
 
-async function createPage(siteId, { slug, title, copyFromId } = {}) {
+async function createPage(siteId, { slug, title, copyFromId, templateId } = {}) {
     const site = await getProject(siteId);
     if (!site) throw new Error('Project not found');
 
@@ -529,6 +664,14 @@ async function createPage(siteId, { slug, title, copyFromId } = {}) {
             slug: finalSlug,
             title: title || `${source.title} (copy)`,
             blocks: source.blocks.map(b => ({ ...clone(b), id: newId('blk') })),
+        };
+    } else if (templateId) {
+        // Apply a saved template — blocks come back already deep-cloned
+        // with fresh ids, so we can drop them straight onto an empty page.
+        const blocks = await applyTemplate(templateId);
+        page = {
+            ...emptyPage({ id, slug: finalSlug, title: title || finalSlug }),
+            blocks,
         };
     } else {
         page = emptyPage({ id, slug: finalSlug, title: title || finalSlug });
@@ -965,23 +1108,336 @@ async function getAdminPayload(siteId) {
     };
 }
 
+// ── Export / Import ──────────────────────────────────────────────────
+//
+// Export bundles the entire SiteDoc + every PageDoc (with blocks) into a
+// single JSON payload. Locale overrides and the published snapshot are
+// intentionally NOT included — they're presentation state that should
+// be recomputed on the destination environment, not migrated as-is.
+//
+// Import generates fresh IDs for the site, every page, and every block,
+// so a re-import never collides with an existing site or any future
+// site that happens to share an old id. Header / footer link references
+// of `kind: 'page'` are remapped to the new page IDs so the imported
+// nav still points at the new pages, not the originals.
+
+const EXPORT_MARKER  = '_beeflow_export';
+const EXPORT_VERSION = 1;
+
+async function exportSite(siteId) {
+    const site = await getProject(siteId);
+    if (!site) throw new Error('Site not found');
+
+    // Pull every PageDoc by id (the site.pages array is just the index;
+    // the actual block content lives in cms_project_{site}_page_{id}).
+    // We carry both the index metadata (slug/title/isHomepage/hideHeader…)
+    // AND the full PageDoc (seo + blocks) for each page so an import can
+    // restore the page exactly. The exported page item is the union of
+    // both shapes — duplicate fields like slug/title resolve to the
+    // index entry's values (authoritative source).
+    const exportedPages = [];
+    for (const entry of site.pages || []) {
+        const doc = await getPage(siteId, entry.id) || {};
+        exportedPages.push({
+            // Index-side fields:
+            slug: entry.slug,
+            title: entry.title,
+            isHomepage: !!entry.isHomepage,
+            hideHeader: !!entry.hideHeader,
+            hideFooter: !!entry.hideFooter,
+            isNotFound: !!entry.isNotFound,
+            // PageDoc-side fields:
+            seo: doc.seo || { metaTitle: '', metaDescription: '', ogImage: '', noIndex: false },
+            blocks: Array.isArray(doc.blocks) ? doc.blocks : [],
+        });
+    }
+
+    return {
+        [EXPORT_MARKER]: true,
+        version: EXPORT_VERSION,
+        exportedAt: new Date().toISOString(),
+        site: {
+            name: site.name,
+            // Settings = site-level toggles other than nav chrome / design,
+            // surfaced under a single key for import-side clarity. Today
+            // there's only `homepageSlug` (derived from the homepage page
+            // index entry) — future flags can land here without breaking
+            // import-compatibility.
+            settings: {
+                homepageSlug: (site.pages || []).find(p => p.isHomepage)?.slug || null,
+            },
+            design: site.design || {},
+            chrome: {
+                header: site.header || {},
+                footer: site.footer || {},
+            },
+            pages: exportedPages,
+        },
+    };
+}
+
+// Structural caps on import payloads. Imports come from admin users, so
+// the threat model isn't anonymous DoS — it's a compromised admin
+// session pushing a deeply-nested or oversized payload that bloats the
+// config table and the in-memory parse. Numbers are sized for "normal"
+// marketing sites (a few dozen pages, a dozen blocks each); legitimate
+// imports will never come close.
+const IMPORT_MAX_PAGES        = 200;
+const IMPORT_MAX_BLOCKS_PAGE  = 100;
+const IMPORT_MAX_FIELD_BYTES  = 256 * 1024;  // 256 KB per stringified content/style blob
+
+function approxByteSize(value) {
+    try { return Buffer.byteLength(JSON.stringify(value) || '', 'utf8'); }
+    catch (_) { return Infinity; }
+}
+
+async function importSite(exportData) {
+    if (!isPlainObject(exportData)) throw new Error('Invalid export payload');
+    if (exportData[EXPORT_MARKER] !== true) throw new Error('Not a Bee Flow site export');
+    if (exportData.version !== EXPORT_VERSION) {
+        throw new Error(`Unsupported export version: ${exportData.version}`);
+    }
+    const incoming = exportData.site;
+    if (!isPlainObject(incoming)) throw new Error('Export payload is missing the `site` object');
+
+    // Cap pages and blocks before the loop below allocates them. Bytes-
+    // per-field is checked inside the block loop so we can reject early
+    // with a clear message instead of silently truncating.
+    const pagesPreview = Array.isArray(incoming.pages) ? incoming.pages : [];
+    if (pagesPreview.length > IMPORT_MAX_PAGES) {
+        throw new Error(`Too many pages in import (max ${IMPORT_MAX_PAGES})`);
+    }
+    for (const p of pagesPreview) {
+        if (!isPlainObject(p)) continue;
+        const blocks = Array.isArray(p.blocks) ? p.blocks : [];
+        if (blocks.length > IMPORT_MAX_BLOCKS_PAGE) {
+            throw new Error(`Too many blocks on one page (max ${IMPORT_MAX_BLOCKS_PAGE})`);
+        }
+    }
+
+    // Fresh site id + a name suffix so the user can tell originals apart
+    // from imports at a glance. The suffix is plain; users rename via
+    // the Site Switcher right after import if they want.
+    const newSiteId = newId('pj');
+    const now = new Date().toISOString();
+    const siteName = (typeof incoming.name === 'string' && incoming.name.trim())
+        ? `${incoming.name} (imported)`
+        : 'Imported site';
+
+    // Remap page ids: keep slug/title/order, generate fresh page ids and
+    // fresh block ids. Track old→new id mapping so we can rewrite any
+    // page-kind link references that pointed at the OLD page ids inside
+    // header/footer chrome and inside block content of every page.
+    const pagesIn = Array.isArray(incoming.pages) ? incoming.pages : [];
+    const pagesOut = [];
+    const idMap = new Map();   // oldId → newId (oldId is the slug since exports don't carry the original page id)
+    // We use slug as the lookup key because exports don't carry the
+    // ORIGINAL page id — by design, they shouldn't leak runtime ids.
+    // Internal link references (`{kind:'page', pageId: <oldId>}`) point
+    // at the OLD ids; we don't have those, so we *also* support
+    // `{kind:'page', slug: <slug>}` style remapping during import. If
+    // the chrome / block content uses oldId only and the original
+    // pageId isn't reachable, links resolve to '#' at render time
+    // (graceful degradation; we never crash). To preserve perfect
+    // fidelity, callers who depend on chrome page links should ensure
+    // the export tool carries page ids alongside link references — for
+    // now we remap by slug when available, leave old ids otherwise so
+    // the renderer's fallback (`broken: true`) surfaces them clearly.
+    const slugToNewId = new Map();
+
+    for (const incomingPage of pagesIn) {
+        if (!isPlainObject(incomingPage)) continue;
+        const pageId = newId('pg');
+        const slug = normalizeSlug(incomingPage.slug || incomingPage.title || 'page') || 'page';
+        const finalSlug = ensureUniqueSlug(slug, pagesOut, null);
+        pagesOut.push({
+            id: pageId,
+            slug: finalSlug,
+            title: typeof incomingPage.title === 'string' ? incomingPage.title : finalSlug,
+            isHomepage: !!incomingPage.isHomepage,
+            hideHeader: !!incomingPage.hideHeader,
+            hideFooter: !!incomingPage.hideFooter,
+            isNotFound: !!incomingPage.isNotFound,
+        });
+        slugToNewId.set(finalSlug, pageId);
+        // Stash the original slug too, so chrome links written with the
+        // original slug still remap even if the import normalised it.
+        if (incomingPage.slug && incomingPage.slug !== finalSlug) {
+            slugToNewId.set(String(incomingPage.slug), pageId);
+        }
+        idMap.set(finalSlug, pageId);
+    }
+
+    // Walk a node tree and replace any `{kind:'page', pageId:'<old>'}`
+    // references with the new id where we can resolve the target by
+    // slug. This is a best-effort remap — if the old export carried no
+    // slug hint and the old id is unknown, the link is left untouched
+    // and the renderer will display it as broken until the user fixes
+    // it manually.
+    const remapPageLinks = (node) => {
+        if (Array.isArray(node)) return node.map(remapPageLinks);
+        if (!isPlainObject(node)) return node;
+        if (node.kind === 'page') {
+            // Prefer a slug hint if the export carried one alongside the
+            // pageId. Fall through to no-op if neither matches.
+            const slug = typeof node.slug === 'string' ? node.slug : null;
+            if (slug && slugToNewId.has(slug)) {
+                return { ...node, pageId: slugToNewId.get(slug) };
+            }
+            return { ...node };
+        }
+        const out = {};
+        for (const [k, v] of Object.entries(node)) out[k] = remapPageLinks(v);
+        return out;
+    };
+
+    // Build the new SiteDoc.
+    const incomingChrome = isPlainObject(incoming.chrome) ? incoming.chrome : {};
+    const homepageEntry = pagesOut.find(p => p.isHomepage) || pagesOut[0] || null;
+    const newSite = {
+        version: SITE_VERSION,
+        id: newSiteId,
+        name: siteName,
+        homepageId: homepageEntry?.id || null,
+        pages: pagesOut.map(p => ({
+            ...p,
+            isHomepage: !!(homepageEntry && p.id === homepageEntry.id),
+        })),
+        header: remapPageLinks(isPlainObject(incomingChrome.header) ? incomingChrome.header : clone(SITE_DEFAULTS.header)),
+        footer: remapPageLinks(isPlainObject(incomingChrome.footer) ? incomingChrome.footer : clone(SITE_DEFAULTS.footer)),
+        design: sanitizeDesign(incoming.design),
+    };
+    await configStore.setConfig(projectKey(newSiteId), newSite);
+
+    // Write each PageDoc with a fresh page id and fresh block ids,
+    // remapping any internal page links inside block content too.
+    for (let i = 0; i < pagesIn.length; i++) {
+        const incomingPage = pagesIn[i];
+        const indexEntry = pagesOut[i];
+        if (!incomingPage || !indexEntry) continue;
+        const blocks = Array.isArray(incomingPage.blocks) ? incomingPage.blocks : [];
+        const pageDoc = {
+            id: indexEntry.id,
+            slug: indexEntry.slug,
+            title: indexEntry.title,
+            seo: isPlainObject(incomingPage.seo) ? incomingPage.seo : {
+                metaTitle: '', metaDescription: '', ogImage: '', noIndex: false,
+            },
+            blocks: blocks.map(b => {
+                if (!isPlainObject(b)) return null;
+                const content = isPlainObject(b.content) ? remapPageLinks(b.content) : {};
+                const style   = isPlainObject(b.style)   ? b.style   : {};
+                // Reject pathologically large blobs. A legit block is a
+                // few KB; 256 KB is already 10× the largest real-world
+                // sample we've seen, so this only catches abuse.
+                if (approxByteSize(content) > IMPORT_MAX_FIELD_BYTES
+                    || approxByteSize(style) > IMPORT_MAX_FIELD_BYTES) {
+                    throw new Error('Block content exceeds size limit');
+                }
+                return {
+                    id: newId('blk'),
+                    type: b.type,
+                    enabled: b.enabled !== false,
+                    content,
+                    style,
+                };
+            }).filter(Boolean),
+        };
+        await setPage(newSiteId, pageDoc);
+    }
+
+    // Register the new project in the index so it shows up in the
+    // listProjects() call the panel uses to refresh its switcher list.
+    const index = await getProjectsIndex();
+    index.projects.push({
+        id: newSiteId,
+        name: siteName,
+        createdAt: now,
+        updatedAt: now,
+    });
+    await setProjectsIndex(index);
+
+    return { siteId: newSiteId, name: siteName };
+}
+
+// ── Page templates (global, not site-scoped) ─────────────────────────
+//
+// Templates are reusable page block-arrays a user can apply when creating
+// a new page. Stored as one flat array under KEY_TEMPLATES. Each entry:
+//   { id, name, description, createdAt, blocks: [...] }
+// where `blocks` is a deep-cloned snapshot of a page's blocks taken at
+// save time. IDs inside blocks are NOT regenerated at save — they are
+// regenerated at APPLY time, so the saved entry is portable across sites
+// and stable to delete-without-affecting copies.
+
+async function getTemplates() {
+    const raw = await configStore.getConfig(KEY_TEMPLATES);
+    if (!Array.isArray(raw)) return [];
+    return raw;
+}
+
+async function setTemplates(list) {
+    const sanitized = Array.isArray(list) ? list : [];
+    await configStore.setConfig(KEY_TEMPLATES, sanitized);
+}
+
+async function saveTemplate({ name, description, blocks } = {}) {
+    const trimmedName = String(name || '').trim();
+    if (!trimmedName) throw new Error('Template name is required');
+    if (!Array.isArray(blocks)) throw new Error('Template blocks must be an array');
+    const list = await getTemplates();
+    const entry = {
+        id: newId('tpl'),
+        name: trimmedName.slice(0, 200),
+        description: String(description || '').slice(0, 500),
+        createdAt: new Date().toISOString(),
+        blocks: clone(blocks),
+    };
+    list.push(entry);
+    await setTemplates(list);
+    return entry;
+}
+
+async function deleteTemplate(id) {
+    if (!id) throw new Error('Template id is required');
+    const list = await getTemplates();
+    const next = list.filter(t => t.id !== id);
+    await setTemplates(next);
+}
+
+// Returns a deep copy of the template's blocks with FRESH block IDs so
+// it's safe to drop directly into a new page. Throws when the template
+// doesn't exist so callers can surface a clear error to the user.
+async function applyTemplate(id) {
+    if (!id) throw new Error('Template id is required');
+    const list = await getTemplates();
+    const tpl = list.find(t => t.id === id);
+    if (!tpl) throw new Error('Template not found');
+    const blocks = Array.isArray(tpl.blocks) ? tpl.blocks : [];
+    return blocks.map(b => ({ ...clone(b), id: newId('blk') }));
+}
+
 module.exports = {
     // locale settings
     getDefaultLocale, setDefaultLocale,
     // projects
-    listProjects, createProject, getProject, setProject, deleteProject, renameProject,
+    listProjects, createProject, getProject, setProject, deleteProject, renameProject, duplicateProject,
     // site-locale overrides
     getSiteLocaleOverride, setSiteLocaleOverride, deleteSiteLocaleOverride,
     // pages
     getPage, setPage, deletePage,
     getPageLocaleOverride, setPageLocaleOverride, deletePageLocaleOverride,
     createPage, removePage, updatePageMeta, setHomepage, reorderPages,
+    // page templates (global)
+    getTemplates, saveTemplate, deleteTemplate, applyTemplate,
     // preview / graph
     getEffective, getEffectivePublished, getSiteGraph,
     // publishing
     publishSite, getPublishedSnapshot,
     // admin
     getAdminPayload,
+    // import / export
+    exportSite, importSite,
     // helpers / constants for tests
     makeBlock, resolveLink,
     BLOCK_TYPE_IDS, RESERVED_SLUGS,
