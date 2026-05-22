@@ -417,6 +417,12 @@ app.use('/api/webpages', requireLicenseFeature('webpages'), requireWebpagesBeta(
 // by HMAC bearer tokens (issued by the session-authenticated route above),
 // not by the session itself, since the iframe has no cookies.
 app.use('/api/webpages-preview', require('./routes/webpagesPreview'));
+// Public webpage viewer — unauthenticated `/p/:token` route for external
+// recipients of a published webpage. Has its own rate limiter, strict CSP,
+// HMAC-signed magic links and unlock cookies. License/beta gates do NOT
+// apply: once a publisher (whose org is gated) creates a share, recipients
+// are anonymous third parties.
+app.use('/p', require('./routes/publicViewer'));
 // Meeting Notes beta feature gate
 const { requireBetaFeature } = require('./core/betaFeatures');
 app.use('/api/transcriptions', requireLicenseFeature('meeting_notes'), requireBetaFeature('meeting_notes'), require('./routes/transcriptions'));

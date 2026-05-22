@@ -910,17 +910,22 @@ router.get('/config/tiers-for-user', requireAuth, async (req, res) => {
             });
         }
 
-        // The Flow tier (key 'standard') depends on the `skills` beta; the
-        // Swarm tier depends on the `swarm` beta. Hide either tier when the
-        // caller's org/user doesn't have the matching feature so they never
-        // appear in the dropdown.
+        // The Flow tier (key 'standard') requires BOTH the `flow` beta (the
+        // tier opt-in) and the `skills` beta (its runtime dependency: Flow
+        // bootstraps chat-local session skills). The Swarm tier depends on
+        // the `swarm` beta. Hide either tier when the caller's org/user
+        // doesn't have the required feature(s).
         const { userHasBetaFeature } = require('../../core/betaFeatures');
         const hasSkillsFeature = userId
             ? await userHasBetaFeature(userId, 'skills', req.session).catch(() => false)
             : false;
+        const hasFlowFeature = userId
+            ? await userHasBetaFeature(userId, 'flow', req.session).catch(() => false)
+            : false;
         const hasSwarmFeature = userId
             ? await userHasBetaFeature(userId, 'swarm', req.session).catch(() => false)
             : false;
+        const hasFlowTier = hasFlowFeature && hasSkillsFeature;
 
         const result = {};
         // Auto is a meta/routing tier (no concrete modelId) — always include it
@@ -934,7 +939,7 @@ router.get('/config/tiers-for-user', requireAuth, async (req, res) => {
             // Direct-chat-only tiers: never expose for non-direct tasks.
             if ((key === 'standard' || key === 'swarm') && taskType !== 'direct_chat') continue;
             // Beta gates: Flow uses `skills`, Swarm uses `swarm`.
-            if (key === 'standard' && !hasSkillsFeature) continue;
+            if (key === 'standard' && !hasFlowTier) continue;
             if (key === 'swarm' && !hasSwarmFeature) continue;
             if (!tierPermittedByGroups(key)) continue;
             if (standardTiers && standardTiers[key]) result[key] = standardTiers[key];

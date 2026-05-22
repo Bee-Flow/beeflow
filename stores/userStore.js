@@ -479,6 +479,18 @@ async function initDB() {
     try { await exec(`ALTER TABLE consumer_subscriptions ADD COLUMN IF NOT EXISTS manual_override_until TIMESTAMPTZ`); } catch (e) { }
     try { await exec(`ALTER TABLE consumer_subscriptions ADD COLUMN IF NOT EXISTS manual_override_by TEXT`); } catch (e) { }
 
+    // In-app cancel + period tracking. cancel_at_period_end mirrors Stripe's
+    // flag so the UI can show a "cancels on …" banner; cancel_at and
+    // current_period_end carry the timestamps needed for that banner without
+    // a round-trip to Stripe. Populated by the customer.subscription.updated
+    // webhook and by the cancel/reactivate endpoints.
+    try { await exec(`ALTER TABLE organization_subscriptions ADD COLUMN IF NOT EXISTS cancel_at_period_end BOOLEAN NOT NULL DEFAULT FALSE`); } catch (e) { }
+    try { await exec(`ALTER TABLE organization_subscriptions ADD COLUMN IF NOT EXISTS cancel_at TIMESTAMPTZ`); } catch (e) { }
+    try { await exec(`ALTER TABLE organization_subscriptions ADD COLUMN IF NOT EXISTS current_period_end TIMESTAMPTZ`); } catch (e) { }
+    try { await exec(`ALTER TABLE consumer_subscriptions ADD COLUMN IF NOT EXISTS cancel_at_period_end BOOLEAN NOT NULL DEFAULT FALSE`); } catch (e) { }
+    try { await exec(`ALTER TABLE consumer_subscriptions ADD COLUMN IF NOT EXISTS cancel_at TIMESTAMPTZ`); } catch (e) { }
+    try { await exec(`ALTER TABLE consumer_subscriptions ADD COLUMN IF NOT EXISTS current_period_end TIMESTAMPTZ`); } catch (e) { }
+
     // Seat-cap atomic enforcement support index (PR 1.C). The serializable
     // transaction in createUserWithSeatCheck reads a COUNT()...FOR UPDATE
     // and benefits from a covering partial index.
@@ -1525,8 +1537,11 @@ async function setOrgSubscription(orgId, data) {
             if (data.manual_override_until !== undefined) updateMap.manual_override_until = data.manual_override_until;
             if (data.manual_override_by !== undefined) updateMap.manual_override_by = data.manual_override_by;
             if (data.stripe_seat_quantity !== undefined) updateMap.stripe_seat_quantity = data.stripe_seat_quantity;
+            if (data.cancel_at_period_end !== undefined) updateMap.cancel_at_period_end = data.cancel_at_period_end;
+            if (data.cancel_at !== undefined) updateMap.cancel_at = data.cancel_at;
+            if (data.current_period_end !== undefined) updateMap.current_period_end = data.current_period_end;
             updateMap.updated_at = now;
-            const colMap = { plan_id: 'plan_id', status: 'status', max_messages_per_month: 'max_messages_per_month', max_messages_by_type: 'max_messages_by_type', max_tokens_per_month: 'max_tokens_per_month', max_cost_per_month: 'max_cost_per_month', max_users: 'max_users', max_agents: 'max_agents', max_knowledge_sources: 'max_knowledge_sources', allowed_features: 'allowed_features', allowed_models: 'allowed_models', billing_cycle_start: 'billing_cycle_start', notes: 'notes', trial_end_date: 'trial_end_date', stripe_customer_id: 'stripe_customer_id', stripe_subscription_id: 'stripe_subscription_id', payment_status: 'payment_status', manual_override_until: 'manual_override_until', manual_override_by: 'manual_override_by', stripe_seat_quantity: 'stripe_seat_quantity', updated_at: 'updated_at' };
+            const colMap = { plan_id: 'plan_id', status: 'status', max_messages_per_month: 'max_messages_per_month', max_messages_by_type: 'max_messages_by_type', max_tokens_per_month: 'max_tokens_per_month', max_cost_per_month: 'max_cost_per_month', max_users: 'max_users', max_agents: 'max_agents', max_knowledge_sources: 'max_knowledge_sources', allowed_features: 'allowed_features', allowed_models: 'allowed_models', billing_cycle_start: 'billing_cycle_start', notes: 'notes', trial_end_date: 'trial_end_date', stripe_customer_id: 'stripe_customer_id', stripe_subscription_id: 'stripe_subscription_id', payment_status: 'payment_status', manual_override_until: 'manual_override_until', manual_override_by: 'manual_override_by', stripe_seat_quantity: 'stripe_seat_quantity', cancel_at_period_end: 'cancel_at_period_end', cancel_at: 'cancel_at', current_period_end: 'current_period_end', updated_at: 'updated_at' };
             const q = dynamicUpdate('organization_subscriptions', orgId, updateMap, colMap, 'organization_id');
             if (q) await run(q.sql, q.params);
         } else {
@@ -1664,8 +1679,11 @@ async function setConsumerSubscription(userId, data) {
             if (data.trial_end_date !== undefined) updateMap.trial_end_date = data.trial_end_date;
             if (data.manual_override_until !== undefined) updateMap.manual_override_until = data.manual_override_until;
             if (data.manual_override_by !== undefined) updateMap.manual_override_by = data.manual_override_by;
+            if (data.cancel_at_period_end !== undefined) updateMap.cancel_at_period_end = data.cancel_at_period_end;
+            if (data.cancel_at !== undefined) updateMap.cancel_at = data.cancel_at;
+            if (data.current_period_end !== undefined) updateMap.current_period_end = data.current_period_end;
             updateMap.updated_at = now;
-            const colMap = { plan_id: 'plan_id', status: 'status', stripe_customer_id: 'stripe_customer_id', stripe_subscription_id: 'stripe_subscription_id', payment_status: 'payment_status', billing_cycle_start: 'billing_cycle_start', trial_end_date: 'trial_end_date', manual_override_until: 'manual_override_until', manual_override_by: 'manual_override_by', updated_at: 'updated_at' };
+            const colMap = { plan_id: 'plan_id', status: 'status', stripe_customer_id: 'stripe_customer_id', stripe_subscription_id: 'stripe_subscription_id', payment_status: 'payment_status', billing_cycle_start: 'billing_cycle_start', trial_end_date: 'trial_end_date', manual_override_until: 'manual_override_until', manual_override_by: 'manual_override_by', cancel_at_period_end: 'cancel_at_period_end', cancel_at: 'cancel_at', current_period_end: 'current_period_end', updated_at: 'updated_at' };
             const q = dynamicUpdate('consumer_subscriptions', userId, updateMap, colMap, 'user_id');
             if (q) await run(q.sql, q.params);
         } else {

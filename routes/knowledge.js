@@ -389,7 +389,7 @@ router.post('/agents/:id/knowledge/url', requireAuth, async (req, res) => {
         console.log(`[Knowledge:URL] Fetching ${url}...`);
 
         // Use the proper webpage-to-markdown converter
-        const { htmlToMarkdown } = require('../../components/webpage-to-markdown/index');
+        const { htmlToMarkdown } = require('../utils/htmlToMarkdown');
 
         const response = await fetch(url, {
             headers: {

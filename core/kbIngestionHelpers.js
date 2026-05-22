@@ -270,7 +270,7 @@ async function fetchUrlContent(url) {
         const contentType = response.headers.get('content-type') || '';
 
         if (contentType.includes('text/html')) {
-            const { htmlToMarkdown } = require('../../components/webpage-to-markdown/index');
+            const { htmlToMarkdown } = require('../utils/htmlToMarkdown');
             const result = htmlToMarkdown(html, resolvedUrl, { includeLinks: true, includeImages: false });
             content = result.markdown;
             pageTitle = result.title || parsedUrl.hostname;
@@ -359,7 +359,7 @@ async function fetchWithPlaywright(url) {
         browser = null;
 
         // Convert rendered HTML to markdown
-        const { htmlToMarkdown } = require('../../components/webpage-to-markdown/index');
+        const { htmlToMarkdown } = require('../utils/htmlToMarkdown');
         const result = htmlToMarkdown(html, resolvedUrl, { includeLinks: true, includeImages: false });
         let content = result.markdown;
 

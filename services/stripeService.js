@@ -560,8 +560,49 @@ async function syncSeatQuantityForOrg(orgId) {
 }
 
 /**
+ * Switch a subscription to a new price in-place. Used by the upgrade flow —
+ * does NOT create a new checkout session. Pro-rates with `always_invoice` so
+ * the customer is charged the partial-period difference immediately. The
+ * existing billing_cycle_anchor is preserved so the next renewal lands on
+ * the same day of month. `payment_behavior: error_if_incomplete` makes
+ * Stripe reject the update outright if the proration invoice can't be
+ * collected — better a clean 402 than a half-applied plan change.
+ */
+async function updateSubscriptionPlan({ stripeSubscriptionId, newPriceId, quantity = 1 }) {
+    const stripe = await getClient();
+    const sub = await stripe.subscriptions.retrieve(stripeSubscriptionId);
+    const item = sub.items?.data?.[0];
+    if (!item) throw new Error(`Stripe subscription ${stripeSubscriptionId} has no items`);
+    return stripe.subscriptions.update(stripeSubscriptionId, {
+        items: [{ id: item.id, price: newPriceId, quantity: Math.max(1, quantity) }],
+        proration_behavior: 'always_invoice',
+        billing_cycle_anchor: 'unchanged',
+        payment_behavior: 'error_if_incomplete',
+    });
+}
+
+/**
+ * Schedule the subscription to cancel at the end of the current period.
+ * Status stays 'active' (or 'trialing') until cancel_at; the
+ * customer.subscription.updated webhook mirrors the flag locally.
+ */
+async function cancelSubscriptionAtPeriodEnd(stripeSubscriptionId) {
+    const stripe = await getClient();
+    return stripe.subscriptions.update(stripeSubscriptionId, { cancel_at_period_end: true });
+}
+
+/**
+ * Undo a scheduled cancel. Only valid while the subscription is still
+ * 'active' / 'trialing' and the period hasn't elapsed.
+ */
+async function reactivateSubscription(stripeSubscriptionId) {
+    const stripe = await getClient();
+    return stripe.subscriptions.update(stripeSubscriptionId, { cancel_at_period_end: false });
+}
+
+/**
  * Construct and verify a Stripe webhook event.
- * 
+ *
  * @param {Buffer} rawBody - Raw request body
  * @param {string} signature - Stripe-Signature header
  * @returns {object} Verified Stripe event
@@ -720,6 +761,9 @@ module.exports = {
     createPortalSession,
     retrieveCheckoutSession,
     syncSeatQuantityForOrg,
+    updateSubscriptionPlan,
+    cancelSubscriptionAtPeriodEnd,
+    reactivateSubscription,
     constructWebhookEvent,
     createPromoCode,
     listPromoCodes,

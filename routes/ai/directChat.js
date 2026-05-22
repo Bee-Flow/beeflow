@@ -381,14 +381,20 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
     }
     let resolvedTier = modelTier || 'fast';
 
-    // Defensive gate: the Standard tier requires the `skills` beta feature
-    // (it bootstraps chat-local session skills). The frontend already hides
-    // the option when ungranted — this just stops a hand-crafted request.
+    // Defensive gate: the Flow tier (key 'standard') requires BOTH:
+    //   - `flow`   — the tier opt-in beta feature
+    //   - `skills` — the runtime dependency (Flow bootstraps chat-local
+    //                session skills; see session-skill setup at ~L1081-1238)
+    // The frontend already hides the option when either is ungranted — this
+    // just stops a hand-crafted request.
     if (resolvedTier === 'standard') {
         const { userHasBetaFeature } = require('../../core/betaFeatures');
-        const allowed = await userHasBetaFeature(userId, 'skills', req.session).catch(() => false);
-        if (!allowed) {
-            console.warn(`[DirectChat] User ${userId} requested standard tier without skills feature — falling back to fast`);
+        const [hasFlow, hasSkills] = await Promise.all([
+            userHasBetaFeature(userId, 'flow', req.session).catch(() => false),
+            userHasBetaFeature(userId, 'skills', req.session).catch(() => false),
+        ]);
+        if (!hasFlow || !hasSkills) {
+            console.warn(`[DirectChat] User ${userId} requested Flow tier without required betas (flow=${hasFlow}, skills=${hasSkills}) — falling back to fast`);
             resolvedTier = 'fast';
         }
     }
@@ -932,13 +938,19 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         let notebookspaceContext = '';
         if (notebooksEnabled && notebookspaceAvailable) {
             notebookspaceContext = `\n\n[NOTEBOOK CAPABILITY]
-A Notebook panel is available in the user's UI. For long-form output the user is likely to keep or edit — memos, notes, letters, briefs, reports, articles, plans, code files, meeting notes — write the document into the notebook by calling notebook_write. The panel auto-opens when you write. Tools:
+A Notebook panel is available in the user's UI. Tools:
 - notebook_read: Read content. Modes: "outline" (default—headings+stats), "section" (one section by heading), "search" (find text), "full" (entire doc). Use outline first, then section/search for targeted access.
 - notebook_write: Replace ALL content (for new documents or full rewrites). Write in Markdown.
 - notebook_replace: Replace a SPECIFIC portion (find_text + replace_text). Preferred for partial edits.
 - notebook_insert: Add content at "start", "end", or "after" a heading.
 
-CRITICAL: When you use a notebook tool, do NOT also write the document text in your chat reply. Acknowledge briefly (one short sentence) and stop — the user reads the result in the Notebook panel. Use Markdown inside the notebook for headings, bold, tables, lists, code blocks.`;
+CRITICAL — WHEN TO WRITE TO THE NOTEBOOK:
+- Only call notebook_write, notebook_replace, or notebook_insert when the user has EXPLICITLY asked you to put something in the notebook (e.g. "save this to the notebook", "schrijf dit in het notebook", "zet in mijn notitie", "add to the document", "write the report in the notebook", "noteer dit", "draft a letter in the notebook").
+- Mere requests to "write", "draft", "summarise", "translate", "rewrite", "explain", or produce long-form content are NOT a notebook request — reply in chat instead. The user will explicitly ask if they want it in the notebook.
+- If unsure whether the user wants the output in the notebook, do NOT write to it. Reply in chat and ask, or just answer in chat.
+- The notebook is the user's document — never overwrite, append to, or modify it without an explicit instruction to do so.
+
+When you DO use a notebook tool (after an explicit request), do NOT also write the document text in your chat reply. Acknowledge briefly (one short sentence) and stop — the user reads the result in the Notebook panel. Use Markdown inside the notebook for headings, bold, tables, lists, code blocks.`;
         }
         if (notebooksEnabled && notebookspaceContent !== undefined) {
             notebookspaceContext += `\n\n[NOTEBOOK OPEN]
@@ -2609,6 +2621,7 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
         const collectedCalendarDrafts = [];
         const collectedMapEmbeds = [];
         const collectedToolHistory = []; // Track tool calls for persistence
+        let notebookWriteCommitted = false; // Set when a notebook tool actually persisted non-empty content; gates the "I wrote it to your Notebook" fallback below.
 
         // Strip internal metadata (_mcp etc.) before sending tools to LLM — providers may reject unknown fields
         directChatTools = directChatTools.map(t => {
@@ -2988,11 +3001,12 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                         // can re-read them via notebook_read in a later turn), but the
                         // user-facing SSE payload gets `[person_N]` → real values
                         // restored from the conversation token map.
-                        if (toolResult._action === 'workspace_update') {
+                        if (toolResult._action === 'workspace_update' && toolResult.content && toolResult.content.trim()) {
                             const { restoreTokens } = require('../../core/piiDetection');
                             const _convMapForWs = require('../../core/dlp/dlpRunner').getConversationTokenMap(convId);
-                            const rendered = restoreTokens(toolResult.content || '', _convMapForWs);
+                            const rendered = restoreTokens(toolResult.content, _convMapForWs);
                             send('workspace_update', { content: rendered });
+                            notebookWriteCommitted = true;
                         }
                         // Emit kb_sources SSE event
                         if (toolResult._action === 'kb_sources' && toolResult._sources?.length > 0) {
@@ -3607,11 +3621,12 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                 }
                 // Emit workspace_update SSE event. Render-time un-tokenisation —
                 // see the matching block in the precheck loop above for rationale.
-                if (toolResult._action === 'workspace_update') {
+                if (toolResult._action === 'workspace_update' && toolResult.content && toolResult.content.trim()) {
                     const { restoreTokens } = require('../../core/piiDetection');
                     const _convMapForWs = require('../../core/dlp/dlpRunner').getConversationTokenMap(convId);
-                    const rendered = restoreTokens(toolResult.content || '', _convMapForWs);
+                    const rendered = restoreTokens(toolResult.content, _convMapForWs);
                     send('workspace_update', { content: rendered });
+                    notebookWriteCommitted = true;
                 }
                 // Emit kb_sources SSE event
                 if (toolResult._action === 'kb_sources' && toolResult._sources?.length > 0) {
@@ -3766,19 +3781,18 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
         }
 
         // ─── Empty-response guard ────────────────────────────────────
-        // When the model emits only tool calls (most commonly `notebook_write`
-        // for long-form output), `fullContent` is an empty string. Saving an
-        // empty assistant bubble cascades into title-gen 400s and a confusing
-        // "Error generating response" in the chat UI. Replace with a useful
-        // human-readable line and push it to the client so the bubble renders
-        // sensibly. The Notebook panel auto-opens via `workspace_update`, so
-        // the user still gets the substance of the answer.
+        // When the model emits only tool calls, `fullContent` is an empty
+        // string. Saving an empty assistant bubble cascades into title-gen
+        // 400s and a confusing "Error generating response" in the chat UI.
+        // Replace with a useful human-readable line. Only claim the answer
+        // is in the notebook when a notebook tool actually persisted real
+        // content this turn — otherwise the user gets pointed at an empty
+        // panel (the original bug).
         if (!fullContent || !fullContent.trim()) {
-            const usedTools = Array.isArray(collectedToolHistory) && collectedToolHistory.length > 0;
-            const fallbackText = usedTools
+            const fallbackText = notebookWriteCommitted
                 ? 'I wrote the answer to your Notebook — open the Notebook panel to view it.'
                 : 'The model returned no response. Please try rephrasing your question.';
-            console.warn(`[DirectChat] Empty assistant content (toolsUsed=${usedTools}) — surfacing fallback line.`);
+            console.warn(`[DirectChat] Empty assistant content (toolsUsed=${collectedToolHistory.length > 0}, notebookWriteCommitted=${notebookWriteCommitted}) — surfacing fallback line.`);
             try { send('content_replace', { text: fallbackText }); } catch (_) { /* SSE may be closing */ }
             fullContent = fallbackText;
             displayContent = fallbackText;

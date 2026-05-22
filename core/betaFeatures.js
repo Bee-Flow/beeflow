@@ -93,6 +93,7 @@ const BETA_FEATURES = [
     { id: 'ai_code_execution', name: 'AI Code Execution', description: 'Allow the AI agent to execute code in a sandboxed environment', lifecycle: BetaLifecycle.EXPERIMENTAL },
     { id: 'custom_themes', name: 'Custom Themes', description: 'Organization-level custom branding and theme support', licenseFeature: 'custom_themes', lifecycle: BetaLifecycle.BETA },
     { id: 'skills', name: 'Skills', description: 'Reusable instruction packs for consistent AI task execution', licenseFeature: 'skills', lifecycle: BetaLifecycle.BETA },
+    { id: 'flow', name: 'Flow Model Tier', description: 'Multi-stage orchestration chat tier ("Flow") that bootstraps chat-local session skills. Requires the Skills beta feature to function — both must be enabled.', lifecycle: BetaLifecycle.BETA },
     { id: 'itil_ticket_assistant', name: 'ITIL Ticket Assistant', description: 'Connect ITSM platforms (Jira, ServiceNow, Zendesk, Freshservice, TopDesk) and email mailboxes as knowledge base sources. Tickets + emails are turned into structured solution articles (Root Cause / Resolution) for agent self-service.', licenseFeature: 'ticket_assistant', lifecycle: BetaLifecycle.BETA },
     // Legacy alias — retained for one release. The initDB() migration in
     // ticketAssistantStore.js rewrites stored org beta_features from

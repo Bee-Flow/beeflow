@@ -23,7 +23,8 @@ const configStore = require('../stores/configStore');
 const { resolveModelForTier } = require('../core/modelResolver');
 
 const EXPLORER_PROMPT_PATH = path.join(__dirname, '..', 'prompts', 'test-explorer-prompt.md');
-const MAX_STEPS = parseInt(process.env.PLAYWRIGHT_AGENT_MAX_STEPS || '25', 10);
+const DEFAULT_MAX_STEPS = parseInt(process.env.PLAYWRIGHT_AGENT_MAX_STEPS || '25', 10);
+const MAX_STEPS_CEILING = parseInt(process.env.PLAYWRIGHT_AGENT_MAX_STEPS_CEILING || '200', 10);
 const MIN_FRAME_INTERVAL_MS = parseInt(process.env.PLAYWRIGHT_AGENT_MIN_FRAME_INTERVAL_MS || '180', 10); // ~5 FPS cap
 const STEP_TIMEOUT_MS = 15_000;
 const FALLBACK_MODEL = 'claude-sonnet-4-6';
@@ -275,7 +276,11 @@ function _makeFrameEmitter(runId, page) {
  * @param {object} [args.sourceMeta]  — { type, label } for the report header
  * @returns {Promise<{status:'passed'|'failed'|'error', reportJson:object, error?:string}>}
  */
-async function runAgentMode({ runId, targetUrl, instructions, userId, organizationId = null, sourceMeta = null, credentials = null }) {
+async function runAgentMode({ runId, targetUrl, instructions, userId, organizationId = null, sourceMeta = null, credentials = null, maxSteps = null }) {
+    const stepCap = Math.min(
+        Math.max(parseInt(maxSteps, 10) || DEFAULT_MAX_STEPS, 1),
+        MAX_STEPS_CEILING,
+    );
     let playwright;
     try { playwright = require('playwright'); }
     catch (_) { return { status: 'error', error: 'playwright_not_installed' }; }
@@ -383,7 +388,7 @@ async function runAgentMode({ runId, targetUrl, instructions, userId, organizati
         let doneRequested = false;
         let cancelled = false;
 
-        while (stepCount < MAX_STEPS && !doneRequested) {
+        while (stepCount < stepCap && !doneRequested) {
             if (testRunStore.isCancelRequested(runId)) {
                 cancelled = true;
                 await testRunStore.appendProgress(runId, '[agent] cancelled by user');
@@ -487,14 +492,14 @@ async function runAgentMode({ runId, targetUrl, instructions, userId, organizati
             };
         }
 
-        if (stepCount >= MAX_STEPS && !doneRequested) {
-            await testRunStore.appendProgress(runId, `[agent] reached MAX_STEPS=${MAX_STEPS}, ending`);
+        if (stepCount >= stepCap && !doneRequested) {
+            await testRunStore.appendProgress(runId, `[agent] reached MAX_STEPS=${stepCap}, ending`);
             findings.push({
                 name: 'Agent reached step cap',
                 status: 'warning',
                 category: 'functionality',
                 severity: 'minor',
-                description: `Exploration ended after ${MAX_STEPS} steps without an explicit pw_done.`,
+                description: `Exploration ended after ${stepCap} steps without an explicit pw_done.`,
             });
         }
 

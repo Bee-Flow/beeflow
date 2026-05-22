@@ -157,7 +157,7 @@ router.post('/suites/:id/restore/:versionId', async (req, res) => {
 
 router.post('/runs', async (req, res) => {
     try {
-        const { suiteId = null, targetUrl, mode = 'suite', source = null, credentials = null } = req.body || {};
+        const { suiteId = null, targetUrl, mode = 'suite', source = null, credentials = null, maxSteps = null } = req.body || {};
         if (!targetUrl || typeof targetUrl !== 'string') {
             return res.status(400).json({ error: 'targetUrl is required' });
         }
@@ -202,6 +202,10 @@ router.post('/runs', async (req, res) => {
                 sourceMeta: { type: source.type, label: resolved.label },
                 instructions: resolved.instructions,
             };
+            const parsedSteps = parseInt(maxSteps, 10);
+            if (Number.isFinite(parsedSteps) && parsedSteps > 0) {
+                metadata.maxSteps = Math.min(parsedSteps, 200);
+            }
         }
 
         const runId = await testRunStore.createRun({

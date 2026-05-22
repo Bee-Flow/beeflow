@@ -671,6 +671,18 @@ async function handleSubscriptionUpdated(subscription) {
         updateData.trial_end_date = new Date(subscription.trial_end * 1000).toISOString();
     }
 
+    // Mirror the cancel-at-period-end flag and the scheduled cancel + current
+    // period-end timestamps so the UI can render a "cancels on …" banner
+    // without re-querying Stripe. These fields are informational; the actual
+    // cancellation still flows through subscription.deleted later.
+    updateData.cancel_at_period_end = !!subscription.cancel_at_period_end;
+    updateData.cancel_at = subscription.cancel_at
+        ? new Date(subscription.cancel_at * 1000).toISOString()
+        : null;
+    updateData.current_period_end = subscription.current_period_end
+        ? new Date(subscription.current_period_end * 1000).toISOString()
+        : null;
+
     if (subscriberType === 'consumer') {
         const userId = subscription.metadata?.beeflow_user_id;
         if (!userId) {

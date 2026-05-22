@@ -1988,10 +1988,10 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     // `[person_N]` tokens (so notebook_read in a later turn still
                     // works for the AI), but the user-facing SSE replaces them
                     // with the real values from the conversation token map.
-                    if (finalToolResult?._action === 'workspace_update') {
+                    if (finalToolResult?._action === 'workspace_update' && finalToolResult.content && finalToolResult.content.trim()) {
                         const { restoreTokens } = require('../piiDetection');
                         const _convMapForWs = require('../dlp/dlpRunner').getConversationTokenMap(conversation?.id);
-                        const rendered = restoreTokens(finalToolResult.content || '', _convMapForWs);
+                        const rendered = restoreTokens(finalToolResult.content, _convMapForWs);
                         onEvent('workspace_update', { content: rendered });
                     }
 

@@ -43,13 +43,16 @@ async function getPermittedTierKeys({ userId, session, taskType = 'direct_chat' 
     };
 
     const hasSkillsFeature = await userHasBetaFeature(userId, 'skills', session).catch(() => false);
+    const hasFlowFeature = await userHasBetaFeature(userId, 'flow', session).catch(() => false);
     const hasSwarmFeature = await userHasBetaFeature(userId, 'swarm', session).catch(() => false);
+    // Flow requires BOTH `flow` (opt-in) and `skills` (runtime dependency).
+    const hasFlowTier = hasFlowFeature && hasSkillsFeature;
 
     const allowed = new Set();
     if (tierPermittedByGroups('auto')) allowed.add('auto');
     for (const key of STANDARD_TIER_KEYS) {
         if ((key === 'standard' || key === 'swarm') && taskType !== 'direct_chat') continue;
-        if (key === 'standard' && !hasSkillsFeature) continue;
+        if (key === 'standard' && !hasFlowTier) continue;
         if (key === 'swarm' && !hasSwarmFeature) continue;
         if (!tierPermittedByGroups(key)) continue;
         allowed.add(key);

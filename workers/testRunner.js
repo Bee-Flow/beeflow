@@ -437,6 +437,7 @@ async function processRun(claim) {
                 organizationId: organizationId || null,
                 sourceMeta: meta?.sourceMeta || null,
                 credentials,
+                maxSteps: meta?.maxSteps ?? null,
             });
         } else if (mode === 'explore') {
             outcome = await runExploreMode({ runId, targetUrl, userId });

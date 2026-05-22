@@ -46,7 +46,7 @@ ALWAYS prefer outline → section over full reads to save tokens.`,
         type: 'function',
         function: {
             name: 'notebook_write',
-            description: 'Write or replace the ENTIRE content of the notebook panel. Use this proactively for long-form output that the user wants to save — reports, plans, stories, code files, meeting notes, etc. Write in Markdown — the notebook renders it as rich text. WARNING: This replaces ALL existing content. For partial edits use notebook_replace; to add content use notebook_insert.',
+            description: 'Write or replace the ENTIRE content of the notebook panel. Only call this when the user has EXPLICITLY asked for output to go into the notebook (e.g. "save this to my notebook", "schrijf dit in het notebook"). Do NOT call for generic write/draft/summarise requests — reply in chat instead. Content must be the full Markdown document; never call with empty or placeholder content. WARNING: This replaces ALL existing content. For partial edits use notebook_replace; to add content use notebook_insert.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -400,8 +400,14 @@ async function executeWorkspaceTool(toolName, args, context) {
 
     // ─── notebook_write ─────────────────────────────────────────────
     if (normalizedName === 'notebook_write') {
-        const content = args.content || '';
+        const content = typeof args.content === 'string' ? args.content : '';
         const title = args.title || 'Notebook';
+
+        if (!content.trim()) {
+            return {
+                error: 'content is required for notebook_write. Generate the full Markdown document first, then call notebook_write with it. Do not call notebook_write with empty or placeholder content.'
+            };
+        }
 
         try {
             const existing = await getWorkspace(conversationId);
@@ -507,6 +513,10 @@ async function executeWorkspaceTool(toolName, args, context) {
             const denied = denyIfCrossUser(workspace);
             if (denied) return denied;
             const currentContent = workspace?.content || '';
+
+            if (!currentContent.trim()) {
+                return { error: 'The notebook is empty — nothing to replace. Use notebook_write to create the initial content (only when the user has explicitly asked).' };
+            }
 
             let searchContent = currentContent;
             let sectionOffset = 0;

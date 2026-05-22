@@ -974,7 +974,7 @@ router.post('/:id/ingest/sitemap', requireAuth, requirePermission('manage_knowle
         console.log(`[KB] Sitemap: found ${pageUrls.length} pages from ${url}`);
 
         // ── Step 2: Ingest each page ──
-        const { htmlToMarkdown } = require('../../components/webpage-to-markdown/index');
+        const { htmlToMarkdown } = require('../utils/htmlToMarkdown');
         const results = { ingested: 0, skipped: 0, errors: 0, details: [] };
 
         for (let i = 0; i < pageUrls.length; i++) {
@@ -1378,7 +1378,7 @@ router.post('/:id/reindex', requireAuth, requirePermission('manage_knowledge'), 
                 if (doc.source_type === 'web' && doc.source_uri) {
                     console.log(`[KB] Reindex [${i + 1}/${docs.length}] Re-fetching URL: ${doc.source_uri}`);
                     try {
-                        const { htmlToMarkdown } = require('../../components/webpage-to-markdown/index');
+                        const { htmlToMarkdown } = require('../utils/htmlToMarkdown');
                         const response = await fetch(doc.source_uri, {
                             headers: { 'User-Agent': 'Mozilla/5.0 (compatible; BeeFlow/1.0)' },
                             redirect: 'follow',

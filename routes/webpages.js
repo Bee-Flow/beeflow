@@ -30,6 +30,8 @@ const crypto = require('crypto');
 const webpageStore = require('../stores/webpageStore');
 const storageStore = require('../stores/storageStore');
 const webpageDbStore = require('../stores/webpageDbStore');
+const publicShareStore = require('../stores/webpagePublicShareStore');
+const webpageSnapshot = require('../services/webpageSnapshot');
 const { issuePreviewToken, requirePreviewToken } = require('../auth/webpagePreviewToken');
 const kbStore = require('../stores/knowledgeBases');
 const { resolveAudienceContext } = require('../auth/audience');
@@ -280,6 +282,171 @@ router.patch('/:id/publish', requireAuth, async (req, res) => {
     } catch (err) {
         console.error('[Webpages] Publish failed:', err);
         res.status(500).json({ error: 'Failed to update publish state' });
+    }
+});
+
+// ── External (public) shares ────────────────────────────────────────
+//
+// Owner-managed share links that publish a sanitized snapshot of the page to
+// anonymous viewers. Strictly opt-in per share: every link is a separate row
+// with its own access mode, expiry, and audit trail. Recipients are NOT Bee
+// Flow users; the public viewer route at /p/:token handles them.
+
+const PUBLIC_SHARE_BASE_URL = process.env.PUBLIC_SHARE_BASE_URL || process.env.PUBLIC_APP_URL || '';
+function buildShareUrl(req, rawToken) {
+    // Prefer an explicit env override (e.g. https://app.beeflow.nl) so that
+    // links emailed from server-side environments don't end up pointing at
+    // localhost. Fall back to the request's own origin so dev works.
+    const base = PUBLIC_SHARE_BASE_URL
+        || `${req.protocol}://${req.get('host') || ''}`;
+    return `${base.replace(/\/+$/, '')}/p/${rawToken}`;
+}
+
+function parseExpiresAt(input) {
+    if (input === null || input === '' || input === undefined) return null;
+    const d = new Date(input);
+    if (Number.isNaN(d.getTime())) throw new Error('Invalid expires_at');
+    if (d.getTime() < Date.now() + 60_000) throw new Error('expires_at must be in the future');
+    return d;
+}
+
+// List all external shares for a webpage. Owner-only.
+router.get('/:id/public-shares', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const wp = await webpageStore.getWebpage(req.params.id, userId);
+        if (!wp) return res.status(404).json({ error: 'Webpage not found' });
+        const shares = await publicShareStore.listSharesForWebpage(req.params.id, userId);
+        res.json({ shares });
+    } catch (err) {
+        console.error('[Webpages] List public shares failed:', err);
+        res.status(500).json({ error: 'Failed to list public shares' });
+    }
+});
+
+// Create a new external share. Body: { accessMode, password?, allowedEmails?, expiresAt?, title? }
+// Returns the raw URL exactly once — the client must show it to the user;
+// the server only stores its sha256.
+router.post('/:id/public-shares', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const wp = await webpageStore.getWebpage(req.params.id, userId);
+        if (!wp) return res.status(404).json({ error: 'Webpage not found' });
+
+        const { accessMode = 'unlisted', password, allowedEmails, expiresAt, title } = req.body || {};
+        let expiry;
+        try { expiry = parseExpiresAt(expiresAt); }
+        catch (e) { return res.status(400).json({ error: e.message }); }
+
+        const { share, rawToken } = await publicShareStore.createShare({
+            webpageId: wp.id,
+            createdBy: userId,
+            organizationId: wp.organizationId || null,
+            accessMode,
+            password,
+            allowedEmails,
+            expiresAt: expiry,
+            title: title || wp.name || '',
+        });
+
+        // Capture the sanitized snapshot synchronously so the link works the
+        // moment the publisher copies it. Owner of the bytes is wp.userId
+        // (the webpage owner), which equals userId here — non-owner publishes
+        // are blocked by the getWebpage owner-scoped lookup above.
+        try {
+            await webpageSnapshot.writeSnapshot({
+                shareId: share.id,
+                webpageId: wp.id,
+                ownerId: wp.userId,
+            });
+        } catch (snapErr) {
+            // Roll back the share row so we don't leave a token pointing at
+            // a missing snapshot.
+            await publicShareStore.deleteShare(share.id, userId).catch(() => {});
+            console.error('[Webpages] Snapshot failed:', snapErr);
+            return res.status(500).json({ error: 'Failed to snapshot webpage: ' + snapErr.message });
+        }
+
+        res.json({
+            success: true,
+            share,
+            url: buildShareUrl(req, rawToken),
+            // The raw token is shown to the user once for copy-to-clipboard.
+            // Subsequent GETs return only the share metadata, never this.
+            rawToken,
+        });
+    } catch (err) {
+        console.error('[Webpages] Create public share failed:', err);
+        res.status(400).json({ error: err.message || 'Failed to create public share' });
+    }
+});
+
+// Re-snapshot an existing share so it reflects the current webpage. Keeps
+// the same token (recipients' links stay valid) but refreshes the bytes.
+router.post('/:id/public-shares/:shareId/refresh', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const wp = await webpageStore.getWebpage(req.params.id, userId);
+        if (!wp) return res.status(404).json({ error: 'Webpage not found' });
+        const share = await publicShareStore.getShareById(req.params.shareId);
+        if (!share || share.webpageId !== wp.id || share.createdBy !== userId) {
+            return res.status(404).json({ error: 'Share not found' });
+        }
+        if (share.revokedAt) return res.status(400).json({ error: 'Cannot refresh a revoked share' });
+        await webpageSnapshot.writeSnapshot({
+            shareId: share.id,
+            webpageId: wp.id,
+            ownerId: wp.userId,
+        });
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[Webpages] Refresh public share failed:', err);
+        res.status(500).json({ error: 'Failed to refresh share' });
+    }
+});
+
+// Update expiry. PATCH body: { expiresAt: ISO|null }
+router.patch('/:id/public-shares/:shareId', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const wp = await webpageStore.getWebpage(req.params.id, userId);
+        if (!wp) return res.status(404).json({ error: 'Webpage not found' });
+        const share = await publicShareStore.getShareById(req.params.shareId);
+        if (!share || share.webpageId !== wp.id || share.createdBy !== userId) {
+            return res.status(404).json({ error: 'Share not found' });
+        }
+        if (Object.prototype.hasOwnProperty.call(req.body || {}, 'expiresAt')) {
+            let expiry;
+            try { expiry = parseExpiresAt(req.body.expiresAt); }
+            catch (e) { return res.status(400).json({ error: e.message }); }
+            await publicShareStore.updateExpiry(share.id, userId, expiry);
+        }
+        const updated = await publicShareStore.getShareById(share.id);
+        res.json({ success: true, share: updated });
+    } catch (err) {
+        console.error('[Webpages] Update public share failed:', err);
+        res.status(500).json({ error: 'Failed to update share' });
+    }
+});
+
+// Revoke (soft-delete: marks revoked_at, snapshot is also purged).
+router.delete('/:id/public-shares/:shareId', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const wp = await webpageStore.getWebpage(req.params.id, userId);
+        if (!wp) return res.status(404).json({ error: 'Webpage not found' });
+        const share = await publicShareStore.getShareById(req.params.shareId);
+        if (!share || share.webpageId !== wp.id || share.createdBy !== userId) {
+            return res.status(404).json({ error: 'Share not found' });
+        }
+        // Always revoke the row first so the token stops working immediately,
+        // even if the snapshot purge takes time / fails.
+        await publicShareStore.revokeShare(share.id, userId);
+        await publicShareStore.deleteShare(share.id, userId).catch(() => {});
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[Webpages] Revoke public share failed:', err);
+        res.status(500).json({ error: 'Failed to revoke share' });
     }
 });
 

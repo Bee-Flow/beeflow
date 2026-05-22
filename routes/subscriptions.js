@@ -39,6 +39,19 @@ async function requireAdmin(req, res, next) {
     next();
 }
 
+// Lifecycle actions (upgrade/cancel/reactivate) are allowed for org-admins of
+// the same org plus super-admins. Distinct from `requireAuthOrOrgMember` —
+// regular org members can read the subscription but must not be able to
+// change the billing relationship.
+async function isOrgAdminForOrg(req, orgId) {
+    if (await isSuperAdmin(req)) return true;
+    const u = req.session?.user;
+    if (!u) return false;
+    const userOrgId = u.organizationId || u.orgId;
+    if (userOrgId !== orgId) return false;
+    return u.role === 'admin' || u.orgRole === 'org_admin' || u.orgRole === 'admin';
+}
+
 // Allow authenticated users to read their own org's subscription, super admins can access all
 async function requireAuthOrOrgMember(req, res, next) {
     if (!req.session?.isAuthenticated) return res.status(401).json({ error: 'Not authenticated' });
@@ -56,8 +69,9 @@ function getAdminId(req) {
     return req.session?.user?.id || req.session?.user?.username || 'unknown';
 }
 
-// Admin-only for plans and write operations; org members can read their own org sub
-router.use((req, res, next) => {
+// Admin-only for plans and write operations; org members can read their own
+// org sub; org-admins can drive lifecycle actions on their own org.
+router.use(async (req, res, next) => {
     // GET /orgs/:orgId and /orgs/:orgId/usage — allow org members
     const orgMatch = req.path.match(/^\/orgs\/([^/]+)(\/usage)?$/);
     if (req.method === 'GET' && orgMatch) {
@@ -68,6 +82,21 @@ router.use((req, res, next) => {
     if (req.method === 'GET' && req.path === '/consumer/usage') {
         if (!req.session?.isAuthenticated) return res.status(401).json({ error: 'Not authenticated' });
         return next();
+    }
+    // POST /orgs/:orgId/{upgrade|cancel|reactivate} — org-admin of that org
+    const orgLifecycle = req.path.match(/^\/orgs\/([^/]+)\/(upgrade|cancel|reactivate)$/);
+    if (req.method === 'POST' && orgLifecycle) {
+        if (!req.session?.isAuthenticated) return res.status(401).json({ error: 'Not authenticated' });
+        if (await isOrgAdminForOrg(req, orgLifecycle[1])) return next();
+        return res.status(403).json({ error: 'Org admin access required' });
+    }
+    // POST /consumer/:userId/{upgrade|cancel|reactivate} — the owner only
+    const consumerLifecycle = req.path.match(/^\/consumer\/([^/]+)\/(upgrade|cancel|reactivate)$/);
+    if (req.method === 'POST' && consumerLifecycle) {
+        if (!req.session?.isAuthenticated) return res.status(401).json({ error: 'Not authenticated' });
+        if (req.session.user?.id === consumerLifecycle[1]) return next();
+        if (await isSuperAdmin(req)) return next();
+        return res.status(403).json({ error: 'Owner access required' });
     }
     // Everything else requires super admin
     return requireAdmin(req, res, next);
@@ -413,12 +442,47 @@ router.get('/orgs/:orgId', async (req, res) => {
             ? { messages: usage.total_calls || 0, tokens: usage.total_tokens || 0, cost: billedCost }
             : { cost: billedCost };
 
+        // Upgradeable plans: same scope + interval, strictly higher price.
+        // The frontend uses this list directly to render the Upgrade picker —
+        // doing the filter server-side prevents the UI from ever offering a
+        // downgrade just because the client logic drifts.
+        let upgradeable_plans = [];
+        try {
+            const allPlans = await userStore.getAllPlans();
+            upgradeable_plans = (allPlans || [])
+                .filter(p => p.is_active !== false
+                    && p.stripe_price_id
+                    && (p.plan_type || 'organization') === (plan?.plan_type || 'organization')
+                    && p.billing_interval === plan?.billing_interval
+                    && Number(p.price) > planPrice)
+                .sort((a, b) => Number(a.price) - Number(b.price))
+                .map(p => ({
+                    id: p.id,
+                    name: p.name,
+                    description: p.description,
+                    price: p.price,
+                    currency: p.currency || 'eur',
+                    billing_interval: p.billing_interval,
+                    max_users: p.max_users,
+                    max_agents: p.max_agents,
+                    max_knowledge_sources: p.max_knowledge_sources,
+                    per_seat: !!p.per_seat,
+                    has_stripe_price: !!p.stripe_price_id,
+                }));
+        } catch (e) {
+            console.warn('[Subscriptions] upgradeable_plans compute failed:', e.message);
+        }
+
         res.json({
             ...sub,
+            cancel_at_period_end: !!sub.cancel_at_period_end,
+            cancel_at: sub.cancel_at || null,
+            current_period_end: sub.current_period_end || null,
             effective_limits: effective,
             billing_period: period,
             billing,
             current_usage: currentUsage,
+            upgradeable_plans,
         });
     } catch (e) {
         console.error('[Subscriptions] getOrgSub error:', e);
@@ -599,6 +663,288 @@ router.post('/consumer/:userId/reissue-license', async (req, res) => {
         }
     } catch (e) {
         console.error('[Subscriptions] reissueLicense (consumer) error:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ── Subscription lifecycle (upgrade / cancel / reactivate) ────────────────
+// In-app actions for the org admin. Drives `stripe.subscriptions.update`
+// directly so the customer stays on the same subscription (no new Checkout
+// session). Downgrades are intentionally rejected — the funnel only opens
+// upward and cancellations end the relationship at period boundary.
+
+const lifecycleErrorMessages = {
+    same_plan: 'You are already on this plan.',
+    no_price_change: 'The selected plan has the same price as your current plan.',
+    downgrade_not_supported: 'Downgrades are not supported. Contact info@beeflow.nl to discuss your options.',
+    interval_mismatch: 'Switching between monthly and yearly billing is not available via Upgrade. Contact info@beeflow.nl.',
+    wrong_plan_type: 'This plan does not match your account type.',
+};
+
+// Translate Stripe payment errors that surface during a synchronous
+// subscription.update — e.g. proration invoice declined — into HTTP 402 so
+// the UI can show a clear "update your payment method" prompt instead of a
+// generic 500.
+function stripePaymentErrorStatus(err) {
+    if (!err) return null;
+    if (err.statusCode === 402) return 402;
+    if (err.code === 'card_declined' || err.code === 'authentication_required') return 402;
+    if (err.type === 'StripeCardError') return 402;
+    return null;
+}
+
+async function performOrgUpgrade(orgId, planId, adminId) {
+    const stripeService = require('../services/stripeService');
+    const sub = await userStore.getOrgSubscription(orgId);
+    if (!sub) { const e = new Error('No subscription found'); e.status = 404; throw e; }
+    if (!sub.stripe_subscription_id) { const e = new Error('Subscription is not Stripe-managed'); e.status = 404; throw e; }
+    const newPlan = await userStore.getPlan(planId);
+    if (!newPlan) { const e = new Error('Plan not found'); e.status = 404; throw e; }
+    if (!newPlan.stripe_price_id) { const e = new Error('Plan not configured for payment'); e.status = 400; throw e; }
+    const currentPlan = sub.plan_id ? await userStore.getPlan(sub.plan_id) : null;
+    if (!currentPlan) { const e = new Error('Current plan is not resolvable'); e.status = 409; throw e; }
+
+    if (newPlan.id === currentPlan.id) { const e = new Error('same_plan'); e.status = 400; throw e; }
+    const newPrice = Number(newPlan.price) || 0;
+    const curPrice = Number(currentPlan.price) || 0;
+    if (newPrice < curPrice) { const e = new Error('downgrade_not_supported'); e.status = 400; throw e; }
+    if (newPrice === curPrice) { const e = new Error('no_price_change'); e.status = 400; throw e; }
+    if (newPlan.billing_interval !== currentPlan.billing_interval) { const e = new Error('interval_mismatch'); e.status = 400; throw e; }
+    if ((newPlan.plan_type || 'organization') !== (currentPlan.plan_type || 'organization')) { const e = new Error('wrong_plan_type'); e.status = 400; throw e; }
+
+    const quantity = newPlan.per_seat ? Math.max(1, await userStore.getActiveSeatCount(orgId)) : 1;
+    let stripeSub;
+    try {
+        stripeSub = await stripeService.updateSubscriptionPlan({
+            stripeSubscriptionId: sub.stripe_subscription_id,
+            newPriceId: newPlan.stripe_price_id,
+            quantity,
+        });
+    } catch (e) {
+        const status = stripePaymentErrorStatus(e);
+        if (status === 402) {
+            await userStore.logSubscriptionAudit(
+                'upgrade_subscription_payment_failed', 'organization', orgId, adminId,
+                { plan_id: currentPlan.id },
+                { plan_id: newPlan.id, stripe_subscription_id: sub.stripe_subscription_id, error: String(e.message || e).slice(0, 500) }
+            );
+            const err = new Error('payment_required'); err.status = 402; throw err;
+        }
+        throw e;
+    }
+
+    // Optimistic local mirror — the customer.subscription.updated webhook will
+    // re-confirm shortly. Don't strip current_period_end on undefined values.
+    await userStore.setOrgSubscription(orgId, {
+        plan_id: newPlan.id,
+        status: 'active',
+        payment_status: 'paid',
+        stripe_seat_quantity: quantity,
+        ...(stripeSub.current_period_end
+            ? { current_period_end: new Date(stripeSub.current_period_end * 1000).toISOString() }
+            : {}),
+    });
+
+    try {
+        await require('../services/planEntitlements').applyPlanToOrg(orgId, newPlan.id, { mode: 'reset' });
+    } catch (e) {
+        console.warn('[Subscriptions] applyPlanToOrg (upgrade) failed:', e.message);
+    }
+
+    await userStore.logSubscriptionAudit(
+        'upgrade_subscription', 'organization', orgId, adminId,
+        { plan_id: currentPlan.id },
+        { plan_id: newPlan.id, stripe_subscription_id: sub.stripe_subscription_id, quantity }
+    );
+
+    return userStore.getOrgSubscription(orgId);
+}
+
+router.post('/orgs/:orgId/upgrade', async (req, res) => {
+    try {
+        const { planId } = req.body || {};
+        if (!planId) return res.status(400).json({ error: 'planId is required' });
+        const result = await performOrgUpgrade(req.params.orgId, planId, getAdminId(req));
+        res.json(result);
+    } catch (e) {
+        const status = e.status || 500;
+        if (status === 500) console.error('[Subscriptions] orgs/:orgId/upgrade error:', e);
+        const msg = lifecycleErrorMessages[e.message] || e.message;
+        res.status(status).json({ error: e.message, message: msg });
+    }
+});
+
+router.post('/orgs/:orgId/cancel', async (req, res) => {
+    try {
+        const stripeService = require('../services/stripeService');
+        const orgId = req.params.orgId;
+        const sub = await userStore.getOrgSubscription(orgId);
+        if (!sub) return res.status(404).json({ error: 'No subscription found' });
+        if (!sub.stripe_subscription_id) return res.status(404).json({ error: 'Subscription is not Stripe-managed' });
+        if (sub.cancel_at_period_end) return res.status(409).json({ error: 'already_scheduled', message: 'Cancellation already scheduled.' });
+
+        const stripeSub = await stripeService.cancelSubscriptionAtPeriodEnd(sub.stripe_subscription_id);
+        await userStore.setOrgSubscription(orgId, {
+            cancel_at_period_end: true,
+            cancel_at: stripeSub.cancel_at ? new Date(stripeSub.cancel_at * 1000).toISOString() : null,
+            current_period_end: stripeSub.current_period_end ? new Date(stripeSub.current_period_end * 1000).toISOString() : null,
+        });
+        await userStore.logSubscriptionAudit(
+            'cancel_subscription_scheduled', 'organization', orgId, getAdminId(req), null,
+            { stripe_subscription_id: sub.stripe_subscription_id, cancel_at: stripeSub.cancel_at }
+        );
+        res.json(await userStore.getOrgSubscription(orgId));
+    } catch (e) {
+        console.error('[Subscriptions] orgs/:orgId/cancel error:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+router.post('/orgs/:orgId/reactivate', async (req, res) => {
+    try {
+        const stripeService = require('../services/stripeService');
+        const orgId = req.params.orgId;
+        const sub = await userStore.getOrgSubscription(orgId);
+        if (!sub) return res.status(404).json({ error: 'No subscription found' });
+        if (!sub.stripe_subscription_id) return res.status(404).json({ error: 'Subscription is not Stripe-managed' });
+        if (!sub.cancel_at_period_end) return res.status(409).json({ error: 'not_scheduled', message: 'Subscription is not scheduled to cancel.' });
+
+        await stripeService.reactivateSubscription(sub.stripe_subscription_id);
+        await userStore.setOrgSubscription(orgId, {
+            cancel_at_period_end: false,
+            cancel_at: null,
+        });
+        await userStore.logSubscriptionAudit(
+            'cancel_subscription_undone', 'organization', orgId, getAdminId(req), null,
+            { stripe_subscription_id: sub.stripe_subscription_id }
+        );
+        res.json(await userStore.getOrgSubscription(orgId));
+    } catch (e) {
+        console.error('[Subscriptions] orgs/:orgId/reactivate error:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Consumer (individual) lifecycle — mirror of the org trio.
+
+async function performConsumerUpgrade(userId, planId, actorId) {
+    const stripeService = require('../services/stripeService');
+    const sub = await userStore.getConsumerSubscription(userId);
+    if (!sub) { const e = new Error('No subscription found'); e.status = 404; throw e; }
+    if (!sub.stripe_subscription_id) { const e = new Error('Subscription is not Stripe-managed'); e.status = 404; throw e; }
+    const newPlan = await userStore.getPlan(planId);
+    if (!newPlan) { const e = new Error('Plan not found'); e.status = 404; throw e; }
+    if (!newPlan.stripe_price_id) { const e = new Error('Plan not configured for payment'); e.status = 400; throw e; }
+    const currentPlan = sub.plan_id ? await userStore.getPlan(sub.plan_id) : null;
+    if (!currentPlan) { const e = new Error('Current plan is not resolvable'); e.status = 409; throw e; }
+
+    if (newPlan.id === currentPlan.id) { const e = new Error('same_plan'); e.status = 400; throw e; }
+    const newPrice = Number(newPlan.price) || 0;
+    const curPrice = Number(currentPlan.price) || 0;
+    if (newPrice < curPrice) { const e = new Error('downgrade_not_supported'); e.status = 400; throw e; }
+    if (newPrice === curPrice) { const e = new Error('no_price_change'); e.status = 400; throw e; }
+    if (newPlan.billing_interval !== currentPlan.billing_interval) { const e = new Error('interval_mismatch'); e.status = 400; throw e; }
+    if ((newPlan.plan_type || 'consumer') !== (currentPlan.plan_type || 'consumer')) { const e = new Error('wrong_plan_type'); e.status = 400; throw e; }
+
+    let stripeSub;
+    try {
+        stripeSub = await stripeService.updateSubscriptionPlan({
+            stripeSubscriptionId: sub.stripe_subscription_id,
+            newPriceId: newPlan.stripe_price_id,
+            quantity: 1,
+        });
+    } catch (e) {
+        const status = stripePaymentErrorStatus(e);
+        if (status === 402) {
+            await userStore.logSubscriptionAudit(
+                'upgrade_subscription_payment_failed', 'consumer', userId, actorId,
+                { plan_id: currentPlan.id },
+                { plan_id: newPlan.id, stripe_subscription_id: sub.stripe_subscription_id, error: String(e.message || e).slice(0, 500) }
+            );
+            const err = new Error('payment_required'); err.status = 402; throw err;
+        }
+        throw e;
+    }
+
+    await userStore.setConsumerSubscription(userId, {
+        plan_id: newPlan.id,
+        status: 'active',
+        payment_status: 'paid',
+        ...(stripeSub.current_period_end
+            ? { current_period_end: new Date(stripeSub.current_period_end * 1000).toISOString() }
+            : {}),
+    });
+
+    await userStore.logSubscriptionAudit(
+        'upgrade_subscription', 'consumer', userId, actorId,
+        { plan_id: currentPlan.id },
+        { plan_id: newPlan.id, stripe_subscription_id: sub.stripe_subscription_id }
+    );
+
+    return userStore.getConsumerSubscription(userId);
+}
+
+router.post('/consumer/:userId/upgrade', async (req, res) => {
+    try {
+        const { planId } = req.body || {};
+        if (!planId) return res.status(400).json({ error: 'planId is required' });
+        const result = await performConsumerUpgrade(req.params.userId, planId, getAdminId(req));
+        res.json(result);
+    } catch (e) {
+        const status = e.status || 500;
+        if (status === 500) console.error('[Subscriptions] consumer/:userId/upgrade error:', e);
+        const msg = lifecycleErrorMessages[e.message] || e.message;
+        res.status(status).json({ error: e.message, message: msg });
+    }
+});
+
+router.post('/consumer/:userId/cancel', async (req, res) => {
+    try {
+        const stripeService = require('../services/stripeService');
+        const userId = req.params.userId;
+        const sub = await userStore.getConsumerSubscription(userId);
+        if (!sub) return res.status(404).json({ error: 'No subscription found' });
+        if (!sub.stripe_subscription_id) return res.status(404).json({ error: 'Subscription is not Stripe-managed' });
+        if (sub.cancel_at_period_end) return res.status(409).json({ error: 'already_scheduled', message: 'Cancellation already scheduled.' });
+
+        const stripeSub = await stripeService.cancelSubscriptionAtPeriodEnd(sub.stripe_subscription_id);
+        await userStore.setConsumerSubscription(userId, {
+            cancel_at_period_end: true,
+            cancel_at: stripeSub.cancel_at ? new Date(stripeSub.cancel_at * 1000).toISOString() : null,
+            current_period_end: stripeSub.current_period_end ? new Date(stripeSub.current_period_end * 1000).toISOString() : null,
+        });
+        await userStore.logSubscriptionAudit(
+            'cancel_subscription_scheduled', 'consumer', userId, getAdminId(req), null,
+            { stripe_subscription_id: sub.stripe_subscription_id, cancel_at: stripeSub.cancel_at }
+        );
+        res.json(await userStore.getConsumerSubscription(userId));
+    } catch (e) {
+        console.error('[Subscriptions] consumer/:userId/cancel error:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+router.post('/consumer/:userId/reactivate', async (req, res) => {
+    try {
+        const stripeService = require('../services/stripeService');
+        const userId = req.params.userId;
+        const sub = await userStore.getConsumerSubscription(userId);
+        if (!sub) return res.status(404).json({ error: 'No subscription found' });
+        if (!sub.stripe_subscription_id) return res.status(404).json({ error: 'Subscription is not Stripe-managed' });
+        if (!sub.cancel_at_period_end) return res.status(409).json({ error: 'not_scheduled', message: 'Subscription is not scheduled to cancel.' });
+
+        await stripeService.reactivateSubscription(sub.stripe_subscription_id);
+        await userStore.setConsumerSubscription(userId, {
+            cancel_at_period_end: false,
+            cancel_at: null,
+        });
+        await userStore.logSubscriptionAudit(
+            'cancel_subscription_undone', 'consumer', userId, getAdminId(req), null,
+            { stripe_subscription_id: sub.stripe_subscription_id }
+        );
+        res.json(await userStore.getConsumerSubscription(userId));
+    } catch (e) {
+        console.error('[Subscriptions] consumer/:userId/reactivate error:', e);
         res.status(500).json({ error: e.message });
     }
 });
