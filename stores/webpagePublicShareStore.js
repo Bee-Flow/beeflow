@@ -31,14 +31,40 @@ const crypto = require('crypto');
 const argon2 = require('argon2');
 const { run, getOne, getAll, exec } = require('../db');
 const storageStore = require('./storageStore');
+const webpageStore = require('./webpageStore');
 
 let initialized = false;
+// Cache the in-flight init promise so concurrent first-callers all await
+// the same DDL run instead of each spawning their own. Without this, the
+// `if (initialized) return` check only fires AFTER the awaits, so N parallel
+// callers all execute the CREATE TABLE block N times. Harmless under
+// IF NOT EXISTS but causes pointless DDL queue contention on the first
+// burst of viewer traffic.
+let _initPromise = null;
 
 const ACCESS_MODES = ['unlisted', 'password', 'email'];
 
 async function initDB() {
     if (initialized) return;
+    if (_initPromise) return _initPromise;
+    _initPromise = (async () => {
+        // The webpage_public_shares table has a FK to webpages(id), so the
+        // parent table must exist first. webpageStore exposes a `ready`
+        // promise on its own initDB so we can serialize the two safely.
+        if (webpageStore.ready) {
+            try { await webpageStore.ready; }
+            catch (e) {
+                console.error('[WebpagePublicShareStore] Parent init failed:', e.message);
+                throw e;
+            }
+        }
+        await runInit();
+        initialized = true;
+    })();
+    return _initPromise;
+}
 
+async function runInit() {
     await exec(`
         CREATE TABLE IF NOT EXISTS webpage_public_shares (
             id TEXT PRIMARY KEY,
@@ -75,11 +101,15 @@ async function initDB() {
         CREATE INDEX IF NOT EXISTS idx_wppsv_share ON webpage_public_share_views(share_id, viewed_at DESC);
     `);
 
-    initialized = true;
     console.log('[WebpagePublicShareStore] PostgreSQL initialized');
 }
 
-initDB().catch(err => console.error('[WebpagePublicShareStore] Init error:', err.message));
+// Eager init, log-only swallow; concurrent callers below all share the
+// cached promise so this race-free.
+initDB().then(
+    () => { /* ok */ },
+    err => console.error('[WebpagePublicShareStore] Init error:', err.message)
+);
 
 // ── Token helpers ───────────────────────────────────────────────────
 

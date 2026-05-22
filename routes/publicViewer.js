@@ -286,22 +286,36 @@ async function resolveShareOr404(req, res) {
     return { share, rawToken };
 }
 
+// Race a promise against a timeout. Returns `fallback` if `ms` ms elapse
+// before the promise settles. Used so a slow DB query never holds the
+// public-viewer response open for tens of seconds — the chrome can be
+// rendered without publisher metadata if userStore is unreachable.
+function withTimeout(p, ms, fallback) {
+    return new Promise((resolve) => {
+        const t = setTimeout(() => resolve(fallback), ms);
+        Promise.resolve(p).then(
+            (v) => { clearTimeout(t); resolve(v); },
+            () => { clearTimeout(t); resolve(fallback); }
+        );
+    });
+}
+
 async function lookupPublisher(share) {
-    try {
-        const u = await userStore.getUser(share.createdBy);
-        if (!u) return { name: 'a Bee Flow user', orgName: '' };
-        let orgName = '';
-        if (share.organizationId) {
-            try {
-                const orgs = await userStore.getAllOrganizations?.();
-                const org = Array.isArray(orgs) ? orgs.find(o => o.id === share.organizationId) : null;
-                if (org?.name) orgName = org.name;
-            } catch (_) { /* best-effort */ }
-        }
-        return { name: u.name || u.displayName || u.email || 'a Bee Flow user', orgName };
-    } catch (_) {
-        return { name: 'a Bee Flow user', orgName: '' };
+    const PUBLISHER_TIMEOUT_MS = 3000;
+    const fallback = { name: 'a Bee Flow user', orgName: '' };
+    const u = await withTimeout(userStore.getUser(share.createdBy), PUBLISHER_TIMEOUT_MS, null);
+    if (!u) return fallback;
+    let orgName = '';
+    if (share.organizationId && typeof userStore.getAllOrganizations === 'function') {
+        const orgs = await withTimeout(
+            userStore.getAllOrganizations(),
+            PUBLISHER_TIMEOUT_MS,
+            null
+        );
+        const org = Array.isArray(orgs) ? orgs.find(o => o.id === share.organizationId) : null;
+        if (org?.name) orgName = org.name;
     }
+    return { name: u.name || u.displayName || u.email || 'a Bee Flow user', orgName };
 }
 
 // GET /p/:token — chrome + gate (or direct content if unlocked / unlisted).
@@ -359,11 +373,17 @@ async function renderChrome(req, res, share, rawToken, nonce, viewerEmail) {
     const publisher = await lookupPublisher(share);
     setSecurityHeaders(res, { nonce });
     // Record an audit row per chrome render — distinct visits, not per asset.
-    publicShareStore.recordView(share.id, {
-        viewerEmail: viewerEmail || null,
-        ip: req.ip,
-        userAgent: req.headers['user-agent'] || '',
-    }).catch(() => {});
+    // Fire-and-forget with a 2s ceiling so a slow INSERT can never delay the
+    // response. The bookkeeping is best-effort; missing rows are acceptable.
+    withTimeout(
+        publicShareStore.recordView(share.id, {
+            viewerEmail: viewerEmail || null,
+            ip: req.ip,
+            userAgent: req.headers['user-agent'] || '',
+        }),
+        2000,
+        null
+    );
     res.status(200).type('html').send(composeViewerChrome({ share, publisher, nonce, rawToken }));
 }
 

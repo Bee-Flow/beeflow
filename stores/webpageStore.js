@@ -162,7 +162,18 @@ async function initDB() {
     console.log('[WebpageStore] PostgreSQL initialized');
 }
 
-initDB().catch(err => console.error('[WebpageStore] Init error:', err.message));
+// Eager init at module load + an awaitable handle so dependants (e.g.
+// webpagePublicShareStore, which references webpages(id) by FK) can wait
+// for the parent table to exist before running their own DDL. Each call
+// to `initDB()` short-circuits when `initialized` is true, so dependants
+// can either await the cached `ready` promise OR re-invoke initDB() — same
+// outcome. Logging is attached via a no-op .then so we don't suppress the
+// rejection on `ready` itself.
+const ready = initDB();
+ready.then(
+    () => { /* ok */ },
+    err => console.error('[WebpageStore] Init error:', err.message)
+);
 
 // ── RustFS helpers ─────────────────────────────────────────────────
 
@@ -1089,6 +1100,7 @@ async function checkGrant(webpageId, kind, key) {
 module.exports = {
     SLOTS,
     VERSIONED_SLOTS,
+    ready,
     // Webpages
     createWebpage,
     getWebpages,
