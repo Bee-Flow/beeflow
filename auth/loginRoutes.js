@@ -128,13 +128,29 @@ router.get('/setup-status', async (req, res) => {
     const waitlistEnabled = (await configStore.getConfig('signup_waitlist_enabled')) ?? false;
     const consumerLoginMethods = (await configStore.getConfig('consumer_login_methods')) ?? ['password', 'google', 'microsoft'];
 
+    // Self-hosted deploys have a single tenant — surface its branding pre-auth
+    // so the login page and initial loading screen can render the customer's
+    // logo instead of Bee Flow's. Skipped on cloud where there's no single org.
+    const deploymentMode = process.env.DEPLOYMENT_MODE || 'cloud';
+    let branding = null;
+    if (deploymentMode === 'self-hosted') {
+        try {
+            const orgs = await userStore.getAllOrganizations();
+            const org = Array.isArray(orgs) ? orgs.find(o => o.logo || o.name) || orgs[0] : null;
+            if (org) branding = { logo: org.logo || null, name: org.name || null };
+        } catch (err) {
+            console.warn('[Auth] setup-status — branding lookup failed:', err.message);
+        }
+    }
+
     res.json({
         isSetupComplete,
         isOAuthConfigured,
         isGoogleConfigured,
         isMicrosoftConfigured,
         serverUrl,
-        deploymentMode: process.env.DEPLOYMENT_MODE || 'cloud',
+        deploymentMode,
+        branding,
         allowSignups: allowOrgSignups || allowConsumerSignups,
         allowOrgSignups,
         allowConsumerSignups,
@@ -493,6 +509,19 @@ router.get('/user', async (req, res) => {
                     notebooksMenu: notebooksMenuEnabled !== false && notebooksMenuEnabled !== 'false',
                     deploymentMode: process.env.DEPLOYMENT_MODE || 'cloud',
                 };
+            })(),
+            // Org branding (logo + name) for self-hosted white-label rendering
+            // in the sidebar / loading screens. Cloud users see the same data
+            // but the frontend only swaps the logo when deploymentMode is
+            // 'self-hosted', so leaving it populated everywhere is harmless.
+            organization: await (async () => {
+                try {
+                    const orgId = freshUser?.organizationId;
+                    if (!orgId) return null;
+                    const org = await userStore.getOrganization(orgId);
+                    if (!org) return null;
+                    return { id: org.id, name: org.name || null, logo: org.logo || null };
+                } catch (e) { return null; }
             })(),
             // Org-level enabled integrations
             enabledIntegrations: await (async () => {

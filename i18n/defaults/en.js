@@ -111,6 +111,7 @@ const GUI_DEFAULTS = {
     'sidebar.older': 'Older',
     'sidebar.pinned': 'Pinned',
     'sidebar.direct_chat': 'Direct Chat',
+    'sidebar.powered_by': 'Powered by Bee Flow',
     'sidebar.agent_store': 'Agents',
     'sidebar.my_agents': 'My Agents',
     'sidebar.discover_agents': 'Discover AI Agents',

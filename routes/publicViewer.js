@@ -1,5 +1,5 @@
 /**
- * Public Webpage Viewer — unauthenticated route at /p/:token.
+ * Public Webpage Viewer — unauthenticated route at /share/:token.
  *
  * This is the only route in the app that serves user-supplied HTML to
  * anonymous visitors, so it carries the bulk of the external-publishing
@@ -7,7 +7,7 @@
  *
  *   1. Token entropy        — 256 bits, lookup by sha256, so a leaked DB
  *                             dump doesn't yield working URLs.
- *   2. Rate limiting        — per-IP and per-token caps on the /p prefix
+ *   2. Rate limiting        — per-IP and per-token caps on the /share prefix
  *                             slow scraping and brute-forcing.
  *   3. Access gating        — unlisted (token only), password (argon2id),
  *                             or email-allowlist with HMAC magic links.
@@ -19,7 +19,7 @@
  *                             slipped through it cannot run.
  *   6. Strict CSP           — default-src 'none' with narrow allowlist;
  *                             frame-ancestors 'none' to block embedding.
- *   7. Cookie isolation     — unlock cookie is scoped to /p, HttpOnly,
+ *   7. Cookie isolation     — unlock cookie is scoped to /share, HttpOnly,
  *                             SameSite=Lax, and bound to share ID + HMAC.
  */
 
@@ -100,7 +100,7 @@ function setUnlockCookie(req, res, shareId, email) {
         httpOnly: true,
         sameSite: 'lax',
         secure: isHttpsRequest(req),
-        path: '/p',
+        path: '/share',
         maxAge: publicShareToken.UNLOCK_COOKIE_TTL_MS,
     });
 }
@@ -158,7 +158,7 @@ function composeViewerChrome({ share, publisher, nonce, rawToken }) {
   <span class="bf-meta">Shared by ${publisherName}${publisherOrg ? ' · ' + publisherOrg : ''}</span>
 </header>
 <main class="bf-frame-wrap">
-  <iframe class="bf-frame" sandbox="allow-forms" referrerpolicy="no-referrer" src="/p/${encodeURIComponent(rawToken)}/content"></iframe>
+  <iframe class="bf-frame" sandbox="allow-forms" referrerpolicy="no-referrer" src="/share/${encodeURIComponent(rawToken)}/content"></iframe>
 </main>
 <footer class="bf-footer">
   This page was shared via Bee Flow.
@@ -176,10 +176,10 @@ function composeIframeContent({ html, css, rawToken }) {
     //
     // <base href> points relative URLs at the extras prefix so that
     // <img src="logo.png"> in the user's HTML resolves to
-    // /p/:token/extras/logo.png. The sandbox has an opaque origin so the
+    // /share/:token/extras/logo.png. The sandbox has an opaque origin so the
     // browser performs a CORS-less GET against our same-origin route, which
     // returns the snapshot bytes after re-checking the gate.
-    const extrasBase = `/p/${encodeURIComponent(rawToken)}/extras/`;
+    const extrasBase = `/share/${encodeURIComponent(rawToken)}/extras/`;
     return `<!doctype html>
 <html><head>
 <meta charset="utf-8">
@@ -230,7 +230,7 @@ function composeGate({ share, csrf, error, mode, nonce, rawToken }) {
   <p>${isPassword
         ? 'This shared page is password-protected. Ask the sender if you don\'t have one.'
         : 'Enter the email you received this link from to continue. We\'ll send you a one-time access link.'}</p>
-  <form method="POST" action="/p/${encodeURIComponent(rawToken)}/unlock" autocomplete="off">
+  <form method="POST" action="/share/${encodeURIComponent(rawToken)}/unlock" autocomplete="off">
     <input type="hidden" name="_csrf" value="${htmlEscape(csrf)}">
     ${isPassword ? `
       <label for="pw">Password</label>
@@ -318,7 +318,7 @@ async function lookupPublisher(share) {
     return { name: u.name || u.displayName || u.email || 'a Bee Flow user', orgName };
 }
 
-// GET /p/:token — chrome + gate (or direct content if unlocked / unlisted).
+// GET /share/:token — chrome + gate (or direct content if unlocked / unlisted).
 router.get('/:token', async (req, res) => {
     try {
         const ctx = await resolveShareOr404(req, res);
@@ -333,7 +333,7 @@ router.get('/:token', async (req, res) => {
                 setUnlockCookie(req, res, share.id, claim.email);
                 // Redirect to clean URL (strip the ?k param) so the link can't
                 // be re-shared with the credential embedded.
-                return res.redirect(302, `/p/${encodeURIComponent(rawToken)}`);
+                return res.redirect(302, `/share/${encodeURIComponent(rawToken)}`);
             }
         }
 
@@ -349,7 +349,7 @@ router.get('/:token', async (req, res) => {
             // allow-list (publisher may have edited it since unlock).
             if (share.accessMode === 'email' && !publicShareStore.isEmailAllowed(share, unlock.email)) {
                 // Drop the stale cookie and re-gate.
-                res.clearCookie(UNLOCK_COOKIE_NAME, { path: '/p' });
+                res.clearCookie(UNLOCK_COOKIE_NAME, { path: '/share' });
             } else {
                 return renderChrome(req, res, share, rawToken, nonce, unlock.email);
             }
@@ -387,7 +387,7 @@ async function renderChrome(req, res, share, rawToken, nonce, viewerEmail) {
     res.status(200).type('html').send(composeViewerChrome({ share, publisher, nonce, rawToken }));
 }
 
-// GET /p/:token/content — the iframe-loaded content document. Same auth
+// GET /share/:token/content — the iframe-loaded content document. Same auth
 // rules as the chrome page; we re-check on each request so the iframe
 // cannot be hot-linked from another origin to bypass the gate.
 router.get('/:token/content', async (req, res) => {
@@ -437,7 +437,7 @@ router.get('/:token/content', async (req, res) => {
     }
 });
 
-// GET /p/:token/extras/* — serve a sanitized/binary extra file from
+// GET /share/:token/extras/* — serve a sanitized/binary extra file from
 // the snapshot. Same auth check as content. Express 5 requires a named
 // wildcard for path-to-regexp, hence `:path(*)`.
 router.get('/:token/extras/*path', async (req, res) => {
@@ -475,7 +475,7 @@ router.get('/:token/extras/*path', async (req, res) => {
     }
 });
 
-// POST /p/:token/unlock — password or email gate submission.
+// POST /share/:token/unlock — password or email gate submission.
 router.post('/:token/unlock', unlockLimiter, formParser, async (req, res) => {
     try {
         const ctx = await resolveShareOr404(req, res);
@@ -504,7 +504,7 @@ router.post('/:token/unlock', unlockLimiter, formParser, async (req, res) => {
                 }));
             }
             setUnlockCookie(req, res, share.id, null);
-            return res.redirect(302, `/p/${encodeURIComponent(rawToken)}`);
+            return res.redirect(302, `/share/${encodeURIComponent(rawToken)}`);
         }
 
         if (share.accessMode === 'email') {
@@ -517,7 +517,7 @@ router.post('/:token/unlock', unlockLimiter, formParser, async (req, res) => {
                 const magic = publicShareToken.issueMagicLink({ shareId: share.id, email });
                 const base = process.env.PUBLIC_SHARE_BASE_URL
                     || `${req.protocol}://${req.get('host') || ''}`;
-                const link = `${base.replace(/\/+$/, '')}/p/${encodeURIComponent(rawToken)}?k=${encodeURIComponent(magic)}`;
+                const link = `${base.replace(/\/+$/, '')}/share/${encodeURIComponent(rawToken)}?k=${encodeURIComponent(magic)}`;
                 sendServiceEmail({
                     to: email,
                     subject: `Your access link for "${share.title || 'shared page'}"`,
@@ -530,7 +530,7 @@ router.post('/:token/unlock', unlockLimiter, formParser, async (req, res) => {
         }
 
         // Unlisted shouldn't POST here — bounce to GET.
-        return res.redirect(302, `/p/${encodeURIComponent(rawToken)}`);
+        return res.redirect(302, `/share/${encodeURIComponent(rawToken)}`);
     } catch (err) {
         console.error('[PublicViewer] unlock failed:', err);
         const nonce = crypto.randomBytes(12).toString('base64');

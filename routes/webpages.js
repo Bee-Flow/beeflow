@@ -290,7 +290,7 @@ router.patch('/:id/publish', requireAuth, async (req, res) => {
 // Owner-managed share links that publish a sanitized snapshot of the page to
 // anonymous viewers. Strictly opt-in per share: every link is a separate row
 // with its own access mode, expiry, and audit trail. Recipients are NOT Bee
-// Flow users; the public viewer route at /p/:token handles them.
+// Flow users; the public viewer route at /share/:token handles them.
 
 const PUBLIC_SHARE_BASE_URL = process.env.PUBLIC_SHARE_BASE_URL || process.env.PUBLIC_APP_URL || '';
 function buildShareUrl(req, rawToken) {
@@ -299,7 +299,7 @@ function buildShareUrl(req, rawToken) {
     // localhost. Fall back to the request's own origin so dev works.
     const base = PUBLIC_SHARE_BASE_URL
         || `${req.protocol}://${req.get('host') || ''}`;
-    return `${base.replace(/\/+$/, '')}/p/${rawToken}`;
+    return `${base.replace(/\/+$/, '')}/share/${rawToken}`;
 }
 
 function parseExpiresAt(input) {
