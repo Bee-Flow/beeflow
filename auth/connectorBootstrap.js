@@ -219,10 +219,18 @@ async function bindOrgToNcInstance(org, params) {
 router.post('/connector/bootstrap', bootstrapLimiter, async (req, res) => {
     const { ncInstanceId, ncBaseUrl, ncAdminUid, ncAdminEmail, ncAdminDisplayName, connectorCallbackUrl } = readBootstrapHeaders(req);
     if (!ncInstanceId || !ncBaseUrl || !ncAdminUid || !ncAdminEmail) {
-        return res.status(400).json({ error: 'Missing required X-Beeflow-NC-* headers' });
+        return res.status(400).json({
+            error: 'Missing required X-Beeflow-NC-* headers',
+            code: 'missing_headers',
+            remediation: 'The Bee Flow connector must send X-Beeflow-NC-Instance-Id, -Base-Url, -Admin-Uid and -Admin-Email. Re-deploy the connector or upgrade to the latest release.',
+        });
     }
     if (!ncAdminEmail.includes('@')) {
-        return res.status(400).json({ error: 'NC admin email is not a valid email' });
+        return res.status(400).json({
+            error: 'NC admin email is not a valid email',
+            code: 'invalid_admin_email',
+            remediation: 'Configure an email address on your Nextcloud admin user and re-deploy the connector.',
+        });
     }
 
     let nc;
@@ -233,8 +241,15 @@ router.post('/connector/bootstrap', bootstrapLimiter, async (req, res) => {
         try {
             nc = await verifyNcInstance(ncBaseUrl, ncInstanceId);
         } catch (e) {
-            console.warn(`[ConnectorBootstrap] Verify failed for ${ncBaseUrl}: ${e.message}`);
-            return res.status(403).json({ error: 'Could not verify NC instance ownership: ' + e.message });
+            console.warn(`[ConnectorBootstrap] verify_failed url=${ncBaseUrl} ncInstance=${ncInstanceId} reason=${e.message}`);
+            const isUnreachable = /unreachable|fetch failed|timeout|ENOTFOUND|ECONNREFUSED/i.test(e.message);
+            return res.status(403).json({
+                error: 'Could not verify NC instance ownership: ' + e.message,
+                code: isUnreachable ? 'nc_capabilities_unreachable' : 'nc_capabilities_mismatch',
+                remediation: isUnreachable
+                    ? 'Bee Flow Cloud could not reach your Nextcloud at ' + ncBaseUrl + '. Your Nextcloud must be publicly reachable for SaaS-to-NC callbacks. Either expose it publicly, or set BEEFLOW_NC_PUBLIC_URL in the connector to an HTTPS tunnel or reverse-proxy URL we can reach.'
+                    : 'Your Nextcloud responded but its instance id does not match the one the connector sent. This usually means the connector was reinstalled while the SaaS still tracked the old instance. Contact support if it persists.',
+            });
         }
     }
 
@@ -244,19 +259,25 @@ router.post('/connector/bootstrap', bootstrapLimiter, async (req, res) => {
         try {
             await ensureOrgAdminUser(org, { ncAdminEmail, ncAdminUid, ncAdminDisplayName });
         } catch (e) {
-            if (e.statusCode === 409) return res.status(409).json({ error: e.message });
+            if (e.statusCode === 409) return res.status(409).json({
+                error: e.message,
+                code: 'admin_email_conflict',
+                remediation: 'The Nextcloud admin email is already used by a user in a different Bee Flow organization. Either use a different admin user on Nextcloud, or contact support to merge the accounts.',
+            });
             throw e;
         }
         const tenantKey = await getOrMintTenantKey(org.id);
         if (connectorCallbackUrl && org.connector_callback_url !== connectorCallbackUrl) {
             await userStore.updateOrganization(org.id, { connectorCallbackUrl });
         }
+        console.log(`[ConnectorBootstrap] returning_bind org=${org.id} ncInstance=${ncInstanceId} ncBaseUrl=${ncBaseUrl}`);
         return res.json({
             tenantKey,
             organizationId: org.id,
             organizationName: org.name,
             isNew: false,
             ncVersion: nc.ncVersion,
+            code: 'returning_bind',
         });
     }
 
@@ -269,8 +290,12 @@ router.post('/connector/bootstrap', bootstrapLimiter, async (req, res) => {
             // flooding the admin UI with rotating fake instance ids.
             const activeCount = await userStore.countActivePendingNcBindingsForOrg(candidateOrg.id);
             if (activeCount >= MAX_PENDING_PER_ORG) {
-                console.warn(`[ConnectorBootstrap] Rejecting bootstrap for org ${candidateOrg.id} — pending cap reached`);
-                return res.status(429).json({ error: 'Too many pending NC bindings for this organization. Try again later.' });
+                console.warn(`[ConnectorBootstrap] too_many_pending org=${candidateOrg.id} ncInstance=${ncInstanceId}`);
+                return res.status(429).json({
+                    error: 'Too many pending NC bindings for this organization. Try again later.',
+                    code: 'too_many_pending_bindings',
+                    remediation: 'Sign in to Bee Flow and either approve or dismiss the existing pending Nextcloud bindings for this organization, then retry from the connector.',
+                });
             }
             const pending = await userStore.createPendingNcBinding({
                 orgId: candidateOrg.id,
@@ -283,13 +308,15 @@ router.post('/connector/bootstrap', bootstrapLimiter, async (req, res) => {
                 themingName: nc.themingName,
                 ncVersion: nc.ncVersion,
             }, PENDING_TTL_SECONDS);
-            console.log(`[ConnectorBootstrap] Pending binding ${pending.id} created for org ${candidateOrg.id} (NC ${ncInstanceId} @ ${ncBaseUrl})`);
+            console.log(`[ConnectorBootstrap] pending_claim org=${candidateOrg.id} pendingId=${pending.id} ncInstance=${ncInstanceId} expiresAt=${pending.expiresAt}`);
             return res.status(202).json({
                 status: 'pending_claim',
+                code: 'pending_admin_approval',
                 pendingId: pending.id,
                 pollUrl: `/auth/connector/bootstrap/pending/${pending.id}`,
                 expiresAt: pending.expiresAt,
                 message: 'Awaiting org-admin confirmation in Bee Flow UI',
+                remediation: 'An admin of the matching Bee Flow organization must approve this binding from the Bee Flow web UI before the connector receives a tenant key.',
             });
         }
     }
@@ -311,15 +338,23 @@ router.post('/connector/bootstrap', bootstrapLimiter, async (req, res) => {
         enabledIntegrations: NC_INTEGRATIONS,
     });
     if (!created) {
-        return res.status(500).json({ error: 'Failed to create organization' });
+        return res.status(500).json({
+            error: 'Failed to create organization',
+            code: 'org_create_failed',
+            remediation: 'Bee Flow could not provision a new organization. This is usually a transient database issue — wait a minute and the connector will retry automatically. If it persists, contact support with the connector logs.',
+        });
     }
     org = await userStore.getOrganizationByNcInstanceId(ncInstanceId);
-    console.log(`[ConnectorBootstrap] Created org ${orgId} for NC instance ${ncInstanceId} (${ncBaseUrl})`);
+    console.log(`[ConnectorBootstrap] fresh_org org=${orgId} ncInstance=${ncInstanceId} ncBaseUrl=${ncBaseUrl} adminEmail=${ncAdminEmail}`);
 
     try {
         await ensureOrgAdminUser(org, { ncAdminEmail, ncAdminUid, ncAdminDisplayName });
     } catch (e) {
-        if (e.statusCode === 409) return res.status(409).json({ error: e.message });
+        if (e.statusCode === 409) return res.status(409).json({
+            error: e.message,
+            code: 'admin_email_conflict',
+            remediation: 'The Nextcloud admin email is already used by a user in another Bee Flow organization. Use a different admin user on Nextcloud, or contact support.',
+        });
         throw e;
     }
     const tenantKey = await getOrMintTenantKey(org.id);
@@ -329,6 +364,7 @@ router.post('/connector/bootstrap', bootstrapLimiter, async (req, res) => {
         organizationName: org.name,
         isNew: true,
         ncVersion: nc.ncVersion,
+        code: 'fresh_org',
     });
 });
 

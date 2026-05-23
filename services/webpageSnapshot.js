@@ -36,14 +36,67 @@ const storageStore = require('../stores/storageStore');
 const _window = new JSDOM('<!doctype html><html><body></body></html>').window;
 const DOMPurify = createDOMPurify(_window);
 
+// Iframe allowlist: only Bee Flow's own chat-embed pages may survive into a
+// public snapshot. The host is derived from the same env var that the share
+// URL builder uses, so deployments on white-label / self-hosted domains keep
+// behaviour in lockstep. Trailing slash is normalised; path must be /chat/<id>
+// with a conservative id charset.
+function getEmbedAllowedHost() {
+    const raw = process.env.PUBLIC_SHARE_BASE_URL
+        || process.env.PUBLIC_APP_URL
+        || 'https://app.beeflow.nl';
+    try { return new URL(raw).origin; }
+    catch { return 'https://app.beeflow.nl'; }
+}
+function isAllowedEmbedSrc(src) {
+    if (typeof src !== 'string' || !src) return false;
+    let u;
+    try { u = new URL(src); }
+    catch { return false; }
+    if (u.origin !== getEmbedAllowedHost()) return false;
+    return /^\/chat\/[A-Za-z0-9-]+\/?$/.test(u.pathname);
+}
+
+// Iframes whose `src` survives `isAllowedEmbedSrc` keep only this attribute
+// set; everything else (sandbox/srcdoc/name/allow/onload/…) is stripped. We
+// set the OUTER sandbox in publicViewer.js, so callers cannot escalate
+// privileges by smuggling their own sandbox= here.
+const IFRAME_ATTR_ALLOWLIST = new Set([
+    'src', 'width', 'height', 'style', 'title', 'loading',
+    'frameborder', 'scrolling', 'allowfullscreen',
+]);
+
+DOMPurify.addHook('uponSanitizeElement', (node, data) => {
+    if (data.tagName !== 'iframe') return;
+    const src = node.getAttribute && node.getAttribute('src');
+    if (!isAllowedEmbedSrc(src)) {
+        // Returning here is not enough — we have to remove the node ourselves
+        // since DOMPurify doesn't know we want it gone. parentNode.removeChild
+        // is the standard pattern in DOMPurify hooks.
+        if (node.parentNode) node.parentNode.removeChild(node);
+        return;
+    }
+    // Strip any attributes that aren't on the allowlist. Iterate over a
+    // snapshot of names because we mutate the live NamedNodeMap.
+    const attrs = Array.from(node.attributes || []);
+    for (const a of attrs) {
+        if (!IFRAME_ATTR_ALLOWLIST.has(a.name.toLowerCase())) {
+            node.removeAttribute(a.name);
+        }
+    }
+});
+
 const SANITIZE_HTML_CONFIG = {
     USE_PROFILES: { html: true, svg: true },
-    FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'base', 'meta', 'form'],
+    // `iframe` removed from FORBID_TAGS — the uponSanitizeElement hook above
+    // gates it by src so only Bee Flow chat embeds pass through. Everything
+    // else (script/object/embed/base/meta/form) stays banned.
+    FORBID_TAGS: ['script', 'object', 'embed', 'base', 'meta', 'form'],
     FORBID_ATTR: ['style' /* allowed via SAFE_FOR_TEMPLATES off */],
     // Allow inline style — pages often rely on it heavily — but block the rest.
     ALLOWED_ATTR: undefined,
-    ADD_TAGS: [],
-    ADD_ATTR: ['target', 'rel'],
+    ADD_TAGS: ['iframe'],
+    ADD_ATTR: ['target', 'rel', 'allowfullscreen'],
     // Strip on* handlers (default), javascript:/vbscript: URLs (default),
     // and anything that could re-enable scripting.
     KEEP_CONTENT: true,

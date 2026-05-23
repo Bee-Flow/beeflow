@@ -14,9 +14,18 @@
  *   4. Sanitization         — already applied at snapshot time
  *                             (webpageSnapshot.js). The bytes stored under
  *                             webpage-public-shares/{id}/ are pre-cleaned.
- *   5. Iframe sandbox       — `sandbox="allow-forms"` (no allow-scripts,
- *                             no allow-same-origin), so even if a script
- *                             slipped through it cannot run.
+ *   5. Iframe sandbox       — `sandbox="allow-scripts allow-forms"` on the
+ *                             outer content frame. No `allow-same-origin`,
+ *                             so the document gets an opaque origin and
+ *                             cannot reach back into the host page. The
+ *                             user's HTML is pre-sanitized at snapshot
+ *                             time (no <script>, no on* handlers, no
+ *                             javascript: URLs), so allow-scripts only
+ *                             benefits whitelisted nested iframes (the
+ *                             Bee Flow chat embed at /chat/<agentId>),
+ *                             which run with their own real origin and
+ *                             their own CSP. DOMPurify is the trust
+ *                             boundary for the outer document.
  *   6. Strict CSP           — default-src 'none' with narrow allowlist;
  *                             frame-ancestors 'none' to block embedding.
  *   7. Cookie isolation     — unlock cookie is scoped to /share, HttpOnly,
@@ -158,7 +167,7 @@ function composeViewerChrome({ share, publisher, nonce, rawToken }) {
   <span class="bf-meta">Shared by ${publisherName}${publisherOrg ? ' · ' + publisherOrg : ''}</span>
 </header>
 <main class="bf-frame-wrap">
-  <iframe class="bf-frame" sandbox="allow-forms" referrerpolicy="no-referrer" src="/share/${encodeURIComponent(rawToken)}/content"></iframe>
+  <iframe class="bf-frame" sandbox="allow-scripts allow-forms" referrerpolicy="no-referrer" src="/p/${encodeURIComponent(rawToken)}/content"></iframe>
 </main>
 <footer class="bf-footer">
   This page was shared via Bee Flow.

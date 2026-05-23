@@ -472,6 +472,24 @@ app.listen(PORT, '0.0.0.0', () => {
     const { runBootInit } = require('./boot-init');
     runBootInit().catch(err => console.error('[boot-init] Fatal:', err));
 
+    // Connector bootstrap sanity probe — verifies the tables the
+    // /auth/connector/bootstrap endpoint relies on actually exist after the
+    // store modules' implicit migrations. Runs after a short delay so the
+    // store init has time to finish CREATE TABLE statements. If a critical
+    // table is missing we log fatal and exit non-zero so Kubernetes treats
+    // the rollout as failed and we see it in `kubectl rollout status`
+    // instead of catching cryptic 500s at the first customer install.
+    setTimeout(() => {
+        const userStore = require('./stores/userStore');
+        userStore.getOrganizationByNcInstanceId('__sanity_probe__')
+            .then(() => console.log('[Server] Connector bootstrap tables: OK'))
+            .catch(err => {
+                console.error(`[Server] FATAL: Connector bootstrap sanity probe failed: ${err.message}`);
+                console.error('[Server] The /auth/connector/bootstrap endpoint will return 500s. Exiting so Kubernetes restarts.');
+                process.exit(1);
+            });
+    }, 8000).unref();
+
     // Dutch Legal Sources — auto-seed the system KB if it's empty. The
     // service itself is idempotent (content_hash skip) and runs in the
     // background via setImmediate, so this never blocks boot. Admins can
