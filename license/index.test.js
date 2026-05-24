@@ -153,7 +153,7 @@ const now = Math.floor(Date.now() / 1000);
 
     // ── Activate a legacy Pro license → resolves as enterprise ─────────
     const proToken = sign({
-        iss: 'license.beeflow.ai',
+        iss: 'license.beeflow.nl',
         sub: 'org_acme',
         tier: 'pro',
         license_id: 'lic_pro_acme',

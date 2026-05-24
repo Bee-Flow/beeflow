@@ -96,7 +96,7 @@ function isPrivateAddress(addr) {
     return true; // unknown format → treat as unsafe
 }
 
-const SEARCH_SERVICE_URL = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
+const SEARCH_SERVICE_URL = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.nl';
 
 /**
  * SimHash (64-bit) over normalized tokens of `text`.

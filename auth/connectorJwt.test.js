@@ -36,7 +36,7 @@ test('accepts a valid token', () => {
         sub: 'alice',
         email: 'alice@example.com',
         iss: 'nextcloud-connector',
-        aud: 'beeflow.ai',
+        aud: 'beeflow.nl',
         exp: NOW + 300,
     });
     const payload = _verifyHs256(token, KEY);

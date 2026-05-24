@@ -43,7 +43,7 @@ const now = Math.floor(Date.now() / 1000);
 // ── Happy path: valid pro license ───────────────────────────────────────
 {
     const token = sign({
-        iss: 'license.beeflow.ai',
+        iss: 'license.beeflow.nl',
         sub: 'org_test',
         tier: 'pro',
         license_id: 'lic_pro_1',
@@ -60,7 +60,7 @@ const now = Math.floor(Date.now() / 1000);
 // ── Expired token ───────────────────────────────────────────────────────
 {
     const token = sign({
-        iss: 'license.beeflow.ai',
+        iss: 'license.beeflow.nl',
         sub: 'org_test',
         tier: 'pro',
         license_id: 'lic_expired',
@@ -90,7 +90,7 @@ const now = Math.floor(Date.now() / 1000);
 // ── Tampered signature ──────────────────────────────────────────────────
 {
     const token = sign({
-        iss: 'license.beeflow.ai',
+        iss: 'license.beeflow.nl',
         sub: 'org_test',
         tier: 'pro',
         license_id: 'lic_tamper',
@@ -107,7 +107,7 @@ const now = Math.floor(Date.now() / 1000);
 // ── Wrong algorithm header ──────────────────────────────────────────────
 {
     const token = sign({
-        iss: 'license.beeflow.ai',
+        iss: 'license.beeflow.nl',
         sub: 'org_test',
         tier: 'pro',
         license_id: 'lic_alg',
@@ -122,7 +122,7 @@ const now = Math.floor(Date.now() / 1000);
 // ── Invalid tier claim ──────────────────────────────────────────────────
 {
     const token = sign({
-        iss: 'license.beeflow.ai',
+        iss: 'license.beeflow.nl',
         sub: 'org_test',
         tier: 'starter',
         license_id: 'lic_invalid_tier',
@@ -137,7 +137,7 @@ const now = Math.floor(Date.now() / 1000);
 // ── Missing license_id ──────────────────────────────────────────────────
 {
     const token = sign({
-        iss: 'license.beeflow.ai',
+        iss: 'license.beeflow.nl',
         sub: 'org_test',
         tier: 'pro',
         iat: now,
@@ -151,7 +151,7 @@ const now = Math.floor(Date.now() / 1000);
 // ── Full tier with WRONG (regular) issuer → rejected ────────────────────
 {
     const token = sign({
-        iss: 'license.beeflow.ai',         // regular issuer, not the internal one
+        iss: 'license.beeflow.nl',         // regular issuer, not the internal one
         sub: 'org_test',
         tier: 'full',
         license_id: 'lic_full_forge',
@@ -166,7 +166,7 @@ const now = Math.floor(Date.now() / 1000);
 // ── Full tier with INTERNAL issuer → accepted ───────────────────────────
 {
     const token = sign({
-        iss: 'license.beeflow.ai/internal',
+        iss: 'license.beeflow.nl/internal',
         sub: 'org_beeflow',
         tier: 'full',
         license_id: 'lic_full_internal',
@@ -200,7 +200,7 @@ const now = Math.floor(Date.now() / 1000);
 {
     verify._setPublicKeyForTesting(null);
     const token = sign({
-        iss: 'license.beeflow.ai',
+        iss: 'license.beeflow.nl',
         sub: 'org_test',
         tier: 'pro',
         license_id: 'lic_wrongkey',

@@ -10,7 +10,7 @@
  *     only), so they go through this route instead.
  *
  *   GET /api/billing/public-plans    — unauthenticated. Feeds the public
- *     /pricing page on beeflow.ai. Same filter as offered-plans (public
+ *     /pricing page on beeflow.nl. Same filter as offered-plans (public
  *     organization plans), same field projection. No auth so Google's
  *     OAuth verifier and any visitor can read it.
  */

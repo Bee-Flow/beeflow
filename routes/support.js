@@ -85,7 +85,7 @@ async function _hasAdminSupport(req) {
 }
 
 function _clientHost() {
-    return `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}`;
+    return `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
 }
 
 function _buildThreadUrl(thread, { forStaff = false } = {}) {

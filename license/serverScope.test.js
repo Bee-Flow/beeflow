@@ -127,7 +127,7 @@ function activeOrgRow(orgId, tier) {
         userId: null,
         scope: 'organization',
         tier,
-        issuer: 'license.beeflow.ai',
+        issuer: 'license.beeflow.nl',
         issuedAt: new Date(Date.now() - 1000).toISOString(),
         expiresAt: new Date(Date.now() + 365 * 86400000).toISOString(),
         billingInterval: 'yearly',

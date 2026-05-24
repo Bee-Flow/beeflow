@@ -39,7 +39,7 @@ app.use(helmet({
     hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
     contentSecurityPolicy: false,        // Handled by Nginx
     crossOriginEmbedderPolicy: false,    // Can break embedded content
-    crossOriginResourcePolicy: { policy: 'same-site' },  // Allow cross-subdomain resource loading (server.dev → dev.beeflow.ai)
+    crossOriginResourcePolicy: { policy: 'same-site' },  // Allow cross-subdomain resource loading (server.dev → dev.beeflow.nl)
     permissionsPolicy: false,            // Managed manually below (clipboard needs self)
 }));
 // Allow clipboard access so users can paste screenshots in the conversation area.
@@ -64,7 +64,7 @@ const WORKFLOWS_DIR = path.resolve(__dirname, '../workflows');
 if (!fs.existsSync(WORKFLOWS_DIR)) fs.mkdirSync(WORKFLOWS_DIR, { recursive: true });
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
-const ALLOWED_ORIGINS = (process.env.CORS_ORIGIN || 'https://dev.beeflow.ai,https://server.dev.beeflow.ai,http://localhost:5173')
+const ALLOWED_ORIGINS = (process.env.CORS_ORIGIN || 'https://dev.beeflow.nl,https://server.dev.beeflow.nl,http://localhost:5173')
     .split(',')
     .map(s => s.trim())
     .filter(Boolean);
@@ -546,7 +546,7 @@ app.listen(PORT, '0.0.0.0', () => {
         } catch (_) { /* fail-quiet */ }
     });
 
-    // License refresh scheduler — periodic ping to license.beeflow.ai for
+    // License refresh scheduler — periodic ping to license.beeflow.nl for
     // monthly licenses. Yearly/lifetime licenses are validated by JWT exp
     // and skip this loop. Disable with LICENSE_REFRESH_DISABLED=true.
     try { require('./license/refresh').start(); } catch (e) {

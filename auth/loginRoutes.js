@@ -160,7 +160,7 @@ router.get('/setup-status', async (req, res) => {
         availableLocales,
         // Self-hosted / white-label deploys can override the upgrade URL via
         // LICENSE_UPGRADE_URL. Frontend reads this once at boot.
-        licenseUpgradeUrl: process.env.LICENSE_UPGRADE_URL || 'https://beeflow.ai/pricing',
+        licenseUpgradeUrl: process.env.LICENSE_UPGRADE_URL || 'https://beeflow.nl/pricing',
     });
 });
 
@@ -1219,7 +1219,7 @@ router.get('/invite/:token', async (req, res) => {
 // access logs after the redirect fires.
 router.get('/redeem-invite/:token', async (req, res) => {
     const token = req.params.token;
-    const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}`;
+    const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
     try {
         const invitationStore = require('../stores/invitationStore');
         const invitation = await invitationStore.getInvitationByToken(token);

@@ -145,7 +145,7 @@ async function sendServiceEmail({ to, subject, text, html, cc, bcc, replyTo }) {
 async function sendInvitationEmail({ email, orgName, inviterName, inviteUrl, role }) {
     const roleLabel = role && role !== 'user' ? role.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()) : '';
 
-    const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}`;
+    const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
     const logoUrl = `${clientHost}/bee-flow-logo.svg`;
 
     const html = `
@@ -185,7 +185,7 @@ async function sendInvitationEmail({ email, orgName, inviterName, inviteUrl, rol
         <!-- Footer -->
         <tr><td style="padding:20px 40px;text-align:center;background:#fafafa;border-top:1px solid #f0f0f0;">
           <p style="margin:0;font-size:11px;color:#94a3b8;">
-            Sent by BeeFlow · <a href="${clientHost}" style="color:#6b7280;text-decoration:none;">${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}</a>
+            Sent by BeeFlow · <a href="${clientHost}" style="color:#6b7280;text-decoration:none;">${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}</a>
           </p>
         </td></tr>
       </table>
@@ -209,7 +209,7 @@ async function sendInvitationEmail({ email, orgName, inviterName, inviteUrl, rol
  * @param {{ email: string, displayName: string }} opts
  */
 async function sendWaitlistApprovedEmail({ email, displayName }) {
-    const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}`;
+    const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
     const logoUrl = `${clientHost}/bee-flow-logo.svg`;
     const loginUrl = clientHost;
 
@@ -249,7 +249,7 @@ async function sendWaitlistApprovedEmail({ email, displayName }) {
         <!-- Footer -->
         <tr><td style="padding:20px 40px;text-align:center;background:#fafafa;border-top:1px solid #f0f0f0;">
           <p style="margin:0;font-size:11px;color:#94a3b8;">
-            Sent by BeeFlow · <a href="${clientHost}" style="color:#6b7280;text-decoration:none;">${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}</a>
+            Sent by BeeFlow · <a href="${clientHost}" style="color:#6b7280;text-decoration:none;">${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}</a>
           </p>
         </td></tr>
       </table>
@@ -276,7 +276,7 @@ async function sendWaitlistApprovedEmail({ email, displayName }) {
  * @param {{ email: string, displayName?: string, orgName?: string, trialEndIso: string, portalUrl: string }} opts
  */
 async function sendTrialEndingEmail({ email, displayName, orgName, trialEndIso, portalUrl }) {
-    const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}`;
+    const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
     const logoUrl = `${clientHost}/bee-flow-logo.svg`;
     const targetName = orgName || displayName || 'there';
     const trialEnd = trialEndIso ? new Date(trialEndIso) : null;
@@ -316,7 +316,7 @@ async function sendTrialEndingEmail({ email, displayName, orgName, trialEndIso, 
         </td></tr>
         <tr><td style="padding:20px 40px;text-align:center;background:#fafafa;border-top:1px solid #f0f0f0;">
           <p style="margin:0;font-size:11px;color:#94a3b8;">
-            Sent by BeeFlow · <a href="${clientHost}" style="color:#6b7280;text-decoration:none;">${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}</a>
+            Sent by BeeFlow · <a href="${clientHost}" style="color:#6b7280;text-decoration:none;">${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}</a>
           </p>
         </td></tr>
       </table>
@@ -343,7 +343,7 @@ async function sendTrialEndingEmail({ email, displayName, orgName, trialEndIso, 
  * @param {{ title: string, intro?: string, body: string, ctaLabel?: string, ctaUrl?: string, footer?: string }} parts
  */
 function _renderEmailShell({ title, intro, body, ctaLabel, ctaUrl, footer }) {
-    const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}`;
+    const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
     const logoUrl = `${clientHost}/bee-flow-logo.svg`;
     const cta = (ctaLabel && ctaUrl)
         ? `
@@ -375,7 +375,7 @@ function _renderEmailShell({ title, intro, body, ctaLabel, ctaUrl, footer }) {
         </td></tr>
         <tr><td style="padding:20px 40px;text-align:center;background:#fafafa;border-top:1px solid #f0f0f0;">
           <p style="margin:0;font-size:11px;color:#94a3b8;">
-            Sent by BeeFlow · <a href="${clientHost}" style="color:#6b7280;text-decoration:none;">${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}</a>
+            Sent by BeeFlow · <a href="${clientHost}" style="color:#6b7280;text-decoration:none;">${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}</a>
           </p>
         </td></tr>
       </table>

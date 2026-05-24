@@ -865,7 +865,7 @@ async function handleSetupIntentFailed(setupIntent) {
         }
         if (!recipientEmail) return;
 
-        const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}`;
+        const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
         let portalUrl = `${clientHost}/settings/billing`;
         try {
             const portal = await stripeService.createPortalSession(customerId, portalUrl);
@@ -980,7 +980,7 @@ async function _sendTrialEndingEmailOnce({ scope, orgId, userId, subscription, t
         // Build a portal URL the customer can click directly. If Stripe is
         // misconfigured the helper will throw — swallow it and fall back to a
         // plain link to the billing dashboard.
-        const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}`;
+        const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
         let portalUrl = `${clientHost}/settings/billing`;
         try {
             if (subscription.customer) {
@@ -1306,7 +1306,7 @@ async function _sendFinalDunningEmailOnce({ target, customerId }) {
         }
         if (!recipientEmail) return;
 
-        const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}`;
+        const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
         let portalUrl = `${clientHost}/settings/billing`;
         try {
             if (customerId) {
@@ -1361,7 +1361,7 @@ async function _sendPaymentFailedEmailOnce({ target, attempt, customerId }) {
         }
         if (!recipientEmail) return;
 
-        const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}`;
+        const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
         let portalUrl = `${clientHost}/settings/billing`;
         try {
             if (customerId) {

@@ -129,7 +129,7 @@ async function fetchPage(url) {
         const res = await fetch(url, {
             method: 'GET',
             headers: {
-                'User-Agent': 'Mozilla/5.0 (compatible; BeeFlowSearchBot/1.0; +https://beeflow.ai)',
+                'User-Agent': 'Mozilla/5.0 (compatible; BeeFlowSearchBot/1.0; +https://beeflow.nl)',
                 Accept: 'text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5',
             },
             redirect: 'follow',

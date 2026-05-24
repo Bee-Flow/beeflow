@@ -731,7 +731,7 @@ router.post('/:id/ai-fill', requireAuth, async (req, res) => {
                     }
                 }
             } else {
-                const searchUrl = await configStore.getConfig('search_service_url') || 'https://services.beeflow.ai';
+                const searchUrl = await configStore.getConfig('search_service_url') || 'https://services.beeflow.nl';
                 const searchKey = await configStore.getSecret('search_service_api_key') || '';
 
                 // Fetch all KB content using source names as queries

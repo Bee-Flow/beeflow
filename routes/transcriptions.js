@@ -432,7 +432,7 @@ Keep it concise and actionable. Skip empty sections.`,
  * Returns a response object with the same shape as Voxtral output.
  */
 async function transcribeWithWhisperX(filePath, fileName, language, contextTerms) {
-    const whisperxUrl = process.env.WHISPERX_URL || 'https://services.beeflow.ai/whisperx';
+    const whisperxUrl = process.env.WHISPERX_URL || 'https://services.beeflow.nl/whisperx';
     const FormData = require('form-data');
     const fetch = require('node-fetch');
 

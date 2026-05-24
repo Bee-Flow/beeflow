@@ -1716,7 +1716,7 @@ router.post('/invitations', requireAuth, invitationInviterLimiter, async (req, r
         // bar, the Referer header, or reverse-proxy access logs after the
         // 302 fires. The endpoint moves the token into the session and
         // redirects to /login?signup=1.
-        const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}`;
+        const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
         const inviteUrl = `${clientHost}/api/auth/redeem-invite/${invitation.token}`;
 
         // Get org name and inviter display name

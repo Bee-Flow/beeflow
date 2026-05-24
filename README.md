@@ -14,7 +14,7 @@ the automation engine, and the license gate.
 Open-sourced so anyone can:
 - Self-host Bee Flow at the **community tier** (single user, basic chat,
   local KB) — no license key required.
-- Audit exactly what the SaaS at `api.beeflow.ai` runs on (this repo *is*
+- Audit exactly what the SaaS at `server.beeflow.nl` runs on (this repo *is*
   what runs in production).
 - Contribute bug fixes and integrations.
 
@@ -67,7 +67,7 @@ Full feature ↔ tier mapping: [`license/tiers.js`](./license/tiers.js).
    └───────────────────────────────────────────────────────┘
 ```
 
-You can buy a license at [beeflow.ai/pricing](https://beeflow.ai/pricing).
+You can buy a license at [beeflow.nl/pricing](https://beeflow.nl/pricing).
 Free / community tier is always available without a key.
 
 ## Running in production

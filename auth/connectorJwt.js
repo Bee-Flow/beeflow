@@ -99,7 +99,7 @@ function _verifyHs256(token, key) {
     if (payload.exp && now >= payload.exp) throw new Error('token expired');
     if (payload.nbf && now < payload.nbf) throw new Error('token not yet valid');
     if (payload.iss && payload.iss !== 'nextcloud-connector') throw new Error(`unexpected iss: ${payload.iss}`);
-    if (payload.aud && payload.aud !== 'beeflow.ai') throw new Error(`unexpected aud: ${payload.aud}`);
+    if (payload.aud && payload.aud !== 'beeflow.nl') throw new Error(`unexpected aud: ${payload.aud}`);
 
     return payload;
 }

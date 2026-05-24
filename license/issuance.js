@@ -1,5 +1,5 @@
 /**
- * License Issuance — Outbound callout to license.beeflow.ai
+ * License Issuance — Outbound callout to license.beeflow.nl
  *
  * Called from the Stripe webhook (checkout.session.completed) to ask the
  * Beeflow license server to mint a signed JWT for the freshly-paid
@@ -19,7 +19,7 @@
 const fetch = require('node-fetch');
 const license = require('./index');
 
-const ISSUE_URL = process.env.LICENSE_ISSUE_URL || 'https://license.beeflow.ai/v1/issue';
+const ISSUE_URL = process.env.LICENSE_ISSUE_URL || 'https://license.beeflow.nl/v1/issue';
 const ISSUE_API_KEY = process.env.LICENSE_ISSUE_API_KEY || '';
 const ISSUE_TIMEOUT_MS = parseInt(process.env.LICENSE_ISSUE_TIMEOUT_MS || '15000', 10);
 

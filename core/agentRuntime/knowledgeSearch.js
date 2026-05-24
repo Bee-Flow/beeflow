@@ -109,7 +109,7 @@ async function performKnowledgeSearch({ agent, userId, userMessage, isStrictKnow
                 }));
             } else {
                 // ── Search-service path ─────────────────────────────────
-                const searchUrl = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
+                const searchUrl = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.nl';
 
                 const searchRes = await fetch(`${searchUrl}/tools/kb-search`, {
                     method: 'POST',
@@ -377,7 +377,7 @@ async function quickKBSearch(userId, kbIds, query, options = {}) {
             const { searchLocally } = require('../localKBIngest');
             chunks = await searchLocally(userId, kbIds, query, { topK: topK + 2 });
         } else {
-            const searchUrl = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
+            const searchUrl = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.nl';
             const searchRes = await fetch(`${searchUrl}/tools/kb-search`, {
                 method: 'POST',
                 headers: getServiceHeaders(),

@@ -91,7 +91,7 @@
   "overrides": {
     "protobufjs": "^7.5.7"
   },
-  "homepage": "https://beeflow.ai",
+  "homepage": "https://beeflow.nl",
   "repository": {
     "type": "git",
     "url": "https://github.com/Bee-Flow/beeflow.git"

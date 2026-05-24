@@ -11,7 +11,7 @@
 const { sendServiceEmail } = require('./emailService');
 
 function _clientHost() {
-    return `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}`;
+    return `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
 }
 
 function _escape(s) {
@@ -54,7 +54,7 @@ function _shell({ title, intro, body, ctaLabel, ctaUrl, footer }) {
         </td></tr>
         <tr><td style="padding:20px 40px;text-align:center;background:#fafafa;border-top:1px solid #f0f0f0;">
           <p style="margin:0;font-size:11px;color:#94a3b8;">
-            Bee Flow B.V. · <a href="${clientHost}" style="color:#6b7280;text-decoration:none;">${process.env.CLIENT_PUBLIC_HOST || 'beeflow.ai'}</a>
+            Bee Flow B.V. · <a href="${clientHost}" style="color:#6b7280;text-decoration:none;">${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}</a>
           </p>
         </td></tr>
       </table>

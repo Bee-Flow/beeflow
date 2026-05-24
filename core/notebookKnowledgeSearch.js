@@ -17,7 +17,7 @@
 const configStore = require('../stores/configStore');
 const { getServiceHeaders } = require('./serviceAuth');
 
-const SEARCH_SERVICE_URL = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
+const SEARCH_SERVICE_URL = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.nl';
 
 // ── Query Preprocessing ────────────────────────────────────────────
 

@@ -216,7 +216,7 @@ async function executeKbSearchTool(toolName, args, context = {}) {
             chunks = localResults;
         } else {
             // ── Search-service path ────────────────────────────────
-            const searchUrl = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
+            const searchUrl = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.nl';
             // Resolve the admin's Web-Search Inference Routing config so the
             // search-service knows which backend to use per task. Falls back
             // to the service's own env defaults when unresolved.

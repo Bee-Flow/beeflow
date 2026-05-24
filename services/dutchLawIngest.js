@@ -213,7 +213,7 @@ async function fetchStatute(bwbId) {
     const res = await fetch(url, {
         headers: {
             'Accept': 'application/xml',
-            'User-Agent': 'Bee-Flow-AI/legal-ingest (https://beeflow.ai)',
+            'User-Agent': 'Bee-Flow-AI/legal-ingest (https://beeflow.nl)',
         },
         signal: AbortSignal.timeout(60000),
     });

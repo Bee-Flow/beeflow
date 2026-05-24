@@ -34,7 +34,7 @@ async function resolveEnabledSystemSlugs(req) {
     }
 }
 
-const SEARCH_SERVICE_URL = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
+const SEARCH_SERVICE_URL = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.nl';
 const { getServiceHeaders } = require('../core/serviceAuth');
 
 const VALID_USAGE_CONTEXTS = new Set(['agent', 'direct_chat', 'webpage']);

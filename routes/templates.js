@@ -21,7 +21,7 @@ const configStore = require('../stores/configStore');
 const { getAIConfig, getProviderForModel } = require('../core/aiAgent');
 const { getAdapter } = require('../core/providers');
 
-const SEARCH_SERVICE_URL = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.ai';
+const SEARCH_SERVICE_URL = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.nl';
 const { getServiceHeaders } = require('../core/serviceAuth');
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB max

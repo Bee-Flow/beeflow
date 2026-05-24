@@ -436,7 +436,7 @@ function requireBetaFeature(featureId) {
                     feature: featureId,
                     reason: 'beta_requires_enterprise',
                     required: BETA_TIER_FLOOR,
-                    upgrade_url: process.env.LICENSE_UPGRADE_URL || 'https://beeflow.ai/pricing',
+                    upgrade_url: process.env.LICENSE_UPGRADE_URL || 'https://beeflow.nl/pricing',
                 });
             }
             return res.status(403).json({ error: `Beta feature '${featureId}' is not enabled for your organization` });

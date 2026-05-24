@@ -1,7 +1,7 @@
 /**
  * License Refresh Scheduler
  *
- * Periodically pings license.beeflow.ai/v1/refresh for every monthly license
+ * Periodically pings license.beeflow.nl/v1/refresh for every monthly license
  * that hasn't been re-confirmed within the polling window. Yearly and
  * lifetime licenses are skipped — their JWT `exp` is the source of truth.
  *
@@ -30,7 +30,7 @@ const { ADMIN_ISSUER } = require('./adminIssuance');
 // all. The JWT exp/signature remain the source of truth. This avoids the
 // "freshly activated → grace → expired" failure mode when no real license
 // server is reachable (e.g. dev installs, air-gapped customers, beta period
-// before license.beeflow.ai is live).
+// before license.beeflow.nl is live).
 const REFRESH_URL = process.env.LICENSE_REFRESH_URL || '';
 const TICK_INTERVAL_SEC = parseInt(process.env.LICENSE_REFRESH_INTERVAL_SECONDS || '3600', 10);
 const STALE_AFTER_SEC = parseInt(process.env.LICENSE_REFRESH_STALE_SECONDS || '86400', 10);

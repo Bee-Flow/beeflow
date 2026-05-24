@@ -1,7 +1,7 @@
 /**
  * License JWT Verification
  *
- * Verifies RS256-signed license tokens issued by license.beeflow.ai.
+ * Verifies RS256-signed license tokens issued by license.beeflow.nl.
  * Implemented with Node's built-in `crypto` (no external JWT lib) so we
  * don't add a dependency for one signature scheme.
  *
@@ -24,8 +24,8 @@ const fs = require('fs');
 const path = require('path');
 const { isValidTier, TIER_HIERARCHY } = require('./tiers');
 
-const EXPECTED_ISSUER = 'license.beeflow.ai';
-const FULL_TIER_ISSUER = 'license.beeflow.ai/internal';
+const EXPECTED_ISSUER = 'license.beeflow.nl';
+const FULL_TIER_ISSUER = 'license.beeflow.nl/internal';
 const ALG = 'RS256';
 
 const BUNDLED_KEY_PATH = path.join(__dirname, 'bundled-public-key.pem');

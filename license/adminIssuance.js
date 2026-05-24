@@ -1,7 +1,7 @@
 /**
  * Admin License Issuance — direct license minting from the admin console.
  *
- * Bypasses the license.beeflow.ai → JWT → activate flow so a super admin can
+ * Bypasses the license.beeflow.nl → JWT → activate flow so a super admin can
  * grant any tier without Stripe or an outbound license-server call. Trust
  * comes from the admin gate on the route, not from a signature.
  *

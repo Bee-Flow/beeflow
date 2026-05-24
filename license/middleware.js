@@ -13,7 +13,7 @@
  * can render as a "Upgrade required" call-to-action.
  *
  *   { error: 'tier_required', required: 'enterprise', current: 'community',
- *     feature: 'sso_saml' (optional), upgrade_url: 'https://beeflow.ai/pricing' }
+ *     feature: 'sso_saml' (optional), upgrade_url: 'https://beeflow.nl/pricing' }
  *
  * When the underlying tier lookup hits a real DB error (not a missing table
  * during early boot), the middleware fails *closed* with 503 rather than
@@ -24,7 +24,7 @@ const license = require('./index');
 const { resolveUserOrgIds } = require('../auth/permissions');
 const tiers = license.tiers;
 
-const UPGRADE_URL = process.env.LICENSE_UPGRADE_URL || 'https://beeflow.ai/pricing';
+const UPGRADE_URL = process.env.LICENSE_UPGRADE_URL || 'https://beeflow.nl/pricing';
 const RESOLUTION_CACHE_TTL_MS = parseInt(process.env.LICENSE_RESOLUTION_CACHE_TTL_MS || '30000', 10);
 
 // Precompute a feature → required-tier map at module load. The TIER_HIERARCHY
