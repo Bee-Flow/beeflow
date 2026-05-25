@@ -125,24 +125,21 @@ function _respondOAuthLogin(req, res, provider, returnTo, userId) {
 }
 
 async function isEncryptionEnabledForUser(userId) {
+    // Encryption (per-user PIN-wrapped DEK) is still in beta. Strict opt-in:
+    // only on for orgs whose `allowed_features` explicitly lists "encryption".
+    // No admin bypass, no implicit "empty list means all on" — that triggered
+    // a forced PIN-setup screen for every SSO admin on production.
     try {
         const user = await userStore.getUser(userId);
-        if (!user) return false; // new user, no plan yet
-        if (user.role === 'admin') return true; // admins always get encryption
-
+        if (!user) return false;
         const orgId = user.organizationId;
-        if (!orgId) return false; // no org = no plan = no encryption
-
+        if (!orgId) return false;
         const limits = await userStore.getEffectiveLimits(orgId);
-        if (!limits) return false; // no subscription = no encryption
-
-        const features = limits.allowed_features;
-        // Empty array = all features enabled (including encryption)
-        if (!features || features.length === 0) return true;
-        return features.includes('encryption');
+        const features = limits?.allowed_features;
+        return Array.isArray(features) && features.includes('encryption');
     } catch (e) {
         console.error('[OAuth] Failed to check encryption feature:', e.message);
-        return false; // fail-safe: encryption is paid, default off
+        return false;
     }
 }
 

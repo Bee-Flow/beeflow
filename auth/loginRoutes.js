@@ -19,19 +19,20 @@ const { getOrCreateUserDEKCompat, setupSSOUserDEK, unlockSSOUserDEK, unlockWithR
  * Encryption is a paid feature — disabled by default unless plan explicitly includes it.
  */
 async function isEncryptionEnabledForUser(userId) {
+    // Encryption (per-user PIN-wrapped DEK) is still in beta. Strict opt-in:
+    // only on for orgs whose `allowed_features` explicitly lists "encryption".
+    // No admin bypass, no implicit "empty list means all on" — that triggered
+    // a forced PIN-setup screen for every SSO admin on production.
     try {
         const user = await userStore.getUser(userId);
-        if (!user) return false; // new user, no plan yet
-        if (user.role === 'admin') return true; // admins always get encryption
+        if (!user) return false;
         const orgId = user.organizationId;
-        if (!orgId) return false; // no org = no encryption
+        if (!orgId) return false;
         const limits = await userStore.getEffectiveLimits(orgId);
-        if (!limits) return false; // no subscription = no encryption
-        const features = limits.allowed_features;
-        if (!features || features.length === 0) return true; // empty = all features
-        return features.includes('encryption');
+        const features = limits?.allowed_features;
+        return Array.isArray(features) && features.includes('encryption');
     } catch (e) {
-        return false; // fail-safe: paid feature, default off
+        return false;
     }
 }
 
@@ -423,10 +424,18 @@ router.get('/user', async (req, res) => {
                 })()
             },
             isOAuthConfigured: !!(config.oauth.clientId && config.oauth.clientSecret),
-            // Encryption status for SSO users
-            needsEncryptionSetup: req.session.needsEncryptionSetup || false,
-            needsEncryptionPin: req.session.needsEncryptionPin || false,
-            encryptionEnabled: await isEncryptionEnabledForUser(req.session.user.id),
+            // Encryption status for SSO users. Suppress the setup/pin prompts
+            // when encryption is disabled for this user — a stale session flag
+            // from before the feature was gated off would otherwise still pop
+            // the PIN-setup screen.
+            ...(await (async () => {
+                const enabled = await isEncryptionEnabledForUser(req.session.user.id);
+                return {
+                    encryptionEnabled: enabled,
+                    needsEncryptionSetup: enabled && !!req.session.needsEncryptionSetup,
+                    needsEncryptionPin: enabled && !!req.session.needsEncryptionPin,
+                };
+            })()),
             // Organisation membership for SSO users
             noOrganization: req.session.noOrganization || false,
             isConsumerAccount: !freshUser?.organizationId && !req.session.noOrganization && (process.env.DEPLOYMENT_MODE || 'cloud') === 'cloud',

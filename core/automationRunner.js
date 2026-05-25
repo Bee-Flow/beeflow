@@ -32,6 +32,14 @@ const { summariseDefinition } = require('../automation/summarise');
 const cron = require('../automation/cron');
 const sandbox = require('../automation/codeSandbox');
 const { NOTIFICATION_DEFAULTS, VALID_LEVELS } = require('../automation/notificationDefaults');
+const cancellation = require('./automationRunner/cancellation');
+const {
+    ACTIVE_RUNS,
+    registerRunCancellation,
+    clearRunCancellation,
+    requestCancel,
+    isCancelRequested,
+} = cancellation;
 
 const RUNNER_INTERVAL_MS = 60_000;
 const POLLING_INTERVAL_MS = 30_000;
@@ -100,32 +108,6 @@ function resolveNotificationPolicy(automation, event) {
 // next "between-steps" check (the DB flag is the cross-process signal,
 // the AbortController is the in-process one).
 
-const ACTIVE_RUNS = new Map();
-
-function registerRunCancellation(runId) {
-    const controller = new AbortController();
-    ACTIVE_RUNS.set(runId, controller);
-    return controller;
-}
-
-function clearRunCancellation(runId) {
-    ACTIVE_RUNS.delete(runId);
-}
-
-/**
- * Request cancellation of an in-flight run. Returns the updated run row,
- * or null if no active row matched. The DB flag is the cross-process
- * signal; the AbortController short-circuits when the run is local.
- */
-async function requestCancel(runId) {
-    const updated = await automationStore.requestCancelRun(runId).catch(() => null);
-    const ctrl = ACTIVE_RUNS.get(runId);
-    if (ctrl) {
-        try { ctrl.abort(); } catch {}
-    }
-    return updated;
-}
-
 /**
  * Resume a paused or failed run from a specific step. Loads the original
  * run + automation, rebuilds runState by replaying the persisted
@@ -175,23 +157,6 @@ async function resumeFromStep(runId, fromStepId, { decision = null, userId = nul
         replayState: replayedStepState,
         skipUntilStepId: fromStepId,
     });
-}
-
-/**
- * Cross-process cancellation check. Reads the cancel_requested flag from
- * the run row so a cancel issued against a different runner pod is still
- * honoured — at worst on the next "between steps" check.
- *
- * Best-effort: a DB hiccup falls through (returns false) so a flaky
- * connection doesn't kill in-progress work.
- */
-async function isCancelRequested(runId) {
-    try {
-        const r = await automationStore.getRun(runId);
-        return !!r?.cancelRequested;
-    } catch {
-        return false;
-    }
 }
 
 // Stable per-process token. Identifies which runner instance currently
@@ -341,10 +306,27 @@ function buildAdjacency(def) {
     return { adj, incoming, stepById };
 }
 
+/**
+ * Return outgoing edges from a step, optionally filtered by edge label.
+ *
+ * `label === null/undefined`  → every outgoing edge (legacy traversal).
+ * `label === 'on_success'`    → edges explicitly labelled 'on_success'
+ *                               PLUS unlabeled edges (back-compat: an
+ *                               edge without a label fires on success).
+ * Any other label             → exact match only.
+ *
+ * The back-compat carve-out for 'on_success' means existing automations
+ * (which never set edge.label) keep working without migration. New
+ * routines can opt into explicit success/error/complete branches and
+ * have them routed by §19's edge semantics.
+ */
 function nextEdgesFor(stepId, adj, label = null) {
     const out = adj.get(stepId) || [];
-    if (label) return out.filter(e => e.label === label);
-    return out;
+    if (!label) return out;
+    if (label === 'on_success') {
+        return out.filter(e => !e.label || e.label === 'on_success');
+    }
+    return out.filter(e => e.label === label);
 }
 
 // ── Step executors ──────────────────────────────────────
@@ -1105,7 +1087,41 @@ async function runDag(def, ctx, runStateInit, mode, dispatchStep, { recordSteps 
             // Live dispatch. fromStepId/onlyStepId targets break us out of
             // the skip block; their dispatch is the resumption point.
             if (isTargetForFrom || isTargetForOnly) stillSkipping = false;
-            const dispatched = await dispatchStep(step, ctx, runState, mode);
+            let dispatched;
+            try {
+                dispatched = await dispatchStep(step, ctx, runState, mode);
+            } catch (stepErr) {
+                // §19: native error-edge routing. If the step has an
+                // explicit 'on_error' outgoing edge, treat the failure
+                // as a recoverable branch — record the failed step, route
+                // execution along on_error, and keep walking. Otherwise
+                // bubble up (preserve legacy fail-the-run behavior).
+                const allOut = adj.get(id) || [];
+                const hasErrorBranch = allOut.some(e => e.label === 'on_error');
+                if (!hasErrorBranch) throw stepErr;
+                runState.steps = runState.steps || {};
+                runState.steps[step.id] = { output: null, status: 'error', error: stepErr.message };
+                if (recordSteps && ctx.runId) {
+                    try {
+                        await automationStore.recordRunStep({
+                            runId: ctx.runId,
+                            stepId: step.id,
+                            stepType: step.type,
+                            attempts: 1,
+                            status: 'error',
+                            startedAt: new Date().toISOString(),
+                            finishedAt: new Date().toISOString(),
+                            input: null,
+                            output: null,
+                            error: stepErr.message,
+                            branchIndex,
+                        });
+                    } catch { /* best-effort log */ }
+                }
+                const errEdges = nextEdgesFor(id, adj, 'on_error');
+                for (const e of errEdges) queue.push(e.to);
+                continue;
+            }
             // Save into runState. Clone the output so downstream steps
             // that mutate it can't corrupt the cached binding source.
             runState.steps = runState.steps || {};
@@ -1144,6 +1160,10 @@ async function runDag(def, ctx, runStateInit, mode, dispatchStep, { recordSteps 
             if (isTargetForOnly) break;
         }
 
+        // Default success-path: when no branching override fired, treat
+        // the step as having succeeded so 'on_success'-labelled edges
+        // route correctly (unlabeled edges still match — see nextEdgesFor).
+        if (nextLabel == null) nextLabel = 'on_success';
         const outEdges = nextEdgesFor(id, adj, nextLabel);
         for (const e of outEdges) queue.push(e.to);
     }

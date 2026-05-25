@@ -19,6 +19,12 @@ async function initDB() {
     try { await require('../migrations/automation-timeout-and-subs-2026-05').up(); } catch (e) { /* tolerate */ }
     try { await require('../migrations/automation-event-mode-2026-05').up(); } catch (e) { /* tolerate */ }
     try { await require('../migrations/automation-approval-and-parallel-2026-06').up(); } catch (e) { /* tolerate */ }
+    try { await require('../migrations/automation-error-class-2026-06').up(); } catch (e) { /* tolerate */ }
+    try { await require('../migrations/automation-approval-expiry-2026-06').up(); } catch (e) { /* tolerate */ }
+    try { await require('../migrations/automation-heartbeat-2026-06').up(); } catch (e) { /* tolerate */ }
+    try { await require('../migrations/automation-alerts-2026-06').up(); } catch (e) { /* tolerate */ }
+    try { await require('../migrations/automation-extras-2026-06').up(); } catch (e) { /* tolerate */ }
+    try { await require('../migrations/n8n-connections-2026-06').up(); } catch (e) { /* tolerate */ }
     initialized = true;
     console.log('[AutomationStore] PostgreSQL initialized');
 }
@@ -82,6 +88,13 @@ function rowToRun(r) {
         // Approval / resume plumbing (added by automation-approval-and-parallel-2026-06).
         awaitingStepId: r.awaiting_step_id ?? null,
         approvalToken: r.approval_token ?? null,
+        // §27a — optional deadline on awaiting_approval. NULL means "no
+        // expiry"; a past timestamp causes the approve route to 410.
+        awaitingStepExpiresAt: r.awaiting_step_expires_at
+            ? new Date(r.awaiting_step_expires_at).toISOString()
+            : null,
+        // §25 — typed error class persisted alongside the free-text error.
+        errorClass: r.error_class ?? null,
     };
 }
 
@@ -595,6 +608,11 @@ async function updateRun(id, updates) {
         // Phase 2 approval flow
         awaitingStepId: 'awaiting_step_id',
         approvalToken: 'approval_token',
+        // §27a — optional deadline on the awaiting_approval state.
+        awaitingStepExpiresAt: 'awaiting_step_expires_at',
+        // §25 — typed error class so the activity dashboard can filter
+        // by error category without parsing the free-text message.
+        errorClass: 'error_class',
     };
     const setClauses = []; const params = []; let idx = 1;
     for (const [jsKey, dbCol] of Object.entries(map)) {

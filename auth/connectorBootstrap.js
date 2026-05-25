@@ -90,6 +90,7 @@ function readBootstrapHeaders(req) {
         ncAdminEmail: String(req.headers['x-beeflow-nc-admin-email'] || '').trim().toLowerCase(),
         ncAdminDisplayName: String(req.headers['x-beeflow-nc-admin-display-name'] || '').trim(),
         connectorCallbackUrl: String(req.headers['x-beeflow-connector-callback-url'] || '').trim().replace(/\/+$/, ''),
+        pairingCode: String(req.headers['x-beeflow-pairing-code'] || '').trim().toUpperCase(),
     };
 }
 
@@ -217,7 +218,7 @@ async function bindOrgToNcInstance(org, params) {
 }
 
 router.post('/connector/bootstrap', bootstrapLimiter, async (req, res) => {
-    const { ncInstanceId, ncBaseUrl, ncAdminUid, ncAdminEmail, ncAdminDisplayName, connectorCallbackUrl } = readBootstrapHeaders(req);
+    const { ncInstanceId, ncBaseUrl, ncAdminUid, ncAdminEmail, ncAdminDisplayName, connectorCallbackUrl, pairingCode } = readBootstrapHeaders(req);
     if (!ncInstanceId || !ncBaseUrl || !ncAdminUid || !ncAdminEmail) {
         return res.status(400).json({
             error: 'Missing required X-Beeflow-NC-* headers',
@@ -251,6 +252,83 @@ router.post('/connector/bootstrap', bootstrapLimiter, async (req, res) => {
                     : 'Your Nextcloud responded but its instance id does not match the one the connector sent. This usually means the connector was reinstalled while the SaaS still tracked the old instance. Contact support if it persists.',
             });
         }
+    }
+
+    // 0. Pairing-code branch — wins over auto-detect when present. The org
+    //    admin has handed out a one-shot code; whoever holds it gets to bind
+    //    this NC instance to that specific org. No fresh-org creation, no
+    //    pending approval queue — the code already IS the approval. Code is
+    //    consumed atomically on success so it can't be reused.
+    if (pairingCode) {
+        const pending = await userStore.getPendingBindingByPairingCode(pairingCode);
+        if (!pending) {
+            console.warn(`[ConnectorBootstrap] pairing_code_invalid code=${pairingCode.slice(0, 4)}*** ncInstance=${ncInstanceId}`);
+            return res.status(401).json({
+                error: 'Pairing code is invalid, expired, or already used',
+                code: 'pairing_code_invalid',
+                remediation: 'Ask the Bee Flow organisation admin to generate a fresh pairing code from Settings → Organisation → Pair a new Nextcloud, then set it as the BEEFLOW_PAIRING_CODE env var on this connector and reinstall.',
+            });
+        }
+        const targetOrg = await userStore.getOrganization(pending.orgId);
+        if (!targetOrg) {
+            return res.status(410).json({
+                error: 'Organisation for this pairing code no longer exists',
+                code: 'pairing_code_org_gone',
+            });
+        }
+        // Refuse to redeem a code against an org that's already bound to a
+        // different NC — a misissued code shouldn't be able to steal an
+        // existing binding.
+        if (targetOrg.nc_instance_id && targetOrg.nc_instance_id !== ncInstanceId) {
+            return res.status(409).json({
+                error: 'Target organisation is already bound to a different Nextcloud instance',
+                code: 'pairing_code_org_already_bound',
+            });
+        }
+        const consumed = await userStore.consumePairingCode(pending.id, {
+            ncInstanceId,
+            ncBaseUrl,
+            ncAdminUid,
+            ncAdminEmail,
+            ncAdminDisplayName,
+            connectorCallbackUrl,
+            themingName: nc.themingName,
+            ncVersion: nc.ncVersion,
+        });
+        if (!consumed) {
+            // Lost the race against another connector consuming the same code
+            // — rare but possible.
+            return res.status(409).json({
+                error: 'Pairing code was just consumed by another request',
+                code: 'pairing_code_race',
+            });
+        }
+        let boundOrg = targetOrg;
+        if (!targetOrg.nc_instance_id) {
+            boundOrg = await bindOrgToNcInstance(targetOrg, {
+                ncInstanceId, ncBaseUrl, ncAdminUid, connectorCallbackUrl,
+            });
+        }
+        try {
+            await ensureOrgAdminUser(boundOrg, { ncAdminEmail, ncAdminUid, ncAdminDisplayName });
+        } catch (e) {
+            if (e.statusCode === 409) return res.status(409).json({
+                error: e.message,
+                code: 'admin_email_conflict',
+            });
+            throw e;
+        }
+        const tenantKey = await getOrMintTenantKey(boundOrg.id);
+        console.log(`[ConnectorBootstrap] pairing_code_redeemed org=${boundOrg.id} ncInstance=${ncInstanceId}`);
+        return res.json({
+            tenantKey,
+            organizationId: boundOrg.id,
+            organizationName: boundOrg.name,
+            isNew: false,
+            isAdopted: true,
+            ncVersion: nc.ncVersion,
+            code: 'pairing_code_redeemed',
+        });
     }
 
     // 1. Returning bind — instance id already mapped → idempotent return.
@@ -405,6 +483,107 @@ router.get('/connector/bootstrap/pending/:id', pendingPollLimiter, async (req, r
         status: 'pending',
         expiresAt: row.expiresAt,
     });
+});
+
+// Diagnostic endpoint — connector calls this when /api/license/* keeps
+// returning "no matching tenant key" and we need to know why without
+// kubectl-ing into the server pod. Authentication is the same NC-ownership
+// proof as bootstrap (round-trip the instanceid via /ocs capabilities), so
+// possession of a fake header set isn't enough. Returns NO secret material —
+// only fingerprints (first 16 hex chars of sha256) so the caller can compare
+// against its own locally cached key.
+router.post('/connector/diagnose', bootstrapLimiter, async (req, res) => {
+    const h = readBootstrapHeaders(req);
+    if (!h.ncInstanceId || !h.ncBaseUrl) {
+        return res.status(400).json({
+            error: 'Missing X-Beeflow-NC-Instance-Id or X-Beeflow-NC-Base-Url header',
+        });
+    }
+    try {
+        await verifyNcInstance(h.ncBaseUrl, h.ncInstanceId);
+    } catch (e) {
+        return res.status(403).json({
+            error: 'NC ownership verification failed',
+            detail: e.message,
+        });
+    }
+
+    const out = {
+        ncInstanceId: h.ncInstanceId,
+        ncBaseUrl: h.ncBaseUrl,
+        org: null,
+        tenantKey: { exists: false },
+    };
+
+    let org;
+    try {
+        org = await userStore.getOrganizationByNcInstanceId(h.ncInstanceId);
+    } catch (e) {
+        return res.status(500).json({ ...out, error: 'org lookup failed: ' + e.message });
+    }
+    if (!org) {
+        return res.json({
+            ...out,
+            note: 'No organization bound to this NC instance — bootstrap has not run, or it failed before persisting the binding.',
+        });
+    }
+    out.org = {
+        id: org.id,
+        name: org.name,
+        ncOnboardingCompletedAt: org.nc_onboarding_completed_at || null,
+    };
+
+    const cfgKey = TENANT_KEY_PREFIX + org.id;
+    let decrypted = null;
+    let decryptError = null;
+    try {
+        decrypted = await configStore.getSecret(cfgKey);
+    } catch (e) {
+        decryptError = e.message;
+    }
+    out.tenantKey.exists = !!decrypted;
+    out.tenantKey.decryptOk = !decryptError;
+    if (decryptError) out.tenantKey.decryptError = decryptError;
+    if (decrypted) {
+        out.tenantKey.fingerprint = crypto.createHash('sha256')
+            .update(decrypted)
+            .digest('hex')
+            .slice(0, 16);
+    }
+
+    // Look up the raw row's updated_at so the caller can see how stale the
+    // stored key is relative to when it last bootstrapped. Direct DB read —
+    // configStore has no metadata helper.
+    try {
+        const { getOne } = require('../db');
+        const row = await getOne('SELECT updated_at FROM config WHERE key = $1', [cfgKey]);
+        if (row?.updated_at) out.tenantKey.updatedAt = row.updated_at;
+    } catch (_) { /* tolerate — informational only */ }
+
+    // If the caller sent a test JWT, try to verify it against the stored
+    // key. This is the smoking-gun check: connector says "this is what I'm
+    // signing with", SaaS says "and this is what verification gives".
+    const testToken = typeof req.body?.testToken === 'string' ? req.body.testToken.trim() : '';
+    if (testToken) {
+        if (!decrypted) {
+            out.tenantKey.testVerify = { ok: false, error: 'no stored key to verify against' };
+        } else {
+            try {
+                const { _verifyHs256 } = require('./connectorJwt');
+                const payload = _verifyHs256(testToken, decrypted);
+                out.tenantKey.testVerify = {
+                    ok: true,
+                    sub: payload.sub || null,
+                    email: payload.email || null,
+                    exp: payload.exp || null,
+                };
+            } catch (e) {
+                out.tenantKey.testVerify = { ok: false, error: e.message };
+            }
+        }
+    }
+
+    return res.json(out);
 });
 
 module.exports = router;

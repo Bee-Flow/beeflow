@@ -4,7 +4,22 @@
  *
  * `enabledKey` mirrors the keys used by integrationTools.js's isAppOn() check,
  * so the catalog only surfaces apps the user has actually connected/enabled.
+ *
+ * `availableTo` declares which execution contexts the app's tools may be
+ * surfaced in. Phase 1 metadata only — consumers continue to use ad-hoc
+ * imports today; later phases switch them to query this metadata via
+ * `availableForContext()`. Valid contexts:
+ *   - 'agent'           — agent runtime (chat tool-use loop)
+ *   - 'routine_step'    — automation step (integration_action)
+ *   - 'routine_trigger' — surface as a routine trigger (currently only used
+ *                          by the trigger bus; here for future symmetry)
+ *
+ * The default is `['agent', 'routine_step']` — both contexts. Apps that
+ * are currently agent-only (kb-search, agent-search) keep their narrow
+ * scope until §16 flips them.
  */
+
+const DEFAULT_AVAILABILITY = ['agent', 'routine_step'];
 
 const TOOL_REGISTRY = [
     { app: 'gmail',                   label: 'Gmail',                  module: '../integrations/gmailTools',                arrayName: 'GMAIL_TOOLS',                enabledKey: 'gmail' },
@@ -20,7 +35,7 @@ const TOOL_REGISTRY = [
     { app: 'youtrack',                label: 'YouTrack',               module: '../integrations/youtrackTools',             arrayName: 'YOUTRACK_TOOLS',             enabledKey: 'youtrack' },
     { app: 'signrequest',             label: 'SignRequest',            module: '../integrations/signrequestTools',          arrayName: 'SIGNREQUEST_TOOLS',          enabledKey: 'signrequest' },
     { app: 'gamma',                   label: 'Gamma',                  module: '../integrations/gammaTools',                arrayName: 'GAMMA_TOOLS',                enabledKey: 'gamma' },
-    { app: 'agent-search',            label: 'Web Search',             module: '../integrations/agentSearchTools',          arrayName: 'AGENT_SEARCH_TOOLS',         enabledKey: 'agent-search' },
+    { app: 'agent-search',            label: 'Web Search',             module: '../integrations/agentSearchTools',          arrayName: 'AGENT_SEARCH_TOOLS',         enabledKey: 'agent-search',         availableTo: ['agent', 'routine_step'] },
     { app: 'maps',                    label: 'Google Maps',            module: '../integrations/mapsTools',                 arrayName: 'MAPS_TOOLS',                 enabledKey: 'google-maps' },
     { app: 'linkedin',                label: 'LinkedIn',               module: '../integrations/linkedinTools',             arrayName: 'LINKEDIN_TOOLS',             enabledKey: 'linkedin' },
     { app: 'github',                  label: 'GitHub',                 module: '../integrations/githubTools',               arrayName: 'GITHUB_TOOLS',               enabledKey: 'github' },
@@ -28,7 +43,7 @@ const TOOL_REGISTRY = [
     { app: 'ms-calendar',             label: 'Microsoft Calendar',     module: '../integrations/msCalendarTools',           arrayName: 'MS_CALENDAR_TOOLS',          enabledKey: 'ms-calendar' },
     { app: 'onedrive',                label: 'OneDrive',               module: '../integrations/oneDriveTools',             arrayName: 'ONEDRIVE_TOOLS',             enabledKey: 'onedrive' },
     { app: 'ms-contacts',             label: 'Microsoft Contacts',     module: '../integrations/msContactsTools',           arrayName: 'MS_CONTACTS_TOOLS',          enabledKey: 'ms-contacts' },
-    { app: 'kb-search',               label: 'Knowledge Base',         module: '../integrations/kbSearchTools',             arrayName: 'KB_SEARCH_TOOLS',            enabledKey: 'kb-search' },
+    { app: 'kb-search',               label: 'Knowledge Base',         module: '../integrations/kbSearchTools',             enabledKey: 'kb-search',          arrayName: 'KB_SEARCH_TOOLS',            availableTo: ['agent', 'routine_step'] },
     { app: 'nextcloud',               label: 'Nextcloud',              module: '../integrations/nextcloudTools',            arrayName: 'NEXTCLOUD_TOOLS',            enabledKey: 'nextcloud' },
     { app: 'nextcloud-calendar',      label: 'Nextcloud Calendar',     module: '../integrations/nextcloudCalendarTools',    arrayName: 'NEXTCLOUD_CALENDAR_TOOLS',   enabledKey: 'nextcloud-calendar' },
     { app: 'nextcloud-contacts',      label: 'Nextcloud Contacts',     module: '../integrations/nextcloudContactsTools',    arrayName: 'NEXTCLOUD_CONTACTS_TOOLS',   enabledKey: 'nextcloud-contacts' },
@@ -80,4 +95,33 @@ function findOwnerOfTool(toolName) {
     return null;
 }
 
-module.exports = { TOOL_REGISTRY, loadTools, findOwnerOfTool };
+/**
+ * Return the declared availability for an app — entry-level override
+ * if present, otherwise the registry-wide default. Centralised so any
+ * future consumer reads one source of truth.
+ */
+function availabilityFor(entry) {
+    if (entry && Array.isArray(entry.availableTo)) return entry.availableTo;
+    return DEFAULT_AVAILABILITY;
+}
+
+/**
+ * Filter the registry to apps that are available in a given execution
+ * context. Phase 1 wiring is metadata-only: consumers (agent runtime,
+ * automation builder) still import their tools directly today; later
+ * phases switch them to this helper so a single edit on the registry
+ * row controls whether the tool surfaces in chats vs canvases.
+ */
+function availableForContext(context) {
+    if (!context) return TOOL_REGISTRY.slice();
+    return TOOL_REGISTRY.filter(entry => availabilityFor(entry).includes(context));
+}
+
+module.exports = {
+    TOOL_REGISTRY,
+    DEFAULT_AVAILABILITY,
+    loadTools,
+    findOwnerOfTool,
+    availabilityFor,
+    availableForContext,
+};

@@ -599,12 +599,15 @@ leading search step just to look up data that's already in the payload.`,
             parameters: {
                 type: 'object',
                 properties: {
-                    kind: { type: 'string', enum: ['schedule', 'manual', 'webhook', 'app_event'] },
+                    kind: { type: 'string', enum: ['schedule', 'manual', 'webhook', 'app_event', 'agent_call'] },
                     cron: { type: 'string', description: 'Standard 5-field cron, REQUIRED when kind=schedule. Use exact format: minute hour day-of-month month day-of-week. Example: "0 9 * * 1" = every Monday at 9:00.' },
                     tz: { type: 'string', description: 'IANA timezone, e.g. Europe/Amsterdam (when kind=schedule).' },
                     appProvider: { type: 'string', description: 'Provider id (when kind=app_event): gmail | google-calendar | google-drive | nextcloud | ticket-assistant' },
                     appEvent: { type: 'string', description: 'Event name (when kind=app_event). Allowed: gmail.{mail.new, label.added}; google-calendar.{event.changed, event.upcoming}; google-drive.file.new; nextcloud.{file.new, file.changed, file.deleted, file.renamed, file.commented, file.tagged, share.created, share.received, share.accepted, share.deleted, calendar.event.created, calendar.event.changed, calendar.event.deleted, calendar.event.upcoming, deck.card.created, deck.card.changed, deck.card.deleted, deck.card.moved, deck.card.completed, talk.message.received, talk.mention.received, task.created, task.completed, task.due, activity.new, notification.new, user.status.changed}; ticket-assistant.{ticket.new, sync.completed}.' },
                     filter: { type: 'object', description: 'Optional filter object that must shallowly match the event payload.' },
+                    // §28 agent-callable trigger: routine is exposed as a tool the agent / direct chat can invoke.
+                    toolName: { type: 'string', description: 'When kind=agent_call: the tool name agents will see (sanitised to [a-z0-9_]). Defaults to automation_<id>.' },
+                    parametersSchema: { type: 'object', description: 'When kind=agent_call: JSON-schema-shaped input declaration for the tool. The runtime exposes this verbatim to the model.' },
                 },
                 required: ['kind'],
             },

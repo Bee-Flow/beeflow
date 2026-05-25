@@ -299,6 +299,25 @@ async function initDB() {
     try { await exec(`CREATE INDEX IF NOT EXISTS idx_pending_nc_bindings_org_status
         ON pending_nc_bindings (org_id, status)`); } catch (e) { }
 
+    // Phase-2 pairing-code branch: org-admin generates a code in Bee Flow,
+    // hands it to whoever installs the connector on a new NC. The code lives
+    // in the same table as email-match pending bindings so the lifecycle
+    // (pending/approved/denied/expired) stays unified. Nullable NC fields
+    // because we don't know the target NC until the code is redeemed.
+    try { await exec(`ALTER TABLE pending_nc_bindings
+        ADD COLUMN IF NOT EXISTS pairing_code             TEXT,
+        ADD COLUMN IF NOT EXISTS pairing_code_consumed_at TIMESTAMPTZ`); } catch (e) { }
+    try { await exec(`ALTER TABLE pending_nc_bindings
+        ALTER COLUMN nc_instance_id  DROP NOT NULL,
+        ALTER COLUMN nc_base_url     DROP NOT NULL,
+        ALTER COLUMN nc_admin_uid    DROP NOT NULL,
+        ALTER COLUMN nc_admin_email  DROP NOT NULL`); } catch (e) { }
+    try { await exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_nc_bindings_pairing_code_active
+        ON pending_nc_bindings (pairing_code)
+        WHERE pairing_code IS NOT NULL
+          AND status = 'pending'
+          AND pairing_code_consumed_at IS NULL`); } catch (e) { }
+
     // ── Subscription schema migrations ──
     try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS price REAL`); } catch (e) { }
     try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'EUR'`); } catch (e) { }
@@ -951,7 +970,7 @@ async function setOrgEnabledBetaFeatures(orgId, ids) {
 
 async function deleteOrganization(orgId) {
     await initDB();
-    const org = await getOne('SELECT id FROM organizations WHERE id = $1', [orgId]);
+    const org = await getOne('SELECT id, nc_instance_id FROM organizations WHERE id = $1', [orgId]);
     if (!org) return false;
     console.log(`[UserStore] Deleting organization '${orgId}' and all related data...`);
 
@@ -963,6 +982,13 @@ async function deleteOrganization(orgId) {
 
     try { await run('DELETE FROM groups WHERE "organizationId" = $1', [orgId]); } catch (e) { }
     try { await run('DELETE FROM organization_subscriptions WHERE organization_id = $1', [orgId]); } catch (e) { }
+
+    // Wipe the per-org tenant key so a stale connector cache can't keep
+    // presenting JWTs signed by the deleted org's key after the admin nukes
+    // the org row.
+    try {
+        await run(`DELETE FROM config WHERE key = $1`, [`connector_tenant_key_${orgId}`]);
+    } catch (e) { console.warn('[UserStore] connector tenant key cleanup failed:', e.message); }
     // Wipe every per-org row in the config store. Pre-M3 this was a curated
     // list of known suffixes (privacy shield only); now that secrets are
     // keyed under `org_<orgId>_*` consistently, delete everything matching.
@@ -1031,7 +1057,126 @@ function parsePendingBinding(row) {
         expiresAt: row.expires_at,
         approvedAt: row.approved_at,
         approvedByUserId: row.approved_by_user_id,
+        pairingCode: row.pairing_code || null,
+        pairingCodeConsumedAt: row.pairing_code_consumed_at || null,
     };
+}
+
+// ── Pairing-code helpers (Phase 2 branch B) ──
+
+// Generate a human-friendly 8-char code split with a dash (e.g. "BEEF-FL0W").
+// Excludes ambiguous glyphs (0/O, 1/I/L, etc.) so the admin can read it off a
+// screen and type it on another machine without mistakes.
+function _generatePairingCodeString() {
+    const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no 0/O/1/I/L
+    const pickN = (n) => Array.from(crypto.randomBytes(n))
+        .map(b => alphabet[b % alphabet.length])
+        .join('');
+    return `${pickN(4)}-${pickN(4)}`;
+}
+
+// Mint a new pairing code for an org. Caller (the SaaS endpoint) is responsible
+// for org-admin auth. We always create a fresh row — the unique index on
+// pairing_code (active) prevents two unused codes from colliding by chance.
+async function createOrgPairingCode(orgId, { mintedByUserId, ttlSeconds = 900 } = {}) {
+    if (!orgId) throw new Error('orgId required');
+    await initDB();
+    const id = crypto.randomBytes(16).toString('hex');
+    const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+    // Retry on the (extremely rare) collision against an active code.
+    for (let attempt = 0; attempt < 5; attempt++) {
+        const code = _generatePairingCodeString();
+        try {
+            const row = await getOne(`
+                INSERT INTO pending_nc_bindings
+                    (id, org_id, pairing_code, expires_at, approved_by_user_id)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING *
+            `, [id, orgId, code, expiresAt, mintedByUserId || null]);
+            return parsePendingBinding(row);
+        } catch (e) {
+            if (/idx_pending_nc_bindings_pairing_code_active/i.test(e.message)) continue;
+            throw e;
+        }
+    }
+    throw new Error('Failed to mint pairing code after 5 attempts');
+}
+
+async function getPendingBindingByPairingCode(code) {
+    if (!code) return null;
+    await initDB();
+    const row = await getOne(`
+        SELECT * FROM pending_nc_bindings
+        WHERE pairing_code = $1
+          AND status = 'pending'
+          AND pairing_code_consumed_at IS NULL
+          AND expires_at > NOW()
+        LIMIT 1
+    `, [String(code).trim().toUpperCase()]);
+    return parsePendingBinding(row);
+}
+
+// Mark code consumed. Returns false if the row was already consumed or no
+// longer pending — caller treats that as "code already used".
+async function consumePairingCode(id, { ncInstanceId, ncBaseUrl, ncAdminUid, ncAdminEmail, ncAdminDisplayName, connectorCallbackUrl, themingName, ncVersion } = {}) {
+    if (!id) return false;
+    await initDB();
+    const res = await run(`
+        UPDATE pending_nc_bindings SET
+            pairing_code_consumed_at = NOW(),
+            status = 'approved',
+            approved_at = NOW(),
+            nc_instance_id = COALESCE($2, nc_instance_id),
+            nc_base_url    = COALESCE($3, nc_base_url),
+            nc_admin_uid   = COALESCE($4, nc_admin_uid),
+            nc_admin_email = COALESCE($5, nc_admin_email),
+            nc_admin_display_name = COALESCE($6, nc_admin_display_name),
+            connector_callback_url = COALESCE($7, connector_callback_url),
+            theming_name   = COALESCE($8, theming_name),
+            nc_version     = COALESCE($9, nc_version)
+        WHERE id = $1
+          AND status = 'pending'
+          AND pairing_code_consumed_at IS NULL
+    `, [
+        id,
+        ncInstanceId || null,
+        ncBaseUrl || null,
+        ncAdminUid || null,
+        ncAdminEmail || null,
+        ncAdminDisplayName || null,
+        connectorCallbackUrl || null,
+        themingName || null,
+        ncVersion || null,
+    ]);
+    return (res?.rowCount || 0) > 0;
+}
+
+async function getActivePairingCodesForOrg(orgId) {
+    if (!orgId) return [];
+    await initDB();
+    const rows = await getAll(`
+        SELECT * FROM pending_nc_bindings
+        WHERE org_id = $1
+          AND pairing_code IS NOT NULL
+          AND status = 'pending'
+          AND pairing_code_consumed_at IS NULL
+          AND expires_at > NOW()
+        ORDER BY created_at DESC
+    `, [orgId]);
+    return rows.map(parsePendingBinding);
+}
+
+async function deletePairingCode(id, orgId) {
+    if (!id) return false;
+    await initDB();
+    const res = await run(`
+        DELETE FROM pending_nc_bindings
+        WHERE id = $1
+          AND ($2::text IS NULL OR org_id = $2)
+          AND pairing_code IS NOT NULL
+          AND pairing_code_consumed_at IS NULL
+    `, [id, orgId || null]);
+    return (res?.rowCount || 0) > 0;
 }
 
 async function createPendingNcBinding(data, ttlSeconds = 1800) {
@@ -1083,10 +1228,16 @@ async function getPendingNcBinding(id) {
 async function getPendingNcBindingForOrg(orgId) {
     if (!orgId) return null;
     await initDB();
-    // Newest non-expired pending row.
+    // Email-match approval rows only. Pairing-code rows live in the same
+    // table but are a different flow (the connector redeems them on
+    // bootstrap, never the SPA), so they must not surface in the approval
+    // modal. Distinguishing column: pairing_code IS NULL for approval rows.
     const row = await getOne(
         `SELECT * FROM pending_nc_bindings
-         WHERE org_id = $1 AND status = 'pending' AND expires_at > NOW()
+         WHERE org_id = $1
+           AND status = 'pending'
+           AND expires_at > NOW()
+           AND pairing_code IS NULL
          ORDER BY created_at DESC LIMIT 1`,
         [orgId]
     );
@@ -1096,9 +1247,15 @@ async function getPendingNcBindingForOrg(orgId) {
 async function countActivePendingNcBindingsForOrg(orgId) {
     if (!orgId) return 0;
     await initDB();
+    // Mirror getPendingNcBindingForOrg — count only approval rows so the
+    // bootstrap rate-limit "too many pending bindings" check doesn't false-
+    // trip on accumulated unused pairing codes.
     const row = await getOne(
         `SELECT COUNT(*)::int AS n FROM pending_nc_bindings
-         WHERE org_id = $1 AND status = 'pending' AND expires_at > NOW()`,
+         WHERE org_id = $1
+           AND status = 'pending'
+           AND expires_at > NOW()
+           AND pairing_code IS NULL`,
         [orgId]
     );
     return row?.n || 0;
@@ -2463,8 +2620,14 @@ async function createUserWithSeatCheck(userData, { strict = true } = {}) {
             await client.query("SET LOCAL TRANSACTION ISOLATION LEVEL SERIALIZABLE");
 
             if (max != null) {
+                // PG rejects FOR UPDATE alongside aggregate functions
+                // ("FOR UPDATE is not allowed with aggregate functions"),
+                // so we count rows under SERIALIZABLE isolation instead.
+                // Concurrent INSERTs that would push us over the cap raise
+                // a 40001 serialization failure on COMMIT, which the
+                // attempt-retry below already handles.
                 const countRow = await client.query(
-                    `SELECT COUNT(*)::int AS n FROM users WHERE "organizationId" = $1 AND COALESCE(status, 'active') = 'active' FOR UPDATE`,
+                    `SELECT COUNT(*)::int AS n FROM users WHERE "organizationId" = $1 AND COALESCE(status, 'active') = 'active'`,
                     [orgId]
                 );
                 const current = countRow.rows[0]?.n ?? 0;
@@ -2495,11 +2658,11 @@ async function createUserWithSeatCheck(userData, { strict = true } = {}) {
             // when the active user count changes; we don't await so a Stripe
             // outage can't block user creation. The webhook will reconcile
             // stripe_seat_quantity once the update is processed.
-            if (organizationId) {
+            if (orgId) {
                 Promise.resolve().then(async () => {
                     try {
                         const { syncSeatQuantityForOrg } = require('../services/stripeService');
-                        await syncSeatQuantityForOrg(organizationId);
+                        await syncSeatQuantityForOrg(orgId);
                     } catch (_) { /* best-effort */ }
                 });
             }
@@ -2523,6 +2686,8 @@ module.exports = {
     getOrgEnabledIntegrations, setOrgEnabledIntegrations, getOrgEnabledBetaFeatures, setOrgEnabledBetaFeatures,
     getUserByNcUid,
     createPendingNcBinding, getPendingNcBinding, getPendingNcBindingForOrg,
+    createOrgPairingCode, getPendingBindingByPairingCode, consumePairingCode,
+    getActivePairingCodesForOrg, deletePairingCode,
     countActivePendingNcBindingsForOrg, markPendingNcBindingApproved,
     markPendingNcBindingDenied, expirePendingNcBindings,
     getAllGroups, createGroup, updateGroup, deleteGroup, getGroupByAzureId, getUserByAzureId,

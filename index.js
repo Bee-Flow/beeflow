@@ -467,6 +467,10 @@ if (process.env.NODE_ENV === 'production') {
 // ── Start server ──────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://0.0.0.0:${PORT}`);
+    if (process.env.INSECURE_CONNECTOR_TRUST === '1') {
+        console.error('[SECURITY] INSECURE_CONNECTOR_TRUST=1 was set in the environment but the insecure connector bypass has been retired (Phase 2). Remove the variable. Refusing to boot.');
+        process.exit(1);
+    }
 
     // Run first-boot setup from INIT_* env vars (set by install wizard)
     const { runBootInit } = require('./boot-init');

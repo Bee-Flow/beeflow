@@ -122,6 +122,79 @@ router.post('/admin/nc-bindings/:id/approve', requireAuth, async (req, res) => {
     });
 });
 
+// ── Pairing-code branch (Phase 2 Branch B) ──
+//
+// Email-auto-match (Branch A above) only fires when the NC admin's email is
+// already registered as an org_admin in Bee Flow. The pairing-code branch
+// covers the case where it isn't — for example, the NC admin is an IT person
+// and the Bee Flow account-holder is somebody from procurement.
+//
+// Flow:
+//   1. Org admin in Bee Flow generates a code (this endpoint). 15-min TTL.
+//   2. Code is handed off out-of-band (Slack, ticket, in person).
+//   3. Whoever installs Bee Flow on the new NC sets BEEFLOW_PAIRING_CODE via
+//      occ/AppAPI before first boot (or by uninstall+reinstall after setting).
+//   4. Connector includes the code as an X-Beeflow-Pairing-Code header on its
+//      /auth/connector/bootstrap call.
+//   5. SaaS validates the code in connectorBootstrap.js and binds + returns
+//      tenantKey directly — no separate approval step (the code IS the
+//      approval).
+router.post('/admin/nc-bindings/generate-pairing-code', requireAuth, async (req, res) => {
+    const sessionUser = req.session?.user;
+    if (!sessionUser?.id) return res.status(401).json({ error: 'Not authenticated' });
+    const freshUser = await userStore.getUser(sessionUser.id);
+    if (!freshUser) return res.status(401).json({ error: 'Session user no longer exists' });
+
+    const targetOrgId = String(req.body?.organizationId || freshUser.organizationId || '').trim();
+    if (!targetOrgId) return res.status(400).json({ error: 'organizationId required' });
+
+    const isSuperAdmin = req.session.isAdmin || freshUser.role === 'admin';
+    const isOrgAdmin = freshUser.orgRole === 'org_admin' && freshUser.organizationId === targetOrgId;
+    if (!isSuperAdmin && !isOrgAdmin) {
+        return res.status(403).json({ error: 'Organization admin access required' });
+    }
+
+    const code = await userStore.createOrgPairingCode(targetOrgId, {
+        mintedByUserId: freshUser.id,
+        ttlSeconds: 15 * 60,
+    });
+    console.log(`[NcBindingRoutes] Pairing code minted for org=${targetOrgId} by user=${freshUser.id} expiresAt=${code.expiresAt}`);
+    return res.json({
+        code: code.pairingCode,
+        expiresAt: code.expiresAt,
+        id: code.id,
+    });
+});
+
+router.get('/admin/nc-bindings/pairing-codes', requireAuth, async (req, res) => {
+    const sessionUser = req.session?.user;
+    if (!sessionUser?.id) return res.status(401).json({ error: 'Not authenticated' });
+    const freshUser = await userStore.getUser(sessionUser.id);
+    if (!freshUser) return res.status(401).json({ error: 'Session user no longer exists' });
+    const orgId = freshUser.organizationId;
+    if (!orgId) return res.json({ codes: [] });
+    const codes = await userStore.getActivePairingCodesForOrg(orgId);
+    return res.json({
+        codes: codes.map(c => ({
+            id: c.id,
+            code: c.pairingCode,
+            expiresAt: c.expiresAt,
+            createdAt: c.createdAt,
+        })),
+    });
+});
+
+router.delete('/admin/nc-bindings/pairing-codes/:id', requireAuth, async (req, res) => {
+    const sessionUser = req.session?.user;
+    if (!sessionUser?.id) return res.status(401).json({ error: 'Not authenticated' });
+    const freshUser = await userStore.getUser(sessionUser.id);
+    if (!freshUser) return res.status(401).json({ error: 'Session user no longer exists' });
+    const ok = await userStore.deletePairingCode(req.params.id, freshUser.organizationId);
+    if (!ok) return res.status(404).json({ error: 'Pairing code not found' });
+    console.log(`[NcBindingRoutes] Pairing code ${req.params.id} revoked by user=${freshUser.id}`);
+    return res.json({ ok: true });
+});
+
 router.post('/admin/nc-bindings/:id/deny', requireAuth, async (req, res) => {
     const ctx = await loadAndAuthorize(req, res);
     if (!ctx) return;

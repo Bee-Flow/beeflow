@@ -332,7 +332,8 @@ router.get('/catalog', async (req, res) => {
                 { kind: 'schedule', label: 'On a schedule' },
                 { kind: 'manual', label: 'Run manually' },
                 { kind: 'webhook', label: 'Webhook URL' },
-                { kind: 'app_event', providers: ['gmail', 'google-calendar', 'msgraph', 'github'] },
+                { kind: 'app_event', providers: ['gmail', 'google-calendar', 'google-drive', 'msgraph', 'github', 'nextcloud', 'ticket-assistant'] },
+                { kind: 'agent_call', label: 'Callable by AI agent or direct chat (exposed as a tool)' },
             ],
             flags: { code: codeFlag, automations: automationsFlag },
         });
@@ -1008,6 +1009,65 @@ router.get('/_runs/recent', async (req, res) => {
     }
 });
 
+/**
+ * §9 Activity dashboard — facet counts for the filter chips.
+ *
+ * Returns counts grouped by status, automation, trigger kind, and error
+ * class, restricted to the last `range` hours (default 24, max 720 = 30
+ * days). Phase 2 will read straight from automation_runs with proper
+ * indexed queries; until then we derive from the recent-runs list.
+ */
+router.get('/_runs/facets', async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const range = Math.min(Math.max(parseInt(req.query.range, 10) || 24, 1), 720);
+        const since = Date.now() - range * 3600 * 1000;
+        const runs = await automationStore.getRecentRunsForUser(userId, { limit: 500 }).catch(() => []);
+        const facets = { status: {}, automationId: {}, triggerKind: {}, errorClass: {} };
+        for (const r of runs) {
+            const t = r.startedAt ? Date.parse(r.startedAt) : 0;
+            if (t < since) continue;
+            if (r.status) facets.status[r.status] = (facets.status[r.status] || 0) + 1;
+            if (r.automationId) facets.automationId[r.automationId] = (facets.automationId[r.automationId] || 0) + 1;
+            if (r.triggerKind) facets.triggerKind[r.triggerKind] = (facets.triggerKind[r.triggerKind] || 0) + 1;
+            if (r.errorClass) facets.errorClass[r.errorClass] = (facets.errorClass[r.errorClass] || 0) + 1;
+        }
+        res.json({ facets, rangeHours: range });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * §9 SSE stream of run lifecycle events (org-wide). Subscribes to
+ * runEventBus and pushes events as they fire. Phase 2 wires the runner
+ * to emit; this endpoint is the consumer surface.
+ */
+router.get('/_runs/stream', async (req, res) => {
+    try {
+        const { onAny } = require('../core/runEventBus');
+        res.set({
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            Connection: 'keep-alive',
+            'X-Accel-Buffering': 'no',
+        });
+        res.flushHeaders?.();
+        const unsubscribe = onAny((event) => {
+            res.write(`data: ${JSON.stringify(event)}\n\n`);
+        });
+        const heartbeat = setInterval(() => {
+            res.write(': keepalive\n\n');
+        }, 25_000);
+        req.on('close', () => {
+            clearInterval(heartbeat);
+            unsubscribe();
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // Templates routes were moved to the top of this file (just before `/:id`)
 // to avoid Express matching `/:id` first against the literal "templates".
 
@@ -1019,6 +1079,33 @@ router.get('/:id/versions', async (req, res) => {
         if (a.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
         const versions = await automationStore.listVersions(a.id);
         res.json({ versions });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * §7 — Diff one stored version against another. Both must belong to
+ * the same automation. Returns the two definitions plus a coarse
+ * change summary the UI uses to seed its side-by-side viewer. Clients
+ * compute the actual line/word diff locally.
+ */
+router.get('/:id/versions/:versionId/diff/:otherVersionId', async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const a = await automationStore.getAutomation(req.params.id);
+        if (!a) return res.status(404).json({ error: 'Not found' });
+        if (a.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
+        const [vA, vB] = await Promise.all([
+            automationStore.getVersion(req.params.versionId),
+            automationStore.getVersion(req.params.otherVersionId),
+        ]);
+        if (!vA || !vB) return res.status(404).json({ error: 'Version not found' });
+        if (vA.automationId !== a.id || vB.automationId !== a.id) {
+            return res.status(400).json({ error: 'Versions do not belong to this automation' });
+        }
+        const summary = summariseDefinitionDiff(vA.definition, vB.definition);
+        res.json({ a: vA, b: vB, summary });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -1221,6 +1308,13 @@ router.post('/runs/:runId/approve-step', async (req, res) => {
         if (!original.awaitingStepId) {
             return res.status(409).json({ error: 'Run has no recorded awaiting step' });
         }
+        // §27a: approval token expiry. Once the deadline passes, the
+        // approve endpoint refuses the decision (410 Gone). Reaper later
+        // transitions the row to status='error' with error_class.
+        if (original.awaitingStepExpiresAt
+            && new Date(original.awaitingStepExpiresAt).getTime() < Date.now()) {
+            return res.status(410).json({ error: 'Approval window expired.', error_class: 'ApprovalExpired' });
+        }
 
         const decision = String(req.body?.decision || 'approve').toLowerCase();
         if (decision !== 'approve' && decision !== 'reject') {
@@ -1313,5 +1407,101 @@ router.post('/runs/:id/approve', async (req, res) => {
         res.status(500).json({ error: e.message });
     }
 });
+
+/**
+ * §28 — Agent-callable invocation endpoint. The agent runtime
+ * dispatcher hits this when it sees an automation_<id> tool call.
+ * Body: { args, callerUserId, callerSessionId }. Returns the final
+ * step output verbatim so the agent can fold it back into its
+ * reasoning.
+ */
+router.post('/:id/agent-invoke', async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const automation = await automationStore.getAutomation(req.params.id);
+        if (!automation) return res.status(404).json({ error: 'Automation not found' });
+        if (automation.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
+        const trigger = automation.definition?.trigger;
+        if (!trigger || trigger.kind !== 'agent_call') {
+            return res.status(409).json({ error: 'Automation is not declared as agent-callable. Set trigger.kind = "agent_call".' });
+        }
+        if (!automation.isActive) {
+            return res.status(409).json({ error: 'Automation is paused. Activate it first.' });
+        }
+        const args = (req.body && typeof req.body.args === 'object') ? req.body.args : {};
+        const runner = require('../core/automationRunner');
+        const result = await runner.executeAutomation(automation, {
+            triggerKind: 'agent_call',
+            triggerPayload: args,
+            mode: 'live',
+        });
+        res.json({ ok: true, output: result?.lastOutput ?? null });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * §14b — Webhook playground. Signs and posts a user-supplied payload
+ * through the real webhook handler path (bypassing the nonce-replay
+ * check via a single-use test token) and returns the full
+ * request/response for display. Phase 2 lands the full implementation;
+ * this is the route surface so the UI can target a stable URL.
+ */
+router.post('/:id/webhook/:slug/test', async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const automation = await automationStore.getAutomation(req.params.id);
+        if (!automation) return res.status(404).json({ error: 'Not found' });
+        if (automation.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
+        // Phase 2: actually sign the supplied payload, dispatch through
+        // the webhook ingestion path, capture the response. Until then
+        // we acknowledge the endpoint so the UI can light up.
+        res.json({
+            accepted: true,
+            playground: true,
+            note: 'Webhook playground full implementation arrives in Phase 2.',
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * Coarse structural diff between two automation definitions. Builds a
+ * step-id → change-kind map so the UI can colour the diff viewer
+ * without doing the JSON walk on the client. Phase 2 swaps this for a
+ * proper jsondiffpatch payload — for now the summary covers ~90% of
+ * what users want to see (added/removed/edited steps + edges).
+ */
+function summariseDefinitionDiff(defA, defB) {
+    const stepsA = new Map();
+    const stepsB = new Map();
+    for (const s of (defA?.steps || [])) if (s?.id) stepsA.set(s.id, s);
+    for (const s of (defB?.steps || [])) if (s?.id) stepsB.set(s.id, s);
+
+    const added = [];
+    const removed = [];
+    const changed = [];
+    for (const [id, sB] of stepsB) {
+        const sA = stepsA.get(id);
+        if (!sA) { added.push(id); continue; }
+        if (JSON.stringify(sA) !== JSON.stringify(sB)) changed.push(id);
+    }
+    for (const id of stepsA.keys()) {
+        if (!stepsB.has(id)) removed.push(id);
+    }
+
+    const edgesA = JSON.stringify(defA?.edges || []);
+    const edgesB = JSON.stringify(defB?.edges || []);
+    const triggerA = JSON.stringify(defA?.trigger || null);
+    const triggerB = JSON.stringify(defB?.trigger || null);
+
+    return {
+        steps: { added, removed, changed },
+        edgesChanged: edgesA !== edgesB,
+        triggerChanged: triggerA !== triggerB,
+    };
+}
 
 module.exports = router;

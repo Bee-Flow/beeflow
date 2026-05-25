@@ -12,19 +12,7 @@
  */
 
 const automationStore = require('../stores/automationStore');
-
-function matchFilter(payload, filter) {
-    if (!filter) return true;
-    if (typeof filter !== 'object') return true;
-    for (const k of Object.keys(filter)) {
-        const want = filter[k];
-        const got = payload?.[k];
-        if (Array.isArray(want)) { if (!want.includes(got)) return false; }
-        else if (typeof want === 'object' && want !== null) { if (!matchFilter(got, want)) return false; }
-        else if (got !== want) return false;
-    }
-    return true;
-}
+const { matchFilter, applyDslFilter } = require('./triggers/dslFilters');
 
 /**
  * Gmail-aware mail.new filter. The shallow `matchFilter` above is fine
@@ -297,56 +285,6 @@ function matchTicketAssistantSyncFilter(payload, filter) {
 //     ...rest of structured fields evaluated by the per-event matcher
 //   }
 //
-// any[]   → at least ONE sub-filter matches (OR)
-// none[]  → NO sub-filter matches (NOT-OR)
-// expr    → boolean expression evaluated via expr.js against payload root
-// age     → time window relative to NOW based on payload.datetime/timestamp
-// All combinators are AND-ed with the structured per-event match.
-function applyDslFilter(payload, filter, perEventMatcher) {
-    if (!filter || typeof filter !== 'object') return perEventMatcher(payload, filter);
-
-    if (Array.isArray(filter.any) && filter.any.length > 0) {
-        const ok = filter.any.some(sub => perEventMatcher(payload, sub));
-        if (!ok) return false;
-    }
-    if (Array.isArray(filter.none) && filter.none.length > 0) {
-        const hit = filter.none.some(sub => perEventMatcher(payload, sub));
-        if (hit) return false;
-    }
-    if (typeof filter.expr === 'string' && filter.expr.trim()) {
-        try {
-            const { evaluate } = require('./expr');
-            // Single-arg evaluator: payload accessible as `trigger`. Restricted
-            // grammar already forbids function calls, so this is safe to run
-            // on tenant-supplied strings.
-            const result = evaluate(filter.expr, { trigger: payload });
-            if (!result) return false;
-        } catch (_) {
-            // Invalid expression fails closed — same as Gmail subjectRegex.
-            return false;
-        }
-    }
-    if (filter.age && typeof filter.age === 'object') {
-        const ts = payload?.datetime || payload?.timestamp || payload?.date;
-        const t = ts ? Date.parse(ts) : NaN;
-        if (Number.isFinite(t)) {
-            const ageMin = (Date.now() - t) / 60_000;
-            if (typeof filter.age.olderThanMinutes === 'number' && ageMin < filter.age.olderThanMinutes) return false;
-            if (typeof filter.age.newerThanMinutes === 'number' && ageMin > filter.age.newerThanMinutes) return false;
-        }
-    }
-
-    // Strip DSL keys before delegating; otherwise the per-event matcher
-    // would see them as unknown structured fields. We don't mutate the
-    // caller's filter object.
-    const stripped = { ...filter };
-    delete stripped.any;
-    delete stripped.none;
-    delete stripped.expr;
-    delete stripped.age;
-    return perEventMatcher(payload, stripped);
-}
-
 // ── Phase 1.3 matchers — new Nextcloud trigger types ─────────────────
 
 function matchNextcloudCommentFilter(payload, filter) {

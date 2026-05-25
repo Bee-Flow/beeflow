@@ -148,11 +148,21 @@ async function _listOrgIdsFallback() {
         .map(k => k.slice(TENANT_KEY_PREFIX.length));
 }
 
+
 async function connectorJwtMiddleware(req, res, next) {
     // Skip if the cookie session is already authenticated — let session take
     // precedence so users who log in normally aren't surprised.
+    // BUT: if the session claims a user that no longer exists in the DB
+    // (e.g. admin deleted the org, dev `reset` wiped users) the connector
+    // headers should be allowed to re-establish the session. Otherwise the
+    // SPA sits on the login form forever even though the connector is
+    // sending valid headers.
     if (req.session?.isAuthenticated && req.session?.user?.id) {
-        return next();
+        const stillExists = await userStore.getUser(req.session.user.id).catch(() => null);
+        if (stillExists) return next();
+        // Stale session — destroy it and fall through to header-based auth.
+        console.log(`[ConnectorJWT] Dropping stale session for missing user ${req.session.user.id}`);
+        await new Promise(resolve => req.session.destroy(() => resolve()));
     }
 
     // Connector requests are tagged with this header. Without it, fall through

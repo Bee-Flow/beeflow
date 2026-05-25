@@ -183,7 +183,7 @@ function validateDefinition(def, { availableTools = null } = {}) {
     // Trigger — ensure it has an id and a kind.
     const trigger = def.trigger;
     if (!trigger.id || typeof trigger.id !== 'string') pushE({ code: 'trigger.id_missing', severity: 'error', path: 'trigger.id', message: 'trigger.id is required.', hint: 'Re-run builder_propose_trigger; it generates a stable id.' });
-    if (!trigger.kind || typeof trigger.kind !== 'string') pushE({ code: 'trigger.kind_missing', severity: 'error', path: 'trigger.kind', message: 'trigger.kind is required.', hint: 'Use one of: schedule, manual, webhook, app_event.' });
+    if (!trigger.kind || typeof trigger.kind !== 'string') pushE({ code: 'trigger.kind_missing', severity: 'error', path: 'trigger.kind', message: 'trigger.kind is required.', hint: 'Use one of: schedule, manual, webhook, app_event, agent_call.' });
     validatePosition(trigger.position, 'trigger', pushE);
 
     // Steps — unique ids, valid types.
