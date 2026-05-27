@@ -203,6 +203,10 @@ const OUTPUT_SCHEMAS = {
         shape: { id: 'string', moved: 'boolean', newParentId: 'string' },
         sample: { id: 'file-1', moved: true, newParentId: 'folder-1' },
     },
+    drive_upload_file: {
+        shape: { fileId: 'string', name: 'string', webViewLink: 'string', parents: 'array of string', mimeType: 'string', bytesUploaded: 'number', updated: 'boolean' },
+        sample: { fileId: 'file-1', name: 'factuur.pdf', webViewLink: 'https://drive.google.com/file/d/file-1/view', parents: ['folder-supp'], mimeType: 'application/pdf', bytesUploaded: 81234, updated: false },
+    },
 
     // ── Contacts ──────────────────────────────────────────────────
     contacts_create: {

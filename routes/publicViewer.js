@@ -36,6 +36,8 @@ const express = require('express');
 const router = express.Router();
 const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 const publicShareStore = require('../stores/webpagePublicShareStore');
 const webpageSnapshot = require('../services/webpageSnapshot');
@@ -138,28 +140,25 @@ function composeViewerChrome({ share, publisher, nonce, rawToken }) {
 <meta name="robots" content="noindex,nofollow">
 <title>${title}</title>
 <style nonce="${nonce}">
-  :root { color-scheme: light dark; }
+  :root { color-scheme: light; }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif; background: #f6f7f9; color: #111827; }
-  @media (prefers-color-scheme: dark) { html, body { background: #0b0c0f; color: #e5e7eb; } }
-  .bf-header { display:flex; align-items:center; gap:10px; padding:10px 16px; border-bottom:1px solid rgba(0,0,0,.08); background:#fff; }
-  @media (prefers-color-scheme: dark) { .bf-header { background:#111418; border-bottom-color:rgba(255,255,255,.08); } }
+  .bf-header { display:flex; align-items:center; gap:10px; padding:10px 16px; border-bottom:1px solid rgba(0,0,0,.08); background:#fff; color:#111827; }
   .bf-brand { font-weight:700; letter-spacing:.2px; display:flex; align-items:center; gap:6px; }
-  .bf-bee { width:18px; height:18px; }
+  .bf-bee { width:28px; height:28px; border-radius:6px; object-fit:contain; display:block; }
   .bf-title { font-weight:600; font-size:14px; opacity:.9; margin-left:6px; }
   .bf-spacer { flex:1; }
   .bf-meta { font-size:12px; opacity:.65; }
   .bf-frame-wrap { height: calc(100% - 92px); padding: 12px; }
   .bf-frame { width:100%; height:100%; border:1px solid rgba(0,0,0,.08); border-radius:10px; background:#fff; box-shadow:0 1px 2px rgba(0,0,0,.04); }
-  @media (prefers-color-scheme: dark) { .bf-frame { background:#fff; border-color:rgba(255,255,255,.1); } }
-  .bf-footer { padding: 8px 16px; font-size: 12px; opacity:.65; text-align:center; }
+  .bf-footer { padding: 8px 16px; font-size: 12px; opacity:.65; text-align:center; color:#111827; background:#f6f7f9; }
   .bf-footer a { color: inherit; }
 </style>
 </head>
 <body>
 <header class="bf-header">
   <span class="bf-brand">
-    <svg class="bf-bee" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10" fill="#f59e0b"/><path d="M6 12h12M9 8c.6-1 2-2 3-2s2.4 1 3 2M9 16c.6 1 2 2 3 2s2.4-1 3-2" stroke="#111827" stroke-width="1.4" fill="none"/></svg>
+    <img class="bf-bee" src="/share/_brand/icon.svg" alt="" aria-hidden="true">
     Bee Flow
   </span>
   <span class="bf-title">${title}</span>
@@ -167,7 +166,7 @@ function composeViewerChrome({ share, publisher, nonce, rawToken }) {
   <span class="bf-meta">Shared by ${publisherName}${publisherOrg ? ' · ' + publisherOrg : ''}</span>
 </header>
 <main class="bf-frame-wrap">
-  <iframe class="bf-frame" sandbox="allow-scripts allow-forms" referrerpolicy="no-referrer" src="/p/${encodeURIComponent(rawToken)}/content"></iframe>
+  <iframe class="bf-frame" sandbox="allow-scripts allow-forms" referrerpolicy="no-referrer" src="/share/${encodeURIComponent(rawToken)}/content"></iframe>
 </main>
 <footer class="bf-footer">
   This page was shared via Bee Flow.
@@ -212,18 +211,15 @@ function composeGate({ share, csrf, error, mode, nonce, rawToken }) {
 <meta name="robots" content="noindex,nofollow">
 <title>Enter ${isPassword ? 'password' : 'email'} — Bee Flow</title>
 <style nonce="${nonce}">
+  :root { color-scheme: light; }
   html, body { margin:0; min-height:100%; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif; background:#f6f7f9; color:#111827; }
-  @media (prefers-color-scheme: dark) { html, body { background:#0b0c0f; color:#e5e7eb; } }
   .wrap { min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; }
-  .card { width:100%; max-width:380px; background:#fff; border:1px solid rgba(0,0,0,.08); border-radius:14px; padding:24px; box-shadow:0 8px 32px rgba(0,0,0,.06); }
-  @media (prefers-color-scheme: dark) { .card { background:#111418; border-color:rgba(255,255,255,.08); } }
+  .card { width:100%; max-width:380px; background:#fff; border:1px solid rgba(0,0,0,.08); border-radius:14px; padding:24px; box-shadow:0 8px 32px rgba(0,0,0,.06); color:#111827; }
   h1 { font-size:18px; margin:0 0 4px; }
   p { margin:0 0 16px; font-size:13px; opacity:.7; }
   label { display:block; font-size:12px; margin:8px 0 4px; opacity:.8; }
-  input { width:100%; padding:10px 12px; border-radius:8px; border:1px solid rgba(0,0,0,.15); background:#fff; color:inherit; font-size:14px; }
-  @media (prefers-color-scheme: dark) { input { background:#0b0c0f; border-color:rgba(255,255,255,.15); } }
+  input { width:100%; padding:10px 12px; border-radius:8px; border:1px solid rgba(0,0,0,.15); background:#fff; color:#111827; font-size:14px; }
   button { width:100%; margin-top:14px; padding:10px 14px; border:0; border-radius:8px; background:#111827; color:#fff; font-weight:600; cursor:pointer; }
-  @media (prefers-color-scheme: dark) { button { background:#f59e0b; color:#111; } }
   .err { color:#b91c1c; font-size:13px; margin-top:10px; }
   .brand { display:flex; align-items:center; gap:8px; font-weight:700; margin-bottom:12px; }
   .bee { width:20px; height:20px; }
@@ -258,17 +254,37 @@ function composeGate({ share, csrf, error, mode, nonce, rawToken }) {
 
 function composeMagicSent({ nonce }) {
     return `<!doctype html><html><head><meta charset="utf-8"><meta name="robots" content="noindex,nofollow"><title>Check your email</title>
-<style nonce="${nonce}">body{font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;background:#f6f7f9;color:#111827;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:24px}.card{max-width:380px;background:#fff;border-radius:14px;padding:24px;border:1px solid rgba(0,0,0,.08);text-align:center}@media(prefers-color-scheme:dark){body{background:#0b0c0f;color:#e5e7eb}.card{background:#111418;border-color:rgba(255,255,255,.08)}}</style>
+<style nonce="${nonce}">body{font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;background:#f6f7f9;color:#111827;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:24px}.card{max-width:380px;background:#fff;border-radius:14px;padding:24px;border:1px solid rgba(0,0,0,.08);text-align:center}:root{color-scheme:light}</style>
 </head><body><div class="card"><h2>Check your email</h2><p>If the address is on the allow-list, a one-time link is on its way. The link expires in 24 hours.</p></div></body></html>`;
 }
 
 function composeNotFound({ nonce }) {
     return `<!doctype html><html><head><meta charset="utf-8"><meta name="robots" content="noindex,nofollow"><title>Link not available</title>
-<style nonce="${nonce}">body{font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;background:#f6f7f9;color:#111827;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:24px}.card{max-width:380px;background:#fff;border-radius:14px;padding:24px;border:1px solid rgba(0,0,0,.08);text-align:center}@media(prefers-color-scheme:dark){body{background:#0b0c0f;color:#e5e7eb}.card{background:#111418;border-color:rgba(255,255,255,.08)}}</style>
+<style nonce="${nonce}">body{font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;background:#f6f7f9;color:#111827;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:24px}.card{max-width:380px;background:#fff;border-radius:14px;padding:24px;border:1px solid rgba(0,0,0,.08);text-align:center}:root{color-scheme:light}</style>
 </head><body><div class="card"><h2>Link not available</h2><p>This shared page is no longer accessible. It may have expired or been revoked by the sender.</p></div></body></html>`;
 }
 
 // ── Routes ──────────────────────────────────────────────────────────
+
+// Brand icon — same asset as the collapsed sidebar in the app, so external
+// recipients see a consistent Bee Flow mark. Loaded once at module init and
+// served with an immutable cache header so the rate limiter below never
+// sees repeat fetches from the same browser. Registered BEFORE viewLimiter
+// so the static asset never consumes a share-viewer rate budget.
+const BRAND_ICON_PATH = path.resolve(__dirname, '../assets/brand/bee-icon.svg');
+const BRAND_ICON_BUF = fs.readFileSync(BRAND_ICON_PATH);
+const BRAND_ICON_ETAG = '"' + crypto.createHash('sha256').update(BRAND_ICON_BUF).digest('base64').slice(0, 27) + '"';
+
+router.get('/_brand/icon.svg', (req, res) => {
+    if (req.headers['if-none-match'] === BRAND_ICON_ETAG) {
+        return res.status(304).end();
+    }
+    res.setHeader('Content-Type', 'image/svg+xml');
+    res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+    res.setHeader('ETag', BRAND_ICON_ETAG);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.end(BRAND_ICON_BUF);
+});
 
 router.use(viewLimiter);
 

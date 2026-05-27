@@ -30,8 +30,23 @@ const crypto = require('crypto');
 const userStore = require('../stores/userStore');
 const configStore = require('../stores/configStore');
 const encryption = require('./encryption');
+const orgRolesConfig = require('../config/orgRoles.json');
 
 const TENANT_KEY_PREFIX = 'connector_tenant_key_';
+
+// Default org-role for NC users auto-provisioned through the connector.
+// `agent_editor` gives them what they expect coming from the embedded SPA:
+// view + author agents/skills/knowledge, use notebooks — but no
+// org-administration powers. An org-admin can override the default via
+// org.nc_new_user_default_org_role and promote individual users later.
+const VALID_ORG_ROLES = new Set(Object.keys(orgRolesConfig));
+const DEFAULT_NC_USER_ORG_ROLE = 'agent_editor';
+
+function resolveDefaultNcUserOrgRole(org) {
+    const requested = String(org?.nc_new_user_default_org_role || '').trim();
+    if (requested && VALID_ORG_ROLES.has(requested)) return requested;
+    return DEFAULT_NC_USER_ORG_ROLE;
+}
 
 // In-memory cache of (orgId → tenant key) — avoids hitting configStore on
 // every request. Invalidated on key rotation by the admin endpoint via
@@ -224,13 +239,14 @@ async function connectorJwtMiddleware(req, res, next) {
             const ncUid = String(req.headers['x-beeflow-nc-uid'] || payload.sub || '').trim();
             const status = (org.nc_new_user_default_status === 'pending') ? 'pending' : 'active';
             const userId = `nc_${orgId}_${(ncUid || payload.email).replace(/[^a-zA-Z0-9]+/g, '-').slice(0, 40)}`;
+            const defaultOrgRole = resolveDefaultNcUserOrgRole(org);
             const r = await userStore.createUserWithSeatCheck({
                 id: userId,
                 username: payload.email,
                 email: payload.email,
                 displayName: payload.name || ncUid || payload.email,
                 role: 'user',
-                orgRole: '',
+                orgRole: defaultOrgRole,
                 organizationId: orgId,
                 ncUid: ncUid || null,
                 provider: 'nextcloud_connector',

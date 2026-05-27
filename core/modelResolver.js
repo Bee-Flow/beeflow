@@ -25,15 +25,18 @@ const configStore = require('../stores/configStore');
 //   - deep_thinking: Complex multi-step tasks. Maximum quality.
 //   - smart:         Legacy alias for thinking tier — same defaults.
 //   - pro:           Legacy alias for writer tier — same defaults.
+// Output ceilings stay below Sonnet 4.6's 64K max so the same numbers are
+// safe on every Claude 4.x model (Opus 4.7 allows 128K; we don't need that
+// much in normal direct-chat scenarios and a high cap mostly hurts latency).
 const TIER_DEFAULTS = {
     fast: {
-        maxTokens: 2048,
+        maxTokens: 4096,
         temperature: 0.2,
         reasoningEffort: undefined, // no reasoning for speed
         reasoningSummary: false,
     },
     standard: {
-        maxTokens: 8192,
+        maxTokens: 16384,
         temperature: 0.5,
         reasoningEffort: 'low',
         reasoningSummary: false,
@@ -42,38 +45,38 @@ const TIER_DEFAULTS = {
         // Swarm tier delegates per-message to a multi-agent runtime; the
         // tier's model is used as the synthesiser default and as the
         // fallback for any worker that doesn't declare its own tier.
-        maxTokens: 8192,
+        maxTokens: 16384,
         temperature: 0.5,
         reasoningEffort: 'low',
         reasoningSummary: false,
     },
     thinking: {
-        maxTokens: 16384,
+        maxTokens: 32768,
         temperature: 0.7,
         reasoningEffort: 'medium',
         reasoningSummary: true,
     },
     writer: {
-        maxTokens: 16384,
+        maxTokens: 32768,
         temperature: 0.7,
         reasoningEffort: 'low',
         reasoningSummary: false,
     },
     deep_thinking: {
-        maxTokens: 40960,
+        maxTokens: 64000,
         temperature: 0.7,
         reasoningEffort: 'high',
         reasoningSummary: true,
     },
     // Legacy aliases
     smart: {
-        maxTokens: 16384,
+        maxTokens: 32768,
         temperature: 0.7,
         reasoningEffort: 'medium',
         reasoningSummary: true,
     },
     pro: {
-        maxTokens: 16384,
+        maxTokens: 32768,
         temperature: 0.7,
         reasoningEffort: 'low',
         reasoningSummary: false,

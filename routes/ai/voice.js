@@ -427,6 +427,7 @@ router.post(
                             name: tc.name,
                             arguments: JSON.stringify(tc.input || {}),
                         },
+                        _thought_signature: tc.thought_signature || tc._thought_signature || undefined,
                     })),
                 });
 

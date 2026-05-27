@@ -6,6 +6,7 @@
  *   GET    /                    — list user's webpages
  *   GET    /:id                 — get webpage detail (metadata + html/css/js bytes)
  *   PUT    /:id                 — update webpage (metadata and/or file slots)
+ *   POST   /:id/clone           — duplicate webpage (skips publishing scope + external shares)
  *   DELETE /:id                 — delete webpage (purges DB rows + RustFS objects)
  *   POST   /:id/sources/file    — upload file source (pdf, docx, xlsx, txt, …)
  *   POST   /:id/sources/url     — add URL source
@@ -294,7 +295,7 @@ router.patch('/:id/publish', requireAuth, async (req, res) => {
 
 const PUBLIC_SHARE_BASE_URL = process.env.PUBLIC_SHARE_BASE_URL || process.env.PUBLIC_APP_URL || '';
 function buildShareUrl(req, rawToken) {
-    // Prefer an explicit env override (e.g. https://app.beeflow.nl) so that
+    // Prefer an explicit env override (e.g. https://beeflow.nl) so that
     // links emailed from server-side environments don't end up pointing at
     // localhost. Fall back to the request's own origin so dev works.
     const base = PUBLIC_SHARE_BASE_URL
@@ -640,6 +641,35 @@ router.delete('/:id/chat', requireAuth, async (req, res) => {
     } catch (err) {
         console.error('[Webpages] Chat clear failed:', err);
         res.status(500).json({ error: 'Failed to clear chat history' });
+    }
+});
+
+router.post('/:id/clone', requireAuth, async (req, res) => {
+    try {
+        const sourceId = req.params.id;
+        const { name } = req.body || {};
+        const { userId, orgIds, userGroups } = await resolveAudienceContext(req);
+        const orgIdArr = orgIds instanceof Set ? [...orgIds] : (Array.isArray(orgIds) ? orgIds : []);
+
+        // Visibility gate: owner OR audience member of an org/group the source
+        // is published to. Mirrors the GET /:id rules so anyone who can read
+        // the page can also fork it onto their own account.
+        const source = await webpageStore.getWebpageRaw(sourceId);
+        if (!source || !webpageStore.canReadWebpage(source, userId, userGroups, orgIdArr)) {
+            return res.status(404).json({ error: 'Webpage not found' });
+        }
+
+        // Flush as the SOURCE owner — they're the only one who can hold an
+        // open SQLite handle. Best-effort: when the handle isn't loaded in
+        // this server process the call rejects and we proceed regardless.
+        try { await webpageDbStore.flush(source.userId, sourceId); } catch (_) { /* not loaded or not the owner — fine */ }
+
+        const cloned = await webpageStore.cloneWebpage({ sourceId, newOwnerId: userId, newName: name });
+        if (!cloned) return res.status(404).json({ error: 'Webpage not found' });
+        res.json({ success: true, webpage: cloned });
+    } catch (err) {
+        console.error('[Webpages] Clone failed:', err);
+        res.status(500).json({ error: 'Failed to clone webpage: ' + err.message });
     }
 });
 

@@ -7,6 +7,7 @@
  */
 
 const { google } = require('googleapis');
+const { Readable } = require('stream');
 const { loadConfig } = require('../auth/permissions');
 
 const DRIVE_TOOLS = [
@@ -114,6 +115,59 @@ const DRIVE_TOOLS = [
     {
         type: 'function',
         function: {
+            name: 'drive_upload_file',
+            description:
+                'Upload a file to Google Drive. Two input modes:\n' +
+                '  1) sourceHandle — opaque handle from another tool (e.g. the `sourceHandle` returned by gmail_read_attachment) pointing at bytes the server already has. PREFERRED for mail attachments: no base64 ever passes through the AI context.\n' +
+                '  2) content — inline string for AI-generated text files (UTF-8, or base64 with isBase64=true). Use only for small text payloads, never for forwarding binary attachments.\n' +
+                'Returns { fileId, name, webViewLink, parents, bytesUploaded, updated }.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    name: {
+                        type: 'string',
+                        description: 'Filename to save as (include the extension, e.g. "factuur.pdf").'
+                    },
+                    parentFolderId: {
+                        type: 'string',
+                        description: 'Drive folder ID to place the file in. Omit (or "root") for My Drive root.'
+                    },
+                    mimeType: {
+                        type: 'string',
+                        description: 'MIME type. Inferred from sourceHandle.mimeType or the filename extension when omitted.'
+                    },
+                    sourceHandle: {
+                        type: 'object',
+                        description: 'Server-side reference to bytes from another tool. Currently supported: { kind: "gmail_attachment", messageId, attachmentId, filename?, mimeType?, size? }.',
+                        properties: {
+                            kind:         { type: 'string', enum: ['gmail_attachment'] },
+                            messageId:    { type: 'string' },
+                            attachmentId: { type: 'string' },
+                            filename:     { type: 'string' },
+                            mimeType:     { type: 'string' },
+                            size:         { type: 'integer' }
+                        }
+                    },
+                    content: {
+                        type: 'string',
+                        description: 'Inline content. Mutually exclusive with sourceHandle. UTF-8 string, or base64 when isBase64=true.'
+                    },
+                    isBase64: {
+                        type: 'boolean',
+                        description: 'If true, content is interpreted as base64-encoded binary.'
+                    },
+                    overwriteIfExists: {
+                        type: 'boolean',
+                        description: 'If true and a file with the same name already exists in parentFolderId, update it (new revision) instead of creating a duplicate. Default false.'
+                    }
+                },
+                required: ['name']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
             name: 'drive_get_content',
             description: 'Download and read the text content of a Google Drive file. Supports Google Docs (exported as plain text), Google Sheets (exported as CSV), PDFs (text extracted), and plain text files. Use this after drive_search to read the actual content of financial documents, invoices, or spreadsheets stored in Drive.',
             parameters: {
@@ -162,6 +216,35 @@ async function createDriveClient(session) {
     });
 
     return google.drive({ version: 'v3', auth: oauth2Client });
+}
+
+// ─── MIME inference ────────────────────────────────────────────
+
+const EXT_TO_MIME = {
+    pdf: 'application/pdf',
+    png: 'image/png',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    gif: 'image/gif',
+    webp: 'image/webp',
+    svg: 'image/svg+xml',
+    csv: 'text/csv',
+    txt: 'text/plain',
+    md: 'text/markdown',
+    html: 'text/html',
+    json: 'application/json',
+    xml: 'application/xml',
+    zip: 'application/zip',
+    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+};
+
+function inferMimeType({ mimeArg, handleMime, filename }) {
+    if (mimeArg) return mimeArg;
+    if (handleMime) return handleMime;
+    const ext = String(filename || '').toLowerCase().match(/\.([a-z0-9]+)$/)?.[1];
+    return (ext && EXT_TO_MIME[ext]) || 'application/octet-stream';
 }
 
 // ─── Format File ───────────────────────────────────────────────
@@ -295,6 +378,91 @@ async function executeDriveTool(toolName, args, session) {
             };
         }
 
+        case 'drive_upload_file': {
+            if (!args.name) return { error: 'name is required' };
+            const hasHandle = args.sourceHandle && typeof args.sourceHandle === 'object';
+            const hasContent = typeof args.content === 'string';
+            if (hasHandle && hasContent) {
+                return { error: 'Pass either sourceHandle or content, not both.' };
+            }
+            if (!hasHandle && !hasContent) {
+                return { error: 'Either sourceHandle (preferred for binary) or content (for inline text) is required.' };
+            }
+
+            // Resolve bytes. Handles stay opaque to the AI; the only currently
+            // supported kind is gmail_attachment.
+            let buffer;
+            let handleMime;
+            if (hasHandle) {
+                const kind = args.sourceHandle.kind;
+                if (kind === 'gmail_attachment') {
+                    const { fetchAttachmentBuffer } = require('./gmailTools');
+                    const res = await fetchAttachmentBuffer(session, {
+                        messageId: args.sourceHandle.messageId,
+                        attachmentId: args.sourceHandle.attachmentId,
+                    });
+                    buffer = res.buffer;
+                    handleMime = args.sourceHandle.mimeType;
+                } else {
+                    return { error: `Unsupported sourceHandle.kind: ${kind}` };
+                }
+            } else {
+                buffer = Buffer.from(args.content, args.isBase64 ? 'base64' : 'utf-8');
+            }
+
+            const mimeType = inferMimeType({ mimeArg: args.mimeType, handleMime, filename: args.name });
+
+            // Idempotent overwrite: look for an existing file with the same name
+            // in the target folder and update it in place rather than creating a
+            // duplicate. Off by default — duplicates are safer than surprise
+            // overwrites in invoice-archive flows.
+            let existingId = null;
+            if (args.overwriteIfExists && args.parentFolderId) {
+                const escapedName = String(args.name).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+                const listRes = await drive.files.list({
+                    q: `name = '${escapedName}' and '${args.parentFolderId}' in parents and trashed = false`,
+                    pageSize: 1,
+                    fields: 'files(id, name)',
+                    supportsAllDrives: true,
+                    includeItemsFromAllDrives: true,
+                });
+                existingId = listRes.data.files?.[0]?.id || null;
+            }
+
+            const media = { mimeType, body: Readable.from(buffer) };
+            let res;
+            if (existingId) {
+                res = await drive.files.update({
+                    fileId: existingId,
+                    media,
+                    fields: 'id, name, webViewLink, parents',
+                    supportsAllDrives: true,
+                });
+            } else {
+                res = await drive.files.create({
+                    requestBody: {
+                        name: args.name,
+                        parents: args.parentFolderId ? [args.parentFolderId] : undefined,
+                        mimeType,
+                    },
+                    media,
+                    fields: 'id, name, webViewLink, parents',
+                    supportsAllDrives: true,
+                });
+            }
+
+            return {
+                success: true,
+                fileId: res.data.id,
+                name: res.data.name,
+                webViewLink: res.data.webViewLink,
+                parents: res.data.parents,
+                mimeType,
+                bytesUploaded: buffer.length,
+                updated: !!existingId,
+            };
+        }
+
         case 'drive_get_content': {
             if (!args.fileId) return { error: 'fileId is required' };
 
@@ -407,7 +575,7 @@ async function executeDriveTool(toolName, args, session) {
 }
 
 function isDriveTool(toolName) {
-    return ['drive_search', 'drive_list_files', 'drive_get_file', 'drive_get_content', 'drive_move_file', 'drive_create_folder'].includes(toolName);
+    return ['drive_search', 'drive_list_files', 'drive_get_file', 'drive_get_content', 'drive_move_file', 'drive_create_folder', 'drive_upload_file'].includes(toolName);
 }
 
 module.exports = {

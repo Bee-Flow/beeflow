@@ -39,6 +39,78 @@ const TEMPLATES = [
         },
     },
     {
+        id: 'gdrive-invoice-archive',
+        title: 'Facturen archiveren in Google Drive',
+        description: 'Inkomende mail met bijlage → AI bepaalt of het een factuur is → upload origineel naar Google Drive onder invoices/jaar/maand/leverancier.',
+        category: 'Files',
+        icon: 'FileText',
+        tags: ['gmail', 'google-drive', 'ai'],
+        definition: {
+            trigger: { id: 'trg', type: 'trigger', kind: 'app_event', appEvent: { provider: 'gmail', event: 'mail.new', filter: { hasAttachment: true } } },
+            steps: [
+                step('read', 'integration_action', {
+                    tool: 'gmail_read_attachment',
+                    label: 'Lees bijlage',
+                    inputs: {
+                        messageId: { kind: 'ref', path: 'trigger.output.messageId' },
+                        attachmentId: { kind: 'ref', path: 'trigger.output.attachments.0.attachmentId' },
+                        filename: { kind: 'ref', path: 'trigger.output.attachments.0.filename' },
+                    },
+                }),
+                step('classify', 'ai_step', {
+                    prompt: 'Bepaal of deze tekst een factuur is. Zo ja, extraheer leverancier (kort, zonder BV/B.V. suffix), jaar (YYYY) en maand (MM). Antwoord met JSON.',
+                    inputs: { text: { kind: 'ref', path: 'steps.read.output.content' } },
+                    outputSchema: { type: 'object', properties: {
+                        isInvoice: { type: 'boolean' },
+                        supplier: { type: 'string' },
+                        year: { type: 'string' },
+                        month: { type: 'string' },
+                    } },
+                }),
+                step('gate', 'condition', { expression: 'steps.classify.output.isInvoice === true' }),
+                step('mkYear', 'integration_action', {
+                    tool: 'drive_create_folder',
+                    label: 'Map voor het jaar',
+                    inputs: { name: { kind: 'ref', path: 'steps.classify.output.year' } },
+                }),
+                step('mkMonth', 'integration_action', {
+                    tool: 'drive_create_folder',
+                    label: 'Map voor de maand',
+                    inputs: {
+                        name: { kind: 'ref', path: 'steps.classify.output.month' },
+                        parentFolderId: { kind: 'ref', path: 'steps.mkYear.output.folderId' },
+                    },
+                }),
+                step('mkSupp', 'integration_action', {
+                    tool: 'drive_create_folder',
+                    label: 'Map voor de leverancier',
+                    inputs: {
+                        name: { kind: 'ref', path: 'steps.classify.output.supplier' },
+                        parentFolderId: { kind: 'ref', path: 'steps.mkMonth.output.folderId' },
+                    },
+                }),
+                step('upload', 'integration_action', {
+                    tool: 'drive_upload_file',
+                    label: 'Upload bijlage naar Drive',
+                    inputs: {
+                        name: { kind: 'ref', path: 'trigger.output.attachments.0.filename' },
+                        parentFolderId: { kind: 'ref', path: 'steps.mkSupp.output.folderId' },
+                        sourceHandle: { kind: 'ref', path: 'steps.read.output.sourceHandle' },
+                    },
+                }),
+            ],
+            edges: [
+                { from: 'trg', to: 'read' },
+                { from: 'read', to: 'classify' },
+                { from: 'classify', to: 'gate' },
+                { from: 'gate', to: 'mkYear', branch: 'then' },
+                { from: 'mkYear', to: 'mkMonth' },
+                { from: 'mkMonth', to: 'mkSupp' },
+                { from: 'mkSupp', to: 'upload' },
+            ],
+        },
+    },
+    {
         id: 'nc-pdf-summarise',
         title: 'PDF summary',
         description: 'When a PDF lands anywhere under /Documents, summarise it and post a Talk message.',

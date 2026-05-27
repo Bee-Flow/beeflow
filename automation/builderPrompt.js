@@ -106,8 +106,12 @@ draft is a typed DAG of steps:
        Right:  \`{ kind: "ref", path: "steps.ai_47.output.replyText" }\`
        Right:  \`{ kind: "template", value: "Re: {{trigger.output.subject}}" }\`
    - For a Gmail \`mail.new\` trigger, the available output fields are:
-     \`messageId, threadId, from, to, cc, subject, snippet, labelIds, date\`.
-     Always reference them as \`trigger.output.<field>\`.
+     \`messageId, threadId, from, to, cc, subject, snippet, labelIds, date,
+     hasAttachment, attachments[{filename, mimeType, size, attachmentId}]\`.
+     Always reference them as \`trigger.output.<field>\`. The \`attachments\`
+     array is pre-populated — branch on \`trigger.output.hasAttachment\` and
+     bind \`trigger.output.attachments.0.attachmentId\` directly to
+     \`gmail_read_attachment\`; no extra \`gmail_read\` step is needed.
    - Inside a loop body, refer to the current item as \`loop.<itemVar>\`.
 4. **Summarise**. After each batch of mutations call \`builder_summarise\`
    so the user can read the current plan in plain English.
@@ -236,6 +240,39 @@ Move Move Facturen webapp":
        \`params\`: nine refs into the ai_step output (\`steps.<ai>.output.factuurnummer\`, etc.)
   5. Optionally \`builder_add_notification\` so the user gets a "1 invoice added" ping.
 
+## Mail attachments → Google Drive (or other upload targets)
+
+To file an email attachment into Drive without sending the PDF bytes through
+the AI context, use the \`sourceHandle\` pattern:
+
+  1. \`builder_propose_trigger\` → \`mail.new\` with \`filter: { hasAttachment: true }\`.
+  2. \`builder_add_action\` → \`gmail_read_attachment\` with
+     \`messageId: trigger.output.messageId\`,
+     \`attachmentId: trigger.output.attachments.0.attachmentId\`,
+     \`filename: trigger.output.attachments.0.filename\`.
+     The step returns \`{ content, sourceHandle, ... }\`.
+  3. \`builder_add_ai_step\` → classify the \`content\` (e.g. is this an invoice?
+     supplier / year / month). Set an \`outputSchema\` like
+     \`{ isInvoice: 'boolean', supplier: 'string', year: 'string', month: 'string' }\`.
+  4. \`builder_add_condition\` on \`steps.<ai>.output.isInvoice\`.
+  5. Build the destination path with existing tools — \`drive_search\` to find or
+     create the root folder, then \`drive_create_folder\` per level (year →
+     month → supplier). Bind each \`parentFolderId\` to the previous step's
+     \`output.folderId\`.
+  6. \`builder_add_action\` → \`drive_upload_file\` with
+     \`sourceHandle: { kind: "ref", path: "steps.<read>.output.sourceHandle" }\`,
+     \`name: trigger.output.attachments.0.filename\`,
+     \`parentFolderId\` bound to the deepest folder step. NEVER bind the raw
+     \`content\` / base64 of an attachment — always use the handle.
+
+Multiple attachments? Wrap steps 2-6 in a \`loop\` over
+\`trigger.output.attachments\` with an \`itemVar\` like \`att\`, then reference
+\`loop.att.attachmentId\` / \`loop.att.filename\` inside the body.
+
+HARD RULE: when forwarding a mail attachment to any upload target,
+\`drive_upload_file\` (and similar) MUST receive a \`sourceHandle\` ref — never
+a base64 string and never the OCR'd \`content\`.
+
 ## Catalog (only these are available)
 
 ${apps || '_(user has no integrations connected)_'}
@@ -277,9 +314,11 @@ EVERY tool input value must be a binding object — never a bare string/number:
 Ref paths MUST start with one of: \`trigger\`, \`steps\`, \`vars\`, \`secrets\`, \`loop\`.
 Field names alone (e.g. \`"from"\`, \`"subject"\`) are NOT valid paths — prepend \`trigger.output.\`.
 
-Gmail mail.new trigger exposes: \`messageId, threadId, from, to, cc, subject, snippet, labelIds, date\` — reference as \`trigger.output.<field>\`.
+Gmail mail.new trigger exposes: \`messageId, threadId, from, to, cc, subject, snippet, labelIds, date, hasAttachment, attachments[{filename, mimeType, size, attachmentId}]\` — reference as \`trigger.output.<field>\`.
 
 When replying to a Gmail trigger, bind \`replyToMessageId: trigger.output.messageId\` on the \`gmail_compose\` step.
+
+Forwarding a mail attachment to Drive? Pass the \`sourceHandle\` returned by \`gmail_read_attachment\` to \`drive_upload_file\` (\`sourceHandle: { kind: "ref", path: "steps.<read>.output.sourceHandle" }\`). NEVER bind raw base64 or the OCR'd \`content\` as the file body.
 
 ## Hard rules
 
@@ -446,6 +485,155 @@ function buildFewShotMessages(count = 0) {
                 }],
             },
             { role: 'tool', tool_call_id: 'ex_u3', content: JSON.stringify({ ok: true, stepId: 's_send' }) },
+        ],
+        // Example 3: mail attachment → Google Drive via sourceHandle (no base64
+        // through the AI context). Demonstrates filter.hasAttachment, the
+        // attachments[] payload, the sourceHandle pattern, and chained
+        // drive_create_folder for the invoices/year/month/supplier path.
+        [
+            { role: 'user', content: 'When an invoice email comes in, file the PDF in Google Drive under invoices/year/month/supplier.' },
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: [{
+                    id: 'ex_v1', type: 'function',
+                    function: {
+                        name: 'builder_propose_trigger',
+                        arguments: JSON.stringify({
+                            kind: 'app_event',
+                            appProvider: 'gmail',
+                            appEvent: 'mail.new',
+                            filter: { hasAttachment: true },
+                        }),
+                    },
+                }],
+            },
+            { role: 'tool', tool_call_id: 'ex_v1', content: JSON.stringify({ ok: true, trigger: { id: 'trg' } }) },
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: [{
+                    id: 'ex_v2', type: 'function',
+                    function: {
+                        name: 'builder_add_action',
+                        arguments: JSON.stringify({
+                            tool: 'gmail_read_attachment',
+                            inputs: {
+                                messageId: { kind: 'ref', path: 'trigger.output.messageId' },
+                                attachmentId: { kind: 'ref', path: 'trigger.output.attachments.0.attachmentId' },
+                                filename: { kind: 'ref', path: 'trigger.output.attachments.0.filename' },
+                            },
+                        }),
+                    },
+                }],
+            },
+            { role: 'tool', tool_call_id: 'ex_v2', content: JSON.stringify({ ok: true, stepId: 's_read' }) },
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: [{
+                    id: 'ex_v3', type: 'function',
+                    function: {
+                        name: 'builder_add_ai_step',
+                        arguments: JSON.stringify({
+                            afterStepId: 's_read',
+                            prompt: 'Determine if this text is an invoice. If yes, extract supplier, year (YYYY) and month (MM). Respond with JSON.',
+                            outputSchema: { isInvoice: 'boolean', supplier: 'string', year: 'string', month: 'string' },
+                            inputs: { text: { kind: 'ref', path: 'steps.s_read.output.content' } },
+                        }),
+                    },
+                }],
+            },
+            { role: 'tool', tool_call_id: 'ex_v3', content: JSON.stringify({ ok: true, stepId: 's_ai' }) },
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: [{
+                    id: 'ex_v4', type: 'function',
+                    function: {
+                        name: 'builder_add_condition',
+                        arguments: JSON.stringify({
+                            afterStepId: 's_ai',
+                            expression: 'steps.s_ai.output.isInvoice === true',
+                        }),
+                    },
+                }],
+            },
+            { role: 'tool', tool_call_id: 'ex_v4', content: JSON.stringify({ ok: true, stepId: 's_if' }) },
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: [{
+                    id: 'ex_v5', type: 'function',
+                    function: {
+                        name: 'builder_add_action',
+                        arguments: JSON.stringify({
+                            afterStepId: 's_if',
+                            tool: 'drive_create_folder',
+                            inputs: { name: { kind: 'ref', path: 'steps.s_ai.output.year' } },
+                        }),
+                    },
+                }],
+            },
+            { role: 'tool', tool_call_id: 'ex_v5', content: JSON.stringify({ ok: true, stepId: 's_year' }) },
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: [{
+                    id: 'ex_v6', type: 'function',
+                    function: {
+                        name: 'builder_add_action',
+                        arguments: JSON.stringify({
+                            afterStepId: 's_year',
+                            tool: 'drive_create_folder',
+                            inputs: {
+                                name: { kind: 'ref', path: 'steps.s_ai.output.month' },
+                                parentFolderId: { kind: 'ref', path: 'steps.s_year.output.folderId' },
+                            },
+                        }),
+                    },
+                }],
+            },
+            { role: 'tool', tool_call_id: 'ex_v6', content: JSON.stringify({ ok: true, stepId: 's_month' }) },
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: [{
+                    id: 'ex_v7', type: 'function',
+                    function: {
+                        name: 'builder_add_action',
+                        arguments: JSON.stringify({
+                            afterStepId: 's_month',
+                            tool: 'drive_create_folder',
+                            inputs: {
+                                name: { kind: 'ref', path: 'steps.s_ai.output.supplier' },
+                                parentFolderId: { kind: 'ref', path: 'steps.s_month.output.folderId' },
+                            },
+                        }),
+                    },
+                }],
+            },
+            { role: 'tool', tool_call_id: 'ex_v7', content: JSON.stringify({ ok: true, stepId: 's_supp' }) },
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: [{
+                    id: 'ex_v8', type: 'function',
+                    function: {
+                        name: 'builder_add_action',
+                        arguments: JSON.stringify({
+                            afterStepId: 's_supp',
+                            tool: 'drive_upload_file',
+                            inputs: {
+                                name: { kind: 'ref', path: 'trigger.output.attachments.0.filename' },
+                                parentFolderId: { kind: 'ref', path: 'steps.s_supp.output.folderId' },
+                                sourceHandle: { kind: 'ref', path: 'steps.s_read.output.sourceHandle' },
+                            },
+                        }),
+                    },
+                }],
+            },
+            { role: 'tool', tool_call_id: 'ex_v8', content: JSON.stringify({ ok: true, stepId: 's_up' }) },
         ],
     ];
 

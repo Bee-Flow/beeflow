@@ -772,7 +772,7 @@ class AIAgent {
     }
 
     async _chatLoop(config, onProgress = null) {
-        const maxIterations = 20;
+        const maxIterations = 30;
         let iterations = 0;
         const tools = await this.getToolsForRequest();
         const emit = (type, detail) => { if (onProgress) onProgress({ type, detail }); };

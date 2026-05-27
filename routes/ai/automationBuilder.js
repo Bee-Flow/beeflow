@@ -304,8 +304,15 @@ router.post('/stream', requireAuth, builderRateLimit, async (req, res) => {
         // history yet). Once the user has been chatting, the prior turns
         // are the real-world example the model should learn from — adding
         // canned examples on top would dilute that signal.
+        // Gemini 3.x rejects any functionCall in the request whose part is
+        // missing a thought_signature, and the synthetic few-shot tool_calls
+        // can't carry one (signatures are cryptographic, model-issued).
+        // Skip few-shots for these models — the rest of the system prompt
+        // already documents the tool schema in detail.
+        const isGemini3x = /gemini-3(\.\d+)?-(pro|flash)/i.test(modelId || '');
+        const effectiveFewShots = isGemini3x ? 0 : (profile.fewShots || 0);
         const fewShotMessages = (!history || history.length === 0)
-            ? buildFewShotMessages(profile.fewShots || 0)
+            ? buildFewShotMessages(effectiveFewShots)
             : [];
         const messages = [
             { role: 'system', content: sys },
@@ -351,6 +358,8 @@ router.post('/stream', requireAuth, builderRateLimit, async (req, res) => {
                             name: tc.function.name,
                             arguments: typeof tc.function.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc.function.arguments),
                         },
+                        _thought_signature: tc._thought_signature || undefined,
+                        _raw_content_parts: tc._raw_content_parts || undefined,
                     })),
                 });
                 let mutatedThisIter = false;

@@ -601,6 +601,76 @@ router.post('/config/auto-classifier', requireAuth, async (req, res) => {
     }
 });
 
+// ─── Claude-specific settings ────────────────────────────────────
+// Global knobs that only apply to Anthropic Claude models. Per-tier
+// settings (model, max_tokens, effort, budget_tokens) live in the
+// regular chat_model_tiers config; this endpoint exists for the
+// cross-tier robustness toggles.
+//
+// auto_retry_on_empty — when a Claude turn returns stop_reason=max_tokens
+// (or any path where thinking ate the budget and the final text is empty),
+// kick off ONE follow-up non-streaming call with reasoningEffort='none' so
+// the model writes a real answer based on what it already thought. Default
+// true; flip off if you'd rather see the raw "no response" symptom.
+
+router.get('/config/claude-settings', requireAuth, async (req, res) => {
+    try {
+        const settings = (await configStore.getConfig('claude_settings')) || {};
+        res.json({
+            autoRetryOnEmpty: settings.autoRetryOnEmpty !== false, // default true
+        });
+    } catch (e) {
+        console.error('Failed to get Claude settings:', e);
+        res.status(500).json({ error: 'Failed to fetch config' });
+    }
+});
+
+router.post('/config/claude-settings', requireAuth, async (req, res) => {
+    if (!(await isAdminUser(req))) return res.status(403).json({ error: 'Admin access required' });
+    try {
+        const { autoRetryOnEmpty } = req.body || {};
+        const settings = {
+            autoRetryOnEmpty: autoRetryOnEmpty !== false,
+        };
+        await configStore.setConfig('claude_settings', settings);
+        res.json({ success: true, ...settings });
+    } catch (e) {
+        console.error('Failed to save Claude settings:', e);
+        res.status(500).json({ error: 'Failed to save config' });
+    }
+});
+
+// ─── Hidden Models (global blocklist) ────────────────────────────
+// Admins can hide specific model IDs from every tier picker (Fast, Flow,
+// Thinking, etc.). Stored as a flat array of model IDs under
+// `hidden_model_ids`. The list is purely cosmetic — it does NOT remove the
+// model from the provider catalog, just from the picker UI.
+
+router.get('/config/hidden-models', requireAuth, async (req, res) => {
+    try {
+        const raw = await configStore.getConfig('hidden_model_ids');
+        const ids = Array.isArray(raw) ? raw.filter(id => typeof id === 'string') : [];
+        res.json({ modelIds: ids });
+    } catch (e) {
+        console.error('Failed to get hidden models:', e);
+        res.status(500).json({ error: 'Failed to fetch config' });
+    }
+});
+
+router.post('/config/hidden-models', requireAuth, async (req, res) => {
+    if (!(await isAdminUser(req))) return res.status(403).json({ error: 'Admin access required' });
+    try {
+        const raw = req.body?.modelIds;
+        if (!Array.isArray(raw)) return res.status(400).json({ error: 'modelIds must be an array' });
+        const ids = [...new Set(raw.filter(id => typeof id === 'string' && id.trim()).map(id => id.trim()))];
+        await configStore.setConfig('hidden_model_ids', ids);
+        res.json({ success: true, modelIds: ids });
+    } catch (e) {
+        console.error('Failed to save hidden models:', e);
+        res.status(500).json({ error: 'Failed to save config' });
+    }
+});
+
 // ─── EU Model Tier Config ────────────────────────────────────────
 
 router.get('/config/chat-models-eu', requireAuth, async (req, res) => {

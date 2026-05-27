@@ -1860,6 +1860,19 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                     } catch (_) { /* transparency is best-effort */ }
                 }
             }
+            // ── Prompt cache breakpoint on the last attachment block ─────
+            // OCR / PDF extraction is expensive and the document content is
+            // stable across follow-up questions in the same chat. Mark the
+            // LAST attachment-derived block so Anthropic caches the document
+            // for ≥5 min at 10% cost on the next turn. The Claude provider's
+            // normalizeMessages counts this pre-existing marker against its
+            // own breakpoint budget so we stay under the 4-marker API limit.
+            if (contentParts.length > 0) {
+                const lastBlock = contentParts[contentParts.length - 1];
+                if (lastBlock && typeof lastBlock === 'object' && !lastBlock.cache_control) {
+                    lastBlock.cache_control = { type: 'ephemeral' };
+                }
+            }
             messages.push({ role: 'user', content: contentParts });
         } else {
             messages.push({ role: 'user', content: message });
@@ -2478,7 +2491,7 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
         // All providers handle tool calls natively in streaming — no need for a separate non-streaming call
         const skipToolPrecheck = adapter.shouldUseResponsesApi?.(modelId, chatOptions) || ['google', 'openai', 'claude', 'mistral'].includes(config.providerType);
         let toolCallRounds = 0;
-        const MAX_TOOL_ROUNDS = parseInt(await configStore.getConfig('max_tool_rounds_chat'), 10) || 5;
+        const MAX_TOOL_ROUNDS = parseInt(await configStore.getConfig('max_tool_rounds_chat'), 10) || 15;
         // Step-machine guard. Completion is explicit — the LLM calls
         // `complete_session_skill` to advance. Without explicit completion,
         // the LLM streams its final answer alongside integration-tool calls
@@ -3780,22 +3793,63 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
             }
         }
 
-        // ─── Empty-response guard ────────────────────────────────────
+        // ─── Empty-response guard + Claude auto-retry ────────────────
         // When the model emits only tool calls, `fullContent` is an empty
         // string. Saving an empty assistant bubble cascades into title-gen
         // 400s and a confusing "Error generating response" in the chat UI.
-        // Replace with a useful human-readable line. Only claim the answer
-        // is in the notebook when a notebook tool actually persisted real
-        // content this turn — otherwise the user gets pointed at an empty
-        // panel (the original bug).
+        //
+        // Special case for Claude adaptive thinking (Sonnet 4.6 / Opus 4.7):
+        // thinking and output share the same max_tokens pot. A heavy turn
+        // can consume the whole budget on thinking and finish with empty
+        // text. If we already have thinking content, do ONE follow-up
+        // non-streaming call without thinking — the model writes a real
+        // answer based on what it already deliberated. Admin-disable via
+        // the `claude_settings.autoRetryOnEmpty` config key.
         if (!fullContent || !fullContent.trim()) {
-            const fallbackText = notebookWriteCommitted
-                ? 'I wrote the answer to your Notebook — open the Notebook panel to view it.'
-                : 'The model returned no response. Please try rephrasing your question.';
-            console.warn(`[DirectChat] Empty assistant content (toolsUsed=${collectedToolHistory.length > 0}, notebookWriteCommitted=${notebookWriteCommitted}) — surfacing fallback line.`);
-            try { send('content_replace', { text: fallbackText }); } catch (_) { /* SSE may be closing */ }
-            fullContent = fallbackText;
-            displayContent = fallbackText;
+            let _retryRecovered = false;
+            const _isClaude = /claude/i.test(modelId) || config.providerType === 'claude';
+            if (_isClaude && thinkingContent && thinkingContent.trim()) {
+                let _autoRetryEnabled = true;
+                try {
+                    const _cs = await configStore.getConfig('claude_settings');
+                    if (_cs && _cs.autoRetryOnEmpty === false) _autoRetryEnabled = false;
+                } catch (_) { /* default true */ }
+                if (_autoRetryEnabled) {
+                    try {
+                        console.log('[DirectChat] Empty content with thinking — auto-retrying without thinking');
+                        send('phase', { type: 'auto_retry_no_thinking' });
+                        const _retryRes = await adapter.chat(apiKey, apiUrl, modelId,
+                            applyTokenMapToMessages({ conversationId: convId, messages }),
+                            {
+                                ...chatOptions,
+                                reasoningEffort: 'none',
+                                tools: undefined,
+                                toolChoice: undefined,
+                                maxTokens: Math.min(chatOptions.maxTokens || 8192, 8192),
+                            }
+                        );
+                        const _retryText = _retryRes?.content;
+                        if (_retryText && _retryText.trim()) {
+                            fullContent = _retryText;
+                            displayContent = _retryText;
+                            try { send('content_replace', { text: _retryText }); } catch (_) { /* ignore */ }
+                            _retryRecovered = true;
+                            console.log(`[DirectChat] Auto-retry recovered ${_retryText.length} chars`);
+                        }
+                    } catch (e) {
+                        console.warn(`[DirectChat] Auto-retry failed: ${e.message}`);
+                    }
+                }
+            }
+            if (!_retryRecovered) {
+                const fallbackText = notebookWriteCommitted
+                    ? 'I wrote the answer to your Notebook — open the Notebook panel to view it.'
+                    : 'The model returned no response. Please try rephrasing your question.';
+                console.warn(`[DirectChat] Empty assistant content (toolsUsed=${collectedToolHistory.length > 0}, notebookWriteCommitted=${notebookWriteCommitted}) — surfacing fallback line.`);
+                try { send('content_replace', { text: fallbackText }); } catch (_) { /* SSE may be closing */ }
+                fullContent = fallbackText;
+                displayContent = fallbackText;
+            }
         }
 
         const conv = await agentStore.getDirectConversation(convId, userId);

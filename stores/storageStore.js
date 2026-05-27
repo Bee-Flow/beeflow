@@ -186,6 +186,27 @@ async function listKeys(prefix) {
  * round-tripping bytes through Node.
  */
 async function copyObject(sourceKey, destKey) {
+    if (mode === 'local') {
+        const src = localPathFor(sourceKey);
+        const dst = localPathFor(destKey);
+        if (!fs.existsSync(src)) {
+            // Mirror the S3 NoSuchKey shape so callers can use the same handling.
+            const err = new Error(`NoSuchKey: ${sourceKey}`);
+            err.name = 'NoSuchKey';
+            err.$metadata = { httpStatusCode: 404 };
+            throw err;
+        }
+        fs.mkdirSync(path.dirname(dst), { recursive: true });
+        fs.copyFileSync(src, dst);
+        // Carry the content-type and tags sidecars so streamFile returns the
+        // same MIME on the copy. Best-effort — missing sidecars are fine.
+        for (const ext of ['.meta', '.tags']) {
+            if (fs.existsSync(src + ext)) {
+                try { fs.copyFileSync(src + ext, dst + ext); } catch (_) { /* ignore */ }
+            }
+        }
+        return;
+    }
     if (!s3) throw new Error('StorageStore not initialized');
     const { CopyObjectCommand } = require('@aws-sdk/client-s3');
     await s3.send(new CopyObjectCommand({

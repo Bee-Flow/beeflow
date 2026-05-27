@@ -254,7 +254,21 @@ async function initDB() {
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "nc_sync_groups" TEXT DEFAULT '[]'`); } catch (e) { }
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "nc_sync_excluded_groups" TEXT DEFAULT '[]'`); } catch (e) { }
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "nc_new_user_default_status" TEXT DEFAULT 'active'`); } catch (e) { }
+    // orgRole assigned to NC users auto-provisioned via the connector JWT path
+    // ([server/auth/connectorJwt.js]). Without this column the default in
+    // connectorJwt.js (agent_editor) applies, which gives standard agent/skill/
+    // knowledge author rights. Operators can downgrade individual orgs by
+    // updating this column directly (e.g. 'member' for chat-only deployments).
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "nc_new_user_default_org_role" TEXT`); } catch (e) { }
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "nc_last_sync_at" TIMESTAMPTZ`); } catch (e) { }
+    // One-shot backfill: NC users provisioned before this column existed
+    // landed with orgRole = '', which means the permission resolver gives them
+    // only the page_chat fallback. Bump them to the agent_editor default so
+    // Studio / Webpages / Meeting Notes routes stop 403-ing under their JWTs.
+    try { await exec(`UPDATE users
+                         SET "orgRole" = 'agent_editor'
+                       WHERE provider = 'nextcloud_connector'
+                         AND ("orgRole" IS NULL OR "orgRole" = '')`); } catch (e) { }
     // First-run wizard flag — null until org-admin completes the App Store
     // onboarding. connectorJwt.js gates auto-provision on this so other NC
     // users wait at a "Setup in progress" screen until the admin is done.
@@ -1521,6 +1535,21 @@ async function getPlan(planId) {
     return parsePlan(p);
 }
 
+// Used by the Nextcloud connector bootstrap to grant freshly-provisioned NC
+// orgs the entitlements the SaaS operator has flagged as "NC default" (via
+// the nc_recommended boolean on subscription_plans). Returns null when no
+// plan is flagged — caller treats that as graceful degradation to the
+// community fallback.
+async function getDefaultNcPlan() {
+    await initDB();
+    const p = await getOne(`SELECT * FROM subscription_plans
+                              WHERE nc_recommended = TRUE
+                           ORDER BY price ASC NULLS LAST, sort_order ASC
+                              LIMIT 1`);
+    if (!p) return null;
+    return parsePlan(p);
+}
+
 async function createPlan(data) {
     await initDB();
     if (!data.name || typeof data.name !== 'string' || !data.name.trim()) {
@@ -2693,7 +2722,7 @@ module.exports = {
     getAllGroups, createGroup, updateGroup, deleteGroup, getGroupByAzureId, getUserByAzureId,
     storeAppPassword, getAppPassword, hasAppPassword, deleteAppPassword,
     getAllRoles, createRole, updateRole, deleteRole,
-    getAllPlans, getPlan, createPlan, updatePlan, deletePlan,
+    getAllPlans, getPlan, getDefaultNcPlan, createPlan, updatePlan, deletePlan,
     getAllOrgSubscriptions, getOrgSubscription, setOrgSubscription, deleteOrgSubscription, getEffectiveLimits, getActiveSeatCount,
     getConsumerSubscription, setConsumerSubscription, deleteConsumerSubscription, getAllConsumerSubscriptions,
     getBillingPeriod, logSubscriptionAudit, getAuditLog, getUnresolvedLicenseIssuanceFailures,

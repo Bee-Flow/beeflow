@@ -17,9 +17,11 @@
  *      deletion or transfer
  *
  * JS is NOT included in the snapshot. The public viewer renders the snapshot
- * inside an iframe with `sandbox="allow-forms"` (no allow-scripts) — running
- * the page's JS would be both blocked at render time AND a meaningful
- * security regression if we ever loosened the sandbox later. Strip it now.
+ * inside an iframe with `sandbox="allow-scripts allow-forms"` (no
+ * allow-same-origin) — the page's own JS is stripped at snapshot time so
+ * allow-scripts only benefits whitelisted nested iframes (the Bee Flow chat
+ * embed). Keeping the snapshot script-free means a future sandbox tightening
+ * remains a no-op for stored pages.
  *
  * Extra files (multi-file projects): text files (HTML/CSS/SVG) are sanitized
  * and copied; binary files (images, fonts) are copied as-is.
@@ -44,9 +46,9 @@ const DOMPurify = createDOMPurify(_window);
 function getEmbedAllowedHost() {
     const raw = process.env.PUBLIC_SHARE_BASE_URL
         || process.env.PUBLIC_APP_URL
-        || 'https://app.beeflow.nl';
+        || 'https://beeflow.nl';
     try { return new URL(raw).origin; }
-    catch { return 'https://app.beeflow.nl'; }
+    catch { return 'https://beeflow.nl'; }
 }
 function isAllowedEmbedSrc(src) {
     if (typeof src !== 'string' || !src) return false;

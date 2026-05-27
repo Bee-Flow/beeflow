@@ -29,6 +29,28 @@ const router = express.Router();
 const userStore = require('../stores/userStore');
 const configStore = require('../stores/configStore');
 const { invalidateTenantKeyCache } = require('./connectorJwt');
+const planEntitlements = require('../services/planEntitlements');
+
+// Auto-apply the operator-flagged "Nextcloud recommended" plan to freshly
+// provisioned or freshly-adopted NC orgs so they get enterprise-equivalent
+// entitlements (Webpages, Meeting Notes, Automations, …) without manual
+// intervention. Without this the org defaults to the community tier and the
+// admin lands on a stripped-down SPA on their first visit. Best-effort — a
+// failure logs and continues; the org is still usable on the community
+// fallback.
+async function applyNcDefaultPlanIfConfigured(orgId, source) {
+    try {
+        const plan = await userStore.getDefaultNcPlan();
+        if (!plan) {
+            console.log(`[ConnectorBootstrap] no NC-recommended plan configured; org ${orgId} will use community fallback (source=${source})`);
+            return;
+        }
+        await planEntitlements.applyPlanToOrg(orgId, plan.id, { mode: 'reset' });
+        console.log(`[ConnectorBootstrap] Applied NC default plan ${plan.id} (${plan.name}) to org ${orgId} (source=${source})`);
+    } catch (err) {
+        console.warn(`[ConnectorBootstrap] failed to apply NC default plan to org ${orgId}: ${err.message}`);
+    }
+}
 
 const TENANT_KEY_PREFIX = 'connector_tenant_key_';
 const PENDING_TTL_SECONDS = 1800;
@@ -304,10 +326,15 @@ router.post('/connector/bootstrap', bootstrapLimiter, async (req, res) => {
             });
         }
         let boundOrg = targetOrg;
-        if (!targetOrg.nc_instance_id) {
+        const wasFreshlyBound = !targetOrg.nc_instance_id;
+        if (wasFreshlyBound) {
             boundOrg = await bindOrgToNcInstance(targetOrg, {
                 ncInstanceId, ncBaseUrl, ncAdminUid, connectorCallbackUrl,
             });
+            // Apply default plan only on the first NC binding so we don't
+            // overwrite an existing direct-SaaS org's plan when it's adopting
+            // an NC tenant for the first time.
+            await applyNcDefaultPlanIfConfigured(boundOrg.id, 'pairing_code');
         }
         try {
             await ensureOrgAdminUser(boundOrg, { ncAdminEmail, ncAdminUid, ncAdminDisplayName });
@@ -424,6 +451,8 @@ router.post('/connector/bootstrap', bootstrapLimiter, async (req, res) => {
     }
     org = await userStore.getOrganizationByNcInstanceId(ncInstanceId);
     console.log(`[ConnectorBootstrap] fresh_org org=${orgId} ncInstance=${ncInstanceId} ncBaseUrl=${ncBaseUrl} adminEmail=${ncAdminEmail}`);
+
+    await applyNcDefaultPlanIfConfigured(org.id, 'fresh_org');
 
     try {
         await ensureOrgAdminUser(org, { ncAdminEmail, ncAdminUid, ncAdminDisplayName });

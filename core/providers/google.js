@@ -154,6 +154,28 @@ class GoogleProvider extends BaseProvider {
 
             // ─── Assistant messages ────────────────────────────────
             if (msg.role === 'assistant') {
+                // Gemini 3.x: when the previous response captured its raw
+                // SDK parts on the first tool call, replay them verbatim.
+                // This preserves thought parts + signatures exactly as
+                // received, which is what the docs require for multi-turn
+                // tool calling. We only re-attach our internal _toolCallId
+                // marker so subsequent tool-result messages can match up.
+                const rawParts = msg.tool_calls?.[0]?._raw_content_parts;
+                if (Array.isArray(rawParts) && rawParts.length > 0) {
+                    let fcIdx = 0;
+                    const replay = rawParts.map((p) => {
+                        if (!p || typeof p !== 'object') return p;
+                        const clone = { ...p };
+                        if (clone.functionCall) {
+                            const tc = msg.tool_calls[fcIdx++];
+                            if (tc?.id) clone._toolCallId = tc.id;
+                        }
+                        return clone;
+                    });
+                    contents.push({ role: 'model', parts: replay });
+                    continue;
+                }
+
                 const parts = [];
 
                 // Add text content if present and non-empty
@@ -437,6 +459,15 @@ class GoogleProvider extends BaseProvider {
         const parts = response.candidates?.[0]?.content?.parts;
         if (!parts) return null;
 
+        // Gemini 3.x can attach the thought_signature to an adjacent thought
+        // part instead of the functionCall part. The docs require replaying
+        // the FULL content as received, so we fall back to a part-wide scan.
+        let fallbackSig = null;
+        for (const part of parts) {
+            const sig = part.thoughtSignature || part.thought_signature;
+            if (sig) { fallbackSig = sig; break; }
+        }
+
         const toolCalls = [];
         for (const part of parts) {
             if (part.functionCall) {
@@ -448,17 +479,20 @@ class GoogleProvider extends BaseProvider {
                         arguments: JSON.stringify(part.functionCall.args || {}),
                     },
                 };
-                // Preserve thought_signature (required by Gemini 3.x for multi-turn tool calls)
-                // SDK may return as camelCase `thoughtSignature` or snake_case `thought_signature`
-                const sig = part.thoughtSignature || part.thought_signature;
+                const sig = part.thoughtSignature || part.thought_signature || (toolCalls.length === 0 ? fallbackSig : null);
                 if (sig) {
                     tc._thought_signature = sig;
-                    console.log(`[Google] Captured thought_signature for ${part.functionCall.name} (${sig.length} chars)`);
-                } else {
-                    console.log(`[Google] No thought_signature on ${part.functionCall.name} (keys: ${Object.keys(part).join(', ')})`);
                 }
                 toolCalls.push(tc);
             }
+        }
+
+        if (toolCalls.length > 0) {
+            // Capture the raw SDK parts on the first tool call. normalizeMessages
+            // replays these verbatim on the next turn so Gemini 3.x signatures
+            // (which may live on a thought part, not the functionCall) survive
+            // our OpenAI-shaped bridge.
+            toolCalls[0]._raw_content_parts = parts;
         }
 
         return toolCalls.length > 0 ? toolCalls : null;
@@ -493,6 +527,7 @@ class GoogleProvider extends BaseProvider {
             // Remove inline system instruction — it's in the cache
             delete params.config.systemInstruction;
             delete params.config.tools;
+            delete params.config.toolConfig;
         }
 
         const response = await ai.models.generateContent(params);
@@ -546,6 +581,7 @@ class GoogleProvider extends BaseProvider {
             params.config.cachedContent = cacheName;
             delete params.config.systemInstruction;
             delete params.config.tools;
+            delete params.config.toolConfig;
         }
 
         let textChunks = 0;

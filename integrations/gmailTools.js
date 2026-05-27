@@ -55,7 +55,7 @@ const GMAIL_TOOLS = [
         type: 'function',
         function: {
             name: 'gmail_read_attachment',
-            description: 'Download and read a PDF attachment from a Gmail email. Uses OCR to extract text from the PDF. Use gmail_read first to get the list of attachments with their IDs.',
+            description: 'Download and read a PDF attachment from a Gmail email. Uses OCR to extract text from the PDF. Use gmail_read first to get the list of attachments with their IDs. Returns the extracted text AND a `sourceHandle` you can pass to `drive_upload_file` (or other upload tools) to forward the original bytes — never bind base64 directly.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -345,6 +345,19 @@ async function executeGmailTool(toolName, args, session, opts = {}) {
         // Convert from URL-safe base64 to standard base64
         const standardBase64 = base64Data.replace(/-/g, '+').replace(/_/g, '/');
 
+        // Opaque handle pointing back at the same bytes server-side. Downstream
+        // tools (drive_upload_file, nextcloud_upload_file, …) resolve the
+        // handle by re-fetching the attachment via fetchAttachmentBuffer — the
+        // raw base64 never has to pass through the AI context.
+        const sourceHandle = {
+            kind: 'gmail_attachment',
+            messageId,
+            attachmentId,
+            filename: fname || 'attachment.pdf',
+            mimeType: 'application/pdf',
+            size: attachment.data.size || 0,
+        };
+
         // Unified attachment pipeline: pdfjs → Azure DI → Mistral OCR, plus
         // the garbage-text fallback for CID-font invoices. Same code path
         // chat uploads and Nextcloud reads use, so PDF quirks fix in one place.
@@ -359,12 +372,14 @@ async function executeGmailTool(toolName, args, session, opts = {}) {
             return {
                 error: `${fname || 'attachment.pdf'} appears to be an image-only PDF (${result.meta?.numPages || '?'} pages) with no extractable text. Configure Azure Document Intelligence or Mistral OCR to read scanned PDFs from Gmail.`,
                 filename: fname || 'attachment.pdf',
+                sourceHandle,
             };
         }
         if (result.kind !== 'text' || !result.text) {
             return {
                 error: `Could not extract text from the PDF: ${result.reason || 'unknown reason'}.`,
                 filename: fname || 'attachment.pdf',
+                sourceHandle,
             };
         }
 
@@ -379,6 +394,7 @@ async function executeGmailTool(toolName, args, session, opts = {}) {
             charCount: extractedText.length,
             truncated: extractedText.length > MAX_CHARS,
             extractedVia: result.source,
+            sourceHandle,
         };
 
     } else if (toolName === 'gmail_compose') {
@@ -548,9 +564,34 @@ function isGmailTool(toolName) {
     return ['gmail_search', 'gmail_read', 'gmail_read_attachment', 'gmail_compose'].includes(toolName);
 }
 
+/**
+ * Resolve a `gmail_attachment` sourceHandle back to raw bytes. Lets
+ * downstream tools (drive_upload_file, nextcloud_upload_file, …) forward
+ * an attachment without round-tripping the base64 through the AI context.
+ */
+async function fetchAttachmentBuffer(session, { messageId, attachmentId }) {
+    if (!messageId || !attachmentId) {
+        throw new Error('fetchAttachmentBuffer: messageId and attachmentId are required');
+    }
+    const gmail = await createGmailClient(session);
+    const attachment = await gmail.users.messages.attachments.get({
+        userId: 'me',
+        messageId,
+        id: attachmentId,
+    });
+    const base64Data = attachment.data.data;
+    if (!base64Data) throw new Error('Attachment data is empty');
+    // Gmail returns URL-safe base64; Buffer accepts standard base64.
+    const standardBase64 = base64Data.replace(/-/g, '+').replace(/_/g, '/');
+    const buffer = Buffer.from(standardBase64, 'base64');
+    return { buffer, size: attachment.data.size || buffer.length };
+}
+
 module.exports = {
     GMAIL_TOOLS,
     executeGmailTool,
     isGmailTool,
     createGmailClient,
+    extractAttachments,
+    fetchAttachmentBuffer,
 };

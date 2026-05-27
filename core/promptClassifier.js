@@ -153,25 +153,24 @@ function classifyPromptComplexity(message) {
     }
 
     // ── Length scaling ──
+    // Length alone is a weak signal of complexity — verbose questions are not
+    // necessarily heavy reasoning tasks. Keep the contribution small so the
+    // semantic signals (code, math, URLs) dominate.
     if (len > 1500) {
-        score += 3;
+        score += 1;
         reasons.push('very long');
     } else if (len > 500) {
-        score += 2;
-        reasons.push('long');
-    } else if (len > 200) {
         score += 1;
-        reasons.push('medium');
+        reasons.push('long');
     }
 
     // ── High-confidence shortcuts ──
-    // Very long messages, heavy URLs, or large code blocks → deep_thinking.
-    // (Note: "Flow" / standard tier is never picked by the heuristic — its
-    //  trigger is multi-phase intent, which is a semantic signal the LLM
-    //  decides on. Heuristic only handles obvious extremes.)
+    // Only extreme structural signals (lots of URLs to research, very large
+    // code blocks to analyse) shortcut to deep_thinking. Long prose alone is
+    // NOT enough — the LLM stage decides whether long = complex.
     const codeFenceLines = (msg.match(/```[\s\S]*?```/g) || [])
         .reduce((acc, block) => acc + block.split('\n').length, 0);
-    if (len > 1500 || urls >= 3 || codeFenceLines > 40) {
+    if (urls >= 3 || codeFenceLines > 40) {
         return {
             tier: 'deep_thinking',
             score,
@@ -182,17 +181,17 @@ function classifyPromptComplexity(message) {
 
     // ── Score-based tier (medium confidence) ──
     let tier;
-    if (score >= 6) tier = 'deep_thinking';
+    if (score >= 8) tier = 'deep_thinking';
     else if (score >= 3) tier = 'thinking';
     else tier = 'fast';
 
-    // The only confident heuristic verdicts are:
+    // Confident heuristic verdicts:
     //   - very short input (handled at the top, len ≤ 12 → fast)
-    //   - very heavy input (handled above → deep_thinking)
-    //   - score ≥ 6 (clearly heavy signals → deep_thinking)
+    //   - very heavy structural input (handled above → deep_thinking)
+    //   - score ≥ 8 (overwhelming heavy signals → deep_thinking)
     // Everything else is ambiguous and should defer to the LLM, which knows
     // the user's language and can distinguish thinking vs flow vs writer.
-    const confident = score >= 6;
+    const confident = score >= 8;
 
     return { tier, score, reason: reasons.join(', ') || 'standard query', confident };
 }

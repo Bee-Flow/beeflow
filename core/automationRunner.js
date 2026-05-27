@@ -585,6 +585,8 @@ async function execAiStep(step, ctx, runState, mode) {
                         name: tc.function.name,
                         arguments: typeof tc.function.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc.function.arguments),
                     },
+                    _thought_signature: tc._thought_signature || undefined,
+                    _raw_content_parts: tc._raw_content_parts || undefined,
                 })),
             });
             for (const tc of response.toolCalls) {

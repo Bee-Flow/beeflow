@@ -55,9 +55,11 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
     // Process dynamic tags in system prompt
     systemPrompt = processSystemPrompt(systemPrompt);
 
-    // Tool execution loop (max 10 iterations to prevent infinite loops)
+    // Tool execution loop (max 20 iterations to prevent infinite loops).
+    // Bumped from 10 after Opus 4.7 multi-step agent runs were hitting the
+    // cap mid-task. Admins can still narrow this in code if a regression hits.
     let iterations = 0;
-    const maxIterations = 10;
+    const maxIterations = 20;
     let toolCalls = [];
 
     // ── Unicode Smuggling Defense (must run FIRST) ───────────────────

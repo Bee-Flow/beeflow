@@ -9,7 +9,7 @@
  */
 
 const aiTaskStore = require('../stores/aiTaskStore');
-const { resolveModelForTier } = require('./modelResolver');
+const { resolveModelForTier, TIER_DEFAULTS } = require('./modelResolver');
 const { getProviderForModel } = require('./aiAgent');
 const { getAdapter } = require('./providers');
 const { pool } = require('../db');
@@ -21,8 +21,9 @@ const MAX_CONCURRENT = 5;
 // Routines that fan out across several topics (news digests, multi-source
 // research) routinely chain 6-8 tool calls before producing a final answer.
 // Capping at 5 used to silently truncate them — the loop would exit with no
-// final assistant text and the user got a blank notification.
-const MAX_TOOL_ITERATIONS = 10;
+// final assistant text and the user got a blank notification. Bumped to 20
+// after Opus 4.7 agent runs were hitting the cap at ~15 rounds.
+const MAX_TOOL_ITERATIONS = 20;
 
 /**
  * R3: cheap, deterministic topic extraction from a routine result. Looks for
@@ -226,11 +227,12 @@ async function executeTask(task, { manual = false } = {}) {
         });
 
         // Tool-calling loop (max iterations)
+        const tierDefaults = TIER_DEFAULTS[task.modelTier] || TIER_DEFAULTS.thinking;
         for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
             lastIter = iter + 1;
             const response = await adapter.chat(config.apiKey, config.url, modelId, messages, {
-                maxTokens: 16384,
-                temperature: 0.7,
+                maxTokens: tierDefaults.maxTokens,
+                temperature: tierDefaults.temperature ?? 0.7,
                 tools: tools.length > 0 ? tools : undefined,
                 toolChoice: tools.length > 0 ? 'auto' : undefined,
             });
@@ -265,6 +267,7 @@ async function executeTask(task, { manual = false } = {}) {
                                 : JSON.stringify(tc.function.arguments),
                         },
                         _thought_signature: tc._thought_signature || undefined,
+                        _raw_content_parts: tc._raw_content_parts || undefined,
                     })),
                 });
 

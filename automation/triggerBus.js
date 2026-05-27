@@ -35,7 +35,9 @@ const { matchFilter, applyDslFilter } = require('./triggers/dslFilters');
  *                     match), so a typo can't fire on every email.
  *   labelIds          string[]; match if the message has ANY of these.
  *   excludeLabelIds   string[]; match only if the message has NONE.
- *   hasAttachment     boolean; checks for HAS_ATTACHMENT system label.
+ *   hasAttachment     boolean; matches when the enriched payload has at
+ *                     least one entry in `attachments[]`. Falls back to the
+ *                     HAS_ATTACHMENT system label for legacy payloads.
  *   excludeFromSelf   boolean; drops messages the user sent themselves
  *                     (uses the SENT system label).
  *   maxAgeMinutes     number; drops messages whose Date header is older
@@ -78,7 +80,12 @@ function matchGmailMailFilter(payload, filter) {
         if (filter.excludeLabelIds.some(id => labelIds.includes(id))) return false;
     }
     if (filter.hasAttachment === true) {
-        if (!labelIds.includes('HAS_ATTACHMENT')) return false;
+        // Prefer the explicit attachments[] populated by fetchGmailMessageMetadata
+        // (definitive) and fall back to the HAS_ATTACHMENT system label so
+        // older payloads (e.g. from the live-watcher diff path that hasn't been
+        // enriched yet) still work.
+        const hasExplicit = Array.isArray(payload.attachments) && payload.attachments.length > 0;
+        if (!hasExplicit && !labelIds.includes('HAS_ATTACHMENT')) return false;
     }
     if (filter.excludeFromSelf === true) {
         if (labelIds.includes('SENT')) return false;
@@ -1206,19 +1213,29 @@ const POLLERS = {
  * (e.g. `filter: { labelIds: ['Label_3'] }`) and downstream binding
  * (`{{trigger.output.subject}}`) without an extra round-trip.
  *
- * `format: 'metadata'` is much cheaper than `format: 'full'` — we only
- * pull the half-dozen headers users actually filter on. Body fetching is
- * left to an explicit `gmail_read` step.
+ * We use `format: 'full'` rather than 'metadata' so the payload also
+ * exposes `attachments[]` (filename, mimeType, size, attachmentId). The
+ * AI builder can then branch on `trigger.output.hasAttachment` and pass
+ * `trigger.output.attachments[i].attachmentId` straight into
+ * `gmail_read_attachment` — saving an extra `gmail_read` round-trip and
+ * letting attachment bytes flow via `sourceHandle` to upload tools
+ * without ever passing through the model context.
  */
 async function fetchGmailMessageMetadata(gmail, messageId) {
+    const { extractAttachments } = require('../integrations/gmailTools');
     const r = await gmail.users.messages.get({
         userId: 'me',
         id: messageId,
-        format: 'metadata',
-        metadataHeaders: ['From', 'To', 'Cc', 'Subject', 'Date', 'Message-ID'],
+        format: 'full',
     });
     const headers = r.data.payload?.headers || [];
     const get = (name) => headers.find(h => h.name?.toLowerCase() === name.toLowerCase())?.value || null;
+    const attachments = extractAttachments(r.data.payload).map(a => ({
+        filename: a.filename,
+        mimeType: a.mimeType,
+        size: a.size,
+        attachmentId: a.attachmentId,
+    }));
     return {
         from: get('From'),
         to: get('To'),
@@ -1229,6 +1246,8 @@ async function fetchGmailMessageMetadata(gmail, messageId) {
         labelIds: r.data.labelIds || [],
         sizeEstimate: r.data.sizeEstimate || null,
         historyId: r.data.historyId || null,
+        attachments,
+        hasAttachment: attachments.length > 0,
     };
 }
 

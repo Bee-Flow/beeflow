@@ -745,6 +745,112 @@ async function setChatMessages(id, userId, messages) {
     return rowCount > 0;
 }
 
+/**
+ * Clone a webpage. The new row is owned by `newOwnerId`; the source row
+ * stays untouched. Copies all four RustFS slots (html/css/js/db), the
+ * thumbnail, and every extra file from the source owner's prefix into
+ * the new owner's prefix — but resets the publishing scope
+ * (is_published=false, shared_groups=[], organization_id=null) and skips
+ * chat history, version history, sources, and public share links.
+ *
+ * Callers MUST gate visibility before invoking (canReadWebpage). This
+ * function does not check whether the cloner is allowed to see the source
+ * — it trusts the route to have done that.
+ *
+ * RustFS copies run server-side via `copyObject`, so even large `data.db`
+ * blobs never round-trip through Node. Callers should flush any in-memory
+ * SQLite handle for the source webpage first (see webpageDbStore.flush)
+ * to ensure the on-disk blob is up-to-date before the copy.
+ */
+async function cloneWebpage({ sourceId, newOwnerId, newName }) {
+    await initDB();
+    // Look up source by id only — visibility is the caller's responsibility.
+    const src = await getOne('SELECT * FROM webpages WHERE id = $1', [sourceId]);
+    if (!src) return null;
+    const sourceOwnerId = src.user_id;
+
+    const newId = crypto.randomUUID();
+    const name = (typeof newName === 'string' && newName.trim()) ? newName.trim() : `Copy of ${src.name}`;
+    const kbIds = typeof src.knowledge_base_ids === 'string'
+        ? src.knowledge_base_ids
+        : JSON.stringify(src.knowledge_base_ids || []);
+    const settings = typeof src.settings === 'string'
+        ? src.settings
+        : JSON.stringify(src.settings || {});
+    const grants = typeof src.bridge_grants === 'string'
+        ? src.bridge_grants
+        : JSON.stringify(src.bridge_grants || DEFAULT_BRIDGE_GRANTS);
+
+    // Insert mirrors the source row except for the three publishing fields
+    // (defaulted to private), chat_messages (defaulted to []), timestamps,
+    // and the FK-linked sources/versions/public-shares (intentionally skipped).
+    await run(
+        `INSERT INTO webpages (
+            id, user_id, name, description, instructions,
+            knowledge_base_ids, settings,
+            html_sha256, css_sha256, js_sha256, db_sha256,
+            html_size, css_size, js_size, db_size,
+            icon, accent_color, tagline, thumbnail_sha256, thumbnail_size,
+            bridge_grants
+         ) VALUES (
+            $1, $2, $3, $4, $5,
+            $6::jsonb, $7::jsonb,
+            $8, $9, $10, $11,
+            $12, $13, $14, $15,
+            $16, $17, $18, $19, $20,
+            $21::jsonb
+         )`,
+        [
+            newId, newOwnerId, name, src.description || '', src.instructions || '',
+            kbIds, settings,
+            src.html_sha256 || '', src.css_sha256 || '', src.js_sha256 || '', src.db_sha256 || '',
+            parseInt(src.html_size) || 0, parseInt(src.css_size) || 0,
+            parseInt(src.js_size) || 0, parseInt(src.db_size) || 0,
+            src.icon || '', src.accent_color || '', src.tagline || '',
+            src.thumbnail_sha256 || '', parseInt(src.thumbnail_size) || 0,
+            grants,
+        ]
+    );
+
+    const ignoreMissing = (err) => {
+        if (err?.name === 'NoSuchKey' || err?.$metadata?.httpStatusCode === 404) return;
+        throw err;
+    };
+
+    if (storageStore.isAvailable()) {
+        // Slot blobs — read from the SOURCE owner's prefix, write to the NEW
+        // owner's prefix. NoSuchKey is fine: an empty slot (no object) just
+        // means there's nothing to copy.
+        for (const slot of VERSIONED_SLOTS) {
+            try { await storageStore.copyObject(keyFor(sourceOwnerId, sourceId, slot), keyFor(newOwnerId, newId, slot)); }
+            catch (err) { try { ignoreMissing(err); } catch (e) { console.warn(`[WebpageStore] Clone slot ${slot} failed:`, e.message); } }
+        }
+        // Thumbnail — only attempt when the source row records one.
+        if (src.thumbnail_sha256) {
+            try { await storageStore.copyObject(thumbnailKey(sourceOwnerId, sourceId), thumbnailKey(newOwnerId, newId)); }
+            catch (err) { try { ignoreMissing(err); } catch (e) { console.warn(`[WebpageStore] Clone thumbnail failed:`, e.message); } }
+        }
+    }
+
+    // Extra files — duplicate every row + corresponding RustFS blob.
+    const extras = await getAll('SELECT * FROM webpage_extra_files WHERE webpage_id = $1', [sourceId]);
+    for (const f of extras) {
+        const extraId = crypto.randomUUID();
+        await run(
+            `INSERT INTO webpage_extra_files (id, webpage_id, path, mime_type, is_text, sha256, size)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [extraId, newId, f.path, f.mime_type, f.is_text, f.sha256, f.size]
+        );
+        if (storageStore.isAvailable()) {
+            try { await storageStore.copyObject(extraKey(sourceOwnerId, sourceId, f.path), extraKey(newOwnerId, newId, f.path)); }
+            catch (err) { try { ignoreMissing(err); } catch (e) { console.warn(`[WebpageStore] Clone extra ${f.path} failed:`, e.message); } }
+        }
+    }
+
+    console.log(`[WebpageStore] Cloned ${sourceId} (owner ${sourceOwnerId}) → ${newId} (owner ${newOwnerId}) ("${name}")`);
+    return mapWebpageRow({ ...src, id: newId, user_id: newOwnerId, name, is_published: false, shared_groups: '[]', organization_id: null, chat_messages: [], source_count: 0, created_at: new Date(), updated_at: new Date() });
+}
+
 async function deleteWebpage(id, userId) {
     await initDB();
     const r = await getOne('SELECT * FROM webpages WHERE id = $1 AND user_id = $2', [id, userId]);
@@ -1111,6 +1217,7 @@ module.exports = {
     canWriteWebpage,
     setWebpagePublished,
     updateWebpageMetadata,
+    cloneWebpage,
     deleteWebpage,
     // Chat history
     getChatMessages,

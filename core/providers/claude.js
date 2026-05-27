@@ -92,23 +92,28 @@ class ClaudeProvider extends BaseProvider {
         if (typeof content === "string") return content;
         if (Array.isArray(content)) {
             return content.map(block => {
-                // Convert OpenAI image_url → Claude native image block
+                // Convert OpenAI image_url → Claude native image block.
+                // Preserve cache_control if the caller marked it (directChat
+                // tags the last attachment block to extend the cache prefix).
                 if (block.type === 'image_url') {
                     const url = typeof block.image_url === 'string'
                         ? block.image_url
                         : block.image_url?.url || '';
+                    const preserved = block.cache_control ? { cache_control: block.cache_control } : {};
                     if (url.startsWith('data:')) {
                         const match = url.match(/^data:([^;]+);base64,(.+)$/s);
                         if (match) {
                             return {
                                 type: 'image',
                                 source: { type: 'base64', media_type: match[1], data: match[2] },
+                                ...preserved,
                             };
                         }
                     } else if (url.startsWith('http')) {
                         return {
                             type: 'image',
                             source: { type: 'url', url },
+                            ...preserved,
                         };
                     }
                     return null; // Skip if unresolvable
@@ -174,7 +179,7 @@ class ClaudeProvider extends BaseProvider {
         // requires longer TTLs to appear earlier in the wire order. The
         // adapter already places one 1h breakpoint on the first system block
         // (extractSystem) which caches "tools + stable system" together.
-        // Here we add up to two 5-min breakpoints further down the request:
+        // Here we add up to three 5-min breakpoints further down the request:
         //
         //   (a) Immediately after the compaction summary block, if present.
         //       This lets Anthropic cache (tools + system + summary) as a
@@ -184,13 +189,25 @@ class ClaudeProvider extends BaseProvider {
         //   (b) On the last genuine user text message. This creates a
         //       shorter-lived breakpoint so the next turn can still hit the
         //       cache for "system + tools + summary + full recent history".
+        //       Skipped if the message already has a cache_control marker
+        //       set upstream (e.g. directChat attaches one to the last file
+        //       block so the document content gets cached).
         //
-        // Total breakpoints used: 1 (system, 1h) + up to 2 (5-min) = 3 max,
-        // safely under the 4-breakpoint cap.
+        //   (c) On the last tool_result in a multi-turn agent loop. Each
+        //       extra round otherwise re-tokenises the full tool history at
+        //       full price. Tool_result blocks DO support cache_control per
+        //       Anthropic docs.
         //
-        // Both are skipped for very short conversations (<4 messages) where
-        // caching overhead isn't worth it. cache_control is only valid on
-        // text-type content blocks, so tool_result messages are skipped.
+        // Total breakpoints used: 1 (system, 1h) + up to 3 (5-min) = 4 max,
+        // exactly at the 4-breakpoint cap.
+        //
+        // All skipped for very short conversations (<4 messages) where
+        // caching overhead isn't worth it.
+        const hasCacheControl = (msg) => {
+            if (!Array.isArray(msg.content)) return false;
+            return msg.content.some(b => b && typeof b === 'object' && b.cache_control);
+        };
+
         const markLastTextBlock = (msg) => {
             if (typeof msg.content === 'string' && msg.content.trim()) {
                 msg.content = [{
@@ -211,6 +228,17 @@ class ClaudeProvider extends BaseProvider {
             return false;
         };
 
+        const markLastToolResultBlock = (msg) => {
+            if (!Array.isArray(msg.content) || msg.content.length === 0) return false;
+            for (let j = msg.content.length - 1; j >= 0; j--) {
+                if (msg.content[j].type === 'tool_result') {
+                    msg.content[j].cache_control = { type: "ephemeral" };
+                    return true;
+                }
+            }
+            return false;
+        };
+
         const isSummaryMessage = (msg) => {
             if (msg.role !== 'user') return false;
             const text = typeof msg.content === 'string'
@@ -222,19 +250,45 @@ class ClaudeProvider extends BaseProvider {
         };
 
         if (normalized.length >= 4) {
-            // (a) Breakpoint on the summary message, if the compactor inserted one.
-            const summaryIdx = normalized.findIndex(isSummaryMessage);
-            if (summaryIdx >= 0) {
-                markLastTextBlock(normalized[summaryIdx]);
+            let breakpointsUsed = 0;
+            const BREAKPOINT_BUDGET = 3; // (a) summary, (b) last-user-text, (c) last-tool_result
+
+            // Count pre-existing markers (e.g. attachment caching set in directChat).
+            for (const msg of normalized) {
+                if (hasCacheControl(msg)) breakpointsUsed += 1;
             }
 
-            // (b) Breakpoint on the last genuine user text message.
-            for (let i = normalized.length - 1; i >= 0; i--) {
-                const msg = normalized[i];
-                if (msg.role !== 'user') continue;
-                if (i === summaryIdx) continue; // already marked above
-                if (Array.isArray(msg.content) && msg.content.some(b => b.type === 'tool_result')) continue;
-                if (markLastTextBlock(msg)) break;
+            // (a) Breakpoint on the summary message, if the compactor inserted one.
+            const summaryIdx = normalized.findIndex(isSummaryMessage);
+            if (summaryIdx >= 0 && !hasCacheControl(normalized[summaryIdx]) && breakpointsUsed < BREAKPOINT_BUDGET) {
+                if (markLastTextBlock(normalized[summaryIdx])) breakpointsUsed += 1;
+            }
+
+            // (b) Breakpoint on the last genuine user text message — skipped
+            //     if the message already carries a marker (attachment cache).
+            if (breakpointsUsed < BREAKPOINT_BUDGET) {
+                for (let i = normalized.length - 1; i >= 0; i--) {
+                    const msg = normalized[i];
+                    if (msg.role !== 'user') continue;
+                    if (i === summaryIdx) continue; // already marked above
+                    if (hasCacheControl(msg)) continue; // upstream already marked
+                    if (Array.isArray(msg.content) && msg.content.some(b => b.type === 'tool_result')) continue;
+                    if (markLastTextBlock(msg)) { breakpointsUsed += 1; break; }
+                }
+            }
+
+            // (c) Breakpoint on the latest tool_result, if any. Multi-turn
+            //     agent loops re-send the full tool-call chain every round;
+            //     caching the last tool_result lets the next iteration read
+            //     the prior context at 10% cost.
+            if (breakpointsUsed < BREAKPOINT_BUDGET) {
+                for (let i = normalized.length - 1; i >= 0; i--) {
+                    const msg = normalized[i];
+                    if (msg.role !== 'user') continue;
+                    if (hasCacheControl(msg)) continue;
+                    if (!Array.isArray(msg.content) || !msg.content.some(b => b.type === 'tool_result')) continue;
+                    if (markLastToolResultBlock(msg)) { breakpointsUsed += 1; break; }
+                }
             }
         }
 
