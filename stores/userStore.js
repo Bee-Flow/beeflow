@@ -332,6 +332,19 @@ async function initDB() {
           AND status = 'pending'
           AND pairing_code_consumed_at IS NULL`); } catch (e) { }
 
+    // Email-code verification branch: when a connector bootstraps and the NC
+    // admin email's DOMAIN matches an existing un-bound org (or exactly matches
+    // a user), we send a one-time code to that mailbox and let the admin confirm
+    // the binding from inside the embedded Nextcloud view — no external SaaS
+    // login. The code is hashed at rest (salted with org_id:nc_instance_id);
+    // attempts are capped. These rows always carry a real nc_instance_id, which
+    // distinguishes them from pairing-code rows (nc_instance_id NULL until
+    // redeemed) and from plain approval rows (verification_code_hash NULL).
+    try { await exec(`ALTER TABLE pending_nc_bindings
+        ADD COLUMN IF NOT EXISTS verification_code_hash TEXT,
+        ADD COLUMN IF NOT EXISTS verification_email      TEXT,
+        ADD COLUMN IF NOT EXISTS verification_attempts   INTEGER DEFAULT 0`); } catch (e) { }
+
     // ── Subscription schema migrations ──
     try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS price REAL`); } catch (e) { }
     try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'EUR'`); } catch (e) { }
@@ -863,6 +876,42 @@ async function getAllOrganizations() {
     return rows.map(parseOrg);
 }
 
+// Find an un-bound organisation that "owns" an email domain, used by the
+// connector bootstrap to route a same-domain Nextcloud install into the
+// email-code verification flow (vs. creating a fresh org). Matches either an
+// org_admin user whose email is at the domain, or an org whose admin-configured
+// allowed_domains lists it. Callers MUST exclude free/public email providers
+// before calling — this does not (a corporate domain implies the company
+// controls its mailboxes). Returns null when nothing matches.
+async function findUnboundOrgByEmailDomain(domain) {
+    const d = String(domain || '').toLowerCase().trim();
+    if (!d || !/^[a-z0-9.-]+\.[a-z]{2,}$/.test(d)) return null;
+    await initDB();
+    const byAdmin = await getOne(
+        `SELECT o.* FROM organizations o
+         JOIN users u ON u."organizationId" = o.id
+         WHERE u."orgRole" = 'org_admin'
+           AND LOWER(u.email) LIKE '%@' || $1
+           AND o.nc_instance_id IS NULL
+         ORDER BY o.id ASC
+         LIMIT 1`,
+        [d]
+    );
+    if (byAdmin) return parseOrg(byAdmin);
+    // allowed_domains is a JSON array string; match the quoted element so a
+    // domain can't accidentally match as a substring of a longer one.
+    const byAllowed = await getOne(
+        `SELECT * FROM organizations
+         WHERE nc_instance_id IS NULL
+           AND allowed_domains IS NOT NULL
+           AND allowed_domains ILIKE '%"' || $1 || '"%'
+         ORDER BY id ASC
+         LIMIT 1`,
+        [d]
+    );
+    return byAllowed ? parseOrg(byAllowed) : null;
+}
+
 async function getOrganization(id) {
     await initDB();
     const o = await getOne('SELECT * FROM organizations WHERE id = $1', [id]);
@@ -1073,7 +1122,31 @@ function parsePendingBinding(row) {
         approvedByUserId: row.approved_by_user_id,
         pairingCode: row.pairing_code || null,
         pairingCodeConsumedAt: row.pairing_code_consumed_at || null,
+        verificationEmail: row.verification_email || null,
+        verificationAttempts: row.verification_attempts || 0,
+        hasVerification: !!row.verification_code_hash,
     };
+}
+
+// ── Email-code verification helpers ──
+const NC_VERIFICATION_TTL_SECONDS = 15 * 60;
+const NC_VERIFICATION_MAX_ATTEMPTS = 5;
+
+// Salt the code hash with org_id:nc_instance_id (both stable across the
+// createPendingNcVerification upsert) rather than the row id — ON CONFLICT keeps
+// the original row id, so an id-based salt would desync on re-bootstrap.
+function _hashNcVerificationCode(orgId, ncInstanceId, code) {
+    return crypto.createHash('sha256')
+        .update(`${orgId}:${ncInstanceId}:${code}`)
+        .digest('hex');
+}
+
+function _ncCodeMatches(row, code) {
+    if (!row?.verification_code_hash || !code) return false;
+    const expected = _hashNcVerificationCode(row.org_id, row.nc_instance_id, code);
+    const a = Buffer.from(expected, 'hex');
+    const b = Buffer.from(String(row.verification_code_hash), 'hex');
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 // ── Pairing-code helpers (Phase 2 branch B) ──
@@ -1232,6 +1305,132 @@ async function createPendingNcBinding(data, ttlSeconds = 1800) {
     return parsePendingBinding(row);
 }
 
+// Create (or refresh) a pending email-verification binding and store the hash of
+// the supplied one-time `code`. Returns the row (incl. expiresAt) so the caller
+// can email the code and report the expiry to the connector. ON CONFLICT on the
+// (org_id, nc_instance_id) partial unique index means a re-bootstrap from the
+// same instance refreshes the existing row's code + resets attempts.
+async function createPendingNcVerification(data, { ttlSeconds = NC_VERIFICATION_TTL_SECONDS, code } = {}) {
+    if (!data?.orgId || !data?.ncInstanceId || !code) throw new Error('orgId, ncInstanceId and code required');
+    await initDB();
+    const id = crypto.randomBytes(16).toString('hex');
+    const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+    const hash = _hashNcVerificationCode(data.orgId, data.ncInstanceId, code);
+    const sql = `
+        INSERT INTO pending_nc_bindings
+            (id, org_id, nc_instance_id, nc_base_url, nc_admin_uid, nc_admin_email,
+             nc_admin_display_name, connector_callback_url, theming_name, nc_version,
+             expires_at, verification_code_hash, verification_email, verification_attempts)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,0)
+        ON CONFLICT (org_id, nc_instance_id) WHERE status = 'pending'
+        DO UPDATE SET
+            nc_base_url = EXCLUDED.nc_base_url,
+            nc_admin_uid = EXCLUDED.nc_admin_uid,
+            nc_admin_email = EXCLUDED.nc_admin_email,
+            nc_admin_display_name = EXCLUDED.nc_admin_display_name,
+            connector_callback_url = EXCLUDED.connector_callback_url,
+            theming_name = EXCLUDED.theming_name,
+            nc_version = EXCLUDED.nc_version,
+            expires_at = EXCLUDED.expires_at,
+            verification_code_hash = EXCLUDED.verification_code_hash,
+            verification_email = EXCLUDED.verification_email,
+            verification_attempts = 0
+        RETURNING *
+    `;
+    const row = await getOne(sql, [
+        id,
+        data.orgId,
+        data.ncInstanceId,
+        data.ncBaseUrl || null,
+        data.ncAdminUid || null,
+        data.ncAdminEmail || null,
+        data.ncAdminDisplayName || null,
+        data.connectorCallbackUrl || null,
+        data.themingName || null,
+        data.ncVersion || null,
+        expiresAt,
+        hash,
+        data.verificationEmail || data.ncAdminEmail || null,
+    ]);
+    return parsePendingBinding(row);
+}
+
+// Verify a submitted code against a pending verification row. Atomically counts
+// the attempt. Returns a discriminated result; on 'ok' the row is left 'pending'
+// — the caller binds the org and marks it approved (mirrors the approve handler)
+// so a mid-flight failure doesn't burn the binding.
+async function verifyPendingNcCode(id, code) {
+    if (!id) return { status: 'not_found' };
+    await initDB();
+    const existing = await getOne(`SELECT * FROM pending_nc_bindings WHERE id = $1`, [id]);
+    if (!existing) return { status: 'not_found' };
+    if (!existing.verification_code_hash) return { status: 'not_verification' };
+
+    const expired = existing.expires_at && new Date(existing.expires_at).getTime() <= Date.now();
+    // Idempotent re-verify after a successful approval (e.g. the connector lost
+    // the first response): accept the matching code and hand the row back.
+    if (existing.status === 'approved') {
+        return _ncCodeMatches(existing, code)
+            ? { status: 'ok', row: parsePendingBinding(existing) }
+            : { status: 'invalid', attemptsLeft: 0 };
+    }
+    if (existing.status === 'denied') return { status: 'denied' };
+    if (existing.status === 'expired' || (existing.status === 'pending' && expired)) {
+        return { status: 'expired' };
+    }
+
+    // Count this attempt atomically against a still-valid pending row.
+    const row = await getOne(
+        `UPDATE pending_nc_bindings SET verification_attempts = verification_attempts + 1
+         WHERE id = $1 AND status = 'pending' AND expires_at > NOW()
+           AND verification_code_hash IS NOT NULL
+         RETURNING *`,
+        [id]
+    );
+    if (!row) return { status: 'expired' };
+    if ((row.verification_attempts || 0) > NC_VERIFICATION_MAX_ATTEMPTS) {
+        return { status: 'too_many' };
+    }
+    if (!_ncCodeMatches(row, code)) {
+        return { status: 'invalid', attemptsLeft: Math.max(0, NC_VERIFICATION_MAX_ATTEMPTS - (row.verification_attempts || 0)) };
+    }
+    return { status: 'ok', row: parsePendingBinding(row) };
+}
+
+// Resend: mint a new code for an existing pending verification row, reset the
+// attempt counter and extend the TTL. Returns the refreshed row (with
+// verificationEmail) or null if the row isn't an eligible pending verification.
+async function resetNcVerificationCode(id, code, ttlSeconds = NC_VERIFICATION_TTL_SECONDS) {
+    if (!id || !code) return null;
+    await initDB();
+    const existing = await getOne(`SELECT * FROM pending_nc_bindings WHERE id = $1`, [id]);
+    if (!existing || !existing.verification_code_hash || existing.status !== 'pending') return null;
+    const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+    const hash = _hashNcVerificationCode(existing.org_id, existing.nc_instance_id, code);
+    const row = await getOne(
+        `UPDATE pending_nc_bindings
+            SET verification_code_hash = $2, verification_attempts = 0, expires_at = $3
+          WHERE id = $1 AND status = 'pending' AND verification_code_hash IS NOT NULL
+          RETURNING *`,
+        [id, hash, expiresAt]
+    );
+    return parsePendingBinding(row);
+}
+
+async function countActivePendingNcVerificationsForOrg(orgId) {
+    if (!orgId) return 0;
+    await initDB();
+    const row = await getOne(
+        `SELECT COUNT(*)::int AS n FROM pending_nc_bindings
+         WHERE org_id = $1
+           AND status = 'pending'
+           AND expires_at > NOW()
+           AND verification_code_hash IS NOT NULL`,
+        [orgId]
+    );
+    return row?.n || 0;
+}
+
 async function getPendingNcBinding(id) {
     if (!id) return null;
     await initDB();
@@ -1252,6 +1451,7 @@ async function getPendingNcBindingForOrg(orgId) {
            AND status = 'pending'
            AND expires_at > NOW()
            AND pairing_code IS NULL
+           AND verification_code_hash IS NULL
          ORDER BY created_at DESC LIMIT 1`,
         [orgId]
     );
@@ -1269,7 +1469,8 @@ async function countActivePendingNcBindingsForOrg(orgId) {
          WHERE org_id = $1
            AND status = 'pending'
            AND expires_at > NOW()
-           AND pairing_code IS NULL`,
+           AND pairing_code IS NULL
+           AND verification_code_hash IS NULL`,
         [orgId]
     );
     return row?.n || 0;
@@ -2712,9 +2913,12 @@ module.exports = {
     getAllUsers, getAllUserAvatars, getUser, getUserByEmail, createUser, updateUser, deleteUser,
     createUserWithSeatCheck, SeatCapExceededError, PlanInUseError,
     getAllOrganizations, getOrganization, getOrganizationByNcInstanceId, createOrganization, updateOrganization, deleteOrganization,
+    findUnboundOrgByEmailDomain,
     getOrgEnabledIntegrations, setOrgEnabledIntegrations, getOrgEnabledBetaFeatures, setOrgEnabledBetaFeatures,
     getUserByNcUid,
     createPendingNcBinding, getPendingNcBinding, getPendingNcBindingForOrg,
+    createPendingNcVerification, verifyPendingNcCode, resetNcVerificationCode,
+    countActivePendingNcVerificationsForOrg,
     createOrgPairingCode, getPendingBindingByPairingCode, consumePairingCode,
     getActivePairingCodesForOrg, deletePairingCode,
     countActivePendingNcBindingsForOrg, markPendingNcBindingApproved,

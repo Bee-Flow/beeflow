@@ -482,9 +482,44 @@ async function sendBreachNotificationEmail({ to, incidentSummary, occurredAt, ac
     });
 }
 
+/**
+ * Nextcloud connector pairing — one-time verification code. Sent when a
+ * Nextcloud install's admin email matches an existing Bee Flow organisation
+ * (same domain). The admin types the code into the embedded Bee Flow view in
+ * Nextcloud to confirm the link — no external login required. Never log or
+ * return the code anywhere else; this email is the only place it appears.
+ *
+ * @param {{ to: string, code: string, orgName?: string, expiresAt?: string }} opts
+ */
+async function sendNcVerificationCodeEmail({ to, code, orgName, expiresAt }) {
+    const minutes = expiresAt
+        ? Math.max(1, Math.round((new Date(expiresAt).getTime() - Date.now()) / 60000))
+        : 15;
+    const orgLine = orgName
+        ? `link this Nextcloud to <strong>${orgName}</strong>`
+        : 'link this Nextcloud to your Bee Flow organisation';
+    const html = _renderEmailShell({
+        title: 'Your Nextcloud connection code',
+        body: `Enter this code in the Bee Flow app inside Nextcloud to ${orgLine}:
+            <div style="margin:24px 0;text-align:center;">
+              <span style="display:inline-block;font-size:34px;font-weight:700;letter-spacing:10px;color:#0f172a;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:12px;padding:16px 24px;font-family:'SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace;">${code}</span>
+            </div>
+            <p style="margin:0;font-size:13px;color:#64748b;">This code expires in ${minutes} minute${minutes === 1 ? '' : 's'}.</p>`,
+        footer: 'If you didn\'t install the Bee Flow app on Nextcloud, you can safely ignore this email — no connection will be made.',
+    });
+    const text = `Your Bee Flow Nextcloud connection code: ${code}\n\nEnter this code in the Bee Flow app inside Nextcloud to ${orgName ? `link this Nextcloud to ${orgName}` : 'link this Nextcloud to your Bee Flow organisation'}.\n\nThis code expires in ${minutes} minute(s).\n\nIf you didn't install the Bee Flow app on Nextcloud, you can safely ignore this email.`;
+    return sendServiceEmail({
+        to,
+        subject: `Bee Flow: your Nextcloud connection code is ${code}`,
+        text,
+        html,
+    });
+}
+
 module.exports = {
     getServiceEmailConfig,
     sendServiceEmail,
+    sendNcVerificationCodeEmail,
     sendInvitationEmail,
     sendWaitlistApprovedEmail,
     sendTrialEndingEmail,

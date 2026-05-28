@@ -30,6 +30,7 @@ const userStore = require('../stores/userStore');
 const configStore = require('../stores/configStore');
 const { invalidateTenantKeyCache } = require('./connectorJwt');
 const planEntitlements = require('../services/planEntitlements');
+const { sendNcVerificationCodeEmail } = require('../utils/emailService');
 
 // Auto-apply the operator-flagged "Nextcloud recommended" plan to freshly
 // provisioned or freshly-adopted NC orgs so they get enterprise-equivalent
@@ -54,7 +55,19 @@ async function applyNcDefaultPlanIfConfigured(orgId, source) {
 
 const TENANT_KEY_PREFIX = 'connector_tenant_key_';
 const PENDING_TTL_SECONDS = 1800;
-const MAX_PENDING_PER_ORG = 5;
+const MAX_VERIFICATIONS_PER_ORG = 5;
+
+// Free/public email providers. A shared domain here does NOT imply control of a
+// Bee Flow org, so a domain-only match against one of these never routes into
+// adoption — only an exact email match to an existing user does. Everything else
+// (different free-provider local-part, or no match) creates a fresh org.
+const FREE_EMAIL_DOMAINS = new Set([
+    'gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'hotmail.co.uk',
+    'live.com', 'msn.com', 'yahoo.com', 'yahoo.co.uk', 'ymail.com', 'icloud.com',
+    'me.com', 'mac.com', 'proton.me', 'protonmail.com', 'pm.me', 'gmx.com',
+    'gmx.net', 'mail.com', 'aol.com', 'zoho.com', 'yandex.com', 'yandex.ru',
+    'hey.com', 'fastmail.com', 'tutanota.com', 'tuta.com',
+]);
 
 // Bootstrap is unauthenticated by design (the connector has no SaaS creds
 // at this point). Rate-limit per source IP so an attacker can't flood the
@@ -85,6 +98,17 @@ const pendingPollLimiter = rateLimit({
     validate: { trustProxy: false },
 });
 
+// Resending a verification code emails the org's admin mailbox; cap it tightly
+// per source IP so a held pendingId can't be used to mail-bomb the address.
+const verificationResendLimiter = rateLimit({
+    windowMs: 15 * 60_000,         // 15 minutes
+    max: 5,                        // 5 resends per IP per window
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many code requests; try again later.' },
+    validate: { trustProxy: false },
+});
+
 // All NC integrations Bee Flow ships with — auto-enabled on connector
 // bootstrap so the agent can immediately reach Files, Calendar, Mail, etc.
 // out-of-the-box without an org-admin having to flip toggles. The connector
@@ -102,6 +126,21 @@ function slugify(s) {
         .replace(/[^a-z0-9]+/g, '-')
         .replace(/^-+|-+$/g, '')
         .slice(0, 40) || 'nc';
+}
+
+// 6-digit numeric one-time code, zero-padded. crypto.randomInt is uniform.
+function generateVerificationCode() {
+    return String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
+}
+
+// Mask an email for display in the connector / SPA without leaking the full
+// local-part: tomkooy@beeflow.nl → t•••y@beeflow.nl.
+function maskEmail(email) {
+    const [local = '', domain = ''] = String(email || '').split('@');
+    if (!domain) return '***';
+    const first = local.slice(0, 1) || '*';
+    const last = local.length > 1 ? local.slice(-1) : '';
+    return `${first}${'•'.repeat(3)}${last}@${domain}`;
 }
 
 function readBootstrapHeaders(req) {
@@ -386,44 +425,68 @@ router.post('/connector/bootstrap', bootstrapLimiter, async (req, res) => {
         });
     }
 
-    // 2. Adoption candidate — defer to authenticated approval.
+    // 2. Same-domain match → confirm via an emailed one-time code, entered in
+    //    the embedded Bee Flow view (no external SaaS login). The code proves
+    //    control of a mailbox at the matching domain, which is what stops a
+    //    rogue Nextcloud from silently adopting someone else's org.
+    //      - Exact email match to an existing user (any domain): always eligible.
+    //      - Domain-only match: corporate domains only — a shared free-provider
+    //        domain (gmail.com, …) does not imply org control.
+    //    No match → fall through to a fresh org (branch 3).
+    const emailDomain = ncAdminEmail.split('@')[1] || '';
+    let verifyOrg = null;
     const candidate = await userStore.getUserByEmail(ncAdminEmail);
     if (candidate?.organizationId) {
         const candidateOrg = await userStore.getOrganization(candidate.organizationId);
-        if (candidateOrg && !candidateOrg.nc_instance_id) {
-            // Cap pending bindings per org to prevent attacker spam from
-            // flooding the admin UI with rotating fake instance ids.
-            const activeCount = await userStore.countActivePendingNcBindingsForOrg(candidateOrg.id);
-            if (activeCount >= MAX_PENDING_PER_ORG) {
-                console.warn(`[ConnectorBootstrap] too_many_pending org=${candidateOrg.id} ncInstance=${ncInstanceId}`);
-                return res.status(429).json({
-                    error: 'Too many pending NC bindings for this organization. Try again later.',
-                    code: 'too_many_pending_bindings',
-                    remediation: 'Sign in to Bee Flow and either approve or dismiss the existing pending Nextcloud bindings for this organization, then retry from the connector.',
-                });
-            }
-            const pending = await userStore.createPendingNcBinding({
-                orgId: candidateOrg.id,
-                ncInstanceId,
-                ncBaseUrl,
-                ncAdminUid,
-                ncAdminEmail,
-                ncAdminDisplayName,
-                connectorCallbackUrl,
-                themingName: nc.themingName,
-                ncVersion: nc.ncVersion,
-            }, PENDING_TTL_SECONDS);
-            console.log(`[ConnectorBootstrap] pending_claim org=${candidateOrg.id} pendingId=${pending.id} ncInstance=${ncInstanceId} expiresAt=${pending.expiresAt}`);
-            return res.status(202).json({
-                status: 'pending_claim',
-                code: 'pending_admin_approval',
-                pendingId: pending.id,
-                pollUrl: `/auth/connector/bootstrap/pending/${pending.id}`,
-                expiresAt: pending.expiresAt,
-                message: 'Awaiting org-admin confirmation in Bee Flow UI',
-                remediation: 'An admin of the matching Bee Flow organization must approve this binding from the Bee Flow web UI before the connector receives a tenant key.',
+        if (candidateOrg && !candidateOrg.nc_instance_id) verifyOrg = candidateOrg;
+    }
+    if (!verifyOrg && emailDomain && !FREE_EMAIL_DOMAINS.has(emailDomain)) {
+        verifyOrg = await userStore.findUnboundOrgByEmailDomain(emailDomain);
+    }
+    if (verifyOrg) {
+        const activeCount = await userStore.countActivePendingNcVerificationsForOrg(verifyOrg.id);
+        if (activeCount >= MAX_VERIFICATIONS_PER_ORG) {
+            console.warn(`[ConnectorBootstrap] too_many_verifications org=${verifyOrg.id} ncInstance=${ncInstanceId}`);
+            return res.status(429).json({
+                error: 'Too many pending Nextcloud connection attempts for this organisation. Try again later.',
+                code: 'too_many_pending_bindings',
+                remediation: 'Wait for the existing verification codes to expire (15 minutes) and retry from the connector.',
             });
         }
+        const code = generateVerificationCode();
+        const pending = await userStore.createPendingNcVerification({
+            orgId: verifyOrg.id,
+            ncInstanceId,
+            ncBaseUrl,
+            ncAdminUid,
+            ncAdminEmail,
+            ncAdminDisplayName,
+            connectorCallbackUrl,
+            themingName: nc.themingName,
+            ncVersion: nc.ncVersion,
+            verificationEmail: ncAdminEmail,
+        }, { code });
+        let emailSent = false;
+        try {
+            const r = await sendNcVerificationCodeEmail({ to: ncAdminEmail, code, orgName: verifyOrg.name, expiresAt: pending.expiresAt });
+            emailSent = !!r?.success;
+            if (!emailSent) console.warn(`[ConnectorBootstrap] verification_email_failed org=${verifyOrg.id} reason=${r?.error}`);
+        } catch (e) {
+            console.warn(`[ConnectorBootstrap] verification_email_error org=${verifyOrg.id} reason=${e.message}`);
+        }
+        console.log(`[ConnectorBootstrap] email_verification_required org=${verifyOrg.id} pendingId=${pending.id} ncInstance=${ncInstanceId} emailSent=${emailSent} expiresAt=${pending.expiresAt}`);
+        return res.status(202).json({
+            status: 'pending_verification',
+            code: 'email_verification_required',
+            pendingId: pending.id,
+            verifyUrl: `/auth/connector/bootstrap/pending/${pending.id}/verify`,
+            resendUrl: `/auth/connector/bootstrap/pending/${pending.id}/resend`,
+            maskedEmail: maskEmail(ncAdminEmail),
+            expiresAt: pending.expiresAt,
+            emailSent,
+            organizationName: verifyOrg.name,
+            message: 'A verification code has been emailed to the Nextcloud admin address.',
+        });
     }
 
     // 3. Fresh-org branch — no victim, no risk. One-click.
@@ -485,6 +548,10 @@ router.get('/connector/bootstrap/pending/:id', pendingPollLimiter, async (req, r
 
     const row = await userStore.getPendingNcBinding(id);
     if (!row) return res.status(404).json({ status: 'not_found' });
+    // Email-verification rows are confirmed via the /verify endpoint, not by
+    // polling. Don't expose them here — that would hand the tenant key to anyone
+    // holding the id once the code is accepted.
+    if (row.hasVerification) return res.status(404).json({ status: 'not_found' });
 
     const expired = row.expiresAt && new Date(row.expiresAt).getTime() <= Date.now();
     if (row.status === 'denied') return res.status(410).json({ status: 'denied' });
@@ -512,6 +579,94 @@ router.get('/connector/bootstrap/pending/:id', pendingPollLimiter, async (req, r
         status: 'pending',
         expiresAt: row.expiresAt,
     });
+});
+
+// Submit the emailed verification code. Possession of the code (delivered to a
+// mailbox at the matching domain) is the proof of authority; on success we bind
+// the org, mint the tenant key and hand it straight back so the connector can
+// cache it without a separate poll. Unauthenticated by design — the connector
+// has no SaaS creds yet — but attempt-capped (in verifyPendingNcCode) and
+// IP-rate-limited.
+router.post('/connector/bootstrap/pending/:id/verify', pendingPollLimiter, async (req, res) => {
+    const id = String(req.params.id || '').trim();
+    const code = String(req.body?.code || '').trim();
+    if (!id) return res.status(400).json({ error: 'Missing id' });
+    if (!/^\d{6}$/.test(code)) {
+        return res.status(400).json({ error: 'Enter the 6-digit code from the email.', code: 'invalid_code' });
+    }
+
+    const result = await userStore.verifyPendingNcCode(id, code);
+    switch (result.status) {
+        case 'not_found': return res.status(404).json({ status: 'not_found', code: 'not_found' });
+        case 'not_verification': return res.status(409).json({ error: 'This connection does not use email verification.', code: 'not_verification' });
+        case 'denied': return res.status(410).json({ status: 'denied', code: 'denied' });
+        case 'expired': return res.status(410).json({ status: 'expired', code: 'expired', remediation: 'The code expired. Request a new one and try again.' });
+        case 'too_many': return res.status(429).json({ error: 'Too many incorrect attempts. Request a new code.', code: 'too_many_attempts' });
+        case 'invalid': return res.status(400).json({ error: 'That code is not correct.', code: 'invalid_code', attemptsLeft: result.attemptsLeft });
+        case 'ok': break;
+        default: return res.status(500).json({ error: 'Verification failed' });
+    }
+
+    const row = result.row;
+    const org = await userStore.getOrganization(row.orgId);
+    if (!org) return res.status(410).json({ status: 'expired', code: 'org_gone' });
+    if (org.nc_instance_id && org.nc_instance_id !== row.ncInstanceId) {
+        return res.status(409).json({ error: 'Organisation is already bound to a different Nextcloud instance', code: 'already_bound' });
+    }
+
+    let boundOrg = org;
+    if (!org.nc_instance_id) {
+        boundOrg = await bindOrgToNcInstance(org, {
+            ncInstanceId: row.ncInstanceId,
+            ncBaseUrl: row.ncBaseUrl,
+            ncAdminUid: row.ncAdminUid,
+            connectorCallbackUrl: row.connectorCallbackUrl,
+        });
+        await applyNcDefaultPlanIfConfigured(boundOrg.id, 'email_verification');
+    }
+    try {
+        await ensureOrgAdminUser(boundOrg, {
+            ncAdminEmail: row.ncAdminEmail,
+            ncAdminUid: row.ncAdminUid,
+            ncAdminDisplayName: row.ncAdminDisplayName,
+        });
+    } catch (e) {
+        if (e.statusCode === 409) return res.status(409).json({ error: e.message, code: 'admin_email_conflict' });
+        throw e;
+    }
+    const tenantKey = await getOrMintTenantKey(boundOrg.id);
+    await userStore.markPendingNcBindingApproved(row.id, null);
+    console.log(`[ConnectorBootstrap] verification_succeeded org=${boundOrg.id} ncInstance=${row.ncInstanceId}`);
+    return res.json({
+        tenantKey,
+        organizationId: boundOrg.id,
+        organizationName: boundOrg.name,
+        ncVersion: row.ncVersion,
+        isAdopted: true,
+        code: 'verified',
+    });
+});
+
+// Re-send the verification code (new code, attempts reset, TTL extended). Goes
+// to the same mailbox the original was sent to, so a held pendingId can't
+// redirect the code elsewhere.
+router.post('/connector/bootstrap/pending/:id/resend', verificationResendLimiter, async (req, res) => {
+    const id = String(req.params.id || '').trim();
+    if (!id) return res.status(400).json({ error: 'Missing id' });
+    const code = generateVerificationCode();
+    const row = await userStore.resetNcVerificationCode(id, code);
+    if (!row) return res.status(410).json({ status: 'expired', code: 'expired' });
+    const to = row.verificationEmail || row.ncAdminEmail;
+    let emailSent = false;
+    try {
+        const org = await userStore.getOrganization(row.orgId);
+        const r = await sendNcVerificationCodeEmail({ to, code, orgName: org?.name, expiresAt: row.expiresAt });
+        emailSent = !!r?.success;
+    } catch (e) {
+        console.warn(`[ConnectorBootstrap] resend_email_error pendingId=${id} reason=${e.message}`);
+    }
+    console.log(`[ConnectorBootstrap] verification_resent pendingId=${id} emailSent=${emailSent} expiresAt=${row.expiresAt}`);
+    return res.json({ ok: true, maskedEmail: maskEmail(to), expiresAt: row.expiresAt, emailSent });
 });
 
 // Diagnostic endpoint — connector calls this when /api/license/* keeps

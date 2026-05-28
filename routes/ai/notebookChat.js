@@ -23,6 +23,37 @@ const { searchNotebookKB, executeNotebookKBSearchTool, NOTEBOOK_KB_SEARCH_TOOL }
 const { emitPhase, emitPhaseEnd } = require('../../core/agentRuntime/phaseEvents');
 const { checkSubscriptionLimits } = require('../../core/limits');
 
+// ── Legal Studio (dutch_legal_sources) ──────────────────────────────
+// A legal matter is a notebook of type 'legal_matter'. For those, we expose
+// the Dutch legal research tools (rechtspraak / EUR-Lex / tuchtrecht /
+// kamerstukken / bekendmakingen) and append a legal-mode prompt. Dispatch is
+// reused via the central toolDispatcher — no duplicated legal if/else.
+const fs = require('fs');
+const path = require('path');
+const legalCitationStore = require('../../stores/legalCitationStore');
+const { executeTool } = require('../../core/toolDispatcher');
+const { RECHTSPRAAK_TOOLS, isRechtspraakTool } = require('../../integrations/rechtspraakTools');
+const { EURLEX_TOOLS, isEurlexTool } = require('../../integrations/eurlexTools');
+const { TUCHTRECHT_TOOLS, isTuchtrechtTool } = require('../../integrations/tuchtrechtTools');
+const { KAMERSTUKKEN_TOOLS, isKamerstukkenTool } = require('../../integrations/kamerstukkenTools');
+const { BEKENDMAKINGEN_TOOLS, isBekendmakingenTool } = require('../../integrations/bekendmakingenTools');
+const { LEGAL_MATTER_TOOLS, isLegalMatterTool, executeLegalMatterTool } = require('../../integrations/legalMatterTools');
+const { userHasBetaFeature } = require('../../core/betaFeatures');
+
+const LEGAL_TOOLS = [...RECHTSPRAAK_TOOLS, ...EURLEX_TOOLS, ...TUCHTRECHT_TOOLS, ...KAMERSTUKKEN_TOOLS, ...BEKENDMAKINGEN_TOOLS];
+function isLegalTool(name) {
+    return isRechtspraakTool(name) || isEurlexTool(name) || isTuchtrechtTool(name)
+        || isKamerstukkenTool(name) || isBekendmakingenTool(name);
+}
+
+let _LEGAL_CHAT_PROMPT = null;
+function getLegalChatPrompt() {
+    if (_LEGAL_CHAT_PROMPT === null) {
+        try { _LEGAL_CHAT_PROMPT = fs.readFileSync(path.join(__dirname, '../../prompts/legal-matter-chat-prompt.md'), 'utf-8'); }
+        catch (e) { _LEGAL_CHAT_PROMPT = ''; console.warn('[NotebookChat] legal prompt load failed:', e.message); }
+    }
+    return _LEGAL_CHAT_PROMPT;
+}
 
 function requireAuth(req, res, next) {
     if (req.session && req.session.user) return next();
@@ -41,6 +72,15 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
     // Load notebook
     const notebook = await notebookStore.getNotebook(notebookId, userId);
     if (!notebook) return res.status(404).json({ error: 'Notebook not found' });
+
+    // Legal Studio: expose the Dutch legal research tools + legal-mode prompt
+    // only for matters whose owner has the dutch_legal_sources beta enabled.
+    const isLegalMatter = notebook.type === 'legal_matter';
+    let legalToolsEnabled = false;
+    if (isLegalMatter) {
+        try { legalToolsEnabled = await userHasBetaFeature(userId, 'dutch_legal_sources', req.session); }
+        catch (_) { legalToolsEnabled = false; }
+    }
 
     // ── Subscription limit enforcement ──
     // Same pattern as /api/agents/:id/chat/stream — block AI calls past the
@@ -145,6 +185,31 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
 
     const send = (event, data) => {
         res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+
+    // Persist a verified authority into the matter's bronnenlijst when a
+    // retrieval tool returns a real record (a successful _get IS verification).
+    // format_citation only auto-verifies at high/medium confidence.
+    const recordLegalCitationFromTool = async (toolName, result) => {
+        if (!result || result.error) return;
+        let cite = null;
+        if (toolName === 'rechtspraak_get' && result.ecli) cite = { kind: 'jurisprudentie', identifier: result.ecli, title: result.title, url: result.link };
+        else if (toolName === 'eurlex_get' && result.celex) cite = { kind: 'eu', identifier: result.celex, title: result.title, url: result.link };
+        else if (toolName === 'tuchtrecht_get' && (result.ecli || result.identifier)) cite = { kind: 'tuchtrecht', identifier: result.ecli || result.identifier, title: result.title, url: result.link };
+        else if (toolName === 'format_citation' && result.ok && result.ecli && result.confidence !== 'low') cite = { kind: 'jurisprudentie', identifier: result.ecli, title: result.title, url: result.url };
+        if (!cite) return;
+        try {
+            const saved = await legalCitationStore.upsertCitation({ notebookId, ...cite, verified: true, verificationMethod: toolName });
+            if (saved) send('legal_citation_found', { citation: saved });
+        } catch (e) { console.warn('[NotebookChat] citation upsert failed:', e.message); }
+    };
+
+    // Route a Dutch legal tool through the central dispatcher, then feed any
+    // retrieved authority into the bronnenlijst.
+    const handleLegalTool = async (toolName, toolArgs) => {
+        const result = await executeTool(toolName, toolArgs, { userId, session: req.session });
+        await recordLegalCitationFromTool(toolName, result);
+        return result;
     };
 
     // Notify frontend of auto-selected model
@@ -442,7 +507,7 @@ ${searchAvailable ? `[WEB SEARCH & SOURCES]
 - You can search the web using agent_search for current information and research
 - You can add search results or any text directly as a notebook source using notebook_add_source
 - When adding web search results as a source, pass the complete results text directly — no need to re-fetch
-` : ''}${kbContext}${documentContext}${selectionContext}
+` : ''}${legalToolsEnabled ? '\n' + getLegalChatPrompt() + '\n' : ''}${kbContext}${documentContext}${selectionContext}
 Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = new Date(); const _dp = _now.toLocaleString('sv-SE', { timeZone: _tz }); const _lp = new Date(_now.toLocaleString('en-US', { timeZone: _tz })); const _om = Math.round((_lp - _now) / 60000); const _s = _om >= 0 ? '+' : '-'; const _a = Math.abs(_om); return `${_dp} UTC${_s}${String(Math.floor(_a/60)).padStart(2,'0')}:${String(_a%60).padStart(2,'0')} (${_tz})`; } catch(_) { return new Date().toISOString(); } })()}`;
         }
         emitPhaseEnd(send, 'building_prompt', Date.now() - _spT);
@@ -469,15 +534,34 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             const contentParts = [];
             if (message) contentParts.push({ type: 'text', text: message });
 
+            // Use the same server-side extraction pipeline as direct chat so
+            // PDFs/DOCX/spreadsheets are turned into real text (pdfjs → Azure →
+            // Mistral OCR → vision) instead of being UTF-8-decoded into garbage.
+            const { extractAttachment, formatTextHeader, formatImagesHeader, formatFailureNote, isPdf, isDocx, isSpreadsheet } = require('../../core/attachmentExtractor');
             for (const att of attachments) {
                 try {
                     if (att.type && att.type.startsWith('image/') && att.content) {
                         contentParts.push({ type: 'image_url', image_url: { url: att.content } });
+                    } else if (att.content && (isPdf(att) || isDocx(att) || isSpreadsheet(att))) {
+                        const result = await extractAttachment(att, { modelSupportsVision: adapter.supportsVision?.(modelId) });
+                        if (result.kind === 'text') {
+                            contentParts.push({ type: 'text', text: `${formatTextHeader(att, result)}\n---\n${(result.text || '').slice(0, 20000)}\n---` });
+                        } else if (result.kind === 'images' && Array.isArray(result.images)) {
+                            contentParts.push({ type: 'text', text: formatImagesHeader(att, result) });
+                            for (const img of result.images) {
+                                contentParts.push({ type: 'image_url', image_url: { url: `data:${img.mimeType};base64,${img.base64}` } });
+                            }
+                        } else {
+                            contentParts.push({ type: 'text', text: formatFailureNote(att, result) });
+                        }
                     } else if (att.content && typeof att.content === 'string') {
+                        // Plain-text / csv / code files — a UTF-8 decode is correct.
                         const textContent = att.content.startsWith('data:') ? Buffer.from(att.content.split(',')[1] || '', 'base64').toString('utf-8') : att.content;
                         if (textContent) contentParts.push({ type: 'text', text: `[File: ${att.name}]\n---\n${textContent.slice(0, 8000)}\n---` });
                     }
-                } catch {}
+                } catch (attErr) {
+                    contentParts.push({ type: 'text', text: `[Bestand: ${att.name} — kon niet worden gelezen: ${attErr.message}]` });
+                }
             }
 
             const hasImages = contentParts.some(p => p.type === 'image_url');
@@ -544,6 +628,12 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             notebookTools.push(...AGENT_SEARCH_TOOLS);
         }
 
+        // Dutch legal research tools + matter actions (bronnenlijst, verify) —
+        // only for legal matters with the beta on.
+        if (legalToolsEnabled) {
+            notebookTools.push(...LEGAL_TOOLS, ...LEGAL_MATTER_TOOLS);
+        }
+
 
 
         // ── Tool calling loop ────────────────────────────────────────
@@ -555,246 +645,113 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             temperature: tierSettings.temperature !== undefined ? tierSettings.temperature : tierDefaults.temperature,
         };
 
-        // Track mutable document content (updated by tool calls)
+        // Track mutable document content (updated by doc tools across rounds).
         let currentDocContent = documentContent || '';
-        let toolCallRounds = 0;
-        const MAX_TOOL_ROUNDS = parseInt(await configStore.getConfig('max_tool_rounds_chat'), 10) || 5;
 
-        while (toolCallRounds < MAX_TOOL_ROUNDS) {
-            let result;
-            try {
-                result = await adapter.chat(apiKey, apiUrl, modelId, messages, {
-                    ...chatOptions,
-                    tools: notebookTools,
-                    toolChoice: 'auto',
+        // Single tool executor — used for every tool the model calls, in every
+        // round. Performs side-effects (doc update, source added, legal citation
+        // feed-through) and returns the result object handed back to the model.
+        const executeNotebookTool = async (toolName, toolArgs) => {
+            if (toolName.startsWith('notebook_doc_')) {
+                const r = executeNotebookDocTool(toolName, toolArgs, currentDocContent);
+                if (r && r._action === 'notebook_doc_update') {
+                    currentDocContent = r.content;
+                    send('notebook_doc_update', { content: r.content, title: r.title });
+                }
+                return r;
+            }
+            if (toolName === 'notebook_add_source') {
+                const { ingestTextSource } = require('../../agents/notebooks/sourceIngestion');
+                const sourceName = toolArgs.name || 'AI Research';
+                const sourceContent = toolArgs.content || '';
+                const sourceMeta = toolArgs.metadata || {};
+                if (!sourceContent.trim()) return { error: 'Content is required to add a source.' };
+                const source = await notebookStore.addSource({
+                    notebookId, type: 'text', name: sourceName, metadata: sourceMeta,
+                    wordCount: sourceContent.split(/\s+/).length,
                 });
-            } catch (err) {
-                console.error('[NotebookChat] Tool check error:', err.message);
-                // Fall through to streaming without tools
-                break;
+                sources.push({ ...source, metadata: sourceMeta });
+                ingestTextSource(notebookId, source.id, userId, sourceContent, sourceName)
+                    .catch(err => console.error('[NotebookChat] Source ingestion failed:', err.message));
+                send('notebook_source_added', { source: { id: source.id, name: sourceName, type: 'text', status: 'processing', metadata: sourceMeta } });
+                return { success: true, message: `Source "${sourceName}" added and indexing.`, sourceId: source.id };
             }
-
-            if (!result.toolCalls || result.toolCalls.length === 0) {
-                // No tool calls — break to streaming
-                break;
+            if (toolName === 'notebook_kb_search') {
+                return await executeNotebookKBSearchTool(toolArgs, userId, kbIds);
             }
+            if (isAgentSearchTool(toolName)) {
+                return await executeAgentSearchTool(toolName, toolArgs);
+            }
+            if (legalToolsEnabled && isLegalTool(toolName)) {
+                return await handleLegalTool(toolName, toolArgs);
+            }
+            if (legalToolsEnabled && isLegalMatterTool(toolName)) {
+                return await executeLegalMatterTool(toolName, toolArgs, { notebookId, documentContent: currentDocContent });
+            }
+            return { error: `Unknown tool: ${toolName}` };
+        };
 
-            // Add assistant message with tool calls to history
-            messages.push({
-                role: 'assistant',
-                content: result.content || null,
-                tool_calls: result.toolCalls,
-            });
-            toolCallRounds++;
-
-            // Execute tool calls
-            const toolResults = await Promise.all(result.toolCalls.map(async (toolCall) => {
-                const toolName = toolCall.function?.name || toolCall.name;
-                let toolArgs = {};
-                try { toolArgs = JSON.parse(toolCall.function?.arguments || '{}'); } catch (e) {}
-
-                console.log(`[NotebookChat] Tool call: ${toolName}(${JSON.stringify(toolArgs).substring(0, 200)})`);
-                send('thinking', { text: `Using tool: ${toolName}...` });
-
-                let toolResult;
-
-                // Notebook document tools
-                if (toolName.startsWith('notebook_doc_')) {
-                    toolResult = executeNotebookDocTool(toolName, toolArgs, currentDocContent);
-
-                    // If tool updated the document, send the update to the frontend
-                    if (toolResult._action === 'notebook_doc_update') {
-                        currentDocContent = toolResult.content;
-                        send('notebook_doc_update', { content: toolResult.content, title: toolResult.title });
-                    }
-                }
-                // Notebook add source — directly ingest text as a source
-                else if (toolName === 'notebook_add_source') {
-                    try {
-                        const { ingestTextSource } = require('../../agents/notebooks/sourceIngestion');
-                        const sourceName = toolArgs.name || 'AI Research';
-                        const sourceContent = toolArgs.content || '';
-                        const sourceMeta = toolArgs.metadata || {};
-
-                        if (!sourceContent.trim()) {
-                            toolResult = { error: 'Content is required to add a source.' };
-                        } else {
-                            // Create the source record with structured metadata
-                            const source = await notebookStore.addSource({
-                                notebookId,
-                                type: 'text',
-                                name: sourceName,
-                                metadata: sourceMeta,
-                                wordCount: sourceContent.split(/\s+/).length,
-                            });
-
-                            // Track new source for in-flight dedup within same session
-                            sources.push({ ...source, metadata: sourceMeta });
-
-                            // Background ingest (chunk + index)
-                            ingestTextSource(notebookId, source.id, userId, sourceContent, sourceName).catch(err => {
-                                console.error(`[NotebookChat] Source ingestion failed:`, err.message);
-                            });
-
-                            // Notify frontend with metadata for instant dashboard update
-                            send('notebook_source_added', {
-                                source: { id: source.id, name: sourceName, type: 'text', status: 'processing', metadata: sourceMeta }
-                            });
-
-                            toolResult = {
-                                success: true,
-                                message: `Source "${sourceName}" added to the notebook. It's being indexed and will be available for citation shortly.`,
-                                sourceId: source.id
-                            };
-                            console.log(`[NotebookChat] Added source "${sourceName}" (${sourceContent.split(/\s+/).length} words, vendor: ${sourceMeta.vendor || 'unknown'})`);
-                        }
-                    } catch (err) {
-                        console.error('[NotebookChat] Add source failed:', err.message);
-                        toolResult = { error: `Failed to add source: ${err.message}` };
-                    }
-                }
-                // Notebook KB search tool
-                else if (toolName === 'notebook_kb_search') {
-                    try {
-                        toolResult = await executeNotebookKBSearchTool(toolArgs, userId, kbIds);
-                    } catch (err) {
-                        toolResult = { error: `KB search failed: ${err.message}` };
-                    }
-                }
-                // Web search
-                else if (isAgentSearchTool(toolName)) {
-                    try {
-                        toolResult = await executeAgentSearchTool(toolName, toolArgs);
-                    } catch (err) {
-                        toolResult = { error: `Search failed: ${err.message}` };
-                    }
-                }
-
-                // Unknown tool
-                else {
-                    toolResult = { error: `Unknown tool: ${toolName}` };
-                }
-
-                return {
-                    role: 'tool',
-                    tool_call_id: toolCall.id,
-                    content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult)
-                };
-            }));
-
-            messages.push(...toolResults);
-        }
-
-        // ── Stream final response ────────────────────────────────────
+        // ── Multi-round streaming agentic loop (mirrors direct chat) ──
+        // Every round streams content + reasoning + tool calls; tools stay
+        // enabled across rounds so the model can chain (search → get → verify →
+        // draft), all streamed, with tool_start/tool_end events the shared chat
+        // renderer already understands. Fixes the previous one-shot truncation.
+        const MAX_TOOL_ROUNDS = parseInt(await configStore.getConfig('max_tool_rounds_chat'), 10) || 15;
         let fullContent = '';
-        const streamOptions = {
-            ...chatOptions,
-            // Only pass tools if we haven't exhausted tool rounds and there was no tool use yet
-            tools: toolCallRounds === 0 ? notebookTools : undefined,
-            toolChoice: toolCallRounds === 0 ? 'auto' : undefined,
-        };
-
-        let streamToolCalls = [];
-        const streamCallback = (type, data) => {
-            if (type === 'text') {
-                fullContent += data.text;
-                send('content', { text: data.text });
-            } else if (type === 'thinking') {
-                send('thinking', { text: data.text });
-            } else if (type === 'tool_use') {
-                streamToolCalls.push({
-                    id: data.id || `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-                    type: 'function',
-                    function: {
-                        name: data.name,
-                        arguments: JSON.stringify(data.input || {}),
-                    },
-                });
-            } else if (type === 'error') {
-                send('error', data);
-            }
-        };
-
         emitPhase(send, 'streaming_start', modelId);
-        await adapter.stream(apiKey, apiUrl, modelId, messages, streamOptions, streamCallback);
 
-        // Handle tool calls that came through streaming (SDK-based providers like Google)
-        if (streamToolCalls.length > 0 && toolCallRounds < MAX_TOOL_ROUNDS) {
-            messages.push({
-                role: 'assistant',
-                content: fullContent || null,
-                tool_calls: streamToolCalls,
-            });
-
-            const streamToolResults = await Promise.all(streamToolCalls.map(async (toolCall) => {
-                const toolName = toolCall.function?.name || toolCall.name;
-                let toolArgs = {};
-                try { toolArgs = JSON.parse(toolCall.function?.arguments || '{}'); } catch (e) {}
-
-                console.log(`[NotebookChat] Stream tool call: ${toolName}`);
-                if (!toolName) return { tool_call_id: toolCall.id, role: 'tool', content: 'Unknown tool' };
-                let toolResult;
-
-                if (toolName.startsWith('notebook_doc_')) {
-                    toolResult = executeNotebookDocTool(toolName, toolArgs, currentDocContent);
-                    if (toolResult._action === 'notebook_doc_update') {
-                        currentDocContent = toolResult.content;
-                        send('notebook_doc_update', { content: toolResult.content, title: toolResult.title });
-                    }
-                } else if (toolName === 'notebook_add_source') {
-                    try {
-                        const { ingestTextSource } = require('../../agents/notebooks/sourceIngestion');
-                        const sourceName = toolArgs.name || 'AI Research';
-                        const sourceContent = toolArgs.content || '';
-                        const sourceMeta = toolArgs.metadata || {};
-                        if (!sourceContent.trim()) {
-                            toolResult = { error: 'Content is required.' };
-                        } else {
-                            const source = await notebookStore.addSource({
-                                notebookId, type: 'text', name: sourceName,
-                                metadata: sourceMeta,
-                                wordCount: sourceContent.split(/\s+/).length,
-                            });
-                            sources.push({ ...source, metadata: sourceMeta });
-                            ingestTextSource(notebookId, source.id, userId, sourceContent, sourceName).catch(() => {});
-                            send('notebook_source_added', { source: { id: source.id, name: sourceName, type: 'text', status: 'processing', metadata: sourceMeta } });
-                            toolResult = { success: true, message: `Source "${sourceName}" added.`, sourceId: source.id };
-                        }
-                    } catch (err) {
-                        toolResult = { error: err.message };
-                    }
-                } else if (toolName === 'notebook_kb_search') {
-                    try { toolResult = await executeNotebookKBSearchTool(toolArgs, userId, kbIds); }
-                    catch (err) { toolResult = { error: `KB search failed: ${err.message}` }; }
-                } else if (isAgentSearchTool(toolName)) {
-                    try { toolResult = await executeAgentSearchTool(toolName, toolArgs); }
-                    catch (err) { toolResult = { error: err.message }; }
-
-                } else {
-                    toolResult = { error: `Unknown tool: ${toolName}` };
-                }
-
-                return {
-                    role: 'tool',
-                    tool_call_id: toolCall.id,
-                    content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult)
-                };
-            }));
-
-            messages.push(...streamToolResults);
-
-            // Stream the follow-up response (no tools this time)
-            fullContent = '';
-            const followUpCallback = (type, data) => {
-                if (type === 'text') {
-                    fullContent += data.text;
-                    send('content', { text: data.text });
-                } else if (type === 'thinking') {
-                    send('thinking', { text: data.text });
-                }
+        for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+            const isFinalRound = round === MAX_TOOL_ROUNDS;
+            let roundText = '';
+            const roundToolCalls = [];
+            const streamCallback = (type, data) => {
+                if (type === 'text') { roundText += data.text; fullContent += data.text; send('content', { text: data.text }); }
+                else if (type === 'thinking') send('thinking', { text: data.text });
+                else if (type === 'thinking_start') send('thinking_start', data || {});
+                else if (type === 'thinking_stop') send('thinking_stop', data || {});
+                else if (type === 'tool_use') {
+                    roundToolCalls.push({
+                        id: data.id || `call_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
+                        type: 'function',
+                        function: { name: data.name, arguments: JSON.stringify(data.input || {}) },
+                    });
+                } else if (type === 'error') send('error', data);
             };
 
-            await adapter.stream(apiKey, apiUrl, modelId, messages, chatOptions, followUpCallback);
+            const streamOptions = {
+                ...chatOptions,
+                // Tools stay enabled every round except a final safety round,
+                // which forces a textual answer if the model hits the cap.
+                tools: isFinalRound ? undefined : notebookTools,
+                toolChoice: isFinalRound ? undefined : 'auto',
+            };
+
+            try {
+                await adapter.stream(apiKey, apiUrl, modelId, messages, streamOptions, streamCallback);
+            } catch (err) {
+                console.error('[NotebookChat] Stream error:', err.message);
+                send('error', { error: err.message });
+                break;
+            }
+
+            if (roundToolCalls.length === 0) break; // model produced its final answer
+
+            // Record the assistant turn (preamble + tool calls), run the tools
+            // with tool_start/tool_end, feed results back, and loop.
+            messages.push({ role: 'assistant', content: roundText || null, tool_calls: roundToolCalls });
+            const toolResults = await Promise.all(roundToolCalls.map(async (toolCall) => {
+                const toolName = toolCall.function?.name || toolCall.name;
+                let toolArgs = {};
+                try { toolArgs = JSON.parse(toolCall.function?.arguments || '{}'); } catch (_) {}
+                send('tool_start', { name: toolName, args: toolArgs });
+                let toolResult;
+                try { toolResult = await executeNotebookTool(toolName, toolArgs); }
+                catch (err) { toolResult = { error: err.message }; }
+                const resultStr = typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult);
+                send('tool_end', { name: toolName, result: resultStr.slice(0, 800) });
+                return { role: 'tool', tool_call_id: toolCall.id, content: resultStr };
+            }));
+            messages.push(...toolResults);
         }
 
         send('done', {});

@@ -33,16 +33,30 @@ const CONTENT_URL = 'https://data.rechtspraak.nl/uitspraken/content';
 const RECHTSGEBIED_URIS = {
     civiel: 'http://psi.rechtspraak.nl/rechtsgebied#civielRecht',
     'civiel-personen-familie': 'http://psi.rechtspraak.nl/rechtsgebied#civielRecht_personenEnFamilierecht',
+    // Cleaner alias for the same (proven) URI as 'civiel-personen-familie'.
+    'personen-en-familierecht': 'http://psi.rechtspraak.nl/rechtsgebied#civielRecht_personenEnFamilierecht',
     arbeidsrecht: 'http://psi.rechtspraak.nl/rechtsgebied#civielRecht_arbeidsrecht',
     ondernemingsrecht: 'http://psi.rechtspraak.nl/rechtsgebied#civielRecht_ondernemingsrecht',
     insolventierecht: 'http://psi.rechtspraak.nl/rechtsgebied#civielRecht_insolventierecht',
     huurrecht: 'http://psi.rechtspraak.nl/rechtsgebied#civielRecht_verbintenissenrecht',
+    // Same (proven) verbintenissenrecht URI as huurrecht, exposed under its own key.
+    verbintenissenrecht: 'http://psi.rechtspraak.nl/rechtsgebied#civielRecht_verbintenissenrecht',
     bestuursrecht: 'http://psi.rechtspraak.nl/rechtsgebied#bestuursrecht',
     belastingrecht: 'http://psi.rechtspraak.nl/rechtsgebied#bestuursrecht_belastingrecht',
     socialezekerheidsrecht: 'http://psi.rechtspraak.nl/rechtsgebied#bestuursrecht_socialezekerheidsrecht',
     vreemdelingenrecht: 'http://psi.rechtspraak.nl/rechtsgebied#bestuursrecht_vreemdelingenrecht',
     strafrecht: 'http://psi.rechtspraak.nl/rechtsgebied#strafrecht',
     europees: 'http://psi.rechtspraak.nl/rechtsgebied#europeesRecht',
+    // ── Additional second-level areas from the psi.rechtspraak.nl taxonomy. ──
+    // These follow the documented controlled-vocabulary naming but were not
+    // round-tripped against the live feed in this environment — if any returns
+    // 0 results in production, the feed rejected the URI: drop or correct it.
+    goederenrecht: 'http://psi.rechtspraak.nl/rechtsgebied#civielRecht_goederenrecht',
+    'intellectuele-eigendom': 'http://psi.rechtspraak.nl/rechtsgebied#civielRecht_intellectueleEigendomsrecht',
+    aanbestedingsrecht: 'http://psi.rechtspraak.nl/rechtsgebied#civielRecht_aanbestedingsrecht',
+    'internationaal-privaatrecht': 'http://psi.rechtspraak.nl/rechtsgebied#civielRecht_internationaalPrivaatrecht',
+    omgevingsrecht: 'http://psi.rechtspraak.nl/rechtsgebied#bestuursrecht_omgevingsrecht',
+    ambtenarenrecht: 'http://psi.rechtspraak.nl/rechtsgebied#ambtenarenrecht',
 };
 
 const INSTANTIE_URIS = {

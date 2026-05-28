@@ -17,7 +17,9 @@ const express = require('express');
 const router = express.Router();
 
 const userStore = require('../stores/userStore');
+const configStore = require('../stores/configStore');
 const { requireAuth } = require('./permissions');
+const { invalidateTenantKeyCache } = require('./connectorJwt');
 const { helpers: bootstrapHelpers } = require('./connectorBootstrap');
 
 const { ensureOrgAdminUser, bindOrgToNcInstance, getOrMintTenantKey } = bootstrapHelpers;
@@ -205,6 +207,60 @@ router.post('/admin/nc-bindings/:id/deny', requireAuth, async (req, res) => {
     await userStore.markPendingNcBindingDenied(row.id, freshUser.id);
     console.log(`[NcBindingRoutes] Denied binding ${row.id} for org ${row.orgId} by user ${freshUser.id}`);
     return res.json({ status: 'denied' });
+});
+
+// ── Global-admin: remove an organisation's Nextcloud association ──
+//
+// Clears the NC binding fields on the org, revokes the per-org tenant key (so
+// the disconnected connector can no longer mint valid JWTs) and drops the
+// in-memory key cache so it takes effect immediately. The organisation itself
+// is kept — to delete it entirely use DELETE /auth/organizations/:id. This is
+// super-admin only: it severs connector login for every user of the org, which
+// is beyond an org admin's remit, and it must work on orgs the caller isn't a
+// member of (e.g. cleaning up an orphaned auto-provisioned org).
+router.delete('/admin/nc-bindings/org/:orgId', requireAuth, async (req, res) => {
+    const sessionUser = req.session?.user;
+    if (!sessionUser?.id) return res.status(401).json({ error: 'Not authenticated' });
+    const freshUser = await userStore.getUser(sessionUser.id);
+    if (!freshUser) return res.status(401).json({ error: 'Session user no longer exists' });
+    const isSuperAdmin = req.session.isAdmin || freshUser.role === 'admin';
+    if (!isSuperAdmin) return res.status(403).json({ error: 'Global administrator access required' });
+
+    const orgId = String(req.params.orgId || '').trim();
+    if (!orgId) return res.status(400).json({ error: 'Missing orgId' });
+
+    const org = await userStore.getOrganization(orgId);
+    if (!org) return res.status(404).json({ error: 'Organization not found' });
+    if (!org.nc_instance_id) {
+        return res.status(409).json({ error: 'Organization is not bound to a Nextcloud instance', code: 'not_bound' });
+    }
+
+    const before = { ncInstanceId: org.nc_instance_id, ncBaseUrl: org.nc_base_url, ncAdminUid: org.nc_admin_uid };
+
+    const updates = {
+        ncInstanceId: null,
+        ncBaseUrl: null,
+        ncAdminUid: null,
+        ncProvisionedAt: null,
+        connectorCallbackUrl: null,
+        ncOnboardingCompletedAt: null,
+    };
+    if (org.authMethod === 'nextcloud_connector') updates.authMethod = null;
+    await userStore.updateOrganization(orgId, updates);
+
+    // Revoke the per-org tenant key + drop the cache so the severed connector
+    // can't keep authenticating with a still-valid (cached) JWT key.
+    try {
+        await configStore.deleteConfig(`connector_tenant_key_${orgId}`, { orgId, userId: freshUser.id });
+    } catch (e) { console.warn('[NcBindingRoutes] tenant key revoke failed:', e.message); }
+    invalidateTenantKeyCache(orgId);
+
+    try {
+        await userStore.logAccessAudit('org.nc_binding.remove', 'organization', orgId, freshUser.id, before, null, orgId);
+    } catch (_) { /* audit is best-effort */ }
+
+    console.log(`[NcBindingRoutes] NC binding removed from org=${orgId} (was ncInstance=${before.ncInstanceId}) by super-admin ${freshUser.id}`);
+    return res.json({ ok: true, organizationId: orgId });
 });
 
 module.exports = router;

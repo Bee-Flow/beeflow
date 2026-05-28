@@ -409,6 +409,10 @@ const notebookFeatureGate = async (req, res, next) => {
 // per deployment.
 app.use('/api/notebooks', requireLicenseFeature('notebooks'), notebookFeatureGate, require('./routes/notebooks'));
 app.use('/api/notebooks', requireLicenseFeature('notebooks'), notebookFeatureGate, require('./routes/notebookExport'));
+// Legal Studio (Dutch legal matters) — a matter is a notebook of type
+// 'legal_matter', so it shares the notebooks licence + feature gate. The
+// per-org dutch_legal_sources beta gate lives inside the router.
+app.use('/api/legal-matters', requireLicenseFeature('notebooks'), notebookFeatureGate, require('./routes/legalMatters'));
 // Webpages — gated per-organization via the beta-feature registry.
 const { requireBetaFeature: requireWebpagesBeta } = require('./core/betaFeatures');
 app.use('/api/webpages', requireLicenseFeature('webpages'), requireWebpagesBeta('webpages'), require('./routes/webpages'));

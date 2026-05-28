@@ -498,6 +498,51 @@ const VALID_GEN_TYPES = new Set([
 ]);
 const REMOVED_GEN_TYPES = new Set(['studyGuide', 'flashcards', 'quiz', 'audio_overview']);
 
+// ── Legal Studio generators (only for notebooks of type 'legal_matter') ──
+const VALID_LEGAL_GEN_TYPES = new Set([
+    'juridisch_advies', 'dagvaarding', 'conclusie_van_antwoord', 'pleitnota', 'verzoekschrift',
+    'bezwaar_beroep', 'sommatie', 'vaststellingsovereenkomst', 'processtuk_analyse', 'chronologie', 'issue_list',
+]);
+// Formal court documents — these honour the per-matter strict citation mode.
+const LEGAL_PROCESSTUK_TYPES = new Set(['dagvaarding', 'conclusie_van_antwoord', 'pleitnota', 'verzoekschrift', 'bezwaar_beroep']);
+
+const _legalPromptCache = {};
+function getLegalGenPrompt(type) {
+    if (_legalPromptCache[type] === undefined) {
+        try { _legalPromptCache[type] = require('fs').readFileSync(require('path').join(__dirname, `../prompts/legal-${type}.md`), 'utf-8'); }
+        catch (e) { _legalPromptCache[type] = null; }
+    }
+    return _legalPromptCache[type];
+}
+
+function buildLegalGenSystemPrompt(docPrompt, sourceMaterial, today, nb) {
+    const legal = (nb.settings && nb.settings.legal) || {};
+    const meta = [
+        legal.clientName ? `Cliënt: ${legal.clientName}` : null,
+        legal.wederpartij ? `Wederpartij: ${legal.wederpartij}` : null,
+        legal.rechtsgebied ? `Rechtsgebied: ${legal.rechtsgebied}` : null,
+        legal.zaaknummer ? `Zaaknummer: ${legal.zaaknummer}` : null,
+    ].filter(Boolean).join(' · ');
+    return `Je bent een ervaren Nederlandse jurist die een juridisch document opstelt. Vandaag is ${today}.
+${meta ? `\n[DOSSIER] ${meta}\n` : ''}
+${docPrompt}
+
+KRITIEKE REGELS:
+- Schrijf in correct, formeel Nederlands.
+- Baseer je UITSLUITEND op het onderstaande [BRONMATERIAAL] (dossierstukken + geconsolideerde wetgeving). Gebruik geen feiten van buiten deze bronnen.
+- Verzin NOOIT een ECLI, CELEX-nummer of zaaknummer. Noem alleen vindplaatsen die in het bronmateriaal staan of die je zeker weet uit de aangeleverde stukken. Bij twijfel: laat de verwijzing weg of markeer haar als "[vindplaats nog te verifiëren]".
+- Verwijs naar jurisprudentie met het volledige ECLI en, waar mogelijk, de rechtsoverweging (r.o.); naar wetgeving met het concrete artikel (bv. "art. 6:162 BW"); naar EU-recht met het CELEX-nummer. Deze worden automatisch omgezet in klikbare links.
+- Onderscheid duidelijk de feiten, het juridisch kader en jouw analyse/standpunt.
+- Sluit het document af met de zin: "AI-gegenereerd — controleer bronnen en juistheid zelf voordat u hierop handelt."
+
+OPMAAK:
+- Lever het document in Markdown met heldere kopjes en opsommingen. Compacte, professionele stijl; geen overbodige inleidingen of dubbele witregels.
+- Het document wordt op A4 gepagineerd, dus schrijf ruimte-efficiënt.
+
+[BRONMATERIAAL]
+${sourceMaterial.slice(0, 50000)}`;
+}
+
 router.post('/:id/generate/:type', requireAuth, async (req, res) => {
     try {
         const userId = req.session.user.id;
@@ -511,12 +556,17 @@ router.post('/:id/generate/:type', requireAuth, async (req, res) => {
                 code: 'generation_type_removed',
             });
         }
-        if (!VALID_GEN_TYPES.has(type)) {
-            return res.status(400).json({ error: `Unknown generation type "${type}"`, code: 'generation_type_unknown' });
-        }
 
         const nb = await notebookStore.getNotebook(notebookId, userId);
         if (!nb) return res.status(404).json({ error: 'Notebook not found' });
+
+        // Legal matters get the Dutch legal document generators; plain notebooks
+        // get the existing content types.
+        const isLegal = nb.type === 'legal_matter';
+        const validTypes = isLegal ? VALID_LEGAL_GEN_TYPES : VALID_GEN_TYPES;
+        if (!validTypes.has(type)) {
+            return res.status(400).json({ error: `Unknown generation type "${type}"`, code: 'generation_type_unknown' });
+        }
 
         const sources = await notebookStore.getSources(notebookId);
         const readySources = sources.filter(s => s.status === 'ready');
@@ -553,7 +603,9 @@ Wrap your output in \`\`\`mermaid ... \`\`\` tags. Focus on hierarchical relatio
             data_table: `Extract the most important quantitative data, comparisons, or structured information from the source material and present it as a Markdown table.`,
         };
 
-        const prompt = typePrompts[type] || typePrompts.summary;
+        const prompt = isLegal
+            ? (getLegalGenPrompt(type) || `Stel een juridisch document op van het type "${type}".`)
+            : (typePrompts[type] || typePrompts.summary);
 
         // Resolve model
         const { getAIConfig, getProviderForModel } = require('../core/aiAgent');
@@ -611,7 +663,7 @@ Wrap your output in \`\`\`mermaid ... \`\`\` tags. Focus on hierarchical relatio
         const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 
         const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-        const systemPrompt = `You are an expert content generator. Today is ${today}.
+        const systemPrompt = isLegal ? buildLegalGenSystemPrompt(prompt, allContent, today, nb) : `You are an expert content generator. Today is ${today}.
 
 ${prompt}
 
@@ -646,7 +698,9 @@ ${allContent.slice(0, 50000)}`;
 
         const messages = [
             { role: 'system', content: systemPrompt },
-            { role: 'user', content: `Generate the ${type} now. Be thorough but concise — prioritize substance over volume. Use compact formatting with minimal whitespace. Where appropriate, include Mermaid diagrams to visualize key concepts, processes, or relationships.` }
+            { role: 'user', content: isLegal
+                ? `Stel nu het document "${type.replace(/_/g, ' ')}" op. Wees juridisch precies en bondig, baseer je uitsluitend op het bronmateriaal, en verwijs naar wetgeving en jurisprudentie met correcte vindplaatsen (ECLI / artikel / CELEX).`
+                : `Generate the ${type} now. Be thorough but concise — prioritize substance over volume. Use compact formatting with minimal whitespace. Where appropriate, include Mermaid diagrams to visualize key concepts, processes, or relationships.` }
         ];
 
         const { TIER_DEFAULTS } = require('../core/modelResolver');
@@ -672,6 +726,35 @@ ${allContent.slice(0, 50000)}`;
         // (Removed audio_overview ElevenLabs post-processing — the Audio Podcast
         // generation type was retired. Any cached/legacy callers now hit the
         // REMOVED_GEN_TYPES 400 at the top of this route.)
+
+        // Legal matters: verify every citation in the generated document against
+        // the authoritative sources, record outcomes in the bronnenlijst, and —
+        // for formal court documents in strict mode — return a redacted version
+        // that withholds citations we couldn't confirm.
+        if (isLegal) {
+            try {
+                const { verifyText } = require('../core/legalCitationVerifier');
+                const report = await verifyText(fullGeneratedText, { notebookId });
+                const strict = ((nb.settings?.legal?.citationMode) === 'strict_formal') && LEGAL_PROCESSTUK_TYPES.has(type);
+                let redactedContent = null;
+                if (strict && (report.notFound.length || report.unverified.length)) {
+                    redactedContent = fullGeneratedText;
+                    for (const e of [...report.notFound, ...report.unverified]) {
+                        redactedContent = redactedContent.split(e.token).join('[bron niet geverifieerd — controleer]');
+                    }
+                }
+                send('citation_report', {
+                    total: report.total,
+                    verified: report.verified,
+                    notFound: report.notFound,
+                    unverified: report.unverified,
+                    strict,
+                    redactedContent,
+                });
+            } catch (e) {
+                console.warn('[Notebooks] legal citation verification failed:', e.message);
+            }
+        }
 
         send('done', {});
         res.end();
