@@ -210,6 +210,7 @@ function emptySite(siteId, name) {
         pages: [],
         header: clone(SITE_DEFAULTS.header),
         footer: clone(SITE_DEFAULTS.footer),
+        cookieBanner: clone(SITE_DEFAULTS.cookieBanner),
         design: clone(DESIGN_DEFAULTS),
     };
 }
@@ -353,6 +354,7 @@ async function setProject(siteId, site) {
         pages: Array.isArray(site.pages) ? site.pages.map(sanitizePageIndexEntry).filter(Boolean) : [],
         header: isPlainObject(site.header) ? site.header : clone(SITE_DEFAULTS.header),
         footer: isPlainObject(site.footer) ? site.footer : clone(SITE_DEFAULTS.footer),
+        cookieBanner: isPlainObject(site.cookieBanner) ? site.cookieBanner : clone(SITE_DEFAULTS.cookieBanner),
         design: sanitizeDesign(site.design),
     };
 
@@ -469,6 +471,9 @@ async function duplicateProject(sourceSiteId) {
             .map(e => ({ ...clone(e), id: pageIdMap.get(e.id) })),
         header: remap(clone(source.header || {})),
         footer: remap(clone(source.footer || {})),
+        // No internal page-links inside the banner (privacyUrl is a plain
+        // URL string), so a straight clone is enough — no remap needed.
+        cookieBanner: clone(source.cookieBanner || {}),
         design: clone(source.design || {}),
     };
     await configStore.setConfig(projectKey(newSiteId), newSite);
@@ -753,11 +758,45 @@ async function reorderPages(siteId, orderedIds) {
     await setProject(siteId, site);
 }
 
+// Recursively walk a site-chrome subtree (header/footer) and strip any
+// link references to the given pageId. The renderer's resolveLink already
+// degrades broken page links gracefully ({ href: '#', broken: true }), but
+// stored references also show up as ghost nav items in the editor, so we
+// clean them at delete time.
+//
+// Two patterns are handled:
+//   1. Array items keyed by `link` (nav items, ctas, footer column links):
+//      drop the whole item when its link points at the deleted page.
+//   2. Direct link objects on a parent property (e.g. logo.link): replace
+//      with an inert anchor link so the parent's shape stays valid.
+function stripPageRefsToDeleted(node, deletedPageId) {
+    if (Array.isArray(node)) {
+        return node
+            .filter(item => !(isPlainObject(item)
+                && isPlainObject(item.link)
+                && item.link.kind === 'page'
+                && item.link.pageId === deletedPageId))
+            .map(item => stripPageRefsToDeleted(item, deletedPageId));
+    }
+    if (!isPlainObject(node)) return node;
+    const out = {};
+    for (const [k, v] of Object.entries(node)) {
+        if (isPlainObject(v) && v.kind === 'page' && v.pageId === deletedPageId) {
+            out[k] = { kind: 'anchor', anchor: '' };
+            continue;
+        }
+        out[k] = stripPageRefsToDeleted(v, deletedPageId);
+    }
+    return out;
+}
+
 async function removePage(siteId, pageId) {
     const site = await getProject(siteId);
     if (!site) throw new Error('Project not found');
     site.pages = site.pages.filter(p => p.id !== pageId);
     if (site.homepageId === pageId) site.homepageId = site.pages[0]?.id || null;
+    if (isPlainObject(site.header)) site.header = stripPageRefsToDeleted(site.header, pageId);
+    if (isPlainObject(site.footer)) site.footer = stripPageRefsToDeleted(site.footer, pageId);
     await setProject(siteId, site);
     await deletePage(siteId, pageId);
 }
@@ -851,7 +890,7 @@ async function getEffectivePublished(siteId, slug, locale) {
 
 async function resolveEffective(siteId, slug, locale, ctx) {
     const site = await ctx.getSite();
-    if (!site) return { found: false, page: null, header: null, footer: null, pages: [], design: clone(DESIGN_DEFAULTS) };
+    if (!site) return { found: false, page: null, header: null, footer: null, cookieBanner: null, pages: [], design: clone(DESIGN_DEFAULTS) };
 
     const defaultLocale = await getDefaultLocale();
     const reqLocale = (locale || defaultLocale || 'en').toLowerCase().split('-')[0];
@@ -893,14 +932,17 @@ async function resolveEffective(siteId, slug, locale, ctx) {
     }
     header = resolveLinksInTree(header, site.pages);
     footer = resolveLinksInTree(footer, site.pages);
+    // Cookie banner is global per site (no locale layer — text carries all
+    // locales) and has no internal page-links, so no resolveLinksInTree.
+    const cookieBanner = deepMerge(clone(SITE_DEFAULTS.cookieBanner), site.cookieBanner);
 
     if (!entry) {
-        return { found: false, page: null, header, footer, pages: publicPages, design };
+        return { found: false, page: null, header, footer, cookieBanner, pages: publicPages, design };
     }
 
     const pageDoc = await ctx.getPage(entry.id);
     if (!pageDoc) {
-        return { found: false, page: null, header, footer, pages: publicPages, design };
+        return { found: false, page: null, header, footer, cookieBanner, pages: publicPages, design };
     }
 
     let blocks = pageDoc.blocks.map(b => clone(b));
@@ -931,7 +973,7 @@ async function resolveEffective(siteId, slug, locale, ctx) {
         seo: pageDoc.seo,
         blocks,
     };
-    return { found: true, page, header, footer, pages: publicPages, design };
+    return { found: true, page, header, footer, cookieBanner, pages: publicPages, design };
 }
 
 // ── Publishing ───────────────────────────────────────────────────────
@@ -1170,6 +1212,7 @@ async function exportSite(siteId) {
             chrome: {
                 header: site.header || {},
                 footer: site.footer || {},
+                cookieBanner: site.cookieBanner || {},
             },
             pages: exportedPages,
         },
@@ -1305,6 +1348,8 @@ async function importSite(exportData) {
         })),
         header: remapPageLinks(isPlainObject(incomingChrome.header) ? incomingChrome.header : clone(SITE_DEFAULTS.header)),
         footer: remapPageLinks(isPlainObject(incomingChrome.footer) ? incomingChrome.footer : clone(SITE_DEFAULTS.footer)),
+        // No internal page-links inside the banner, so no remapPageLinks.
+        cookieBanner: clone(isPlainObject(incomingChrome.cookieBanner) ? incomingChrome.cookieBanner : SITE_DEFAULTS.cookieBanner),
         design: sanitizeDesign(incoming.design),
     };
     await configStore.setConfig(projectKey(newSiteId), newSite);

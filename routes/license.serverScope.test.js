@@ -4,8 +4,7 @@
  * Covers the new branches added to POST /api/license/activate and
  * DELETE /api/license/deactivate:
  *
- *   - scope='server' as super-admin on self-hosted → 200 + activated row
- *   - scope='server' on cloud → 403 server_scope_cloud_blocked
+ *   - scope='server' as super-admin → 200 + activated row (any deploy mode)
  *   - scope='server' as org-admin (not super) → 403 super_admin_required
  *   - scope='server' with community-tier token → 400 community_server_license_pointless
  *   - DELETE ?scope=server symmetric checks
@@ -148,9 +147,7 @@ const ORG_ADMIN_SESSION = {
 
 (async () => {
     try {
-        // ── POST /activate scope=server, super-admin, self-hosted → 200 ─
-        process.env.DEPLOYMENT_MODE = 'self-hosted';
-        delete process.env.LICENSE_ALLOW_SERVER_SCOPE_ON_CLOUD;
+        // ── POST /activate scope=server, super-admin → 200 ─────────────
         mockActivatedTier = 'enterprise';
         currentSession = SUPER_ADMIN_SESSION;
         lastActivateArgs = null;
@@ -165,28 +162,17 @@ const ORG_ADMIN_SESSION = {
         assert.strictEqual(lastActivateArgs.organizationId, null);
         assert.strictEqual(lastActivateArgs.userId, null);
 
-        // ── POST /activate scope=server on CLOUD → 403 ─────────────────
+        // ── POST /activate scope=server on CLOUD → 200 (no deploy gate) ─
         process.env.DEPLOYMENT_MODE = 'cloud';
         currentSession = SUPER_ADMIN_SESSION;
         const cloudRes = await request('POST', '/api/license/activate', {
             body: { token: 'fake-token', scope: 'server' },
         });
-        assert.strictEqual(cloudRes.status, 403);
-        assert.strictEqual(cloudRes.body.error, 'server_scope_cloud_blocked');
-
-        // ── LICENSE_ALLOW_SERVER_SCOPE_ON_CLOUD=true overrides cloud gate
-        process.env.DEPLOYMENT_MODE = 'cloud';
-        process.env.LICENSE_ALLOW_SERVER_SCOPE_ON_CLOUD = 'true';
-        currentSession = SUPER_ADMIN_SESSION;
-        const cloudOverrideRes = await request('POST', '/api/license/activate', {
-            body: { token: 'fake-token', scope: 'server' },
-        });
-        assert.strictEqual(cloudOverrideRes.status, 200,
-            'cloud override env var should re-enable server scope');
-        delete process.env.LICENSE_ALLOW_SERVER_SCOPE_ON_CLOUD;
+        assert.strictEqual(cloudRes.status, 200,
+            'server scope works regardless of deployment mode');
+        assert.ok(cloudRes.body.activated, 'cloud activation carries activated row');
 
         // ── POST /activate scope=server as ORG-admin → 403 super-admin ─
-        process.env.DEPLOYMENT_MODE = 'self-hosted';
         currentSession = ORG_ADMIN_SESSION;
         const orgAdminRes = await request('POST', '/api/license/activate', {
             body: { token: 'fake-token', scope: 'server' },
@@ -195,7 +181,6 @@ const ORG_ADMIN_SESSION = {
         assert.strictEqual(orgAdminRes.body.error, 'super_admin_required');
 
         // ── POST /activate scope=server with community tier → 400 ──────
-        process.env.DEPLOYMENT_MODE = 'self-hosted';
         currentSession = SUPER_ADMIN_SESSION;
         mockActivatedTier = 'community';
         lastDeactivateArgs = null;
@@ -210,8 +195,7 @@ const ORG_ADMIN_SESSION = {
             'route must roll back the just-created community server row');
         mockActivatedTier = 'enterprise'; // restore
 
-        // ── DELETE ?scope=server, super-admin, self-hosted → 200 ───────
-        process.env.DEPLOYMENT_MODE = 'self-hosted';
+        // ── DELETE ?scope=server, super-admin → 200 ───────────────────
         currentSession = SUPER_ADMIN_SESSION;
         lastDeactivateArgs = null;
         mockDeactivateOk = true;
@@ -220,22 +204,22 @@ const ORG_ADMIN_SESSION = {
         assert.strictEqual(delRes.body.success, true);
         assert.strictEqual(lastDeactivateArgs.scope, 'server');
 
-        // ── DELETE ?scope=server on CLOUD → 403 ────────────────────────
+        // ── DELETE ?scope=server on CLOUD → 200 (no deploy gate) ───────
         process.env.DEPLOYMENT_MODE = 'cloud';
         currentSession = SUPER_ADMIN_SESSION;
+        lastDeactivateArgs = null;
+        mockDeactivateOk = true;
         const delCloudRes = await request('DELETE', '/api/license/deactivate', { query: 'scope=server' });
-        assert.strictEqual(delCloudRes.status, 403);
-        assert.strictEqual(delCloudRes.body.error, 'server_scope_cloud_blocked');
+        assert.strictEqual(delCloudRes.status, 200);
+        assert.strictEqual(delCloudRes.body.success, true);
 
         // ── DELETE ?scope=server as ORG-admin → 403 super-admin ───────
-        process.env.DEPLOYMENT_MODE = 'self-hosted';
         currentSession = ORG_ADMIN_SESSION;
         const delOrgRes = await request('DELETE', '/api/license/deactivate', { query: 'scope=server' });
         assert.strictEqual(delOrgRes.status, 403);
         assert.strictEqual(delOrgRes.body.error, 'super_admin_required');
 
         // ── DELETE ?scope=server with no active row → 404 ──────────────
-        process.env.DEPLOYMENT_MODE = 'self-hosted';
         currentSession = SUPER_ADMIN_SESSION;
         mockDeactivateOk = false;
         const delNoneRes = await request('DELETE', '/api/license/deactivate', { query: 'scope=server' });

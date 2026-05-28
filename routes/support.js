@@ -96,6 +96,54 @@ function _buildThreadUrl(thread, { forStaff = false } = {}) {
     return `${host}/support/t/${thread.id}?token=${token}`;
 }
 
+// Build the public CSAT links (5 star URLs + a dispute URL) for a thread.
+// The API base is the server's own public host (where these routes live).
+function _buildCsatLinks(thread) {
+    const apiBase = `${process.env.API_PROTOCOL || 'https'}://${process.env.API_PUBLIC_HOST || process.env.SERVER_PUBLIC_HOST || 'server.beeflow.nl'}`;
+    const base = `${apiBase}/api/support/csat/${thread.id}`;
+    const stars = [1, 2, 3, 4, 5].map(score => {
+        const token = supportStore.buildCsatToken(thread.id, thread.requester_email, score);
+        return `${base}?score=${score}&token=${token}`;
+    });
+    const disputeToken = supportStore.buildCsatToken(thread.id, thread.requester_email, 0);
+    const dispute = `${base}?dispute=1&token=${disputeToken}`;
+    return { stars, dispute };
+}
+
+// ── Canned-response variable substitution ────────────────────────────────
+// One-pass, plaintext, known keys only. A value coming from a thread field
+// (e.g. a subject containing "{{x}}") is treated as literal text — it never
+// triggers a second substitution pass, so it can't inject new placeholders.
+function renderCannedBody(body, thread, req) {
+    const staff = req?.session?.user;
+    const vars = {
+        requester_name: thread?.requester_name || 'there',
+        requester_email: thread?.requester_email || '',
+        org_name: thread?.requester_org_name || '',
+        thread_subject: thread?.subject || '',
+        staff_first_name: (staff?.displayName || staff?.name || staff?.username || '').split(' ')[0] || '',
+    };
+    return String(body || '').replace(/\{\{\s*([a-z_]+)\s*\}\}/gi, (match, key) => {
+        const k = key.toLowerCase();
+        return Object.prototype.hasOwnProperty.call(vars, k) ? vars[k] : match;
+    });
+}
+
+// Minimal self-contained HTML page for the public CSAT landing.
+function _csatHtml({ score, disputed, error } = {}) {
+    let heading, body;
+    if (error) { heading = 'Hmm'; body = error; }
+    else if (disputed) { heading = 'Thanks for letting us know'; body = 'We\'ve reopened your request and a team member will follow up shortly.'; }
+    else { heading = 'Thank you!'; body = `We\'ve recorded your rating${score ? ` of ${score}/5` : ''}. We appreciate your feedback.`; }
+    return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bee Flow Support</title>
+<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#f8fafc;margin:0;display:flex;min-height:100vh;align-items:center;justify-content:center}
+.card{background:#fff;border-radius:16px;box-shadow:0 4px 24px rgba(0,0,0,.08);padding:40px;max-width:420px;text-align:center}
+h1{font-size:22px;margin:0 0 12px;color:#0f172a}p{color:#475569;line-height:1.5;margin:0}</style></head>
+<body><div class="card"><h1>${heading}</h1><p>${body}</p></div></body></html>`;
+}
+
 // ── SSE event bus for the staff inbox ─────────────────────────────────────
 const supportEvents = new EventEmitter();
 supportEvents.setMaxListeners(50);
@@ -347,6 +395,22 @@ router.post('/threads', publicCreateLimiter, async (req, res) => {
             requesterUa: req.headers['user-agent'] || null,
         });
 
+        // Compute SLA due dates from the org/global policy (best-effort).
+        try {
+            const { computeSlaDueAt } = require('../services/supportSlaEnforcer');
+            const due = await computeSlaDueAt(thread);
+            if (due.first || due.resolution) {
+                await supportStore.setThreadSla(thread.id, {
+                    firstDueAt: due.first,
+                    resolutionDueAt: due.resolution,
+                });
+                thread.sla_first_response_due_at = due.first;
+                thread.sla_resolution_due_at = due.resolution;
+            }
+        } catch (e) {
+            console.warn('[Support] SLA compute on create failed:', e.message);
+        }
+
         const firstMsg = await supportStore.appendMessage({
             threadId: thread.id,
             authorKind: 'requester',
@@ -412,6 +476,21 @@ router.post('/threads', publicCreateLimiter, async (req, res) => {
                             message: result.escalateReason || 'AI handed off to staff',
                             threadId: thread.id,
                         }).catch(() => {});
+                    }
+                    // AI fully resolved → send a resolution + CSAT email so the
+                    // customer can confirm and rate without logging in.
+                    if (result.resolved && !skipOutboundEmail) {
+                        sendOrNotifyStaff(
+                            sendThreadResolvedEmail,
+                            {
+                                to: requesterEmail,
+                                requesterName,
+                                subject: val.subject,
+                                threadUrl: requesterUrl,
+                                csatLinks: _buildCsatLinks(thread),
+                            },
+                            { kind: 'resolved', threadId: thread.id },
+                        );
                     }
                     if (userId) {
                         notificationStore.createNotification({
@@ -651,7 +730,7 @@ router.patch('/threads/:id', async (req, res) => {
         if (!thread) return res.status(404).json({ error: 'thread not found' });
 
         const patch = {};
-        const { status, priority, assignee_user_id } = req.body || {};
+        const { status, priority, assignee_user_id, category, tags } = req.body || {};
 
         if (status) {
             const allowed = ['open', 'ai_responding', 'awaiting_user', 'awaiting_agent', 'resolved', 'closed'];
@@ -666,9 +745,38 @@ router.patch('/threads/:id', async (req, res) => {
         }
         if (assignee_user_id !== undefined) {
             patch.assignee_user_id = assignee_user_id || null;
+            // A manual assignee change always clears the auto-assigned flag.
+            patch.auto_assigned = false;
+        }
+        if (category !== undefined) {
+            patch.category = category ? String(category).trim().slice(0, 100) : null;
+        }
+        // Priority drives the SLA clock — recompute due dates when it changes.
+        if (patch.priority && patch.priority !== thread.priority) {
+            try {
+                const { computeSlaDueAt } = require('../services/supportSlaEnforcer');
+                const due = await computeSlaDueAt({ ...thread, priority: patch.priority });
+                patch.sla_first_response_due_at = due.first;
+                patch.sla_resolution_due_at = due.resolution;
+            } catch (e) {
+                console.warn('[Support] SLA recompute on priority change failed:', e.message);
+            }
         }
 
         const updated = await supportStore.updateThread(thread.id, patch);
+
+        // Tags are JSONB — handled by a dedicated helper, not the generic patch.
+        if (tags !== undefined && Array.isArray(tags)) {
+            const tagged = await supportStore.setThreadTags(thread.id, tags);
+            if (tagged) Object.assign(updated, tagged);
+            supportStore.recordThreadEvent({
+                threadId: thread.id,
+                actorUserId: getUserId(req),
+                actorKind: 'staff',
+                action: 'tags_change',
+                payload: { tags: tagged?.tags || [] },
+            }).catch(() => {});
+        }
 
         const userId = getUserId(req);
         // Audit each field that actually changed.
@@ -709,6 +817,7 @@ router.patch('/threads/:id', async (req, res) => {
                     requesterName: thread.requester_name,
                     subject: thread.subject,
                     threadUrl: _buildThreadUrl(thread),
+                    csatLinks: _buildCsatLinks(thread),
                 },
                 { kind: 'resolved', threadId: thread.id },
             );
@@ -819,7 +928,9 @@ router.get('/config', async (req, res) => {
         if (kbRaw) {
             try { kbIds = Array.isArray(kbRaw) ? kbRaw : JSON.parse(kbRaw); } catch { kbIds = []; }
         }
-        res.json({ agentId: agentId || null, kbIds });
+        const v2Enabled = !!(await configStore.getConfig('support_ai_v2_enabled'));
+        const autoResolveThreshold = Number(await configStore.getConfig('support_ai_autoresolve_threshold')) || 0.78;
+        res.json({ agentId: agentId || null, kbIds, v2Enabled, autoResolveThreshold });
     } catch (err) {
         console.error('[Support] GET /config error:', err);
         res.status(500).json({ error: err.message });
@@ -831,13 +942,21 @@ router.put('/config', async (req, res) => {
         if (!isSuperAdmin(req)) {
             return res.status(403).json({ error: 'Super-admin required' });
         }
-        const { agentId, kbIds } = req.body || {};
+        const { agentId, kbIds, v2Enabled, autoResolveThreshold } = req.body || {};
         if (agentId !== undefined) {
             await configStore.setConfig('support_ai_agent_id', agentId || '');
         }
         if (kbIds !== undefined) {
             if (!Array.isArray(kbIds)) return res.status(400).json({ error: 'kbIds must be an array' });
             await configStore.setConfig('support_ai_kb_ids', JSON.stringify(kbIds));
+        }
+        if (v2Enabled !== undefined) {
+            await configStore.setConfig('support_ai_v2_enabled', !!v2Enabled);
+        }
+        if (autoResolveThreshold !== undefined) {
+            const n = Number(autoResolveThreshold);
+            if (!Number.isFinite(n) || n < 0 || n > 1) return res.status(400).json({ error: 'autoResolveThreshold must be between 0 and 1' });
+            await configStore.setConfig('support_ai_autoresolve_threshold', n);
         }
         res.json({ ok: true });
     } catch (err) {
@@ -1010,7 +1129,334 @@ router.post('/preview', async (req, res) => {
     }
 });
 
+// ──────────────────────────────────────────────────────────────────────────
+// Acting org for staff-managed catalogues (tags, canned responses, SLA).
+// Super-admins manage system-wide entries (org = null). Org-scoped support
+// staff manage entries for their own org only.
+// ──────────────────────────────────────────────────────────────────────────
+async function _actingOrgId(req) {
+    if (isSuperAdmin(req)) return null;
+    const orgIds = await resolveUserOrgIds(req);
+    if (orgIds === null) return null; // also super-admin
+    const first = [...orgIds][0];
+    return first || null;
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Tag taxonomy CRUD (staff)
+// ──────────────────────────────────────────────────────────────────────────
+router.get('/tags', async (req, res) => {
+    try {
+        if (!(await _hasAdminSupport(req))) {
+            return res.status(403).json({ error: 'admin_support permission required' });
+        }
+        const orgId = await _actingOrgId(req);
+        const tags = await supportStore.listTags(orgId);
+        res.json({ tags });
+    } catch (err) {
+        console.error('[Support] GET /tags error:', err.message);
+        res.status(500).json({ error: 'Internal error' });
+    }
+});
+
+router.post('/tags', async (req, res) => {
+    try {
+        if (!(await _hasAdminSupport(req))) {
+            return res.status(403).json({ error: 'admin_support permission required' });
+        }
+        const name = (req.body?.name || '').toString().trim();
+        if (!name) return res.status(400).json({ error: 'name required' });
+        if (name.length > 50) return res.status(400).json({ error: 'name too long (max 50)' });
+        const orgId = await _actingOrgId(req);
+        const tag = await supportStore.createTag({
+            organizationId: orgId,
+            name,
+            color: (req.body?.color || '').toString().trim() || null,
+            description: (req.body?.description || '').toString().trim() || null,
+        });
+        res.json({ ok: true, tag });
+    } catch (err) {
+        if (/duplicate key/i.test(err.message)) return res.status(409).json({ error: 'tag already exists' });
+        console.error('[Support] POST /tags error:', err.message);
+        res.status(500).json({ error: 'Internal error' });
+    }
+});
+
+router.delete('/tags/:id', async (req, res) => {
+    try {
+        if (!(await _hasAdminSupport(req))) {
+            return res.status(403).json({ error: 'admin_support permission required' });
+        }
+        const orgId = await _actingOrgId(req);
+        const ok = await supportStore.deleteTag(req.params.id, orgId);
+        if (!ok) return res.status(404).json({ error: 'not found' });
+        res.json({ ok: true });
+    } catch (err) {
+        console.error('[Support] DELETE /tags/:id error:', err.message);
+        res.status(500).json({ error: 'Internal error' });
+    }
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// POST /threads/bulk — apply an action to multiple threads (staff)
+// Body: { ids: [], action: 'assign'|'status'|'priority'|'tag'|'resolve', params }
+// Per-thread partial success; never an all-or-nothing transaction.
+// ──────────────────────────────────────────────────────────────────────────
+router.post('/threads/bulk', async (req, res) => {
+    try {
+        if (!(await _hasAdminSupport(req))) {
+            return res.status(403).json({ error: 'admin_support permission required' });
+        }
+        const { ids, action, params = {} } = req.body || {};
+        if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids required' });
+        if (ids.length > 50) return res.status(400).json({ error: 'max 50 threads per bulk action' });
+        const VALID = ['assign', 'status', 'priority', 'tag', 'resolve'];
+        if (!VALID.includes(action)) return res.status(400).json({ error: 'invalid action' });
+
+        const userId = getUserId(req);
+        const results = [];
+        for (const id of ids) {
+            try {
+                const thread = await supportStore.getThread(id);
+                if (!thread) { results.push({ id, ok: false, error: 'not found' }); continue; }
+
+                if (action === 'tag') {
+                    const tag = (params.tag || '').toString().trim();
+                    if (!tag) { results.push({ id, ok: false, error: 'tag required' }); continue; }
+                    await supportStore.addThreadTag(id, tag);
+                    supportStore.recordThreadEvent({ threadId: id, actorUserId: userId, actorKind: 'staff', action: 'tags_change', payload: { added: tag } }).catch(() => {});
+                } else if (action === 'assign') {
+                    await supportStore.updateThread(id, { assignee_user_id: params.assignee_user_id || null, auto_assigned: false });
+                    supportStore.recordThreadEvent({ threadId: id, actorUserId: userId, actorKind: 'staff', action: 'assignee_change', payload: { to: params.assignee_user_id || null } }).catch(() => {});
+                } else if (action === 'priority') {
+                    if (!['low', 'normal', 'high', 'urgent'].includes(params.priority)) { results.push({ id, ok: false, error: 'invalid priority' }); continue; }
+                    await supportStore.updateThread(id, { priority: params.priority });
+                    supportStore.recordThreadEvent({ threadId: id, actorUserId: userId, actorKind: 'staff', action: 'priority_change', payload: { from: thread.priority, to: params.priority } }).catch(() => {});
+                } else if (action === 'status' || action === 'resolve') {
+                    const status = action === 'resolve' ? 'resolved' : params.status;
+                    if (!['open', 'ai_responding', 'awaiting_user', 'awaiting_agent', 'resolved', 'closed'].includes(status)) { results.push({ id, ok: false, error: 'invalid status' }); continue; }
+                    const patch = { status };
+                    if (status === 'resolved') patch.resolved_at = new Date().toISOString();
+                    await supportStore.updateThread(id, patch);
+                    supportStore.recordThreadEvent({ threadId: id, actorUserId: userId, actorKind: 'staff', action: status === 'resolved' ? 'resolved' : 'status_change', payload: { from: thread.status, to: status } }).catch(() => {});
+                }
+                _emit('thread_updated', { threadId: id });
+                results.push({ id, ok: true });
+            } catch (e) {
+                results.push({ id, ok: false, error: e.message });
+            }
+        }
+        res.json({ ok: true, results });
+    } catch (err) {
+        console.error('[Support] POST /threads/bulk error:', err.message);
+        res.status(500).json({ error: 'Internal error' });
+    }
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// SLA policies (staff read, super-admin write for system-wide)
+// ──────────────────────────────────────────────────────────────────────────
+router.get('/sla-policies', async (req, res) => {
+    try {
+        if (!(await _hasAdminSupport(req))) {
+            return res.status(403).json({ error: 'admin_support permission required' });
+        }
+        const orgId = await _actingOrgId(req);
+        const policies = await supportStore.listSlaPolicies(orgId);
+        res.json({ policies });
+    } catch (err) {
+        console.error('[Support] GET /sla-policies error:', err.message);
+        res.status(500).json({ error: 'Internal error' });
+    }
+});
+
+router.put('/sla-policies', async (req, res) => {
+    try {
+        if (!(await _hasAdminSupport(req))) {
+            return res.status(403).json({ error: 'admin_support permission required' });
+        }
+        const { priority, first_response_minutes, resolution_minutes, enabled } = req.body || {};
+        const fr = parseInt(first_response_minutes, 10);
+        const rr = parseInt(resolution_minutes, 10);
+        if (!Number.isInteger(fr) || fr < 1 || !Number.isInteger(rr) || rr < 1) {
+            return res.status(400).json({ error: 'first_response_minutes and resolution_minutes must be positive integers' });
+        }
+        const orgId = await _actingOrgId(req);
+        const policy = await supportStore.upsertSlaPolicy({
+            organizationId: orgId,
+            priority,
+            firstResponseMinutes: fr,
+            resolutionMinutes: rr,
+            enabled: enabled !== false,
+        });
+        res.json({ ok: true, policy });
+    } catch (err) {
+        console.error('[Support] PUT /sla-policies error:', err.message);
+        res.status(400).json({ error: err.message });
+    }
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// Canned responses CRUD + render (staff)
+// ──────────────────────────────────────────────────────────────────────────
+router.get('/canned', async (req, res) => {
+    try {
+        if (!(await _hasAdminSupport(req))) {
+            return res.status(403).json({ error: 'admin_support permission required' });
+        }
+        const orgId = await _actingOrgId(req);
+        const responses = await supportStore.listCannedResponses(orgId);
+        res.json({ responses });
+    } catch (err) {
+        console.error('[Support] GET /canned error:', err.message);
+        res.status(500).json({ error: 'Internal error' });
+    }
+});
+
+router.post('/canned', async (req, res) => {
+    try {
+        if (!(await _hasAdminSupport(req))) {
+            return res.status(403).json({ error: 'admin_support permission required' });
+        }
+        const title = (req.body?.title || '').toString().trim();
+        const body = (req.body?.body || '').toString();
+        if (!title) return res.status(400).json({ error: 'title required' });
+        if (!body.trim()) return res.status(400).json({ error: 'body required' });
+        if (body.length > 5000) return res.status(400).json({ error: 'body too long' });
+        const orgId = await _actingOrgId(req);
+        const created = await supportStore.createCannedResponse({
+            organizationId: orgId,
+            title,
+            body,
+            shortcut: (req.body?.shortcut || '').toString().trim() || null,
+            createdBy: getUserId(req),
+        });
+        res.json({ ok: true, response: created });
+    } catch (err) {
+        if (/duplicate key/i.test(err.message)) return res.status(409).json({ error: 'shortcut already in use' });
+        console.error('[Support] POST /canned error:', err.message);
+        res.status(500).json({ error: 'Internal error' });
+    }
+});
+
+router.put('/canned/:id', async (req, res) => {
+    try {
+        if (!(await _hasAdminSupport(req))) {
+            return res.status(403).json({ error: 'admin_support permission required' });
+        }
+        const orgId = await _actingOrgId(req);
+        const patch = {};
+        if (req.body?.title !== undefined) patch.title = req.body.title.toString();
+        if (req.body?.body !== undefined) patch.body = req.body.body.toString();
+        if (req.body?.shortcut !== undefined) patch.shortcut = req.body.shortcut;
+        const updated = await supportStore.updateCannedResponse(req.params.id, patch, orgId);
+        if (!updated) return res.status(404).json({ error: 'not found' });
+        res.json({ ok: true, response: updated });
+    } catch (err) {
+        console.error('[Support] PUT /canned/:id error:', err.message);
+        res.status(500).json({ error: 'Internal error' });
+    }
+});
+
+router.delete('/canned/:id', async (req, res) => {
+    try {
+        if (!(await _hasAdminSupport(req))) {
+            return res.status(403).json({ error: 'admin_support permission required' });
+        }
+        const orgId = await _actingOrgId(req);
+        const ok = await supportStore.deleteCannedResponse(req.params.id, orgId);
+        if (!ok) return res.status(404).json({ error: 'not found' });
+        res.json({ ok: true });
+    } catch (err) {
+        console.error('[Support] DELETE /canned/:id error:', err.message);
+        res.status(500).json({ error: 'Internal error' });
+    }
+});
+
+// POST /canned/:id/render — substitute thread variables server-side.
+// One-pass, plaintext, known keys only — no nested templates, no eval.
+router.post('/canned/:id/render', async (req, res) => {
+    try {
+        if (!(await _hasAdminSupport(req))) {
+            return res.status(403).json({ error: 'admin_support permission required' });
+        }
+        const canned = await supportStore.getCannedResponse(req.params.id);
+        if (!canned) return res.status(404).json({ error: 'not found' });
+        const thread = req.body?.threadId ? await supportStore.getThread(req.body.threadId) : null;
+        const rendered = renderCannedBody(canned.body, thread, req);
+        res.json({ rendered });
+    } catch (err) {
+        console.error('[Support] POST /canned/:id/render error:', err.message);
+        res.status(500).json({ error: 'Internal error' });
+    }
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// GET /insights — CSAT + SLA dashboard aggregates (staff)
+// ──────────────────────────────────────────────────────────────────────────
+router.get('/insights', async (req, res) => {
+    try {
+        if (!(await _hasAdminSupport(req))) {
+            return res.status(403).json({ error: 'admin_support permission required' });
+        }
+        const insights = await supportStore.getInsights();
+        res.json(insights);
+    } catch (err) {
+        console.error('[Support] GET /insights error:', err.message);
+        res.status(500).json({ error: 'Internal error' });
+    }
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// GET /csat/:threadId — PUBLIC. Records a CSAT vote or dispute via HMAC token.
+// Links live in the resolution email; no session required.
+// ──────────────────────────────────────────────────────────────────────────
+router.get('/csat/:threadId', threadReadLimiter, async (req, res) => {
+    try {
+        const { score, dispute, token } = req.query;
+        const thread = await supportStore.getThread(req.params.threadId);
+        if (!thread) return res.status(404).send(_csatHtml({ error: 'Thread not found.' }));
+
+        const numScore = dispute ? 0 : parseInt(score, 10);
+        if (!Number.isInteger(numScore) || numScore < 0 || numScore > 5) {
+            return res.status(400).send(_csatHtml({ error: 'Invalid request.' }));
+        }
+        if (!supportStore.verifyCsatToken(thread.id, thread.requester_email, numScore, token)) {
+            return res.status(403).send(_csatHtml({ error: 'This link is invalid or expired.' }));
+        }
+
+        if (dispute) {
+            await supportStore.disputeResolution(thread.id);
+            await supportStore.recordThreadEvent({
+                threadId: thread.id, actorUserId: null, actorKind: 'requester',
+                action: 'resolution_disputed', payload: {},
+            });
+            notifyStaff({
+                title: `Reopened by customer: ${thread.subject}`,
+                message: 'Customer indicated the issue was not resolved.',
+                threadId: thread.id,
+                category: 'urgent',
+            });
+            _emit('thread_updated', { threadId: thread.id });
+            return res.send(_csatHtml({ disputed: true }));
+        }
+
+        await supportStore.setCsat({ threadId: thread.id, score: numScore });
+        await supportStore.confirmResolution(thread.id);
+        await supportStore.recordThreadEvent({
+            threadId: thread.id, actorUserId: null, actorKind: 'requester',
+            action: 'csat', payload: { score: numScore },
+        });
+        _emit('thread_updated', { threadId: thread.id });
+        res.send(_csatHtml({ score: numScore }));
+    } catch (err) {
+        console.error(`[Support] GET /csat/:threadId error (id=${_shortId(req.params.threadId)}):`, err.message);
+        res.status(500).send(_csatHtml({ error: 'Something went wrong.' }));
+    }
+});
+
 // Exported so server/index.js can trigger SLA checks.
 module.exports = router;
 module.exports.supportEvents = supportEvents;
+module.exports.renderCannedBody = renderCannedBody;
 module.exports.notifyStaff = notifyStaff;

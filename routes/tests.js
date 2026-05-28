@@ -181,17 +181,21 @@ router.post('/runs', async (req, res) => {
             if (!suite) return res.status(404).json({ error: 'Suite not found' });
         }
 
-        if (await testRunStore.hasActiveRunForUser(req.session.user.id)) {
-            return res.status(409).json({
-                error: 'concurrent_run_limit',
-                message: 'You already have a test run in progress. Wait for it to finish before starting another.',
-            });
-        }
-
         // Resolve agent-mode source into a single instruction string before
         // the worker picks the row up. Doing it here keeps the worker simple
         // and lets the user see integration errors (missing GitHub / YouTrack
         // token) immediately via 422 instead of inside a streamed run.
+        // Whitelist credentials up-front (agent + suite modes accept them).
+        // The values never enter `metadata`/the DB — only the worker's memory.
+        let safeCreds = null;
+        if ((mode === 'agent' || mode === 'suite') && credentials && typeof credentials === 'object') {
+            const safe = {};
+            for (const k of ['username', 'email', 'password', 'totp']) {
+                if (typeof credentials[k] === 'string' && credentials[k].length > 0) safe[k] = credentials[k];
+            }
+            if (Object.keys(safe).length > 0) safeCreds = safe;
+        }
+
         let metadata = null;
         if (mode === 'agent') {
             const resolved = await _resolveAgentSource(source, req.session.user.id);
@@ -207,6 +211,10 @@ router.post('/runs', async (req, res) => {
                 metadata.maxSteps = Math.min(parsedSteps, 200);
             }
         }
+        // Record (not the value) that credentials were supplied, so the worker
+        // can fail a run whose secrets expired from memory while it sat queued,
+        // rather than silently attempting a broken login.
+        if (safeCreds) metadata = { ...(metadata || {}), expectsCredentials: true };
 
         const runId = await testRunStore.createRun({
             suiteId,
@@ -218,23 +226,31 @@ router.post('/runs', async (req, res) => {
         });
 
         // Per-run credentials live in worker memory only — never in `metadata`,
-        // never in the DB, never echoed back. Sanitise to whitelisted fields
-        // and toss the original object reference immediately.
-        if (mode === 'agent' && credentials && typeof credentials === 'object') {
-            const safe = {};
-            for (const k of ['username', 'email', 'password', 'totp']) {
-                if (typeof credentials[k] === 'string' && credentials[k].length > 0) {
-                    safe[k] = credentials[k];
-                }
-            }
-            if (Object.keys(safe).length > 0) testRunner.stashRunSecrets(runId, safe);
-        }
+        // never in the DB, never echoed back.
+        if (safeCreds) testRunner.stashRunSecrets(runId, safeCreds);
 
         // Fast-path: kick the worker once for this row so users don't wait
         // for the periodic tick. Errors are absorbed — the tick picks it up.
-        testRunner.drainOne(runId).catch(err => console.warn('[Tests] drainOne failed:', err.message));
+        // When a dedicated worker owns draining (PLAYWRIGHT_DRAIN_IN_API=false)
+        // the API must not run browser work itself; the worker's short tick
+        // picks the row up promptly instead.
+        if (process.env.PLAYWRIGHT_DRAIN_IN_API !== 'false') {
+            testRunner.drainOne(runId).catch(err => console.warn('[Tests] drainOne failed:', err.message));
+        }
 
-        res.json({ runId });
+        // Tell the UI whether this run will start now or wait for a free slot.
+        let queued = false;
+        try {
+            const caps = {
+                perUser: parseInt(process.env.PLAYWRIGHT_MAX_CONCURRENT_PER_USER || '3', 10),
+                org: parseInt(process.env.PLAYWRIGHT_MAX_CONCURRENT_PER_ORG || '5', 10),
+                global: parseInt(process.env.PLAYWRIGHT_MAX_CONCURRENT_GLOBAL || '6', 10),
+            };
+            const active = await testRunStore.countActiveByScope(req.session.user.id, req.session.user.organizationId || null);
+            queued = active.userActive >= caps.perUser || active.orgActive >= caps.org || active.globalActive >= caps.global;
+        } catch (_) { /* best-effort hint */ }
+
+        res.json({ runId, queued });
     } catch (err) {
         console.error('[Tests] create run failed:', err);
         res.status(500).json({ error: 'Failed to start test run' });
@@ -324,11 +340,48 @@ async function _resolveAgentSource(source, userId) {
 
 router.get('/runs/active', async (req, res) => {
     try {
-        const r = await testRunStore.getActiveRunForUser(req.session.user.id);
-        res.json({ run: r || null });
+        const runs = await testRunStore.listActiveRunsForUser(req.session.user.id);
+        // `run` (most-recent single) retained for backward compatibility.
+        res.json({ runs, run: runs[0] || null });
     } catch (err) {
-        console.error('[Tests] get active run failed:', err);
-        res.status(500).json({ error: 'Failed to fetch active run' });
+        console.error('[Tests] get active runs failed:', err);
+        res.status(500).json({ error: 'Failed to fetch active runs' });
+    }
+});
+
+// ── Insights ───────────────────────────────────────────────────────
+
+router.get('/insights/overview', async (req, res) => {
+    try {
+        const overview = await testRunStore.getInsightsOverview(req.session.user.id);
+        res.json(overview);
+    } catch (err) {
+        console.error('[Tests] insights overview failed:', err);
+        res.status(500).json({ error: 'Failed to fetch insights' });
+    }
+});
+
+router.get('/suites/:id/trends', async (req, res) => {
+    try {
+        const suite = await testSuiteStore.getSuite(req.params.id, req.session.user.id);
+        if (!suite) return res.status(404).json({ error: 'Suite not found' });
+        const trends = await testRunStore.getSuiteTrends(req.params.id, req.session.user.id);
+        res.json({ trends });
+    } catch (err) {
+        console.error('[Tests] suite trends failed:', err);
+        res.status(500).json({ error: 'Failed to fetch trends' });
+    }
+});
+
+router.get('/suites/:id/flakiness', async (req, res) => {
+    try {
+        const suite = await testSuiteStore.getSuite(req.params.id, req.session.user.id);
+        if (!suite) return res.status(404).json({ error: 'Suite not found' });
+        const flakiness = await testRunStore.getSuiteFlakiness(req.params.id, req.session.user.id);
+        res.json({ flakiness });
+    } catch (err) {
+        console.error('[Tests] suite flakiness failed:', err);
+        res.status(500).json({ error: 'Failed to fetch flakiness' });
     }
 });
 

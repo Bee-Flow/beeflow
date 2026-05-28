@@ -32,6 +32,11 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
     console.log(`[AgentRuntime] Using model: ${modelToUse} from provider: ${config.providerName || 'default'}`);
 
     const tools = await getAgentTools(agentId);
+    // Callers (e.g. the support auto-responder) may inject extra read-only
+    // tool schemas that aren't registered as agent components.
+    if (Array.isArray(userAuth?.extraTools) && userAuth.extraTools.length) {
+        tools.push(...userAuth.extraTools);
+    }
 
     // Load tool configs with fixed params
     const toolParamsMap = {};
@@ -223,6 +228,7 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
                             userAuth,
                             fixedParams: fixedParams,
                             agentId,
+                            supportThreadId: userAuth?.supportThreadId || null,
                         });
                     } catch (err) {
                         console.error(`[Agent] Tool execution failed for ${toolName}:`, err);

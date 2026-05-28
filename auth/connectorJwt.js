@@ -275,7 +275,10 @@ async function connectorJwtMiddleware(req, res, next) {
             // it identifies must belong to org X. Refusing here prevents a stolen
             // tenant key from being used to act on users in other tenants.
             console.warn(`[ConnectorJWT] Cross-tenant rejection: user ${user.id} (org=${user.organizationId}) presented org=${orgId}'s key`);
-            return res.status(403).json({ error: 'Token does not match user tenant' });
+            return res.status(403).json({
+                error: 'This Nextcloud is connected to a different Bee Flow organisation than your account. Ask an admin of your organisation to generate a pairing code (Settings → Organisation → Nextcloud Sync → "Pair a new Nextcloud") and re-pair this Nextcloud with it.',
+                code: 'NC_ORG_MISMATCH',
+            });
         }
         if (user.status === 'pending') {
             return res.status(403).json({ error: 'Account is pending admin approval' });

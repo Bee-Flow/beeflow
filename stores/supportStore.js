@@ -84,6 +84,84 @@ CREATE TABLE IF NOT EXISTS support_messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_support_messages_thread ON support_messages(thread_id, created_at);
+
+-- iteration 4: full ticket-system fields — tags/category, SLA timers, CSAT,
+-- and auto-assignment. All additive so existing rows keep working.
+ALTER TABLE support_threads ADD COLUMN IF NOT EXISTS tags JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE support_threads ADD COLUMN IF NOT EXISTS category TEXT;
+ALTER TABLE support_threads ADD COLUMN IF NOT EXISTS sla_first_response_due_at TIMESTAMPTZ;
+ALTER TABLE support_threads ADD COLUMN IF NOT EXISTS sla_resolution_due_at TIMESTAMPTZ;
+ALTER TABLE support_threads ADD COLUMN IF NOT EXISTS sla_first_response_breached_at TIMESTAMPTZ;
+ALTER TABLE support_threads ADD COLUMN IF NOT EXISTS sla_resolution_breached_at TIMESTAMPTZ;
+ALTER TABLE support_threads ADD COLUMN IF NOT EXISTS sla_paused BOOLEAN DEFAULT false;
+ALTER TABLE support_threads ADD COLUMN IF NOT EXISTS csat_score SMALLINT
+    CHECK (csat_score IS NULL OR (csat_score >= 1 AND csat_score <= 5));
+ALTER TABLE support_threads ADD COLUMN IF NOT EXISTS csat_comment TEXT;
+ALTER TABLE support_threads ADD COLUMN IF NOT EXISTS csat_at TIMESTAMPTZ;
+ALTER TABLE support_threads ADD COLUMN IF NOT EXISTS resolution_confirmed_at TIMESTAMPTZ;
+ALTER TABLE support_threads ADD COLUMN IF NOT EXISTS resolution_disputed_at TIMESTAMPTZ;
+ALTER TABLE support_threads ADD COLUMN IF NOT EXISTS auto_assigned BOOLEAN DEFAULT false;
+
+CREATE INDEX IF NOT EXISTS idx_support_threads_tags ON support_threads USING GIN (tags);
+CREATE INDEX IF NOT EXISTS idx_support_threads_sla_first
+    ON support_threads(sla_first_response_due_at)
+    WHERE sla_first_response_breached_at IS NULL
+      AND status IN ('open','ai_responding','awaiting_user','awaiting_agent');
+CREATE INDEX IF NOT EXISTS idx_support_threads_sla_res
+    ON support_threads(sla_resolution_due_at)
+    WHERE sla_resolution_breached_at IS NULL
+      AND status NOT IN ('resolved','closed');
+CREATE INDEX IF NOT EXISTS idx_support_threads_csat ON support_threads(csat_at);
+
+-- Canned responses: org-scoped templates (NULL organization_id = system-wide).
+CREATE TABLE IF NOT EXISTS support_canned_responses (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id TEXT,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    shortcut TEXT,
+    created_by TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_support_canned_org ON support_canned_responses(organization_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_support_canned_shortcut
+    ON support_canned_responses(COALESCE(organization_id, '__system__'), shortcut)
+    WHERE shortcut IS NOT NULL;
+
+-- SLA policies: per org × priority. NULL organization_id = global default.
+CREATE TABLE IF NOT EXISTS support_sla_policies (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id TEXT,
+    priority TEXT NOT NULL CHECK (priority IN ('low','normal','high','urgent')),
+    first_response_minutes INT NOT NULL,
+    resolution_minutes INT NOT NULL,
+    enabled BOOLEAN DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_sla_global ON support_sla_policies(priority) WHERE organization_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_sla_org ON support_sla_policies(organization_id, priority) WHERE organization_id IS NOT NULL;
+
+-- Tag taxonomy: org catalogue of tag name + colour, for consistent UI.
+-- Actual thread tags stay denormalised as JSONB on support_threads.
+CREATE TABLE IF NOT EXISTS support_tag_taxonomy (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id TEXT,
+    name TEXT NOT NULL,
+    color TEXT,
+    description TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_tag_org_name
+    ON support_tag_taxonomy(COALESCE(organization_id, '__system__'), LOWER(name));
+
+-- Round-robin cursor per org for auto-assignment ('__global__' for unscoped).
+CREATE TABLE IF NOT EXISTS support_assignment_state (
+    organization_id TEXT PRIMARY KEY,
+    last_assignee_user_id TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 `;
 
 let initialized = false;
@@ -222,10 +300,20 @@ async function updateThread(id, patch = {}) {
     const allowed = [
         'status', 'priority', 'assignee_user_id', 'ai_handled', 'ai_escalated_reason',
         'first_response_at', 'resolved_at', 'last_message_at', 'subject',
+        'category', 'auto_assigned', 'sla_paused',
+        'sla_first_response_due_at', 'sla_resolution_due_at',
+        'sla_first_response_breached_at', 'sla_resolution_breached_at',
+        'resolution_confirmed_at', 'resolution_disputed_at',
     ];
+    const effective = { ...patch };
+    // The SLA clock pauses while waiting on the customer. Derive it from the
+    // status transition unless the caller set sla_paused explicitly.
+    if (effective.status !== undefined && effective.sla_paused === undefined) {
+        effective.sla_paused = effective.status === 'awaiting_user';
+    }
     const sets = [];
     const params = [];
-    for (const [k, v] of Object.entries(patch)) {
+    for (const [k, v] of Object.entries(effective)) {
         if (!allowed.includes(k)) continue;
         params.push(v);
         sets.push(`${k} = $${params.length}`);
@@ -380,6 +468,396 @@ async function findSlaAtRiskThreads({ olderThanMinutes = 60 } = {}) {
     return rows;
 }
 
+// ── Tags & category ────────────────────────────────────────────────────────
+
+/**
+ * Replace a thread's tags. Normalises to lowercase, trims, dedupes, caps at 10.
+ */
+async function setThreadTags(threadId, tags = []) {
+    await initDB();
+    const clean = [...new Set(
+        (Array.isArray(tags) ? tags : [])
+            .map(t => String(t || '').trim())
+            .filter(Boolean)
+    )].slice(0, 10);
+    const { rows } = await pool.query(
+        `UPDATE support_threads SET tags = $2::jsonb, updated_at = now() WHERE id = $1 RETURNING *`,
+        [threadId, JSON.stringify(clean)]
+    );
+    return rows[0] || null;
+}
+
+/**
+ * Add a single tag to a thread without removing existing ones (cap 10).
+ */
+async function addThreadTag(threadId, tag) {
+    await initDB();
+    const t = String(tag || '').trim();
+    if (!t) return getThread(threadId);
+    const thread = await getThread(threadId);
+    if (!thread) return null;
+    const existing = Array.isArray(thread.tags) ? thread.tags : [];
+    return setThreadTags(threadId, [...existing, t]);
+}
+
+// ── Tag taxonomy CRUD ────────────────────────────────────────────────────────
+
+async function listTags(organizationId = null) {
+    await initDB();
+    // Org-scoped tags plus system-wide (NULL org) tags.
+    const { rows } = await pool.query(
+        `SELECT * FROM support_tag_taxonomy
+          WHERE organization_id IS NULL OR organization_id = $1
+          ORDER BY LOWER(name) ASC`,
+        [organizationId]
+    );
+    return rows;
+}
+
+async function createTag({ organizationId = null, name, color = null, description = null }) {
+    await initDB();
+    if (!name || !name.trim()) throw new Error('tag name required');
+    const { rows } = await pool.query(
+        `INSERT INTO support_tag_taxonomy (organization_id, name, color, description)
+         VALUES ($1,$2,$3,$4) RETURNING *`,
+        [organizationId, name.trim(), color, description]
+    );
+    return rows[0];
+}
+
+async function deleteTag(id, organizationId = null) {
+    await initDB();
+    const { rowCount } = await pool.query(
+        `DELETE FROM support_tag_taxonomy
+          WHERE id = $1 AND (organization_id IS NOT DISTINCT FROM $2)`,
+        [id, organizationId]
+    );
+    return rowCount > 0;
+}
+
+// ── SLA policies ─────────────────────────────────────────────────────────────
+
+/**
+ * Resolve the SLA policy for an org+priority, falling back to the global
+ * (NULL-org) policy when no org-specific one exists.
+ */
+async function getSlaPolicy(organizationId, priority) {
+    await initDB();
+    const { rows } = await pool.query(
+        `SELECT * FROM support_sla_policies
+          WHERE priority = $2
+            AND (organization_id = $1 OR organization_id IS NULL)
+          ORDER BY (organization_id IS NULL) ASC
+          LIMIT 1`,
+        [organizationId, priority]
+    );
+    return rows[0] || null;
+}
+
+async function listSlaPolicies(organizationId = null) {
+    await initDB();
+    const { rows } = await pool.query(
+        `SELECT * FROM support_sla_policies
+          WHERE organization_id IS NULL OR organization_id = $1
+          ORDER BY (organization_id IS NULL) DESC,
+                   array_position(ARRAY['urgent','high','normal','low'], priority)`,
+        [organizationId]
+    );
+    return rows;
+}
+
+async function upsertSlaPolicy({ organizationId = null, priority, firstResponseMinutes, resolutionMinutes, enabled = true }) {
+    await initDB();
+    if (!['low', 'normal', 'high', 'urgent'].includes(priority)) throw new Error('invalid priority');
+    // Partial unique indices differ by NULL-ness, so branch the conflict target.
+    if (organizationId == null) {
+        const { rows } = await pool.query(
+            `INSERT INTO support_sla_policies
+                (organization_id, priority, first_response_minutes, resolution_minutes, enabled)
+             VALUES (NULL, $1, $2, $3, $4)
+             ON CONFLICT (priority) WHERE organization_id IS NULL
+             DO UPDATE SET first_response_minutes = EXCLUDED.first_response_minutes,
+                           resolution_minutes = EXCLUDED.resolution_minutes,
+                           enabled = EXCLUDED.enabled, updated_at = now()
+             RETURNING *`,
+            [priority, firstResponseMinutes, resolutionMinutes, enabled]
+        );
+        return rows[0];
+    }
+    const { rows } = await pool.query(
+        `INSERT INTO support_sla_policies
+            (organization_id, priority, first_response_minutes, resolution_minutes, enabled)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (organization_id, priority) WHERE organization_id IS NOT NULL
+         DO UPDATE SET first_response_minutes = EXCLUDED.first_response_minutes,
+                       resolution_minutes = EXCLUDED.resolution_minutes,
+                       enabled = EXCLUDED.enabled, updated_at = now()
+         RETURNING *`,
+        [organizationId, priority, firstResponseMinutes, resolutionMinutes, enabled]
+    );
+    return rows[0];
+}
+
+// ── Canned responses ─────────────────────────────────────────────────────────
+
+async function listCannedResponses(organizationId = null) {
+    await initDB();
+    const { rows } = await pool.query(
+        `SELECT * FROM support_canned_responses
+          WHERE organization_id IS NULL OR organization_id = $1
+          ORDER BY title ASC`,
+        [organizationId]
+    );
+    return rows;
+}
+
+async function getCannedResponse(id) {
+    await initDB();
+    const { rows } = await pool.query(`SELECT * FROM support_canned_responses WHERE id = $1`, [id]);
+    return rows[0] || null;
+}
+
+async function createCannedResponse({ organizationId = null, title, body, shortcut = null, createdBy = null }) {
+    await initDB();
+    if (!title || !title.trim()) throw new Error('title required');
+    if (!body || !body.trim()) throw new Error('body required');
+    const { rows } = await pool.query(
+        `INSERT INTO support_canned_responses (organization_id, title, body, shortcut, created_by)
+         VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+        [organizationId, title.trim(), body, shortcut ? shortcut.trim() : null, createdBy]
+    );
+    return rows[0];
+}
+
+async function updateCannedResponse(id, { title, body, shortcut }, organizationId = null) {
+    await initDB();
+    const sets = [];
+    const params = [];
+    if (title !== undefined) { params.push(title.trim()); sets.push(`title = $${params.length}`); }
+    if (body !== undefined) { params.push(body); sets.push(`body = $${params.length}`); }
+    if (shortcut !== undefined) { params.push(shortcut ? shortcut.trim() : null); sets.push(`shortcut = $${params.length}`); }
+    if (!sets.length) return getCannedResponse(id);
+    sets.push(`updated_at = now()`);
+    params.push(id);
+    params.push(organizationId);
+    const { rows } = await pool.query(
+        `UPDATE support_canned_responses SET ${sets.join(', ')}
+          WHERE id = $${params.length - 1} AND (organization_id IS NOT DISTINCT FROM $${params.length})
+          RETURNING *`,
+        params
+    );
+    return rows[0] || null;
+}
+
+async function deleteCannedResponse(id, organizationId = null) {
+    await initDB();
+    const { rowCount } = await pool.query(
+        `DELETE FROM support_canned_responses
+          WHERE id = $1 AND (organization_id IS NOT DISTINCT FROM $2)`,
+        [id, organizationId]
+    );
+    return rowCount > 0;
+}
+
+// ── SLA timers ───────────────────────────────────────────────────────────────
+
+async function setThreadSla(threadId, { firstDueAt = null, resolutionDueAt = null }) {
+    await initDB();
+    const { rows } = await pool.query(
+        `UPDATE support_threads
+            SET sla_first_response_due_at = $2,
+                sla_resolution_due_at = $3,
+                updated_at = now()
+          WHERE id = $1 RETURNING *`,
+        [threadId, firstDueAt, resolutionDueAt]
+    );
+    return rows[0] || null;
+}
+
+// ── CSAT & resolution confirmation ──────────────────────────────────────────
+
+function buildCsatToken(threadId, email, score) {
+    const h = crypto.createHmac('sha256', _secret());
+    // 'csat:' purpose-prefix prevents replay of a thread access token as a vote,
+    // and including the score stops URL-tampering 4★ → 5★.
+    h.update(`csat:${threadId}:${(email || '').toLowerCase()}:${score}`);
+    return h.digest('hex').slice(0, 32);
+}
+
+function verifyCsatToken(threadId, email, score, token) {
+    if (!token || typeof token !== 'string') return false;
+    const expected = buildCsatToken(threadId, email, score);
+    const expectedBuf = Buffer.from(expected, 'utf8');
+    const candidateBuf = Buffer.alloc(expectedBuf.length, 0);
+    Buffer.from(token, 'utf8').copy(candidateBuf, 0, 0, expectedBuf.length);
+    return crypto.timingSafeEqual(candidateBuf, expectedBuf) && token.length === expected.length;
+}
+
+async function setCsat({ threadId, score, comment = null }) {
+    await initDB();
+    const { rows } = await pool.query(
+        `UPDATE support_threads
+            SET csat_score = $2, csat_comment = COALESCE($3, csat_comment),
+                csat_at = now(), updated_at = now()
+          WHERE id = $1 RETURNING *`,
+        [threadId, score, comment]
+    );
+    return rows[0] || null;
+}
+
+async function confirmResolution(threadId) {
+    await initDB();
+    const { rows } = await pool.query(
+        `UPDATE support_threads
+            SET resolution_confirmed_at = now(), updated_at = now()
+          WHERE id = $1 RETURNING *`,
+        [threadId]
+    );
+    return rows[0] || null;
+}
+
+async function disputeResolution(threadId) {
+    await initDB();
+    const { rows } = await pool.query(
+        `UPDATE support_threads
+            SET resolution_disputed_at = now(),
+                status = 'awaiting_agent',
+                resolved_at = NULL,
+                updated_at = now()
+          WHERE id = $1 RETURNING *`,
+        [threadId]
+    );
+    return rows[0] || null;
+}
+
+// ── SLA enforcement queries ─────────────────────────────────────────────────
+
+/**
+ * Atomically flag first-response SLA breaches. Returns the rows just flagged
+ * so the caller can notify. Idempotent: the WHERE clause excludes already-flagged.
+ */
+async function flagFirstResponseBreaches() {
+    await initDB();
+    const { rows } = await pool.query(
+        `UPDATE support_threads
+            SET sla_first_response_breached_at = now(), updated_at = now()
+          WHERE sla_first_response_breached_at IS NULL
+            AND sla_first_response_due_at IS NOT NULL
+            AND sla_first_response_due_at < now()
+            AND first_response_at IS NULL
+            AND status NOT IN ('resolved','closed')
+            AND sla_paused = false
+          RETURNING id, subject, assignee_user_id, requester_email, organization_id`
+    );
+    return rows;
+}
+
+async function flagResolutionBreaches() {
+    await initDB();
+    const { rows } = await pool.query(
+        `UPDATE support_threads
+            SET sla_resolution_breached_at = now(), updated_at = now()
+          WHERE sla_resolution_breached_at IS NULL
+            AND sla_resolution_due_at IS NOT NULL
+            AND sla_resolution_due_at < now()
+            AND status NOT IN ('resolved','closed')
+            AND sla_paused = false
+          RETURNING id, subject, assignee_user_id, requester_email, organization_id`
+    );
+    return rows;
+}
+
+// ── Auto-assignment round-robin ──────────────────────────────────────────────
+
+/**
+ * Atomically advance the round-robin cursor for an org and return the next
+ * assignee from `candidateUserIds` (ordered list). Serialised per-org via
+ * SELECT … FOR UPDATE so concurrent escalations don't double-assign.
+ */
+async function getAndAdvanceRoundRobin(organizationId, candidateUserIds = []) {
+    await initDB();
+    if (!candidateUserIds.length) return null;
+    const key = organizationId || '__global__';
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const { rows } = await client.query(
+            `SELECT last_assignee_user_id FROM support_assignment_state
+              WHERE organization_id = $1 FOR UPDATE`,
+            [key]
+        );
+        const last = rows[0]?.last_assignee_user_id || null;
+        const lastIdx = candidateUserIds.indexOf(last);
+        const next = candidateUserIds[(lastIdx + 1) % candidateUserIds.length];
+        await client.query(
+            `INSERT INTO support_assignment_state (organization_id, last_assignee_user_id, updated_at)
+             VALUES ($1, $2, now())
+             ON CONFLICT (organization_id)
+             DO UPDATE SET last_assignee_user_id = EXCLUDED.last_assignee_user_id, updated_at = now()`,
+            [key, next]
+        );
+        await client.query('COMMIT');
+        return next;
+    } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+    } finally {
+        client.release();
+    }
+}
+
+// ── Insights / dashboard aggregates ─────────────────────────────────────────
+
+async function getInsights({ organizationId = null } = {}) {
+    await initDB();
+    const orgFilter = organizationId ? `AND organization_id = $1` : '';
+    const params = organizationId ? [organizationId] : [];
+
+    const csat = await pool.query(
+        `SELECT
+            AVG(csat_score) FILTER (WHERE csat_at > now() - interval '7 days')::numeric(3,2)  AS avg_7d,
+            AVG(csat_score) FILTER (WHERE csat_at > now() - interval '30 days')::numeric(3,2) AS avg_30d,
+            COUNT(*) FILTER (WHERE csat_score IS NOT NULL)                                    AS responses,
+            COUNT(*) FILTER (WHERE status = 'resolved')                                       AS resolved_total
+         FROM support_threads WHERE 1=1 ${orgFilter}`,
+        params
+    );
+
+    const handling = await pool.query(
+        `SELECT
+            COUNT(*) FILTER (WHERE ai_handled = true AND ai_escalated_reason IS NULL AND status IN ('resolved','closed','awaiting_user')) AS ai_resolved,
+            COUNT(*) FILTER (WHERE status IN ('resolved','closed') AND (ai_escalated_reason IS NOT NULL OR ai_handled = false))            AS staff_resolved,
+            COUNT(*) FILTER (WHERE sla_first_response_breached_at IS NOT NULL OR sla_resolution_breached_at IS NOT NULL)                   AS sla_breaches,
+            COUNT(*) AS total,
+            EXTRACT(EPOCH FROM AVG(first_response_at - created_at) FILTER (WHERE first_response_at IS NOT NULL)) AS avg_first_response_secs,
+            EXTRACT(EPOCH FROM AVG(resolved_at - created_at) FILTER (WHERE resolved_at IS NOT NULL))             AS avg_resolution_secs
+         FROM support_threads WHERE 1=1 ${orgFilter}`,
+        params
+    );
+
+    const c = csat.rows[0] || {};
+    const h = handling.rows[0] || {};
+    const respondedRate = Number(c.resolved_total) > 0
+        ? Number(c.responses) / Number(c.resolved_total)
+        : 0;
+    return {
+        csat: {
+            avg7d: c.avg_7d != null ? Number(c.avg_7d) : null,
+            avg30d: c.avg_30d != null ? Number(c.avg_30d) : null,
+            responses: Number(c.responses) || 0,
+            responseRate: Number(respondedRate.toFixed(3)),
+        },
+        handling: {
+            aiResolved: Number(h.ai_resolved) || 0,
+            staffResolved: Number(h.staff_resolved) || 0,
+            slaBreaches: Number(h.sla_breaches) || 0,
+            total: Number(h.total) || 0,
+            avgFirstResponseSecs: h.avg_first_response_secs != null ? Math.round(Number(h.avg_first_response_secs)) : null,
+            avgResolutionSecs: h.avg_resolution_secs != null ? Math.round(Number(h.avg_resolution_secs)) : null,
+        },
+    };
+}
+
 module.exports = {
     initDB,
     createThread,
@@ -396,4 +874,28 @@ module.exports = {
     setMessageEmailStatus,
     recordThreadEvent,
     listThreadEvents,
+    // iteration 4
+    setThreadTags,
+    addThreadTag,
+    listTags,
+    createTag,
+    deleteTag,
+    getSlaPolicy,
+    listSlaPolicies,
+    upsertSlaPolicy,
+    listCannedResponses,
+    getCannedResponse,
+    createCannedResponse,
+    updateCannedResponse,
+    deleteCannedResponse,
+    setThreadSla,
+    buildCsatToken,
+    verifyCsatToken,
+    setCsat,
+    confirmResolution,
+    disputeResolution,
+    flagFirstResponseBreaches,
+    flagResolutionBreaches,
+    getAndAdvanceRoundRobin,
+    getInsights,
 };

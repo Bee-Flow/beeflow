@@ -48,8 +48,11 @@ them:
 - Do NOT add `await page.waitForTimeout(...)` "just in case". Use
   `expect.toHaveText` / `toBeVisible` instead — they wait correctly.
 - Do NOT hard-code credentials, API keys or fixtures that are not present in
-  the input. If a test needs credentials, mark it `test.skip(...)` with a
-  comment explaining what's needed.
+  the input. If a test needs a login, read credentials from the environment:
+  `process.env.BF_USERNAME`, `process.env.BF_PASSWORD`, `process.env.BF_EMAIL`,
+  `process.env.BF_TOTP` (the runner injects these securely at run-time when the
+  user supplies them). Guard with `test.skip(!process.env.BF_PASSWORD, '…')` so
+  the test self-skips when no credentials were provided rather than failing.
 - Keep the file under ~250 lines. If sources imply more, write the most
   load-bearing tests first.
 

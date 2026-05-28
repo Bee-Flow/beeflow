@@ -26,6 +26,7 @@ const crypto = require('crypto');
 
 const testRunStore = require('../stores/testRunStore');
 const testSuiteStore = require('../stores/testSuiteStore');
+const pwtRunner = require('../services/pwtRunner');
 
 // ── Per-run secrets (in-memory only) ──────────────────────────────
 // Credentials for agent runs live here for the run's lifetime and are
@@ -47,11 +48,63 @@ function takeRunSecrets(runId) {
     return s;
 }
 
-const BATCH_SIZE = parseInt(process.env.PLAYWRIGHT_RUN_BATCH_SIZE || '2', 10);
 const HARD_FAIL_DAYS = 14;
 const PLAYWRIGHT_TIMEOUT_MS = parseInt(process.env.PLAYWRIGHT_TEST_TIMEOUT_MS || '300000', 10); // 5 min
 const EXPLORE_MAX_STEPS = parseInt(process.env.PLAYWRIGHT_EXPLORE_MAX_STEPS || '25', 10);
 const WORKER_ID = `tr-${process.pid}-${crypto.randomBytes(3).toString('hex')}`;
+
+// ── Concurrency caps ───────────────────────────────────────────────
+// Runs that would exceed a cap stay `queued` and are claimed once a slot
+// frees. The global cap doubles as the container-pool size.
+const MAX_PER_USER = parseInt(process.env.PLAYWRIGHT_MAX_CONCURRENT_PER_USER || '3', 10);
+const MAX_PER_ORG = parseInt(process.env.PLAYWRIGHT_MAX_CONCURRENT_PER_ORG || '5', 10);
+const MAX_GLOBAL = parseInt(process.env.PLAYWRIGHT_MAX_CONCURRENT_GLOBAL || '6', 10);
+
+// ── Execution mode ─────────────────────────────────────────────────
+// 'container' → each run in a throwaway, network-isolated docker container.
+// 'host'      → legacy in-process / spawn execution (unsandboxed fallback).
+// 'auto'      → container if a docker socket is present; else host on
+//               self-hosted, hard error on cloud (never run untrusted
+//               browsers in the API/worker process on cloud).
+const RUNNER_MODE = (process.env.PLAYWRIGHT_RUNNER_MODE || 'auto').toLowerCase();
+const DEPLOYMENT_MODE = (process.env.DEPLOYMENT_MODE || 'cloud').toLowerCase();
+
+async function resolveExecMode() {
+    const dockerOk = await pwtRunner.dockerAvailable();
+    if (RUNNER_MODE === 'host') return 'host';
+    if (RUNNER_MODE === 'container') return dockerOk ? 'container' : 'error';
+    // auto
+    if (dockerOk) return 'container';
+    return DEPLOYMENT_MODE === 'cloud' ? 'error' : 'host';
+}
+
+// Base dir for the suite spec tempdir. When the worker is containerized the
+// bind path must be valid on the HOST, so we use a workdir that compose mounts
+// at an identical path on both sides. Native workers just use os.tmpdir().
+function runnerWorkdirBase() {
+    if (pwtRunner.isServerInContainer()) {
+        return process.env.PLAYWRIGHT_RUNNER_WORKDIR || '/var/lib/beeflow/pwt';
+    }
+    return process.env.PLAYWRIGHT_RUNNER_WORKDIR || os.tmpdir();
+}
+
+function buildPlaywrightConfig({ baseURL, testDir, reportPath }) {
+    return `import { defineConfig } from '@playwright/test';
+export default defineConfig({
+    testDir: ${JSON.stringify(testDir)},
+    timeout: 30_000,
+    reporter: [['json', { outputFile: ${JSON.stringify(reportPath)} }]],
+    use: {
+        baseURL: ${JSON.stringify(baseURL)},
+        screenshot: 'only-on-failure',
+        trace: 'retain-on-failure',
+    },
+    workers: 1,
+});
+`;
+}
+
+const EXPLORE_BROWSER_ARGS = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'];
 
 // ── SSRF guard: block targets that resolve into RFC1918, loopback, link-
 //    local, or private IPv6 ranges. Defence in depth — a malicious user
@@ -94,7 +147,7 @@ function ensureImports(code) {
     return SPEC_HEADER + code;
 }
 
-async function runSuiteMode({ runId, suiteId, targetUrl, userId }) {
+async function runSuiteMode({ runId, suiteId, targetUrl, userId, execMode = 'host', credentials = null }) {
     if (!suiteId) {
         return { status: 'error', error: 'Suite run requested without a suiteId.' };
     }
@@ -106,33 +159,153 @@ async function runSuiteMode({ runId, suiteId, targetUrl, userId }) {
         return { status: 'error', error: 'Suite has no Playwright code. Generate the suite first.' };
     }
 
+    if (execMode === 'container') {
+        return runSuiteModeContainer({ runId, targetUrl, code: suite.playwrightCode, userId, credentials });
+    }
+    return runSuiteModeHost({ runId, targetUrl, code: suite.playwrightCode, credentials });
+}
+
+// Map per-run credentials to BF_*-prefixed env the Playwright code can read.
+// Never logged; passed straight to the container/child env.
+function credentialEnv(credentials) {
+    if (!credentials || typeof credentials !== 'object') return {};
+    const env = {};
+    if (credentials.username) env.BF_USERNAME = String(credentials.username);
+    if (credentials.email) env.BF_EMAIL = String(credentials.email);
+    if (credentials.password) env.BF_PASSWORD = String(credentials.password);
+    if (credentials.totp) env.BF_TOTP = String(credentials.totp);
+    return env;
+}
+
+// Collect Playwright JSON-report attachments (screenshots / traces / videos)
+// and persist them as run artifacts so the UI can render them in the failure
+// view. `tmpRoot` is the host-side workdir; container paths are rooted at /work,
+// which maps to tmpRoot. Best-effort: never fails the run.
+async function uploadSuiteArtifacts({ runId, userId, report, tmpRoot }) {
+    if (!report || !userId) return;
+    let storageStore;
+    try { storageStore = require('../stores/storageStore'); } catch (_) { return; }
+    if (typeof storageStore.isAvailable === 'function' && !storageStore.isAvailable()) return;
+
+    const attachments = [];
+    const visit = (s) => {
+        if (!s) return;
+        for (const spec of (s.specs || [])) {
+            for (const tcase of (spec.tests || [])) {
+                for (const r of (tcase.results || [])) {
+                    for (const a of (r.attachments || [])) {
+                        if (a?.path) attachments.push(a);
+                    }
+                }
+            }
+        }
+        (s.suites || []).forEach(visit);
+    };
+    (report.suites || []).forEach(visit);
+
+    const kindFor = (a) => {
+        const ct = a.contentType || '';
+        if (a.name === 'trace' || /zip/.test(ct)) return 'trace';
+        if (/video/.test(ct)) return 'video';
+        return 'screenshot';
+    };
+
+    for (const a of attachments.slice(0, 20)) {
+        try {
+            // Map the container path (/work/...) onto the host workdir.
+            const rel = a.path.startsWith('/work/') ? a.path.slice('/work/'.length) : path.basename(a.path);
+            const filePath = path.join(tmpRoot, rel);
+            const buf = await fs.promises.readFile(filePath);
+            const kind = kindFor(a);
+            const key = storageStore.buildKey(userId, 'test-artifacts', `${runId}-${path.basename(a.path)}`);
+            await storageStore.uploadFile(key, buf, a.contentType || 'application/octet-stream');
+            await testRunStore.addArtifact(runId, { kind, storageKey: key, mimeType: a.contentType || null, sizeBytes: buf.length });
+        } catch (_) { /* skip this attachment */ }
+    }
+}
+
+// Container path: write spec to a shared-workdir tempdir, run it in a
+// throwaway runner container, read report.json back. No host env leaks in.
+async function runSuiteModeContainer({ runId, targetUrl, code, userId, credentials = null }) {
+    const base = runnerWorkdirBase();
+    await fs.promises.mkdir(base, { recursive: true }).catch(() => {});
+    const tmpRoot = await fs.promises.mkdtemp(path.join(base, 'bf-pwt-'));
+    const specDir = path.join(tmpRoot, 'tests');
+    await fs.promises.mkdir(specDir, { recursive: true });
+    await fs.promises.writeFile(path.join(specDir, 'generated.spec.ts'), ensureImports(code), 'utf-8');
+    await fs.promises.writeFile(
+        path.join(tmpRoot, 'playwright.config.ts'),
+        buildPlaywrightConfig({ baseURL: targetUrl, testDir: '/work/tests', reportPath: '/work/report.json' }),
+        'utf-8',
+    );
+
+    // Poll for cancellation and kill the container if the user cancels.
+    const cancelPoll = setInterval(() => {
+        if (testRunStore.isCancelRequested(runId)) pwtRunner.killRun(runId).catch(() => {});
+    }, 2000);
+    cancelPoll.unref?.();
+
+    let result;
+    try {
+        result = await pwtRunner.runSuiteContainer({
+            runId,
+            workdir: tmpRoot,
+            baseUrl: targetUrl,
+            secretEnv: credentialEnv(credentials),
+            onLine: (line) => testRunStore.appendProgress(runId, line).catch(() => {}),
+            timeoutMs: PLAYWRIGHT_TIMEOUT_MS,
+        });
+    } catch (e) {
+        fs.promises.rm(tmpRoot, { recursive: true, force: true }).catch(() => {});
+        return { status: 'error', error: `runner_failed: ${e.message}` };
+    }
+
+    let report = null;
+    try {
+        report = JSON.parse(await fs.promises.readFile(path.join(tmpRoot, 'report.json'), 'utf-8'));
+    } catch (_) { /* OOM / timeout / crash — no report */ }
+
+    // Persist failure artifacts (screenshots/traces) before cleaning up.
+    await uploadSuiteArtifacts({ runId, userId, report, tmpRoot }).catch(() => {});
+    fs.promises.rm(tmpRoot, { recursive: true, force: true }).catch(() => {});
+
+    const json = buildReportFromPlaywright({
+        report,
+        targetUrl,
+        stdoutTail: '',
+        exitCode: result.exitCode,
+    });
+    if (result.timedOut) {
+        return { status: 'error', error: `Run exceeded ${PLAYWRIGHT_TIMEOUT_MS}ms and was stopped.`, reportJson: json };
+    }
+    const failed = json.summary.failed || 0;
+    const passed = json.summary.passed || 0;
+    const status = result.exitCode === 0 && failed === 0 && passed >= 0 ? 'passed' :
+                   (failed > 0 ? 'failed' : 'error');
+    return { status, reportJson: json };
+}
+
+// Host path: legacy in-process spawn. Used only when no docker socket is
+// available on a self-hosted install. Inherits the worker env (unsandboxed) —
+// container mode is strongly preferred.
+async function runSuiteModeHost({ runId, targetUrl, code, credentials = null }) {
     const tmpRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'bf-pwt-'));
     const specDir = path.join(tmpRoot, 'tests');
     await fs.promises.mkdir(specDir, { recursive: true });
     const specPath = path.join(specDir, 'generated.spec.ts');
-    await fs.promises.writeFile(specPath, ensureImports(suite.playwrightCode), 'utf-8');
+    await fs.promises.writeFile(specPath, ensureImports(code), 'utf-8');
 
     const configPath = path.join(tmpRoot, 'playwright.config.ts');
-    const baseURL = targetUrl;
-    const configBody = `import { defineConfig } from '@playwright/test';
-export default defineConfig({
-    testDir: './tests',
-    timeout: 30_000,
-    reporter: [['json', { outputFile: 'report.json' }]],
-    use: {
-        baseURL: ${JSON.stringify(baseURL)},
-        screenshot: 'only-on-failure',
-        trace: 'retain-on-failure',
-    },
-    workers: 1,
-});
-`;
-    await fs.promises.writeFile(configPath, configBody, 'utf-8');
+    await fs.promises.writeFile(
+        configPath,
+        buildPlaywrightConfig({ baseURL: targetUrl, testDir: './tests', reportPath: 'report.json' }),
+        'utf-8',
+    );
 
     return await new Promise((resolve) => {
         const child = spawn('npx', ['playwright', 'test', '--config', configPath], {
             cwd: tmpRoot,
-            env: { ...process.env, CI: '1' },
+            env: { ...process.env, CI: '1', ...credentialEnv(credentials) },
             shell: false,
         });
 
@@ -270,7 +443,7 @@ function formatDuration(ms) {
 
 // ── Explore-mode execution ────────────────────────────────────────
 
-async function runExploreMode({ runId, targetUrl, userId }) {
+async function runExploreMode({ runId, targetUrl, userId, execMode = 'host' }) {
     let chromium;
     try {
         ({ chromium } = require('playwright'));
@@ -279,12 +452,17 @@ async function runExploreMode({ runId, targetUrl, userId }) {
     }
 
     const findings = [];
-    let browser, ctx, page;
+    let browser, ctx, page, serve = null;
     try {
-        browser = await chromium.launch({
-            headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-        });
+        if (execMode === 'container') {
+            serve = await pwtRunner.startServeContainer({
+                runId,
+                onLine: (line) => testRunStore.appendProgress(runId, line).catch(() => {}),
+            });
+            browser = await chromium.connect(serve.wsEndpoint);
+        } else {
+            browser = await chromium.launch({ headless: true, args: EXPLORE_BROWSER_ARGS });
+        }
         ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
         page = await ctx.newPage();
         page.setDefaultTimeout(15_000);
@@ -313,6 +491,7 @@ async function runExploreMode({ runId, targetUrl, userId }) {
         try { await page?.close(); } catch (_) {}
         try { await ctx?.close(); } catch (_) {}
         try { await browser?.close(); } catch (_) {}
+        if (serve) { try { await serve.cleanup(); } catch (_) {} }
     }
 
     const summary = { passed: 0, failed: 0, skipped: 0, warnings: 0 };
@@ -418,6 +597,15 @@ async function processRun(claim) {
         return { ok: true, status: 'error' };
     }
 
+    const execMode = await resolveExecMode();
+    if (execMode === 'error') {
+        await testRunStore.markFinished(runId, {
+            status: 'error',
+            error: 'docker_unavailable: test runs require an isolated container but the Docker socket is not reachable. Set PLAYWRIGHT_RUNNER_MODE=host to allow unsandboxed execution (self-hosted only).',
+        });
+        return { ok: true, status: 'error' };
+    }
+
     await testRunStore.markRunning(runId);
 
     let outcome;
@@ -429,20 +617,50 @@ async function processRun(claim) {
             // Pull credentials from the in-process stash (set by the route)
             // and clear them in one step so a retry doesn't keep them.
             const credentials = takeRunSecrets(runId);
-            outcome = await agentTestDriver.runAgentMode({
-                runId,
-                targetUrl,
-                instructions: meta?.instructions || '',
-                userId,
-                organizationId: organizationId || null,
-                sourceMeta: meta?.sourceMeta || null,
-                credentials,
-                maxSteps: meta?.maxSteps ?? null,
-            });
+            // If the run was created expecting credentials but they expired from
+            // the in-memory stash (e.g. it sat queued past the TTL), fail loudly
+            // rather than silently attempting a broken login.
+            if (meta?.expectsCredentials && !credentials) {
+                outcome = { status: 'error', error: 'credentials_expired: this run waited in the queue longer than credentials are held in memory. Re-run it.' };
+            } else {
+                // Agent + explore drive a remote browser in a serve container.
+                let serve = null;
+                if (execMode === 'container') {
+                    serve = await pwtRunner.startServeContainer({
+                        runId,
+                        onLine: (line) => testRunStore.appendProgress(runId, line).catch(() => {}),
+                    });
+                }
+                try {
+                    outcome = await agentTestDriver.runAgentMode({
+                        runId,
+                        targetUrl,
+                        instructions: meta?.instructions || '',
+                        userId,
+                        organizationId: organizationId || null,
+                        sourceMeta: meta?.sourceMeta || null,
+                        credentials,
+                        maxSteps: meta?.maxSteps ?? null,
+                        cdpEndpoint: serve?.wsEndpoint || null,
+                    });
+                } finally {
+                    if (serve) { try { await serve.cleanup(); } catch (_) {} }
+                }
+            }
         } else if (mode === 'explore') {
-            outcome = await runExploreMode({ runId, targetUrl, userId });
+            outcome = await runExploreMode({ runId, targetUrl, userId, execMode });
         } else {
-            outcome = await runSuiteMode({ runId, suiteId, targetUrl, userId });
+            let meta = null;
+            try { meta = typeof rawMetadata === 'string' ? JSON.parse(rawMetadata) : rawMetadata; } catch (_) {}
+            // Suite runs may carry credentials, exposed to the Playwright code as
+            // BF_USERNAME / BF_PASSWORD / BF_EMAIL / BF_TOTP. Same in-memory,
+            // never-persisted handling as agent mode.
+            const credentials = takeRunSecrets(runId);
+            if (meta?.expectsCredentials && !credentials) {
+                outcome = { status: 'error', error: 'credentials_expired: this run waited in the queue longer than credentials are held in memory. Re-run it.' };
+            } else {
+                outcome = await runSuiteMode({ runId, suiteId, targetUrl, userId, execMode, credentials });
+            }
         }
     } catch (e) {
         outcome = { status: 'error', error: `worker_exception: ${e.message}` };
@@ -465,7 +683,10 @@ async function processRun(claim) {
 
 async function drainOnce(targetRunId = null) {
     const claimed = await testRunStore.claimDueJobs({
-        batchSize: BATCH_SIZE,
+        batchSize: MAX_GLOBAL,
+        perUserCap: MAX_PER_USER,
+        orgCap: MAX_PER_ORG,
+        globalCap: MAX_GLOBAL,
         targetRunId,
         workerId: WORKER_ID,
     });
@@ -496,11 +717,26 @@ async function drainOne(runId) {
     return drainOnce(runId);
 }
 
+// Remove orphaned runner containers. A run is "active" if its row is still
+// queued/running — anything else is safe to reap. Called on worker boot and
+// on an interval.
+async function reapRunners() {
+    return pwtRunner.reapStaleRunners(async (runId) => {
+        try {
+            const r = await testRunStore.getRun(runId);
+            return !!r && (r.status === 'queued' || r.status === 'running');
+        } catch (_) {
+            return false;
+        }
+    });
+}
+
 module.exports = {
     drainOnce,
     drainOne,
+    reapRunners,
     isPrivateTarget,
     stashRunSecrets,
     // exported for tests
-    _internals: { buildReportFromPlaywright, mapPlaywrightStatus, formatDuration, sweepBasics, takeRunSecrets },
+    _internals: { buildReportFromPlaywright, mapPlaywrightStatus, formatDuration, sweepBasics, takeRunSecrets, resolveExecMode },
 };

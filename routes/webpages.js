@@ -244,24 +244,55 @@ router.patch('/:id/publish', requireAuth, async (req, res) => {
 
         const { isPublished, sharedGroups } = req.body || {};
 
-        // Stamp organization_id on first publish. Owner's primary org is the
-        // source of truth — falling back to their first group's org if no
-        // direct organizationId is set on the user record.
+        // Stamp organization_id on first publish. When publishing to specific
+        // groups, derive the org from THOSE groups — not from the owner's
+        // primary org. The owner can be in multiple orgs; the groups define
+        // which org's audience the page is visible to. Without this, group
+        // members in a non-primary org of the owner silently never see the
+        // page because the visibility SQL requires an exact org match.
         let organizationId;
         if (!!isPublished && !wp.organizationId) {
-            const owner = await userStore.getUser(wp.userId);
-            organizationId = owner?.organizationId || null;
-            if (!organizationId) {
-                const groups = Array.isArray(owner?.groups) ? owner.groups
-                    : (() => { try { return JSON.parse(owner?.groups || '[]'); } catch { return []; } })();
-                if (groups.length > 0) {
-                    const allGroups = await userStore.getAllGroups();
-                    const g = allGroups.find(x => groups.includes(x.id) && x.organizationId);
-                    organizationId = g?.organizationId || null;
+            const incomingGroups = Array.isArray(sharedGroups)
+                ? sharedGroups.map(g => String(g)).filter(Boolean)
+                : [];
+
+            if (incomingGroups.length > 0) {
+                // Specific-groups publish — the groups dictate the org. Validate
+                // that every sharedGroup exists and that they all share a single
+                // org; otherwise the visibility model breaks (one row = one org).
+                const allGroups = await userStore.getAllGroups();
+                const byId = new Map(allGroups.map(g => [g.id, g]));
+                const orgs = new Set();
+                for (const gid of incomingGroups) {
+                    const g = byId.get(gid);
+                    if (!g) return res.status(400).json({ error: `Unknown group: ${gid}` });
+                    if (g.organizationId) orgs.add(g.organizationId);
                 }
-            }
-            if (!organizationId) {
-                return res.status(400).json({ error: 'Cannot publish: owner has no organisation' });
+                if (orgs.size === 0) {
+                    return res.status(400).json({ error: 'Cannot publish: shared groups have no organisation' });
+                }
+                if (orgs.size > 1) {
+                    return res.status(400).json({ error: 'Cannot publish to groups across multiple organisations' });
+                }
+                organizationId = [...orgs][0];
+            } else {
+                // Entire-org publish (sharedGroups empty / undefined) — fall back
+                // to the owner's primary org, then their first group's org if
+                // the user record has no direct organizationId set.
+                const owner = await userStore.getUser(wp.userId);
+                organizationId = owner?.organizationId || null;
+                if (!organizationId) {
+                    const groups = Array.isArray(owner?.groups) ? owner.groups
+                        : (() => { try { return JSON.parse(owner?.groups || '[]'); } catch { return []; } })();
+                    if (groups.length > 0) {
+                        const allGroups = await userStore.getAllGroups();
+                        const g = allGroups.find(x => groups.includes(x.id) && x.organizationId);
+                        organizationId = g?.organizationId || null;
+                    }
+                }
+                if (!organizationId) {
+                    return res.status(400).json({ error: 'Cannot publish: owner has no organisation' });
+                }
             }
         }
 

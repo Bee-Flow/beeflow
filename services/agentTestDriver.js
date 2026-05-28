@@ -276,7 +276,7 @@ function _makeFrameEmitter(runId, page) {
  * @param {object} [args.sourceMeta]  — { type, label } for the report header
  * @returns {Promise<{status:'passed'|'failed'|'error', reportJson:object, error?:string}>}
  */
-async function runAgentMode({ runId, targetUrl, instructions, userId, organizationId = null, sourceMeta = null, credentials = null, maxSteps = null }) {
+async function runAgentMode({ runId, targetUrl, instructions, userId, organizationId = null, sourceMeta = null, credentials = null, maxSteps = null, cdpEndpoint = null }) {
     const stepCap = Math.min(
         Math.max(parseInt(maxSteps, 10) || DEFAULT_MAX_STEPS, 1),
         MAX_STEPS_CEILING,
@@ -322,10 +322,18 @@ async function runAgentMode({ runId, targetUrl, instructions, userId, organizati
     };
 
     try {
-        browser = await playwright.chromium.launch({
-            headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-        });
+        // When a cdpEndpoint is supplied the browser runs inside an isolated
+        // runner container and we drive it remotely — the untrusted target site
+        // never touches this process. Falls back to a local launch only on
+        // host-mode deployments (no docker socket).
+        if (cdpEndpoint) {
+            browser = await playwright.chromium.connect(cdpEndpoint);
+        } else {
+            browser = await playwright.chromium.launch({
+                headless: true,
+                args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+            });
+        }
         ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
 
         // Block cross-origin navigation requests defensively at the network

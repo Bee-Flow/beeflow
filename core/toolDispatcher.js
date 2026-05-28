@@ -57,6 +57,7 @@ const { isNextcloudMailTool, executeNextcloudMailTool } = require('../integratio
 const { isNextcloudActivityTool, executeNextcloudActivityTool } = require('../integrations/nextcloudActivityTools');
 const { isNextcloudStatusTool, executeNextcloudStatusTool } = require('../integrations/nextcloudStatusTools');
 const { isTicketAssistantTool, executeTicketAssistantTool } = require('../integrations/ticketAssistantTools');
+const { isSupportTool, executeSupportTool } = require('../integrations/supportTools');
 const { isWebpageAutomationTool, executeWebpageAutomationTool } = require('../integrations/webpageAutomationTools');
 
 /**
@@ -423,6 +424,9 @@ async function executeTool(toolName, toolArgs, context = {}) {
     }
     if (isTicketAssistantTool(toolName)) {
         return await executeTicketAssistantTool(toolName, toolArgs, userId, session);
+    }
+    if (isSupportTool(toolName)) {
+        return await executeSupportTool(toolName, toolArgs, { userId, session, userAuth, supportThreadId: context.supportThreadId });
     }
     if (isWebpageAutomationTool(toolName)) {
         return await executeWebpageAutomationTool(toolName, toolArgs, {

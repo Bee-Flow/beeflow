@@ -2,7 +2,7 @@
  * CMS Defaults — schema-of-record for the website builder.
  *
  * Two tiers:
- *   SITE_DEFAULTS   site-wide chrome (header, footer) + empty nav scaffold
+ *   SITE_DEFAULTS   site-wide chrome (header, footer, cookieBanner) + empty nav scaffold
  *   BLOCK_DEFAULTS  per-block-type seed content; used by:
  *                     - cmsStore.makeBlock() for any server-side block creation
  *                     - the admin panel ALSO ships its own client-side
@@ -18,7 +18,7 @@
  * The public site resolves keys via /api/cms/asset/:key.
  */
 
-// ── Site-wide defaults (header / footer) ─────────────────────────────
+// ── Site-wide defaults (header / footer / cookie banner) ─────────────
 //
 // Brand-neutral. A fresh site has empty nav and empty footer columns —
 // the user fills them in once they've decided what their pages and
@@ -61,6 +61,29 @@ const SITE_DEFAULTS = {
         columns: [],
         socials: [],
         copyright: '© My Website',
+    },
+    // Site-wide cookie consent banner. `text` carries every locale's copy
+    // in one blob; the renderer picks the visitor's language at display
+    // time, so the banner needs no per-locale override layer. enabled:true
+    // means a fresh site shows the banner until the visitor chooses.
+    cookieBanner: {
+        enabled: true,
+        text: {
+            en: {
+                message: 'We use cookies to improve your experience.',
+                accept: 'Accept',
+                decline: 'Decline',
+                privacyLabel: 'Privacy Policy',
+                privacyUrl: '/privacy',
+            },
+            nl: {
+                message: 'Wij gebruiken cookies om je ervaring te verbeteren.',
+                accept: 'Accepteren',
+                decline: 'Weigeren',
+                privacyLabel: 'Privacybeleid',
+                privacyUrl: '/privacy',
+            },
+        },
     },
 };
 

@@ -22,8 +22,11 @@ const supportStore = require('../stores/supportStore');
 const configStore = require('../stores/configStore');
 const { chatWithAgent } = require('../core/agentRuntime');
 const { quickKBSearch } = require('../core/agentRuntime/knowledgeSearch');
+const { SUPPORT_TOOLS } = require('../integrations/supportTools');
 
 const ESCALATE_RE = /\[ESCALATE(?::\s*([^\]]+))?\]/i;
+const RESOLVED_RE = /\[RESOLVED\]/i;
+const DEFAULT_AUTORESOLVE_THRESHOLD = 0.78;
 
 // Upper bounds — any upstream call that exceeds these gets force-aborted and
 // the thread escalates. Tuned to be safely below typical reverse-proxy idle
@@ -99,6 +102,61 @@ async function _escalate(threadId, reason, { systemMessage } = {}) {
         action: 'ai_escalated',
         payload: { reason },
     });
+    // Auto-assign to the next staff member if nobody is on it yet.
+    try {
+        await _maybeAutoAssign(threadId);
+    } catch (e) {
+        console.warn('[SupportAI] auto-assign failed:', e.message);
+    }
+}
+
+/**
+ * Assign an unassigned escalated thread to the next staff member via the
+ * round-robin cursor. No-op if already assigned or no eligible staff.
+ */
+async function _maybeAutoAssign(threadId) {
+    const thread = await supportStore.getThread(threadId);
+    if (!thread || thread.assignee_user_id) return;
+    const { pickNextAssignee } = require('./supportAutoAssigner');
+    const next = await pickNextAssignee(thread.organization_id || null);
+    if (!next) return;
+    await supportStore.updateThread(threadId, { assignee_user_id: next, auto_assigned: true });
+    await _safeRecordEvent({
+        threadId, actorUserId: null, actorKind: 'system',
+        action: 'auto_assigned', payload: { assignee_user_id: next },
+    });
+}
+
+/**
+ * Fire-and-forget tag + category suggestion using the fast tier. Never throws.
+ */
+async function _autoTag(thread, lastBody, draftReply) {
+    try {
+        const taxonomy = await supportStore.listTags(thread.organization_id || null);
+        if (!taxonomy.length) return; // nothing to choose from
+        const llmClient = require('../core/llmClient');
+        const { resolveAgentModel } = require('../core/agentRuntime');
+        const { getAIConfig } = require('../core/aiAgent');
+        const modelId = await resolveAgentModel('tier:fast', lastBody, await getAIConfig());
+        const result = await llmClient.chat(modelId, [
+            { role: 'system', content: 'You assign tags and one category to a support thread. Respond with strict JSON only: {"tags":["..."],"category":"..."}. Choose tags ONLY from the provided list; category is a short free-text label.' },
+            { role: 'user', content: `Available tags: ${JSON.stringify(taxonomy.map(t => t.name))}\n\nSubject: ${thread.subject}\nCustomer message: ${lastBody}\nDraft reply: ${draftReply || ''}` },
+        ], { maxTokens: 200, temperature: 0 });
+        const raw = (result && result.content) || '';
+        const match = raw.match(/\{[\s\S]*\}/);
+        if (!match) return;
+        const parsed = JSON.parse(match[0]);
+        if (Array.isArray(parsed.tags) && parsed.tags.length) {
+            const valid = new Set(taxonomy.map(t => t.name.toLowerCase()));
+            const chosen = parsed.tags.filter(t => valid.has(String(t).toLowerCase())).slice(0, 5);
+            if (chosen.length) await supportStore.setThreadTags(thread.id, chosen);
+        }
+        if (parsed.category) {
+            await supportStore.updateThread(thread.id, { category: String(parsed.category).slice(0, 100) });
+        }
+    } catch (e) {
+        console.warn('[SupportAI] auto-tag failed:', e.message);
+    }
 }
 
 /**
@@ -176,6 +234,8 @@ async function runAiAutoResponder(threadId, opts = {}) {
             return `${who}: ${m.body}`;
         }).join('\n\n');
 
+        const v2Enabled = !!(await configStore.getConfig('support_ai_v2_enabled'));
+
         const userMessage = `You are answering a Bee Flow customer-support thread.
 
 ${requesterLine}
@@ -185,13 +245,20 @@ Full conversation so far:
 ${transcript}
 ${kbContext}
 
-Reply only to the customer's most recent message. If the knowledge base does not contain a confident answer, or the question involves account-specific actions you can't safely perform (billing changes, password resets, account deletion, custom-deal pricing, anything escalation-worthy), respond briefly and end your reply with the exact token [ESCALATE: <short reason>]. Otherwise answer concisely and cite the KB section by title where applicable.`;
+Reply only to the customer's most recent message. If the knowledge base does not contain a confident answer, or the question involves account-specific actions you can't safely perform (billing changes, password resets, account deletion, custom-deal pricing, anything escalation-worthy), respond briefly and end your reply with the exact token [ESCALATE: <short reason>]. ${v2Enabled ? 'You may use the available read-only support tools to look up the customer, their organization, subscription, and the knowledge base before answering. ' : ''}If you are confident your reply fully resolves the customer's issue and no human follow-up is needed, append the exact token [RESOLVED] on its own line at the very end. Otherwise answer concisely and cite the KB section by title where applicable.`;
+
+        // v2: expose read-only support tools + thread context to the agent loop.
+        const chatAuth = { userOrgId: thread.organization_id || null };
+        if (v2Enabled) {
+            chatAuth.extraTools = SUPPORT_TOOLS;
+            chatAuth.supportThreadId = thread.id;
+        }
 
         let aiResultRaw = '';
         let modelUsed = null;
         try {
             const result = await _withTimeout(
-                chatWithAgent(agentId, aiUserId, userMessage, { userOrgId: thread.organization_id || null }),
+                chatWithAgent(agentId, aiUserId, userMessage, chatAuth),
                 CHAT_AGENT_TIMEOUT_MS,
                 'chatWithAgent',
             );
@@ -207,12 +274,19 @@ Reply only to the customer's most recent message. If the knowledge base does not
         }
 
         const escalateMatch = aiResultRaw.match(ESCALATE_RE);
-        const cleanBody = _stripEscalateToken(aiResultRaw);
+        const resolvedMatch = aiResultRaw.match(RESOLVED_RE);
+        const cleanBody = _stripEscalateToken(aiResultRaw).replace(RESOLVED_RE, '').trim();
         // Empty / extremely short answers are unreliable — treat as escalation.
         const tooShort = cleanBody.length < 20;
         const escalated = !!escalateMatch || tooShort || (kbHits.length === 0 && cleanBody.length < 60);
         const escalateReason = escalateMatch?.[1]?.trim()
             || (tooShort ? 'empty_or_too_short' : (kbHits.length === 0 ? 'no_kb_grounding' : null));
+
+        // Auto-resolve only when the AI is confident AND the top KB hit clears
+        // the configured similarity threshold. Customer still confirms via CSAT.
+        const threshold = Number(await configStore.getConfig('support_ai_autoresolve_threshold')) || DEFAULT_AUTORESOLVE_THRESHOLD;
+        const topScore = kbHits.length ? (kbHits[0].score || 0) : 0;
+        const aiResolved = !escalated && !!resolvedMatch && topScore >= threshold;
 
         const finalBody = cleanBody || 'I was not able to draft a confident response — a human will follow up shortly.';
 
@@ -240,6 +314,7 @@ Reply only to the customer's most recent message. If the knowledge base does not
             payload: {
                 model: modelUsed,
                 escalated,
+                resolved: aiResolved,
                 escalateReason: escalated ? (escalateReason || 'low_confidence') : null,
                 citationCount: citations.length,
             },
@@ -247,6 +322,17 @@ Reply only to the customer's most recent message. If the knowledge base does not
 
         if (escalated) {
             await _escalate(threadId, escalateReason || 'low_confidence');
+        } else if (aiResolved) {
+            await supportStore.updateThread(threadId, {
+                status: 'resolved',
+                resolved_at: new Date().toISOString(),
+                ai_handled: true,
+                ai_escalated_reason: null,
+            });
+            await _safeRecordEvent({
+                threadId, actorUserId: null, actorKind: 'system',
+                action: 'resolved', payload: { by: 'ai', awaitingCustomerConfirmation: true },
+            });
         } else {
             await supportStore.updateThread(threadId, {
                 status: 'awaiting_user',
@@ -255,8 +341,11 @@ Reply only to the customer's most recent message. If the knowledge base does not
             });
         }
 
+        // Fire-and-forget tag + category suggestion (never blocks the reply).
+        Promise.resolve().then(() => _autoTag(thread, lastRequester.body, finalBody)).catch(() => {});
+
         settled = true;
-        return { message: aiMsg, escalated, escalateReason };
+        return { message: aiMsg, escalated, escalateReason, resolved: aiResolved };
     } catch (outerErr) {
         // Catch-all — any unexpected throw (DB hiccup, bad config, etc.).
         console.error('[SupportAI] runAiAutoResponder unexpected error:', outerErr.message);

@@ -133,14 +133,33 @@ async function sendStaffReplyEmail({ to, requesterName, subject, staffName, repl
 }
 
 /**
- * Resolution notice.
+ * Build the CSAT rating + dispute block. `csatLinks` is { stars: [url×5], dispute }.
  */
-async function sendThreadResolvedEmail({ to, requesterName, subject, threadUrl }) {
+function _csatBlock(csatLinks) {
+    if (!csatLinks || !Array.isArray(csatLinks.stars) || csatLinks.stars.length !== 5) return '';
+    const stars = csatLinks.stars.map((url, i) =>
+        `<a href="${url}" target="_blank" style="display:inline-block;padding:8px 12px;margin:0 2px;font-size:20px;text-decoration:none;border-radius:8px;background:#f1f5f9;color:#0f172a;">${'★'.repeat(i + 1)}</a>`
+    ).join('');
+    return `
+        <p style="margin:24px 0 8px;font-size:14px;color:#334155;text-align:center;font-weight:600;">How did we do?</p>
+        <table width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:4px 0 12px;">
+            ${csatLinks.stars.map((url, i) => `<a href="${url}" target="_blank" style="display:inline-block;width:40px;height:40px;line-height:40px;margin:0 3px;font-size:13px;font-weight:700;text-decoration:none;border-radius:50%;background:#f1f5f9;color:#0f172a;text-align:center;">${i + 1}</a>`).join('')}
+        </td></tr></table>
+        ${csatLinks.dispute ? `<p style="margin:4px 0 0;font-size:12px;color:#94a3b8;text-align:center;"><a href="${csatLinks.dispute}" target="_blank" style="color:#64748b;">This wasn't resolved — reopen my request</a></p>` : ''}
+    `;
+}
+
+/**
+ * Resolution notice. When `csatLinks` is supplied, embeds a 1-5 rating row and
+ * a "not resolved" dispute link (both HMAC-token URLs built by the route).
+ */
+async function sendThreadResolvedEmail({ to, requesterName, subject, threadUrl, csatLinks = null }) {
     const title = 'Your request was resolved';
     const intro = `Hi <strong>${_escape(requesterName || 'there')}</strong>,`;
     const body = `
         <p style="margin:0 0 12px;">We've marked your support request <strong>${_escape(subject)}</strong> as resolved.</p>
         <p style="margin:0 0 12px;">If this didn't actually fix things, reply on the conversation page and we'll reopen it.</p>
+        ${_csatBlock(csatLinks)}
     `;
     const text = `Hi ${requesterName || 'there'},\n\nWe've marked your support request "${subject}" as resolved. If this didn't actually fix things, reply on the conversation page and we'll reopen it.\n\nView: ${threadUrl}`;
     return sendServiceEmail({

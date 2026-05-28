@@ -334,6 +334,10 @@ function synthesizeLegacyContent(eff) {
             })),
         };
     }
+    // Site-wide cookie banner — passes through verbatim. Its `text` blob
+    // already carries every locale, so the renderer picks the visitor's
+    // language; no flattening or link resolution needed here.
+    if (eff.cookieBanner) out.cookieBanner = eff.cookieBanner;
     // Embed design inside content so the public-site renderer at "/" picks
     // it up via the existing RootPathGate pass-through (no App.jsx change
     // needed). The renderer reads initialContent.design for non-preview

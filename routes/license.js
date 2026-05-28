@@ -19,17 +19,10 @@ const rateLimit = require('express-rate-limit');
 const license = require('../license');
 const { hasPermission, resolveUserOrgIds, OrgRoles, SystemRoles, Permissions, isOrgAdminRole } = require('../auth/permissions');
 
-// Self-host detection — server-wide licence activation is gated to
-// self-hosted installs by default so a staff super-admin on cloud
-// cannot accidentally re-tier every tenant in one click.
-// LICENSE_ALLOW_SERVER_SCOPE_ON_CLOUD=true is an escape hatch (off by
-// default) for the edge case where Bee Flow runs as a single-tenant
-// managed-cloud deployment.
-function isServerScopeAllowed() {
-    if (process.env.LICENSE_ALLOW_SERVER_SCOPE_ON_CLOUD === 'true') return true;
-    return (process.env.DEPLOYMENT_MODE || 'cloud') === 'self-hosted';
-}
-
+// Server-wide licence activation is restricted to super-admins (see
+// isSuperAdmin below) and is available on every deployment mode: a
+// server-wide licence governs the whole install, which is exactly what a
+// single-tenant operator wants whether they run cloud or self-hosted.
 function isSuperAdmin(req) {
     return !!(req.session?.isAdmin || req.session?.user?.role === SystemRoles.SUPER_ADMIN);
 }
@@ -112,7 +105,6 @@ router.get('/status', licenseLimiter, async (req, res) => {
 //
 // scope='server' applies the licence install-wide. It requires:
 //   - super-admin caller (session.isAdmin or role='admin')
-//   - DEPLOYMENT_MODE=self-hosted (or LICENSE_ALLOW_SERVER_SCOPE_ON_CLOUD=true)
 //   - tier ≥ enterprise — a community-tier server licence is meaningless
 //     (community is the default floor for every install). We refuse it
 //     up-front rather than persist a row that does nothing.
@@ -130,12 +122,6 @@ router.post('/activate', licenseLimiter, async (req, res) => {
         // returned shape (we let activateLicense parse the token first
         // because that's where verification lives).
         if (scope === 'server') {
-            if (!isServerScopeAllowed()) {
-                return res.status(403).json({
-                    error: 'server_scope_cloud_blocked',
-                    message: 'Server-wide licences are only supported on self-hosted deployments.',
-                });
-            }
             if (!isSuperAdmin(req)) {
                 return res.status(403).json({
                     error: 'super_admin_required',
@@ -257,16 +243,13 @@ router.get('/health', async (req, res) => {
 
 // ── DELETE /deactivate ──────────────────────────────────────────────────
 // Query: ?scope=server removes the install-wide server licence. Same
-// super-admin + self-host gates as activate. Org/consumer scope follows
-// the legacy "infer from session" rule.
+// super-admin gate as activate. Org/consumer scope follows the legacy
+// "infer from session" rule.
 router.delete('/deactivate', async (req, res) => {
     try {
         const orgId = getOrgId(req);
         const userId = getUserId(req);
         if (req.query?.scope === 'server') {
-            if (!isServerScopeAllowed()) {
-                return res.status(403).json({ error: 'server_scope_cloud_blocked' });
-            }
             if (!isSuperAdmin(req)) {
                 return res.status(403).json({ error: 'super_admin_required' });
             }

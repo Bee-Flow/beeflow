@@ -499,25 +499,32 @@ app.listen(PORT, '0.0.0.0', () => {
     // background via setImmediate, so this never blocks boot. Admins can
     // re-trigger from the System Knowledge Bases admin panel.
     try {
-        const dutchLawIngest = require('./services/dutchLawIngest');
-        dutchLawIngest.seedIfMissing();
-        // Weekly refresh — re-fetch each BWB statute so amended legislation
-        // propagates to existing customers without an admin clicking
-        // "Refresh". Idempotent (content_hash dedup), runs in background.
-        // Configurable via SYSTEM_KB_REFRESH_INTERVAL_MS (default 7 days).
-        const SYSTEM_KB_REFRESH_INTERVAL_MS = parseInt(process.env.SYSTEM_KB_REFRESH_INTERVAL_MS || String(7 * 24 * 60 * 60 * 1000), 10);
-        const runSystemKBRefresh = () => {
-            try {
-                dutchLawIngest.refresh({ force: false });
-                console.log('[dutchLawIngest] Weekly refresh kicked off');
-            } catch (e) {
-                console.warn('[dutchLawIngest] Weekly refresh start failed:', e.message);
-            }
-        };
-        // First refresh fires 30 min after boot so the boot seed has time
-        // to settle, then repeats on the configured interval.
-        setTimeout(runSystemKBRefresh, 30 * 60 * 1000).unref();
-        setInterval(runSystemKBRefresh, SYSTEM_KB_REFRESH_INTERVAL_MS).unref();
+        // Local-dev escape hatch: set SKIP_SYSTEM_KB_SEED=true to skip the
+        // (CPU-bound, multi-minute) Dutch legal sources seed and its weekly
+        // refresh. Has no effect in production unless the var is set there.
+        if (process.env.SKIP_SYSTEM_KB_SEED === 'true') {
+            console.log('[dutchLawIngest] SKIP_SYSTEM_KB_SEED=true — skipping boot seed and weekly refresh.');
+        } else {
+            const dutchLawIngest = require('./services/dutchLawIngest');
+            dutchLawIngest.seedIfMissing();
+            // Weekly refresh — re-fetch each BWB statute so amended legislation
+            // propagates to existing customers without an admin clicking
+            // "Refresh". Idempotent (content_hash dedup), runs in background.
+            // Configurable via SYSTEM_KB_REFRESH_INTERVAL_MS (default 7 days).
+            const SYSTEM_KB_REFRESH_INTERVAL_MS = parseInt(process.env.SYSTEM_KB_REFRESH_INTERVAL_MS || String(7 * 24 * 60 * 60 * 1000), 10);
+            const runSystemKBRefresh = () => {
+                try {
+                    dutchLawIngest.refresh({ force: false });
+                    console.log('[dutchLawIngest] Weekly refresh kicked off');
+                } catch (e) {
+                    console.warn('[dutchLawIngest] Weekly refresh start failed:', e.message);
+                }
+            };
+            // First refresh fires 30 min after boot so the boot seed has time
+            // to settle, then repeats on the configured interval.
+            setTimeout(runSystemKBRefresh, 30 * 60 * 1000).unref();
+            setInterval(runSystemKBRefresh, SYSTEM_KB_REFRESH_INTERVAL_MS).unref();
+        }
     } catch (e) {
         console.warn('[dutchLawIngest] Boot auto-seed could not start:', e.message);
     }
@@ -737,20 +744,36 @@ app.listen(PORT, '0.0.0.0', () => {
         }
     }
 
-    // Playwright test-run drain — claims test_run_jobs outbox rows and spawns
-    // Playwright. Same outbox + backoff pattern as PAYG drain. Self-hosted
-    // installs run it too — Playwright is local; nothing depends on cloud.
+    // Playwright test-run drain — claims test_run_jobs outbox rows and runs
+    // them in isolated containers. Same outbox + backoff pattern as PAYG drain.
+    // When a dedicated test-runner worker is deployed, set
+    // PLAYWRIGHT_DRAIN_IN_API=false so the API stops draining and the worker is
+    // the single claimer (keeps headless-browser work out of the API process
+    // and the concurrency caps unambiguous). A periodic reaper removes any
+    // orphaned runner containers regardless of who drains.
     try {
+        const drainInApi = process.env.PLAYWRIGHT_DRAIN_IN_API !== 'false';
         const TEST_RUN_DRAIN_INTERVAL_MS = parseInt(process.env.PLAYWRIGHT_DRAIN_TICK_INTERVAL_MS || '15000', 10);
-        const runTestDrain = async () => {
-            try {
-                const r = await require('./workers/testRunner').drainOnce();
-                if (r?.processed) console.log(`[TestRunner] processed=${r.processed}`);
-            } catch (e) { console.error('[TestRunner] tick error:', e.message); }
-        };
-        setTimeout(runTestDrain, 20_000).unref();
-        setInterval(runTestDrain, TEST_RUN_DRAIN_INTERVAL_MS).unref();
-        console.log(`[Server] Playwright test-run drain scheduler started (interval=${TEST_RUN_DRAIN_INTERVAL_MS}ms)`);
+        const REAP_INTERVAL_MS = parseInt(process.env.PLAYWRIGHT_REAP_INTERVAL_MS || '120000', 10);
+        const testRunner = require('./workers/testRunner');
+
+        if (drainInApi) {
+            const runTestDrain = async () => {
+                try {
+                    const r = await testRunner.drainOnce();
+                    if (r?.processed) console.log(`[TestRunner] processed=${r.processed}`);
+                } catch (e) { console.error('[TestRunner] tick error:', e.message); }
+            };
+            setTimeout(runTestDrain, 20_000).unref();
+            setInterval(runTestDrain, TEST_RUN_DRAIN_INTERVAL_MS).unref();
+            // Reap orphaned runner containers (crashed-worker leftovers) on boot
+            // and periodically.
+            testRunner.reapRunners().catch(() => {});
+            setInterval(() => testRunner.reapRunners().catch(() => {}), REAP_INTERVAL_MS).unref();
+            console.log(`[Server] Playwright test-run drain scheduler started (interval=${TEST_RUN_DRAIN_INTERVAL_MS}ms)`);
+        } else {
+            console.log('[Server] Playwright test-run drain disabled in API (PLAYWRIGHT_DRAIN_IN_API=false) — dedicated worker owns it');
+        }
     } catch (e) {
         console.warn('[Server] Failed to start test-run drain scheduler:', e.message);
     }
@@ -864,31 +887,12 @@ app.listen(PORT, '0.0.0.0', () => {
     } catch (err) {
         console.warn('[Server] Ticket Assistant sync engine load failed:', err.message);
     }
-    // Customer Support SLA watcher — every 15 minutes, ping staff about
-    // awaiting_agent threads with no first-response after 60 minutes.
+    // Customer Support SLA enforcer — policy-driven first-response/resolution
+    // breach detection on a 60s tick (replaces the old 15-min at-risk warner).
     try {
-        const supportStore = require('./stores/supportStore');
-        const supportRoute = require('./routes/support');
-        const _seenSla = new Map(); // threadId → last-warned timestamp
-        setInterval(async () => {
-            try {
-                const stale = await supportStore.findSlaAtRiskThreads({ olderThanMinutes: 60 });
-                for (const t of stale) {
-                    const last = _seenSla.get(t.id) || 0;
-                    if (Date.now() - last < 60 * 60 * 1000) continue; // warn at most hourly
-                    _seenSla.set(t.id, Date.now());
-                    await supportRoute.notifyStaff({
-                        title: `SLA at risk: ${t.subject}`,
-                        message: `Awaiting agent for >1h — ${t.requester_email}`,
-                        threadId: t.id,
-                    });
-                }
-            } catch (e) {
-                console.warn('[Server] Support SLA watcher tick error:', e.message);
-            }
-        }, 15 * 60 * 1000);
+        require('./services/supportSlaEnforcer').start();
     } catch (err) {
-        console.warn('[Server] Support SLA watcher load failed:', err.message);
+        console.warn('[Server] Support SLA enforcer load failed:', err.message);
     }
     // NC user/group sync backstop — covers gaps when real-time webhooks miss
     try {

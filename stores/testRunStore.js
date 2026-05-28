@@ -249,6 +249,42 @@ async function getActiveRunForUser(userId) {
     return mapRunRow(r);
 }
 
+// All in-flight runs (queued + running) for a user — powers the multi-run
+// sidebar so several concurrent runs are visible at once.
+async function listActiveRunsForUser(userId) {
+    await initDB();
+    const rows = await getAll(
+        `SELECT * FROM test_runs WHERE user_id = $1 AND status IN ('queued','running')
+         ORDER BY created_at DESC LIMIT 50`,
+        [userId]
+    );
+    return rows.map(mapRunRow);
+}
+
+/**
+ * Count active (claimed-and-undelivered, i.e. queued-claimed or running) runs
+ * globally and for the given user/org. Used to decide whether a freshly created
+ * run will start immediately or sit queued, and to surface counts in the UI.
+ */
+async function countActiveByScope(userId = null, organizationId = null) {
+    await initDB();
+    const r = await getOne(
+        `SELECT
+            COUNT(*)::int AS global_active,
+            COUNT(*) FILTER (WHERE r.user_id = $1)::int AS user_active,
+            COUNT(*) FILTER (WHERE $2::text IS NOT NULL AND r.organization_id = $2)::int AS org_active
+          FROM test_run_jobs j
+          JOIN test_runs r ON r.id = j.run_id
+         WHERE j.delivered_at IS NULL AND j.claim_token IS NOT NULL`,
+        [userId, organizationId]
+    );
+    return {
+        globalActive: r?.global_active || 0,
+        userActive: r?.user_active || 0,
+        orgActive: r?.org_active || 0,
+    };
+}
+
 // ── Cancellation ───────────────────────────────────────────────────
 // Workers poll `isCancelRequested(runId)` between steps; the route layer
 // flips the flag and immediately marks the run cancelled in the DB. Two
@@ -303,40 +339,78 @@ async function markCancelled(runId, userId) {
 // ── Worker-facing claim/finalize API ──────────────────────────────
 
 /**
- * Claim up to `batchSize` outbox rows whose backoff window has elapsed.
- * Uses FOR UPDATE SKIP LOCKED so concurrent workers never grab the same row.
+ * Claim outbox rows whose backoff window has elapsed, respecting concurrency
+ * caps. A run is "active" (counts toward caps) while its outbox job is claimed
+ * and not yet delivered — i.e. queued-but-claimed or running. Eligible queued
+ * candidates are ranked per user/org so a single user can't fill more than
+ * their remaining slots in one batch, and the batch is capped at the remaining
+ * global slots. Uses FOR UPDATE SKIP LOCKED so concurrent workers never grab
+ * the same row.
  *
+ * Caps default to effectively unlimited when not supplied (back-compat).
  * Returns the claimed rows joined with their parent run rows.
  */
-async function claimDueJobs({ batchSize = 5, targetRunId = null, workerId = 'inproc' } = {}) {
+async function claimDueJobs({ batchSize = 5, perUserCap = 1e9, orgCap = 1e9, globalCap = 1e9, targetRunId = null, workerId = 'inproc' } = {}) {
     await initDB();
     const client = await getClient();
     let claimed = [];
     try {
         await client.query('BEGIN');
-        // Lease window: once a claim_token is set we exclude the row for the
-        // length of CLAIM_LEASE_MS to prevent a second worker from re-claiming
-        // an in-flight run between transactions. Crashed workers' claims are
-        // naturally released when the lease expires; markFinished sets
-        // delivered_at and removes the row from the outbox eligibility filter
-        // altogether.
-        const params = [];
-        let where = `WHERE j.delivered_at IS NULL
-                     AND (j.claimed_at IS NULL OR j.claimed_at < NOW() - INTERVAL '10 minutes')
-                     AND (j.last_attempt_at IS NULL
-                          OR j.last_attempt_at < NOW() - (POWER(2, LEAST(j.attempt_count, 12)) * INTERVAL '1 second'))`;
+        // Lease window: once a claim_token is set we exclude the row for 10 min
+        // to prevent a second worker from re-claiming an in-flight run. Crashed
+        // workers' claims release when the lease expires; markFinished sets
+        // delivered_at and drops the row from eligibility altogether.
+        const params = [perUserCap, orgCap, globalCap];
+        let targetFilter = '';
         if (targetRunId) {
             params.push(targetRunId);
-            where += ` AND j.run_id = $${params.length}`;
+            targetFilter = ` AND j.run_id = $${params.length}`;
         }
-        const q = `SELECT j.id AS job_id, j.run_id, j.attempt_count,
-                          r.suite_id, r.user_id, r.organization_id, r.target_url, r.mode, r.status, r.metadata
-                     FROM test_run_jobs j
-                     JOIN test_runs r ON r.id = j.run_id
-                     ${where}
-                     ORDER BY j.next_attempt_at ASC
-                     LIMIT ${Math.max(1, batchSize | 0)}
-                     FOR UPDATE OF j SKIP LOCKED`;
+        // $1 perUserCap, $2 orgCap, $3 globalCap, [$4 targetRunId]
+        const q = `
+            WITH active AS (
+                SELECT r.user_id, r.organization_id
+                  FROM test_run_jobs j
+                  JOIN test_runs r ON r.id = j.run_id
+                 WHERE j.delivered_at IS NULL AND j.claim_token IS NOT NULL
+            ),
+            active_user AS (SELECT user_id, COUNT(*) c FROM active GROUP BY user_id),
+            active_org AS (SELECT organization_id, COUNT(*) c FROM active WHERE organization_id IS NOT NULL GROUP BY organization_id),
+            active_total AS (SELECT COUNT(*) c FROM active),
+            candidates AS (
+                SELECT j.id AS job_id, j.run_id, j.attempt_count, j.next_attempt_at,
+                       r.suite_id, r.user_id, r.organization_id, r.target_url, r.mode, r.status, r.metadata, r.created_at,
+                       COALESCE(au.c, 0) AS user_active,
+                       COALESCE(ao.c, 0) AS org_active,
+                       ROW_NUMBER() OVER (PARTITION BY r.user_id ORDER BY j.next_attempt_at ASC) AS user_rank,
+                       ROW_NUMBER() OVER (PARTITION BY r.organization_id ORDER BY j.next_attempt_at ASC) AS org_rank
+                  FROM test_run_jobs j
+                  JOIN test_runs r ON r.id = j.run_id
+                  LEFT JOIN active_user au ON au.user_id = r.user_id
+                  LEFT JOIN active_org ao ON ao.organization_id = r.organization_id
+                 WHERE j.delivered_at IS NULL
+                   AND r.status = 'queued'
+                   AND (j.claimed_at IS NULL OR j.claimed_at < NOW() - INTERVAL '10 minutes')
+                   AND (j.last_attempt_at IS NULL
+                        OR j.last_attempt_at < NOW() - (POWER(2, LEAST(j.attempt_count, 12)) * INTERVAL '1 second'))
+                   ${targetFilter}
+            ),
+            eligible AS (
+                SELECT job_id
+                  FROM candidates
+                 WHERE user_active + user_rank <= $1::int
+                   AND (organization_id IS NULL OR org_active + org_rank <= $2::int)
+                 ORDER BY next_attempt_at ASC
+                 LIMIT GREATEST(0, $3::int - (SELECT c FROM active_total))::int
+            )
+            SELECT j.id AS job_id, j.run_id, j.attempt_count,
+                   r.suite_id, r.user_id, r.organization_id, r.target_url, r.mode, r.status, r.metadata, r.created_at
+              FROM test_run_jobs j
+              JOIN test_runs r ON r.id = j.run_id
+             WHERE j.id IN (SELECT job_id FROM eligible)
+             ORDER BY j.next_attempt_at ASC
+             LIMIT ${Math.max(1, batchSize | 0)}
+             FOR UPDATE OF j SKIP LOCKED`;
         const result = await client.query(q, params);
         claimed = result.rows;
 
@@ -435,6 +509,128 @@ async function markRetryable(runId, errorMessage) {
     publishEvent(runId, 'progress', { line: `[retry] ${errorMessage}` });
 }
 
+// ── Insights ──────────────────────────────────────────────────────
+
+/**
+ * Account-wide overview: suite count, run volume, pass rate, in-flight counts,
+ * and a recent-activity feed. Scoped to the user.
+ */
+async function getInsightsOverview(userId) {
+    await initDB();
+    const [suiteRow, runStats, recent, active] = await Promise.all([
+        getOne(`SELECT COUNT(*)::int AS c FROM test_suites WHERE user_id = $1`, [userId]).catch(() => ({ c: 0 })),
+        getOne(
+            `SELECT
+                COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days')::int  AS runs_7d,
+                COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '30 days')::int AS runs_30d,
+                COUNT(*) FILTER (WHERE status = 'passed' AND created_at > NOW() - INTERVAL '30 days')::int AS passed_30d,
+                COUNT(*) FILTER (WHERE status = 'failed' AND created_at > NOW() - INTERVAL '30 days')::int AS failed_30d
+              FROM test_runs WHERE user_id = $1`,
+            [userId]
+        ),
+        getAll(
+            `SELECT id, suite_id, target_url, mode, status, duration_ms, created_at
+               FROM test_runs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 15`,
+            [userId]
+        ),
+        countActiveByScope(userId),
+    ]);
+
+    const passed = runStats?.passed_30d || 0;
+    const failed = runStats?.failed_30d || 0;
+    const denom = passed + failed;
+    return {
+        suiteCount: suiteRow?.c || 0,
+        runs7d: runStats?.runs_7d || 0,
+        runs30d: runStats?.runs_30d || 0,
+        passRate30d: denom > 0 ? Math.round((passed / denom) * 100) : null,
+        activeCount: active.userActive,
+        recent: recent.map(r => ({
+            id: r.id,
+            suiteId: r.suite_id || null,
+            targetUrl: r.target_url,
+            mode: r.mode,
+            status: r.status,
+            durationMs: r.duration_ms != null ? Number(r.duration_ms) : null,
+            createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+        })),
+    };
+}
+
+/** Per-run pass/fail/duration time series for a suite (oldest first). */
+async function getSuiteTrends(suiteId, userId, { limit = 50 } = {}) {
+    await initDB();
+    const rows = await getAll(
+        `SELECT id, status, duration_ms, report_json, created_at
+           FROM test_runs
+          WHERE suite_id = $1 AND user_id = $2 AND status IN ('passed','failed','error','cancelled')
+          ORDER BY created_at DESC LIMIT $3`,
+        [suiteId, userId, limit]
+    );
+    return rows.reverse().map(r => {
+        const report = parseJSON(r.report_json, null);
+        const s = report?.summary || {};
+        return {
+            id: r.id,
+            status: r.status,
+            durationMs: r.duration_ms != null ? Number(r.duration_ms) : null,
+            passed: s.passed || 0,
+            failed: s.failed || 0,
+            warnings: s.warnings || 0,
+            createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+        };
+    });
+}
+
+/**
+ * Flakiness: aggregate per-test outcomes across a suite's recent runs and rank
+ * tests that flip between pass and fail. A test that both passed and failed
+ * across runs is flaky; flipRate weights how often it changed outcome.
+ */
+async function getSuiteFlakiness(suiteId, userId, { limit = 50 } = {}) {
+    await initDB();
+    const rows = await getAll(
+        `SELECT report_json, created_at
+           FROM test_runs
+          WHERE suite_id = $1 AND user_id = $2 AND report_json IS NOT NULL
+          ORDER BY created_at DESC LIMIT $3`,
+        [suiteId, userId, limit]
+    );
+    // name → ordered list of outcomes (oldest→newest)
+    const byName = new Map();
+    for (const r of rows.reverse()) {
+        const report = parseJSON(r.report_json, null);
+        for (const t of (report?.tests || [])) {
+            if (!t?.name) continue;
+            if (!byName.has(t.name)) byName.set(t.name, []);
+            byName.get(t.name).push(t.status === 'passed' ? 'passed' : (t.status === 'failed' ? 'failed' : 'other'));
+        }
+    }
+    const out = [];
+    for (const [name, outcomes] of byName) {
+        const runs = outcomes.length;
+        const passed = outcomes.filter(o => o === 'passed').length;
+        const failed = outcomes.filter(o => o === 'failed').length;
+        let flips = 0;
+        for (let i = 1; i < outcomes.length; i++) {
+            if (outcomes[i] !== outcomes[i - 1]) flips++;
+        }
+        const flaky = passed > 0 && failed > 0;
+        out.push({
+            name,
+            runs,
+            passed,
+            failed,
+            flips,
+            flipRate: runs > 1 ? Math.round((flips / (runs - 1)) * 100) : 0,
+            flaky,
+        });
+    }
+    // Flaky first, then by flip rate, then by failure share.
+    out.sort((a, b) => (Number(b.flaky) - Number(a.flaky)) || (b.flipRate - a.flipRate) || (b.failed - a.failed));
+    return out;
+}
+
 async function addArtifact(runId, { kind, storageKey, mimeType, sizeBytes }) {
     await initDB();
     const id = crypto.randomUUID();
@@ -467,6 +663,11 @@ module.exports = {
     listRunsForSuite,
     hasActiveRunForUser,
     getActiveRunForUser,
+    listActiveRunsForUser,
+    countActiveByScope,
+    getInsightsOverview,
+    getSuiteTrends,
+    getSuiteFlakiness,
     requestCancel,
     isCancelRequested,
     markCancelled,
