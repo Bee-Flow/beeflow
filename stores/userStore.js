@@ -1417,6 +1417,34 @@ async function resetNcVerificationCode(id, code, ttlSeconds = NC_VERIFICATION_TT
     return parsePendingBinding(row);
 }
 
+// Re-point a pending verification at a different admin (the NC user actually
+// performing the setup, rather than the arbitrary first admin chosen at
+// bootstrap): swap the target email + admin identity, mint a fresh code, reset
+// attempts and extend the TTL. The caller MUST first validate that `email`
+// qualifies for the row's org (exact user match or matching corporate domain).
+async function retargetNcVerification(id, { email, uid, displayName, code, ttlSeconds = NC_VERIFICATION_TTL_SECONDS }) {
+    if (!id || !email || !code) return null;
+    await initDB();
+    const existing = await getOne(`SELECT * FROM pending_nc_bindings WHERE id = $1`, [id]);
+    if (!existing || !existing.verification_code_hash || existing.status !== 'pending') return null;
+    const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+    const hash = _hashNcVerificationCode(existing.org_id, existing.nc_instance_id, code);
+    const row = await getOne(
+        `UPDATE pending_nc_bindings
+            SET verification_email = $2,
+                nc_admin_email = $2,
+                nc_admin_uid = COALESCE($3, nc_admin_uid),
+                nc_admin_display_name = COALESCE($4, nc_admin_display_name),
+                verification_code_hash = $5,
+                verification_attempts = 0,
+                expires_at = $6
+          WHERE id = $1 AND status = 'pending' AND verification_code_hash IS NOT NULL
+          RETURNING *`,
+        [id, String(email).toLowerCase(), uid || null, displayName || null, hash, expiresAt]
+    );
+    return parsePendingBinding(row);
+}
+
 async function countActivePendingNcVerificationsForOrg(orgId) {
     if (!orgId) return 0;
     await initDB();
@@ -2918,7 +2946,7 @@ module.exports = {
     getUserByNcUid,
     createPendingNcBinding, getPendingNcBinding, getPendingNcBindingForOrg,
     createPendingNcVerification, verifyPendingNcCode, resetNcVerificationCode,
-    countActivePendingNcVerificationsForOrg,
+    retargetNcVerification, countActivePendingNcVerificationsForOrg,
     createOrgPairingCode, getPendingBindingByPairingCode, consumePairingCode,
     getActivePairingCodesForOrg, deletePairingCode,
     countActivePendingNcBindingsForOrg, markPendingNcBindingApproved,

@@ -46,8 +46,14 @@ async function applyNcDefaultPlanIfConfigured(orgId, source) {
             console.log(`[ConnectorBootstrap] no NC-recommended plan configured; org ${orgId} will use community fallback (source=${source})`);
             return;
         }
+        // Make it the org's ACTIVE subscription — createOrganization pre-assigns
+        // the `is_default` plan, so without this the org would keep that plan and
+        // only inherit this plan's integrations/features. setOrgSubscription
+        // upserts the organization_subscriptions row so billing/limits read the
+        // NC plan. Then applyPlanToOrg syncs the enabled integrations/features.
+        await userStore.setOrgSubscription(orgId, { plan_id: plan.id, status: 'active' });
         await planEntitlements.applyPlanToOrg(orgId, plan.id, { mode: 'reset' });
-        console.log(`[ConnectorBootstrap] Applied NC default plan ${plan.id} (${plan.name}) to org ${orgId} (source=${source})`);
+        console.log(`[ConnectorBootstrap] Applied NC default plan ${plan.id} (${plan.name}) as active subscription for org ${orgId} (source=${source})`);
     } catch (err) {
         console.warn(`[ConnectorBootstrap] failed to apply NC default plan to org ${orgId}: ${err.message}`);
     }
@@ -453,6 +459,11 @@ router.post('/connector/bootstrap', bootstrapLimiter, async (req, res) => {
                 remediation: 'Wait for the existing verification codes to expire (15 minutes) and retry from the connector.',
             });
         }
+        // Create the pending verification but DON'T email a code here. Bootstrap
+        // runs at connector startup with no user context, so `ncAdminEmail` is
+        // just the arbitrary first admin. The code is sent to whichever admin
+        // actually opens the embedded view (see /retarget), so it reaches the
+        // person doing the setup — who also becomes the org admin on success.
         const code = generateVerificationCode();
         const pending = await userStore.createPendingNcVerification({
             orgId: verifyOrg.id,
@@ -466,26 +477,17 @@ router.post('/connector/bootstrap', bootstrapLimiter, async (req, res) => {
             ncVersion: nc.ncVersion,
             verificationEmail: ncAdminEmail,
         }, { code });
-        let emailSent = false;
-        try {
-            const r = await sendNcVerificationCodeEmail({ to: ncAdminEmail, code, orgName: verifyOrg.name, expiresAt: pending.expiresAt });
-            emailSent = !!r?.success;
-            if (!emailSent) console.warn(`[ConnectorBootstrap] verification_email_failed org=${verifyOrg.id} reason=${r?.error}`);
-        } catch (e) {
-            console.warn(`[ConnectorBootstrap] verification_email_error org=${verifyOrg.id} reason=${e.message}`);
-        }
-        console.log(`[ConnectorBootstrap] email_verification_required org=${verifyOrg.id} pendingId=${pending.id} ncInstance=${ncInstanceId} emailSent=${emailSent} expiresAt=${pending.expiresAt}`);
+        console.log(`[ConnectorBootstrap] email_verification_required org=${verifyOrg.id} pendingId=${pending.id} ncInstance=${ncInstanceId} expiresAt=${pending.expiresAt}`);
         return res.status(202).json({
             status: 'pending_verification',
             code: 'email_verification_required',
             pendingId: pending.id,
             verifyUrl: `/auth/connector/bootstrap/pending/${pending.id}/verify`,
             resendUrl: `/auth/connector/bootstrap/pending/${pending.id}/resend`,
-            maskedEmail: maskEmail(ncAdminEmail),
+            retargetUrl: `/auth/connector/bootstrap/pending/${pending.id}/retarget`,
             expiresAt: pending.expiresAt,
-            emailSent,
             organizationName: verifyOrg.name,
-            message: 'A verification code has been emailed to the Nextcloud admin address.',
+            message: 'Awaiting in-app verification by a Nextcloud admin.',
         });
     }
 
@@ -667,6 +669,61 @@ router.post('/connector/bootstrap/pending/:id/resend', verificationResendLimiter
     }
     console.log(`[ConnectorBootstrap] verification_resent pendingId=${id} emailSent=${emailSent} expiresAt=${row.expiresAt}`);
     return res.json({ ok: true, maskedEmail: maskEmail(to), expiresAt: row.expiresAt, emailSent });
+});
+
+// Re-point a pending verification at the admin who is actually performing the
+// setup (the NC user in the embedded view), then email them the code. The
+// connector supplies the current user's email/uid; we re-validate that the
+// email qualifies for the org before redirecting the code, so a held pendingId
+// can't be used to send the code to an unrelated mailbox.
+router.post('/connector/bootstrap/pending/:id/retarget', verificationResendLimiter, async (req, res) => {
+    const id = String(req.params.id || '').trim();
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const uid = String(req.body?.uid || '').trim();
+    const displayName = String(req.body?.displayName || '').trim();
+    if (!id) return res.status(400).json({ error: 'Missing id' });
+    if (!email.includes('@')) return res.status(400).json({ error: 'A valid email is required', code: 'invalid_email' });
+
+    const row = await userStore.getPendingNcBinding(id);
+    if (!row) return res.status(404).json({ status: 'not_found', code: 'not_found' });
+    if (!row.hasVerification || row.status !== 'pending') {
+        return res.status(409).json({ error: 'No pending verification for this connection', code: 'not_verification' });
+    }
+    const expired = row.expiresAt && new Date(row.expiresAt).getTime() <= Date.now();
+    if (expired) return res.status(410).json({ status: 'expired', code: 'expired' });
+
+    // The target email must itself qualify for the org being linked — exact
+    // user match, or a matching corporate domain. Mirrors the bootstrap routing.
+    const domain = email.split('@')[1] || '';
+    let qualifies = false;
+    const exact = await userStore.getUserByEmail(email);
+    if (exact?.organizationId === row.orgId) qualifies = true;
+    if (!qualifies && domain && !FREE_EMAIL_DOMAINS.has(domain)) {
+        const o = await userStore.findUnboundOrgByEmailDomain(domain);
+        if (o?.id === row.orgId) qualifies = true;
+    }
+    if (!qualifies) {
+        return res.status(403).json({
+            error: 'This Nextcloud account is not part of the Bee Flow organisation this connection is being linked to.',
+            code: 'email_not_in_org',
+        });
+    }
+
+    const code = generateVerificationCode();
+    const updated = await userStore.retargetNcVerification(id, { email, uid, displayName, code });
+    if (!updated) return res.status(410).json({ status: 'expired', code: 'expired' });
+
+    let emailSent = false;
+    try {
+        const org = await userStore.getOrganization(row.orgId);
+        const r = await sendNcVerificationCodeEmail({ to: email, code, orgName: org?.name, expiresAt: updated.expiresAt });
+        emailSent = !!r?.success;
+        if (!emailSent) console.warn(`[ConnectorBootstrap] retarget_email_failed pendingId=${id} reason=${r?.error}`);
+    } catch (e) {
+        console.warn(`[ConnectorBootstrap] retarget_email_error pendingId=${id} reason=${e.message}`);
+    }
+    console.log(`[ConnectorBootstrap] verification_retargeted pendingId=${id} org=${row.orgId} emailSent=${emailSent}`);
+    return res.json({ ok: true, maskedEmail: maskEmail(email), expiresAt: updated.expiresAt, emailSent });
 });
 
 // Diagnostic endpoint — connector calls this when /api/license/* keeps

@@ -40,6 +40,12 @@ const { BEKENDMAKINGEN_TOOLS, isBekendmakingenTool } = require('../../integratio
 const { LEGAL_MATTER_TOOLS, isLegalMatterTool, executeLegalMatterTool } = require('../../integrations/legalMatterTools');
 const { userHasBetaFeature } = require('../../core/betaFeatures');
 
+// ── Guardrails (parity with direct chat) ─────────────────────────────
+const { sanitizeMessagesUnicode } = require('../../utils/unicodeSanitizer');
+const { resolveShieldFor, mergeWithOrgShield } = require('../../core/orgShield');
+const { checkRegexPatterns } = require('../../core/guardrails');
+const guardrailEventStore = require('../../stores/guardrailEventStore');
+
 const LEGAL_TOOLS = [...RECHTSPRAAK_TOOLS, ...EURLEX_TOOLS, ...TUCHTRECHT_TOOLS, ...KAMERSTUKKEN_TOOLS, ...BEKENDMAKINGEN_TOOLS];
 function isLegalTool(name) {
     return isRechtspraakTool(name) || isEurlexTool(name) || isTuchtrechtTool(name)
@@ -575,6 +581,26 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             messages.push({ role: 'user', content: message });
         }
 
+        // ── Unicode Smuggling Defense (must run FIRST) ──────────────────
+        const unicodeResult = sanitizeMessagesUnicode(messages);
+        if (unicodeResult.smugglingDetected) {
+            console.warn(`[NotebookChat] 🚨 Unicode smuggling stripped: ${unicodeResult.totalStripped} hidden chars`);
+            send('unicode_smuggling_detected', {
+                strippedCount: unicodeResult.totalStripped,
+                messageIndices: unicodeResult.detectedIn,
+            });
+            guardrailEventStore.logGuardrailEvent({
+                organization_id: userOrgForTiers || null,
+                user_id: userId || null,
+                conversation_id: notebookId || null,
+                violation_type: 'unicode_smuggling',
+                violation_categories: `${unicodeResult.totalStripped} hidden chars`,
+                direction: 'input',
+                action_taken: 'stripped',
+                source: 'notebook',
+            }).catch(() => {});
+        }
+
         // ── PII detection / tokenization (Privacy Shield) ──────────────
         // Mirrors directChat: if the org's Privacy Shield is enabled,
         // run validateInputForPii on the last user message and apply
@@ -613,6 +639,66 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
                 return res.end();
             }
             // Service unavailable → fail-open
+        }
+
+        // ── Regex Guardrails (org Privacy Shield + input check) ──────────
+        // Resolve org-wide regex rules; mirrors directChat.js:2348-2393
+        const orgShieldConfig = await resolveShieldFor({ orgId: userOrgForTiers, userId });
+        let regexConfig = mergeWithOrgShield(orgShieldConfig, null); // no notebook-local overrides
+
+        // Input regex check: block/redact before the model sees the message
+        if (regexConfig?.enabled && regexConfig?.scope?.userInput) {
+            const matches = checkRegexPatterns(message, regexConfig.rulesWithNames);
+            if (matches.length > 0) {
+                const ruleNames = matches.map(m => m.ruleName).join(', ');
+                console.log(`[NotebookChat RegexGuard] User input violated rules: ${ruleNames}, action: ${regexConfig.action}`);
+
+                if (regexConfig.action === 'redact') {
+                    // Redact the message for the model
+                    let redactedMessage = message;
+                    for (const rule of regexConfig.rulesWithNames) {
+                        try {
+                            const regex = new RegExp(rule.pattern, 'gi');
+                            redactedMessage = redactedMessage.replace(regex, `[REDACTED: ${rule.name}]`);
+                        } catch (e) { /* skip invalid patterns */ }
+                    }
+                    send('content_redact', {
+                        originalMessage: message,
+                        redactedMessage,
+                        rules: ruleNames,
+                        autoRedactSeconds: 5
+                    });
+                    // Replace in messages
+                    const lastMsg = messages[messages.length - 1];
+                    if (typeof lastMsg.content === 'string') {
+                        lastMsg.content = redactedMessage;
+                    }
+                    guardrailEventStore.logGuardrailEvent({
+                        organization_id: userOrgForTiers || null,
+                        user_id: userId || null,
+                        conversation_id: notebookId || null,
+                        violation_type: 'regex',
+                        violation_categories: ruleNames,
+                        direction: 'input',
+                        action_taken: 'redacted',
+                        source: 'notebook',
+                    }).catch(() => {});
+                } else {
+                    // Block the message — don't send to model
+                    send('guardrail_violation', { rules: ruleNames, autoDeleteSeconds: 5 });
+                    guardrailEventStore.logGuardrailEvent({
+                        organization_id: userOrgForTiers || null,
+                        user_id: userId || null,
+                        conversation_id: notebookId || null,
+                        violation_type: 'regex',
+                        violation_categories: ruleNames,
+                        direction: 'input',
+                        action_taken: 'blocked',
+                        source: 'notebook',
+                    }).catch(() => {});
+                    return res.end();
+                }
+            }
         }
 
         // ── Build tool list ──────────────────────────────────────────
@@ -752,6 +838,57 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
                 return { role: 'tool', tool_call_id: toolCall.id, content: resultStr };
             }));
             messages.push(...toolResults);
+        }
+
+        // ── Output Regex Guardrails (agentOutput scope) ──────────────────
+        // Check the model's response for guardrail violations; apply redaction
+        // or warning. Mirrors directChat.js:3753
+        if (regexConfig?.enabled && regexConfig?.scope?.agentOutput && fullContent) {
+            const outputMatches = checkRegexPatterns(fullContent, regexConfig.rulesWithNames);
+            if (outputMatches.length > 0) {
+                const ruleNames = outputMatches.map(m => m.ruleName).join(', ');
+                console.log(`[NotebookChat RegexGuard] Output violated rules: ${ruleNames}, action: ${regexConfig.action}`);
+
+                if (regexConfig.action === 'redact') {
+                    // Redact the output
+                    let redactedOutput = fullContent;
+                    for (const rule of regexConfig.rulesWithNames) {
+                        try {
+                            const regex = new RegExp(rule.pattern, 'gi');
+                            redactedOutput = redactedOutput.replace(regex, `[REDACTED: ${rule.name}]`);
+                        } catch (e) { /* skip invalid patterns */ }
+                    }
+                    send('content_redact', {
+                        originalMessage: fullContent.slice(0, 500),
+                        redactedMessage: redactedOutput.slice(0, 500),
+                        rules: ruleNames,
+                        autoRedactSeconds: 5
+                    });
+                    guardrailEventStore.logGuardrailEvent({
+                        organization_id: userOrgForTiers || null,
+                        user_id: userId || null,
+                        conversation_id: notebookId || null,
+                        violation_type: 'regex',
+                        violation_categories: ruleNames,
+                        direction: 'output',
+                        action_taken: 'redacted',
+                        source: 'notebook',
+                    }).catch(() => {});
+                } else {
+                    // Block: emit violation warning
+                    send('guardrail_violation', { rules: ruleNames, autoDeleteSeconds: 5 });
+                    guardrailEventStore.logGuardrailEvent({
+                        organization_id: userOrgForTiers || null,
+                        user_id: userId || null,
+                        conversation_id: notebookId || null,
+                        violation_type: 'regex',
+                        violation_categories: ruleNames,
+                        direction: 'output',
+                        action_taken: 'blocked',
+                        source: 'notebook',
+                    }).catch(() => {});
+                }
+            }
         }
 
         send('done', {});
