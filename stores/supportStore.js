@@ -51,11 +51,6 @@ CREATE INDEX IF NOT EXISTS idx_support_threads_requester_user ON support_threads
 ALTER TABLE support_threads ADD COLUMN IF NOT EXISTS requester_org_role TEXT;
 ALTER TABLE support_threads ADD COLUMN IF NOT EXISTS requester_org_name TEXT;
 
--- iteration 3: per-message email delivery status. JSONB shape:
---   { ok: true, at: '2026-…' } on success,
---   { ok: false, error: 'SMTP …', at: '2026-…' } on failure.
-ALTER TABLE support_messages ADD COLUMN IF NOT EXISTS email_send_status JSONB;
-
 -- iteration 3: append-only audit log of who-did-what on a thread.
 CREATE TABLE IF NOT EXISTS support_thread_events (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -84,6 +79,15 @@ CREATE TABLE IF NOT EXISTS support_messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_support_messages_thread ON support_messages(thread_id, created_at);
+
+-- iteration 3: per-message email delivery status. JSONB shape:
+--   { ok: true, at: '2026-…' } on success,
+--   { ok: false, error: 'SMTP …', at: '2026-…' } on failure.
+-- MUST come after the support_messages CREATE above: this ALTER references
+-- the table, so on a fresh DB it would otherwise abort the whole INIT_SQL
+-- batch (one implicit transaction) with 'relation "support_messages" does
+-- not exist', leaving every support table uncreated.
+ALTER TABLE support_messages ADD COLUMN IF NOT EXISTS email_send_status JSONB;
 
 -- iteration 4: full ticket-system fields — tags/category, SLA timers, CSAT,
 -- and auto-assignment. All additive so existing rows keep working.

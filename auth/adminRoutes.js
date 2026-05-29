@@ -140,26 +140,35 @@ router.get('/users', requireAuth, async (req, res) => {
 
     let allUsers = [superAdmin, ...users.filter(u => u.id !== 'admin')];
 
-    // Org-scoped filtering using canonical resolver
+    // Org-scoped filtering using canonical resolver.
+    //
+    // `resolveUserOrgIds` returns null ONLY for super-admins (already handled
+    // above via isSuperAdmin), so for any non-super caller it returns a Set —
+    // possibly empty. We ALWAYS apply the filter for non-super callers: an
+    // empty org set must scope DOWN to "self only", never widen to "all users".
+    // The previous `if (myOrgIds.size > 0)` guard silently returned every user
+    // in the system when the caller's `organizationId` was falsy/missing — a
+    // cross-org leak. The caller is always allowed to see their own row so an
+    // org-admin whose own org pointer is momentarily off still sees themselves.
     if (!isSuperAdmin) {
-        const myOrgIds = await resolveUserOrgIds(req);
-        if (myOrgIds && myOrgIds.size > 0) {
-            const allGroups = await userStore.getAllGroups();
-            const orgGroupIds = new Set();
-            for (const group of allGroups) {
-                if (group.organizationId && myOrgIds.has(group.organizationId)) {
-                    orgGroupIds.add(group.id);
-                }
+        const myOrgIds = (await resolveUserOrgIds(req)) || new Set();
+        const selfId = req.session.user?.id;
+        const allGroups = await userStore.getAllGroups();
+        const orgGroupIds = new Set();
+        for (const group of allGroups) {
+            if (group.organizationId && myOrgIds.has(group.organizationId)) {
+                orgGroupIds.add(group.id);
             }
-
-            allUsers = allUsers.filter(u => {
-                if (u.isSystem) return false;
-                if (u.organizationId && myOrgIds.has(u.organizationId)) return true;
-                let uGroups = [];
-                try { uGroups = Array.isArray(u.groups) ? u.groups : JSON.parse(u.groups || '[]'); } catch (_) { }
-                return uGroups.some(gid => orgGroupIds.has(gid));
-            });
         }
+
+        allUsers = allUsers.filter(u => {
+            if (u.isSystem) return false;
+            if (selfId && u.id === selfId) return true;
+            if (u.organizationId && myOrgIds.has(u.organizationId)) return true;
+            let uGroups = [];
+            try { uGroups = Array.isArray(u.groups) ? u.groups : JSON.parse(u.groups || '[]'); } catch (_) { }
+            return uGroups.some(gid => orgGroupIds.has(gid));
+        });
     }
 
     res.json(allUsers);
@@ -1334,14 +1343,13 @@ async function resolveActiveFeaturesContext(req) {
 
     const org = await userStore.getOrganization(orgId);
 
-    // Beta allow-list = super admin's grant ∪ features marked `freeForAllOrgs`
-    // (open-data sources etc. where a per-org super-admin grant adds friction
-    // without security value — the org-admin active toggle is authoritative).
-    // The grant overrides the plan cap below; only the freeForAll defaults
-    // are capped. An explicit super-admin grant is an authoritative decision
-    // that the plan template's ceiling should not silently undo.
+    // Beta allow-list = the super admin's per-org grant, full stop. A beta
+    // feature the platform admin hasn't granted to this org never appears in
+    // the org-admin panel and can't be enabled — there is no free-for-all
+    // bypass. The grant is also authoritative over the plan cap: an explicit
+    // super-admin grant is a deliberate decision the plan template's ceiling
+    // should not silently undo, so the grant list is not plan-capped here.
     const grantedAllowList = await getOrgBetaFeatures(orgId);
-    const freeForAll = BETA_FEATURES.filter(f => f.freeForAllOrgs).map(f => f.id);
     const enabledBetaFeatures = await userStore.getOrgEnabledBetaFeatures(orgId);
 
     // Integration allow-list = super admin's enabledIntegrations (or global
@@ -1357,23 +1365,18 @@ async function resolveActiveFeaturesContext(req) {
     allowedIntegrations = allowedIntegrations.filter(id => !NC_ID_SET.has(id));
     const enabledIntegrations = await userStore.getOrgEnabledIntegrations(orgId);
 
-    // Plan cap applies to plan-driven defaults (freeForAll) and to
-    // integrations. Explicit super-admin beta grants override the cap —
-    // if a platform admin granted a beta to this org, it surfaces here
-    // regardless of the plan template's ceiling.
-    let planCappedFreeForAll = freeForAll;
+    // Plan cap applies to integrations only. Beta grants are authoritative
+    // over the plan ceiling (see above), so the grant list passes through
+    // uncapped.
     let planCappedInt = allowedIntegrations;
     try {
         const { getOrgCaps, applyCap } = require('../services/planEntitlements');
         const caps = await getOrgCaps(orgId);
-        planCappedFreeForAll = applyCap(freeForAll, caps.betaFeatures);
         planCappedInt = applyCap(allowedIntegrations, caps.integrations);
     } catch (e) {
         console.warn('[ActiveFeatures] plan cap lookup failed:', e.message);
     }
-    const allowedBetaFeatures = Array.from(
-        new Set([...grantedAllowList, ...planCappedFreeForAll])
-    );
+    const allowedBetaFeatures = Array.from(new Set(grantedAllowList));
 
     return {
         orgId,

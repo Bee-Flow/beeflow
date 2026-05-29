@@ -280,19 +280,15 @@ router.get('/system', requireAuth, async (req, res) => {
         }
 
         // The org's real-world active set = intersection of super-admin
-        // allow-list (∪ features marked `freeForAllOrgs`) AND org-admin
-        // active list. We surface both so the UI can tell whether enabling
-        // requires a super-admin step first.
-        const { getOrgBetaFeatures, listBetaFeatures } = require('../core/betaFeatures');
-        const freeForAll = new Set(listBetaFeatures().filter(f => f.freeForAllOrgs).map(f => f.id));
+        // allow-list AND org-admin active list. We surface both so the UI can
+        // tell whether enabling requires a super-admin grant step first.
+        const { getOrgBetaFeatures } = require('../core/betaFeatures');
         let orgAllowed = new Set();
         let orgActive = new Set();
         if (orgId) {
             try { orgAllowed = new Set(await getOrgBetaFeatures(orgId)); } catch (_) { /* */ }
             try { orgActive = new Set(await userStore.getOrgEnabledBetaFeatures(orgId)); } catch (_) { /* */ }
         }
-        // Free-for-all features count as allowed even without a super-admin grant.
-        for (const id of freeForAll) orgAllowed.add(id);
 
         const all = await kbStore.listSystemKBs();
         const payload = all.map(kb => {

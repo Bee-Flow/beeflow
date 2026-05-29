@@ -2,54 +2,72 @@
  * Azure AI Provider Adapter
  *
  * Uses the `openai` npm package's `AzureOpenAI` class.
- * Extends OpenAIProvider — inherits all tool calling, streaming,
- * reasoning logic. Only difference: SDK initialization uses
- * Azure endpoint + API key + API version + deployment.
+ * Extends OpenAIProvider — inherits ALL tool calling, streaming, reasoning,
+ * verbosity, cache-hint and Responses-API logic. The only Azure-specific
+ * behaviour lives here:
+ *   - SDK init uses an Azure endpoint + API key + api-version + deployment.
+ *   - store: false on the Responses API (see responsesStore below).
  *
  * Authentication (per Azure AI Foundry docs):
- *   - endpoint: Azure OpenAI resource URL (e.g. https://resource.cognitiveservices.azure.com/)
+ *   - endpoint: Azure OpenAI resource URL (e.g. https://resource.openai.azure.com/)
  *   - apiKey: Azure API key
- *   - apiVersion: API version (e.g. 2025-04-01-preview)
+ *   - apiVersion: API version. Defaults to a recent dated preview
+ *     (2025-04-01-preview) that the installed `openai` SDK (v4.x) supports on
+ *     the dated Azure surface (`/openai/responses`, `/openai/deployments/...`).
+ *     The v1 GA surface ('preview' → `/openai/v1/...`) is recognised by the
+ *     gate below but requires openai-node v5.x to route correctly; until that
+ *     upgrade, prefer the dated value. A dated version can be pinned per
+ *     provider for back-compat.
  *   - deployment: The deployment name (same as model name for Azure)
  *
  * Responses API support:
- *   - Azure v1 API (GA August 2025) supports client.responses.create
- *   - Requires apiVersion >= 2025-03-01-preview
- *   - Enables reasoning summaries ("thinking" bubbles) for GPT-5/o-series
- *   - Falls back to Chat Completions for older API versions
+ *   - v1 GA surface ('preview'/'v1') supports client.responses.create.
+ *   - Dated versions require apiVersion >= 2025-03-01.
+ *   - Enables reasoning summaries ("thinking" bubbles) for GPT-5/o-series.
+ *   - Falls back to Chat Completions for older dated API versions.
  *
- * Performance optimizations (Azure-specific):
- *   - store: false — disables server-side response storage to avoid DB lookups
- *     that add latency on Azure. BeeFlow manages conversation history itself.
- *   - Tier-aware token defaults — uses TIER_DEFAULTS from modelResolver for
- *     optimised per-tier maxTokens instead of a flat 8192 fallback.
+ * Performance:
+ *   - responsesStore = false — disables server-side response storage to avoid
+ *     the DB lookups that add latency on Azure. BeeFlow manages conversation
+ *     history itself, so the inherited base methods send full history and skip
+ *     response chaining when storage is off.
  */
 
 const OpenAIProvider = require('./openai');
-const { TIER_DEFAULTS } = require('../modelResolver');
 
-// API versions that support the Responses API
+// Default api-version. Dated preview that the installed openai SDK (v4.x)
+// supports on the dated Azure surface. Switch to 'preview' once openai-node
+// v5.x (with native /openai/v1/ routing) is adopted.
+const DEFAULT_API_VERSION = '2025-04-01-preview';
+// Oldest dated api-version that supports the Responses API.
 const RESPONSES_API_MIN_VERSION = '2025-03-01';
 
 class AzureProvider extends OpenAIProvider {
     constructor() {
         super();
         this.name = 'azure';
+        // Azure charges latency for server-side state lookups (store:true). Since
+        // BeeFlow manages conversation history itself, run store:false — the
+        // inherited Responses methods then send full history and skip chaining.
+        this.responsesStore = false;
     }
 
-    // ─── Responses API: enabled for new API versions ────────────────
-    // Azure v1 API (2025+) supports Responses API with reasoning summaries.
-    // Older versions (2024-*) only support Chat Completions.
+    /** Effective api-version: provider config → env → v1 GA default. */
+    _resolveApiVersion(options = {}) {
+        return options.apiVersion || process.env.AZURE_OPENAI_API_VERSION || DEFAULT_API_VERSION;
+    }
+
+    // ─── Responses API gate ─────────────────────────────────────────
+    // v1 GA ('preview'/'v1') always supports Responses. Dated versions
+    // (2024-*) only support Chat Completions; 2025-03-01+ support Responses.
     shouldUseResponsesApi(model, options = {}) {
-        // First check if the model supports reasoning at all
         if (!this.supportsReasoning(model)) return false;
         if (options.reasoningEffort === 'none') return false;
 
-        // Check API version — only use Responses API with 2025+ versions
-        const apiVersion = options.apiVersion || '';
-        if (!apiVersion) return false;
+        const apiVersion = this._resolveApiVersion(options);
+        if (apiVersion === 'preview' || apiVersion === 'v1') return true;
 
-        // Extract the date portion (e.g. "2025-04-01" from "2025-04-01-preview")
+        // Dated version back-compat: require >= 2025-03-01.
         const versionDate = apiVersion.substring(0, 10);
         return versionDate >= RESPONSES_API_MIN_VERSION;
     }
@@ -63,7 +81,7 @@ class AzureProvider extends OpenAIProvider {
      * @param {string} apiKey - Azure API key
      * @param {object} [options] - Provider config options
      * @param {string} [options.endpoint] - Azure OpenAI endpoint URL
-     * @param {string} [options.apiVersion] - API version string
+     * @param {string} [options.apiVersion] - API version string ('preview' for v1 GA)
      * @param {string} [options.deployment] - Deployment name (model name)
      */
     createClient(apiKey, options = {}) {
@@ -71,7 +89,7 @@ class AzureProvider extends OpenAIProvider {
 
         // endpoint comes from the provider URL field
         const endpoint = options.endpoint || process.env.AZURE_OPENAI_ENDPOINT;
-        const apiVersion = options.apiVersion || process.env.AZURE_OPENAI_API_VERSION || '2025-04-01-preview';
+        const apiVersion = this._resolveApiVersion(options);
         const deployment = options.deployment || undefined;
 
         if (!endpoint) {
@@ -89,6 +107,9 @@ class AzureProvider extends OpenAIProvider {
     }
 
     // ─── Override chat/stream to pass endpoint + deployment ────────
+    // The actual request building (Chat Completions vs Responses, reasoning,
+    // verbosity, tools, cache hints, streaming event loop) is inherited from
+    // OpenAIProvider and is store-aware via this.responsesStore.
 
     async chat(apiKey, baseUrl, model, messages, options = {}) {
         // For Azure, baseUrl IS the endpoint, model IS the deployment
@@ -98,7 +119,6 @@ class AzureProvider extends OpenAIProvider {
             deployment: model,
         });
 
-        // Choose API based on model capability and API version
         if (this.shouldUseResponsesApi(model, options)) {
             console.log('[Azure] Using Responses API for model:', model);
             return this._chatResponses(client, model, messages, options);
@@ -113,129 +133,11 @@ class AzureProvider extends OpenAIProvider {
             deployment: model,
         });
 
-        // Choose API based on model capability and API version
         if (this.shouldUseResponsesApi(model, options)) {
             console.log('[Azure] Using Responses API streaming for model:', model);
             return this._streamResponses(client, model, messages, options, onEvent);
         }
         return this._streamCompletions(client, model, messages, options, onEvent);
-    }
-
-    // ─── Azure-specific Responses API overrides ──────────────────────
-    // Azure charges latency for server-side state lookups (store: true).
-    // Since BeeFlow manages conversation history on its own backend,
-    // we override store to false — eliminates DB lookup overhead on every request.
-
-    async _chatResponses(client, model, messages, options = {}) {
-        const params = {
-            model,
-            store: false, // Azure perf: skip server-side state storage
-        };
-
-        // Send full message history (no chaining without store)
-        params.input = this.toResponsesInput(messages);
-
-        if (options.maxTokens !== undefined) params.max_output_tokens = options.maxTokens;
-
-        const reasoning = { summary: options.reasoningSummary ? 'auto' : 'concise' };
-        const effort = this.normalizeEffort(model, options.reasoningEffort);
-        reasoning.effort = effort || 'medium';
-        params.reasoning = reasoning;
-
-        console.log('[Azure] SDK chat (responses, store=false) for model:', model);
-        const response = await client.responses.create(params);
-
-        return {
-            content: response.output_text || null,
-            toolCalls: null,
-            usage: response.usage || null,
-            responseId: null, // No chaining without store
-            raw: response,
-        };
-    }
-
-    async _streamResponses(client, model, messages, options, onEvent) {
-        const params = {
-            model,
-            stream: true,
-            store: false, // Azure perf: skip server-side state storage
-        };
-
-        // Always send full history (no previous_response_id without store)
-        params.input = this.toResponsesInput(messages);
-
-        if (options.maxTokens !== undefined) params.max_output_tokens = options.maxTokens;
-
-        const reasoning = { summary: options.reasoningSummary ? 'auto' : 'concise' };
-        const effort = this.normalizeEffort(model, options.reasoningEffort);
-        reasoning.effort = effort || 'medium';
-        params.reasoning = reasoning;
-
-        if (options.tools && options.tools.length > 0) {
-            params.tools = options.tools.map(t => ({
-                type: 'function',
-                name: t.function?.name || t.name,
-                description: t.function?.description || t.description || '',
-                parameters: t.function?.parameters || t.parameters || {},
-            }));
-        }
-
-        console.log('[Azure] SDK streaming (responses, store=false) for model:', model, 'reasoning:', JSON.stringify(reasoning));
-        const stream = await client.responses.create(params);
-
-        // Track current function call being accumulated
-        let currentFnCall = null;
-        let streamUsage = null;
-
-        for await (const event of stream) {
-            if (event.type === 'response.output_text.delta') {
-                if (event.delta) onEvent('text', { text: event.delta });
-            } else if (event.type === 'response.reasoning_summary_text.delta') {
-                if (event.delta) onEvent('thinking', { text: event.delta });
-            } else if (event.type === 'response.output_item.added') {
-                // New output item — could be a function call
-                if (event.item?.type === 'function_call') {
-                    currentFnCall = {
-                        id: event.item.call_id || event.item.id,
-                        name: event.item.name || '',
-                        arguments: '',
-                    };
-                }
-            } else if (event.type === 'response.function_call_arguments.delta') {
-                if (currentFnCall && event.delta) {
-                    currentFnCall.arguments += event.delta;
-                }
-            } else if (event.type === 'response.function_call_arguments.done') {
-                if (currentFnCall) {
-                    let input = {};
-                    try { input = JSON.parse(currentFnCall.arguments || '{}'); } catch (e) { }
-                    onEvent('tool_use', {
-                        id: currentFnCall.id,
-                        name: currentFnCall.name,
-                        input,
-                    });
-                    console.log(`[Azure] Responses stream tool_use: ${currentFnCall.name}`);
-                    currentFnCall = null;
-                }
-            } else if (event.type === 'response.completed') {
-                // Capture usage from completed response
-                const usage = event.response?.usage;
-                if (usage) {
-                    streamUsage = {
-                        prompt_tokens: usage.input_tokens || 0,
-                        completion_tokens: usage.output_tokens || 0,
-                        total_tokens: (usage.input_tokens || 0) + (usage.output_tokens || 0),
-                        cached_tokens: usage.input_tokens_details?.cached_tokens || 0,
-                    };
-                    if (streamUsage.cached_tokens > 0) {
-                        console.log(`[Azure] ⚡ Responses API cache hit: ${streamUsage.cached_tokens} cached tokens`);
-                    }
-                }
-                // No responseId capture — store is disabled
-            }
-        }
-
-        onEvent('done', streamUsage || {});
     }
 
     // ─── List Models (Static from config) ──────────────────────────
@@ -270,4 +172,3 @@ class AzureProvider extends OpenAIProvider {
 }
 
 module.exports = AzureProvider;
-

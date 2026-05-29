@@ -284,6 +284,25 @@ async function connectorJwtMiddleware(req, res, next) {
             return res.status(403).json({ error: 'Account is pending admin approval' });
         }
 
+        // Reconcile a missing org pointer. We reach here only when the user
+        // either already belongs to `orgId` or has no org at all (the
+        // cross-tenant guard above rejects a user bound to a *different* org).
+        // The session below would otherwise fall back to `orgId` while the DB
+        // row keeps a falsy organizationId — so embedded (session-org) and
+        // standalone (`/auth/user` reads the DB row) would resolve different
+        // orgs for the same person, and org-scoped queries that read the DB
+        // (resolveUserOrgIds) would exclude them. Persist the org so DB and
+        // session agree everywhere. Idempotent.
+        if (!user.organizationId && orgId) {
+            try {
+                await userStore.updateUser(user.id, { organizationId: orgId });
+                user.organizationId = orgId;
+                console.log(`[ConnectorJWT] Backfilled organizationId=${orgId} for user ${user.id}`);
+            } catch (e) {
+                console.warn(`[ConnectorJWT] Failed to backfill organizationId for ${user.id}: ${e.message}`);
+            }
+        }
+
         // Observability: surface data-corruption — a user marked as connector-
         // sourced should always live under an NC-bound org. If we ever see
         // provider=nextcloud_connector under an org without nc_instance_id,

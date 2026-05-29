@@ -504,6 +504,7 @@ const GUI_DEFAULTS = {
     'org.license_subtitle': 'Your current plan and usage for this billing period',
     'org.no_license': 'No license assigned',
     'org.no_license_desc': 'Contact your administrator to set up a plan for your organisation.',
+    'org.server_license_no_subscription': 'This installation is covered by a server-wide licence, so your organisation does not need a subscription. Usage and billing are managed by the platform operator.',
     'org.billing_started': 'Billing cycle started {date}',
     'org.cost_cap_month': 'cost cap / month',
     'org.messages': 'Messages',

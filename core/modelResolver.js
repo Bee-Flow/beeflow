@@ -28,18 +28,23 @@ const configStore = require('../stores/configStore');
 // Output ceilings stay below Sonnet 4.6's 64K max so the same numbers are
 // safe on every Claude 4.x model (Opus 4.7 allows 128K; we don't need that
 // much in normal direct-chat scenarios and a high cap mostly hurts latency).
+// `verbosity` is a GPT-5-only output-length knob (low/medium/high). It is
+// ignored by non-GPT-5 models (the adapter only forwards it for GPT-5), so it
+// is safe to carry on every tier.
 const TIER_DEFAULTS = {
     fast: {
         maxTokens: 4096,
         temperature: 0.2,
-        reasoningEffort: undefined, // no reasoning for speed
+        reasoningEffort: undefined, // resolved per-model (GPT-5 → 'minimal'), see applyReasoningDefaults
         reasoningSummary: false,
+        verbosity: 'low',
     },
     standard: {
         maxTokens: 16384,
         temperature: 0.5,
         reasoningEffort: 'low',
         reasoningSummary: false,
+        verbosity: 'medium',
     },
     swarm: {
         // Swarm tier delegates per-message to a multi-agent runtime; the
@@ -49,24 +54,28 @@ const TIER_DEFAULTS = {
         temperature: 0.5,
         reasoningEffort: 'low',
         reasoningSummary: false,
+        verbosity: 'medium',
     },
     thinking: {
         maxTokens: 32768,
         temperature: 0.7,
         reasoningEffort: 'medium',
         reasoningSummary: true,
+        verbosity: 'medium',
     },
     writer: {
         maxTokens: 32768,
         temperature: 0.7,
         reasoningEffort: 'low',
         reasoningSummary: false,
+        verbosity: 'high',
     },
     deep_thinking: {
         maxTokens: 64000,
         temperature: 0.7,
         reasoningEffort: 'high',
         reasoningSummary: true,
+        verbosity: 'high',
     },
     // Legacy aliases
     smart: {
@@ -74,12 +83,14 @@ const TIER_DEFAULTS = {
         temperature: 0.7,
         reasoningEffort: 'medium',
         reasoningSummary: true,
+        verbosity: 'medium',
     },
     pro: {
         maxTokens: 32768,
         temperature: 0.7,
         reasoningEffort: 'low',
         reasoningSummary: false,
+        verbosity: 'high',
     },
 };
 
@@ -242,7 +253,7 @@ function isReasoningModel(modelId) {
  * upgrade `undefined` → enabled — explicit `false` from the admin or custom
  * tier config is respected.
  */
-function applyReasoningDefaults(merged, userConfig) {
+function applyReasoningDefaults(merged, userConfig, tierName) {
     if (!merged?.modelId || !isReasoningModel(merged.modelId)) return merged;
     const userSetSummary  = Object.prototype.hasOwnProperty.call(userConfig || {}, 'reasoningSummary');
     const userSetEffort   = Object.prototype.hasOwnProperty.call(userConfig || {}, 'reasoningEffort');
@@ -250,7 +261,13 @@ function applyReasoningDefaults(merged, userConfig) {
         merged.reasoningSummary = true;
     }
     if (!userSetEffort && (merged.reasoningEffort === undefined || merged.reasoningEffort === null)) {
-        merged.reasoningEffort = 'medium';
+        // The fast/swarm tiers are tuned for speed. GPT-5 models expose a
+        // dedicated 'minimal' reasoning tier — use it there instead of the
+        // generic 'medium' default so "fast" stays fast (and cheap). Other
+        // providers (Claude/Gemini) keep the 'medium' default unchanged.
+        const isFastTier = tierName === 'fast' || tierName === 'swarm';
+        const isGpt5 = /^gpt-5/i.test(merged.modelId);
+        merged.reasoningEffort = (isFastTier && isGpt5) ? 'minimal' : 'medium';
     }
     return merged;
 }
@@ -275,9 +292,10 @@ async function getTierConfig(tierName, { userOrgId = null, userId = null } = {})
                 temperature: custom.temperature,
                 reasoningEffort: custom.reasoningEffort,
                 reasoningSummary: custom.reasoningSummary,
+                verbosity: custom.verbosity,
                 modelId: custom.modelId,
             };
-            return applyReasoningDefaults(merged, custom);
+            return applyReasoningDefaults(merged, custom, tierName);
         }
         // Fall through to fast defaults if the id is unknown
     }
@@ -287,7 +305,7 @@ async function getTierConfig(tierName, { userOrgId = null, userId = null } = {})
     const defaults = TIER_DEFAULTS[tierName] || TIER_DEFAULTS['fast'];
     // Merge: defaults provide baselines, user config overrides
     const merged = { ...defaults, ...userConfig };
-    return applyReasoningDefaults(merged, userConfig);
+    return applyReasoningDefaults(merged, userConfig, tierName);
 }
 
 /**

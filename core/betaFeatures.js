@@ -106,7 +106,7 @@ const BETA_FEATURES = [
     { id: 'webpages', name: 'Webpages', description: 'AI-built static webpages. Three-file projects (index.html / style.css / script.js) hosted in RustFS, with sandboxed live preview, auto-versioning, KB-grounded AI chat, and a one-click ZIP download.', licenseFeature: 'webpages', lifecycle: BetaLifecycle.BETA },
     { id: 'automations', name: 'Automations', description: 'Conversational no-code automation builder. Users describe an automation in chat; the AI assembles a typed DAG that mixes scheduled triggers, integration actions, AI reasoning steps, conditions, loops, and notifications. Includes dry-run preview, run history, and webhook + app-event triggers.', licenseFeature: 'automations', lifecycle: BetaLifecycle.BETA },
     { id: 'agent_routines', name: 'Agent routines', description: 'Schedule recurring tasks that run through a specific agent. The routine fires the agent on a cron-like schedule with the full agent runtime (system prompt, attached skills, knowledge bases, integrations) and saves the result to a persistent chat thread.', licenseFeature: 'agent_routines', lifecycle: BetaLifecycle.BETA },
-    { id: 'dutch_legal_sources', name: 'Dutch Legal Sources', description: 'Nederlandse juridische bronnen — geconsolideerde wetgeving (BW, Awb, Rv, Wvk, AVG-uitvoeringswet) als systeem-KB, plus tools voor jurisprudentie (rechtspraak.nl) en EU-recht (EUR-Lex / HvJEU) in het Nederlands. Bedoeld voor juridische agents die juristen helpen bij opstellen van adviezen, contracten en pleitnota’s. Alle bronnen zijn vrij te gebruiken (overheid open data).', freeForAllOrgs: true, lifecycle: BetaLifecycle.BETA },
+    { id: 'dutch_legal_sources', name: 'Dutch Legal Sources', description: 'Nederlandse juridische bronnen — geconsolideerde wetgeving (BW, Awb, Rv, Wvk, AVG-uitvoeringswet) als systeem-KB, plus tools voor jurisprudentie (rechtspraak.nl) en EU-recht (EUR-Lex / HvJEU) in het Nederlands. Bedoeld voor juridische agents die juristen helpen bij opstellen van adviezen, contracten en pleitnota’s. Alle bronnen zijn vrij te gebruiken (overheid open data).', lifecycle: BetaLifecycle.BETA },
     { id: 'playwright_tests', name: 'Playwright Tests (Beta)', description: 'Generate and run Playwright tests against external sites from conversations, GitHub commits, YouTrack issues or free text. Includes an explore mode that drives a Chromium browser without pre-generated tests and reports findings.', licenseFeature: 'playwright_tests', lifecycle: BetaLifecycle.BETA },
 ];
 
@@ -286,14 +286,9 @@ async function getUserBetaFeatures(userId, session = null, { tierHint = null } =
 
     // Intersection of the super-admin allow-list with the org-admin
     // "active" subset — both must include a feature for it to be
-    // available to users in the org. Exception: features marked
-    // `freeForAllOrgs: true` skip the allow-list step — the org-admin
-    // active toggle is authoritative on its own. Used for fully free
-    // features (open-data sources etc.) where a separate super-admin
-    // grant per org is friction without security value.
-    const freeForAll = new Set(
-        BETA_FEATURES.filter(f => f.freeForAllOrgs).map(f => f.id)
-    );
+    // available to users in the org. The super-admin grant is the sole
+    // gate: a feature the platform admin hasn't granted to the org can
+    // never be enabled here, even by the org admin.
     // GA-lifecycle features auto-enable when they're in the allowed set —
     // org admins can still flip them off explicitly, but they don't need to
     // toggle them on. This is the off-switch / GA-promotion mechanism.
@@ -307,7 +302,7 @@ async function getUserBetaFeatures(userId, session = null, { tierHint = null } =
             const allowed = await getOrgBetaFeatures(orgId);
             const active = await userStore.getOrgEnabledBetaFeatures(orgId);
             const activeSet = new Set(active);
-            const allowedSet = new Set([...allowed, ...freeForAll]);
+            const allowedSet = new Set(allowed);
             for (const fid of allowedSet) {
                 if (activeSet.has(fid)) { featureSet.add(fid); continue; }
                 // GA: auto-active unless org-admin has explicitly turned it
@@ -356,8 +351,7 @@ async function userHasBetaFeature(userId, featureId, session = null) {
  * background runners (automations, schedulers) where there's no user session
  * to pass through `userHasBetaFeature`. Applies the same intersection rule:
  * the super-admin allow-list must contain the feature AND the org-admin
- * must have it in the active subset. `freeForAllOrgs` features skip the
- * super-admin step.
+ * must have it in the active subset.
  */
 async function orgHasBetaFeature(orgId, featureId, { tierHint = null } = {}) {
     if (!orgId) return false;
@@ -373,10 +367,7 @@ async function orgHasBetaFeature(orgId, featureId, { tierHint = null } = {}) {
         const gaSet = new Set(
             BETA_FEATURES.filter(f => f.lifecycle === BetaLifecycle.GA).map(f => f.id)
         );
-        const freeForAll = new Set(
-            BETA_FEATURES.filter(f => f.freeForAllOrgs).map(f => f.id)
-        );
-        const allowed = new Set([...(await getOrgBetaFeatures(orgId)), ...freeForAll]);
+        const allowed = new Set(await getOrgBetaFeatures(orgId));
         const userStore = require('../stores/userStore');
         let active = [];
         try { active = await userStore.getOrgEnabledBetaFeatures(orgId); }

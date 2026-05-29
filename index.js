@@ -503,11 +503,17 @@ app.listen(PORT, '0.0.0.0', () => {
     // background via setImmediate, so this never blocks boot. Admins can
     // re-trigger from the System Knowledge Bases admin panel.
     try {
+        // Private-cloud ("local cloud") installs are pre-provisioned by Bee
+        // Flow ops — the operator decides what (if any) legal sources live in
+        // the system KB, so the server must not auto-seed/refresh them on boot.
+        const isPrivateCloud = (process.env.DEPLOYMENT_MODE || 'cloud') === 'private-cloud';
         // Local-dev escape hatch: set SKIP_SYSTEM_KB_SEED=true to skip the
         // (CPU-bound, multi-minute) Dutch legal sources seed and its weekly
         // refresh. Has no effect in production unless the var is set there.
-        if (process.env.SKIP_SYSTEM_KB_SEED === 'true') {
-            console.log('[dutchLawIngest] SKIP_SYSTEM_KB_SEED=true — skipping boot seed and weekly refresh.');
+        if (process.env.SKIP_SYSTEM_KB_SEED === 'true' || isPrivateCloud) {
+            console.log(isPrivateCloud
+                ? '[dutchLawIngest] private-cloud deployment — skipping boot seed and weekly refresh of Dutch legal sources.'
+                : '[dutchLawIngest] SKIP_SYSTEM_KB_SEED=true — skipping boot seed and weekly refresh.');
         } else {
             const dutchLawIngest = require('./services/dutchLawIngest');
             dutchLawIngest.seedIfMissing();

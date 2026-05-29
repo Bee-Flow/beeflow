@@ -20,7 +20,7 @@ const userStore = require('../stores/userStore');
 const kbStore = require('../stores/knowledgeBases');
 const { getAll, getOne } = require('../db');
 const { PRESETS, PRESETS_MAP, PRESETS_PROMPTS_DIR } = require('../stores/agent/agentPresetRegistry');
-const { getOrgBetaFeatures, listBetaFeatures } = require('../core/betaFeatures');
+const { getOrgBetaFeatures } = require('../core/betaFeatures');
 
 function loadPromptFile(filename) {
     const full = path.join(PRESETS_PROMPTS_DIR, filename);
@@ -50,14 +50,12 @@ router.get('/', requireAuth, async (req, res) => {
     try {
         const { orgId, isSuperAdmin } = await resolveOrgContext(req);
 
-        const freeForAll = new Set(listBetaFeatures().filter(f => f.freeForAllOrgs).map(f => f.id));
         let orgAllowed = new Set();
         let orgActive = new Set();
         if (orgId) {
             try { orgAllowed = new Set(await getOrgBetaFeatures(orgId)); } catch (_) { /* */ }
             try { orgActive = new Set(await userStore.getOrgEnabledBetaFeatures(orgId)); } catch (_) { /* */ }
         }
-        for (const id of freeForAll) orgAllowed.add(id);
 
         // Pre-load existing org agents by name so the UI can flag "already installed".
         let existingByName = new Map();
@@ -109,9 +107,7 @@ router.post('/:slug/install', requireAuth, async (req, res) => {
 
         // Gate on the preset's beta feature unless caller is super-admin.
         if (preset.betaFeature && !isSuperAdmin) {
-            const freeForAll = new Set(listBetaFeatures().filter(f => f.freeForAllOrgs).map(f => f.id));
             const orgAllowed = new Set(await getOrgBetaFeatures(orgId).catch(() => []));
-            for (const id of freeForAll) orgAllowed.add(id);
             const orgActive = new Set(await userStore.getOrgEnabledBetaFeatures(orgId).catch(() => []));
             if (!orgAllowed.has(preset.betaFeature) || !orgActive.has(preset.betaFeature)) {
                 return res.status(403).json({

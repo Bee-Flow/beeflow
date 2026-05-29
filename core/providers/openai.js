@@ -13,6 +13,13 @@
  */
 
 const BaseProvider = require('./base');
+const {
+    clampEffort,
+    buildReasoningParams,
+    supportsVerbosity,
+    supportsParallelToolCalls,
+    mapToolChoice,
+} = require('./openaiModelCaps');
 
 // Models that don't support custom temperature
 const RESTRICTED_MODEL_PATTERNS = [
@@ -27,15 +34,12 @@ const REASONING_MODEL_PATTERNS = [
     /^gpt-5/,        // GPT-5.x family
 ];
 
-// Model-specific effort limits
-const MODEL_EFFORT_OVERRIDES = {
-    'gpt-5-pro': 'high',
-    'gpt-5.2-pro': 'high',
-};
-
 class OpenAIProvider extends BaseProvider {
     constructor() {
         super('openai');
+        // OpenAI uses server-side response storage so we can chain turns via
+        // previous_response_id. Azure overrides this to false (see azure.js).
+        this.responsesStore = true;
     }
 
     // ─── SDK Client ──────────────────────────────────────────────
@@ -46,20 +50,6 @@ class OpenAIProvider extends BaseProvider {
     }
 
     // ─── Model Helpers ───────────────────────────────────────────
-
-    normalizeEffort(model, effort) {
-        if (!effort) return null;
-        // Map any non-standard values to valid OpenAI values
-        const EFFORT_MAP = {
-            'minimal': 'low',   // 'minimal' is not valid for OpenAI, map to 'low'
-            'xhigh': 'high',   // 'xhigh' maps to OpenAI's max effort level
-        };
-        effort = EFFORT_MAP[effort] || effort;
-        for (const [pattern, fixed] of Object.entries(MODEL_EFFORT_OVERRIDES)) {
-            if (model.startsWith(pattern)) return fixed;
-        }
-        return effort;
-    }
 
     isRestrictedModel(modelId) {
         return RESTRICTED_MODEL_PATTERNS.some(p => p.test(modelId));
@@ -79,6 +69,36 @@ class OpenAIProvider extends BaseProvider {
         if (!this.supportsReasoning(model)) return false;
         if (options.reasoningEffort === 'none') return false;
         return true;
+    }
+
+    /**
+     * Attach cache-routing + abuse-monitoring hints to a request.
+     * `prompt_cache_key` is the dedicated cache-routing hint (better hit rate
+     * than overloading `user`); `user` is retained for abuse monitoring.
+     * Shared across Chat Completions and Responses, OpenAI and Azure.
+     */
+    _applyCacheHints(params, options = {}) {
+        if (options.promptCacheKey) params.prompt_cache_key = String(options.promptCacheKey);
+        if (options.userId) params.user = String(options.userId);
+    }
+
+    /**
+     * Attach Responses-API tool params: mapped tool_choice and the
+     * parallel_tool_calls guard (disabled under `minimal` effort, which the
+     * API rejects when parallel calls are requested).
+     */
+    _applyResponsesToolParams(params, options, effort) {
+        if (options.tools && options.tools.length > 0) {
+            params.tools = options.tools.map(t => ({
+                type: 'function',
+                name: t.function?.name || t.name,
+                description: t.function?.description || t.description || '',
+                parameters: t.function?.parameters || t.parameters || {},
+            }));
+            const tc = mapToolChoice(options.toolChoice);
+            if (tc) params.tool_choice = tc;
+            if (!supportsParallelToolCalls(effort)) params.parallel_tool_calls = false;
+        }
     }
 
     // ─── Responses API input normalization ────────────────────────
@@ -180,15 +200,16 @@ class OpenAIProvider extends BaseProvider {
         }
         if (options.tools && options.tools.length > 0) {
             params.tools = options.tools;
-            params.tool_choice = options.toolChoice || 'auto';
+            params.tool_choice = mapToolChoice(options.toolChoice) || 'auto';
         }
-        const effort = this.normalizeEffort(model, options.reasoningEffort);
+        const effort = clampEffort(model, options.reasoningEffort);
         if (effort && effort !== 'none' && this.supportsReasoning(model)) {
             params.reasoning_effort = effort;
         }
-        // Stable end-user hint — OpenAI routes identical prefixes from the same
-        // user to the same cache shard, improving hit rate.
-        if (options.userId) params.user = String(options.userId);
+        // GPT-5 output-length control (low/medium/high). Only sent for models
+        // that support it so gpt-4o/o-series requests stay untouched.
+        if (options.verbosity && supportsVerbosity(model)) params.verbosity = options.verbosity;
+        this._applyCacheHints(params, options);
 
         console.log('[OpenAI] SDK chat (completions) for model:', model);
         const response = await client.chat.completions.create(params);
@@ -205,18 +226,19 @@ class OpenAIProvider extends BaseProvider {
     async _chatResponses(client, model, messages, options = {}) {
         const params = {
             model,
-            store: true, // Enable server-side storage for response chaining
+            store: this.responsesStore,
         };
 
-        // If we have a previous response ID, chain from it — only send new message
-        if (options.previousResponseId) {
+        // Chain from a prior response only when storage is enabled (chaining
+        // requires server-side state). Azure runs store:false → always full history.
+        if (this.responsesStore && options.previousResponseId) {
             params.previous_response_id = options.previousResponseId;
             // Only send the last user message as input
             const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
             params.input = lastUserMsg
                 ? this.toResponsesInput([lastUserMsg])
                 : this.toResponsesInput(messages);
-            console.log('[OpenAI] Using previous_response_id:', options.previousResponseId);
+            console.log(`[${this.name}] Using previous_response_id:`, options.previousResponseId);
         } else {
             params.input = this.toResponsesInput(messages);
         }
@@ -224,21 +246,20 @@ class OpenAIProvider extends BaseProvider {
         if (options.maxTokens !== undefined) params.max_output_tokens = options.maxTokens;
         // Note: temperature is not supported in the Responses API for reasoning models
 
-        const reasoning = { summary: options.reasoningSummary ? 'auto' : 'concise' };
-        const effort = this.normalizeEffort(model, options.reasoningEffort);
-        reasoning.effort = effort || 'medium';
-        params.reasoning = reasoning;
+        const effort = clampEffort(model, options.reasoningEffort) || 'medium';
+        params.reasoning = buildReasoningParams(model, options);
+        if (options.verbosity && supportsVerbosity(model)) params.text = { verbosity: options.verbosity };
+        this._applyResponsesToolParams(params, options, effort);
+        this._applyCacheHints(params, options);
 
-        if (options.userId) params.user = String(options.userId);
-
-        console.log('[OpenAI] SDK chat (responses) for model:', model);
+        console.log(`[${this.name}] SDK chat (responses, store=${this.responsesStore}) for model:`, model);
         const response = await client.responses.create(params);
 
         return {
             content: response.output_text || null,
             toolCalls: null,
             usage: response.usage || null,
-            responseId: response.id || null, // Return for chaining
+            responseId: this.responsesStore ? (response.id || null) : null, // chaining only when stored
             raw: response,
         };
     }
@@ -265,13 +286,14 @@ class OpenAIProvider extends BaseProvider {
         }
         if (options.tools && options.tools.length > 0) {
             params.tools = options.tools;
-            params.tool_choice = options.toolChoice || 'auto';
+            params.tool_choice = mapToolChoice(options.toolChoice) || 'auto';
         }
-        const effort = this.normalizeEffort(model, options.reasoningEffort);
+        const effort = clampEffort(model, options.reasoningEffort);
         if (effort && effort !== 'none' && this.supportsReasoning(model)) {
             params.reasoning_effort = effort;
         }
-        if (options.userId) params.user = String(options.userId);
+        if (options.verbosity && supportsVerbosity(model)) params.verbosity = options.verbosity;
+        this._applyCacheHints(params, options);
 
         console.log('[OpenAI] SDK streaming (completions) for model:', model);
         const stream = await client.chat.completions.create(params);
@@ -351,17 +373,18 @@ class OpenAIProvider extends BaseProvider {
         const params = {
             model,
             stream: true,
-            store: true, // Enable server-side storage for response chaining
+            store: this.responsesStore,
         };
 
-        // If we have a previous response ID, chain from it — only send new message
-        if (options.previousResponseId) {
+        // Chain from a prior response only when storage is enabled. Azure runs
+        // store:false (no chaining) → always send full history.
+        if (this.responsesStore && options.previousResponseId) {
             params.previous_response_id = options.previousResponseId;
             // Only send the last user message + any trailing tool results
             const lastUserIdx = messages.map(m => m.role).lastIndexOf('user');
             const newMessages = lastUserIdx >= 0 ? messages.slice(lastUserIdx) : messages;
             params.input = this.toResponsesInput(newMessages);
-            console.log('[OpenAI] Streaming with previous_response_id:', options.previousResponseId);
+            console.log(`[${this.name}] Streaming with previous_response_id:`, options.previousResponseId);
         } else {
             params.input = this.toResponsesInput(messages);
         }
@@ -369,22 +392,13 @@ class OpenAIProvider extends BaseProvider {
         if (options.maxTokens !== undefined) params.max_output_tokens = options.maxTokens;
         // Note: temperature is not supported in the Responses API
 
-        const reasoning = { summary: options.reasoningSummary ? 'auto' : 'concise' };
-        const effort = this.normalizeEffort(model, options.reasoningEffort);
-        reasoning.effort = effort || 'medium';
-        params.reasoning = reasoning;
+        const effort = clampEffort(model, options.reasoningEffort) || 'medium';
+        params.reasoning = buildReasoningParams(model, options);
+        if (options.verbosity && supportsVerbosity(model)) params.text = { verbosity: options.verbosity };
+        this._applyResponsesToolParams(params, options, effort);
+        this._applyCacheHints(params, options);
 
-        if (options.tools && options.tools.length > 0) {
-            params.tools = options.tools.map(t => ({
-                type: 'function',
-                name: t.function?.name || t.name,
-                description: t.function?.description || t.description || '',
-                parameters: t.function?.parameters || t.parameters || {},
-            }));
-        }
-        if (options.userId) params.user = String(options.userId);
-
-        console.log('[OpenAI] SDK streaming (responses) for model:', model, 'reasoning:', JSON.stringify(reasoning));
+        console.log(`[${this.name}] SDK streaming (responses, store=${this.responsesStore}) for model:`, model, 'reasoning:', JSON.stringify(params.reasoning));
         const stream = await client.responses.create(params);
 
         // Track current function call being accumulated

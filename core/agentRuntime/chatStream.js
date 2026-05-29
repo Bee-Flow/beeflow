@@ -1354,9 +1354,20 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     // It overrides tier defaults when present.
                     reasoningEffort: messageMetadata?.reasoningEffort || tierSettings.reasoningEffort || tierDefaults.reasoningEffort || undefined,
                     reasoningSummary: tierSettings.reasoningSummary !== undefined ? tierSettings.reasoningSummary : (tierDefaults.reasoningSummary || false),
+                    // GPT-5 output-length control. Per-turn override → tier setting → tier default.
+                    // Only forwarded to GPT-5 models by the adapter; ignored elsewhere.
+                    verbosity: messageMetadata?.verbosity || tierSettings.verbosity || tierDefaults.verbosity || undefined,
                     // Azure-specific: needed for Responses API version check
                     apiVersion: config.apiVersion || undefined,
                 };
+
+                // Conversation-stable prompt-cache routing hint. A per-conversation
+                // key keeps the (byte-stable) system+tools prefix on the same cache
+                // shard across turns — much better hit rate than a per-user key.
+                // Falls back to userId when there's no conversation id yet.
+                adapterOptions.promptCacheKey = conversation?.id
+                    ? `conv-${conversation.id}`
+                    : (userId ? String(userId) : undefined);
 
 
                 if (tools.length > 0) {
@@ -1373,7 +1384,10 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                             const bn = b.function?.name || b.name || '';
                             return an.localeCompare(bn);
                         });
-                    adapterOptions.toolChoice = 'auto';
+                    // Honour a per-turn tool_choice ('required'/'any'/'none') from the
+                    // composer; default to 'auto'. The adapter maps this onto the
+                    // Chat Completions and Responses APIs uniformly.
+                    adapterOptions.toolChoice = messageMetadata?.toolChoice || 'auto';
                 }
                 // Stable end-user identifier — OpenAI uses it as a cache-routing hint
                 // and for abuse monitoring. Safe to pass the raw userId (opaque string).
