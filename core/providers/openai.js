@@ -255,9 +255,19 @@ class OpenAIProvider extends BaseProvider {
         console.log(`[${this.name}] SDK chat (responses, store=${this.responsesStore}) for model:`, model);
         const response = await client.responses.create(params);
 
+        // Extract any function_call items from the Responses output and map them
+        // to the OpenAI Chat Completions tool_calls shape callers expect.
+        const toolCalls = (response.output || [])
+            .filter(item => item?.type === 'function_call')
+            .map(item => ({
+                id: item.call_id || item.id,
+                type: 'function',
+                function: { name: item.name, arguments: item.arguments || '{}' },
+            }));
+
         return {
             content: response.output_text || null,
-            toolCalls: null,
+            toolCalls: toolCalls.length ? toolCalls : null,
             usage: response.usage || null,
             responseId: this.responsesStore ? (response.id || null) : null, // chaining only when stored
             raw: response,

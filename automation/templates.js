@@ -122,7 +122,7 @@ const TEMPLATES = [
             steps: [
                 step('read', 'integration_action', { tool: 'nextcloud_read_file', label: 'Read PDF', inputs: { path: { kind: 'ref', path: 'trigger.output.path' } } }),
                 step('summarise', 'ai_step', { prompt: 'Summarise this document in 3 sentences.', inputs: { content: { kind: 'ref', path: 'steps.read.output.content' } } }),
-                step('notify', 'integration_action', { tool: 'nextcloud_talk_send_message', label: 'Post to Talk', inputs: { roomToken: { kind: 'literal', value: '' }, message: { kind: 'ref', path: 'steps.summarise.output' } } }),
+                step('notify', 'integration_action', { tool: 'nextcloud_talk_send_message', label: 'Post to Talk', inputs: { token: { kind: 'literal', value: '' }, message: { kind: 'ref', path: 'steps.summarise.output' } } }),
             ],
             edges: [{ from: 'trg', to: 'read' }, { from: 'read', to: 'summarise' }, { from: 'summarise', to: 'notify' }],
         },
@@ -158,8 +158,11 @@ const TEMPLATES = [
             trigger: { id: 'trg', type: 'trigger', kind: 'app_event', appEvent: { provider: 'nextcloud', event: 'share.created', filter: { shareType: 'link' } } },
             steps: [
                 step('judge', 'ai_step', { prompt: 'Given a file path, classify sensitivity as low/medium/high. Path: {{trigger.output.path}}. Return JSON {sensitivity, reason}.', outputSchema: { type: 'object', properties: { sensitivity: { type: 'string' }, reason: { type: 'string' } } } }),
-                step('approve', 'approval', { prompt: 'A new public share was created for "{{trigger.output.path}}". AI judged it: {{steps.judge.output.sensitivity}} ({{steps.judge.output.reason}}). Approve to keep, reject to delete.', title: 'External share approval' }),
-                step('revoke', 'integration_action', { tool: 'nextcloud_share_delete', label: 'Revoke if rejected', inputs: { shareId: { kind: 'ref', path: 'trigger.output.shareId' } } }),
+                // NB: the engine runs the next step on APPROVE (resume); REJECT
+                // ends the run. So "approve" must mean "revoke", or fixing the
+                // tool name below would make "approve to keep" delete the share.
+                step('approve', 'approval', { prompt: 'A new public share was created for "{{trigger.output.path}}". AI judged it: {{steps.judge.output.sensitivity}} ({{steps.judge.output.reason}}). Approve to REVOKE this share; reject to leave it active.', title: 'Revoke external share?' }),
+                step('revoke', 'integration_action', { tool: 'nextcloud_delete_share', label: 'Revoke share', inputs: { shareId: { kind: 'ref', path: 'trigger.output.shareId' } } }),
             ],
             edges: [{ from: 'trg', to: 'judge' }, { from: 'judge', to: 'approve' }, { from: 'approve', to: 'revoke' }],
         },
@@ -176,7 +179,7 @@ const TEMPLATES = [
         definition: {
             trigger: { id: 'trg', type: 'trigger', kind: 'app_event', appEvent: { provider: 'nextcloud', event: 'talk.mention.received' } },
             steps: [
-                step('store', 'integration_action', { tool: 'nextcloud_notes_create', label: 'Append to Mentions note', inputs: { title: { kind: 'literal', value: 'Mentions log' }, content: { kind: 'literal', value: '{{trigger.output.datetime}} — {{trigger.output.actor}}: {{trigger.output.message}}' } } }),
+                step('store', 'integration_action', { tool: 'nextcloud_notes_append', label: 'Append to Mentions note', inputs: { title: { kind: 'literal', value: 'Mentions log' }, content: { kind: 'template', value: '{{trigger.output.datetime}} — {{trigger.output.actor}}: {{trigger.output.message}}' } } }),
             ],
             edges: [{ from: 'trg', to: 'store' }],
         },
@@ -193,7 +196,7 @@ const TEMPLATES = [
         definition: {
             trigger: { id: 'trg', type: 'trigger', kind: 'app_event', appEvent: { provider: 'nextcloud', event: 'deck.card.completed' } },
             steps: [
-                step('post', 'integration_action', { tool: 'nextcloud_talk_send_message', label: 'Celebrate in Talk', inputs: { roomToken: { kind: 'literal', value: '' }, message: { kind: 'literal', value: '🎉 "{{trigger.output.title}}" is done!' } } }),
+                step('post', 'integration_action', { tool: 'nextcloud_talk_send_message', label: 'Celebrate in Talk', inputs: { token: { kind: 'literal', value: '' }, message: { kind: 'template', value: '🎉 "{{trigger.output.title}}" is done!' } } }),
             ],
             edges: [{ from: 'trg', to: 'post' }],
         },
@@ -212,8 +215,8 @@ const TEMPLATES = [
             steps: [
                 step('parallel', 'parallel', {
                     branches: [
-                        [step('mkdir', 'integration_action', { tool: 'nextcloud_create_folder', inputs: { path: { kind: 'literal', value: '/Welcome/{{trigger.output.actor}}' } } })],
-                        [step('greet', 'integration_action', { tool: 'nextcloud_talk_send_message', inputs: { roomToken: { kind: 'literal', value: '' }, message: { kind: 'literal', value: 'Welcome to the team @{{trigger.output.actor}}!' } } })],
+                        [step('mkdir', 'integration_action', { tool: 'nextcloud_create_folder', inputs: { path: { kind: 'template', value: '/Welcome/{{trigger.output.actor}}' } } })],
+                        [step('greet', 'integration_action', { tool: 'nextcloud_talk_send_message', inputs: { token: { kind: 'literal', value: '' }, message: { kind: 'template', value: 'Welcome to the team @{{trigger.output.actor}}!' } } })],
                         [step('meet', 'integration_action', { tool: 'nextcloud_calendar_create_event', inputs: { summary: { kind: 'literal', value: 'Intro chat' }, startsAt: { kind: 'literal', value: '+1d' } } })],
                     ],
                 }),
@@ -271,7 +274,7 @@ const TEMPLATES = [
             steps: [
                 step('fetch', 'integration_action', { tool: 'nextcloud_activity_list', inputs: { limit: { kind: 'literal', value: 100 } } }),
                 step('summarise', 'ai_step', { prompt: 'Summarise this week of activity for the team in 5 bullets. Highlight risks and notable shares.', inputs: { activity: { kind: 'ref', path: 'steps.fetch.output' } } }),
-                step('post', 'integration_action', { tool: 'nextcloud_talk_send_message', inputs: { roomToken: { kind: 'literal', value: '' }, message: { kind: 'ref', path: 'steps.summarise.output' } } }),
+                step('post', 'integration_action', { tool: 'nextcloud_talk_send_message', inputs: { token: { kind: 'literal', value: '' }, message: { kind: 'ref', path: 'steps.summarise.output' } } }),
             ],
             edges: [{ from: 'trg', to: 'fetch' }, { from: 'fetch', to: 'summarise' }, { from: 'summarise', to: 'post' }],
         },

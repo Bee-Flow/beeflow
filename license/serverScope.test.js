@@ -102,6 +102,13 @@ require.cache[path.join(__dirname, '__fake_user_store_server__.js')] = {
 // process and need the resolver to see the change immediately.
 process.env.LICENSE_SERVER_TIER_CACHE_TTL_MS = '0';
 
+// The override assertions below exercise the GOVERNING-mode contract
+// (self-hosted / private-cloud), where a server-wide licence overrides every
+// per-org/user resolution. The cloud (non-governing) contract — where the
+// licence exists but each org still needs its own subscription — gets its own
+// block at the end. Default unset mode is 'cloud', so we pin governing here.
+process.env.DEPLOYMENT_MODE = 'self-hosted';
+
 const license = require('./index');
 
 function activeServerRow(tier) {
@@ -237,6 +244,34 @@ function reset() {
     assert.strictEqual(okNothing, false);
     assert.strictEqual(license.getServerLicenseVersion(), v2,
         'no-op deactivate must NOT bump the version counter');
+
+    // ── CLOUD mode: server licence EXISTS but does NOT govern orgs ─────
+    // Each org pays its own subscription; the server licence is operator
+    // record only (still surfaced via serverLicense for the admin panel).
+    reset();
+    process.env.DEPLOYMENT_MODE = 'cloud';
+    fakeStore._server = activeServerRow('enterprise');
+    fakeStore._orgs['org_paid'] = activeOrgRow('org_paid', 'full');
+    assert.strictEqual(license.serverLicenseGovernsOrgs(), false,
+        'cloud → server licence does not govern orgs');
+    assert.strictEqual(await license.getServerLicenseTier(), 'enterprise',
+        'cloud → server tier still resolves (for admin display)');
+    assert.strictEqual(await license.getTierForOrg('org_paid'), 'full',
+        'cloud → org keeps its own tier, server licence ignored');
+    assert.strictEqual(await license.getTierForOrg('org_no_lic_cloud'), 'community',
+        'cloud → org with no licence/sub falls to community despite server licence');
+    assert.strictEqual(await license.getTierForUser('any_user_cloud'), 'community',
+        'cloud → arbitrary user does not inherit server tier');
+    assert.strictEqual(await license.getBestTierForOrgs(['org_paid']), 'full',
+        'cloud → getBestTierForOrgs ignores server licence');
+    const cloudStatus = await license.getLicenseStatus({ organizationId: 'org_no_lic_cloud' });
+    assert.strictEqual(cloudStatus.serverOverride, false,
+        'cloud → status.serverOverride is false');
+    assert.ok(cloudStatus.serverLicense, 'cloud → status still exposes serverLicense for admin');
+    assert.strictEqual(cloudStatus.serverLicense.scope, 'server');
+    assert.strictEqual(cloudStatus.tier, 'community',
+        'cloud → status.tier reflects org resolution, not server licence');
+    process.env.DEPLOYMENT_MODE = 'self-hosted'; // restore governing default
 
     console.log('✓ license/serverScope.test.js — all assertions passed');
 })().catch(err => {

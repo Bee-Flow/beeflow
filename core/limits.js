@@ -151,14 +151,17 @@ async function checkSubscriptionLimits(orgId, agentType, userId = null) {
     // A server-wide licence makes the entire install run at the licence tier
     // — every org/user is covered by it, so no Stripe subscription is needed.
     // Skip the subscription-limit stack the same way self-hosted does. This
-    // matters for private-cloud / on-prem-cloud installs that hold a server
-    // licence: without this, orgs without a Stripe row get blocked with
-    // "no active subscription" even though the server is fully licensed.
-    // (On true Bee Flow Cloud no server-wide licence is ever activated, so
-    // this only relaxes licensed installs — see server/license/index.js.)
+    // ONLY applies on governing modes (private-cloud / on-prem-cloud) that hold
+    // a server licence: without this, orgs without a Stripe row get blocked
+    // with "no active subscription" even though the server is fully licensed.
+    // On Bee Flow Cloud the server licence does NOT govern — each org must hold
+    // its own subscription — so we deliberately do NOT skip the check there
+    // (serverLicenseGovernsOrgs() is false). See server/license/index.js.
     try {
-        const serverTier = await license.getServerLicenseTier();
-        if (serverTier && serverTier !== license.COMMUNITY_FALLBACK) return null;
+        if (license.serverLicenseGovernsOrgs()) {
+            const serverTier = await license.getServerLicenseTier();
+            if (serverTier && serverTier !== license.COMMUNITY_FALLBACK) return null;
+        }
     } catch (_) { /* licence module unavailable — fall through to subscription check */ }
 
     if (!orgId) {

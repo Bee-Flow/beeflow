@@ -62,6 +62,13 @@ const { userHasBetaFeature } = require('./betaFeatures');
 // IDs that are exempt from org-level gating (admin-only tools, internal utilities)
 const ORG_EXEMPT_APPS = ['workspace', 'regex-gen'];
 
+// Integrations auto-enabled for users with an existing saved enabled-apps list
+// (they were added after the user saved their list, so they wouldn't be in it).
+// Module-scoped because BOTH getIntegrationTools() and getUserPermittedApps()
+// gate on it — when this lived inside getIntegrationTools the permitted-apps
+// helper threw a ReferenceError that was swallowed, emptying the builder palette.
+const AUTO_ENABLED_APPS = ['agent-search', 'workspace', 'image-gen', 'music-gen', 'video-gen', 'elevenlabs', 'google-maps', 'linkedin', 'github', 'google-contacts', 'google-keep', 'outlook', 'outlook-readonly', 'ms-calendar', 'onedrive', 'ms-contacts', 'google-groups', 'n8n', 'nextcloud', 'nextcloud-calendar', 'nextcloud-contacts', 'nextcloud-deck', 'nextcloud-mail', 'nextcloud-notifications', 'nextcloud-talk', 'nextcloud-tasks', 'nextcloud-notes', 'nextcloud-activity', 'nextcloud-status', 'webpages'];
+
 /**
  * Build the list of integration tools available for the current user.
  * 
@@ -155,9 +162,7 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
         }
     } catch (e) { /* ignore */ }
 
-    // Auto-enable new integrations for users with existing saved lists
-    // (these were added after the user saved their enabledApps, so they wouldn't be included)
-    const AUTO_ENABLED_APPS = ['agent-search', 'workspace', 'image-gen', 'music-gen', 'video-gen', 'elevenlabs', 'google-maps', 'linkedin', 'github', 'google-contacts', 'google-keep', 'outlook', 'outlook-readonly', 'ms-calendar', 'onedrive', 'ms-contacts', 'google-groups', 'n8n', 'nextcloud', 'nextcloud-calendar', 'nextcloud-contacts', 'nextcloud-deck', 'nextcloud-notifications', 'nextcloud-talk', 'nextcloud-tasks', 'nextcloud-notes', 'nextcloud-activity', 'nextcloud-status', 'webpages'];
+    // AUTO_ENABLED_APPS is now module-scoped (see top of file).
 
     const isAppOn = (appId) => {
         // Must be enabled at user level

@@ -35,14 +35,38 @@ const READ_ONLY = new Set([
     // Maps / Search / KB
     'maps_search_places', 'maps_geocode', 'maps_directions',
     'agent_search', 'kb_search',
-    // Fireflies / Nextcloud read
+    // Fireflies
     'fireflies_search_meetings', 'fireflies_get_meeting',
-    'nextcloud_list', 'nextcloud_read',
-    'nextcloud_calendar_list_events',
-    'nextcloud_contacts_list', 'nextcloud_contacts_search',
-    'nextcloud_deck_list', 'nextcloud_deck_list_boards', 'nextcloud_deck_list_stacks', 'nextcloud_deck_list_cards', 'nextcloud_deck_list_comments',
-    'nextcloud_tasks_list', 'nextcloud_notes_list',
-    'nextcloud_activity_list', 'nextcloud_status_get',
+    // ── Nextcloud (read-only) — names verified against the tool modules ──
+    // Files & WebDAV
+    'nextcloud_list_files', 'nextcloud_search_files', 'nextcloud_read_file',
+    'nextcloud_list_shares', 'nextcloud_list_file_comments',
+    'nextcloud_list_tags', 'nextcloud_find_files_by_tag',
+    'nextcloud_list_trash', 'nextcloud_list_versions',
+    // Calendar
+    'nextcloud_calendar_list', 'nextcloud_calendar_list_events',
+    'nextcloud_calendar_search_events', 'nextcloud_calendar_get_event',
+    // Contacts
+    'nextcloud_contacts_list_addressbooks', 'nextcloud_contacts_list',
+    'nextcloud_contacts_search', 'nextcloud_contacts_get',
+    // Deck
+    'nextcloud_deck_list_boards', 'nextcloud_deck_get_board',
+    'nextcloud_deck_list_stacks', 'nextcloud_deck_list_cards',
+    'nextcloud_deck_search_cards', 'nextcloud_deck_get_card',
+    'nextcloud_deck_list_comments',
+    // Talk
+    'nextcloud_talk_list_rooms', 'nextcloud_talk_get_room',
+    'nextcloud_talk_list_messages', 'nextcloud_talk_search_messages',
+    // Tasks
+    'nextcloud_tasks_list_lists', 'nextcloud_tasks_list',
+    'nextcloud_tasks_search', 'nextcloud_tasks_get',
+    // Notes
+    'nextcloud_notes_list', 'nextcloud_notes_search',
+    'nextcloud_notes_get', 'nextcloud_notes_list_categories',
+    // Notifications / Activity / Status
+    'nextcloud_notifications_list',
+    'nextcloud_activity_list', 'nextcloud_activity_list_for_file',
+    'nextcloud_status_get',
     // Nextcloud Mail (read-only)
     'nextcloud_mail_list_accounts', 'nextcloud_mail_list_mailboxes',
     'nextcloud_mail_search', 'nextcloud_mail_read', 'nextcloud_mail_read_attachment',

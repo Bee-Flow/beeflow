@@ -99,7 +99,7 @@ async function lookupProvider(providerId) {
     const ai = await configStore.getConfig('ai') || {};
     const providers = ai.providers || [];
     const p = providers.find(x => x.id === providerId);
-    return p ? { id: p.id, name: p.name, type: p.type, url: p.url || null } : null;
+    return p ? { id: p.id, name: p.name, type: p.type, url: p.url || null, apiVersion: p.apiVersion || null } : null;
 }
 
 // ── Resolve to outbound payload (no secrets) ─────────────────────────
@@ -146,6 +146,7 @@ async function resolveInferenceTargets() {
             rerankEntry.providerType = p.type;
             rerankEntry.providerName = p.name;
             if (p.url) rerankEntry.endpoint = p.url;
+            rerankEntry.apiVersion = p.apiVersion; // honour provider's pinned api-version (Azure)
         } else {
             rerankEntry.unresolved = true;
             rerankEntry.reason = 'provider_not_found';
@@ -164,6 +165,7 @@ async function resolveInferenceTargets() {
             cleanupEntry.providerType = p.type;
             cleanupEntry.providerName = p.name;
             if (p.url) cleanupEntry.endpoint = p.url;
+            cleanupEntry.apiVersion = p.apiVersion; // honour provider's pinned api-version (Azure)
         } else {
             cleanupEntry.unresolved = true;
             cleanupEntry.reason = 'provider_not_found';

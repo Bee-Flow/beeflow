@@ -13,6 +13,10 @@
 const configStore = require('../stores/configStore');
 const { resolveInferenceTargetsWithSecrets } = require('../core/webSearchInferenceResolver');
 const { getAdapter } = require('../core/providers');
+// Shared Azure-aware embedding chain (provider → legacy Azure → CPU). Same
+// dispatcher KB ingestion uses, so cosine rerank works on an Azure-only setup
+// and never hard-fails (CPU fallback) when no embedding model is configured.
+const { dispatchEmbedTexts } = require('../core/embed/dispatch');
 
 const SERPER_URL = 'https://google.serper.dev/search';
 const PAGE_FETCH_TIMEOUT_MS = 12000;
@@ -25,62 +29,9 @@ function normalizeBaseUrl(url) {
     return (url || '').replace(/\/+$/, '');
 }
 
-/**
- * Call an OpenAI-compatible /v1/embeddings endpoint.
- * Works for OpenAI, Mistral (api.mistral.ai/v1), and generic providers.
- */
-async function embedOpenAICompatible({ apiKey, baseUrl, model, inputs }) {
-    const root = normalizeBaseUrl(baseUrl);
-    const url = root.endsWith('/v1') ? `${root}/embeddings` : `${root}/v1/embeddings`;
-    const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({ model, input: inputs }),
-        signal: AbortSignal.timeout(20000),
-    });
-    if (!res.ok) {
-        const txt = await res.text();
-        throw new Error(`Embedding API ${res.status}: ${txt.slice(0, 300)}`);
-    }
-    const data = await res.json();
-    return (data.data || []).sort((a, b) => a.index - b.index).map(e => e.embedding);
-}
-
-/**
- * Azure OpenAI embeddings — different URL shape per deployment.
- * Falls back to admin-configured endpoint/key when the provider entry
- * lacks a usable URL.
- */
-async function embedAzure({ apiKey, baseUrl, model, inputs }) {
-    let endpoint = baseUrl;
-    let key = apiKey;
-    if (!endpoint) endpoint = await configStore.getConfig('azure_openai_embedding_endpoint');
-    if (!key) key = await configStore.getSecret('azure_openai_embedding_key');
-    const root = normalizeBaseUrl(endpoint);
-    const url = `${root}/openai/deployments/${encodeURIComponent(model)}/embeddings?api-version=2024-06-01`;
-    const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'api-key': key },
-        body: JSON.stringify({ input: inputs }),
-        signal: AbortSignal.timeout(20000),
-    });
-    if (!res.ok) {
-        const txt = await res.text();
-        throw new Error(`Azure embedding ${res.status}: ${txt.slice(0, 300)}`);
-    }
-    const data = await res.json();
-    return (data.data || []).sort((a, b) => a.index - b.index).map(e => e.embedding);
-}
-
-async function embedTexts(target, inputs) {
-    if (!target?.providerId || !target?.modelId) {
-        throw new Error('Embedding model not configured (set one in AI Configuratie → Web Search Inference, or globally in Embeddings)');
-    }
-    if (!Array.isArray(inputs) || inputs.length === 0) return [];
-    const type = target.providerType;
-    if (type === 'azure') return embedAzure({ apiKey: target.apiKey, baseUrl: target.endpoint, model: target.modelId, inputs });
-    return embedOpenAICompatible({ apiKey: target.apiKey, baseUrl: target.endpoint, model: target.modelId, inputs });
-}
+// Embeddings are produced by the shared dispatchEmbedTexts (imported above),
+// which resolves provider → legacy Azure → CPU. node-search no longer carries
+// its own bespoke embedding clients.
 
 // ─── Math ─────────────────────────────────────────────────────────
 
@@ -187,10 +138,13 @@ async function serperSearch({ query, num }) {
 
 // ─── Rerank ───────────────────────────────────────────────────────
 
-async function rerankCosine({ rerank: _rerank, embed }, query, results) {
+async function rerankCosine(_targets, query, results) {
     const texts = results.map(r => `${r.title}\n${r.snippet}\n${(r.content || '').slice(0, 1500)}`);
-    const [queryVec, ...docVecs] = await embedTexts(embed, [query, ...texts]);
-    if (!queryVec) return results;
+    // Shared dispatcher: never throws — falls through provider → legacy Azure →
+    // CPU and returns empty vectors only if all paths fail.
+    const { vectors } = await dispatchEmbedTexts([query, ...texts]);
+    const [queryVec, ...docVecs] = vectors || [];
+    if (!queryVec || docVecs.length !== results.length) return results; // degrade: original order
     return results
         .map((r, i) => ({ ...r, score: cosineSimilarity(queryVec, docVecs[i]) }))
         .sort((a, b) => (b.score || 0) - (a.score || 0));
@@ -209,6 +163,11 @@ async function rerankProviderLLM(rerankTarget, query, results) {
         const out = await adapter.chat(rerankTarget.apiKey, baseUrl, rerankTarget.modelId, messages, {
             temperature: 0,
             maxTokens: 800,
+            // Deterministic scoring call: disable reasoning so GPT-5 doesn't spend
+            // the budget thinking (and so Azure uses Chat Completions, compatible
+            // with any api-version). Honour the provider's configured api-version.
+            reasoningEffort: 'none',
+            apiVersion: rerankTarget.apiVersion,
             timeoutMs: 20000,
             retries: { strategy: 'none' },
         });
@@ -281,6 +240,11 @@ async function cleanupPage(cleanupTarget, query, page) {
         const out = await adapter.chat(cleanupTarget.apiKey, baseUrl, cleanupTarget.modelId, messages, {
             temperature: 0.1,
             maxTokens: 700,
+            // Summarisation utility call: disable reasoning so GPT-5 doesn't burn
+            // the small output budget thinking (and so Azure uses Chat Completions,
+            // compatible with any api-version). Honour the provider's api-version.
+            reasoningEffort: 'none',
+            apiVersion: cleanupTarget.apiVersion,
             timeoutMs: 30000,
             retries: { strategy: 'none' },
         });
@@ -331,9 +295,10 @@ async function executeNodeSearchTool(toolName, args) {
     } catch (err) {
         return { error: `Failed to resolve inference targets: ${err.message}` };
     }
-    if (targets.embed?.unresolved) {
-        return { error: 'No embedding model resolved. Configure one in AI Configuratie → Web Search Inference (or set a global Embeddings model).' };
-    }
+    // Note: we do NOT hard-fail when no embedding model is configured. Cosine
+    // rerank uses the shared dispatcher (which falls back to a CPU embedder),
+    // and if even that yields nothing the results are simply returned unranked.
+    // Search must still return Serper results regardless of embed config.
 
     let results;
     try {

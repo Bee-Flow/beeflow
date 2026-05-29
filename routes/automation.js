@@ -302,12 +302,16 @@ router.get('/catalog', async (req, res) => {
                 // builder can render the brand logo on each action chip /
                 // node. Falls back to the app id when no prefix matches.
                 const resolved = resolveIntegration(name) || null;
+                const os = getOutputSchema(name);
                 return {
                     name,
                     label: name.replace(/_/g, ' '),
                     description: t.function?.description || '',
                     inputSchema: t.function?.parameters || null,
-                    outputSchema: getOutputSchema(name),
+                    outputSchema: os,
+                    // useUpstreamVariables (frontend) reads outputSample to seed
+                    // the variable picker with realistic field names.
+                    outputSample: os?.sample || null,
                     sideEffect: isSideEffect(name),
                     integrationId: resolved?.integration || entry.app,
                     integrationLabel: resolved?.label || entry.label,
@@ -325,8 +329,14 @@ router.get('/catalog', async (req, res) => {
         // the user — so this user's org has the automations feature on.
         const automationsFlag = true;
 
+        // Trigger output field/sample catalog — useUpstreamVariables reads this
+        // to expose `trigger.output.*` variables in the binding picker.
+        let triggerOutputs = {};
+        try { triggerOutputs = require('../automation/builderTools').buildTriggerOutputsCatalog(); } catch (_) { /* keep empty */ }
+
         res.json({
             apps,
+            triggerOutputs,
             stepTypes: ['trigger', 'integration_action', 'ai_step', 'condition', 'loop', ...(codeFlag ? ['code'] : []), 'notification'],
             triggers: [
                 { kind: 'schedule', label: 'On a schedule' },
@@ -469,7 +479,48 @@ router.post('/:id/activate', async (req, res) => {
         const a = await automationStore.getAutomation(req.params.id);
         if (!a) return res.status(404).json({ error: 'Not found' });
         if (a.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
-        const v = validateDefinition(a.definition || {});
+
+        // Build the user's permitted-tool catalog so activation rejects unknown
+        // tools (typos, unpermitted integrations) and missing/empty required
+        // inputs — instead of letting a broken routine go live and fail silently
+        // on first fire. Permission-based (matches the builder palette, not
+        // credential-gated); fail-open if the lookup errors.
+        let availableTools = null;
+        let toolRequiredParams = null;
+        try {
+            const { getUserPermittedApps } = require('../core/integrationTools');
+            const permitted = await getUserPermittedApps({ userId, session: req.session, isAdmin: !!req.session?.isAdmin });
+            availableTools = new Set();
+            toolRequiredParams = {};
+            for (const entry of TOOL_REGISTRY) {
+                const permittedApp = permitted.has(entry.app);
+                for (const t of loadTools(entry)) {
+                    const name = t?.function?.name;
+                    if (!name) continue;
+                    if (permittedApp) availableTools.add(name);
+                    const rq = t?.function?.parameters?.required;
+                    if (Array.isArray(rq)) toolRequiredParams[name] = rq;
+                }
+            }
+        } catch (e) {
+            console.warn('[automation/activate] tool catalog build failed; activating without tool checks:', e.message);
+            availableTools = null; toolRequiredParams = null;
+        }
+        // NC events with a producer: triggerBus pollers ∪ connector push
+        // subscriptions (heartbeat SUBSCRIBED_EVENTS → automationEventsWebhook
+        // mapEvent/refineEvent). Anything else activates but never fires — warn.
+        const deliverableEvents = {
+            nextcloud: new Set([
+                // pollers
+                'file.new', 'file.changed', 'share.received', 'activity.new', 'notification.new', 'calendar.event.upcoming',
+                // connector push (+ refined deck events)
+                'file.deleted', 'file.renamed', 'share.created', 'share.deleted',
+                'calendar.event.created', 'calendar.event.changed', 'calendar.event.deleted',
+                'deck.card.created', 'deck.card.changed', 'deck.card.deleted', 'deck.card.completed', 'deck.card.moved',
+                'talk.message.received',
+            ]),
+        };
+        const v = validateDefinition(a.definition || {}, { availableTools, toolRequiredParams, deliverableEvents });
         if (!v.ok) return res.status(400).json({ error: 'Invalid definition', details: v.errors });
         // Warnings are non-blocking but reported to the client.
         const summary = summariseDefinition(a.definition || {});
@@ -611,12 +662,30 @@ async function syncAppEventSubscription(automationId, userId, def) {
     } else if (provider === 'github') {
         mode = 'webhook';
     } else if (provider === 'nextcloud') {
-        try {
-            const userStore = require('../stores/userStore');
-            const u = await userStore.getUser(userId).catch(() => null);
-            mode = u?.ncUid ? 'webhook' : 'polling';
-        } catch {
+        // Per-event, not per-user. Events with a triggerBus poller MUST be
+        // 'polling' regardless of hosting — otherwise calendar.event.upcoming /
+        // file.new / activity.new never fire. Push-only events (share/deck/talk/
+        // calendar mutations) are 'webhook' for connector-bound users (the ExApp
+        // event-bridge delivers them) and 'polling' otherwise (no producer — the
+        // poll tick simply no-ops, no handler error).
+        //
+        // (Fixes the prior `u?.ncUid` check: getUser returns the raw column
+        // `nc_uid`, so ncUid was always undefined and every NC sub fell to
+        // polling — which happened to be the only thing that worked.)
+        const NC_POLLER_EVENTS = new Set([
+            'file.new', 'file.changed', 'share.received',
+            'activity.new', 'notification.new', 'calendar.event.upcoming',
+        ]);
+        if (NC_POLLER_EVENTS.has(event)) {
             mode = 'polling';
+        } else {
+            let isConnector = false;
+            try {
+                const userStore = require('../stores/userStore');
+                const u = await userStore.getUser(userId).catch(() => null);
+                isConnector = u?.provider === 'nextcloud_connector';
+            } catch { /* default below */ }
+            mode = isConnector ? 'webhook' : 'polling';
         }
     } else {
         mode = 'polling';

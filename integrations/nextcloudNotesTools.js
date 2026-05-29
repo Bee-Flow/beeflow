@@ -75,6 +75,23 @@ const NEXTCLOUD_NOTES_TOOLS = [
     {
         type: 'function',
         function: {
+            name: 'nextcloud_notes_append',
+            description: 'Append text to the note with the given title, creating it if none exists. Idempotent across repeated runs — use this (not nextcloud_notes_create) for running logs like mention digests or audit trails, so each run adds a line instead of spawning a new note.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    title: { type: 'string', description: 'Title of the note to append to (created if missing).' },
+                    content: { type: 'string', description: 'Text to append.' },
+                    category: { type: 'string', description: 'Folder/category — used only when the note is first created.' },
+                    separator: { type: 'string', description: 'Inserted between existing and new content. Defaults to a newline.' }
+                },
+                required: ['title', 'content']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
             name: 'nextcloud_notes_update',
             description: 'Update fields on a note. Only provided fields change. The user has approved this update.',
             parameters: {
@@ -257,6 +274,49 @@ async function executeNextcloudNotesTool(toolName, args, userId, session) {
             }
             const note = await readJsonSafe(res);
             return { success: true, note: summarise(note) };
+        }
+
+        case 'nextcloud_notes_append': {
+            if (!args.title || args.content === undefined) return { error: 'title and content are required' };
+            const sep = args.separator !== undefined ? String(args.separator) : '\n';
+            // Find an existing note with this exact title (case-insensitive).
+            const listRes = await ncFetch(`${api}?exclude=content`, { headers: baseHeaders });
+            if (listRes.status === 401) return { error: authError };
+            if (listRes.status === 404) return { error: 'Notes app is not installed/enabled on this Nextcloud server.' };
+            if (!listRes.ok) return { error: `Notes list failed (${listRes.status})` };
+            const all = await readJsonSafe(listRes);
+            const wanted = String(args.title).trim().toLowerCase();
+            const existing = Array.isArray(all) ? all.find(n => String(n.title || '').trim().toLowerCase() === wanted) : null;
+
+            if (existing) {
+                // Fetch current content, append, and PUT it back.
+                const getRes = await ncFetch(`${api}/${encodeURIComponent(existing.id)}`, { headers: baseHeaders });
+                if (getRes.status === 401) return { error: authError };
+                if (!getRes.ok) return { error: `Note fetch failed (${getRes.status})` };
+                const cur = await readJsonSafe(getRes);
+                const prev = cur && typeof cur.content === 'string' ? cur.content : '';
+                const merged = trimContent(`${prev}${prev ? sep : ''}${args.content}`);
+                const putRes = await ncFetch(`${api}/${encodeURIComponent(existing.id)}`, {
+                    method: 'PUT',
+                    headers: { ...baseHeaders, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ content: merged, modified: Math.floor(Date.now() / 1000) }),
+                });
+                if (putRes.status === 401) return { error: authError };
+                if (!putRes.ok) { const err = await readJsonSafe(putRes); return { error: `Note append failed (${putRes.status})`, detail: err }; }
+                const updated = await readJsonSafe(putRes);
+                return { success: true, appended: true, note: summarise(updated) };
+            }
+
+            // No existing note with that title → create it.
+            const createRes = await ncFetch(api, {
+                method: 'POST',
+                headers: { ...baseHeaders, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ title: args.title, content: args.content, category: args.category || '', favorite: false, modified: Math.floor(Date.now() / 1000) }),
+            });
+            if (createRes.status === 401) return { error: authError };
+            if (!createRes.ok) { const err = await readJsonSafe(createRes); return { error: `Note create failed (${createRes.status})`, detail: err }; }
+            const created = await readJsonSafe(createRes);
+            return { success: true, appended: false, created: true, note: summarise(created) };
         }
 
         case 'nextcloud_notes_update': {

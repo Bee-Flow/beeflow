@@ -184,10 +184,28 @@ let started = false;
 //      backfilled the vault yet, or for cases where the vault returns null
 //      (and only when ROUTINE_AUTH_LEGACY=1 is set).
 
+// Connector-bound users authenticate to Nextcloud through the ExApp reverse
+// proxy, not OAuth — so their routine session must carry the instance binding
+// (connectorOrgId + connectorNcUid) and the provider marker that resolveAuth /
+// resolveConnectorAuth (nextcloudClient.js) and isConnectorUser gate on.
+// Without it, NC tools throw on scheduled/offline runs (no warm web session).
+// getUser() returns raw columns, so the uid is `nc_uid` (snake_case).
+function withConnectorIdentity(session, userRow) {
+    if (!session || !userRow || userRow.provider !== 'nextcloud_connector') return session;
+    session.connectorOrgId = session.connectorOrgId || userRow.organizationId || null;
+    session.connectorNcUid = session.connectorNcUid || userRow.nc_uid || null;
+    session.user = session.user || {};
+    if (!session.user.provider) session.user.provider = 'nextcloud_connector';
+    if (!session.user.ncUid) session.user.ncUid = userRow.nc_uid || null;
+    return session;
+}
+
 async function resolveUserSession(userId) {
+    let userRow = null;
     try {
         const userStore = require('../stores/userStore');
-        const user = await userStore.getUser(userId).catch(() => null);
+        userRow = await userStore.getUser(userId).catch(() => null);
+        const user = userRow;
 
         // Pull the user's enabled apps the same way getIntegrationTools does
         // so the auth helper knows which providers (google / microsoft /
@@ -215,7 +233,7 @@ async function resolveUserSession(userId) {
         const routineAuth = require('./routineAuth');
         const built = await routineAuth.buildUserAuth(userId, { enabledIntegrations: allEnabled });
         if (built) {
-            return {
+            return withConnectorIdentity({
                 // Direct-chat-shaped session so getIntegrationTools and tool
                 // dispatchers see the same shape they expect from req.session.
                 user: {
@@ -230,10 +248,28 @@ async function resolveUserSession(userId) {
                 expiresAt: built.expiresAt,
                 oauthProvider: built.oauthProvider,
                 routineProviders: built.routineProviders || {},
-            };
+            }, userRow);
         }
     } catch (err) {
         console.warn(`[AutomationRunner] vault session lookup failed for user ${userId}: ${err.message}`);
+    }
+
+    // Connector-bound users have no OAuth vault entry (buildUserAuth → null),
+    // but still need a session carrying their connector identity so NC tools
+    // authenticate via the ExApp proxy on scheduled/offline runs. Must come
+    // before the warm-session backstop below — that backstop is the only thing
+    // that currently rescues these users, and it's absent on headless runs.
+    if (userRow && userRow.provider === 'nextcloud_connector') {
+        return withConnectorIdentity({
+            user: {
+                id: userId,
+                email: userRow.email || null,
+                organizationId: userRow.organizationId || null,
+                role: userRow.role || null,
+            },
+            isAdmin: !!userRow.isAdmin,
+            routineProviders: {},
+        }, userRow);
     }
 
     // Last-resort: legacy user_sessions row. Kept behind a flag so we can
@@ -289,6 +325,19 @@ function isEmptyToolResult(result) {
     if (typeof result.total === 'number' && result.total === 0) return true;
     if (typeof result.count === 'number' && result.count === 0) return true;
     return false;
+}
+
+// A tool that returns a soft `{ error }` object — the cross-integration
+// convention for "this failed but didn't throw" (see the `result.error`
+// carve-out in isEmptyToolResult above) — must FAIL the step rather than be
+// recorded as a successful output. Without this, a misconfigured step (e.g. a
+// Talk send with no room token, or a lapsed credential) reports green while
+// doing nothing.
+function isToolErrorResult(result) {
+    return !!result
+        && typeof result === 'object'
+        && !Array.isArray(result)
+        && !!result.error;
 }
 
 function buildAdjacency(def) {
@@ -398,6 +447,16 @@ async function execIntegrationAction(step, ctx, runState, mode) {
     if (mode === 'dry_run' && isEmptyToolResult(result)) {
         const fallback = synthesizeDryRunOutput(step.tool, inputs);
         return { output: fallback, dryRunSynthesised: true, dryRunFallback: 'live_empty' };
+    }
+    // A live tool call that returned a soft `{ error }` object must fail the
+    // step — recording it as success masks misconfigured steps (they show
+    // green while doing nothing). Routes through the same catch as a thrown
+    // error, so on_error edges / retries still apply. dry-run is left to its
+    // read-only fallbacks above so the builder can keep planning against a sample.
+    if (mode !== 'dry_run' && isToolErrorResult(result)) {
+        const err = new Error(`${step.tool} failed: ${String(result.error)}`);
+        err.toolError = true;
+        throw err;
     }
     // Cache the actual output shape so the Builder agent gets ground-truth
     // bindings on its next turn (no more guessing items vs results).

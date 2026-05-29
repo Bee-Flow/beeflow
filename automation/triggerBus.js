@@ -576,6 +576,26 @@ async function runPollingPass() {
  * migration is a separate, future cleanup.
  */
 async function loadSession(userId) {
+    // Connector-bound users authenticate to NC via the ExApp reverse proxy
+    // (HMAC-signed, no bearer token). Resolve their instance binding up front
+    // so it can be merged into whichever credential path wins below. Without
+    // it, nextcloudClient.resolveAuth has nothing to route through AND the
+    // polling pass skips them entirely (loadSession → null → "no credentials"),
+    // so every NC poller stays dark for the primary hosting model. getUser
+    // returns raw columns, so the uid is `nc_uid` (snake_case).
+    let connectorFields = null;
+    try {
+        const userStore = require('../stores/userStore');
+        const u = await userStore.getUser(userId).catch(() => null);
+        if (u && u.provider === 'nextcloud_connector') {
+            connectorFields = {
+                connectorOrgId: u.organizationId || null,
+                connectorNcUid: u.nc_uid || null,
+                user: { id: userId, provider: 'nextcloud_connector', organizationId: u.organizationId || null, ncUid: u.nc_uid || null },
+            };
+        }
+    } catch (_) { /* non-fatal — fall through to token paths */ }
+
     // 1) Vault first.
     try {
         const routineAuth = require('../core/routineAuth');
@@ -589,29 +609,25 @@ async function loadSession(userId) {
                 oauthProvider: built.oauthProvider,
                 routineProviders: built.routineProviders || {},
                 _source: 'vault',
+                // Merge connector binding so hybrid users (connector NC +
+                // OAuth Google) can call both kinds of tool in one routine.
+                ...(connectorFields || {}),
             };
         }
     } catch (err) {
         console.warn(`[TriggerBus] vault session lookup failed for user ${userId}: ${err.message}`);
     }
 
+    // 1.5) Connector-bound users have no bearer token — return the connector
+    // identity directly so resolveAuth routes through /nc/* and the polling
+    // pass actually runs their NC triggers.
+    if (connectorFields) {
+        return { ...connectorFields, routineProviders: {}, _source: 'connector' };
+    }
+
     // 2) user_sessions fallback. Same shape as req.session for the chat path:
     //    { user: { id, ... }, accessToken, refreshToken, oauthProvider, ... }
-    //
-    // Phase 4.2: detect connector-bound users so the silent fallback to
-    // legacy OAuth/app-password isn't invisible. The connector path uses
-    // HMAC-signed reverse-proxy requests, NOT a bearer token, so reaching
-    // here for a connector-bound user means either (a) the org's tenant
-    // key is missing or (b) the user's ncUid was wiped — neither is
-    // recoverable via session tokens. Log loud so operators see it.
-    try {
-        const userStore = require('../stores/userStore');
-        const u = await userStore.getUser(userId).catch(() => null);
-        if (u?.ncUid) {
-            console.warn(`[TriggerBus] connector-bound user ${userId} (ncUid=${u.ncUid}) reached legacy auth fallback — connector tenant key may be missing or vault empty`);
-        }
-    } catch (_) { /* non-fatal */ }
-
+    //    (connector-bound users already returned above at step 1.5.)
     const { pool } = require('../db');
     try {
         const { rows } = await pool.query(
@@ -1178,8 +1194,12 @@ const POLLERS = {
                 const cursorId = sub.lastCursor ? Number(sub.lastCursor) : 0;
 
                 if (!sub.lastCursor) {
-                    const maxId = items.length ? items[items.length - 1].id : 0;
-                    await automationStore.updateSubscription(sub.id, { lastCursor: String(maxId || 0) });
+                    // Only anchor once notifications actually exist. Anchoring at
+                    // 0 on an empty first poll would make the next non-empty tick
+                    // treat the entire list as "fresh" and replay it.
+                    if (items.length) {
+                        await automationStore.updateSubscription(sub.id, { lastCursor: String(items[items.length - 1].id) });
+                    }
                     return [];
                 }
 
@@ -1201,6 +1221,90 @@ const POLLERS = {
                 return events;
             } catch (e) {
                 console.warn('[TriggerBus] nextcloud notifications poll error:', e.message);
+                return [];
+            }
+        },
+
+        /**
+         * calendar.event.upcoming — fire N minutes before a Nextcloud calendar
+         * event starts. NC has no real-time push class for "starting soon", so
+         * this is poll-derived (mirrors the google-calendar event.upcoming
+         * handler above). Cursor JSON: { firedIds:[…last 200] }, keyed
+         * `uid|dtstart` so recurring-event instances dedupe independently.
+         * Emits the shape matchNextcloudCalendarUpcomingFilter expects
+         * (startsAt / summary / calendarId / attendees).
+         */
+        'calendar.event.upcoming': async (sub, session) => {
+            try {
+                const tools = require('../integrations/nextcloudCalendarTools');
+                const filter = sub.filter || {};
+                const leadMinutes = Math.max(1, Math.min(Number(filter.leadMinutes) || 15, 240));
+                const calendar = filter.calendar || filter.calendarId || 'personal';
+                const includeAllDay = filter.includeAllDay === true;
+
+                const now = Date.now();
+                const SAFETY_MIN = 5; // widen the window so a slow tick doesn't miss the boundary
+                const result = await tools.executeNextcloudCalendarTool(
+                    'nextcloud_calendar_list_events',
+                    {
+                        calendar,
+                        start: new Date(now).toISOString(),
+                        end: new Date(now + (leadMinutes + SAFETY_MIN) * 60_000).toISOString(),
+                        limit: 50,
+                    },
+                    sub.userId, session,
+                );
+                if (result?.error) {
+                    console.warn(`[TriggerBus] nextcloud calendar upcoming fetch failed for sub ${sub.id}: ${result.error}`);
+                    return [];
+                }
+                const items = Array.isArray(result?.events) ? result.events : [];
+
+                let cursor = { firedIds: [] };
+                try { if (sub.lastCursor) cursor = JSON.parse(sub.lastCursor) || cursor; } catch { /* ignore */ }
+                const fired = new Set(Array.isArray(cursor.firedIds) ? cursor.firedIds : []);
+
+                const events = [];
+                const newlyFired = [];
+                for (const ev of items) {
+                    const startsAt = ev.dtstart || null;
+                    const startMs = startsAt ? Date.parse(startsAt) : NaN;
+                    if (!Number.isFinite(startMs)) continue;
+                    if (!includeAllDay && ev.allDay) continue; // skip all-day unless asked
+                    const key = `${ev.uid || ev.href || ''}|${startsAt}`;
+                    if (fired.has(key)) continue;
+                    const minutesUntilStart = Math.round((startMs - now) / 60_000);
+                    if (minutesUntilStart > leadMinutes) continue;  // not yet within window
+                    if (minutesUntilStart < -SAFETY_MIN) continue;  // already started > safety ago
+                    events.push({
+                        uid: ev.uid || null,
+                        summary: ev.summary || '',
+                        description: ev.description || null,
+                        startsAt,
+                        endsAt: ev.dtend || null,
+                        location: ev.location || null,
+                        calendar,
+                        calendarId: calendar,
+                        // attendees come back as {cn,email} objects; flatten to
+                        // strings so matchNextcloudCalendarFilter's attendeeContains works.
+                        attendees: (ev.attendees || []).map(a => (a && (a.email || a.cn)) || a).filter(Boolean),
+                        organizer: ev.organizer || null,
+                        allDay: !!ev.allDay,
+                        minutesUntilStart,
+                    });
+                    newlyFired.push(key);
+                }
+
+                if (newlyFired.length > 0) {
+                    const all = [...fired, ...newlyFired].slice(-200);
+                    await automationStore.updateSubscription(sub.id, { lastCursor: JSON.stringify({ firedIds: all }) });
+                } else if (!sub.lastCursor) {
+                    // Anchor an empty cursor so we stop hitting the bootstrap branch.
+                    await automationStore.updateSubscription(sub.id, { lastCursor: JSON.stringify({ firedIds: [] }) });
+                }
+                return events;
+            } catch (e) {
+                console.warn('[TriggerBus] nextcloud calendar upcoming poll error:', e.message);
                 return [];
             }
         },

@@ -44,7 +44,10 @@ const NEXTCLOUD_ACTIVITY_TOOLS = [
 ];
 
 function activityApi(baseUrl) {
-    return `${baseUrl}/ocs/v2.php/cloud/activity`;
+    // Activity app's OCS API v2. The `cloud/activity` namespace does not exist
+    // (404s on every call) — the real endpoint lives under the app's own route,
+    // with sub-paths /all|/self|/by and /filter (used below).
+    return `${baseUrl}/ocs/v2.php/apps/activity/api/v2/activity`;
 }
 
 async function readJsonSafe(res) {
@@ -54,7 +57,9 @@ async function readJsonSafe(res) {
 
 function mapActivity(a) {
     return {
-        id: a.activity_id,
+        // The poller (triggerBus _ncPollChannel) cursors on this id; tolerate
+        // both the OCS v2 `activity_id` and a plain `id` across NC versions.
+        id: a.activity_id ?? a.id,
         type: a.type,
         subject: a.subject_prepared || a.subject,
         message: a.message_prepared || a.message,

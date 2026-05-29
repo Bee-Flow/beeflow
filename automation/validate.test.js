@@ -325,4 +325,75 @@ function trigger() {
     assert.strictEqual(validateDefinition(def).ok, true, 'dedupe with keyField should pass');
 }
 
+// ── WS-9C: tool_unknown only fires when availableTools is supplied ──────
+{
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 's1', type: 'integration_action', tool: 'nextcloud_delete_share', inputs: { shareId: { kind: 'literal', value: 1 } } }],
+        edges: [{ from: 'trg', to: 's1' }],
+    };
+    assert.strictEqual(validateDefinition(def).ok, true, 'no availableTools → tool not checked');
+    const r = validateDefinition(def, { availableTools: new Set(['gmail_send']) });
+    assert.strictEqual(r.ok, false, 'unknown tool blocks when catalog provided');
+    assert.ok(r.errors.some(e => e.code === 'integration_action.tool_unknown'), 'tool_unknown raised');
+    assert.strictEqual(validateDefinition(def, { availableTools: new Set(['nextcloud_delete_share']) }).ok, true, 'known tool passes');
+}
+
+// ── WS-9B: required-param check (absent + empty-string literal) ─────────
+{
+    const reqMap = { nextcloud_talk_send_message: ['token', 'message'] };
+    const emptyTok = {
+        trigger: trigger(),
+        steps: [{ id: 's1', type: 'integration_action', tool: 'nextcloud_talk_send_message', inputs: { token: { kind: 'literal', value: '' }, message: { kind: 'literal', value: 'hi' } } }],
+        edges: [{ from: 'trg', to: 's1' }],
+    };
+    const r1 = validateDefinition(emptyTok, { availableTools: new Set(['nextcloud_talk_send_message']), toolRequiredParams: reqMap });
+    assert.strictEqual(r1.ok, false, 'empty-literal required param blocks');
+    assert.ok(r1.errors.some(e => e.code === 'integration_action.param_missing' && e.path.endsWith('.token')), 'param_missing on token');
+    const noMsg = {
+        trigger: trigger(),
+        steps: [{ id: 's1', type: 'integration_action', tool: 'nextcloud_talk_send_message', inputs: { token: { kind: 'literal', value: 'abc' } } }],
+        edges: [{ from: 'trg', to: 's1' }],
+    };
+    const r2 = validateDefinition(noMsg, { availableTools: new Set(['nextcloud_talk_send_message']), toolRequiredParams: reqMap });
+    assert.ok(r2.errors.some(e => e.code === 'integration_action.param_missing' && e.path.endsWith('.message')), 'param_missing on absent message');
+    const okDef = {
+        trigger: trigger(),
+        steps: [{ id: 's1', type: 'integration_action', tool: 'nextcloud_talk_send_message', inputs: { token: { kind: 'ref', path: 'trigger.output.roomToken' }, message: { kind: 'literal', value: 'hi' } } }],
+        edges: [{ from: 'trg', to: 's1' }],
+    };
+    assert.strictEqual(validateDefinition(okDef, { availableTools: new Set(['nextcloud_talk_send_message']), toolRequiredParams: reqMap }).ok, true, 'all required params present → passes');
+    assert.strictEqual(validateDefinition(emptyTok, { availableTools: new Set(['nextcloud_talk_send_message']) }).ok, true, 'no schema map → param not checked');
+}
+
+// ── WS-9D: literal containing {{…}} → uninterpolated warning (non-blocking) ──
+{
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 's1', type: 'integration_action', tool: 'nextcloud_create_folder', inputs: { path: { kind: 'literal', value: '/Welcome/{{trigger.output.actor}}' } } }],
+        edges: [{ from: 'trg', to: 's1' }],
+    };
+    const r = validateDefinition(def);
+    assert.strictEqual(r.ok, true, 'uninterpolated literal is a warning, not an error');
+    assert.ok(r.warnings.some(w => w.code === 'literal.uninterpolated'), 'literal.uninterpolated warning raised');
+    const def2 = {
+        trigger: trigger(),
+        steps: [{ id: 's1', type: 'integration_action', tool: 'nextcloud_create_folder', inputs: { path: { kind: 'template', value: '/Welcome/{{trigger.output.actor}}' } } }],
+        edges: [{ from: 'trg', to: 's1' }],
+    };
+    assert.ok(!validateDefinition(def2).warnings.some(w => w.code === 'literal.uninterpolated'), 'template kind → no uninterpolated warning');
+}
+
+// ── WS-9A: app_event deliverability warning (non-blocking) ─────────────
+{
+    const deliverable = { nextcloud: new Set(['file.new', 'calendar.event.upcoming']) };
+    const mk = (ev) => ({ trigger: { id: 'trg', kind: 'app_event', appEvent: { provider: 'nextcloud', event: ev } }, steps: [], edges: [] });
+    let r = validateDefinition(mk('file.new'), { deliverableEvents: deliverable });
+    assert.ok(!r.warnings.some(w => w.code === 'trigger.app_event_undeliverable'), 'deliverable event → no warning');
+    r = validateDefinition(mk('talk.mention.received'), { deliverableEvents: deliverable });
+    assert.strictEqual(r.ok, true, 'undeliverable event is a warning, not an error');
+    assert.ok(r.warnings.some(w => w.code === 'trigger.app_event_undeliverable'), 'undeliverable event → warning');
+    assert.ok(!validateDefinition(mk('talk.mention.received')).warnings.some(w => w.code === 'trigger.app_event_undeliverable'), 'no deliverableEvents option → not checked');
+}
+
 console.log('validate.test.js — all checks passed');

@@ -227,21 +227,30 @@ const OUTPUT_SCHEMAS = {
     },
 
     // ── Nextcloud Mail / Talk / Calendar / Notifications ──────────
+    // Shapes verified against the tool modules' actual return statements.
     nextcloud_mail_send: {
-        shape: { sent: 'boolean', messageId: 'string', message: 'string' },
-        sample: { sent: true, messageId: 'nc-mail-1', message: 'Email sent via Nextcloud Mail.' },
+        shape: { success: 'boolean', outboxId: 'integer', to: 'string', subject: 'string' },
+        sample: { success: true, outboxId: 1, to: 'recipient@example.com', subject: 'Sample subject' },
     },
     nextcloud_talk_send_message: {
-        shape: { id: 'integer', token: 'string', message: 'string', sent: 'boolean' },
-        sample: { id: 1, token: 'room-token', message: 'Message text', sent: true },
+        shape: { success: 'boolean', message: '{ id, actor, actorId, message, timestamp }' },
+        sample: { success: true, message: { id: 1, actor: 'Alice', actorId: 'alice', message: 'Message text', timestamp: Math.floor(Date.now() / 1000) } },
     },
     nextcloud_calendar_create_event: {
-        shape: { id: 'string', uri: 'string', summary: 'string', start: 'string', end: 'string' },
-        sample: { id: 'nc-evt-1', uri: '/event/uri', summary: 'Created event', start: new Date().toISOString(), end: new Date(Date.now() + 3600_000).toISOString() },
+        shape: { success: 'boolean', calendar: 'string', uid: 'string', etag: 'string' },
+        sample: { success: true, calendar: 'personal', uid: 'nc-evt-1@cloud.example.com', etag: '"abc123"' },
     },
     nextcloud_notifications_send: {
-        shape: { sent: 'boolean', notificationId: 'integer' },
-        sample: { sent: true, notificationId: 1 },
+        shape: { success: 'boolean', userId: 'string', sentToSelf: 'boolean', shortMessage: 'string', longMessage: 'string|null' },
+        sample: { success: true, userId: 'alice', sentToSelf: true, shortMessage: 'Heads up', longMessage: null },
+    },
+    nextcloud_activity_list: {
+        shape: { count: 'integer', activities: 'array of { id, type, subject, message, actor, objectType, objectId, objectName, link, datetime }' },
+        sample: { count: 1, activities: [{ id: 42, type: 'file_created', subject: 'You created Report.pdf', message: '', actor: 'alice', objectType: 'files', objectId: 1234, objectName: '/Documents/Report.pdf', link: 'https://cloud.example.com/f/1234', datetime: new Date().toISOString() }] },
+    },
+    nextcloud_calendar_list_events: {
+        shape: { calendar: 'string', count: 'integer', events: 'array of { uid, summary, description, location, attendees, dtstart, dtend, organizer, allDay }' },
+        sample: { calendar: 'personal', count: 1, events: [{ uid: 'evt-1@cloud.example.com', summary: 'Standup', description: null, location: null, attendees: [], dtstart: new Date(Date.now() + 600_000).toISOString(), dtend: new Date(Date.now() + 2400_000).toISOString(), organizer: null, allDay: false }] },
     },
 
     // ── GitHub writes ─────────────────────────────────────────────

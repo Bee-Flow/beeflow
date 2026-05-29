@@ -50,6 +50,23 @@ app.use((req, res, next) => {
     next();
 });
 
+// Dynamic, per-user API responses must never be cached by the browser or any
+// intermediary. In the Nextcloud connector path (browser → NC AppAPI proxy →
+// connector → here) these JSON GETs carried no Cache-Control, so the browser
+// heuristically cached them and replayed a stale role / group / member list
+// until the cache was cleared — one account saw a change while another did not.
+// Mark them non-cacheable. Image-ish endpoints (icons, branding) are excluded
+// so they keep their own long-lived caching.
+app.use((req, res, next) => {
+    if ((req.path.startsWith('/auth/') || req.path.startsWith('/api/'))
+        && !req.path.startsWith('/api/icons')
+        && !req.path.startsWith('/api/branding')) {
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+    }
+    next();
+});
+
 // ── Error handlers ────────────────────────────────────────────────────────────
 process.on('unhandledRejection', (reason, promise) => {
     console.error('Unhandled Rejection at:', promise, 'reason:', reason);

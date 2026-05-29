@@ -92,6 +92,26 @@ async function getServerLicenseTier() {
 }
 
 /**
+ * Whether an active server-wide licence GOVERNS per-org / per-user billing.
+ *
+ * On Bee Flow Cloud every organisation pays its own Stripe subscription, so a
+ * server-wide licence is the platform operator's own record only — it must NOT
+ * exempt orgs from needing a subscription, hide their subscription UI, or grant
+ * them paid tiers for free. The licence still exists and is shown in the admin
+ * Server-licence panel; it simply doesn't override per-org resolution.
+ *
+ * On self-hosted / private-cloud the server-wide licence IS the paid-access
+ * mechanism and governs the whole install (every org/user runs at its tier).
+ *
+ * Sourced from DEPLOYMENT_MODE (default 'cloud'). Whitelisted so an unknown
+ * value never silently turns billing off.
+ */
+function serverLicenseGovernsOrgs() {
+    const mode = process.env.DEPLOYMENT_MODE || 'cloud';
+    return mode === 'self-hosted' || mode === 'private-cloud';
+}
+
+/**
  * Resolve the effective tier for an organization. Returns 'community' when
  * no usable license is present.
  *
@@ -102,9 +122,11 @@ async function getServerLicenseTier() {
  *      flow without requiring a deployed JWT license-server.
  */
 async function getTierForOrg(organizationId) {
-    // Server-wide licence overrides per-org rows when active.
+    // Server-wide licence overrides per-org rows — but only when it governs
+    // billing (self-hosted / private-cloud). On cloud each org pays its own
+    // subscription, so we fall through to the per-org licence / Stripe sub.
     const serverTier = await getServerLicenseTier();
-    if (serverTier !== COMMUNITY_FALLBACK) return serverTier;
+    if (serverLicenseGovernsOrgs() && serverTier !== COMMUNITY_FALLBACK) return serverTier;
     if (!organizationId) return COMMUNITY_FALLBACK;
     const lic = await store.getActiveLicenseForOrg(organizationId);
     const licTier = resolveTierFromLicense(lic);
@@ -114,9 +136,11 @@ async function getTierForOrg(organizationId) {
 }
 
 async function getTierForUser(userId) {
-    // Server-wide licence overrides per-user rows when active.
+    // Server-wide licence overrides per-user rows — but only when it governs
+    // billing (self-hosted / private-cloud). On cloud the user's own
+    // subscription decides their tier.
     const serverTier = await getServerLicenseTier();
-    if (serverTier !== COMMUNITY_FALLBACK) return serverTier;
+    if (serverLicenseGovernsOrgs() && serverTier !== COMMUNITY_FALLBACK) return serverTier;
     if (!userId) return COMMUNITY_FALLBACK;
     const lic = await store.getActiveLicenseForUser(userId);
     const licTier = resolveTierFromLicense(lic);
@@ -135,9 +159,11 @@ async function getTierForUser(userId) {
  * Includes subscription-derived tiers for SaaS orgs without a license_keys row.
  */
 async function getBestTierForOrgs(orgIds = []) {
-    // Server-wide licence wins outright when active; skip the org sweep.
+    // Server-wide licence wins outright when it governs billing (self-hosted /
+    // private-cloud); skip the org sweep. On cloud it doesn't override, so we
+    // resolve from the orgs' own licences / subscriptions below.
     const serverTier = await getServerLicenseTier();
-    if (serverTier !== COMMUNITY_FALLBACK) return serverTier;
+    if (serverLicenseGovernsOrgs() && serverTier !== COMMUNITY_FALLBACK) return serverTier;
     if (!Array.isArray(orgIds) || orgIds.length === 0) return COMMUNITY_FALLBACK;
     const licenses = await store.getActiveLicensesForOrgs(orgIds);
     let best = COMMUNITY_FALLBACK;
@@ -249,10 +275,18 @@ async function resolveTier(scope) {
  *   4. Community fallback.
  */
 async function getLicenseStatus({ organizationId = null, userId = null, orgIds = null } = {}) {
-    // Server-wide licence overrides everything else. Render a status that
-    // tells the per-org UI exactly that via `serverOverride: true`.
+    // Snapshot the server-wide licence once. `serverLicense` is exposed on
+    // every response (mode-independent) so the admin Server-licence panel can
+    // always display it. Whether it OVERRIDES per-org billing depends on the
+    // deployment mode — see serverLicenseGovernsOrgs().
     const serverSnap = await _getServerLicenseSnapshot();
-    if (serverSnap.tier !== COMMUNITY_FALLBACK && serverSnap.license) {
+    const serverLicense = serverSnap.license ? publicLicenseShape(serverSnap.license) : null;
+
+    // Governing modes (self-hosted / private-cloud): the server licence covers
+    // the whole install, so report it as the authoritative tier and tell the
+    // per-org UI via `serverOverride: true` (no Stripe subscription needed).
+    // On cloud this branch is skipped — orgs resolve their own subscription.
+    if (serverLicenseGovernsOrgs() && serverSnap.tier !== COMMUNITY_FALLBACK && serverSnap.license) {
         return {
             tier: serverSnap.tier,
             source: 'license_key',
@@ -262,6 +296,7 @@ async function getLicenseStatus({ organizationId = null, userId = null, orgIds =
             features: tiers.getFeaturesForTier(serverSnap.tier),
             limits: tiers.getLimitsForTier(serverSnap.tier),
             serverOverride: true,
+            serverLicense,
         };
     }
 
@@ -349,6 +384,11 @@ async function getLicenseStatus({ organizationId = null, userId = null, orgIds =
         subscription: subscriptionShape,
         features: tiers.getFeaturesForTier(tier),
         limits: tiers.getLimitsForTier(tier),
+        // `serverOverride` is false here (this path runs when no governing
+        // server licence applies), but `serverLicense` still surfaces an
+        // existing server row so the admin panel can show/manage it on cloud.
+        serverOverride: false,
+        serverLicense,
     };
 }
 
@@ -562,6 +602,7 @@ module.exports = {
     getLicenseStatus,
     getMaxSeatsForOrg,
     getServerLicenseTier,
+    serverLicenseGovernsOrgs,
     getServerLicenseVersion,
     // mutation
     activateLicense,

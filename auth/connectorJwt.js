@@ -174,7 +174,37 @@ async function connectorJwtMiddleware(req, res, next) {
     // sending valid headers.
     if (req.session?.isAuthenticated && req.session?.user?.id) {
         const stillExists = await userStore.getUser(req.session.user.id).catch(() => null);
-        if (stillExists) return next();
+        if (stillExists) {
+            // Re-sync the mutable identity fields from the DB before reusing the
+            // session. The embedded SPA lives in a long-lived Nextcloud iframe,
+            // so its session cookie is reused on every request indefinitely —
+            // without this, a connector user's orgRole / organizationId / admin
+            // flag stay frozen at their first-login values even after an admin
+            // changes them. That produced inconsistent role/permission views
+            // between accounts in the same org (one session sees the change, the
+            // other doesn't) and, worse, let a demoted user keep stale elevated
+            // permissions until the session expired. Scope to connector sessions
+            // (cookie-login keeps its own refresh path) and only write when
+            // something actually changed, to avoid a session-store write per
+            // request.
+            if (stillExists.provider === 'nextcloud_connector'
+                || req.headers['x-beeflow-source'] === 'nextcloud-connector') {
+                const nextOrgRole = stillExists.orgRole || '';
+                const nextRole = stillExists.role || 'user';
+                const nextOrgId = stillExists.organizationId || req.session.user.organizationId || null;
+                const nextIsAdmin = stillExists.role === 'admin';
+                if (req.session.user.orgRole !== nextOrgRole
+                    || req.session.user.role !== nextRole
+                    || req.session.user.organizationId !== nextOrgId
+                    || req.session.isAdmin !== nextIsAdmin) {
+                    req.session.user.orgRole = nextOrgRole;
+                    req.session.user.role = nextRole;
+                    req.session.user.organizationId = nextOrgId;
+                    req.session.isAdmin = nextIsAdmin;
+                }
+            }
+            return next();
+        }
         // Stale session — destroy it and fall through to header-based auth.
         console.log(`[ConnectorJWT] Dropping stale session for missing user ${req.session.user.id}`);
         await new Promise(resolve => req.session.destroy(() => resolve()));

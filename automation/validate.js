@@ -97,6 +97,25 @@ function collectRefPaths(value, out) {
     for (const k of Object.keys(value)) collectRefPaths(value[k], out);
 }
 
+/**
+ * Collect `kind:'literal'` string values that contain `{{…}}` placeholders.
+ * Only `kind:'template'` values are interpolated at runtime (see bind.js), so
+ * a literal carrying `{{…}}` ships the braces verbatim — almost always a
+ * mistake. Pushes the offending strings onto `out`.
+ */
+function collectLiteralBraces(value, out) {
+    if (value == null) return;
+    if (Array.isArray(value)) { value.forEach(v => collectLiteralBraces(v, out)); return; }
+    if (typeof value !== 'object') return;
+    if (typeof value.kind === 'string') {
+        if (value.kind === 'literal' && typeof value.value === 'string' && /\{\{[^}]+\}\}/.test(value.value)) {
+            out.push(value.value);
+        }
+        return;
+    }
+    for (const k of Object.keys(value)) collectLiteralBraces(value[k], out);
+}
+
 function rootOf(path) {
     const m = String(path).match(/^([A-Za-z_$][A-Za-z0-9_$]*)/);
     return m ? m[1] : null;
@@ -161,8 +180,14 @@ function secondSegment(path) {
  *
  * `availableTools` (optional) is a Set of tool names from the catalog. When
  * provided, integration_action.tool is checked against it.
+ *
+ * `toolRequiredParams` (optional) is an object map { toolName: ['p1', …] } of
+ * each tool's required input names. When provided, an integration_action whose
+ * required input is absent (or bound to an empty-string literal) is flagged —
+ * this is what stops a Talk-send-with-no-room or calendar-event-with-no-date
+ * from activating green and then failing silently.
  */
-function validateDefinition(def, { availableTools = null } = {}) {
+function validateDefinition(def, { availableTools = null, toolRequiredParams = null, deliverableEvents = null } = {}) {
     const errors = [];
     const warnings = [];
     const pushE = (rec) => errors.push(rec);
@@ -185,6 +210,20 @@ function validateDefinition(def, { availableTools = null } = {}) {
     if (!trigger.id || typeof trigger.id !== 'string') pushE({ code: 'trigger.id_missing', severity: 'error', path: 'trigger.id', message: 'trigger.id is required.', hint: 'Re-run builder_propose_trigger; it generates a stable id.' });
     if (!trigger.kind || typeof trigger.kind !== 'string') pushE({ code: 'trigger.kind_missing', severity: 'error', path: 'trigger.kind', message: 'trigger.kind is required.', hint: 'Use one of: schedule, manual, webhook, app_event, agent_call.' });
     validatePosition(trigger.position, 'trigger', pushE);
+
+    // Deliverability warning (opt-in): an app_event trigger whose event has no
+    // producer on this install — neither a triggerBus poller nor a connector
+    // push subscription — will activate but never fire. Non-blocking: push-only
+    // events are deliverable on connector installs but not OAuth-only ones, so
+    // we warn rather than block.
+    if (deliverableEvents && trigger.kind === 'app_event') {
+        const prov = trigger.appEvent?.provider;
+        const ev = trigger.appEvent?.event;
+        const set = prov && deliverableEvents[prov];
+        if (set && ev && !set.has(ev)) {
+            pushW({ code: 'trigger.app_event_undeliverable', severity: 'warning', path: 'trigger.appEvent.event', message: `Trigger event "${prov}.${ev}" has no delivery path on this install — it will activate but may never fire.`, hint: 'Pick an event that has a poller or is pushed by the connector, or add a producer for this event before relying on it.' });
+        }
+    }
 
     // Steps — unique ids, valid types.
     const ids = new Set([trigger.id]);
@@ -231,6 +270,21 @@ function validateDefinition(def, { availableTools = null } = {}) {
         if (step.type === 'integration_action') {
             if (!step.tool || typeof step.tool !== 'string') pushE({ code: 'integration_action.tool_missing', severity: 'error', path: at + '.tool', message: `Step ${step.id}: integration_action requires \`tool\`.`, hint: 'Pick a tool from the catalog and pass it as a string.' });
             else if (availableTools && !availableTools.has(step.tool)) pushE({ code: 'integration_action.tool_unknown', severity: 'error', path: at + '.tool', message: `Step ${step.id}: tool "${step.tool}" not in user\'s catalog.`, hint: 'Either pick a tool the user has connected or ask them to connect the integration.' });
+            // Required-input check (only when caller supplied the schema map).
+            // Absent or empty-string-literal required inputs would fail at run
+            // time with a tool-side "X is required" error; catch it at activate.
+            else if (toolRequiredParams && Array.isArray(toolRequiredParams[step.tool])) {
+                const inputs = isObject(step.inputs) ? step.inputs : {};
+                for (const param of toolRequiredParams[step.tool]) {
+                    const b = inputs[param];
+                    const absent = b === undefined || b === null;
+                    const emptyLiteral = isObject(b) && b.kind === 'literal'
+                        && (b.value === '' || b.value === undefined || b.value === null);
+                    if (absent || emptyLiteral) {
+                        pushE({ code: 'integration_action.param_missing', severity: 'error', path: at + '.inputs.' + param, message: `Step ${step.id}: tool "${step.tool}" requires input "${param}"${emptyLiteral ? ' but it is set to an empty value' : ''}.`, hint: `Provide "${param}" — bind it to an upstream field (kind:'ref'/'template') or set a non-empty literal.` });
+                    }
+                }
+            }
         }
         if (step.type === 'ai_step') {
             if (!step.prompt || typeof step.prompt !== 'string') pushE({ code: 'ai_step.prompt_missing', severity: 'error', path: at + '.prompt', message: `Step ${step.id}: ai_step requires \`prompt\`.`, hint: 'Provide a non-empty prompt string.' });
@@ -371,6 +425,17 @@ function validateDefinition(def, { availableTools = null } = {}) {
         // runtime injects item per element so we don't validate sub-paths
         // here; the runtime returns undefined for typos. Same shortcut
         // condition/switch already use for their exprs.
+
+        // Uninterpolated-literal lint: a kind:'literal' input carrying {{…}}
+        // ships verbatim (only kind:'template' interpolates), so the user
+        // gets raw braces in their file path / message instead of a value.
+        const litBraces = [];
+        collectLiteralBraces(step.inputs, litBraces);
+        if (step.type === 'set') collectLiteralBraces(step.fields, litBraces);
+        for (const lit of litBraces) {
+            const shown = lit.length > 48 ? lit.slice(0, 48) + '…' : lit;
+            pushW({ code: 'literal.uninterpolated', severity: 'warning', path: at, message: `Step ${step.id}: literal input "${shown}" contains {{…}} but is kind:'literal', so it ships verbatim instead of being interpolated.`, hint: "Set kind:'template' on that input so {{trigger.output.…}} / {{steps.…}} placeholders are substituted at runtime." });
+        }
 
         for (const r of refs) {
             const path = r.kind === 'ref' ? r.path : null;
