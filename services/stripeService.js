@@ -357,32 +357,52 @@ async function createCheckoutSession({ plan, orgId, orgName, userId, subscriberT
         try {
             const userStore = require('../stores/userStore');
             const org = await userStore.getOrganization(orgId);
-            const taxId = org ? resolveStripeTaxId(org.vat) : null;
-            if (taxId) {
-                if (!effectiveCustomerId) {
-                    const created = await stripe.customers.create({
-                        name: orgName || org?.name || undefined,
-                        email: userEmail || org?.email || undefined,
-                        metadata: { beeflow_org_id: orgId },
+
+            // Resolve ONE Stripe customer per org so repeated checkout attempts
+            // (e.g. before the first one activates) don't mint duplicate
+            // customers. Order: stored id → search by metadata.beeflow_org_id →
+            // create. The result is persisted immediately so the next attempt
+            // reuses it without depending on the (eventually-consistent) search
+            // index or the activation webhook.
+            if (!effectiveCustomerId) {
+                try {
+                    const found = await stripe.customers.search({
+                        query: `metadata['beeflow_org_id']:'${orgId}'`,
+                        limit: 1,
                     });
-                    effectiveCustomerId = created.id;
+                    if (found?.data?.[0]?.id) effectiveCustomerId = found.data[0].id;
+                } catch (e) {
+                    // Search API unavailable or index lag — fall through to create.
                 }
-                // Attach the tax id (idempotent: list existing first; create
-                // only if missing). Failure to attach is non-fatal — the
-                // checkout still proceeds and Stripe's inline tax_id_collection
-                // will pick up the slack.
+            }
+            if (!effectiveCustomerId) {
+                const created = await stripe.customers.create({
+                    name: orgName || org?.name || undefined,
+                    email: userEmail || org?.email || undefined,
+                    metadata: { beeflow_org_id: orgId },
+                });
+                effectiveCustomerId = created.id;
+            }
+            if (effectiveCustomerId) {
+                try { await userStore.setOrgSubscription(orgId, { stripe_customer_id: effectiveCustomerId }); }
+                catch (e) { /* non-fatal — webhook will also persist it */ }
+            }
+
+            // Attach the org's VAT id (idempotent) so Stripe Tax can apply EU
+            // reverse charge without the admin re-entering it. Non-fatal: the
+            // checkout still proceeds and inline tax_id_collection covers it.
+            const taxId = org ? resolveStripeTaxId(org.vat) : null;
+            if (taxId && effectiveCustomerId) {
                 try {
                     const existing = await stripe.customers.listTaxIds(effectiveCustomerId, { limit: 25 });
                     const already = (existing?.data || []).some(t => t.value === taxId.value && t.type === taxId.type);
-                    if (!already) {
-                        await stripe.customers.createTaxId(effectiveCustomerId, taxId);
-                    }
+                    if (!already) await stripe.customers.createTaxId(effectiveCustomerId, taxId);
                 } catch (e) {
                     console.warn(`[Stripe] attaching VAT for org ${orgId} failed: ${e.message}`);
                 }
             }
         } catch (e) {
-            console.warn(`[Stripe] org VAT pre-attach skipped: ${e.message}`);
+            console.warn(`[Stripe] org customer resolution skipped: ${e.message}`);
         }
     }
 
@@ -601,6 +621,95 @@ async function reactivateSubscription(stripeSubscriptionId) {
 }
 
 /**
+ * Preview the cost impact of switching a subscription to a new price *now*.
+ * Drives the in-app change-plan modal so the customer sees the prorated
+ * charge before confirming. Returns the net proration (new-plan charge minus
+ * unused-time credit for the old plan) in MAJOR currency units. Non-proration
+ * lines (next period's base fee) are excluded so the figure reflects only
+ * "what you pay today". Stripe SDK v22 → invoices.createPreview.
+ */
+async function previewPlanChange({ stripeSubscriptionId, newPriceId, quantity = 1 }) {
+    const stripe = await getClient();
+    const sub = await stripe.subscriptions.retrieve(stripeSubscriptionId);
+    const item = sub.items?.data?.[0];
+    if (!item) throw new Error(`Stripe subscription ${stripeSubscriptionId} has no items`);
+    const preview = await stripe.invoices.createPreview({
+        subscription: stripeSubscriptionId,
+        subscription_details: {
+            items: [{ id: item.id, price: newPriceId, quantity: Math.max(1, quantity) }],
+            proration_behavior: 'always_invoice',
+        },
+    });
+    const prorationCents = (preview.lines?.data || [])
+        .filter(l => l.proration)
+        .reduce((sum, l) => sum + (l.amount || 0), 0);
+    return {
+        proration_amount: prorationCents / 100,
+        currency: (preview.currency || item.price?.currency || 'eur').toUpperCase(),
+    };
+}
+
+/**
+ * Schedule a plan switch to take effect at the END of the current billing
+ * period (used for downgrades — no mid-cycle refund/credit). Creates a Stripe
+ * Subscription Schedule from the live subscription, keeps the current price as
+ * phase 1 until period end, then starts the new price as phase 2.
+ * end_behavior:'release' hands control back to a plain subscription once
+ * phase 2 begins. Returns { scheduleId, effective }.
+ */
+async function scheduleDowngradeAtPeriodEnd({ stripeSubscriptionId, newPriceId, quantity = 1 }) {
+    const stripe = await getClient();
+    const sub = await stripe.subscriptions.retrieve(stripeSubscriptionId);
+    const item = sub.items?.data?.[0];
+    if (!item) throw new Error(`Stripe subscription ${stripeSubscriptionId} has no items`);
+    const qty = Math.max(1, quantity);
+
+    // Reuse any schedule already governing this subscription; else create one.
+    let scheduleId = sub.schedule;
+    if (!scheduleId) {
+        const created = await stripe.subscriptionSchedules.create({ from_subscription: stripeSubscriptionId });
+        scheduleId = created.id;
+    }
+    const schedule = await stripe.subscriptionSchedules.retrieve(scheduleId);
+    const currentPhase = schedule.phases?.[0];
+    if (!currentPhase) throw new Error(`Schedule ${scheduleId} has no current phase`);
+    const curItem = currentPhase.items?.[0] || {};
+    const updated = await stripe.subscriptionSchedules.update(scheduleId, {
+        end_behavior: 'release',
+        phases: [
+            {
+                items: [{ price: curItem.price, quantity: curItem.quantity || qty }],
+                start_date: currentPhase.start_date,
+                end_date: currentPhase.end_date,
+                proration_behavior: 'none',
+            },
+            {
+                items: [{ price: newPriceId, quantity: qty }],
+                proration_behavior: 'none',
+            },
+        ],
+    });
+    const effective = updated.phases?.[1]?.start_date || currentPhase.end_date || null;
+    return { scheduleId, effective: effective ? new Date(effective * 1000).toISOString() : null };
+}
+
+/**
+ * Release a subscription schedule (undo a pending downgrade), returning the
+ * subscription to a normal month-to-month state at its current price.
+ * Idempotent: a missing/already-released schedule is a no-op.
+ */
+async function releaseSubscriptionSchedule(scheduleId) {
+    if (!scheduleId) return null;
+    const stripe = await getClient();
+    try {
+        return await stripe.subscriptionSchedules.release(scheduleId);
+    } catch (e) {
+        console.warn(`[Stripe] releaseSubscriptionSchedule ${scheduleId} failed: ${e.message}`);
+        return null;
+    }
+}
+
+/**
  * Construct and verify a Stripe webhook event.
  *
  * @param {Buffer} rawBody - Raw request body
@@ -762,6 +871,9 @@ module.exports = {
     retrieveCheckoutSession,
     syncSeatQuantityForOrg,
     updateSubscriptionPlan,
+    previewPlanChange,
+    scheduleDowngradeAtPeriodEnd,
+    releaseSubscriptionSchedule,
     cancelSubscriptionAtPeriodEnd,
     reactivateSubscription,
     constructWebhookEvent,

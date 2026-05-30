@@ -192,7 +192,9 @@ router.post('/', requirePermission('manage_agents'), async (req, res) => {
         const orgAgentCount = allAgents.filter(a => a.organization_id === assignOrgId).length;
         const limitErr = await checkResourceLimits(assignOrgId, 'agents', orgAgentCount);
         if (limitErr) {
-            return res.status(403).json({ error: limitErr });
+            // Structured so the client can show a clear limit-reached warning
+            // with an upgrade CTA instead of a generic save error.
+            return res.status(403).json({ error: limitErr, code: 'limit_reached', resource: 'agents' });
         }
     }
 

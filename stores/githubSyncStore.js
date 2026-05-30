@@ -98,7 +98,7 @@ async function markPending(orgId, resourceType, resourceId) {
         INSERT INTO github_sync_state (id, organization_id, resource_type, resource_id, sync_status)
         VALUES ($1, $2, $3, $4, 'pending')
         ON CONFLICT (organization_id, resource_type, resource_id)
-        DO UPDATE SET sync_status = 'pending'
+        DO UPDATE SET sync_status = 'pending', error_message = NULL
     `, [id, orgId, resourceType, resourceId]);
 }
 
@@ -112,7 +112,7 @@ async function markDeleted(orgId, resourceType, resourceId) {
         INSERT INTO github_sync_state (id, organization_id, resource_type, resource_id, sync_status)
         VALUES ($1, $2, $3, $4, 'deleted')
         ON CONFLICT (organization_id, resource_type, resource_id)
-        DO UPDATE SET sync_status = 'deleted'
+        DO UPDATE SET sync_status = 'deleted', error_message = NULL
     `, [id, orgId, resourceType, resourceId]);
 }
 
@@ -156,12 +156,14 @@ async function getSyncState(orgId, resourceType, resourceId) {
 }
 
 /**
- * Get all resources with pending sync for an org.
+ * Get all resources that need a (re)push for an org — pending, errored, or
+ * deleted. Errored items are included so an incremental "Push Pending" retries
+ * previously-failed pushes instead of leaving them stuck.
  */
 async function getPendingChanges(orgId) {
     await initDB();
     return getAll(
-        "SELECT * FROM github_sync_state WHERE organization_id = $1 AND sync_status IN ('pending', 'deleted')",
+        "SELECT * FROM github_sync_state WHERE organization_id = $1 AND sync_status IN ('pending', 'error', 'deleted')",
         [orgId]
     );
 }
@@ -178,8 +180,10 @@ async function getSyncOverview(orgId) {
     const result = { synced: 0, pending: 0, error: 0, deleted: 0, total: 0 };
     for (const row of rows) {
         result[row.sync_status] = parseInt(row.count);
-        result.total += parseInt(row.count);
     }
+    // Total reflects live resources only — pending-deletions are on their way
+    // out and shouldn't inflate the count.
+    result.total = result.synced + result.pending + result.error;
     return result;
 }
 

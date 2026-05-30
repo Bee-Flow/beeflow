@@ -1154,7 +1154,7 @@ router.delete('/app-password', requireAuth, async (req, res) => {
 
 // === Beta Features Management API (Admin Only) ===
 
-const { BETA_FEATURES, getOrgBetaFeatures, setOrgBetaFeatures } = require('../core/betaFeatures');
+const { BETA_FEATURES, getOrgBetaFeatures, setOrgBetaFeatures, getEffectiveOrgBetaAllowList } = require('../core/betaFeatures');
 
 // Get the full beta feature registry + per-org assignments
 router.get('/beta-features', requireAdmin, async (req, res) => {
@@ -1343,13 +1343,12 @@ async function resolveActiveFeaturesContext(req) {
 
     const org = await userStore.getOrganization(orgId);
 
-    // Beta allow-list = the super admin's per-org grant, full stop. A beta
-    // feature the platform admin hasn't granted to this org never appears in
-    // the org-admin panel and can't be enabled — there is no free-for-all
-    // bypass. The grant is also authoritative over the plan cap: an explicit
-    // super-admin grant is a deliberate decision the plan template's ceiling
-    // should not silently undo, so the grant list is not plan-capped here.
-    const grantedAllowList = await getOrgBetaFeatures(orgId);
+    // Beta allow-list — the effective entitlement for this org. On cloud this
+    // is driven by the org's SUBSCRIPTION (the plan's allowed_beta_features),
+    // which leads over the admin Security→Beta grant; on self-hosted /
+    // private-cloud it is the server-licence-governed admin grant. Either way
+    // a feature outside the allow-list never appears in the org-admin panel.
+    const grantedAllowList = await getEffectiveOrgBetaAllowList(orgId);
     const enabledBetaFeatures = await userStore.getOrgEnabledBetaFeatures(orgId);
 
     // Integration allow-list = super admin's enabledIntegrations (or global

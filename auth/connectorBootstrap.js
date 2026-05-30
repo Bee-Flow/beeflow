@@ -31,6 +31,7 @@ const configStore = require('../stores/configStore');
 const { invalidateTenantKeyCache } = require('./connectorJwt');
 const planEntitlements = require('../services/planEntitlements');
 const { sendNcVerificationCodeEmail } = require('../utils/emailService');
+const { buildAutoOrgName } = require('./orgNaming');
 
 // Auto-apply the operator-flagged "Nextcloud recommended" plan to freshly
 // provisioned or freshly-adopted NC orgs so they get enterprise-equivalent
@@ -494,9 +495,13 @@ router.post('/connector/bootstrap', bootstrapLimiter, async (req, res) => {
     // 3. Fresh-org branch — no victim, no risk. One-click.
     const idSuffix = slugify(ncInstanceId.slice(0, 12)) || crypto.randomBytes(3).toString('hex');
     const orgId = `nc-${slugify(nc.themingName)}-${idSuffix}`;
+    // Build a self-describing org name. Many Nextclouds keep the default
+    // theming name "Nextcloud", which produces indistinguishable orgs in the
+    // admin list — qualify it with the instance host, e.g. "Nextcloud (nc.e380.net)".
+    const orgName = buildAutoOrgName(nc.themingName, ncBaseUrl);
     const created = await userStore.createOrganization({
         id: orgId,
-        name: nc.themingName || 'Nextcloud',
+        name: orgName,
         description: `Auto-provisioned from Nextcloud (${ncBaseUrl})`,
         authMethod: 'nextcloud_connector',
         autoApproveSSO: true,

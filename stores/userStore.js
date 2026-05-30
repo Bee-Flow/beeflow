@@ -537,6 +537,52 @@ async function initDB() {
     try { await exec(`ALTER TABLE consumer_subscriptions ADD COLUMN IF NOT EXISTS cancel_at TIMESTAMPTZ`); } catch (e) { }
     try { await exec(`ALTER TABLE consumer_subscriptions ADD COLUMN IF NOT EXISTS current_period_end TIMESTAMPTZ`); } catch (e) { }
 
+    // Deferred (end-of-period) downgrade. When an org downgrades to a cheaper
+    // plan we don't switch immediately — a Stripe Subscription Schedule flips
+    // the price at the cycle boundary. These two columns record the pending
+    // target + effective date so the UI can show a "downgrade scheduled" banner;
+    // the customer.subscription.updated webhook clears them once the new price
+    // becomes active.
+    try { await exec(`ALTER TABLE organization_subscriptions ADD COLUMN IF NOT EXISTS pending_plan_id TEXT`); } catch (e) { }
+    try { await exec(`ALTER TABLE organization_subscriptions ADD COLUMN IF NOT EXISTS pending_plan_effective TIMESTAMPTZ`); } catch (e) { }
+    try { await exec(`ALTER TABLE organization_subscriptions ADD COLUMN IF NOT EXISTS stripe_schedule_id TEXT`); } catch (e) { }
+
+    // Seed a single €0 "Free" org plan once. New orgs auto-assign whichever
+    // plan carries is_default (see loginRoutes/oauthRoutes), so Free becomes
+    // the no-payment default tier and can be assigned from the admin Orgs view.
+    // Only runs when no Free org plan exists yet — never clobbers admin edits.
+    try {
+        // Skip if ANY free org tier already exists (a plan named 'Free' OR any
+        // €0 org plan) — avoids seeding a duplicate when the operator has
+        // already created their own free plan (e.g. "Bee Flow Free").
+        const existingFree = await getOne(
+            `SELECT id FROM subscription_plans
+              WHERE (plan_type = 'organization' OR plan_type IS NULL)
+                AND (name = 'Free' OR price = 0)
+              LIMIT 1`
+        );
+        if (!existingFree) {
+            const freeId = crypto.randomUUID();
+            // Preserve the single-default invariant the admin CRUD enforces.
+            await run(`UPDATE subscription_plans SET is_default = FALSE WHERE is_default = TRUE`);
+            await run(
+                `INSERT INTO subscription_plans (
+                    id, name, plan_type, description, price, currency, billing_interval, billing_model,
+                    markup_percent, trial_days, max_cost_per_month, max_users, max_agents, max_knowledge_sources,
+                    allowed_features, allowed_models, allowed_integrations, allowed_beta_features,
+                    is_public, is_default, nc_recommended, sort_order, created_at, updated_at
+                 ) VALUES (
+                    $1, 'Free', 'organization', 'Free tier — limited AI usage, no payment required.', 0, 'EUR', 'monthly', 'fixed',
+                    0, 0, 5, 3, 1, 5,
+                    '[]', '[]', '[]', '[]',
+                    FALSE, TRUE, FALSE, 0, NOW(), NOW()
+                 )`,
+                [freeId]
+            );
+            console.log('[UserStore] seeded default Free org plan', freeId);
+        }
+    } catch (e) { console.warn('[UserStore] Free plan seed skipped:', e.message); }
+
     // Seat-cap atomic enforcement support index (PR 1.C). The serializable
     // transaction in createUserWithSeatCheck reads a COUNT()...FOR UPDATE
     // and benefits from a covering partial index.
@@ -1955,8 +2001,14 @@ async function setOrgSubscription(orgId, data) {
             if (data.cancel_at_period_end !== undefined) updateMap.cancel_at_period_end = data.cancel_at_period_end;
             if (data.cancel_at !== undefined) updateMap.cancel_at = data.cancel_at;
             if (data.current_period_end !== undefined) updateMap.current_period_end = data.current_period_end;
+            if (data.pending_plan_id !== undefined) updateMap.pending_plan_id = data.pending_plan_id;
+            if (data.pending_plan_effective !== undefined) updateMap.pending_plan_effective = data.pending_plan_effective;
+            if (data.stripe_schedule_id !== undefined) updateMap.stripe_schedule_id = data.stripe_schedule_id;
+            if (data.payment_attempt_count !== undefined) updateMap.payment_attempt_count = data.payment_attempt_count;
+            if (data.last_payment_failure_at !== undefined) updateMap.last_payment_failure_at = data.last_payment_failure_at;
+            if (data.past_due_since !== undefined) updateMap.past_due_since = data.past_due_since;
             updateMap.updated_at = now;
-            const colMap = { plan_id: 'plan_id', status: 'status', max_messages_per_month: 'max_messages_per_month', max_messages_by_type: 'max_messages_by_type', max_tokens_per_month: 'max_tokens_per_month', max_cost_per_month: 'max_cost_per_month', max_users: 'max_users', max_agents: 'max_agents', max_knowledge_sources: 'max_knowledge_sources', allowed_features: 'allowed_features', allowed_models: 'allowed_models', billing_cycle_start: 'billing_cycle_start', notes: 'notes', trial_end_date: 'trial_end_date', stripe_customer_id: 'stripe_customer_id', stripe_subscription_id: 'stripe_subscription_id', payment_status: 'payment_status', manual_override_until: 'manual_override_until', manual_override_by: 'manual_override_by', stripe_seat_quantity: 'stripe_seat_quantity', cancel_at_period_end: 'cancel_at_period_end', cancel_at: 'cancel_at', current_period_end: 'current_period_end', updated_at: 'updated_at' };
+            const colMap = { plan_id: 'plan_id', status: 'status', max_messages_per_month: 'max_messages_per_month', max_messages_by_type: 'max_messages_by_type', max_tokens_per_month: 'max_tokens_per_month', max_cost_per_month: 'max_cost_per_month', max_users: 'max_users', max_agents: 'max_agents', max_knowledge_sources: 'max_knowledge_sources', allowed_features: 'allowed_features', allowed_models: 'allowed_models', billing_cycle_start: 'billing_cycle_start', notes: 'notes', trial_end_date: 'trial_end_date', stripe_customer_id: 'stripe_customer_id', stripe_subscription_id: 'stripe_subscription_id', payment_status: 'payment_status', manual_override_until: 'manual_override_until', manual_override_by: 'manual_override_by', stripe_seat_quantity: 'stripe_seat_quantity', cancel_at_period_end: 'cancel_at_period_end', cancel_at: 'cancel_at', current_period_end: 'current_period_end', pending_plan_id: 'pending_plan_id', pending_plan_effective: 'pending_plan_effective', stripe_schedule_id: 'stripe_schedule_id', payment_attempt_count: 'payment_attempt_count', last_payment_failure_at: 'last_payment_failure_at', past_due_since: 'past_due_since', updated_at: 'updated_at' };
             const q = dynamicUpdate('organization_subscriptions', orgId, updateMap, colMap, 'organization_id');
             if (q) await run(q.sql, q.params);
         } else {
@@ -2200,6 +2252,31 @@ async function backfillTrialHistory() {
             ON CONFLICT (scope, email_normalized) DO NOTHING`);
     } catch (e) {
         console.warn('[UserStore] backfillTrialHistory failed:', e.message);
+    }
+}
+
+// One-shot idempotent backfill: rename connector-provisioned organisations that
+// are still on the generic default name "Nextcloud" to a self-describing
+// "Nextcloud (<host>)" so they're distinguishable in the admin list. Safe —
+// org id is the stable key, name is display-only. After a row is renamed it no
+// longer matches the predicate, so subsequent boots are no-ops.
+async function backfillAutoProvisionedNcOrgNames() {
+    await initDB();
+    try {
+        const { buildAutoOrgName } = require('../auth/orgNaming');
+        const orgs = await getAllOrganizations();
+        let updated = 0;
+        for (const org of orgs) {
+            if (org.authMethod !== 'nextcloud_connector') continue;
+            if (org.name !== 'Nextcloud') continue;
+            if (!org.nc_base_url) continue;
+            const newName = buildAutoOrgName(org.name, org.nc_base_url);
+            if (newName === org.name) continue;
+            if (await updateOrganization(org.id, { name: newName })) updated++;
+        }
+        if (updated > 0) console.log(`[UserStore] Backfilled ${updated} auto-provisioned NC org name(s)`);
+    } catch (e) {
+        console.warn('[UserStore] backfillAutoProvisionedNcOrgNames failed:', e.message);
     }
 }
 
@@ -2960,7 +3037,7 @@ module.exports = {
     getBillingPeriod, logSubscriptionAudit, getAuditLog, getUnresolvedLicenseIssuanceFailures,
     logAccessAudit, getAccessAuditLog, claimNotification,
     markTrialUsed, hasOrgUsedTrial, hasUserUsedTrial,
-    hasEmailUsedTrial, recordTrialHistory, backfillTrialHistory,
+    hasEmailUsedTrial, recordTrialHistory, backfillTrialHistory, backfillAutoProvisionedNcOrgNames,
     recordStripeEventProcessed,
     recordPaymentFailureForOrg, recordPaymentFailureForConsumer,
     resetPaymentFailureForOrg, resetPaymentFailureForConsumer,

@@ -14,6 +14,7 @@ const express = require('express');
 const stripeService = require('../services/stripeService');
 const userStore = require('../stores/userStore');
 const { perUserRateLimit } = require('../utils/perUserRateLimit');
+const { resolveUserOrgIds } = require('../auth/permissions');
 
 const router = express.Router();
 
@@ -37,6 +38,26 @@ const stripeIpLimiter = perUserRateLimit({
 function requireAuth(req, res, next) {
     if (!req.session?.isAuthenticated) return res.status(401).json({ error: 'Not authenticated' });
     next();
+}
+
+// Robustly resolve the caller's organization id. The session user object
+// doesn't always carry `organizationId`/`orgId` (membership can come via
+// groups), so fall back to the shared RBAC resolver and finally a DB lookup.
+// Without this, an org admin whose session lacks organizationId was wrongly
+// treated as a consumer and blocked from subscribing to org plans.
+async function resolveOrgIdForUser(req) {
+    const user = req.session?.user || {};
+    let orgId = user.organizationId || user.orgId || null;
+    if (!orgId) {
+        try {
+            const orgIds = await resolveUserOrgIds(req); // null = super-admin
+            if (orgIds && orgIds.size > 0) orgId = Array.from(orgIds)[0];
+        } catch (_) { /* fall through */ }
+    }
+    if (!orgId && user.id) {
+        try { const full = await userStore.getUser(user.id); orgId = full?.organizationId || null; } catch (_) { /* ignore */ }
+    }
+    return orgId;
 }
 
 // Stripe-backed flows are cloud-only — self-hosted customers pay via license
@@ -117,12 +138,46 @@ router.post('/checkout', requireCloud, stripeIpLimiter, requireAuth, stripeUserL
         if (!planId) return res.status(400).json({ error: 'planId is required' });
 
         const user = req.session.user;
-        const orgId = user?.organizationId || user?.orgId;
+        const orgId = await resolveOrgIdForUser(req);
         const isConsumer = !!user?.isConsumerAccount || !orgId;
 
         // Get the plan
-        const plan = await userStore.getPlan(planId);
+        let plan = await userStore.getPlan(planId);
         if (!plan) return res.status(404).json({ error: 'Plan not found' });
+
+        // Ensure the plan is linked to a Stripe Price. Marking a plan "public"
+        // does NOT sync it to Stripe, and a plan synced under a previous Stripe
+        // account has no valid price under the current keys — so create/refresh
+        // the price on demand instead of dead-ending the customer on a 400.
+        const ensurePlanPrice = async (p) => {
+            const isPayg = p.billing_model === 'metered';
+            const result = isPayg
+                ? await stripeService.syncPaygPlanToStripe(p)
+                : await stripeService.syncPlanToStripe(p);
+            const updates = { stripe_product_id: result.productId, stripe_price_id: result.priceId };
+            if (isPayg) { updates.stripe_meter_id = result.meterId; updates.stripe_meter_event_name = result.meterEventName; }
+            await userStore.updatePlan(p.id, updates);
+            return userStore.getPlan(p.id);
+        };
+        // Wrap session creation so a stale/cross-account price id (Stripe
+        // "resource_missing") triggers one re-sync + retry rather than a 500.
+        const createWithResync = async (args) => {
+            try {
+                return await stripeService.createCheckoutSession(args);
+            } catch (e) {
+                if (e?.code === 'resource_missing' || /no such (price|product)/i.test(e?.message || '')) {
+                    console.warn('[Stripe] checkout price stale — re-syncing plan and retrying:', e.message);
+                    plan = await ensurePlanPrice(plan);
+                    return stripeService.createCheckoutSession({ ...args, plan });
+                }
+                throw e;
+            }
+        };
+
+        if (!plan.stripe_price_id && (plan.billing_model === 'metered' || (plan.price && plan.price > 0))) {
+            try { plan = await ensurePlanPrice(plan); }
+            catch (e) { console.error('[Stripe] checkout auto-sync failed:', e.message); }
+        }
         if (!plan.stripe_price_id) {
             return res.status(400).json({ error: 'This plan has not been configured for payment yet. Contact your administrator.' });
         }
@@ -177,7 +232,7 @@ router.post('/checkout', requireCloud, stripeIpLimiter, requireAuth, stripeUserL
             const successUrl = customSuccessUrl || `${origin}/app/settings?tab=consumer_license&checkout=success&session_id={CHECKOUT_SESSION_ID}`;
             const cancelUrl = `${origin}/app/settings?tab=consumer_license&checkout=cancelled`;
 
-            const session = await stripeService.createCheckoutSession({
+            const session = await createWithResync({
                 plan,
                 orgId: null,
                 orgName: null,
@@ -201,7 +256,7 @@ router.post('/checkout', requireCloud, stripeIpLimiter, requireAuth, stripeUserL
             const orgs = await userStore.getAllOrganizations();
             const org = orgs.find(o => o.id === orgId);
 
-            const session = await stripeService.createCheckoutSession({
+            const session = await createWithResync({
                 plan,
                 orgId,
                 orgName: org?.name || 'Organization',
@@ -243,13 +298,36 @@ router.get('/sessions/:id', requireCloud, requireAuth, async (req, res) => {
         // Authorize: the session must belong to the caller (same org or
         // same consumer user). Leak guard for shared sessions.
         const callerId = req.session.user?.id;
-        const callerOrgId = req.session.user?.organizationId || req.session.user?.orgId;
+        const callerOrgId = await resolveOrgIdForUser(req);
         const sessOrg = session.metadata?.beeflow_org_id || null;
         const sessUser = session.metadata?.beeflow_user_id || null;
         const isAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
         if (!isAdmin) {
             if (sessOrg && sessOrg !== callerOrgId) return res.status(403).json({ error: 'Not your session' });
             if (sessUser && sessUser !== callerId) return res.status(403).json({ error: 'Not your session' });
+        }
+
+        // Webhook-independent reconcile. The checkout.session.completed webhook
+        // can be delayed or misconfigured, leaving a paying customer stuck on
+        // their old plan. When the session is complete but the local row hasn't
+        // caught up, apply it here so simply returning to the success page (the
+        // client polls this endpoint) finalises the subscription. Idempotent:
+        // skipped once the local row already references this Stripe sub.
+        try {
+            if (session.status === 'complete' && session.subscription) {
+                const subId = typeof session.subscription === 'string' ? session.subscription : session.subscription?.id || null;
+                const customerId = typeof session.customer === 'string' ? session.customer : session.customer?.id || null;
+                const normalized = { ...session, subscription: subId, customer: customerId };
+                if (sessOrg) {
+                    const local = await userStore.getOrgSubscription(sessOrg);
+                    if (subId && local?.stripe_subscription_id !== subId) await handleCheckoutCompleted(normalized);
+                } else if (sessUser) {
+                    const local = await userStore.getConsumerSubscription(sessUser);
+                    if (subId && local?.stripe_subscription_id !== subId) await handleCheckoutCompleted(normalized);
+                }
+            }
+        } catch (e) {
+            console.warn('[Stripe] session reconcile failed:', e.message);
         }
 
         // Echo back just what the UI needs to drive its polling state.
@@ -274,7 +352,7 @@ router.post('/portal', requireCloud, stripeIpLimiter, requireAuth, stripeUserLim
         if (!enabled) return res.status(400).json({ error: 'Stripe payments are not enabled' });
 
         const user = req.session.user;
-        const orgId = user?.organizationId || user?.orgId;
+        const orgId = await resolveOrgIdForUser(req);
         const isConsumer = !!user?.isConsumerAccount || !orgId;
 
         let stripeCustomerId;
@@ -722,6 +800,10 @@ async function handleSubscriptionUpdated(subscription) {
             await userStore.logSubscriptionAudit('webhook_metadata_mismatch', 'organization', orgId, 'stripe_webhook', null, { event: 'subscription.updated', sub_id: subscription.id, claimed: orgId, local_scope: check.localTarget.scope, local_id: check.localTarget.id });
             return;
         }
+        // Snapshot the local row before the write so we can detect a plan_id
+        // transition (e.g. a scheduled downgrade reaching its period boundary).
+        const priorSub = await userStore.getOrgSubscription(orgId).catch(() => null);
+        const priorPlanId = priorSub?.plan_id || null;
         const strippedUpdate = stripOverriddenFields(updateData);
         const result = await userStore.setOrgSubscriptionRespectingOverride(orgId, updateData, strippedUpdate);
         const applied = result.applied === 'stripped' ? strippedUpdate : updateData;
@@ -729,6 +811,21 @@ async function handleSubscriptionUpdated(subscription) {
         if (result.overrideActive) {
             console.log(`[Stripe Webhook] stripe.webhook.override_respected scope=org org=${orgId} stripe_status=${subscription.status}`);
             await userStore.logSubscriptionAudit('manual_override_respected', 'organization', orgId, 'stripe_webhook', null, { stripe_status: subscription.status });
+        }
+        // When the active plan actually changes (deferred downgrade landed, or a
+        // Customer-Portal-initiated switch), re-apply the new plan's entitlements
+        // and clear any pending-downgrade bookkeeping. Skipped while a manual
+        // override holds, since plan_id wasn't written in that case.
+        if (!result.overrideActive && applied.plan_id && applied.plan_id !== priorPlanId) {
+            try {
+                await require('../services/planEntitlements').applyPlanToOrg(orgId, applied.plan_id, { mode: 'reset' });
+            } catch (e) {
+                console.warn('[Stripe Webhook] applyPlanToOrg (plan change) failed:', e.message);
+            }
+            await userStore.logSubscriptionAudit('plan_changed_via_stripe', 'organization', orgId, 'stripe_webhook', { plan_id: priorPlanId }, { plan_id: applied.plan_id });
+        }
+        if (priorSub?.pending_plan_id && applied.plan_id === priorSub.pending_plan_id) {
+            await userStore.setOrgSubscription(orgId, { pending_plan_id: null, pending_plan_effective: null, stripe_schedule_id: null });
         }
         if (planUnmatched) {
             console.warn(`[Stripe Webhook] stripe.plan.unmatched scope=org org=${orgId} price_id=${priceId} sub_id=${subscription.id}`);

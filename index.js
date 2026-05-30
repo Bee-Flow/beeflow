@@ -622,6 +622,15 @@ app.listen(PORT, '0.0.0.0', () => {
             console.warn('[Server] trial_history backfill error:', e.message));
     });
 
+    // NC org-name backfill — idempotent one-shot that renames connector-
+    // provisioned orgs still on the generic "Nextcloud" default to
+    // "Nextcloud (<host>)" so they're distinguishable in the admin list.
+    // After a row is renamed it no longer matches, so re-runs are no-ops.
+    setImmediate(() => {
+        require('./stores/userStore').backfillAutoProvisionedNcOrgNames().catch(e =>
+            console.warn('[Server] nc org-name backfill error:', e.message));
+    });
+
     // Dunning + trial-expiry schedulers. The dunning tick scans for orgs
     // that have been past_due longer than STRIPE_DUNNING_GRACE_DAYS and
     // flips them to suspended. The trial tick suspends trials whose

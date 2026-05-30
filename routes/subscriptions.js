@@ -473,16 +473,60 @@ router.get('/orgs/:orgId', async (req, res) => {
             console.warn('[Subscriptions] upgradeable_plans compute failed:', e.message);
         }
 
+        // Changeable plans: both directions (upgrade + downgrade), same scope +
+        // interval, with a Stripe price and a non-zero price (downgrade-to-free
+        // is "cancel", not a plan change). Each is tagged with its direction so
+        // the in-app Change-plan picker can label and confirm appropriately.
+        let changeable_plans = [];
+        try {
+            const allPlans = await userStore.getAllPlans();
+            changeable_plans = (allPlans || [])
+                .filter(p => p.is_active !== false
+                    && p.stripe_price_id
+                    && Number(p.price) > 0
+                    && p.id !== plan?.id
+                    && (p.plan_type || 'organization') === (plan?.plan_type || 'organization')
+                    && p.billing_interval === plan?.billing_interval
+                    && Number(p.price) !== planPrice)
+                .sort((a, b) => Number(a.price) - Number(b.price))
+                .map(p => ({
+                    id: p.id,
+                    name: p.name,
+                    description: p.description,
+                    price: p.price,
+                    currency: p.currency || 'eur',
+                    billing_interval: p.billing_interval,
+                    max_users: p.max_users,
+                    max_agents: p.max_agents,
+                    max_knowledge_sources: p.max_knowledge_sources,
+                    per_seat: !!p.per_seat,
+                    has_stripe_price: !!p.stripe_price_id,
+                    direction: Number(p.price) > planPrice ? 'upgrade' : 'downgrade',
+                }));
+        } catch (e) {
+            console.warn('[Subscriptions] changeable_plans compute failed:', e.message);
+        }
+
+        // Resolve the friendly name of a pending (scheduled) downgrade target.
+        let pending_plan_name = null;
+        if (sub.pending_plan_id) {
+            try { pending_plan_name = (await userStore.getPlan(sub.pending_plan_id))?.name || null; } catch (_) { /* ignore */ }
+        }
+
         res.json({
             ...sub,
             cancel_at_period_end: !!sub.cancel_at_period_end,
             cancel_at: sub.cancel_at || null,
             current_period_end: sub.current_period_end || null,
+            pending_plan_id: sub.pending_plan_id || null,
+            pending_plan_effective: sub.pending_plan_effective || null,
+            pending_plan_name,
             effective_limits: effective,
             billing_period: period,
             billing,
             current_usage: currentUsage,
             upgradeable_plans,
+            changeable_plans,
         });
     } catch (e) {
         console.error('[Subscriptions] getOrgSub error:', e);
@@ -676,9 +720,10 @@ router.post('/consumer/:userId/reissue-license', async (req, res) => {
 const lifecycleErrorMessages = {
     same_plan: 'You are already on this plan.',
     no_price_change: 'The selected plan has the same price as your current plan.',
-    downgrade_not_supported: 'Downgrades are not supported. Contact info@beeflow.nl to discuss your options.',
-    interval_mismatch: 'Switching between monthly and yearly billing is not available via Upgrade. Contact info@beeflow.nl.',
+    interval_mismatch: 'Switching between monthly and yearly billing is not available here. Contact info@beeflow.nl.',
     wrong_plan_type: 'This plan does not match your account type.',
+    'Subscription is not Stripe-managed': 'This subscription has no active payment yet. Choose a paid plan below to subscribe.',
+    'Plan not configured for payment': 'That plan is not available for self-service billing yet.',
 };
 
 // Translate Stripe payment errors that surface during a synchronous
@@ -693,7 +738,13 @@ function stripePaymentErrorStatus(err) {
     return null;
 }
 
-async function performOrgUpgrade(orgId, planId, adminId) {
+// Generalised in-app plan change. Upgrades (higher price) apply immediately
+// with a prorated charge; downgrades (lower price) are scheduled to take
+// effect at the end of the current billing period via a Stripe Subscription
+// Schedule — no mid-cycle credit. Entitlements for a scheduled downgrade are
+// (deliberately) NOT applied now: the customer.subscription.updated webhook
+// applies them when the new price actually becomes active at the boundary.
+async function performOrgPlanChange(orgId, planId, adminId) {
     const stripeService = require('../services/stripeService');
     const sub = await userStore.getOrgSubscription(orgId);
     if (!sub) { const e = new Error('No subscription found'); e.status = 404; throw e; }
@@ -707,70 +758,166 @@ async function performOrgUpgrade(orgId, planId, adminId) {
     if (newPlan.id === currentPlan.id) { const e = new Error('same_plan'); e.status = 400; throw e; }
     const newPrice = Number(newPlan.price) || 0;
     const curPrice = Number(currentPlan.price) || 0;
-    if (newPrice < curPrice) { const e = new Error('downgrade_not_supported'); e.status = 400; throw e; }
     if (newPrice === curPrice) { const e = new Error('no_price_change'); e.status = 400; throw e; }
     if (newPlan.billing_interval !== currentPlan.billing_interval) { const e = new Error('interval_mismatch'); e.status = 400; throw e; }
     if ((newPlan.plan_type || 'organization') !== (currentPlan.plan_type || 'organization')) { const e = new Error('wrong_plan_type'); e.status = 400; throw e; }
 
     const quantity = newPlan.per_seat ? Math.max(1, await userStore.getActiveSeatCount(orgId)) : 1;
-    let stripeSub;
-    try {
-        stripeSub = await stripeService.updateSubscriptionPlan({
-            stripeSubscriptionId: sub.stripe_subscription_id,
-            newPriceId: newPlan.stripe_price_id,
-            quantity,
-        });
-    } catch (e) {
-        const status = stripePaymentErrorStatus(e);
-        if (status === 402) {
-            await userStore.logSubscriptionAudit(
-                'upgrade_subscription_payment_failed', 'organization', orgId, adminId,
-                { plan_id: currentPlan.id },
-                { plan_id: newPlan.id, stripe_subscription_id: sub.stripe_subscription_id, error: String(e.message || e).slice(0, 500) }
-            );
-            const err = new Error('payment_required'); err.status = 402; throw err;
+    const isUpgrade = newPrice > curPrice;
+
+    if (isUpgrade) {
+        // Re-upgrading cancels any pending downgrade cleanly before switching.
+        if (sub.stripe_schedule_id) {
+            await stripeService.releaseSubscriptionSchedule(sub.stripe_schedule_id);
         }
-        throw e;
+        let stripeSub;
+        try {
+            stripeSub = await stripeService.updateSubscriptionPlan({
+                stripeSubscriptionId: sub.stripe_subscription_id,
+                newPriceId: newPlan.stripe_price_id,
+                quantity,
+            });
+        } catch (e) {
+            const status = stripePaymentErrorStatus(e);
+            if (status === 402) {
+                await userStore.logSubscriptionAudit(
+                    'upgrade_subscription_payment_failed', 'organization', orgId, adminId,
+                    { plan_id: currentPlan.id },
+                    { plan_id: newPlan.id, stripe_subscription_id: sub.stripe_subscription_id, error: String(e.message || e).slice(0, 500) }
+                );
+                const err = new Error('payment_required'); err.status = 402; throw err;
+            }
+            throw e;
+        }
+
+        // Optimistic local mirror — the customer.subscription.updated webhook
+        // will re-confirm shortly. Clear any pending-downgrade bookkeeping.
+        await userStore.setOrgSubscription(orgId, {
+            plan_id: newPlan.id,
+            status: 'active',
+            payment_status: 'paid',
+            stripe_seat_quantity: quantity,
+            pending_plan_id: null,
+            pending_plan_effective: null,
+            stripe_schedule_id: null,
+            ...(stripeSub.current_period_end
+                ? { current_period_end: new Date(stripeSub.current_period_end * 1000).toISOString() }
+                : {}),
+        });
+
+        try {
+            await require('../services/planEntitlements').applyPlanToOrg(orgId, newPlan.id, { mode: 'reset' });
+        } catch (e) {
+            console.warn('[Subscriptions] applyPlanToOrg (upgrade) failed:', e.message);
+        }
+
+        await userStore.logSubscriptionAudit(
+            'upgrade_subscription', 'organization', orgId, adminId,
+            { plan_id: currentPlan.id },
+            { plan_id: newPlan.id, stripe_subscription_id: sub.stripe_subscription_id, quantity }
+        );
+
+        return userStore.getOrgSubscription(orgId);
     }
 
-    // Optimistic local mirror — the customer.subscription.updated webhook will
-    // re-confirm shortly. Don't strip current_period_end on undefined values.
-    await userStore.setOrgSubscription(orgId, {
-        plan_id: newPlan.id,
-        status: 'active',
-        payment_status: 'paid',
-        stripe_seat_quantity: quantity,
-        ...(stripeSub.current_period_end
-            ? { current_period_end: new Date(stripeSub.current_period_end * 1000).toISOString() }
-            : {}),
+    // DOWNGRADE → schedule the switch at period end.
+    const result = await stripeService.scheduleDowngradeAtPeriodEnd({
+        stripeSubscriptionId: sub.stripe_subscription_id,
+        newPriceId: newPlan.stripe_price_id,
+        quantity,
     });
-
-    try {
-        await require('../services/planEntitlements').applyPlanToOrg(orgId, newPlan.id, { mode: 'reset' });
-    } catch (e) {
-        console.warn('[Subscriptions] applyPlanToOrg (upgrade) failed:', e.message);
-    }
-
+    await userStore.setOrgSubscription(orgId, {
+        pending_plan_id: newPlan.id,
+        pending_plan_effective: result.effective,
+        stripe_schedule_id: result.scheduleId,
+    });
     await userStore.logSubscriptionAudit(
-        'upgrade_subscription', 'organization', orgId, adminId,
+        'downgrade_scheduled', 'organization', orgId, adminId,
         { plan_id: currentPlan.id },
-        { plan_id: newPlan.id, stripe_subscription_id: sub.stripe_subscription_id, quantity }
+        { pending_plan_id: newPlan.id, effective: result.effective, schedule_id: result.scheduleId, quantity }
     );
-
     return userStore.getOrgSubscription(orgId);
 }
 
+// Upgrade OR downgrade — the route name stays /upgrade for back-compat but
+// the handler picks the right behaviour from the price delta.
 router.post('/orgs/:orgId/upgrade', async (req, res) => {
     try {
         const { planId } = req.body || {};
         if (!planId) return res.status(400).json({ error: 'planId is required' });
-        const result = await performOrgUpgrade(req.params.orgId, planId, getAdminId(req));
+        const result = await performOrgPlanChange(req.params.orgId, planId, getAdminId(req));
         res.json(result);
     } catch (e) {
         const status = e.status || 500;
         if (status === 500) console.error('[Subscriptions] orgs/:orgId/upgrade error:', e);
         const msg = lifecycleErrorMessages[e.message] || e.message;
         res.status(status).json({ error: e.message, message: msg });
+    }
+});
+
+// Preview the cost impact of a plan change before the customer confirms.
+// Upgrades return the prorated charge that will hit today; downgrades return
+// the new recurring total and the date it takes effect (no charge now).
+router.post('/orgs/:orgId/preview-change', async (req, res) => {
+    try {
+        const stripeService = require('../services/stripeService');
+        const { planId } = req.body || {};
+        if (!planId) return res.status(400).json({ error: 'planId is required' });
+        const orgId = req.params.orgId;
+        const sub = await userStore.getOrgSubscription(orgId);
+        if (!sub) return res.status(404).json({ error: 'No subscription found' });
+        if (!sub.stripe_subscription_id) return res.status(404).json({ error: 'Subscription is not Stripe-managed' });
+        const newPlan = await userStore.getPlan(planId);
+        if (!newPlan || !newPlan.stripe_price_id) return res.status(400).json({ error: 'Plan not configured for payment' });
+        const currentPlan = sub.plan_id ? await userStore.getPlan(sub.plan_id) : null;
+        const newPrice = Number(newPlan.price) || 0;
+        const curPrice = Number(currentPlan?.price) || 0;
+        const quantity = newPlan.per_seat ? Math.max(1, await userStore.getActiveSeatCount(orgId)) : 1;
+        const direction = newPrice > curPrice ? 'upgrade' : 'downgrade';
+        const nextRenewalTotal = newPrice * quantity;
+        const common = {
+            direction,
+            currency: (newPlan.currency || 'EUR').toUpperCase(),
+            plan_name: newPlan.name,
+            per_seat: !!newPlan.per_seat,
+            seat_quantity: quantity,
+            next_renewal_total: nextRenewalTotal,
+        };
+        if (direction === 'upgrade') {
+            const preview = await stripeService.previewPlanChange({
+                stripeSubscriptionId: sub.stripe_subscription_id,
+                newPriceId: newPlan.stripe_price_id,
+                quantity,
+            });
+            return res.json({ ...common, currency: preview.currency || common.currency, proration_amount: preview.proration_amount, effective: 'now' });
+        }
+        return res.json({ ...common, proration_amount: 0, effective: sub.current_period_end || null });
+    } catch (e) {
+        const status = stripePaymentErrorStatus(e) || 500;
+        if (status === 500) console.error('[Subscriptions] orgs/:orgId/preview-change error:', e);
+        res.status(status).json({ error: e.message });
+    }
+});
+
+// Undo a scheduled (end-of-period) downgrade — releases the Stripe schedule
+// and clears the local pending bookkeeping so the org stays on its plan.
+router.post('/orgs/:orgId/cancel-downgrade', async (req, res) => {
+    try {
+        const stripeService = require('../services/stripeService');
+        const orgId = req.params.orgId;
+        const sub = await userStore.getOrgSubscription(orgId);
+        if (!sub) return res.status(404).json({ error: 'No subscription found' });
+        if (!sub.pending_plan_id) return res.status(409).json({ error: 'no_pending_change', message: 'No scheduled change to cancel.' });
+        if (sub.stripe_schedule_id) await stripeService.releaseSubscriptionSchedule(sub.stripe_schedule_id);
+        await userStore.setOrgSubscription(orgId, { pending_plan_id: null, pending_plan_effective: null, stripe_schedule_id: null });
+        await userStore.logSubscriptionAudit(
+            'downgrade_cancelled', 'organization', orgId, getAdminId(req),
+            { pending_plan_id: sub.pending_plan_id }, null
+        );
+        res.json(await userStore.getOrgSubscription(orgId));
+    } catch (e) {
+        console.error('[Subscriptions] orgs/:orgId/cancel-downgrade error:', e);
+        res.status(500).json({ error: e.message });
     }
 });
 
@@ -782,6 +929,13 @@ router.post('/orgs/:orgId/cancel', async (req, res) => {
         if (!sub) return res.status(404).json({ error: 'No subscription found' });
         if (!sub.stripe_subscription_id) return res.status(404).json({ error: 'Subscription is not Stripe-managed' });
         if (sub.cancel_at_period_end) return res.status(409).json({ error: 'already_scheduled', message: 'Cancellation already scheduled.' });
+
+        // A pending downgrade schedule must be released first, otherwise Stripe
+        // refuses to cancel a schedule-governed subscription.
+        if (sub.stripe_schedule_id) {
+            await stripeService.releaseSubscriptionSchedule(sub.stripe_schedule_id);
+            await userStore.setOrgSubscription(orgId, { pending_plan_id: null, pending_plan_effective: null, stripe_schedule_id: null });
+        }
 
         const stripeSub = await stripeService.cancelSubscriptionAtPeriodEnd(sub.stripe_subscription_id);
         await userStore.setOrgSubscription(orgId, {

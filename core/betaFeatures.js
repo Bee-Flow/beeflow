@@ -75,6 +75,17 @@ function _licenseModule() {
  * `orgHasBetaFeature`.
  */
 async function _scopeAllowsBeta({ userId = null, organizationId = null, tierHint = null } = {}) {
+    // On a cloud deployment there is no server-wide licence to reference and
+    // no enterprise tier floor: beta access is decided entirely by the org's
+    // SUBSCRIPTION (getEffectiveOrgBetaAllowList) + the org-admin enabled
+    // subset. Only self-hosted / private-cloud installs (where a server-wide
+    // licence governs every org) apply the tier floor below.
+    try {
+        const lic = _licenseModule();
+        if (!lic.serverLicenseGovernsOrgs || !lic.serverLicenseGovernsOrgs()) {
+            return true;
+        }
+    } catch (_) { /* fall through to the tier check */ }
     if (tierHint) {
         return _licenseModule().tiers.tierAtLeast(tierHint, BETA_TIER_FLOOR);
     }
@@ -203,6 +214,52 @@ async function setOrgBetaFeatures(orgId, features) {
 }
 
 /**
+ * Resolve the effective beta-feature ALLOW-LIST for an organisation.
+ *
+ * This is the "what is this org entitled to" question, and the answer depends
+ * on the deployment model:
+ *
+ *   - self-hosted / private-cloud (server licence governs): the admin-managed
+ *     per-org grant in `organizations.beta_features` is authoritative.
+ *   - cloud: the org's SUBSCRIPTION leads. The plan's `allowed_beta_features`
+ *     is the source of truth — `null` grants every beta in the registry, an
+ *     array restricts to those ids. This deliberately leads over whatever the
+ *     admin Security→Beta panel wrote, so the subscription is what customers
+ *     actually get. Falls back to the admin grant only when the org has no
+ *     resolvable subscription/plan.
+ *
+ * The org-admin "enabled" subset (`org_enabled_beta_features`) is still
+ * intersected on top by callers — this function answers allow-list only.
+ */
+async function getEffectiveOrgBetaAllowList(orgId) {
+    if (!orgId) return [];
+    let serverGoverns = false;
+    try {
+        const lic = _licenseModule();
+        serverGoverns = !!(lic.serverLicenseGovernsOrgs && lic.serverLicenseGovernsOrgs());
+    } catch (_) { /* default cloud */ }
+
+    if (serverGoverns) {
+        return getOrgBetaFeatures(orgId);
+    }
+
+    try {
+        const userStore = require('../stores/userStore');
+        const sub = await userStore.getOrgSubscription(orgId);
+        const plan = sub?.plan_id ? await userStore.getPlan(sub.plan_id) : null;
+        if (plan) {
+            const allowed = plan.allowed_beta_features; // null = unrestricted
+            if (allowed == null) return BETA_FEATURES.map(f => f.id);
+            return Array.isArray(allowed) ? allowed.slice() : [];
+        }
+    } catch (e) {
+        console.warn('[BetaFeatures] effective allow-list (subscription) lookup failed:', e.message);
+    }
+    // No subscription/plan → fall back to the admin-managed grant.
+    return getOrgBetaFeatures(orgId);
+}
+
+/**
  * Resolve the full set of beta features available to a user.
  * Super admins get ALL features.
  *
@@ -299,7 +356,7 @@ async function getUserBetaFeatures(userId, session = null, { tierHint = null } =
     try {
         const userStore = require('../stores/userStore');
         for (const orgId of orgIds) {
-            const allowed = await getOrgBetaFeatures(orgId);
+            const allowed = await getEffectiveOrgBetaAllowList(orgId);
             const active = await userStore.getOrgEnabledBetaFeatures(orgId);
             const activeSet = new Set(active);
             const allowedSet = new Set(allowed);
@@ -367,7 +424,7 @@ async function orgHasBetaFeature(orgId, featureId, { tierHint = null } = {}) {
         const gaSet = new Set(
             BETA_FEATURES.filter(f => f.lifecycle === BetaLifecycle.GA).map(f => f.id)
         );
-        const allowed = new Set(await getOrgBetaFeatures(orgId));
+        const allowed = new Set(await getEffectiveOrgBetaAllowList(orgId));
         const userStore = require('../stores/userStore');
         let active = [];
         try { active = await userStore.getOrgEnabledBetaFeatures(orgId); }
@@ -453,6 +510,7 @@ module.exports = {
     getFeatureLifecycle,
     getOrgBetaFeatures,
     setOrgBetaFeatures,
+    getEffectiveOrgBetaAllowList,
     getUserBetaFeatures,
     userHasBetaFeature,
     orgHasBetaFeature,

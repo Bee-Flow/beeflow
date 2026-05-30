@@ -23,6 +23,10 @@ async function _notifySkillSync(orgId, skillId, action = 'pending') {
         } else {
             await syncStore.markPending(orgId, 'skill', skillId);
         }
+        // When auto-sync is enabled, push the change to GitHub (debounced).
+        if (config.autoSync === true) {
+            require('../services/githubSyncService').autoSyncResource(orgId, 'skill', skillId, action);
+        }
     } catch (e) { /* non-fatal */ }
 }
 

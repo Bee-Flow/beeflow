@@ -166,7 +166,7 @@ function serializeStarterPrompts(agent) {
 
 function serializeSkillMeta(skill) {
     return JSON.stringify({
-        id: skill.id || skill.id,
+        id: skill.id,
         name: skill.name,
         description: skill.description || '',
         icon: skill.icon || '⚡',
@@ -231,7 +231,7 @@ async function syncSkill(skill, token, owner, repo, branch, orgId) {
     const basePath = `skills/${skill.id}`;
     const files = {
         [`${basePath}/skill.json`]: serializeSkillMeta(skill),
-        [`${basePath}/instructions.md`]: skill.instructions || skill.instructions || '',
+        [`${basePath}/instructions.md`]: skill.instructions || '',
         [`${basePath}/rules.md`]: skill.rules || '',
         [`${basePath}/examples.md`]: skill.examples || '',
         [`${basePath}/workflow.md`]: skill.workflow || '',
@@ -453,11 +453,91 @@ async function syncPending(orgId, userId) {
     return { pushed, errors, total: pending.length };
 }
 
+// ── Auto-sync (push on change) ───────────────────────────────────
+
+// Debounce timers keyed by `${orgId}:${type}:${id}` so a burst of edits to the
+// same resource coalesces into a single push instead of one commit per save.
+const _autoSyncTimers = new Map();
+const AUTO_SYNC_DEBOUNCE_MS = 4000;
+
+/**
+ * Push a single resource for one org, using the configured user's token.
+ * Used by the auto-sync debounce; all failures are non-fatal (the resource
+ * stays marked pending/error for a later manual push).
+ */
+async function _pushSingleResource(orgId, resourceType, resourceId, action) {
+    const config = await githubSyncStore.getOrgSyncConfig(orgId);
+    if (!config || config.autoSync !== true) return;
+    if (!config.configuredBy) return; // no token owner to push as
+
+    let token;
+    try {
+        token = await getToken(config.configuredBy);
+    } catch {
+        return; // GitHub not connected for the configuring user — keep pending
+    }
+
+    const { repoOwner, repoName, branch } = config;
+
+    if (action === 'deleted') {
+        if (resourceType === 'agent') {
+            await deleteAgentFromGitHub(resourceId, null, token, repoOwner, repoName, branch, orgId);
+        } else {
+            const basePath = `skills/${resourceId}`;
+            for (const f of ['skill.json', 'instructions.md', 'rules.md', 'examples.md', 'workflow.md']) {
+                try { await deleteFile(token, repoOwner, repoName, `${basePath}/${f}`, `Delete skill`, branch); } catch { /* ok */ }
+            }
+            await githubSyncStore.removeSyncState(orgId, 'skill', resourceId);
+        }
+        return;
+    }
+
+    if (resourceType === 'agent') {
+        const agentCrud = require('../stores/agent/agentCrud');
+        const agentTools = require('../stores/agent/agentTools');
+        const agent = await agentCrud.getAgent(resourceId);
+        if (!agent) { await githubSyncStore.removeSyncState(orgId, 'agent', resourceId); return; }
+
+        const tools = await agentTools.getAgentTools(agent.id);
+        const toolsWithParams = await agentTools.getAgentToolsWithParams(agent.id);
+        const toolParams = {};
+        for (const t of toolsWithParams) {
+            if (t.params) toolParams[t.componentId] = t.params;
+        }
+        await syncAgent(agent, tools, toolParams, token, repoOwner, repoName, branch, orgId);
+    } else if (resourceType === 'skill') {
+        const { getAll: dbGetAll } = require('../db');
+        const rows = await dbGetAll('SELECT * FROM skills WHERE id = $1', [resourceId]);
+        if (rows.length === 0) { await githubSyncStore.removeSyncState(orgId, 'skill', resourceId); return; }
+        await syncSkill(rows[0], token, repoOwner, repoName, branch, orgId);
+    }
+}
+
+/**
+ * Schedule a debounced auto-sync push for a single resource. Fire-and-forget:
+ * callers (agent/skill CRUD hooks) should already have marked the resource
+ * pending/deleted, so a failed push simply leaves it queued for manual sync.
+ */
+function autoSyncResource(orgId, resourceType, resourceId, action = 'pending') {
+    if (!orgId || !resourceId) return;
+    const key = `${orgId}:${resourceType}:${resourceId}`;
+    const existing = _autoSyncTimers.get(key);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+        _autoSyncTimers.delete(key);
+        _pushSingleResource(orgId, resourceType, resourceId, action)
+            .catch(err => console.warn(`[GitHubSync] Auto-sync failed for ${resourceType}/${resourceId}:`, err.message));
+    }, AUTO_SYNC_DEBOUNCE_MS);
+    if (typeof timer.unref === 'function') timer.unref();
+    _autoSyncTimers.set(key, timer);
+}
+
 module.exports = {
     syncAll,
     syncPending,
     syncAgent,
     syncSkill,
     deleteAgentFromGitHub,
+    autoSyncResource,
     getToken,
 };
