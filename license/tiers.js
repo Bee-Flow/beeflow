@@ -13,8 +13,14 @@
  * Default state for a fresh, unactivated install is `community` — the system
  * must remain usable with no license key present. Community ships the free
  * self-hosted core: chat with agents, knowledge bases (local, vector, hybrid,
- * reranked), Nextcloud connector, multi-user with groups, and the skills
- * marketplace. Enterprise layers Studio-class capabilities (voice chat,
+ * reranked), the Nextcloud connector (including logging into Bee Flow from the
+ * Nextcloud App Store app via `nextcloud_oauth`), multi-user with groups, the
+ * skills marketplace, ALL built-in integrations (`integrations` — Google,
+ * Microsoft, AI generation, third-party connectors, the Nextcloud module
+ * family) and the MCP server marketplace (`mcp_marketplace`). Enterprise does
+ * NOT add integrations — it adds the orchestration layer on top (no-code
+ * automation builder, scheduled agent routines) and the rest of the
+ * Studio-class capabilities (voice chat,
  * webpages, automations, agent routines, meeting notes, ticket assistant,
  * notebooks, component designer, projects) on top, plus the advanced
  * Privacy Shield modes (tokenize PII, web-search guard), the non-overview
@@ -73,6 +79,17 @@ const TIER_FEATURES = {
         'single_user_login',
         'multi_user',
         'skills',
+        // Built-in integrations + MCP are part of the free Community core.
+        // These are declarative capability MARKERS (they surface in
+        // getLicenseStatus().features so the UI/docs can reference a real
+        // flag) — they are NOT route gates: integration tool usage in chat is
+        // ungated by design (server/core/integrationTools.js gates only on
+        // OAuth/credentials + org/user toggles, never on tier), and the MCP
+        // marketplace has no tier check. Keep them here so a future edit can't
+        // silently move integrations/MCP behind Enterprise without tripping
+        // the community feature tests.
+        'integrations',
+        'mcp_marketplace',
     ],
     enterprise: [
         // Studio-class features promoted from community in the tier

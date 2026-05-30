@@ -102,13 +102,30 @@ async function runGate(featureName, tier) {
     }
 
     // ── Community keeps the core: chat_basic / skills / kb_unlimited
-    //    / multi_user / nextcloud_basic must NOT fall behind the gate.
+    //    / multi_user / nextcloud_basic / nextcloud_oauth must NOT fall behind
+    //    the gate, and neither may the built-in integrations or the MCP
+    //    marketplace — `integrations` + `mcp_marketplace` are Community
+    //    capability markers, so requireFeature(...) must pass through on a
+    //    community session. This is the regression guard that pins
+    //    "Community keeps all integrations + MCP" and "NC App Store login
+    //    works on Community" (nextcloud_oauth).
     //    (agent_routines, projects, pii_tokenize, web_search_guard and
-    //    advanced_usage_monitoring were promoted in the second wave.)
-    for (const feature of ['chat_basic', 'skills', 'kb_unlimited', 'multi_user', 'nextcloud_basic']) {
+    //    advanced_usage_monitoring were promoted to Enterprise in earlier waves.)
+    for (const feature of ['chat_basic', 'skills', 'kb_unlimited', 'multi_user', 'nextcloud_basic', 'nextcloud_oauth', 'integrations', 'mcp_marketplace']) {
         const { res, calledNext } = await runGate(feature, 'community');
         assert.strictEqual(calledNext, true, `${feature}: community must keep this`);
         assert.strictEqual(res.statusCode, null, `${feature}: community core must not 403`);
+    }
+
+    // ── And the inverse: the Enterprise orchestration layer must STILL be
+    //    locked on community, so the markers above didn't accidentally widen
+    //    the gate. `automations` (no-code builder) + `agent_routines`
+    //    (scheduling) are the orchestration features that sit ABOVE plain
+    //    integration usage. They must 403.
+    for (const feature of ['automations', 'agent_routines']) {
+        const { res, calledNext } = await runGate(feature, 'community');
+        assert.strictEqual(calledNext, false, `${feature}: orchestration must stay Enterprise on community`);
+        assert.strictEqual(res.statusCode, 403, `${feature}: orchestration must 403 on community`);
     }
 
     // ── Server-licence version bump invalidates per-session cache ─────

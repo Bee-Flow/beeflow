@@ -60,6 +60,11 @@ assert.ok(community.includes('nextcloud_oauth'));
 assert.ok(community.includes('single_user_login'));
 assert.ok(community.includes('multi_user'), 'community must include multi_user');
 assert.ok(community.includes('skills'), 'community must include skills');
+// All built-in integrations + the MCP marketplace are part of the free
+// Community core (declarative markers — integration usage is ungated at
+// runtime). Guard against a future edit silently gating them behind Enterprise.
+assert.ok(community.includes('integrations'), 'community must include all built-in integrations');
+assert.ok(community.includes('mcp_marketplace'), 'community must include the MCP server marketplace');
 
 // Promoted to Enterprise — must NOT be in community.
 for (const f of [
@@ -153,6 +158,8 @@ assert.strictEqual(t.getLimitsForTier('community').max_agents, -1, 'getLimitsFor
 // ── tierHasFeature ──────────────────────────────────────────────────────
 assert.strictEqual(t.tierHasFeature('community', 'chat_basic'), true);
 assert.strictEqual(t.tierHasFeature('community', 'skills'), true);
+assert.strictEqual(t.tierHasFeature('community', 'integrations'), true, 'built-in integrations are community');
+assert.strictEqual(t.tierHasFeature('community', 'mcp_marketplace'), true, 'MCP marketplace is community');
 assert.strictEqual(t.tierHasFeature('community', 'agent_routines'), false, 'agent_routines is now enterprise');
 assert.strictEqual(t.tierHasFeature('community', 'automations'), false, 'automations is enterprise');
 assert.strictEqual(t.tierHasFeature('community', 'voice_chat'), false, 'voice_chat is enterprise');
