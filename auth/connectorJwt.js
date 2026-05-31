@@ -277,16 +277,22 @@ async function connectorJwtMiddleware(req, res, next) {
             if (!org) {
                 return res.status(403).json({ error: 'Connector tenant has no organization' });
             }
-            // Admin carve-out — the org's NC admin must ALWAYS be able to reach
+            // Admin carve-out — ANY Nextcloud admin must always be able to reach
             // the onboarding wizard and act, even before onboarding completes and
             // even if their Bee Flow user row was lost (e.g. an org delete/recreate
             // race) or their NC email changed since bootstrap. Without this they
             // fall into the NC_ONBOARDING_PENDING gate below and can never finish
-            // onboarding — a permanent 403 lockout for the whole org. Match on the
-            // stable nc_admin_uid (not email) and re-establish their org_admin row
-            // idempotently, then continue as that user.
+            // onboarding — a permanent 403 lockout for the whole org.
+            //
+            // Two trusted signals, both un-spoofable by a non-admin: (1) the
+            // tenant-key-signed `nc_admin` JWT claim, set by the connector from the
+            // user's real Nextcloud `admin`-group membership — this is what lets
+            // EVERY NC admin onboard, not just the one captured at bootstrap; and
+            // (2) an exact match on the org's recorded nc_admin_uid (the bootstrap
+            // admin) as a fallback for connectors that predate the claim. Either
+            // way we re-establish their org_admin row idempotently and continue.
             const reqNcUid = String(req.headers['x-beeflow-nc-uid'] || payload.sub || '').trim();
-            if (_isOrgAdminRequester(org, reqNcUid)) {
+            if (payload.nc_admin === true || _isOrgAdminRequester(org, reqNcUid)) {
                 try {
                     const { ensureOrgAdminUser } = require('./connectorBootstrap').helpers;
                     const adminUser = await ensureOrgAdminUser(org, {
