@@ -95,16 +95,34 @@ const TIER_FEATURES = {
         // OAuth login stays Community via `nextcloud_oauth`; Google/Microsoft/
         // SAML SSO are Enterprise via `sso_saml`.
         'integrations',
+        // n8n-style free builder: the Automation builder + Agent Routines run
+        // for free in Community, exactly how n8n Community Edition ships the
+        // workflow builder gratis. Building is free; *collaborating* is paid —
+        // org-wide automation sharing (`automation_sharing`) and team workspaces
+        // (`projects`) stay Enterprise (see the enterprise array below).
+        // Automations/routines are owner-private on every tier today (no
+        // is_published/shared_groups on the automations/ai_tasks tables), so
+        // shipping these to Community exposes no cross-user surface.
+        // These are also GA beta features (core/betaFeatures.js) that are
+        // Community-exempt from BETA_TIER_FLOOR; the two gates move together.
+        'automations',
+        'agent_routines',
     ],
     enterprise: [
         // Studio-class features promoted from community in the tier
         // tightening — see docs/docs/licensing/tiers.md. Beta features
         // (entire BETA_FEATURES registry) also gate behind enterprise via
         // core/betaFeatures.js _scopeAllowsBeta.
+        //
+        // NOTE: `automations` + `agent_routines` are NOT here — they moved to
+        // the Community core above (n8n-style free builder). What stays
+        // Enterprise is the *collaboration* layer on top: `automation_sharing`
+        // (org-wide sharing of automations/routines — a reserve boundary; no
+        // route consumes it yet) and `projects` (team workspaces — Bee Flow's
+        // n8n-"Projects" equivalent).
+        'automation_sharing',
         'voice_chat',
         'webpages',
-        'automations',
-        'agent_routines',
         'meeting_notes',
         'ticket_assistant',
         'component_designer',

@@ -115,8 +115,14 @@ const BETA_FEATURES = [
     { id: 'swarm', name: 'Swarm Agents', description: 'Multi-agent swarms (Deep Research, etc.) that run specialised AI workers in parallel phases and synthesise a single answer. Workers share findings via a Hive Mind notebook.', licenseFeature: 'swarm', lifecycle: BetaLifecycle.BETA },
     { id: 'knowledge_bases_beta', name: 'Knowledge Bases (Beta badge)', description: 'Show a "beta" badge on the Knowledge Bases sidebar item. Cosmetic — does not gate access.', lifecycle: BetaLifecycle.BETA },
     { id: 'webpages', name: 'Webpages', description: 'AI-built static webpages. Three-file projects (index.html / style.css / script.js) hosted in RustFS, with sandboxed live preview, auto-versioning, KB-grounded AI chat, and a one-click ZIP download.', licenseFeature: 'webpages', lifecycle: BetaLifecycle.BETA },
-    { id: 'automations', name: 'Automations', description: 'Conversational no-code automation builder. Users describe an automation in chat; the AI assembles a typed DAG that mixes scheduled triggers, integration actions, AI reasoning steps, conditions, loops, and notifications. Includes dry-run preview, run history, and webhook + app-event triggers.', licenseFeature: 'automations', lifecycle: BetaLifecycle.BETA },
-    { id: 'agent_routines', name: 'Agent routines', description: 'Schedule recurring tasks that run through a specific agent. The routine fires the agent on a cron-like schedule with the full agent runtime (system prompt, attached skills, knowledge bases, integrations) and saves the result to a persistent chat thread.', licenseFeature: 'agent_routines', lifecycle: BetaLifecycle.BETA },
+    // n8n-style free builder: GA (auto-on, no opt-in panel) and Community-
+    // licensed. The blanket BETA_TIER_FLOOR short-circuit in getUserBetaFeatures
+    // is exempted for GA betas whose licenceFeature is in the Community tier, so
+    // these light up on a Community install while every other beta stays
+    // Enterprise. Building automations is free; sharing them across a team
+    // (`automation_sharing`) and team workspaces (`projects`) stay Enterprise.
+    { id: 'automations', name: 'Automations', description: 'Conversational no-code automation builder. Users describe an automation in chat; the AI assembles a typed DAG that mixes scheduled triggers, integration actions, AI reasoning steps, conditions, loops, and notifications. Includes dry-run preview, run history, and webhook + app-event triggers.', licenseFeature: 'automations', lifecycle: BetaLifecycle.GA },
+    { id: 'agent_routines', name: 'Agent routines', description: 'Schedule recurring tasks that run through a specific agent. The routine fires the agent on a cron-like schedule with the full agent runtime (system prompt, attached skills, knowledge bases, integrations) and saves the result to a persistent chat thread.', licenseFeature: 'agent_routines', lifecycle: BetaLifecycle.GA },
     { id: 'dutch_legal_sources', name: 'Dutch Legal Sources', description: 'Nederlandse juridische bronnen — geconsolideerde wetgeving (BW, Awb, Rv, Wvk, AVG-uitvoeringswet) als systeem-KB, plus tools voor jurisprudentie (rechtspraak.nl) en EU-recht (EUR-Lex / HvJEU) in het Nederlands. Bedoeld voor juridische agents die juristen helpen bij opstellen van adviezen, contracten en pleitnota’s. Alle bronnen zijn vrij te gebruiken (overheid open data).', lifecycle: BetaLifecycle.BETA },
     { id: 'playwright_tests', name: 'Playwright Tests (Beta)', description: 'Generate and run Playwright tests against external sites from conversations, GitHub commits, YouTrack issues or free text. Includes an explore mode that drives a Chromium browser without pre-generated tests and reports findings.', licenseFeature: 'playwright_tests', lifecycle: BetaLifecycle.BETA },
     { id: 'mcp_marketplace', name: 'MCP Server Marketplace', description: 'Browse, install and manage Model Context Protocol (MCP) servers (GitHub, Slack, Postgres, Playwright, and dozens more) to extend AI agent capabilities. Installed servers expose their tools to agents in chat. Enterprise beta — a later implementation still stabilising.', licenseFeature: 'mcp_marketplace', lifecycle: BetaLifecycle.BETA },
@@ -316,7 +322,20 @@ async function getUserBetaFeatures(userId, session = null, { tierHint = null } =
     const effectiveHint = tierHint || cachedTier;
     const orgIdForResolve = user.organizationId || (Array.isArray(user.groups) ? null : null);
     if (!(await _scopeAllowsBeta({ userId, organizationId: orgIdForResolve, tierHint: effectiveHint }))) {
-        return [];
+        // Below the enterprise beta floor (a Community install), the only betas
+        // available are the GA features whose licence feature is part of the
+        // Community tier — the n8n-style free builder (Automations + Agent
+        // Routines). Everything else stays Enterprise-gated. Derived from the
+        // registry + the licence tier so it self-tracks tiers.js (no hand-
+        // maintained id list). These GA features have no per-org opt-in on
+        // Community (the Beta admin panel is itself Enterprise), so they pass
+        // through directly rather than going through the org allow-list below.
+        const lic = _licenseModule();
+        return BETA_FEATURES
+            .filter(f => getFeatureLifecycle(f) === BetaLifecycle.GA
+                && f.licenseFeature
+                && lic.tiers.tierHasFeature('community', f.licenseFeature))
+            .map(f => f.id);
     }
 
     let groupIds = [];

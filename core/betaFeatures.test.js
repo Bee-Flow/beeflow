@@ -40,6 +40,13 @@ const tiersStub = require('../license/tiers');
 
 const licenseStub = {
     tiers: tiersStub,
+    // This suite exercises the SELF-HOSTED tier-floor path — "beta features are
+    // an enterprise+ benefit" only applies where a server-wide licence governs
+    // every org. On cloud (serverLicenseGovernsOrgs() === false) beta access is
+    // decided purely by the org subscription/allow-list and the floor is not
+    // applied, so the stub asserts the self-hosted behaviour explicitly.
+    serverLicenseGovernsOrgs() { return true; },
+    COMMUNITY_FALLBACK: 'community',
     async resolveTier({ organizationId, userId } = {}) {
         if (mockResolveThrows) throw new Error('simulated tier lookup failure');
         return mockTier;
@@ -110,14 +117,20 @@ function buildRes() {
 (async () => {
     // ── getUserBetaFeatures ─────────────────────────────────────────────
 
-    // Community tier → empty even when org has the feature both allowed
-    // and active.
+    // Community tier → only the n8n-style free-builder GA features
+    // (automations + agent_routines), even when the org has *enterprise* betas
+    // both allowed and active. The free-builder set is derived from the
+    // registry + the licence tier (GA betas whose licenceFeature is in the
+    // Community tier), so it ignores the org allow-list below the floor.
     resetMocks();
     mockTier = 'community';
     mockOrgBetaFeatures = ['meeting_notes', 'voice_chat'];
     mockOrgActiveFeatures = ['meeting_notes', 'voice_chat'];
     let features = await beta.getUserBetaFeatures('u1', { user: mockUser });
-    assert.deepStrictEqual(features, [], 'community must yield no beta features');
+    assert.deepStrictEqual(features.sort(), ['agent_routines', 'automations'],
+        'community must yield exactly the free-builder GA features (n8n-style)');
+    assert.ok(!features.includes('meeting_notes') && !features.includes('voice_chat'),
+        'community must NOT yield enterprise betas even when org-allowed/active');
 
     // Enterprise tier → returns the intersection.
     resetMocks();

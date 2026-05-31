@@ -21,8 +21,6 @@ const license = require('./index');
 const FEATURES = [
     'voice_chat',
     'webpages',
-    'automations',
-    'agent_routines',
     'meeting_notes',
     'ticket_assistant',
     'component_designer',
@@ -32,6 +30,11 @@ const FEATURES = [
     'web_search_guard',
     'advanced_usage_monitoring',
     'playwright_tests',
+    // n8n-style free builder: `automations` + `agent_routines` are NOT here —
+    // they moved to the Community core (building is free). The paid boundary is
+    // org-wide automation SHARING (`automation_sharing`, below) and team
+    // workspaces (`projects`, above), which must still 403 on community.
+    'automation_sharing',
     // Enforcement pass: every other enterprise feature must 403 on community
     // too. mcp_marketplace moved out of community (it's an enterprise beta);
     // sso_saml gates Google/Microsoft/SAML (Nextcloud OAuth stays community);
@@ -121,23 +124,26 @@ async function runGate(featureName, tier) {
     //    community session. This is the regression guard that pins
     //    "Community keeps all integrations + MCP" and "NC App Store login
     //    works on Community" (nextcloud_oauth).
-    //    (agent_routines, projects, pii_tokenize, web_search_guard and
-    //    advanced_usage_monitoring were promoted to Enterprise in earlier waves.)
-    for (const feature of ['chat_basic', 'skills', 'kb_unlimited', 'multi_user', 'nextcloud_basic', 'nextcloud_oauth', 'integrations']) {
+    //    `automations` + `agent_routines` are the n8n-style free builder —
+    //    Community must keep them (building is free; sharing is paid).
+    //    (projects, pii_tokenize, web_search_guard and advanced_usage_monitoring
+    //    were promoted to Enterprise in earlier waves.)
+    for (const feature of ['chat_basic', 'skills', 'kb_unlimited', 'multi_user', 'nextcloud_basic', 'nextcloud_oauth', 'integrations', 'automations', 'agent_routines']) {
         const { res, calledNext } = await runGate(feature, 'community');
         assert.strictEqual(calledNext, true, `${feature}: community must keep this`);
         assert.strictEqual(res.statusCode, null, `${feature}: community core must not 403`);
     }
 
-    // ── And the inverse: the Enterprise orchestration layer must STILL be
-    //    locked on community, so the markers above didn't accidentally widen
-    //    the gate. `automations` (no-code builder) + `agent_routines`
-    //    (scheduling) are the orchestration features that sit ABOVE plain
-    //    integration usage. They must 403.
-    for (const feature of ['automations', 'agent_routines']) {
+    // ── And the inverse: the paid COLLABORATION boundary on top of the free
+    //    builder must STILL be locked on community, so demoting the builder
+    //    didn't widen the gate. `automation_sharing` (org-wide sharing of
+    //    automations/routines) + `projects` (team workspaces) are the
+    //    collaboration features that sit ABOVE the free personal builder. They
+    //    must 403.
+    for (const feature of ['automation_sharing', 'projects']) {
         const { res, calledNext } = await runGate(feature, 'community');
-        assert.strictEqual(calledNext, false, `${feature}: orchestration must stay Enterprise on community`);
-        assert.strictEqual(res.statusCode, 403, `${feature}: orchestration must 403 on community`);
+        assert.strictEqual(calledNext, false, `${feature}: collaboration must stay Enterprise on community`);
+        assert.strictEqual(res.statusCode, 403, `${feature}: collaboration must 403 on community`);
     }
 
     // ── Server-licence version bump invalidates per-session cache ─────

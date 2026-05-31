@@ -64,18 +64,23 @@ assert.ok(community.includes('skills'), 'community must include skills');
 // Community core (declarative markers — integration usage is ungated at
 // runtime). Guard against a future edit silently gating them behind Enterprise.
 assert.ok(community.includes('integrations'), 'community must include all built-in integrations');
+// n8n-style free builder: the Automation builder + Agent Routines are part of
+// the free Community core (n8n Community Edition ships the workflow builder
+// gratis; only collaboration is paid). What stays Enterprise is org-wide
+// automation SHARING (`automation_sharing`) and team workspaces (`projects`).
+assert.ok(community.includes('automations'), 'community must include the automation builder (n8n-style free builder)');
+assert.ok(community.includes('agent_routines'), 'community must include agent routines (n8n-style free builder)');
 // MCP server marketplace is an ENTERPRISE feature (an enterprise beta) — it must
 // NOT be in community. See server/core/betaFeatures.js + the /ai/mcp-servers
 // route gates + the directChatToolStack runtime guard.
 assert.ok(!community.includes('mcp_marketplace'), 'community must NOT include the MCP marketplace (enterprise)');
 assert.ok(enterprise.includes('mcp_marketplace'), 'enterprise must include the MCP marketplace');
 
-// Promoted to Enterprise — must NOT be in community.
+// Promoted to Enterprise — must NOT be in community. (automations +
+// agent_routines were demoted BACK to community above — n8n-style free builder.)
 for (const f of [
     'voice_chat',
     'webpages',
-    'automations',
-    'agent_routines',
     'meeting_notes',
     'ticket_assistant',
     'component_designer',
@@ -88,6 +93,12 @@ for (const f of [
     assert.ok(!community.includes(f), `community must NOT include promoted feature ${f}`);
 }
 
+// The paid collaboration boundary for the free builder: org-wide sharing of
+// automations/routines stays Enterprise (reserve flag — no route consumes it
+// yet, but the boundary is pinned so a future sharing feature lands gated).
+assert.ok(!community.includes('automation_sharing'), 'community must NOT include automation sharing (collaboration is paid)');
+assert.ok(enterprise.includes('automation_sharing'), 'enterprise must include automation sharing');
+
 // Compliance / admin / resale flags stay out of community.
 assert.ok(!community.includes('guardrails_dlp'), 'community must NOT include enterprise features');
 assert.ok(!community.includes('sso_saml'));
@@ -96,11 +107,13 @@ assert.ok(!community.includes('white_label'));
 // Enterprise inherits community + adds the promoted Studio features + the
 // compliance/admin block.
 for (const f of community) assert.ok(enterprise.includes(f), `enterprise should inherit community feature ${f}`);
+// automations + agent_routines are asserted on enterprise via the community
+// inheritance loop above (they're community features now). Enterprise's own
+// adds below include the paid collaboration boundary `automation_sharing`.
 for (const f of [
+    'automation_sharing',
     'voice_chat',
     'webpages',
-    'automations',
-    'agent_routines',
     'meeting_notes',
     'ticket_assistant',
     'component_designer',
@@ -165,8 +178,12 @@ assert.strictEqual(t.tierHasFeature('community', 'skills'), true);
 assert.strictEqual(t.tierHasFeature('community', 'integrations'), true, 'built-in integrations are community');
 assert.strictEqual(t.tierHasFeature('community', 'mcp_marketplace'), false, 'MCP marketplace is enterprise');
 assert.strictEqual(t.tierHasFeature('enterprise', 'mcp_marketplace'), true, 'MCP marketplace is enterprise');
-assert.strictEqual(t.tierHasFeature('community', 'agent_routines'), false, 'agent_routines is now enterprise');
-assert.strictEqual(t.tierHasFeature('community', 'automations'), false, 'automations is enterprise');
+// n8n-style free builder: automations + agent routines are Community.
+assert.strictEqual(t.tierHasFeature('community', 'agent_routines'), true, 'agent_routines is a Community free-builder feature');
+assert.strictEqual(t.tierHasFeature('community', 'automations'), true, 'automations is a Community free-builder feature');
+// Paid collaboration boundary: org-wide automation sharing stays Enterprise.
+assert.strictEqual(t.tierHasFeature('community', 'automation_sharing'), false, 'automation sharing is enterprise (collaboration is paid)');
+assert.strictEqual(t.tierHasFeature('enterprise', 'automation_sharing'), true, 'enterprise gets automation sharing');
 assert.strictEqual(t.tierHasFeature('community', 'voice_chat'), false, 'voice_chat is enterprise');
 assert.strictEqual(t.tierHasFeature('community', 'webpages'), false);
 assert.strictEqual(t.tierHasFeature('community', 'meeting_notes'), false);
@@ -196,6 +213,7 @@ assert.strictEqual(t.tierHasFeature('pro', 'notebooks'), true, 'legacy pro must 
 assert.strictEqual(t.tierHasFeature('pro', 'agent_routines'), true, 'legacy pro must keep agent_routines via enterprise');
 assert.strictEqual(t.tierHasFeature('pro', 'projects'), true, 'legacy pro must keep projects via enterprise');
 assert.strictEqual(t.tierHasFeature('bogus', 'chat_basic'), true, 'invalid tier falls back to community');
-assert.strictEqual(t.tierHasFeature('bogus', 'automations'), false, 'invalid tier falls back to community (no enterprise features)');
+assert.strictEqual(t.tierHasFeature('bogus', 'automations'), true, 'invalid tier falls back to community (automations is now a community feature)');
+assert.strictEqual(t.tierHasFeature('bogus', 'voice_chat'), false, 'invalid tier falls back to community (no enterprise features)');
 
 console.log('✓ license/tiers.test.js — all assertions passed');

@@ -31,8 +31,13 @@ module.exports = {
     // tightening — see docs/docs/licensing/tiers.md — and now enforce on
     // every community install.
     '/components': { gate: 'component_designer', beta: null, notes: 'Enterprise tier; AI custom-UI component builder. Top-level (non-/api) path.' },
-    '/api/automation/builder': { gate: 'automations', beta: null, notes: 'Enterprise tier' },
-    '/api/automation': { gate: 'automations', beta: null, notes: 'Enterprise tier' },
+    // n8n-style free builder: the builder + CRUD are Community (building is
+    // free). `automations` is a Community licence feature AND a GA beta that's
+    // Community-exempt from BETA_TIER_FLOOR (server/core/betaFeatures.js). The
+    // paid line is collaboration: `automation_sharing` (org-wide sharing) +
+    // `projects` (team workspaces) stay Enterprise.
+    '/api/automation/builder': { gate: 'automations', beta: 'automations', notes: 'Community (n8n-style free builder) — automation builder. Licence feature + GA beta, both Community.' },
+    '/api/automation': { gate: 'automations', beta: 'automations', notes: 'Community (n8n-style free builder) — automation CRUD/execution. Licence feature + GA beta, both Community.' },
     '/api/compliance': { gate: 'compliance_hub_gdpr', beta: null, notes: 'Enterprise tier' },
     '/api/dsr': { gate: null, beta: null, notes: 'Public DSR channel must stay reachable per GDPR Art. 12; admin endpoints inside the router enforce admin_compliance' },
     '/api/notebooks': { gate: 'notebooks', beta: null, notes: 'Enterprise tier; configStore.feature_notebooks_enabled remains as a per-deployment kill switch (runs AFTER the licence gate so the frontend sees the actionable feature_locked body first)' },
@@ -52,7 +57,10 @@ module.exports = {
     '/api/projects': { gate: 'projects', beta: null, notes: 'Enterprise tier (promoted in second-wave tightening). configStore.feature_projects_enabled remains as a per-deployment kill switch (runs AFTER the licence gate so the frontend sees feature_locked first).' },
     '/api/org-privacy-shield': { gate: null, beta: null, notes: 'Soft tier clamps applied in-handler: on community tier the PUT handler clamps piiDetectionAction → "block" (pii_tokenize gate) and forces webSearchGuardEnabled → false (web_search_guard gate). Stored row is preserved across upgrades. See server/routes/orgPrivacyShield.js.' },
     '/api/reminders': { gate: null, beta: null, notes: 'Core community feature' },
-    '/api/ai-tasks': { gate: 'agent_routines', beta: 'agent_routines', notes: 'Enterprise tier + beta opt-in — Agent Routines (Studio → Routines), scheduled recurring agent runs. Gated at the mount in server/index.js.' },
+    '/api/ai-tasks': { gate: 'agent_routines', beta: 'agent_routines', notes: 'Community (n8n-style free builder) — Agent Routines (Studio → Routines), scheduled recurring agent runs. `agentId` mode checks the agent_routines beta inside the handler; both licence + beta are Community.' },
+    // Reserve boundary — no route consumes this yet. Org-wide sharing of
+    // automations/routines is the paid collaboration line (Enterprise).
+    '/api/automation/*/share': { gate: 'automation_sharing', beta: null, notes: 'Enterprise (collaboration) — reserve gate for future org-wide automation/routine sharing. Not yet mounted.' },
     '/api/kb': { gate: null, beta: null, notes: 'Knowledge base is community-tier; max_kb_sources limit enforces caps' },
 
     // ── License / billing admin routes (auth + per-handler RBAC) ─────
