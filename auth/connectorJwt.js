@@ -129,6 +129,7 @@ function _verifyHs256(token, key) {
 async function _resolveTenant(token) {
     const orgIds = await configStore.listKeysWithPrefix?.(TENANT_KEY_PREFIX)
         ?? await _listOrgIdsFallback();
+    // Pass 1 — cached keys (fast path; hits on every steady-state request).
     for (const orgId of orgIds) {
         let key = _cacheGet(orgId);
         if (!key) {
@@ -141,6 +142,25 @@ async function _resolveTenant(token) {
             return { orgId, payload };
         } catch (_) {
             // try the next key
+        }
+    }
+    // Pass 2 — cache-bypass. A tenant key may have just been (re)minted on
+    // another replica while this replica's per-process cache still holds the
+    // OLD key (≤60s). Without this, a connector that just (re)bootstrapped is
+    // 403'd for up to a minute on the stale replica. Re-read fresh from the DB
+    // before rejecting; getSecretFresh also self-heals the stale cache. Bounded
+    // by the (single-digit) tenant count, and only runs when Pass 1 misses.
+    if (typeof configStore.getSecretFresh === 'function') {
+        for (const orgId of orgIds) {
+            const fresh = await configStore.getSecretFresh(TENANT_KEY_PREFIX + orgId);
+            if (!fresh) continue;
+            try {
+                const payload = _verifyHs256(token, fresh);
+                _cacheSet(orgId, fresh); // refresh the per-org key cache too
+                return { orgId, payload };
+            } catch (_) {
+                // genuinely not this tenant
+            }
         }
     }
     return null;

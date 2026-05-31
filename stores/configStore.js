@@ -373,6 +373,29 @@ async function getSecret(key) {
     return result;
 }
 
+/**
+ * Read a secret straight from the DB, bypassing (and refreshing) the in-memory
+ * cache. Used on the connector-JWT verification path: each server replica has
+ * its own 60s secret cache, so right after a tenant key is (re)minted on one
+ * replica, another replica can still serve the OLD key for up to a minute and
+ * reject the connector's valid new JWT with a 403. A fresh read closes that
+ * window. Also refreshes the cache so the stale entry self-heals.
+ */
+async function getSecretFresh(key) {
+    await initDB();
+    const row = await getOne('SELECT value FROM config WHERE key = $1', [key]);
+    if (!row || !row.value) { _cacheSet(`__secret__${key}`, null); return null; }
+    let result;
+    try {
+        const parsed = JSON.parse(row.value);
+        if (parsed && typeof parsed === 'object' && parsed._encrypted === 'config-v1') result = decryptValue(parsed);
+        else if (typeof parsed === 'string') result = parsed;
+        else result = row.value;
+    } catch (_) { result = row.value; }
+    _cacheSet(`__secret__${key}`, result);
+    return result;
+}
+
 async function deleteConfig(key, auditCtx = null) {
     await initDB();
     const { rowCount } = await run('DELETE FROM config WHERE key = $1', [key]);
@@ -536,6 +559,7 @@ module.exports = {
     setSecret,
     setSecretIfAbsent,
     getSecret,
+    getSecretFresh,
     encryptValue,
     decryptValue,
     reencryptLegacyPlaintextSecrets,
