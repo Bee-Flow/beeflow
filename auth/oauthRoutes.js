@@ -1196,6 +1196,20 @@ router.get('/providers', requireAdmin, async (req, res) => {
     });
 });
 
+// Guards the /providers/:provider SSO routes: rejects unknown providers with a
+// 404 before the handler runs. NOTE: this middleware was *referenced* by the
+// three routes below but never defined/imported, which crashed server boot with
+// `ReferenceError: requireSsoProvider is not defined`. Defined here to restore
+// boot; validates against the configured OAuth providers plus the Nextcloud
+// OAuth bridge ('nextcloud').
+const requireSsoProvider = (req, res, next) => {
+    const { provider } = req.params;
+    if (provider !== 'nextcloud' && !OAUTH_PROVIDERS[provider]) {
+        return res.status(404).json({ error: `Unknown SSO provider: ${provider}` });
+    }
+    next();
+};
+
 router.get('/providers/:provider', requireAdmin, requireSsoProvider, async (req, res) => {
     const { provider } = req.params;
     const config = await loadConfig();

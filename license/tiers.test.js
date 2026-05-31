@@ -64,7 +64,11 @@ assert.ok(community.includes('skills'), 'community must include skills');
 // Community core (declarative markers — integration usage is ungated at
 // runtime). Guard against a future edit silently gating them behind Enterprise.
 assert.ok(community.includes('integrations'), 'community must include all built-in integrations');
-assert.ok(community.includes('mcp_marketplace'), 'community must include the MCP server marketplace');
+// MCP server marketplace is an ENTERPRISE feature (an enterprise beta) — it must
+// NOT be in community. See server/core/betaFeatures.js + the /ai/mcp-servers
+// route gates + the directChatToolStack runtime guard.
+assert.ok(!community.includes('mcp_marketplace'), 'community must NOT include the MCP marketplace (enterprise)');
+assert.ok(enterprise.includes('mcp_marketplace'), 'enterprise must include the MCP marketplace');
 
 // Promoted to Enterprise — must NOT be in community.
 for (const f of [
@@ -159,7 +163,8 @@ assert.strictEqual(t.getLimitsForTier('community').max_agents, -1, 'getLimitsFor
 assert.strictEqual(t.tierHasFeature('community', 'chat_basic'), true);
 assert.strictEqual(t.tierHasFeature('community', 'skills'), true);
 assert.strictEqual(t.tierHasFeature('community', 'integrations'), true, 'built-in integrations are community');
-assert.strictEqual(t.tierHasFeature('community', 'mcp_marketplace'), true, 'MCP marketplace is community');
+assert.strictEqual(t.tierHasFeature('community', 'mcp_marketplace'), false, 'MCP marketplace is enterprise');
+assert.strictEqual(t.tierHasFeature('enterprise', 'mcp_marketplace'), true, 'MCP marketplace is enterprise');
 assert.strictEqual(t.tierHasFeature('community', 'agent_routines'), false, 'agent_routines is now enterprise');
 assert.strictEqual(t.tierHasFeature('community', 'automations'), false, 'automations is enterprise');
 assert.strictEqual(t.tierHasFeature('community', 'voice_chat'), false, 'voice_chat is enterprise');

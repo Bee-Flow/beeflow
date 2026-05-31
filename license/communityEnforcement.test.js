@@ -32,6 +32,18 @@ const FEATURES = [
     'web_search_guard',
     'advanced_usage_monitoring',
     'playwright_tests',
+    // Enforcement pass: every other enterprise feature must 403 on community
+    // too. mcp_marketplace moved out of community (it's an enterprise beta);
+    // sso_saml gates Google/Microsoft/SAML (Nextcloud OAuth stays community);
+    // guardrails_dlp / audit_log_export / swarm / advanced_analytics /
+    // custom_themes are enterprise capabilities with server gates.
+    'mcp_marketplace',
+    'sso_saml',
+    'guardrails_dlp',
+    'audit_log_export',
+    'swarm',
+    'advanced_analytics',
+    'custom_themes',
 ];
 
 const RESOLUTION_TTL_MS = 60_000;
