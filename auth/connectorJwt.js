@@ -32,6 +32,15 @@ const configStore = require('../stores/configStore');
 const encryption = require('./encryption');
 const orgRolesConfig = require('../config/orgRoles.json');
 
+// True iff the request's Nextcloud uid is THIS org's recorded NC admin. Used to
+// let the org admin past the NC_ONBOARDING_PENDING gate so onboarding can never
+// deadlock. Match is an exact equality on the stable nc_admin_uid — reqNcUid
+// derives from the connector-set X-Beeflow-NC-Uid header / the tenant-key-signed
+// JWT `sub`, so a non-admin cannot spoof it without being signed in as the admin.
+function _isOrgAdminRequester(org, reqNcUid) {
+    return !!(org && org.nc_admin_uid && reqNcUid && reqNcUid === org.nc_admin_uid);
+}
+
 const TENANT_KEY_PREFIX = 'connector_tenant_key_';
 
 // Default org-role for NC users auto-provisioned through the connector.
@@ -277,7 +286,7 @@ async function connectorJwtMiddleware(req, res, next) {
             // stable nc_admin_uid (not email) and re-establish their org_admin row
             // idempotently, then continue as that user.
             const reqNcUid = String(req.headers['x-beeflow-nc-uid'] || payload.sub || '').trim();
-            if (org.nc_admin_uid && reqNcUid && reqNcUid === org.nc_admin_uid) {
+            if (_isOrgAdminRequester(org, reqNcUid)) {
                 try {
                     const { ensureOrgAdminUser } = require('./connectorBootstrap').helpers;
                     const adminUser = await ensureOrgAdminUser(org, {
@@ -463,3 +472,4 @@ async function connectorJwtMiddleware(req, res, next) {
 module.exports = connectorJwtMiddleware;
 module.exports.invalidateTenantKeyCache = invalidateTenantKeyCache;
 module.exports._verifyHs256 = _verifyHs256; // exported for tests
+module.exports._isOrgAdminRequester = _isOrgAdminRequester; // exported for tests

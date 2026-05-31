@@ -12,7 +12,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 const crypto = require('node:crypto');
 
-const { _verifyHs256 } = require('./connectorJwt');
+const { _verifyHs256, _isOrgAdminRequester } = require('./connectorJwt');
 
 const KEY = 'test-tenant-key-32-bytes-minimum-please';
 const NOW = Math.floor(Date.now() / 1000);
@@ -95,4 +95,31 @@ test('payload without iss/aud claims still verifies (legacy / strict-only check)
     const token = mintToken({ email: 'a@b.c', exp: NOW + 60 });
     const payload = _verifyHs256(token, KEY);
     assert.strictEqual(payload.email, 'a@b.c');
+});
+
+// ── Onboarding-gate admin carve-out predicate ──────────────────────────────
+// The org's NC admin must always pass the NC_ONBOARDING_PENDING gate (so they
+// can complete the wizard); everyone else must not. Match is an exact uid
+// equality against the org's stored nc_admin_uid.
+
+test('admin carve-out: exact nc_admin_uid match → true', () => {
+    assert.strictEqual(_isOrgAdminRequester({ nc_admin_uid: 'google-123' }, 'google-123'), true);
+});
+
+test('admin carve-out: different uid → false (no bypass for non-admins)', () => {
+    assert.strictEqual(_isOrgAdminRequester({ nc_admin_uid: 'google-123' }, 'google-999'), false);
+});
+
+test('admin carve-out: org without nc_admin_uid → false', () => {
+    assert.strictEqual(_isOrgAdminRequester({ nc_admin_uid: null }, 'google-123'), false);
+    assert.strictEqual(_isOrgAdminRequester({}, 'google-123'), false);
+});
+
+test('admin carve-out: empty/blank requester uid → false (no empty-string match)', () => {
+    assert.strictEqual(_isOrgAdminRequester({ nc_admin_uid: '' }, ''), false);
+    assert.strictEqual(_isOrgAdminRequester({ nc_admin_uid: 'google-123' }, ''), false);
+});
+
+test('admin carve-out: null org → false (defensive)', () => {
+    assert.strictEqual(_isOrgAdminRequester(null, 'google-123'), false);
 });
