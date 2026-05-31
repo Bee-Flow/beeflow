@@ -103,7 +103,7 @@ require.cache[path.join(__dirname, '__fake_user_store_server__.js')] = {
 process.env.LICENSE_SERVER_TIER_CACHE_TTL_MS = '0';
 
 // The override assertions below exercise the GOVERNING-mode contract
-// (self-hosted / private-cloud), where a server-wide licence overrides every
+// (self-hosted), where a server-wide licence overrides every
 // per-org/user resolution. The cloud (non-governing) contract — where the
 // licence exists but each org still needs its own subscription — gets its own
 // block at the end. Default unset mode is 'cloud', so we pin governing here.

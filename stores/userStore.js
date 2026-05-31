@@ -974,9 +974,15 @@ async function createOrganization(orgData) {
         await run(`INSERT INTO organizations (id, name, description, tagline, address, email, phone, website, kvk, vat, logo, "footerText", "defaultGroups", "allowSignup", "authMethod", "autoApproveSSO", "enabledIntegrations", "allowed_domains", "nc_instance_id", "nc_base_url", "nc_admin_uid", "nc_provisioned_at", "connector_callback_url")
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
             [id, name, description || '', tagline || '', address || '', email || '', phone || '', website || '', kvk || '', vat || '', logo || '', footerText || '', JSON.stringify(defaultGroups || []), allowSignup ? '1' : '0', authMethod || null, autoApproveSSO ? '1' : '0', enabledIntegrations ? JSON.stringify(enabledIntegrations) : null, allowedDomains ? JSON.stringify(allowedDomains) : null, ncInstanceId || null, ncBaseUrl || null, ncAdminUid || null, ncProvisionedAt || null, connectorCallbackUrl || null]);
-        // Auto-assign default subscription plan if one exists
+        // Auto-assign default subscription plan if one exists — cloud only.
+        // Self-hosted (incl. the retired 'private-cloud' value) never seeds a
+        // Stripe subscription row; tier is server-licence or Community, resolved
+        // without ever consulting subscriptions.
         try {
-            const defaultPlan = await getOne('SELECT id FROM subscription_plans WHERE is_default = TRUE LIMIT 1');
+            const subscriptionsEnabled = (process.env.DEPLOYMENT_MODE || 'cloud') === 'cloud';
+            const defaultPlan = subscriptionsEnabled
+                ? await getOne('SELECT id FROM subscription_plans WHERE is_default = TRUE LIMIT 1')
+                : null;
             if (defaultPlan) {
                 await setOrgSubscription(id, { plan_id: defaultPlan.id, status: 'active' });
                 console.log(`[UserStore] Auto-assigned default plan '${defaultPlan.id}' to new org '${id}'`);

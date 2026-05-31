@@ -31,7 +31,7 @@ const configStore = require('../stores/configStore');
 const { invalidateTenantKeyCache } = require('./connectorJwt');
 const planEntitlements = require('../services/planEntitlements');
 const { sendNcVerificationCodeEmail } = require('../utils/emailService');
-const { buildAutoOrgName } = require('./orgNaming');
+const { buildAutoOrgName, ncHostFromUrl } = require('./orgNaming');
 
 // Auto-apply the operator-flagged "Nextcloud recommended" plan to freshly
 // provisioned or freshly-adopted NC orgs so they get enterprise-equivalent
@@ -116,6 +116,58 @@ const verificationResendLimiter = rateLimit({
     validate: { trustProxy: false },
 });
 
+// ── Connector provisioning policy ──────────────────────────────────────────
+// Gate on the fresh-org branch: may an *unknown* Nextcloud (no existing bind,
+// no valid pairing code, no email-domain match) auto-create a brand-new org?
+// This is the control that stops "anyone who knows the server address can mint
+// an organisation on it". Resolution order: super-admin config key → env →
+// deployment default. Returning binds, pairing codes and email-domain adoption
+// are NOT affected by this — they have their own authorisation proof.
+//   - open:         fresh-org allowed (zero-touch one-click). Cloud default.
+//   - pairing_only: fresh-org refused (403 pairing_required). Self-host default.
+// Unknown/invalid values fail closed to pairing_only.
+const PROVISIONING_MODES = ['open', 'pairing_only'];
+
+// Hosts that are the official Bee Flow Cloud control plane. These default to
+// `open` so the App Store install stays zero-touch; every other deployment
+// (i.e. self-hosted) defaults to `pairing_only`.
+const CLOUD_PROVISIONING_HOSTS = new Set([
+    'server.beeflow.nl', 'server.dev.beeflow.nl',
+]);
+
+function defaultProvisioningMode() {
+    const host = String(process.env.SERVER_PUBLIC_HOST || '').trim().toLowerCase();
+    return CLOUD_PROVISIONING_HOSTS.has(host) ? 'open' : 'pairing_only';
+}
+
+// Resolve the effective provisioning mode. The DB-backed super-admin key wins
+// (an operator can flip it at runtime without a redeploy — same mechanism as
+// default_org_integrations), then the env override, then the deployment
+// default. Anything unrecognised fails closed.
+async function resolveProvisioningMode() {
+    let mode = await configStore.getConfig('connector_provisioning_mode').catch(() => null);
+    if (!mode) mode = (process.env.BEEFLOW_CONNECTOR_PROVISIONING || '').trim() || null;
+    if (!mode) mode = defaultProvisioningMode();
+    mode = String(mode).trim().toLowerCase();
+    if (!PROVISIONING_MODES.includes(mode)) {
+        console.warn(`[ConnectorBootstrap] unknown provisioning mode '${mode}' — failing closed to pairing_only`);
+        return 'pairing_only';
+    }
+    return mode;
+}
+
+// Stable fallback id for Nextclouds that expose neither theming.instanceid nor
+// core.instanceid. MUST stay byte-identical to the connector's copy in
+// nextcloud-connector/src/bootstrap.js so the id the connector sends in
+// X-Beeflow-NC-Instance-Id matches the value we re-derive here. Keyed on the NC
+// host (not the NC version) so it doesn't drift across upgrades and silently
+// re-provision a duplicate org.
+function stableInstanceIdFallback(ncBaseUrl, themingName) {
+    const host = ncHostFromUrl(ncBaseUrl);
+    if (host) return `nc-host:${host}`;
+    return `nc:${themingName || 'nextcloud'}`;
+}
+
 // All NC integrations Bee Flow ships with — auto-enabled on connector
 // bootstrap so the agent can immediately reach Files, Calendar, Mail, etc.
 // out-of-the-box without an org-admin having to flip toggles. The connector
@@ -184,7 +236,7 @@ async function verifyNcInstance(ncBaseUrl, expectedInstanceId) {
     if (!data?.version) throw new Error('NC capabilities returned no version data');
     const reportedId = data?.capabilities?.theming?.instanceid
         || data?.capabilities?.core?.instanceid
-        || data?.version?.string + ':' + (data?.capabilities?.theming?.name || 'nextcloud');
+        || stableInstanceIdFallback(ncBaseUrl, data?.capabilities?.theming?.name);
     if (reportedId !== expectedInstanceId) {
         throw new Error(`NC instance id mismatch: header=${expectedInstanceId} server=${reportedId}`);
     }
@@ -301,6 +353,11 @@ router.post('/connector/bootstrap', bootstrapLimiter, async (req, res) => {
             remediation: 'Configure an email address on your Nextcloud admin user and re-deploy the connector.',
         });
     }
+
+    // Resolve the provisioning policy once, up front and OUTSIDE the
+    // skip-verify shortcut below, so the dev bypass can never open the gate.
+    // It only gates the fresh-org branch (3); branches 0–2 are unaffected.
+    const provisioningMode = await resolveProvisioningMode();
 
     let nc;
     if (process.env.BEEFLOW_BOOTSTRAP_SKIP_VERIFY === 'true') {
@@ -492,6 +549,20 @@ router.post('/connector/bootstrap', bootstrapLimiter, async (req, res) => {
         });
     }
 
+    // Provisioning gate — anything reaching here has no existing bind, no valid
+    // pairing code, and no email-domain match. Auto-creating an org for such a
+    // caller is exactly the "anyone who knows the server address can mint an
+    // org" path. Unless this deployment is explicitly `open` (the Bee Flow Cloud
+    // default), refuse and steer the admin to the pairing-code flow instead.
+    if (provisioningMode !== 'open') {
+        console.warn(`[ConnectorBootstrap] fresh_org_refused mode=${provisioningMode} ncInstance=${ncInstanceId} ncBaseUrl=${ncBaseUrl}`);
+        return res.status(403).json({
+            error: 'This Bee Flow server does not auto-create organisations for new Nextcloud instances.',
+            code: 'pairing_required',
+            remediation: 'Ask a Bee Flow organisation admin to generate a pairing code (Settings → Organisation → Pair a new Nextcloud), set it as the BEEFLOW_PAIRING_CODE env var on this connector, and redeploy.',
+        });
+    }
+
     // 3. Fresh-org branch — no victim, no risk. One-click.
     const idSuffix = slugify(ncInstanceId.slice(0, 12)) || crypto.randomBytes(3).toString('hex');
     const orgId = `nc-${slugify(nc.themingName)}-${idSuffix}`;
@@ -513,6 +584,33 @@ router.post('/connector/bootstrap', bootstrapLimiter, async (req, res) => {
         enabledIntegrations: NC_INTEGRATIONS,
     });
     if (!created) {
+        // A concurrent bootstrap for the same NC instance may have just won the
+        // race: the org id is deterministic, so the loser's INSERT collides on
+        // the primary key and createOrganization returns false. Re-fetch — if
+        // the org now exists, fall through to returning-bind semantics instead
+        // of a misleading HTTP 500 (which would also leave the connector retrying).
+        const raced = await userStore.getOrganizationByNcInstanceId(ncInstanceId);
+        if (raced) {
+            try {
+                await ensureOrgAdminUser(raced, { ncAdminEmail, ncAdminUid, ncAdminDisplayName });
+            } catch (e) {
+                if (e.statusCode === 409) return res.status(409).json({
+                    error: e.message,
+                    code: 'admin_email_conflict',
+                });
+                throw e;
+            }
+            const tenantKey = await getOrMintTenantKey(raced.id);
+            console.log(`[ConnectorBootstrap] fresh_org_race_resolved org=${raced.id} ncInstance=${ncInstanceId}`);
+            return res.json({
+                tenantKey,
+                organizationId: raced.id,
+                organizationName: raced.name,
+                isNew: false,
+                ncVersion: nc.ncVersion,
+                code: 'returning_bind',
+            });
+        }
         return res.status(500).json({
             error: 'Failed to create organization',
             code: 'org_create_failed',
@@ -839,4 +937,8 @@ module.exports.helpers = {
     getOrMintTenantKey,
     ensureOrgAdminUser,
     bindOrgToNcInstance,
+    defaultProvisioningMode,
+    resolveProvisioningMode,
+    stableInstanceIdFallback,
+    PROVISIONING_MODES,
 };

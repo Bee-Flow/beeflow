@@ -100,15 +100,32 @@ async function getServerLicenseTier() {
  * them paid tiers for free. The licence still exists and is shown in the admin
  * Server-licence panel; it simply doesn't override per-org resolution.
  *
- * On self-hosted / private-cloud the server-wide licence IS the paid-access
- * mechanism and governs the whole install (every org/user runs at its tier).
+ * On self-hosted the server-wide licence IS the paid-access mechanism and
+ * governs the whole install (every org/user runs at its tier).
  *
- * Sourced from DEPLOYMENT_MODE (default 'cloud'). Whitelisted so an unknown
- * value never silently turns billing off.
+ * Sourced from DEPLOYMENT_MODE (default 'cloud'). Only two modes exist:
+ * 'cloud' (Stripe subscriptions) and 'self-hosted' (licence keys). The legacy
+ * 'private-cloud' value is normalised to 'self-hosted' on read (see
+ * deploymentMode()), so it lands on the governing side here.
  */
-function serverLicenseGovernsOrgs() {
+function deploymentMode() {
     const mode = process.env.DEPLOYMENT_MODE || 'cloud';
-    return mode === 'self-hosted' || mode === 'private-cloud';
+    // Back-compat: the retired 'private-cloud' mode is now just self-hosted.
+    return mode === 'private-cloud' ? 'self-hosted' : mode;
+}
+
+function serverLicenseGovernsOrgs() {
+    return deploymentMode() === 'self-hosted';
+}
+
+/**
+ * Whether Stripe subscriptions are a valid tier source. Self-hosted installs
+ * pay via licence keys only — subscriptions are NEVER consulted there, so the
+ * tier is purely server-licence-or-Community. Cloud is the only mode where
+ * subscriptions decide tier.
+ */
+function subscriptionsEnabled() {
+    return deploymentMode() === 'cloud';
 }
 
 /**
@@ -123,7 +140,7 @@ function serverLicenseGovernsOrgs() {
  */
 async function getTierForOrg(organizationId) {
     // Server-wide licence overrides per-org rows — but only when it governs
-    // billing (self-hosted / private-cloud). On cloud each org pays its own
+    // billing (self-hosted). On cloud each org pays its own
     // subscription, so we fall through to the per-org licence / Stripe sub.
     const serverTier = await getServerLicenseTier();
     if (serverLicenseGovernsOrgs() && serverTier !== COMMUNITY_FALLBACK) return serverTier;
@@ -131,13 +148,15 @@ async function getTierForOrg(organizationId) {
     const lic = await store.getActiveLicenseForOrg(organizationId);
     const licTier = resolveTierFromLicense(lic);
     if (licTier !== COMMUNITY_FALLBACK) return licTier;
+    // Self-hosted never consults Stripe subscriptions — tier is licence-or-Community.
+    if (!subscriptionsEnabled()) return COMMUNITY_FALLBACK;
     const subTier = await resolveTierFromOrgSubscription(organizationId);
     return subTier || COMMUNITY_FALLBACK;
 }
 
 async function getTierForUser(userId) {
     // Server-wide licence overrides per-user rows — but only when it governs
-    // billing (self-hosted / private-cloud). On cloud the user's own
+    // billing (self-hosted). On cloud the user's own
     // subscription decides their tier.
     const serverTier = await getServerLicenseTier();
     if (serverLicenseGovernsOrgs() && serverTier !== COMMUNITY_FALLBACK) return serverTier;
@@ -145,6 +164,8 @@ async function getTierForUser(userId) {
     const lic = await store.getActiveLicenseForUser(userId);
     const licTier = resolveTierFromLicense(lic);
     if (licTier !== COMMUNITY_FALLBACK) return licTier;
+    // Self-hosted never consults Stripe subscriptions — tier is licence-or-Community.
+    if (!subscriptionsEnabled()) return COMMUNITY_FALLBACK;
     const subTier = await resolveTierFromConsumerSubscription(userId);
     return subTier || COMMUNITY_FALLBACK;
 }
@@ -159,8 +180,8 @@ async function getTierForUser(userId) {
  * Includes subscription-derived tiers for SaaS orgs without a license_keys row.
  */
 async function getBestTierForOrgs(orgIds = []) {
-    // Server-wide licence wins outright when it governs billing (self-hosted /
-    // private-cloud); skip the org sweep. On cloud it doesn't override, so we
+    // Server-wide licence wins outright when it governs billing (self-hosted);
+    // skip the org sweep. On cloud it doesn't override, so we
     // resolve from the orgs' own licences / subscriptions below.
     const serverTier = await getServerLicenseTier();
     if (serverLicenseGovernsOrgs() && serverTier !== COMMUNITY_FALLBACK) return serverTier;
@@ -172,6 +193,8 @@ async function getBestTierForOrgs(orgIds = []) {
         if (tiers.tierRank(t) > tiers.tierRank(best)) best = t;
     }
     if (tiers.tierRank(best) >= tiers.tierRank('enterprise')) return best;
+    // Self-hosted never consults Stripe subscriptions — stop at licence/Community.
+    if (!subscriptionsEnabled()) return best;
     for (const orgId of orgIds) {
         if (!orgId) continue;
         const t = await resolveTierFromOrgSubscription(orgId);
@@ -282,7 +305,7 @@ async function getLicenseStatus({ organizationId = null, userId = null, orgIds =
     const serverSnap = await _getServerLicenseSnapshot();
     const serverLicense = serverSnap.license ? publicLicenseShape(serverSnap.license) : null;
 
-    // Governing modes (self-hosted / private-cloud): the server licence covers
+    // Governing mode (self-hosted): the server licence covers
     // the whole install, so report it as the authoritative tier and tell the
     // per-org UI via `serverOverride: true` (no Stripe subscription needed).
     // On cloud this branch is skipped — orgs resolve their own subscription.
@@ -346,9 +369,12 @@ async function getLicenseStatus({ organizationId = null, userId = null, orgIds =
     let tier = resolveTierFromLicense(lic);
 
     // No license row beats community → consult Stripe subscriptions as fallback.
+    // Self-hosted skips this entirely: subscriptions are a cloud-only concept, so
+    // the tier stays licence-or-Community and `source` never becomes
+    // 'stripe_subscription'.
     let subscriptionShape = null;
     let subscriptionScope = null;
-    if (tier === COMMUNITY_FALLBACK) {
+    if (tier === COMMUNITY_FALLBACK && subscriptionsEnabled()) {
         let bestSubTier = COMMUNITY_FALLBACK;
         let bestSubRow = null;
         for (const orgId of candidateOrgIds) {

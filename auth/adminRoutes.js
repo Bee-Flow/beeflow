@@ -576,9 +576,12 @@ router.put('/organizations/:id', requireOrgAdmin('id'), async (req, res) => {
     const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
     const finalIntegrations = isSuperAdmin && enabledIntegrations !== undefined ? enabledIntegrations : undefined;
 
-    // ── allowedDomains validation (private-cloud only) ──
+    // ── allowedDomains validation (self-hosted only) ──
+    // Org domain allow-listing is a self-hosted feature (formerly gated to the
+    // retired 'private-cloud' mode). `!== 'cloud'` keeps it working for both
+    // 'self-hosted' and any lingering 'private-cloud' env value.
     let finalAllowedDomains = undefined;
-    if (allowedDomains !== undefined && process.env.DEPLOYMENT_MODE === 'private-cloud') {
+    if (allowedDomains !== undefined && (process.env.DEPLOYMENT_MODE || 'cloud') !== 'cloud') {
         if (!Array.isArray(allowedDomains)) {
             return res.status(400).json({ error: 'allowedDomains must be an array' });
         }
@@ -1345,9 +1348,9 @@ async function resolveActiveFeaturesContext(req) {
 
     // Beta allow-list — the effective entitlement for this org. On cloud this
     // is driven by the org's SUBSCRIPTION (the plan's allowed_beta_features),
-    // which leads over the admin Security→Beta grant; on self-hosted /
-    // private-cloud it is the server-licence-governed admin grant. Either way
-    // a feature outside the allow-list never appears in the org-admin panel.
+    // which leads over the admin Security→Beta grant; on self-hosted it is the
+    // server-licence-governed admin grant. Either way a feature outside the
+    // allow-list never appears in the org-admin panel.
     const grantedAllowList = await getEffectiveOrgBetaAllowList(orgId);
     const enabledBetaFeatures = await userStore.getOrgEnabledBetaFeatures(orgId);
 
@@ -1628,6 +1631,27 @@ router.put('/default-integrations', requireAdmin, async (req, res) => {
     const { defaults } = req.body;
     // defaults = null means all enabled, or array of enabled IDs
     await configStore.setConfig('default_org_integrations', defaults === null ? null : defaults);
+    res.json({ success: true });
+});
+
+// Connector provisioning mode — governs whether an *unknown* Nextcloud may
+// auto-create a fresh Bee Flow org via POST /auth/connector/bootstrap. See
+// server/auth/connectorBootstrap.js (resolveProvisioningMode). `null`/unset
+// means "use the deployment default" (open on Bee Flow Cloud, pairing_only on
+// self-hosted). Returning binds, pairing codes and email-domain adoption are
+// never affected by this setting.
+const CONNECTOR_PROVISIONING_MODES = ['open', 'pairing_only'];
+router.get('/connector-provisioning-mode', requireAdmin, async (req, res) => {
+    const mode = await configStore.getConfig('connector_provisioning_mode');
+    res.json({ mode: mode || null, allowed: CONNECTOR_PROVISIONING_MODES });
+});
+
+router.put('/connector-provisioning-mode', requireAdmin, async (req, res) => {
+    const { mode } = req.body || {};
+    if (mode !== null && !CONNECTOR_PROVISIONING_MODES.includes(mode)) {
+        return res.status(400).json({ error: `mode must be one of ${CONNECTOR_PROVISIONING_MODES.join(', ')}, or null` });
+    }
+    await configStore.setConfig('connector_provisioning_mode', mode === null ? null : mode);
     res.json({ success: true });
 });
 

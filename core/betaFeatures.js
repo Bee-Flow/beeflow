@@ -78,8 +78,8 @@ async function _scopeAllowsBeta({ userId = null, organizationId = null, tierHint
     // On a cloud deployment there is no server-wide licence to reference and
     // no enterprise tier floor: beta access is decided entirely by the org's
     // SUBSCRIPTION (getEffectiveOrgBetaAllowList) + the org-admin enabled
-    // subset. Only self-hosted / private-cloud installs (where a server-wide
-    // licence governs every org) apply the tier floor below.
+    // subset. Only self-hosted installs (where a server-wide licence governs
+    // every org) apply the tier floor below.
     try {
         const lic = _licenseModule();
         if (!lic.serverLicenseGovernsOrgs || !lic.serverLicenseGovernsOrgs()) {
@@ -219,7 +219,7 @@ async function setOrgBetaFeatures(orgId, features) {
  * This is the "what is this org entitled to" question, and the answer depends
  * on the deployment model:
  *
- *   - self-hosted / private-cloud (server licence governs): the admin-managed
+ *   - self-hosted (server licence governs): the admin-managed
  *     per-org grant in `organizations.beta_features` is authoritative.
  *   - cloud: the org's SUBSCRIPTION leads. The plan's `allowed_beta_features`
  *     is the source of truth — `null` grants every beta in the registry, an

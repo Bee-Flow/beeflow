@@ -143,19 +143,18 @@ async function checkConsumerResourceLimits(userId, resourceType, currentCount) {
  * @returns {Promise<string|null>} Error message if limit exceeded, null otherwise
  */
 async function checkSubscriptionLimits(orgId, agentType, userId = null) {
-    // Self-hosted installs don't have Stripe-backed subscriptions. Skip the
-    // whole limit-check stack so a misconfigured DEPLOYMENT_MODE can't
+    // Self-hosted installs don't have Stripe-backed subscriptions. Any non-cloud
+    // mode (self-hosted; the retired 'private-cloud' value belongs here too)
+    // skips the whole limit-check stack so a misconfigured DEPLOYMENT_MODE can't
     // silently activate cloud billing on a self-hosted server.
-    if ((process.env.DEPLOYMENT_MODE || 'cloud') === 'self-hosted') return null;
+    if ((process.env.DEPLOYMENT_MODE || 'cloud') !== 'cloud') return null;
 
     // A server-wide licence makes the entire install run at the licence tier
     // — every org/user is covered by it, so no Stripe subscription is needed.
-    // Skip the subscription-limit stack the same way self-hosted does. This
-    // ONLY applies on governing modes (private-cloud / on-prem-cloud) that hold
-    // a server licence: without this, orgs without a Stripe row get blocked
-    // with "no active subscription" even though the server is fully licensed.
-    // On Bee Flow Cloud the server licence does NOT govern — each org must hold
-    // its own subscription — so we deliberately do NOT skip the check there
+    // Belt-and-suspenders: the non-cloud check above already returns null, but
+    // a governing server licence is the canonical reason to skip. On Bee Flow
+    // Cloud the server licence does NOT govern — each org must hold its own
+    // subscription — so we deliberately do NOT skip the check there
     // (serverLicenseGovernsOrgs() is false). See server/license/index.js.
     try {
         if (license.serverLicenseGovernsOrgs()) {

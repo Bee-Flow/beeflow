@@ -167,6 +167,9 @@ async function setTrialConfig({ default_org_trial_plan_id, default_consumer_tria
 // Never throws — signup must succeed even if Stripe is down or the configured
 // plan is missing. Logged warnings let the admin notice misconfiguration.
 async function maybeAutoGrantOrgTrial(orgId) {
+    // Trials are a Stripe/subscription concept — cloud only. Self-hosted (incl.
+    // the retired 'private-cloud' value) uses licence keys, never trials.
+    if ((process.env.DEPLOYMENT_MODE || 'cloud') !== 'cloud') return null;
     try {
         const planId = await configStore.getConfig(ORG_TRIAL_PLAN_KEY);
         if (!planId) return null;
@@ -180,6 +183,9 @@ async function maybeAutoGrantOrgTrial(orgId) {
 }
 
 async function maybeAutoGrantConsumerTrial(userId) {
+    // Trials are a Stripe/subscription concept — cloud only. Self-hosted (incl.
+    // the retired 'private-cloud' value) uses licence keys, never trials.
+    if ((process.env.DEPLOYMENT_MODE || 'cloud') !== 'cloud') return null;
     try {
         const planId = await configStore.getConfig(CONSUMER_TRIAL_PLAN_KEY);
         if (!planId) return null;

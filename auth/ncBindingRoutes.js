@@ -142,12 +142,7 @@ router.post('/admin/nc-bindings/:id/approve', requireAuth, async (req, res) => {
 //      tenantKey directly — no separate approval step (the code IS the
 //      approval).
 router.post('/admin/nc-bindings/generate-pairing-code', requireAuth, async (req, res) => {
-    // Private-cloud deployments are pre-provisioned by Bee Flow ops — admins
-    // don't self-pair new Nextclouds. The UI hides this (OrganisationSection),
-    // but gate it here too so the capability is genuinely off.
-    if (process.env.DEPLOYMENT_MODE === 'private-cloud') {
-        return res.status(403).json({ error: 'Nextcloud pairing is managed by your provider in this deployment.', code: 'pairing_disabled_private_cloud' });
-    }
+    // Nextcloud self-pairing is available on self-hosted installs.
     const sessionUser = req.session?.user;
     if (!sessionUser?.id) return res.status(401).json({ error: 'Not authenticated' });
     const freshUser = await userStore.getUser(sessionUser.id);

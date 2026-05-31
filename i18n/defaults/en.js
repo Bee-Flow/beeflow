@@ -23,7 +23,7 @@ const GUI_DEFAULTS = {
     'admin.access_denied_title': 'Access Denied',
 
     'admin.server_license.title': 'Server licence',
-    'admin.server_license.intro': 'One licence key applied install-wide. On self-hosted / private-cloud installs every organisation runs at the tier this licence carries; on Bee Flow Cloud the licence is recorded for the operator but each organisation still pays its own subscription.',
+    'admin.server_license.intro': 'One licence key applied install-wide. On self-hosted installs every organisation runs at the tier this licence carries; on Bee Flow Cloud the licence is recorded for the operator but each organisation still pays its own subscription.',
     'admin.server_license.active_badge': 'Server-wide licence active',
     'admin.server_license.inactive_badge': 'No server-wide licence applied',
     'admin.server_license.issuer': 'Issuer',

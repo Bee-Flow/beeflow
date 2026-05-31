@@ -1,7 +1,7 @@
 /**
  * Organization Azure Configuration API
  * 
- * In private-cloud mode, org admins can view and manage the SAME global
+ * On self-hosted installs, org admins can view and manage the SAME global
  * Azure configuration that platform admins set in the admin dashboard.
  * This avoids config duplication — there's one source of truth.
  */
