@@ -221,7 +221,15 @@ function validateDefinition(def, { availableTools = null, toolRequiredParams = n
         const ev = trigger.appEvent?.event;
         const set = prov && deliverableEvents[prov];
         if (set && ev && !set.has(ev)) {
-            pushW({ code: 'trigger.app_event_undeliverable', severity: 'warning', path: 'trigger.appEvent.event', message: `Trigger event "${prov}.${ev}" has no delivery path on this install — it will activate but may never fire.`, hint: 'Pick an event that has a poller or is pushed by the connector, or add a producer for this event before relying on it.' });
+            // Nextcloud push-only events need the Bee Flow ExApp connector push
+            // pipeline (pending live validation). Surface that precisely so the
+            // user isn't surprised; keep it a non-blocking warning.
+            let pushPending = false;
+            try { pushPending = prov === 'nextcloud' && require('./deliverableEvents').isPushPending(prov, ev); } catch { /* fall back to generic */ }
+            const message = pushPending
+                ? `Trigger event "${prov}.${ev}" requires the Bee Flow ExApp connector and is pending live validation — it will activate but may not fire yet.`
+                : `Trigger event "${prov}.${ev}" has no delivery path on this install — it will activate but may never fire.`;
+            pushW({ code: 'trigger.app_event_undeliverable', severity: 'warning', path: 'trigger.appEvent.event', message, hint: 'Pick a poller-backed event (e.g. file.new, calendar.event.upcoming) to fire today, or wait for the connector validation before relying on this event.' });
         }
     }
 

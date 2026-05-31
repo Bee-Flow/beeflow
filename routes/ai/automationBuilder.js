@@ -34,6 +34,7 @@ const { TOOL_SCHEMAS, applyToolCall, emptyDefinition } = require('../../automati
 const { buildFullSystemPrompt, buildLeanSystemPrompt, buildFewShotMessages } = require('../../automation/builderPrompt');
 const { summariseDefinition } = require('../../automation/summarise');
 const { validateDefinition } = require('../../automation/validate');
+const { getDeliverableEvents } = require('../../automation/deliverableEvents');
 const { getProfileForModel, CORE_TOOL_NAMES } = require('../../automation/builderModelProfiles');
 const { perUserRateLimit } = require('../../utils/perUserRateLimit');
 
@@ -398,7 +399,7 @@ router.post('/stream', requireAuth, builderRateLimit, async (req, res) => {
                         // structural errors. This keeps a half-formed graph
                         // from being saved as "ready" — the LLM gets the
                         // structured errors back and self-corrects.
-                        const finalCheck = validateDefinition(draftWrap.def);
+                        const finalCheck = validateDefinition(draftWrap.def, { deliverableEvents: getDeliverableEvents() });
                         if (!finalCheck.ok) {
                             lastValidation = finalCheck;
                             send('validation_errors', { errors: finalCheck.errors, warnings: finalCheck.warnings });
@@ -427,7 +428,7 @@ router.post('/stream', requireAuth, builderRateLimit, async (req, res) => {
                 // self-correct on specific failures (e.g. "you wired a
                 // condition with no edges") instead of looping on prose.
                 if (mutatedThisIter) {
-                    lastValidation = validateDefinition(draftWrap.def);
+                    lastValidation = validateDefinition(draftWrap.def, { deliverableEvents: getDeliverableEvents() });
                     send('validation_errors', { errors: lastValidation.errors, warnings: lastValidation.warnings });
                     if (lastValidation.errors.length || lastValidation.warnings.length) {
                         messages.push({

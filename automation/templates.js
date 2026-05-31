@@ -283,6 +283,42 @@ const TEMPLATES = [
 
 const CATEGORIES = Array.from(new Set(TEMPLATES.map(t => t.category)));
 
+// Coarse integration id from a tool name (for the gallery "requires" tags).
+function coarseIntegrationFromTool(tool) {
+    if (!tool) return null;
+    if (tool.startsWith('nextcloud')) return 'nextcloud';
+    if (tool.startsWith('gmail')) return 'gmail';
+    if (tool.startsWith('drive')) return 'google-drive';
+    if (tool.startsWith('gcal') || tool.startsWith('calendar')) return 'google-calendar';
+    if (tool.startsWith('webpage')) return 'webpages';
+    return String(tool).split('_')[0] || null;
+}
+
+// Derive which integrations a template touches + whether its trigger fires
+// today (poller-backed / schedule) or needs the pending Bee Flow ExApp
+// connector (push-pending). Used for honest gallery badges — visual only.
+function deriveTemplateMeta(t) {
+    const { isPollerBacked, isPushPending } = require('./deliverableEvents');
+    const def = t.definition || {};
+    const integrations = new Set();
+    const provider = def.trigger?.appEvent?.provider;
+    const event = def.trigger?.appEvent?.event;
+    if (provider) integrations.add(provider);
+    for (const s of (def.steps || [])) {
+        if (s.type === 'integration_action' && s.tool) {
+            const id = coarseIntegrationFromTool(s.tool);
+            if (id) integrations.add(id);
+        }
+    }
+    let triggerReadiness = 'ready';
+    if (def.trigger?.kind === 'app_event' && provider === 'nextcloud' && event) {
+        triggerReadiness = isPollerBacked('nextcloud', event)
+            ? 'ready'
+            : (isPushPending('nextcloud', event) ? 'push-pending' : 'unsupported');
+    }
+    return { requiredIntegrations: [...integrations], triggerReadiness };
+}
+
 function listTemplates() {
     return TEMPLATES.map(t => ({
         id: t.id,
@@ -291,6 +327,7 @@ function listTemplates() {
         category: t.category,
         icon: t.icon,
         tags: t.tags,
+        ...deriveTemplateMeta(t),
     }));
 }
 

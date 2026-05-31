@@ -23,6 +23,7 @@ const { getProviderForModel } = require('./aiAgent');
 const { getAdapter } = require('./providers');
 const { pool } = require('../db');
 const { sanitizeError } = require('./errorSanitizer');
+const { classifyUnknownError, remediationFor } = require('./automationErrors');
 const { resolveValue, resolveDeep, resolveInputs } = require('../automation/bind');
 const { evaluate } = require('../automation/expr');
 const { isSideEffect } = require('../automation/sideEffectMap');
@@ -346,6 +347,25 @@ function isToolErrorResult(result) {
         && !!result.error;
 }
 
+// Enrich a Nextcloud tool failure with a human-readable message + a stable
+// error_class — SURFACING ONLY. It reads the error that already bubbled up
+// and rewrites the message to "<what happened> — <what to do>", stashing the
+// raw text + classification on the error for run history. It does NOT change
+// how Nextcloud connects or how auth is resolved. Non-Nextcloud errors and
+// classifier failures pass through untouched.
+function enrichNextcloudError(toolName, err, rawText) {
+    if (!err || !toolName || !String(toolName).startsWith('nextcloud_')) return err;
+    try {
+        const { classifyNextcloudError } = require('./nextcloudErrorClassifier');
+        const c = classifyNextcloudError(rawText != null ? rawText : err);
+        err.ncRawMessage = err.message;
+        err.ncError = { code: c.code, category: c.category, remediation: c.remediation };
+        err.errorClass = c.errorClass;
+        err.message = `${c.message} — ${c.remediation}`;
+    } catch (_) { /* never let classification break the run */ }
+    return err;
+}
+
 function buildAdjacency(def) {
     const adj = new Map();
     const incoming = new Map();
@@ -469,7 +489,7 @@ async function execIntegrationAction(step, ctx, runState, mode) {
             console.warn(`[AutomationRunner] dry-run: live ${step.tool} failed, using sample (${err.message})`);
             return { output: fallback, dryRunSynthesised: true, dryRunFallback: 'live_failed' };
         }
-        throw err;
+        throw enrichNextcloudError(step.tool, err);
     }
 
     // ── Egress logging (unconditional) ── a real dispatch happened, so record
@@ -493,7 +513,7 @@ async function execIntegrationAction(step, ctx, runState, mode) {
     if (mode !== 'dry_run' && isToolErrorResult(result)) {
         const err = new Error(`${step.tool} failed: ${String(result.error)}`);
         err.toolError = true;
-        throw err;
+        throw enrichNextcloudError(step.tool, err, String(result.error));
     }
     // Cache the actual output shape so the Builder agent gets ground-truth
     // bindings on its next turn (no more guessing items vs results).
@@ -1289,6 +1309,7 @@ async function runDag(def, ctx, runStateInit, mode, dispatchStep, { recordSteps 
                             input: null,
                             output: null,
                             error: stepErr.message,
+                            errorClass: stepErr.errorClass || classifyUnknownError(stepErr),
                             branchIndex,
                         });
                     } catch { /* best-effort log */ }
@@ -1305,6 +1326,15 @@ async function runDag(def, ctx, runStateInit, mode, dispatchStep, { recordSteps 
             runState.steps[step.id] = { output: cloneRunValue(dispatched.output), status: recordedStatus };
             lastOutput = dispatched.output;
             if (recordSteps && ctx.runId) {
+                // In dry-run, annotate the RECORDED output (only) so the UI can
+                // tell a synthesized preview from ground truth. Underscore-prefixed
+                // meta keys, dry_run only — the binding source (runState.steps) is
+                // left untouched so downstream resolves stay clean.
+                let recordedOutput = dispatched.output ?? null;
+                if (mode === 'dry_run' && dispatched.dryRunSynthesised
+                    && recordedOutput && typeof recordedOutput === 'object' && !Array.isArray(recordedOutput)) {
+                    recordedOutput = { ...recordedOutput, _dryRunSynthesised: true, _dryRunFallback: dispatched.dryRunFallback || null };
+                }
                 // When dispatchStep returns from a retry-success path, it
                 // tags the result with `attempt` + `attemptStartedAt` so
                 // this row lands on attempts=N rather than overwriting the
@@ -1318,7 +1348,7 @@ async function runDag(def, ctx, runStateInit, mode, dispatchStep, { recordSteps 
                     startedAt: dispatched.attemptStartedAt || dispatched.startedAt,
                     finishedAt: new Date().toISOString(),
                     input: dispatched.inputSnapshot ?? null,
-                    output: dispatched.output ?? null,
+                    output: recordedOutput,
                     error: null,
                     branchIndex,
                 });
@@ -1535,6 +1565,7 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
                 status: 'error', startedAt: stepStartedAt, finishedAt: new Date().toISOString(),
                 input: inputForRecord,
                 output: null, error: err.message,
+                errorClass: err.errorClass || classifyUnknownError(err),
             });
             // Attempt retry per step config.
             const retry = step.retry || null;
@@ -1585,6 +1616,7 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
                             status: 'error', startedAt: attemptStartedAt, finishedAt: new Date().toISOString(),
                             input: inputForRecord,
                             output: null, error: retryErr.message,
+                            errorClass: retryErr.errorClass || classifyUnknownError(retryErr),
                         });
                     }
                 }
@@ -1643,10 +1675,20 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
         ? (sanitized.error_first_line || `Failed (${sanitized.error_code})`)
         : runErrorMsg;
 
+    // Stable, queryable class for the run (lights up the run-facets dashboard).
+    const runErrorClass = (runStatus === 'error' && runErrorObj)
+        ? (runErrorObj.errorClass || classifyUnknownError(runErrorObj))
+        : null;
+    // Nextcloud errors already embed "<cause> — <remediation>" in their text;
+    // for other errors append a generic remediation so we never double it.
+    const runRemediation = (runStatus === 'error' && !runErrorObj?.ncError && runErrorClass)
+        ? remediationFor(runErrorClass)
+        : null;
+
     const finishedAt = new Date().toISOString();
     const summary = (() => {
         if (firstRunNeedsConfirm) return 'Awaiting first-run confirmation. Review the dry-run output and approve to run live.';
-        if (runErrorMsg) return `Failed: ${userSafeError}`;
+        if (runErrorMsg) return runRemediation ? `Failed: ${userSafeError}. ${runRemediation}` : `Failed: ${userSafeError}`;
         return summariseDefinition(automation.definition || {}).summary;
     })();
 
@@ -1662,6 +1704,7 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
         finishedAt,
         durationMs: Date.now() - startedAt,
         error: runErrorMsg,
+        ...(runErrorClass ? { errorClass: runErrorClass } : {}),
         summary,
         ...(runStatus === 'awaiting_approval'
             ? { awaitingStepId: runErrorObj?.stepId || null, approvalToken }

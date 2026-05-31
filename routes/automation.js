@@ -37,6 +37,7 @@ const configStore = require('../stores/configStore');
 const cron = require('../automation/cron');
 const { validateDefinition } = require('../automation/validate');
 const { summariseDefinition } = require('../automation/summarise');
+const { getDeliverableEvents, deliverabilityForCatalog, isPushPending } = require('../automation/deliverableEvents');
 const { TOOL_REGISTRY, loadTools } = require('../automation/toolRegistry');
 const { isSideEffect, READ_ONLY } = require('../automation/sideEffectMap');
 const { getOutputSchema, synthesizeDryRunOutput } = require('../automation/outputSchemas');
@@ -337,6 +338,10 @@ router.get('/catalog', async (req, res) => {
         res.json({
             apps,
             triggerOutputs,
+            // Which app_event triggers fire today (pollerBacked) vs need the
+            // pending Bee Flow ExApp connector (pushPending). Arrays, not Sets,
+            // so the client can render honest "fires now" / "connector" hints.
+            deliverability: deliverabilityForCatalog(),
             stepTypes: ['trigger', 'integration_action', 'ai_step', 'condition', 'loop', ...(codeFlag ? ['code'] : []), 'notification'],
             triggers: [
                 { kind: 'schedule', label: 'On a schedule' },
@@ -506,20 +511,13 @@ router.post('/:id/activate', async (req, res) => {
             console.warn('[automation/activate] tool catalog build failed; activating without tool checks:', e.message);
             availableTools = null; toolRequiredParams = null;
         }
-        // NC events with a producer: triggerBus pollers ∪ connector push
-        // subscriptions (heartbeat SUBSCRIBED_EVENTS → automationEventsWebhook
-        // mapEvent/refineEvent). Anything else activates but never fires — warn.
-        const deliverableEvents = {
-            nextcloud: new Set([
-                // pollers
-                'file.new', 'file.changed', 'share.received', 'activity.new', 'notification.new', 'calendar.event.upcoming',
-                // connector push (+ refined deck events)
-                'file.deleted', 'file.renamed', 'share.created', 'share.deleted',
-                'calendar.event.created', 'calendar.event.changed', 'calendar.event.deleted',
-                'deck.card.created', 'deck.card.changed', 'deck.card.deleted', 'deck.card.completed', 'deck.card.moved',
-                'talk.message.received',
-            ]),
-        };
+        // Deliverability = poller-backed NC events only (the SaaS poll tick fires
+        // these with no connector dependency). Push-only events (Deck/Talk/share/
+        // calendar mutations) need the Bee Flow ExApp connector push pipeline,
+        // which is pending live validation — so they get a NON-BLOCKING warning
+        // ("requires Bee Flow ExApp connector — pending validation"). This is a
+        // UI honesty signal only; it does not change subscription delivery.
+        const deliverableEvents = getDeliverableEvents();
         const v = validateDefinition(a.definition || {}, { availableTools, toolRequiredParams, deliverableEvents });
         if (!v.ok) return res.status(400).json({ error: 'Invalid definition', details: v.errors });
         // Warnings are non-blocking but reported to the client.
@@ -832,6 +830,98 @@ router.post('/:id/diagnose-trigger', async (req, res) => {
         const trig = a.definition?.trigger;
         const provider = trig?.appEvent?.provider;
         const event = trig?.appEvent?.event;
+
+        // ── Nextcloud diagnostics ─────────────────────────────────────────
+        // READ-ONLY / observational. Reports the state of the trigger so the
+        // user can see why a routine is (or isn't) firing. It does NOT change
+        // how Nextcloud connects or how auth is resolved. Mirrors the Gmail
+        // check shape so the generic TriggerDiagnosePanel renders it unchanged.
+        if (trig?.kind === 'app_event' && provider === 'nextcloud') {
+            const checks = [];
+            const finish = (ok) => res.json({ ok, kind: `nextcloud.${event}`, checks });
+            const ncAppIdForEvent = (ev) => {
+                if (!ev) return 'nextcloud';
+                if (ev.startsWith('calendar.')) return 'nextcloud-calendar';
+                if (ev.startsWith('deck.')) return 'nextcloud-deck';
+                if (ev.startsWith('talk.')) return 'nextcloud-talk';
+                if (ev.startsWith('task.')) return 'nextcloud-tasks';
+                if (ev === 'notification.new') return 'nextcloud-notifications';
+                if (ev === 'activity.new') return 'nextcloud-activity';
+                if (ev.startsWith('user.status')) return 'nextcloud-status';
+                return 'nextcloud';
+            };
+
+            // 1) Integration enabled for this user/org
+            try {
+                const apps = await require('../core/integrationTools').getUserPermittedApps({
+                    userId, session: req.session,
+                    isAdmin: !!req.session?.isAdmin || req.session?.user?.role === 'admin',
+                });
+                const appId = ncAppIdForEvent(event);
+                checks.push(apps.has(appId)
+                    ? { name: 'integration_enabled', status: 'ok', message: `${appId} is enabled.` }
+                    : { name: 'integration_enabled', status: 'error', message: `${appId} is not enabled for your account.`, detail: { remediation: 'Ask your org admin to enable this Nextcloud app.' } });
+            } catch (e) {
+                checks.push({ name: 'integration_enabled', status: 'warn', message: `Could not resolve permitted apps: ${e.message}` });
+            }
+
+            // 2) Auth mode (observational — reports how NC tools authenticate)
+            let session = null;
+            try { session = await require('../automation/triggerBus').loadSession(userId); } catch { session = null; }
+            const isConnector = !!(session && (session._source === 'connector' || session.connectorOrgId || session.user?.provider === 'nextcloud_connector'));
+            if (isConnector) {
+                checks.push({ name: 'auth_mode', status: 'ok', message: 'Connector identity present — NC tools route via the Bee Flow ExApp proxy.', detail: { source: session._source || 'connector' } });
+            } else if (session && require('../integrations/nextcloudClient').isNextcloudOAuthSession(session)) {
+                checks.push({ name: 'auth_mode', status: 'ok', message: 'Nextcloud OAuth session found (bearer token).', detail: { source: session._source || 'oauth' } });
+            } else if (session?.accessToken) {
+                checks.push({ name: 'auth_mode', status: 'ok', message: 'Nextcloud session found.', detail: { source: session._source || 'session' } });
+            } else {
+                checks.push({ name: 'auth_mode', status: 'error', message: 'No Nextcloud credentials found for scheduled/offline runs.', detail: { remediation: 'Connect Nextcloud in Settings → Integrations.' } });
+            }
+
+            // 3) Subscription state (cursor / lastPolledAt / lastPushAt / failures)
+            const subs = await automationStore.getSubscriptionsForAutomation(a.id);
+            const sub = subs.find(s => s.provider === 'nextcloud' && s.eventType === event) || null;
+            if (!sub) {
+                checks.push({ name: 'subscription', status: 'error', message: 'No subscription yet — click Activate to create it.' });
+            } else {
+                const failing = (sub.consecutiveFailures || 0) > 0;
+                checks.push({
+                    name: 'subscription',
+                    status: failing ? 'warn' : 'ok',
+                    message: failing ? `Subscription ${sub.id} has ${sub.consecutiveFailures} recent failure(s).` : `Subscription ${sub.id} active (mode=${sub.mode}).`,
+                    detail: { mode: sub.mode, modePreference: sub.modePreference, lastCursor: sub.lastCursor, lastPolledAt: sub.lastPolledAt, lastPushAt: sub.lastPushAt, consecutiveFailures: sub.consecutiveFailures },
+                });
+            }
+
+            // 4) Deliverability — poller-backed fires today; push-only needs the
+            // (deferred) Bee Flow ExApp connector push pipeline.
+            const pollerBacked = getDeliverableEvents().nextcloud.has(event);
+            if (pollerBacked) {
+                checks.push({ name: 'deliverability', status: 'ok', message: 'Poller-backed — fires on the poll tick with no connector dependency.' });
+            } else if (isPushPending('nextcloud', event)) {
+                checks.push({ name: 'deliverability', status: 'warn', message: 'This event requires the Bee Flow ExApp connector and is pending live validation.' });
+            } else {
+                checks.push({ name: 'deliverability', status: 'warn', message: 'No producer for this event yet — it will not fire until a poller or the connector delivers it.' });
+            }
+
+            // 5) Recent-match probe — only meaningful for poller-backed events
+            if (pollerBacked) {
+                try {
+                    const match = await require('../automation/triggerBus').fetchLatestNextcloudMatch(userId, event, trig.appEvent.filter || null);
+                    checks.push(match
+                        ? { name: 'recent_match', status: 'ok', message: 'Found a recent matching item — the trigger has data to fire on.', detail: match }
+                        : { name: 'recent_match', status: 'warn', message: 'No recent matching activity — the trigger fires when a match arrives.' });
+                } catch (e) {
+                    const { classifyNextcloudError } = require('../core/nextcloudErrorClassifier');
+                    const c = classifyNextcloudError(e);
+                    checks.push({ name: 'recent_match', status: 'warn', message: c.message, detail: { remediation: c.remediation } });
+                }
+            }
+
+            return finish(checks.every(c => c.status !== 'error'));
+        }
+
         if (trig?.kind !== 'app_event' || provider !== 'gmail' || event !== 'mail.new') {
             return res.json({
                 ok: true,

@@ -268,57 +268,84 @@ async function connectorJwtMiddleware(req, res, next) {
             if (!org) {
                 return res.status(403).json({ error: 'Connector tenant has no organization' });
             }
-            // Hold auto-provision until the org-admin has finished the App
-            // Store onboarding wizard. Otherwise users would land here with
-            // pre-wizard defaults (mirror_all + active) which the admin may
-            // be about to switch to pending-approval / selective_groups.
-            // The SPA-side render gate translates this 403 into a friendly
-            // "Setup in progress" screen.
-            if (org.nc_instance_id && !org.nc_onboarding_completed_at) {
-                return res.status(403).json({
-                    error: 'Setup in progress — your organization administrator is finalising the Bee Flow setup. Please refresh in a few minutes.',
-                    code: 'NC_ONBOARDING_PENDING',
-                });
+            // Admin carve-out — the org's NC admin must ALWAYS be able to reach
+            // the onboarding wizard and act, even before onboarding completes and
+            // even if their Bee Flow user row was lost (e.g. an org delete/recreate
+            // race) or their NC email changed since bootstrap. Without this they
+            // fall into the NC_ONBOARDING_PENDING gate below and can never finish
+            // onboarding — a permanent 403 lockout for the whole org. Match on the
+            // stable nc_admin_uid (not email) and re-establish their org_admin row
+            // idempotently, then continue as that user.
+            const reqNcUid = String(req.headers['x-beeflow-nc-uid'] || payload.sub || '').trim();
+            if (org.nc_admin_uid && reqNcUid && reqNcUid === org.nc_admin_uid) {
+                try {
+                    const { ensureOrgAdminUser } = require('./connectorBootstrap').helpers;
+                    const adminUser = await ensureOrgAdminUser(org, {
+                        ncAdminEmail: payload.email,
+                        ncAdminUid: reqNcUid,
+                        ncAdminDisplayName: payload.name || reqNcUid,
+                    });
+                    if (adminUser) {
+                        user = adminUser;
+                        console.log(`[ConnectorJWT] Re-ensured org-admin ${adminUser.id} for org ${orgId} (onboarding-gate bypass)`);
+                    }
+                } catch (e) {
+                    console.warn(`[ConnectorJWT] ensureOrgAdminUser failed for org ${orgId}: ${e.message}`);
+                }
             }
-            const mode = org.nc_sync_mode || 'mirror_all';
-            if (mode === 'manual') {
-                return res.status(403).json({
-                    error: 'Your Nextcloud account is not provisioned in Bee Flow yet. Ask your Bee Flow administrator to invite you.',
-                });
-            }
-            const ncUid = String(req.headers['x-beeflow-nc-uid'] || payload.sub || '').trim();
-            const status = (org.nc_new_user_default_status === 'pending') ? 'pending' : 'active';
-            const userId = `nc_${orgId}_${(ncUid || payload.email).replace(/[^a-zA-Z0-9]+/g, '-').slice(0, 40)}`;
-            const defaultOrgRole = resolveDefaultNcUserOrgRole(org);
-            const r = await userStore.createUserWithSeatCheck({
-                id: userId,
-                username: payload.email,
-                email: payload.email,
-                displayName: payload.name || ncUid || payload.email,
-                role: 'user',
-                orgRole: defaultOrgRole,
-                organizationId: orgId,
-                ncUid: ncUid || null,
-                provider: 'nextcloud_connector',
-                autoProvisioned: true,
-                status,
-            }, { strict: false });
-            if (!r.created) {
-                if (r.reason === 'seat_cap') {
+            if (!user) {
+                // Hold auto-provision until the org-admin has finished the App
+                // Store onboarding wizard. Otherwise users would land here with
+                // pre-wizard defaults (mirror_all + active) which the admin may
+                // be about to switch to pending-approval / selective_groups.
+                // The SPA-side render gate translates this 403 into a friendly
+                // "Setup in progress" screen.
+                if (org.nc_instance_id && !org.nc_onboarding_completed_at) {
                     return res.status(403).json({
-                        error: 'Your organization has reached its user seat limit. Ask your Bee Flow administrator to upgrade.',
-                        code: 'seat_cap_exceeded',
+                        error: 'Setup in progress — your organization administrator is finalising the Bee Flow setup. Please refresh in a few minutes.',
+                        code: 'NC_ONBOARDING_PENDING',
                     });
                 }
-                console.warn(`[ConnectorJWT] auto-provision failed userId=${userId} reason=${r.reason}`);
-                return res.status(500).json({ error: 'Failed to provision user' });
-            }
-            user = await userStore.getUser(userId);
-            console.log(`[ConnectorJWT] Auto-provisioned user ${userId} (org=${orgId}, status=${status})`);
-            if (status === 'pending') {
-                return res.status(403).json({
-                    error: 'Your account has been created in Bee Flow but requires admin approval. Please contact your organization administrator.',
-                });
+                const mode = org.nc_sync_mode || 'mirror_all';
+                if (mode === 'manual') {
+                    return res.status(403).json({
+                        error: 'Your Nextcloud account is not provisioned in Bee Flow yet. Ask your Bee Flow administrator to invite you.',
+                    });
+                }
+                const ncUid = reqNcUid;
+                const status = (org.nc_new_user_default_status === 'pending') ? 'pending' : 'active';
+                const userId = `nc_${orgId}_${(ncUid || payload.email).replace(/[^a-zA-Z0-9]+/g, '-').slice(0, 40)}`;
+                const defaultOrgRole = resolveDefaultNcUserOrgRole(org);
+                const r = await userStore.createUserWithSeatCheck({
+                    id: userId,
+                    username: payload.email,
+                    email: payload.email,
+                    displayName: payload.name || ncUid || payload.email,
+                    role: 'user',
+                    orgRole: defaultOrgRole,
+                    organizationId: orgId,
+                    ncUid: ncUid || null,
+                    provider: 'nextcloud_connector',
+                    autoProvisioned: true,
+                    status,
+                }, { strict: false });
+                if (!r.created) {
+                    if (r.reason === 'seat_cap') {
+                        return res.status(403).json({
+                            error: 'Your organization has reached its user seat limit. Ask your Bee Flow administrator to upgrade.',
+                            code: 'seat_cap_exceeded',
+                        });
+                    }
+                    console.warn(`[ConnectorJWT] auto-provision failed userId=${userId} reason=${r.reason}`);
+                    return res.status(500).json({ error: 'Failed to provision user' });
+                }
+                user = await userStore.getUser(userId);
+                console.log(`[ConnectorJWT] Auto-provisioned user ${userId} (org=${orgId}, status=${status})`);
+                if (status === 'pending') {
+                    return res.status(403).json({
+                        error: 'Your account has been created in Bee Flow but requires admin approval. Please contact your organization administrator.',
+                    });
+                }
             }
         } else if (user.organizationId && user.organizationId !== orgId) {
             // Defence in depth: the JWT was signed with org X's key, so the user

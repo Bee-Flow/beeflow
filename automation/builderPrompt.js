@@ -486,7 +486,84 @@ function buildFewShotMessages(count = 0) {
             },
             { role: 'tool', tool_call_id: 'ex_u3', content: JSON.stringify({ ok: true, stepId: 's_send' }) },
         ],
-        // Example 3: mail attachment → Google Drive via sourceHandle (no base64
+        // Example 3 (Nextcloud): file.new (poller-backed) → read the file →
+        // AI summarise → post to a Talk room. Teaches the NC binding shapes
+        // (trigger.output.path, nextcloud_read_file.content) and that
+        // nextcloud_talk_send_message needs a `token` (the Talk room token).
+        [
+            { role: 'user', content: 'When a PDF lands in my Nextcloud Documents folder, summarise it and post the summary to my Talk room.' },
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: [{
+                    id: 'ex_n1', type: 'function',
+                    function: {
+                        name: 'builder_propose_trigger',
+                        arguments: JSON.stringify({
+                            kind: 'app_event',
+                            appProvider: 'nextcloud',
+                            appEvent: 'file.new',
+                            filter: { inFolder: '/Documents/', extension: 'pdf' },
+                        }),
+                    },
+                }],
+            },
+            { role: 'tool', tool_call_id: 'ex_n1', content: JSON.stringify({ ok: true, trigger: { id: 'trg' } }) },
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: [{
+                    id: 'ex_n2', type: 'function',
+                    function: {
+                        name: 'builder_add_action',
+                        arguments: JSON.stringify({
+                            tool: 'nextcloud_read_file',
+                            inputs: { path: { kind: 'ref', path: 'trigger.output.path' } },
+                        }),
+                    },
+                }],
+            },
+            { role: 'tool', tool_call_id: 'ex_n2', content: JSON.stringify({ ok: true, stepId: 's_read' }) },
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: [{
+                    id: 'ex_n3', type: 'function',
+                    function: {
+                        name: 'builder_add_ai_step',
+                        arguments: JSON.stringify({
+                            afterStepId: 's_read',
+                            prompt: 'Summarise this document in 3 sentences. Respond with JSON {"summary":"..."}.',
+                            outputSchema: { summary: 'string' },
+                            inputs: { text: { kind: 'ref', path: 'steps.s_read.output.content' } },
+                        }),
+                    },
+                }],
+            },
+            { role: 'tool', tool_call_id: 'ex_n3', content: JSON.stringify({ ok: true, stepId: 's_ai' }) },
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: [{
+                    id: 'ex_n4', type: 'function',
+                    function: {
+                        name: 'builder_add_action',
+                        arguments: JSON.stringify({
+                            afterStepId: 's_ai',
+                            tool: 'nextcloud_talk_send_message',
+                            inputs: {
+                                // `token` is the Talk room token — ask the user for it
+                                // (this placeholder must be replaced before activating).
+                                token: { kind: 'literal', value: '<your-talk-room-token>' },
+                                message: { kind: 'ref', path: 'steps.s_ai.output.summary' },
+                            },
+                        }),
+                    },
+                }],
+            },
+            { role: 'tool', tool_call_id: 'ex_n4', content: JSON.stringify({ ok: true, stepId: 's_post' }) },
+        ],
+        // Example 4: mail attachment → Google Drive via sourceHandle (no base64
         // through the AI context). Demonstrates filter.hasAttachment, the
         // attachments[] payload, the sourceHandle pattern, and chained
         // drive_create_folder for the invoices/year/month/supplier path.

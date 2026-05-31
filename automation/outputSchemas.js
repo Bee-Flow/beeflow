@@ -252,6 +252,11 @@ const OUTPUT_SCHEMAS = {
         shape: { calendar: 'string', count: 'integer', events: 'array of { uid, summary, description, location, attendees, dtstart, dtend, organizer, allDay }' },
         sample: { calendar: 'personal', count: 1, events: [{ uid: 'evt-1@cloud.example.com', summary: 'Standup', description: null, location: null, attendees: [], dtstart: new Date(Date.now() + 600_000).toISOString(), dtend: new Date(Date.now() + 2400_000).toISOString(), organizer: null, allDay: false }] },
     },
+    nextcloud_deck_create_card: {
+        // Returns the raw Deck card JSON (POST .../cards). Demo write tool.
+        shape: { id: 'integer', title: 'string', description: 'string', stackId: 'integer', type: 'string', order: 'integer', archived: 'boolean', duedate: 'string|null', createdAt: 'integer', lastModified: 'integer' },
+        sample: { id: 4521, title: 'Follow up with Nextcloud', description: '', stackId: 34, type: 'plain', order: 999, archived: false, duedate: null, createdAt: Math.floor(Date.now() / 1000), lastModified: Math.floor(Date.now() / 1000) },
+    },
 
     // ── GitHub writes ─────────────────────────────────────────────
     github_create_repo: {

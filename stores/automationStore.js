@@ -100,7 +100,7 @@ function rowToRun(r) {
 
 function rowToRunStep(r) {
     if (!r) return null;
-    return {
+    const out = {
         runId: r.run_id,
         stepId: r.step_id,
         stepType: r.step_type,
@@ -111,7 +111,18 @@ function rowToRunStep(r) {
         input: typeof r.input_json === 'string' ? safeParse(r.input_json, null) : (r.input_json ?? null),
         output: typeof r.output_json === 'string' ? safeParse(r.output_json, null) : (r.output_json ?? null),
         error: r.error,
+        errorClass: r.error_class ?? null,
     };
+    // Derive a human "what to do next" hint for LEGACY Nextcloud error rows
+    // recorded before the runner enriched the message. New rows already embed
+    // "<cause> — <remediation>" in `error`, so skip those to avoid doubling.
+    if (r.error && !String(r.error).includes(' — ') && /nextcloud|webdav|deck|talk|ocs/i.test(String(r.error))) {
+        try {
+            const { classifyNextcloudError } = require('../core/nextcloudErrorClassifier');
+            out.errorRemediation = classifyNextcloudError(r.error).remediation;
+        } catch { /* best-effort */ }
+    }
+    return out;
 }
 
 function safeParse(s, fallback) {
@@ -626,7 +637,7 @@ async function updateRun(id, updates) {
     return rowCount > 0;
 }
 
-async function recordRunStep({ runId, stepId, stepType, attempts = 1, status, startedAt, finishedAt, input, output, error, branchIndex = null }) {
+async function recordRunStep({ runId, stepId, stepType, attempts = 1, status, startedAt, finishedAt, input, output, error, errorClass = null, branchIndex = null }) {
     await initDB();
     if (!runId || !stepId) {
         // Defensive: NOT NULL columns; skip rather than crash the whole run.
@@ -634,13 +645,14 @@ async function recordRunStep({ runId, stepId, stepType, attempts = 1, status, st
         return;
     }
     await run(
-        `INSERT INTO automation_run_steps (run_id, step_id, step_type, attempts, status, started_at, finished_at, input_json, output_json, error, branch_index)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        `INSERT INTO automation_run_steps (run_id, step_id, step_type, attempts, status, started_at, finished_at, input_json, output_json, error, error_class, branch_index)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
          ON CONFLICT (run_id, step_id, attempts) DO UPDATE SET
             status = EXCLUDED.status,
             finished_at = EXCLUDED.finished_at,
             output_json = EXCLUDED.output_json,
             error = EXCLUDED.error,
+            error_class = EXCLUDED.error_class,
             branch_index = EXCLUDED.branch_index`,
         [
             runId, stepId, stepType, attempts, status,
@@ -648,6 +660,7 @@ async function recordRunStep({ runId, stepId, stepType, attempts = 1, status, st
             input != null ? JSON.stringify(input) : null,
             output != null ? JSON.stringify(output) : null,
             error || null,
+            errorClass || null,
             branchIndex,
         ],
     );

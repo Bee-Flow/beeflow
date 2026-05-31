@@ -14,6 +14,7 @@ const crypto = require('crypto');
 const automationStore = require('../stores/automationStore');
 const { summariseDefinition } = require('./summarise');
 const { validateDefinition } = require('./validate');
+const { getDeliverableEvents } = require('./deliverableEvents');
 const { isSideEffect } = require('./sideEffectMap');
 
 function newId(prefix = 's') { return `${prefix}_${crypto.randomBytes(3).toString('hex')}`; }
@@ -123,9 +124,25 @@ const TRIGGER_FIELDS_BY_EVENT = {
     'google-drive.file.new':          ['fileId', 'name', 'mimeType', 'parents', 'createdTime', 'owners', 'webViewLink'],
     'nextcloud.file.new':             ['activityId', 'path', 'name', 'extension', 'kind', 'actor', 'datetime', 'link'],
     'nextcloud.file.changed':         ['activityId', 'path', 'name', 'extension', 'kind', 'actor', 'datetime', 'link'],
+    'nextcloud.file.deleted':         ['activityId', 'path', 'name', 'extension', 'kind', 'actor', 'datetime', 'link'],
+    'nextcloud.file.renamed':         ['activityId', 'path', 'oldPath', 'name', 'extension', 'kind', 'actor', 'datetime', 'link'],
     'nextcloud.share.received':       ['activityId', 'path', 'name', 'kind', 'actor', 'datetime', 'link'],
+    'nextcloud.share.created':        ['shareId', 'shareType', 'path', 'name', 'kind', 'actor', 'datetime', 'link'],
     'nextcloud.activity.new':         ['activityId', 'type', 'subject', 'message', 'actor', 'objectName', 'link', 'datetime'],
     'nextcloud.notification.new':     ['notificationId', 'app', 'subject', 'message', 'link', 'datetime'],
+    // Calendar (calendar.event.upcoming is poller-backed; shapes mirror the
+    // triggerBus poller emit, not Google's). Other calendar.event.* are push-only.
+    'nextcloud.calendar.event.upcoming': ['uid', 'calendarId', 'summary', 'startsAt', 'endsAt', 'location', 'attendees', 'minutesUntilStart', 'actor', 'datetime'],
+    'nextcloud.calendar.event.created':  ['uid', 'calendarId', 'summary', 'startsAt', 'endsAt', 'location', 'actor', 'datetime'],
+    'nextcloud.calendar.event.changed':  ['uid', 'calendarId', 'summary', 'startsAt', 'endsAt', 'location', 'actor', 'datetime'],
+    // Deck — push-only (connector); fields mirror the connector normalisePayload
+    // so the variable picker shows real binding paths before validation lands.
+    'nextcloud.deck.card.created':    ['cardId', 'boardId', 'stackId', 'title', 'description', 'actor', 'datetime'],
+    'nextcloud.deck.card.changed':    ['cardId', 'boardId', 'stackId', 'title', 'archived', 'actor', 'datetime'],
+    'nextcloud.deck.card.moved':      ['cardId', 'boardId', 'stackId', 'fromStackId', 'toStackId', 'title', 'actor', 'datetime'],
+    'nextcloud.deck.card.completed':  ['cardId', 'boardId', 'stackId', 'title', 'archived', 'actor', 'datetime'],
+    // Talk — push-only (connector).
+    'nextcloud.talk.message.received':['messageId', 'roomToken', 'roomName', 'actor', 'message', 'datetime'],
     'ticket-assistant.ticket.new':    ['ticketId', 'connectionId', 'provider', 'subject', 'body', 'status', 'status_bucket', 'priority', 'category', 'sourceUri', 'attachments', 'ingestedAt'],
     'ticket-assistant.sync.completed':['connectionId', 'provider', 'outcome', 'stats'],
 };
@@ -235,6 +252,114 @@ const TRIGGER_OUTPUT_SAMPLES = {
         actor: 'bob',
         datetime: '2026-05-13T11:00:00Z',
         link: 'https://cloud.example.com/f/22345',
+    },
+    'nextcloud.file.deleted': {
+        activityId: 12348,
+        path: '/Documents/Old/Draft.docx',
+        name: 'Draft.docx',
+        extension: 'docx',
+        kind: 'file',
+        actor: 'alice',
+        datetime: '2026-05-13T11:30:00Z',
+        link: 'https://cloud.example.com/f/12348',
+    },
+    'nextcloud.file.renamed': {
+        activityId: 12349,
+        path: '/Documents/Invoices/Invoice-2026-001.pdf',
+        oldPath: '/Documents/Invoices/draft.pdf',
+        name: 'Invoice-2026-001.pdf',
+        extension: 'pdf',
+        kind: 'file',
+        actor: 'alice',
+        datetime: '2026-05-13T11:45:00Z',
+        link: 'https://cloud.example.com/f/12345',
+    },
+    'nextcloud.share.created': {
+        shareId: 778,
+        shareType: 'link',
+        path: '/Shared/Report.pdf',
+        name: 'Report.pdf',
+        kind: 'file',
+        actor: 'alice',
+        datetime: '2026-05-13T13:00:00Z',
+        link: 'https://cloud.example.com/s/AbCdEf',
+    },
+    'nextcloud.calendar.event.upcoming': {
+        uid: 'evt-9f2a',
+        calendarId: 'personal',
+        summary: 'Kickoff with Nextcloud',
+        startsAt: '2026-05-13T15:00:00+02:00',
+        endsAt: '2026-05-13T15:30:00+02:00',
+        location: 'Online',
+        attendees: ['alice@example.com', 'bob@example.com'],
+        minutesUntilStart: 15,
+        actor: 'me',
+        datetime: '2026-05-13T14:45:00Z',
+    },
+    'nextcloud.calendar.event.created': {
+        uid: 'evt-9f2b',
+        calendarId: 'personal',
+        summary: 'Design review',
+        startsAt: '2026-05-14T10:00:00+02:00',
+        endsAt: '2026-05-14T11:00:00+02:00',
+        location: '',
+        actor: 'alice',
+        datetime: '2026-05-13T09:00:00Z',
+    },
+    'nextcloud.calendar.event.changed': {
+        uid: 'evt-9f2b',
+        calendarId: 'personal',
+        summary: 'Design review (moved)',
+        startsAt: '2026-05-14T11:00:00+02:00',
+        endsAt: '2026-05-14T12:00:00+02:00',
+        location: 'Room 2',
+        actor: 'alice',
+        datetime: '2026-05-13T09:30:00Z',
+    },
+    'nextcloud.deck.card.created': {
+        cardId: 4521,
+        boardId: 12,
+        stackId: 34,
+        title: 'Follow up with Nextcloud',
+        description: 'Prep the integration demo',
+        actor: 'alice',
+        datetime: '2026-05-13T09:20:00Z',
+    },
+    'nextcloud.deck.card.changed': {
+        cardId: 4521,
+        boardId: 12,
+        stackId: 34,
+        title: 'Follow up with Nextcloud',
+        archived: false,
+        actor: 'alice',
+        datetime: '2026-05-13T10:00:00Z',
+    },
+    'nextcloud.deck.card.moved': {
+        cardId: 4521,
+        boardId: 12,
+        stackId: 36,
+        fromStackId: 34,
+        toStackId: 36,
+        title: 'Follow up with Nextcloud',
+        actor: 'alice',
+        datetime: '2026-05-13T10:30:00Z',
+    },
+    'nextcloud.deck.card.completed': {
+        cardId: 4521,
+        boardId: 12,
+        stackId: 36,
+        title: 'Follow up with Nextcloud',
+        archived: true,
+        actor: 'alice',
+        datetime: '2026-05-13T11:00:00Z',
+    },
+    'nextcloud.talk.message.received': {
+        messageId: 88123,
+        roomToken: 'a1b2c3d4',
+        roomName: 'Demo team',
+        actor: 'alice',
+        message: 'Can someone post the latest invoice summary?',
+        datetime: '2026-05-13T12:30:00Z',
     },
     'nextcloud.activity.new': {
         activityId: 12350,
@@ -1417,7 +1542,7 @@ async function _applyToolCallRaw(name, args, draftWrap) {
  */
 async function persistDraft(draftWrap, { finalize = false } = {}) {
     const def = draftWrap.def;
-    const validation = validateDefinition(def);
+    const validation = validateDefinition(def, { deliverableEvents: getDeliverableEvents() });
     const triggerType = def.trigger?.kind || 'manual';
     const scheduleCron = def.trigger?.schedule?.cron || null;
     const scheduleTz = def.trigger?.schedule?.tz || 'Europe/Amsterdam';

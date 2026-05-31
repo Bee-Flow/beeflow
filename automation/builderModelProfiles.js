@@ -95,7 +95,9 @@ const PROFILES = {
         maxIterations: 24,
         forceFirstToolCall: true,
         catalogMode: 'filtered',
-        fewShots: 2,
+        // 3 so the lean-prompt profile (which most needs worked examples) also
+        // sees the Nextcloud file.new → read → AI → Talk example (index 2).
+        fewShots: 3,
     },
     reasoning: {
         promptVariant: 'lean',

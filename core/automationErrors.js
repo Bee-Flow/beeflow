@@ -128,6 +128,27 @@ const ALL_CODES = [
     'ApprovalExpired',
 ];
 
+/**
+ * A short, user-safe "what to do next" line keyed by error_class code.
+ * Appended to the user-facing failure message so run history reads as
+ * "Failed: <cause>. <remediation>". A provider-specific classifier
+ * (e.g. nextcloudErrorClassifier) may supply a more precise remediation;
+ * this is the generic fallback by class.
+ */
+const REMEDIATION_BY_CODE = {
+    PermissionError: 'Reconnect the integration in Settings → Integrations, then re-run.',
+    TimeoutError: 'This looks transient — retry; if it persists the connector or service may be down.',
+    TransientError: 'A temporary upstream issue — retry in a moment.',
+    ValidationError: 'A required field is empty or malformed — open the step and fill the highlighted input.',
+    IntegrationError: 'Check the target exists (room token / board id / file path) and that the app is enabled.',
+    ApprovalExpired: 'The approval window elapsed — re-run the routine to request approval again.',
+    UserCanceledError: 'The run was canceled — start it again if that was unintended.',
+};
+
+function remediationFor(code) {
+    return REMEDIATION_BY_CODE[code] || 'Open run history for the raw error detail.';
+}
+
 module.exports = {
     AutomationError,
     TransientError,
@@ -138,5 +159,6 @@ module.exports = {
     UserCanceledError,
     ApprovalExpiredError,
     classifyUnknownError,
+    remediationFor,
     ALL_CODES,
 };
