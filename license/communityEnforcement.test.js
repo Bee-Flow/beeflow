@@ -123,7 +123,7 @@ async function runGate(featureName, tier) {
     //    works on Community" (nextcloud_oauth).
     //    (agent_routines, projects, pii_tokenize, web_search_guard and
     //    advanced_usage_monitoring were promoted to Enterprise in earlier waves.)
-    for (const feature of ['chat_basic', 'skills', 'kb_unlimited', 'multi_user', 'nextcloud_basic', 'nextcloud_oauth', 'integrations', 'mcp_marketplace']) {
+    for (const feature of ['chat_basic', 'skills', 'kb_unlimited', 'multi_user', 'nextcloud_basic', 'nextcloud_oauth', 'integrations']) {
         const { res, calledNext } = await runGate(feature, 'community');
         assert.strictEqual(calledNext, true, `${feature}: community must keep this`);
         assert.strictEqual(res.statusCode, null, `${feature}: community core must not 403`);

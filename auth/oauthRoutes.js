@@ -15,6 +15,19 @@ const router = express.Router();
 const { loadConfig, saveConfig, requireAdmin, OAUTH_PROVIDERS } = require('./permissions');
 const { getOrCreateSSOUserDEKCompat, setupSSOUserDEK, unlockSSOUserDEK } = require('./encryption');
 const userStore = require('../stores/userStore');
+
+// SSO tiering: Nextcloud OAuth login is a Community feature (`nextcloud_oauth`),
+// so the Nextcloud provider config/test routes stay open (admin-only). Google /
+// Microsoft / SAML SSO are Enterprise (`sso_saml`). requireSsoProvider reads the
+// `:provider` route param and lets Nextcloud through untouched, while every
+// other provider must clear the `sso_saml` licence feature. Defined here, above
+// the /providers/:provider route registrations that reference it.
+const { requireFeature } = require('../license/middleware');
+const _ssoSamlGate = requireFeature('sso_saml');
+function requireSsoProvider(req, res, next) {
+    if ((req.params?.provider || '').toLowerCase() === 'nextcloud') return next();
+    return _ssoSamlGate(req, res, next);
+}
 const { syncUserGroupsOnLogin } = require('../integrations/azureGroupSync');
 const routineCredentialStore = require('../stores/routineCredentialStore');
 const {
