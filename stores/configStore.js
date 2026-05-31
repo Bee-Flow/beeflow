@@ -307,6 +307,35 @@ async function setSecret(key, value, auditCtx = null) {
 }
 
 /**
+ * Atomic "store this secret only if the key is absent" — and ALWAYS return the
+ * authoritative stored value (the winner's, which may be a concurrent caller's).
+ *
+ * Unlike setSecret (INSERT … ON CONFLICT DO UPDATE = last-write-wins), this uses
+ * INSERT … ON CONFLICT DO NOTHING so that when many callers race to mint the
+ * same key (e.g. concurrent connector bootstraps across replicas each minting a
+ * random tenant key), exactly ONE value is ever stored and everyone reads it
+ * back. This closes the tenant-key divergence at the DB — the only shared state
+ * across server replicas. Returns the stored value, or null on failure.
+ */
+async function setSecretIfAbsent(key, value, auditCtx = null) {
+    await initDB();
+    if (!value || value === '') return await getSecret(key);
+    const orgCtx = _inferOrgIdFromKey(key);
+    const encrypted = encryptValue(String(value), orgCtx);
+    const res = await run(`
+        INSERT INTO config (key, value, updated_at) VALUES ($1, $2, NOW())
+        ON CONFLICT(key) DO NOTHING
+    `, [key, encrypted]);
+    // Bust local caches (a prior getSecret may have cached `null` for this key)
+    // so the read-back hits the DB and returns the authoritative winner.
+    _cacheInvalidate(key);
+    _cacheInvalidate(`__secret__${key}`);
+    const inserted = (res && (res.rowCount === 1 || res.rowCount === undefined && res.rows));
+    if (inserted) _auditCredentialChange(key, 'set', auditCtx).catch(() => {});
+    return await getSecret(key);
+}
+
+/**
  * Retrieve a sensitive value, decrypting if it was encrypted.
  * Transparently handles legacy plaintext values (returns as-is).
  */
@@ -505,6 +534,7 @@ module.exports = {
     deleteConfig,
     getAllConfig,
     setSecret,
+    setSecretIfAbsent,
     getSecret,
     encryptValue,
     decryptValue,

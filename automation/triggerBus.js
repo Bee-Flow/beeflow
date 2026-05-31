@@ -1619,6 +1619,35 @@ async function fetchLatestGmailMatch(userId, filter) {
     }
 }
 
+/**
+ * Find the most recent Nextcloud activity that matches an automation's trigger,
+ * shaped as the trigger payload. Used to seed MANUAL runs and trigger
+ * simulation for NC-triggered automations — without this an NC automation run
+ * by hand gets `triggerPayload=null`, so `trigger.output.path` is undefined and
+ * the first NC action fails with "path is required" (the "Sort Invoices" bug).
+ * Mirrors fetchLatestGmailMatch. Returns null when nothing matches.
+ */
+async function fetchLatestNextcloudMatch(userId, event, filter) {
+    try {
+        const session = await loadSession(userId);
+        if (!session) return null;
+        const rows = await _ncFetchActivityRows(userId, session);
+        if (!rows || !rows.length) return null;
+        const baseMatcher = pickMatcher('nextcloud', event);
+        // Newest first so a manual run binds against the latest matching item.
+        const sorted = rows.slice().sort((a, b) => Number(b.id || 0) - Number(a.id || 0));
+        for (const row of sorted) {
+            const payload = _ncNormaliseActivity(row, session);
+            const ok = baseMatcher ? applyDslFilter(payload, filter || null, baseMatcher) : true;
+            if (ok) return payload;
+        }
+        return null;
+    } catch (e) {
+        console.warn(`[TriggerBus] fetchLatestNextcloudMatch failed for user ${userId}: ${e.message}`);
+        return null;
+    }
+}
+
 module.exports = {
     dispatchEvent,
     dispatchTicketAssistantEvent,
@@ -1629,6 +1658,7 @@ module.exports = {
     buildClientState,
     getPublicBaseUrl,
     fetchLatestGmailMatch,
+    fetchLatestNextcloudMatch,
     loadSession,
     // Matchers — exported for unit testing + so other server code can
     // re-use them (e.g. a future Diagnose endpoint that wants to show

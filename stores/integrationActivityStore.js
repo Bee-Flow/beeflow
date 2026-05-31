@@ -55,6 +55,12 @@ async function initDB() {
     await exec(`ALTER TABLE integration_activity_log ADD COLUMN IF NOT EXISTS connect_ms INTEGER`).catch(() => {});
     await exec(`ALTER TABLE integration_activity_log ADD COLUMN IF NOT EXISTS is_local BOOLEAN DEFAULT false`).catch(() => {});
     await exec(`ALTER TABLE integration_activity_log ADD COLUMN IF NOT EXISTS operator TEXT`).catch(() => {});
+    // Automation/routine egress attribution — lets the run-detail UI show which
+    // node sent what, and lets Compliance Hub exclude dry-run rows from "real egress".
+    await exec(`ALTER TABLE integration_activity_log ADD COLUMN IF NOT EXISTS automation_id TEXT`).catch(() => {});
+    await exec(`ALTER TABLE integration_activity_log ADD COLUMN IF NOT EXISTS run_id TEXT`).catch(() => {});
+    await exec(`ALTER TABLE integration_activity_log ADD COLUMN IF NOT EXISTS step_id TEXT`).catch(() => {});
+    await exec(`ALTER TABLE integration_activity_log ADD COLUMN IF NOT EXISTS is_dry_run BOOLEAN DEFAULT false`).catch(() => {});
 
     await exec(`CREATE INDEX IF NOT EXISTS idx_integ_timestamp ON integration_activity_log(timestamp DESC)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_integ_org ON integration_activity_log(organization_id)`);
@@ -62,6 +68,8 @@ async function initDB() {
     await exec(`CREATE INDEX IF NOT EXISTS idx_integ_user ON integration_activity_log(user_id)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_integ_type ON integration_activity_log(integration_type)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_integ_tool ON integration_activity_log(tool_name)`);
+    await exec(`CREATE INDEX IF NOT EXISTS idx_integ_run ON integration_activity_log(run_id)`).catch(() => {});
+    await exec(`CREATE INDEX IF NOT EXISTS idx_integ_automation ON integration_activity_log(automation_id)`).catch(() => {});
     initialized = true;
 }
 
@@ -118,8 +126,9 @@ async function logIntegrationActivity(event) {
                  data_categories, pii_categories_detected, pii_scan_enabled,
                  data_summary, source, model,
                  server_ip, country_code, country_name, is_eu,
-                 peer_ip, peer_ip_source, tls_servername, connect_ms, is_local, operator)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
+                 peer_ip, peer_ip_source, tls_servername, connect_ms, is_local, operator,
+                 automation_id, run_id, step_id, is_dry_run)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
         `, [
             event.timestamp || new Date().toISOString(),
             event.organization_id || null,
@@ -147,6 +156,10 @@ async function logIntegrationActivity(event) {
             connectMs,
             isLocal,
             operator,
+            event.automation_id || null,
+            event.run_id || null,
+            event.step_id || null,
+            event.is_dry_run || false,
         ]);
     } catch (e) {
         console.error('[IntegrationActivityStore] Failed to log:', e.message);
@@ -458,6 +471,26 @@ async function getEgressLog(filters = {}, limit = 200) {
 }
 
 /**
+ * Per-run egress — every external call an automation run made, with destination,
+ * geo/EU flag and detected PII categories, for the automation run-detail UI.
+ * Ordered by step so it lines up with the run timeline.
+ */
+async function getEgressLogForRun(runId) {
+    if (!runId) return [];
+    await initDB();
+    return getAll(`
+        SELECT
+            id, timestamp, step_id, tool_name, integration_type, server_endpoint, data_direction,
+            data_categories, pii_categories_detected, is_dry_run,
+            COALESCE(peer_ip, server_ip) AS peer_ip,
+            country_code, country_name, is_eu, is_local, operator
+        FROM integration_activity_log
+        WHERE run_id = $1
+        ORDER BY timestamp ASC
+    `, [runId]);
+}
+
+/**
  * Operator-level summary — group by operator name (Google / Microsoft / Cloudflare / …)
  * with a count, distinct-IP count, and last-seen timestamp.
  */
@@ -482,6 +515,7 @@ async function getOperatorSummary(filters = {}) {
 
 module.exports = {
     logIntegrationActivity,
+    getEgressLogForRun,
     getIntegrationSummary,
     getIntegrationTimeline,
     getIntegrationByType,

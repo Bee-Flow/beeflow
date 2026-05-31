@@ -751,6 +751,7 @@ router.post('/:id/run', async (req, res) => {
         const isGmailTrig = trig?.kind === 'app_event'
             && trig?.appEvent?.provider === 'gmail'
             && trig?.appEvent?.event === 'mail.new';
+        const isNcTrig = trig?.kind === 'app_event' && trig?.appEvent?.provider === 'nextcloud';
         if (isGmailTrig && !triggerPayload) {
             const triggerBus = require('../automation/triggerBus');
             const latest = await triggerBus.fetchLatestGmailMatch(userId, trig.appEvent.filter || null);
@@ -762,6 +763,24 @@ router.post('/:id/run', async (req, res) => {
                     pending: false,
                     skipped: true,
                     message: 'No matching email found in your inbox to test against. The automation is ready — it will fire when a new matching email arrives.',
+                });
+            }
+        }
+        // Nextcloud-triggered automations need the same treatment: a manual run
+        // with no payload leaves trigger.output.path undefined and the first NC
+        // action fails ("path is required") — the "Sort Invoices" symptom.
+        if (isNcTrig && !triggerPayload) {
+            const triggerBus = require('../automation/triggerBus');
+            const ev = String(trig.appEvent.event || '').replace(/^nextcloud\./, '');
+            const latest = await triggerBus.fetchLatestNextcloudMatch(userId, ev, trig.appEvent.filter || null);
+            if (latest) {
+                triggerPayload = { provider: 'nextcloud', event: trig.appEvent.event, ...latest };
+            } else {
+                return res.status(200).json({
+                    accepted: true,
+                    pending: false,
+                    skipped: true,
+                    message: 'No matching recent Nextcloud activity to test against. The automation is ready — it will fire when a matching event arrives.',
                 });
             }
         }

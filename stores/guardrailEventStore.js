@@ -32,6 +32,11 @@ async function initDB() {
     // rows continue to leave these columns NULL.
     await exec(`ALTER TABLE guardrail_events ADD COLUMN IF NOT EXISTS attachment_filename TEXT`);
     await exec(`ALTER TABLE guardrail_events ADD COLUMN IF NOT EXISTS attachment_page INT`);
+    // Automation/routine attribution — join a guard decision to a specific run/step.
+    await exec(`ALTER TABLE guardrail_events ADD COLUMN IF NOT EXISTS automation_id TEXT`).catch(() => {});
+    await exec(`ALTER TABLE guardrail_events ADD COLUMN IF NOT EXISTS run_id TEXT`).catch(() => {});
+    await exec(`ALTER TABLE guardrail_events ADD COLUMN IF NOT EXISTS step_id TEXT`).catch(() => {});
+    await exec(`ALTER TABLE guardrail_events ADD COLUMN IF NOT EXISTS is_dry_run BOOLEAN DEFAULT false`).catch(() => {});
     await exec(`CREATE INDEX IF NOT EXISTS idx_guardrail_timestamp ON guardrail_events(timestamp DESC)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_guardrail_org ON guardrail_events(organization_id)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_guardrail_org_timestamp ON guardrail_events(organization_id, timestamp DESC)`);
@@ -49,8 +54,8 @@ async function logGuardrailEvent(event) {
     await initDB();
     try {
         await run(`
-            INSERT INTO guardrail_events (timestamp, organization_id, user_id, agent_id, agent_name, conversation_id, violation_type, violation_categories, direction, action_taken, source, model, attachment_filename, attachment_page)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            INSERT INTO guardrail_events (timestamp, organization_id, user_id, agent_id, agent_name, conversation_id, violation_type, violation_categories, direction, action_taken, source, model, attachment_filename, attachment_page, automation_id, run_id, step_id, is_dry_run)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
         `, [
             event.timestamp || new Date().toISOString(),
             event.organization_id || null,
@@ -66,6 +71,10 @@ async function logGuardrailEvent(event) {
             event.model || null,
             event.attachment_filename || null,
             typeof event.attachment_page === 'number' ? event.attachment_page : null,
+            event.automation_id || null,
+            event.run_id || null,
+            event.step_id || null,
+            event.is_dry_run || false,
         ]);
         console.log(`[GuardrailEventStore] Logged ${event.violation_type} event (${event.action_taken}) for user ${event.user_id || 'unknown'}`);
     } catch (e) {

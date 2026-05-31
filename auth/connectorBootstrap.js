@@ -251,14 +251,23 @@ async function verifyNcInstance(ncBaseUrl, expectedInstanceId) {
 // in ncBindingRoutes.js.
 async function getOrMintTenantKey(orgId) {
     const cfgKey = `${TENANT_KEY_PREFIX}${orgId}`;
-    let tenantKey = await configStore.getSecret(cfgKey);
-    if (!tenantKey) {
-        tenantKey = crypto.randomBytes(32).toString('base64url');
-        await configStore.setSecret(cfgKey, tenantKey);
-        invalidateTenantKeyCache(orgId);
+    const existing = await configStore.getSecret(cfgKey);
+    if (existing) return existing;
+    // Atomic mint: concurrent bootstraps (across replicas) each generate a
+    // candidate, but setSecretIfAbsent only stores the first and returns the
+    // authoritative winner to ALL callers — so the connector receives one
+    // consistent key no matter how many POSTs it sent. Without this, parallel
+    // mints + last-write-wins left the connector cache and the DB on different
+    // keys → every per-user JWT 403'd.
+    const candidate = crypto.randomBytes(32).toString('base64url');
+    const stored = await configStore.setSecretIfAbsent(cfgKey, candidate);
+    invalidateTenantKeyCache(orgId);
+    if (stored === candidate) {
         console.log(`[ConnectorBootstrap] Minted new tenant key for org ${orgId}`);
+    } else {
+        console.log(`[ConnectorBootstrap] Adopted concurrently-minted tenant key for org ${orgId}`);
     }
-    return tenantKey;
+    return stored || candidate;
 }
 
 // Promote / create the NC admin user inside an org. Used by the fresh-org

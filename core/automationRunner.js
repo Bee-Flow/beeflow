@@ -40,6 +40,12 @@ const {
     requestCancel,
     isCancelRequested,
 } = cancellation;
+// Safety/monitoring backbone — PII + regex guardrails + egress logging, mirroring
+// the agent/direct-chat pipeline so automations stop bypassing those controls.
+const safety = require('./automationRunner/safety');
+const { runWithProbe, markLocal } = require('./outboundProbe');
+const usageStore = require('../stores/usageStore');
+const terminationStore = require('../stores/terminationStore');
 
 const RUNNER_INTERVAL_MS = 60_000;
 const POLLING_INTERVAL_MS = 30_000;
@@ -381,11 +387,26 @@ function nextEdgesFor(stepId, adj, label = null) {
 // ── Step executors ──────────────────────────────────────
 
 async function execIntegrationAction(step, ctx, runState, mode) {
-    const inputs = resolveInputs(step.inputs || {}, runState, { allowSecrets: true });
+    let inputs = resolveInputs(step.inputs || {}, runState, { allowSecrets: true });
     const sideEffect = isSideEffect(step.tool);
+
+    // ── Safety: scan resolved inputs (toolInput scope) before anything leaves ──
+    // the platform. On a `block` action this throws GuardrailBlockError, which
+    // flows through dispatchStep's catch → on_error edge or a fail-loud run.
+    const policy = await safety.resolveAutomationPolicy(ctx);
+    const auditBase = safety.buildAuditBase(ctx, step);
+    const guardedIn = await safety.guardToolInput(inputs, policy, auditBase, mode);
+
     if (mode === 'dry_run' && sideEffect) {
-        return { output: synthesizeDryRunOutput(step.tool, inputs), dryRunSynthesised: true };
+        // No real dispatch in a side-effect dry-run, so nothing egresses — but
+        // still surface a "would block" annotation for the builder preview.
+        const out = synthesizeDryRunOutput(step.tool, inputs);
+        if (guardedIn.wouldBlock) out._guardrailWouldBlock = guardedIn.categories;
+        return { output: out, dryRunSynthesised: true };
     }
+    // Apply tokenization, then restore real values for the actual egress unless
+    // the policy deliberately keeps PII tokenized for external destinations.
+    inputs = safety.restoreForEgress(guardedIn.value, guardedIn.tokenMap, policy);
 
     // Defense-in-depth permission check. The catalog filter that the
     // builder used at design-time may be out of date by the time a
@@ -415,19 +436,29 @@ async function execIntegrationAction(step, ctx, runState, mode) {
     }
 
     const { executeTool } = require('./toolDispatcher');
+    const { resolveIntegration } = require('./integrationToolMap');
     let result;
+    let probe = null;
     try {
-        result = await executeTool(step.tool, inputs, {
-            userId: ctx.userId,
-            session: ctx.session,
-            orgId: ctx.orgId,
-            userGroupIds: ctx.userGroupIds || [],
-            userOrgIds: ctx.userOrgIds || [],
-            // Tell email/ticket-style tools that there is NO user UI here to
-            // approve a draft — emit the side effect immediately. Only set
-            // for live mode (dry_run is handled above with synthesized output).
-            autoSend: mode === 'live',
+        // Wrap in runWithProbe so the global fetch shim captures the destination
+        // IP for the egress row. markLocal keeps on-host integrations honest.
+        const ran = await runWithProbe(async () => {
+            const meta = resolveIntegration(step.tool, inputs, { nextcloudUrl: ctx.nextcloudUrl });
+            if (meta && meta.isLocal) markLocal(meta.label || meta.integration);
+            return executeTool(step.tool, inputs, {
+                userId: ctx.userId,
+                session: ctx.session,
+                orgId: ctx.orgId,
+                userGroupIds: ctx.userGroupIds || [],
+                userOrgIds: ctx.userOrgIds || [],
+                // Tell email/ticket-style tools that there is NO user UI here to
+                // approve a draft — emit the side effect immediately. Only set
+                // for live mode (dry_run is handled above with synthesized output).
+                autoSend: mode === 'live',
+            });
         });
+        result = ran.result;
+        probe = ran.probe;
     } catch (err) {
         // Read-only tool fallback in dry-run: when a search/read tool fails
         // (auth lapsed, query yielded nothing, transient API hiccup) the
@@ -440,6 +471,12 @@ async function execIntegrationAction(step, ctx, runState, mode) {
         }
         throw err;
     }
+
+    // ── Egress logging (unconditional) ── a real dispatch happened, so record
+    // where the data went and what type it was. dry-run read-only calls are
+    // logged with is_dry_run=true so Compliance Hub can exclude them.
+    await safety.logEgress({ toolName: step.tool, toolArgs: inputs, result, probe, policy, auditBase, mode });
+
     // Empty-result fallback: a live read-only call that returned no rows
     // teaches the AI nothing about field shapes. In dry-run, swap in the
     // sample so downstream binding decisions are made against realistic
@@ -464,7 +501,10 @@ async function execIntegrationAction(step, ctx, runState, mode) {
     if (mode !== 'dry_run') {
         try { await shapeCache.recordShape({ userId: ctx.userId, toolName: step.tool, output: result }); } catch (_) {}
     }
-    return { output: result };
+    // Scan the tool output (toolOutput scope) before it enters runState and is
+    // bound by downstream steps. block → throws; redact/tokenize → transforms.
+    const guardedOut = await safety.guardToolOutput(result, policy, auditBase, mode);
+    return { output: guardedOut.result };
 }
 
 /**
@@ -622,18 +662,39 @@ async function execAiStep(step, ctx, runState, mode) {
         { role: 'user', content: userMsg },
     ];
 
+    // ── Safety: guard the ai_step prompt (userInput scope) before the LLM call.
+    // A `block` action throws GuardrailBlockError here (live), which flows to
+    // dispatchStep's catch. tokenize/redact mutates the user message in place;
+    // aiGuard.tokenMap restores real values downstream after the model replies.
+    const policy = await safety.resolveAutomationPolicy(ctx);
+    const auditBase = safety.buildAuditBase(ctx, step);
+    auditBase.model = modelId;
+    const aiGuard = await safety.guardAiInput(messages, policy, auditBase, mode);
+
+    // Usage/termination bookkeeping so automation LLM spend is visible & billable.
+    const usageAccum = { prompt: 0, completion: 0, total: 0 };
+    const accrueUsage = (resp) => {
+        const u = resp && resp.usage ? resp.usage : null;
+        if (!u) return;
+        usageAccum.prompt += u.promptTokens || u.prompt_tokens || u.input_tokens || 0;
+        usageAccum.completion += u.completionTokens || u.completion_tokens || u.output_tokens || 0;
+        usageAccum.total += u.totalTokens || u.total_tokens || (usageAccum.prompt + usageAccum.completion ? 0 : 0);
+    };
+
     // Tool-calling loop. When tools are off (the default) this collapses to
     // a single chat call exactly as before. When tools are on, the model can
     // chain a few calls — capped at 4 iterations so a misbehaving step can't
     // burn the run budget.
     const MAX_AI_STEP_TOOL_ITERATIONS = 4;
     let response;
+    let hitIterationCap = false;
     if (tools) {
         const { executeTool } = require('./toolDispatcher');
         for (let iter = 0; iter < MAX_AI_STEP_TOOL_ITERATIONS; iter++) {
             response = await adapter.chat(cfg.apiKey, cfg.url, modelId, messages, {
                 maxTokens: 4096, temperature: 0.2, tools, toolChoice: 'auto',
             });
+            accrueUsage(response);
             if (!response.toolCalls || response.toolCalls.length === 0) break;
             messages.push({
                 role: 'assistant',
@@ -654,12 +715,25 @@ async function execAiStep(step, ctx, runState, mode) {
                 catch { args = {}; }
                 let toolResult;
                 try {
-                    toolResult = await executeTool(tc.function.name, args, {
-                        userId: ctx.userId, session: ctx.session, orgId: ctx.orgId,
-                        userGroupIds: ctx.userGroupIds || [],
-                        userOrgIds: ctx.userOrgIds || [],
-                        autoSend: mode === 'live',
+                    // Guard the AI-chosen tool args + log the egress, just like a
+                    // first-class integration_action — ai_step tool calls were
+                    // previously completely unmonitored.
+                    const toolAudit = { ...auditBase, step_id: `${step.id}:${tc.function.name}` };
+                    const gIn = await safety.guardToolInput(args, policy, toolAudit, mode);
+                    const callArgs = safety.restoreForEgress(gIn.value, gIn.tokenMap, policy);
+                    const ran = await runWithProbe(async () => {
+                        const { resolveIntegration } = require('./integrationToolMap');
+                        const meta = resolveIntegration(tc.function.name, callArgs, { nextcloudUrl: ctx.nextcloudUrl });
+                        if (meta && meta.isLocal) markLocal(meta.label || meta.integration);
+                        return executeTool(tc.function.name, callArgs, {
+                            userId: ctx.userId, session: ctx.session, orgId: ctx.orgId,
+                            userGroupIds: ctx.userGroupIds || [],
+                            userOrgIds: ctx.userOrgIds || [],
+                            autoSend: mode === 'live',
+                        });
                     });
+                    toolResult = ran.result;
+                    await safety.logEgress({ toolName: tc.function.name, toolArgs: callArgs, result: toolResult, probe: ran.probe, policy, auditBase: toolAudit, mode });
                 } catch (e) {
                     toolResult = { error: e.message };
                 }
@@ -670,10 +744,13 @@ async function execAiStep(step, ctx, runState, mode) {
                 });
             }
         }
+        // Exhausted the loop with the model still wanting to call tools.
+        hitIterationCap = !!(response && response.toolCalls && response.toolCalls.length);
     } else {
         response = await adapter.chat(cfg.apiKey, cfg.url, modelId, messages, {
             maxTokens: 4096, temperature: 0.2,
         });
+        accrueUsage(response);
     }
 
     let output = response?.content || '';
@@ -692,6 +769,43 @@ async function execAiStep(step, ctx, runState, mode) {
             output = { [inferredFields[0]]: String(output).trim() };
         }
     }
+
+    // ── Safety: guard model output (agentOutput scope), then restore any input
+    // tokens so downstream steps see real values (the model saw placeholders).
+    const aiOut = await safety.guardAiOutput(output, policy, auditBase, mode);
+    output = aiOut.content;
+    if (aiGuard.tokenMap && Object.keys(aiGuard.tokenMap).length) {
+        try {
+            const { restoreTokens } = require('./piiDetection');
+            output = typeof output === 'string'
+                ? restoreTokens(output, aiGuard.tokenMap)
+                : JSON.parse(restoreTokens(JSON.stringify(output), aiGuard.tokenMap));
+        } catch (_) { /* leave tokenized rather than crash */ }
+    }
+
+    // ── Usage + termination logging (source='routine') — automation LLM spend
+    // was previously invisible in ai_usage_log / ai_task_termination_log.
+    try {
+        usageStore.logUsage({
+            user_id: ctx.userId, organization_id: ctx.orgId || null,
+            agent_id: ctx.automationId, agent_name: ctx.automationTitle || null,
+            agent_type: 'routine', model: modelId, source: 'routine',
+            conversation_id: ctx.automationId, prompt_tokens: usageAccum.prompt,
+            completion_tokens: usageAccum.completion,
+            total_tokens: usageAccum.total || (usageAccum.prompt + usageAccum.completion),
+        }).catch(() => {});
+    } catch (_) {}
+    if (hitIterationCap) {
+        try {
+            terminationStore.logTermination({
+                termination_type: 'max_iterations', source: 'routine', model: modelId,
+                user_id: ctx.userId, organization_id: ctx.orgId || null,
+                agent_id: ctx.automationId, conversation_id: ctx.automationId,
+                iteration_count: MAX_AI_STEP_TOOL_ITERATIONS,
+            }).catch(() => {});
+        } catch (_) {}
+    }
+
     return { output, _tier: resolvedTier };
 }
 
@@ -1308,6 +1422,11 @@ async function executeAutomation(automation, { triggerKind = 'manual', triggerPa
         // any callers that read it. Always false now.
         needsFirstRunConfirm: false,
         automationId: automation.id,
+        // Title is used as the agent_name surrogate in egress/guardrail rows.
+        automationTitle: automation.title || null,
+        // Best-effort NC base URL so egress rows carry a destination for
+        // nextcloud_* tools (the probe captures the real peer IP regardless).
+        nextcloudUrl: session?.connectorNcBaseUrl || session?.nextcloudUrl || automation.nc_base_url || null,
         // The full draft is needed by execAiStep so it can auto-derive an
         // outputSchema from downstream refs — without this, an ai_step that
         // produces structured fields ("replyText", "summary", etc.) just
