@@ -2079,7 +2079,7 @@ const mcpManager = require('../../core/mcpManager');
 const crypto = require('crypto');
 
 // GET /ai/mcp-servers — list all configured MCP servers (admin)
-router.get('/mcp-servers', requireAuth, async (req, res) => {
+router.get('/mcp-servers', requireAuth, requireMcp, async (req, res) => {
     try {
         const servers = await mcpManager.getServersSummary();
         res.json({ servers });
@@ -2090,7 +2090,7 @@ router.get('/mcp-servers', requireAuth, async (req, res) => {
 });
 
 // POST /ai/mcp-servers — add a new MCP server definition (admin)
-router.post('/mcp-servers', requireAuth, async (req, res) => {
+router.post('/mcp-servers', requireAuth, requireMcp, async (req, res) => {
     try {
         const { name, command, args = [], required_credentials = [], transport = 'stdio', url, category, description, icon, source = 'manual' } = req.body;
         if (!name) {
@@ -2112,7 +2112,7 @@ router.post('/mcp-servers', requireAuth, async (req, res) => {
 });
 
 // POST /ai/mcp-servers/test — test an MCP server command
-router.post('/mcp-servers/test', requireAuth, async (req, res) => {
+router.post('/mcp-servers/test', requireAuth, requireMcp, async (req, res) => {
     try {
         const { command, args = [], transport = 'stdio', url } = req.body;
         if (transport === 'stdio' && !command) return res.status(400).json({ error: 'command is required for stdio' });
@@ -2126,7 +2126,7 @@ router.post('/mcp-servers/test', requireAuth, async (req, res) => {
 });
 
 // PUT /ai/mcp-servers/:id — update an MCP server config (admin)
-router.put('/mcp-servers/:id', requireAuth, async (req, res) => {
+router.put('/mcp-servers/:id', requireAuth, requireMcp, async (req, res) => {
     try {
         const { id } = req.params;
         const { name, command, args, required_credentials, enabled, transport, url, category, description, icon } = req.body;
@@ -2151,7 +2151,7 @@ router.put('/mcp-servers/:id', requireAuth, async (req, res) => {
 });
 
 // DELETE /ai/mcp-servers/:id — remove an MCP server (admin)
-router.delete('/mcp-servers/:id', requireAuth, async (req, res) => {
+router.delete('/mcp-servers/:id', requireAuth, requireMcp, async (req, res) => {
     try {
         const { id } = req.params;
         await mcpManager.removeServer(id);
@@ -2163,7 +2163,7 @@ router.delete('/mcp-servers/:id', requireAuth, async (req, res) => {
 });
 
 // POST /ai/mcp-servers/:id/refresh — re-discover tools from a server
-router.post('/mcp-servers/:id/refresh', requireAuth, async (req, res) => {
+router.post('/mcp-servers/:id/refresh', requireAuth, requireMcp, async (req, res) => {
     try {
         const { id } = req.params;
         const tools = await mcpManager.refreshServerTools(id);
@@ -2175,7 +2175,7 @@ router.post('/mcp-servers/:id/refresh', requireAuth, async (req, res) => {
 });
 
 // GET /ai/mcp-servers/user-credentials — get MCP servers needing user credentials
-router.get('/mcp-servers/user-credentials', requireAuth, async (req, res) => {
+router.get('/mcp-servers/user-credentials', requireAuth, requireMcp, async (req, res) => {
     try {
         const userId = req.session.user.id;
         const servers = await mcpManager.getServersForUser(userId);
@@ -2187,7 +2187,7 @@ router.get('/mcp-servers/user-credentials', requireAuth, async (req, res) => {
 });
 
 // POST /ai/mcp-servers/user-credentials — save a user's credential for an MCP server
-router.post('/mcp-servers/user-credentials', requireAuth, async (req, res) => {
+router.post('/mcp-servers/user-credentials', requireAuth, requireMcp, async (req, res) => {
     try {
         const userId = req.session.user.id;
         const { serverId, credKey, value } = req.body;

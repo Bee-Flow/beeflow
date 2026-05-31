@@ -15,11 +15,13 @@
  * self-hosted core: chat with agents, knowledge bases (local, vector, hybrid,
  * reranked), the Nextcloud connector (including logging into Bee Flow from the
  * Nextcloud App Store app via `nextcloud_oauth`), multi-user with groups, the
- * skills marketplace, ALL built-in integrations (`integrations` — Google,
+ * skills marketplace and ALL built-in integrations (`integrations` — Google,
  * Microsoft, AI generation, third-party connectors, the Nextcloud module
- * family) and the MCP server marketplace (`mcp_marketplace`). Enterprise does
- * NOT add integrations — it adds the orchestration layer on top (no-code
- * automation builder, scheduled agent routines) and the rest of the
+ * family). Enterprise does NOT add the integrations themselves — it adds the
+ * orchestration layer on top (no-code automation builder, scheduled agent
+ * routines), the MCP server marketplace (`mcp_marketplace`, an enterprise beta),
+ * SSO beyond Nextcloud (`sso_saml` — Google/Microsoft/SAML; Nextcloud OAuth
+ * login stays Community via `nextcloud_oauth`) and the rest of the
  * Studio-class capabilities (voice chat,
  * webpages, automations, agent routines, meeting notes, ticket assistant,
  * notebooks, component designer, projects) on top, plus the advanced
@@ -79,17 +81,20 @@ const TIER_FEATURES = {
         'single_user_login',
         'multi_user',
         'skills',
-        // Built-in integrations + MCP are part of the free Community core.
-        // These are declarative capability MARKERS (they surface in
-        // getLicenseStatus().features so the UI/docs can reference a real
-        // flag) — they are NOT route gates: integration tool usage in chat is
-        // ungated by design (server/core/integrationTools.js gates only on
-        // OAuth/credentials + org/user toggles, never on tier), and the MCP
-        // marketplace has no tier check. Keep them here so a future edit can't
-        // silently move integrations/MCP behind Enterprise without tripping
-        // the community feature tests.
+        // Built-in integrations are part of the free Community core. This is a
+        // declarative capability MARKER (it surfaces in
+        // getLicenseStatus().features so the UI/docs can reference a real flag)
+        // — it is NOT a route gate: integration tool usage in chat is ungated
+        // by design (server/core/integrationTools.js gates only on
+        // OAuth/credentials + org/user toggles, never on tier). Kept here so a
+        // future edit can't silently move integrations behind Enterprise
+        // without tripping the community feature tests.
+        //
+        // NOTE: the MCP server marketplace (`mcp_marketplace`) is NOT here — it
+        // is an Enterprise beta (see below + core/betaFeatures.js). Nextcloud
+        // OAuth login stays Community via `nextcloud_oauth`; Google/Microsoft/
+        // SAML SSO are Enterprise via `sso_saml`.
         'integrations',
-        'mcp_marketplace',
     ],
     enterprise: [
         // Studio-class features promoted from community in the tier
@@ -106,6 +111,11 @@ const TIER_FEATURES = {
         'notebooks',
         'projects',
         'playwright_tests',
+        // MCP server marketplace — Enterprise beta. Gated server-side on the
+        // /ai/.../mcp-servers* routes and at runtime in directChatToolStack.js
+        // (no MCP tools reach a Community agent), with a beta opt-in registered
+        // in core/betaFeatures.js.
+        'mcp_marketplace',
         // Privacy Shield clamps + Usage tabs — second wave. The licence
         // flag is the source of truth for the routes; orgPrivacyShield.js
         // and the four /api/usage sub-routes enforce these gates.

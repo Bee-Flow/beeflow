@@ -73,7 +73,29 @@ async function buildDirectChatToolStack({ userId, session, isAdmin = false, reso
         console.warn('[DirectChatToolStack] integration tools failed:', e.message);
     }
 
-    // ── MCP tools (org-gated) ──
+    // ── MCP tools (Enterprise + org-gated) ──
+    // MCP is an Enterprise feature (`mcp_marketplace`). Resolve the caller's
+    // REAL tier (no super-admin elevation) and skip MCP injection entirely on
+    // Community — so a downgraded org's leftover server rows never leak tools
+    // to a Community agent. This mirrors the server-side requireFeature gate on
+    // the /ai/.../mcp-servers routes.
+    try {
+        const license = require('../license');
+        const userStoreForTier = require('../stores/userStore');
+        const tierUser = userId ? await userStoreForTier.getUser(userId) : null;
+        const mcpTier = await license.resolveTier({
+            userId,
+            organizationId: tierUser?.organizationId || null,
+        });
+        if (!license.tiers.tierHasFeature(mcpTier, 'mcp_marketplace')) {
+            return { tools, n8nOrgId };
+        }
+    } catch (tierErr) {
+        // Fail CLOSED for a paid feature — if we can't prove entitlement, don't
+        // inject MCP tools.
+        console.warn('[DirectChatToolStack] MCP tier check failed, skipping MCP:', tierErr.message);
+        return { tools, n8nOrgId };
+    }
     try {
         const mcpManager = require('./mcpManager');
         let mcpTools = await mcpManager.getAllToolsAsOpenAI();

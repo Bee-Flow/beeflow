@@ -52,7 +52,7 @@ module.exports = {
     '/api/projects': { gate: 'projects', beta: null, notes: 'Enterprise tier (promoted in second-wave tightening). configStore.feature_projects_enabled remains as a per-deployment kill switch (runs AFTER the licence gate so the frontend sees feature_locked first).' },
     '/api/org-privacy-shield': { gate: null, beta: null, notes: 'Soft tier clamps applied in-handler: on community tier the PUT handler clamps piiDetectionAction → "block" (pii_tokenize gate) and forces webSearchGuardEnabled → false (web_search_guard gate). Stored row is preserved across upgrades. See server/routes/orgPrivacyShield.js.' },
     '/api/reminders': { gate: null, beta: null, notes: 'Core community feature' },
-    '/api/ai-tasks': { gate: null, beta: null, notes: 'Core community feature' },
+    '/api/ai-tasks': { gate: 'agent_routines', beta: 'agent_routines', notes: 'Enterprise tier + beta opt-in — Agent Routines (Studio → Routines), scheduled recurring agent runs. Gated at the mount in server/index.js.' },
     '/api/kb': { gate: null, beta: null, notes: 'Knowledge base is community-tier; max_kb_sources limit enforces caps' },
 
     // ── License / billing admin routes (auth + per-handler RBAC) ─────

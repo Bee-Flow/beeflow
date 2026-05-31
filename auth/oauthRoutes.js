@@ -1196,7 +1196,7 @@ router.get('/providers', requireAdmin, async (req, res) => {
     });
 });
 
-router.get('/providers/:provider', requireAdmin, async (req, res) => {
+router.get('/providers/:provider', requireAdmin, requireSsoProvider, async (req, res) => {
     const { provider } = req.params;
     const config = await loadConfig();
 
@@ -1228,7 +1228,7 @@ router.get('/providers/:provider', requireAdmin, async (req, res) => {
     }
 });
 
-router.put('/providers/:provider', requireAdmin, async (req, res) => {
+router.put('/providers/:provider', requireAdmin, requireSsoProvider, async (req, res) => {
     const { provider } = req.params;
     const config = await loadConfig();
 
@@ -1273,7 +1273,7 @@ router.put('/providers/:provider', requireAdmin, async (req, res) => {
     }
 });
 
-router.post('/providers/:provider/test', requireAdmin, async (req, res) => {
+router.post('/providers/:provider/test', requireAdmin, requireSsoProvider, async (req, res) => {
     const { provider } = req.params;
     const config = await loadConfig();
 

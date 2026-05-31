@@ -272,15 +272,26 @@ async function resolveConnectorAuth(session) {
         }
         const ts = Math.floor(Date.now() / 1000);
         const method = (options.method || 'GET').toUpperCase();
+        // Nextcloud's AppAPI proxy (which fronts the connector's /nc/* route for
+        // SaaS→NC callbacks) forwards standard HTTP verbs but rejects WebDAV
+        // methods (PROPFIND/REPORT/MKCOL/MOVE/COPY/…) with 405. Tunnel those over
+        // POST + X-HTTP-Method-Override; the connector restores the real method
+        // before it reaches Nextcloud (where DAV works fine). The HMAC is signed
+        // over the REAL method so the connector can verify it after un-tunnelling.
+        const STANDARD_METHODS = new Set(['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']);
+        const needsTunnel = !STANDARD_METHODS.has(method);
+        const wireMethod = needsTunnel ? 'POST' : method;
         const message = `${ts}\n${method}\n${pathOnly}\n${ncUid}`;
         const sig = crypto.createHmac('sha256', tenantKey).update(message).digest('hex');
         const headers = {
             ...(options.headers || {}),
             'X-Beeflow-Sig': `${ts}.${sig}`,
             'X-Beeflow-NC-Uid': ncUid,
+            ...(needsTunnel ? { 'X-HTTP-Method-Override': method } : {}),
         };
         const doOnce = () => fetch(url, {
             ...options,
+            method: wireMethod,
             headers,
             signal: options.signal || AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         });
