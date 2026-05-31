@@ -17,9 +17,9 @@ const { getOrCreateSSOUserDEKCompat, setupSSOUserDEK, unlockSSOUserDEK } = requi
 const userStore = require('../stores/userStore');
 // requireSsoProvider (the Nextcloud-exempt `sso_saml` gate) is defined lower in
 // this file, just above the `/providers/:provider` route registrations that use
-// it — see the "Provider-Specific Configuration API" section. It's a hodistable
-// const there; do NOT redeclare it here (a second declaration crashes module
-// load with "Identifier 'requireSsoProvider' has already been declared").
+// it — see the "Provider-Specific Configuration API" section. Do NOT redeclare
+// it here (a second declaration crashes module load with "Identifier
+// 'requireSsoProvider' has already been declared").
 const { syncUserGroupsOnLogin } = require('../integrations/azureGroupSync');
 const routineCredentialStore = require('../stores/routineCredentialStore');
 const {
@@ -1201,18 +1201,29 @@ router.get('/providers', requireAdmin, async (req, res) => {
     });
 });
 
-// Guards the /providers/:provider SSO routes: rejects unknown providers with a
-// 404 before the handler runs. NOTE: this middleware was *referenced* by the
-// three routes below but never defined/imported, which crashed server boot with
-// `ReferenceError: requireSsoProvider is not defined`. Defined here to restore
-// boot; validates against the configured OAuth providers plus the Nextcloud
-// OAuth bridge ('nextcloud').
+// Guards the /providers/:provider SSO routes. Two jobs:
+//   1. Reject unknown providers with a 404 before the handler runs.
+//   2. Tier-gate SSO: Nextcloud OAuth login is a Community feature
+//      (`nextcloud_oauth`), so the Nextcloud provider stays reachable; Google /
+//      Microsoft / SAML SSO are Enterprise (`sso_saml`) and 403 on Community.
+// Defined ONCE here, just above the three /providers/:provider routes that
+// reference it — do NOT redeclare it elsewhere (a second declaration crashes
+// module load with "Identifier 'requireSsoProvider' has already been declared",
+// which crash-looped the server). The licence middleware is required lazily +
+// memoised so this file has no load-order dependency on it.
+let _ssoSamlGate = null;
 const requireSsoProvider = (req, res, next) => {
-    const { provider } = req.params;
+    const provider = (req.params.provider || '').toLowerCase();
     if (provider !== 'nextcloud' && !OAUTH_PROVIDERS[provider]) {
         return res.status(404).json({ error: `Unknown SSO provider: ${provider}` });
     }
-    next();
+    // Nextcloud OAuth is Community — let it through. Everything else needs the
+    // Enterprise `sso_saml` licence feature.
+    if (provider === 'nextcloud') return next();
+    if (!_ssoSamlGate) {
+        _ssoSamlGate = require('../license/middleware').requireFeature('sso_saml');
+    }
+    return _ssoSamlGate(req, res, next);
 };
 
 router.get('/providers/:provider', requireAdmin, requireSsoProvider, async (req, res) => {

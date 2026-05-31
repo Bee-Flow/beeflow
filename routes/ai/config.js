@@ -2078,6 +2078,19 @@ router.put('/n8n/permissions', requireOrgAdminForN8n, async (req, res) => {
 const mcpManager = require('../../core/mcpManager');
 const crypto = require('crypto');
 
+// MCP Server Marketplace is an Enterprise feature (it was moved out of the
+// Community licence — see server/license/tiers.js). Gate every /mcp-servers*
+// route below with the licence middleware. Community sessions get a 403
+// `feature_locked`; super-admins bypass via the resolver's super-admin path.
+//
+// Defined ONCE here, immediately above the routes that reference it — do NOT
+// redeclare `requireMcp` elsewhere. The crash this fixes was the routes using
+// `requireMcp` while its definition/import were never added (a half-applied
+// edit), which aborts module load with `ReferenceError: requireMcp is not
+// defined` and crash-loops the whole server.
+const { requireFeature } = require('../../license/middleware');
+const requireMcp = requireFeature('mcp_marketplace');
+
 // GET /ai/mcp-servers — list all configured MCP servers (admin)
 router.get('/mcp-servers', requireAuth, requireMcp, async (req, res) => {
     try {
