@@ -234,9 +234,14 @@ async function connectorJwtMiddleware(req, res, next) {
             }
             return next();
         }
-        // Stale session — destroy it and fall through to header-based auth.
+        // Stale session — invalidate it and fall through to header-based (JWT)
+        // auth. We REGENERATE rather than destroy(): destroy() nulls req.session
+        // for the rest of THIS request, which then crashes every downstream
+        // reader (requireAuth/requireAdmin read req.session.isAuthenticated) as
+        // well as the JWT re-auth + login handlers that repopulate the session.
+        // regenerate() leaves a fresh, empty, valid session object in its place.
         console.log(`[ConnectorJWT] Dropping stale session for missing user ${req.session.user.id}`);
-        await new Promise(resolve => req.session.destroy(() => resolve()));
+        await new Promise(resolve => req.session.regenerate(() => resolve()));
     }
 
     // Connector requests are tagged with this header. Without it, fall through

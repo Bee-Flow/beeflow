@@ -304,7 +304,7 @@ async function _publish(channel, message) {
 setImmediate(() => { try { _ensureSubscriber(); } catch (_) { /* non-fatal */ } });
 
 const requireAuth = async (req, res, next) => {
-    if (!req.session.isAuthenticated || !req.session.user) {
+    if (!req.session || !req.session.isAuthenticated || !req.session.user) {
         return res.status(401).json({ error: 'Not authenticated' });
     }
 
@@ -583,7 +583,7 @@ async function hasPermission(userId, permission, session = null) {
 
 // Middleware to check admin or manage_users permission (dynamic)
 const requireAdmin = async (req, res, next) => {
-    if (!req.session.isAuthenticated || !req.session.user) {
+    if (!req.session || !req.session.isAuthenticated || !req.session.user) {
         return res.status(401).json({ error: 'Not authenticated' });
     }
 
@@ -601,7 +601,7 @@ const requireAdmin = async (req, res, next) => {
 // Middleware factory to require a specific permission
 const requirePermission = (permissionId) => {
     return async (req, res, next) => {
-        if (!req.session.isAuthenticated || !req.session.user) {
+        if (!req.session || !req.session.isAuthenticated || !req.session.user) {
             return res.status(401).json({ error: 'Not authenticated' });
         }
 
@@ -616,7 +616,7 @@ const requirePermission = (permissionId) => {
 };
 
 const requirePluginAdmin = async (req, res, next) => {
-    if (!req.session.isAuthenticated || !req.session.user) {
+    if (!req.session || !req.session.isAuthenticated || !req.session.user) {
         return res.status(401).json({ error: 'Not authenticated' });
     }
     const userId = req.session.user?.id;
