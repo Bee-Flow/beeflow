@@ -58,7 +58,8 @@ app.use((req, res, next) => {
 // Mark them non-cacheable. Image-ish endpoints (icons, branding) are excluded
 // so they keep their own long-lived caching.
 app.use((req, res, next) => {
-    if ((req.path.startsWith('/auth/') || req.path.startsWith('/api/'))
+    if ((req.path.startsWith('/auth/') || req.path.startsWith('/api/')
+            || req.path.startsWith('/ai/') || req.path.startsWith('/agents/'))
         && !req.path.startsWith('/api/icons')
         && !req.path.startsWith('/api/branding')) {
         res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
