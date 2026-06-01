@@ -455,6 +455,20 @@ async function executeTool(toolName, toolArgs, context = {}) {
         return await executeTranscriptionTool(toolName, toolArgs, { userId, session, attachments, req });
     }
 
+    // ─── Progressive-disclosure safety net ─────────────────────
+    // If the name belongs to a heavy integration group but no executor above
+    // claimed it, the model likely referenced a tool it never loaded. Hand
+    // back a recoverable hint instead of a confusing "unknown tool" so it can
+    // self-correct via load_tools. (No-op for the normal Claude path, which
+    // can only emit tools that were actually sent.)
+    try {
+        const { toolNameToGroupKey } = require('./toolDisclosure');
+        const grp = toolNameToGroupKey(toolName);
+        if (grp) {
+            return { error: `Tool "${toolName}" belongs to the "${grp}" group, which isn't loaded yet. Call load_tools({groups:["${grp}"]}) first, then call this tool.` };
+        }
+    } catch (_) { /* non-fatal — fall through to component lookup */ }
+
     // ─── Fallback: Component Tools ──────────────────────────────
     return await executeComponentTool(toolName, toolArgs, userAuth, fixedParams, agentId);
 }

@@ -601,6 +601,47 @@ router.post('/config/auto-classifier', requireAuth, async (req, res) => {
     }
 });
 
+// ─── Title-generation Model ──────────────────────────────────────
+// Conversation titles are a tiny, tool-free LLM call. By default the
+// title generator inherits the Fast tier model, but admins often want
+// the very cheapest model here (a heavy Fast tier shouldn't make titling
+// expensive). When unset, falls back to the title system-agent config and
+// then the Fast tier.
+
+router.get('/config/title-model', requireAuth, async (req, res) => {
+    if (!(await isAdminUser(req))) return res.status(403).json({ error: 'Admin access required' });
+    try {
+        const modelId = await configStore.getConfig('title_generation_model');
+        res.json({ modelId: typeof modelId === 'string' ? modelId : null });
+    } catch (e) {
+        console.error('Failed to get title-generation model:', e);
+        res.status(500).json({ error: 'Failed to fetch config' });
+    }
+});
+
+router.post('/config/title-model', requireAuth, async (req, res) => {
+    if (!(await isAdminUser(req))) return res.status(403).json({ error: 'Admin access required' });
+    try {
+        const raw = req.body?.modelId;
+        const modelId = typeof raw === 'string' && raw.trim() ? raw.trim() : null;
+
+        if (modelId) {
+            const { getProviderForModel } = require('../../core/aiAgent');
+            try {
+                await getProviderForModel(modelId);
+            } catch (_) {
+                return res.status(400).json({ error: `Model "${modelId}" not found in any configured provider` });
+            }
+        }
+
+        await configStore.setConfig('title_generation_model', modelId);
+        res.json({ success: true, modelId });
+    } catch (e) {
+        console.error('Failed to save title-generation model:', e);
+        res.status(500).json({ error: 'Failed to save config' });
+    }
+});
+
 // ─── Claude-specific settings ────────────────────────────────────
 // Global knobs that only apply to Anthropic Claude models. Per-tier
 // settings (model, max_tokens, effort, budget_tokens) live in the

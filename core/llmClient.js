@@ -52,15 +52,30 @@ class LLMClient {
      * Generate a short title for a conversation.
      */
     async generateTitle(modelId, userMessage, systemPrompt, options = {}) {
+        // `maxInputChars` lets callers pass a short multi-turn transcript (the
+        // direct-chat titler does this) without it being clipped to one line.
+        // It must NOT reach the chat adapter, so it's destructured out here.
+        const { maxInputChars = 500, ...chatOpts } = options;
         // Empty/whitespace user content is a fast no-op: Anthropic and others
         // reject `messages.0` with no content. Without this guard the route
         // logged a noisy 400 for every attachment-only turn.
         const safeUserContent = typeof userMessage === 'string'
-            ? userMessage.slice(0, 500)
-            : (userMessage == null ? '' : JSON.stringify(userMessage).slice(0, 500));
+            ? userMessage.slice(0, maxInputChars)
+            : (userMessage == null ? '' : JSON.stringify(userMessage).slice(0, maxInputChars));
         if (!safeUserContent || !safeUserContent.trim()) return 'New Chat';
+        // Title generation is a tool-free task. State that explicitly so the
+        // model doesn't try to "use" tools or emit code blocks — observed when
+        // a tool-heavy chat's transcript primes it toward code output.
+        const toolFreeNote = 'You have NO tools and cannot browse the web or run code — only read the conversation and output a short title (no code blocks).';
+        const defaultTitlePrompt = `You are naming a chat conversation. ${toolFreeNote} Output a short 2-5 word title (max ~40 characters) describing its topic. Output ONLY the title — no quotes, no extra text.`;
+        // Ensure the tool-free guarantee is present even when an admin-edited
+        // system-agent prompt (which predates this) is supplied.
+        let titleSystemPrompt = defaultTitlePrompt;
+        if (systemPrompt && systemPrompt.trim()) {
+            titleSystemPrompt = /no tools/i.test(systemPrompt) ? systemPrompt : `${systemPrompt}\n\n${toolFreeNote}`;
+        }
         const messages = [
-            { role: 'system', content: systemPrompt || 'Generate a short 2-4 word title for this conversation. Output only the title.' },
+            { role: 'system', content: titleSystemPrompt },
             { role: 'user', content: safeUserContent },
         ];
         const result = await this.chat(modelId, messages, {
@@ -68,7 +83,7 @@ class LLMClient {
             temperature: 0.3,
             budgetTokens: 0,           // Disable thinking — title gen is trivial
             reasoningEffort: 'none',   // Disable reasoning for OpenAI models too
-            ...options,
+            ...chatOpts,
         });
         const raw = result.content || '';
         // Defensive sanitisation — the model has been observed returning a

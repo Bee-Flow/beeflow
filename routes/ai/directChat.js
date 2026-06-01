@@ -40,6 +40,38 @@ const { buildTokenPreservationAddendum } = require('../../core/dlp/tokenPreserva
 const { applyTokenMapToMessages } = require('../../core/dlp/applyTokenMapToOutbound');
 
 /**
+ * Build a short, TOOL-FREE transcript for conversation-title generation:
+ * the first two user+assistant exchanges as plain "User:/Assistant:" lines,
+ * with any tool calls/results stripped. The title model has no tools and must
+ * not be primed with tool noise (it otherwise hallucinates code blocks in
+ * tool-heavy chats). Each line is capped so the whole thing stays tiny.
+ */
+function buildTitleTranscript(savedMessages) {
+    if (!Array.isArray(savedMessages)) return '';
+    const lines = [];
+    let users = 0, assistants = 0;
+    for (const m of savedMessages) {
+        if (!m || (m.role !== 'user' && m.role !== 'assistant')) continue;
+        if (m.role === 'user' && users >= 2) continue;
+        if (m.role === 'assistant' && assistants >= 2) continue;
+        let text = '';
+        if (typeof m.content === 'string') text = m.content;
+        else if (Array.isArray(m.content)) {
+            text = m.content
+                .filter(b => b && b.type === 'text' && typeof b.text === 'string')
+                .map(b => b.text).join(' ');
+        }
+        text = (text || '').replace(/\s+/g, ' ').trim();
+        if (!text) continue;
+        if (text.length > 500) text = text.slice(0, 500);
+        lines.push(`${m.role === 'user' ? 'User' : 'Assistant'}: ${text}`);
+        if (m.role === 'user') users++; else assistants++;
+        if (users >= 2 && assistants >= 2) break;
+    }
+    return lines.join('\n');
+}
+
+/**
  * Strip bulky fields from tool results before they become LLM messages.
  * The full content is already sent via SSE to the frontend;
  * the LLM only needs the compact confirmation message.
@@ -499,6 +531,23 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
     let webpagePlanProposedThisTurn = false;
 
     try {
+        // ─── Progressive tool disclosure: prior activations ─────────────
+        // Which heavy integration groups has this conversation already
+        // expanded? Those keep their full schemas (eager) instead of being
+        // re-advertised in the catalog. Fetched here (before tool assembly)
+        // because the main conversation-metadata load happens much later.
+        const toolDisclosure = require('../../core/toolDisclosure');
+        let activatedToolGroups = new Set();
+        let disclosureLazyByGroup = null;
+        if (conversationId) {
+            try {
+                const _convGroups = await agentStore.getDirectConversation(conversationId, userId, { restore: false });
+                if (Array.isArray(_convGroups?.activatedToolGroups)) {
+                    activatedToolGroups = new Set(_convGroups.activatedToolGroups);
+                }
+            } catch (_) { /* non-fatal — fall back to no pre-activations */ }
+        }
+
         // Load tools enabled for this tier
         const allComponents = componentManager.getComponents();
         const tierToolsConfig = await configStore.getConfig('direct_chat_tier_tools');
@@ -756,6 +805,36 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
             console.log(`[DirectChat] Notebook tools stripped for attachment-Q&A turn (${before} → ${directChatTools.length} tools)`);
         }
 
+        // ─── Progressive tool disclosure ─────────────────────────────────
+        // Swap heavy integration groups for a compact catalog + a `load_tools`
+        // meta-tool; keep small/frequent tools (web search, KB, notebook,
+        // built-ins, media, components) eager. Groups already activated on a
+        // prior turn stay eager with full schemas. The model calls load_tools
+        // mid-turn to pull a group on demand (see applyLoadTools below). Skipped
+        // for light users and when the feature flag is off.
+        let toolCatalogText = '';
+        try {
+            const disclosureOn = (await configStore.getConfig('feature_progressive_tool_disclosure')) !== false;
+            if (disclosureOn && toolDisclosure.countLazyTools(directChatTools) >= toolDisclosure.MIN_TOOLS_FOR_DISCLOSURE) {
+                const { eager, lazyByGroup } = toolDisclosure.partitionTools(directChatTools);
+                disclosureLazyByGroup = lazyByGroup;
+                const next = [...eager];
+                for (const key of activatedToolGroups) {
+                    const entry = lazyByGroup.get(key);
+                    if (entry) for (const t of entry.tools) {
+                        const tn = t.function?.name || t.name;
+                        if (!next.find(x => (x.function?.name || x.name) === tn)) next.push(t);
+                    }
+                }
+                next.push(toolDisclosure.loadToolsDefinition);
+                directChatTools = next;
+                toolCatalogText = toolDisclosure.buildToolCatalog(lazyByGroup, activatedToolGroups);
+                console.log(`[DirectChat] Tool disclosure: ${eager.length} eager + ${lazyByGroup.size} lazy group(s), ${activatedToolGroups.size} pre-activated → ${directChatTools.length} tools sent`);
+            }
+        } catch (discErr) {
+            console.warn('[DirectChat] Tool disclosure failed (sending full toolset):', discErr.message);
+        }
+
         // Build messages array
         emitPhase(send, 'building_prompt');
         const _spT = Date.now();
@@ -770,8 +849,10 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
             + systemPromptText
             + `\n\nToday is ${today}.`;
 
-        // Build explicit integration hints so the AI knows what tools it has
-        const toolHint = await buildToolHint(directChatTools, userId);
+        // Build explicit integration hints so the AI knows what tools it has.
+        // With disclosure on, buildToolHint only describes the eager/loaded
+        // tools still in directChatTools; toolCatalogText advertises the rest.
+        const toolHint = (await buildToolHint(directChatTools, userId)) + toolCatalogText;
 
         // ─── Project context injection ───────────────────────────────
         let projectContext = '';
@@ -2642,6 +2723,31 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
             return clean;
         });
 
+        // Progressive-disclosure: handle a `load_tools` call by injecting the
+        // requested groups' real schemas into the live tool list (visible to
+        // the model on the very next streamed round, which re-reads
+        // directChatTools) and recording the activation for persistence. Defs
+        // come from the pre-strip lazyByGroup, so strip them the same way here.
+        const applyLoadTools = (toolArgs) => {
+            if (!disclosureLazyByGroup) return 'Tool groups are not available in this conversation.';
+            const loadedNames = new Set(directChatTools.map(t => t.function?.name || t.name));
+            const res = toolDisclosure.expandGroups(toolArgs?.groups, {
+                lazyByGroup: disclosureLazyByGroup,
+                loadedNames,
+                currentToolCount: directChatTools.length,
+            });
+            for (const def of res.addedDefs) {
+                const { _mcp, _n8n, ...clean } = def;
+                const cname = clean.function?.name || clean.name;
+                if (!directChatTools.find(t => (t.function?.name || t.name) === cname)) {
+                    directChatTools.push(clean);
+                }
+            }
+            for (const key of res.added) activatedToolGroups.add(key);
+            if (res.added.length) send('tools_loaded', { groups: res.added });
+            return toolDisclosure.buildLoadResult(res);
+        };
+
         // Eager-create moved above the attachment scan so `convId` is
         // available when the attachment scanner calls
         // `dlpRunner.mergeTokenMap(convId, …)`. See the block earlier in
@@ -2818,7 +2924,9 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                                     }
                                 }
                             }
-                            if (toolName === 'propose_webpage_plan') {
+                            if (toolName === toolDisclosure.LOAD_TOOLS_TOOL_NAME) {
+                                toolResult = applyLoadTools(toolArgs);
+                            } else if (toolName === 'propose_webpage_plan') {
                                 toolResult = executeProposeWebpagePlan(toolArgs);
                                 if (toolResult._action === 'webpage_plan_proposed') {
                                     webpagePlanProposedThisTurn = true;
@@ -3435,7 +3543,9 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                             }
                         }
                     }
-                    if (toolName === 'propose_webpage_plan') {
+                    if (toolName === toolDisclosure.LOAD_TOOLS_TOOL_NAME) {
+                        toolResult = applyLoadTools(toolArgs);
+                    } else if (toolName === 'propose_webpage_plan') {
                         toolResult = executeProposeWebpagePlan(toolArgs);
                         if (toolResult._action === 'webpage_plan_proposed') {
                             webpagePlanProposedThisTurn = true;
@@ -4077,6 +4187,12 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                 updateMeta.completedSessionSkillIds = completedSessionSkillIds;
                 updateMeta.sessionSkillsCompletions = sessionSkillsCompletions;
             }
+            // Progressive tool disclosure — remember which heavy integration
+            // groups this conversation expanded so later turns send them eager
+            // (full schema) instead of re-discovering via load_tools.
+            if (activatedToolGroups.size > 0) {
+                updateMeta.activatedToolGroups = [...activatedToolGroups];
+            }
             await agentStore.updateDirectConversation(convId, savedMessages, userId, updateMeta);
             // Persist the user's tier selection on the conversation so a refresh
             // restores the picker to what they last chose ("auto" stays "auto").
@@ -4111,52 +4227,60 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                 } catch (e) { /* ignore */ }
             }
 
-            // Generate title for new conversations (skip if moderation violation — don't send unsafe content to title LLM)
-            console.log(`[DirectChat] Title check: savedMessages=${savedMessages.length}, moderationViolation=${!!moderationViolation}`);
-            // Title gen only runs when BOTH the user prompt and the assistant
-            // response have non-empty trimmed content. Anthropic and most other
-            // providers reject `messages.0` with empty content; attachment-only
-            // or tool-only turns would otherwise log a 400 every time.
-            // Use `displayContent` for the title-gen guard — `fullContent` is
-            // now the tokenised storage form which may differ in content but
-            // is never empty when the un-tokenised one isn't.
-            const _titleHasUserContent = !!(tokenizedMessage && typeof tokenizedMessage === 'string' && tokenizedMessage.trim());
-            const _titleHasAssistantContent = !!(displayContent && typeof displayContent === 'string' && displayContent.trim());
-            if (savedMessages.length <= 2 && !moderationViolation && _titleHasUserContent && _titleHasAssistantContent) {
+            // ─── Conversation title ──────────────────────────────────
+            // Deferred to the SECOND assistant reply and built from the
+            // conversation so far (tool-free), so the title reflects the real
+            // topic rather than a vague opening line. The first reply just
+            // seeds a "New Chat" placeholder so the sidebar isn't blank.
+            // Idempotent: only (re)generates while the title is still a
+            // placeholder, so a chat titled on turn 2 is never re-titled.
+            const _assistantReplies = savedMessages.filter(m => m && m.role === 'assistant').length;
+            const _titleIsPlaceholder = !conv.title || !String(conv.title).trim() || /^new chat$/i.test(String(conv.title).trim());
+            console.log(`[DirectChat] Title check: assistantReplies=${_assistantReplies}, currentTitle="${conv.title || ''}", placeholder=${_titleIsPlaceholder}, moderationViolation=${!!moderationViolation}`);
+
+            if (_assistantReplies === 1) {
+                // First reply — seed a neutral placeholder, NO title LLM call yet.
+                if (_titleIsPlaceholder) {
+                    try { await agentStore.updateDirectConversationTitle(convId, 'New Chat', userId); } catch (_) { /* non-fatal */ }
+                    send('title', { title: 'New Chat', conversationId: convId });
+                }
+            } else if (_assistantReplies >= 2 && _titleIsPlaceholder && !moderationViolation) {
+                // Second reply — generate the real title from the conversation.
                 try {
                     const llmClient = require('../../core/llmClient');
                     const { resolveModelWithGlobalFallback } = require('../../core/modelResolver');
                     const titleAgent = await agentStore.getSystemAgent('system-title-generator');
-                    const rawTitleModel = titleAgent?.model || 'tier:fast';
+                    // Dedicated title model (admin) → title system-agent → Fast tier.
+                    const titleModelCfg = await configStore.getConfig('title_generation_model');
+                    const rawTitleModel = (typeof titleModelCfg === 'string' && titleModelCfg.trim())
+                        ? titleModelCfg.trim()
+                        : (titleAgent?.model || 'tier:fast');
                     const titleModel = await resolveModelWithGlobalFallback(rawTitleModel, {
                         userOrgId: userOrgForTiers || null,
                         userId,
                         fallbackTier: 'fast',
                     }) || modelId;
-                    console.log(`[DirectChat] Title: generating with model=${titleModel}`);
-                    const title = await llmClient.generateTitle(
-                        titleModel,
-                        tokenizedMessage,
-                        titleAgent?.system_prompt
-                    );
-                    console.log(`[DirectChat] Title generated: "${title}" for conv ${convId}`);
-                    await agentStore.updateDirectConversationTitle(convId, title, userId);
-                    send('title', { title, conversationId: convId });
-                    console.log(`[DirectChat] Title saved and sent via SSE`);
+                    // Tool-free transcript of the first two exchanges.
+                    const transcript = buildTitleTranscript(savedMessages);
+                    if (transcript && transcript.trim()) {
+                        console.log(`[DirectChat] Title: generating with model=${titleModel}`);
+                        const title = await llmClient.generateTitle(
+                            titleModel,
+                            transcript,
+                            titleAgent?.system_prompt,
+                            { maxInputChars: 1600 },
+                        );
+                        console.log(`[DirectChat] Title generated: "${title}" for conv ${convId}`);
+                        await agentStore.updateDirectConversationTitle(convId, title, userId);
+                        send('title', { title, conversationId: convId });
+                    }
                 } catch (e) {
                     console.error('[DirectChat] Title generation failed:', e.message, e.stack);
                 }
-            } else if (savedMessages.length <= 2 && !moderationViolation && (!_titleHasUserContent || !_titleHasAssistantContent)) {
-                // Skip title gen but seed a sensible default so the conversation
-                // doesn't appear nameless in the sidebar.
-                const fallbackTitle = 'New Chat';
-                try { await agentStore.updateDirectConversationTitle(convId, fallbackTitle, userId); } catch (_) { /* non-fatal */ }
-                send('title', { title: fallbackTitle, conversationId: convId });
-                console.log(`[DirectChat] Title gen skipped (userEmpty=${!_titleHasUserContent}, assistantEmpty=${!_titleHasAssistantContent}) — used fallback "${fallbackTitle}"`);
-            } else if (savedMessages.length <= 2 && moderationViolation) {
-                // Moderation violation — set a safe generic title instead
+            } else if (_assistantReplies >= 2 && _titleIsPlaceholder && moderationViolation) {
+                // Moderation violation on a still-unnamed chat — safe generic title.
                 const safeTitle = 'New Chat';
-                await agentStore.updateDirectConversationTitle(convId, safeTitle, userId);
+                try { await agentStore.updateDirectConversationTitle(convId, safeTitle, userId); } catch (_) { /* non-fatal */ }
                 send('title', { title: safeTitle, conversationId: convId });
             }
         }

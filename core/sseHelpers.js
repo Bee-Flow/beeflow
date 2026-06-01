@@ -73,16 +73,55 @@ async function persistAndTitle({ conversation, messages, encryptionKey, userId, 
     // Save conversation
     await agentStore.updateConversation(conversation.id, messages, encryptionKey, userId);
 
-    // Generate title for new conversations (skip if moderation violation)
-    if (messages.length <= 3 && generateTitle && !skipTitle) {
+    // Title generation: deferred to the SECOND exchange (≥2 user and ≥2
+    // assistant messages) and built from a tool-free transcript, so the title
+    // reflects the real topic rather than a vague opening line. Idempotent —
+    // only runs while the title is still a placeholder, so it's set once.
+    const userMsgs = Array.isArray(messages) ? messages.filter(m => m && m.role === 'user').length : 0;
+    const assistantMsgs = Array.isArray(messages) ? messages.filter(m => m && m.role === 'assistant').length : 0;
+    const titleIsPlaceholder = !conversation.title || !String(conversation.title).trim()
+        || /^new chat$/i.test(String(conversation.title).trim());
+    if (userMsgs >= 2 && assistantMsgs >= 2 && titleIsPlaceholder && generateTitle && !skipTitle) {
         try {
-            const title = await generateTitle(userMessage, null, orgId, userId);
+            const transcript = _buildTitleTranscript(messages) || userMessage;
+            const title = await generateTitle(transcript, null, orgId, userId);
             if (title && title !== 'New Chat') {
                 await agentStore.updateConversationTitle(conversation.id, title);
                 sendEvent('title_update', { title, conversationId: conversation.id });
             }
         } catch (e) { /* ignore title gen errors */ }
     }
+}
+
+/**
+ * Short, tool-free transcript (first two user+assistant exchanges) for title
+ * generation — role + text only, no tool calls/results. Mirrors the direct-
+ * chat titler so both surfaces title from the conversation, not just the
+ * opening message.
+ */
+function _buildTitleTranscript(messages) {
+    if (!Array.isArray(messages)) return '';
+    const lines = [];
+    let users = 0, assistants = 0;
+    for (const m of messages) {
+        if (!m || (m.role !== 'user' && m.role !== 'assistant')) continue;
+        if (m.role === 'user' && users >= 2) continue;
+        if (m.role === 'assistant' && assistants >= 2) continue;
+        let text = '';
+        if (typeof m.content === 'string') text = m.content;
+        else if (Array.isArray(m.content)) {
+            text = m.content
+                .filter(b => b && b.type === 'text' && typeof b.text === 'string')
+                .map(b => b.text).join(' ');
+        }
+        text = (text || '').replace(/\s+/g, ' ').trim();
+        if (!text) continue;
+        if (text.length > 500) text = text.slice(0, 500);
+        lines.push(`${m.role === 'user' ? 'User' : 'Assistant'}: ${text}`);
+        if (m.role === 'user') users++; else assistants++;
+        if (users >= 2 && assistants >= 2) break;
+    }
+    return lines.join('\n');
 }
 
 /**
