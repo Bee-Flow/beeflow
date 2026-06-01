@@ -4245,27 +4245,45 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                     send('title', { title: 'New Chat', conversationId: convId });
                 }
             } else if (_assistantReplies >= 2 && _titleIsPlaceholder && !moderationViolation) {
-                // Second reply — generate the real title from the conversation.
+                // Second reply — generate the real title from the conversation,
+                // using the SAME model selection + inference path as the chat
+                // tier (getProviderForModel + getAdapter + adapter.chat). The
+                // title model is the dedicated admin model if set, else the same
+                // EU-aware Fast tier the chat resolves from, else this
+                // conversation's model. When it equals the conversation model we
+                // reuse the already-resolved adapter/key/url (no second lookup,
+                // identical to the chat call).
                 try {
                     const llmClient = require('../../core/llmClient');
-                    const { resolveModelWithGlobalFallback } = require('../../core/modelResolver');
                     const titleAgent = await agentStore.getSystemAgent('system-title-generator');
-                    // Dedicated title model (admin) → title system-agent → Fast tier.
                     const titleModelCfg = await configStore.getConfig('title_generation_model');
-                    const rawTitleModel = (typeof titleModelCfg === 'string' && titleModelCfg.trim())
-                        ? titleModelCfg.trim()
-                        : (titleAgent?.model || 'tier:fast');
-                    const titleModel = await resolveModelWithGlobalFallback(rawTitleModel, {
-                        userOrgId: userOrgForTiers || null,
-                        userId,
-                        fallbackTier: 'fast',
-                    }) || modelId;
+                    let titleModelId;
+                    if (typeof titleModelCfg === 'string' && titleModelCfg.trim()) {
+                        titleModelId = titleModelCfg.trim();
+                    } else if (titleAgent?.model && !/^tier:/.test(titleAgent.model)) {
+                        titleModelId = titleAgent.model;
+                    } else {
+                        titleModelId = tiers['fast']?.modelId || modelId;
+                    }
+
+                    // Resolve the provider exactly like the tier path; reuse the
+                    // conversation's resolved provider when the model matches.
+                    let tAdapter = adapter, tApiKey = apiKey, tApiUrl = apiUrl, tApiVersion = config.apiVersion;
+                    if (titleModelId && titleModelId !== modelId) {
+                        const tCfg = await getProviderForModel(titleModelId);
+                        tApiUrl = (tCfg.url || '').replace(/\/+$/, '');
+                        tAdapter = getAdapter(tCfg.providerType, tApiUrl);
+                        tApiKey = tCfg.apiKey;
+                        tApiVersion = tCfg.apiVersion;
+                        titleModelId = tCfg.model || titleModelId;
+                    }
+
                     // Tool-free transcript of the first two exchanges.
                     const transcript = buildTitleTranscript(savedMessages);
                     if (transcript && transcript.trim()) {
-                        console.log(`[DirectChat] Title: generating with model=${titleModel}`);
-                        const title = await llmClient.generateTitle(
-                            titleModel,
+                        console.log(`[DirectChat] Title: generating with model=${titleModelId}`);
+                        const title = await llmClient.generateTitleWithProvider(
+                            { adapter: tAdapter, apiKey: tApiKey, apiUrl: tApiUrl, modelId: titleModelId, apiVersion: tApiVersion },
                             transcript,
                             titleAgent?.system_prompt,
                             { maxInputChars: 1600 },

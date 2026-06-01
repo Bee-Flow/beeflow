@@ -26,6 +26,10 @@ class LLMClient {
             project: config.project || null,
             location: config.location || null,
             serviceAccountKey: config.serviceAccountKey || null,
+            // apiVersion is required by the Azure adapter (api-version query
+            // param). The direct-chat tier path forwards it; dropping it here
+            // silently broke Azure-hosted calls (e.g. title generation).
+            apiVersion: config.apiVersion || null,
         };
     }
 
@@ -34,8 +38,8 @@ class LLMClient {
      * @returns {Promise<{content, toolCalls, usage}>}
      */
     async chat(modelId, messages, options = {}) {
-        const { apiKey, baseUrl, adapter, project, location, serviceAccountKey } = await this._resolve(modelId);
-        return adapter.chat(apiKey, baseUrl, modelId, messages, { ...options, project, location, serviceAccountKey });
+        const { apiKey, baseUrl, adapter, project, location, serviceAccountKey, apiVersion } = await this._resolve(modelId);
+        return adapter.chat(apiKey, baseUrl, modelId, messages, { ...options, project, location, serviceAccountKey, apiVersion });
     }
 
     /**
@@ -44,25 +48,21 @@ class LLMClient {
      *   text, thinking, tool_use, done, error
      */
     async stream(modelId, messages, options = {}, onEvent) {
-        const { apiKey, baseUrl, adapter, project, location, serviceAccountKey } = await this._resolve(modelId);
-        return adapter.stream(apiKey, baseUrl, modelId, messages, { ...options, project, location, serviceAccountKey }, onEvent);
+        const { apiKey, baseUrl, adapter, project, location, serviceAccountKey, apiVersion } = await this._resolve(modelId);
+        return adapter.stream(apiKey, baseUrl, modelId, messages, { ...options, project, location, serviceAccountKey, apiVersion }, onEvent);
     }
 
     /**
-     * Generate a short title for a conversation.
+     * Build the tool-free [system, user] message pair for title generation.
+     * Returns null when there's no usable user content.
      */
-    async generateTitle(modelId, userMessage, systemPrompt, options = {}) {
-        // `maxInputChars` lets callers pass a short multi-turn transcript (the
-        // direct-chat titler does this) without it being clipped to one line.
-        // It must NOT reach the chat adapter, so it's destructured out here.
-        const { maxInputChars = 500, ...chatOpts } = options;
+    _buildTitleMessages(userMessage, systemPrompt, maxInputChars = 500) {
         // Empty/whitespace user content is a fast no-op: Anthropic and others
-        // reject `messages.0` with no content. Without this guard the route
-        // logged a noisy 400 for every attachment-only turn.
+        // reject `messages.0` with no content.
         const safeUserContent = typeof userMessage === 'string'
             ? userMessage.slice(0, maxInputChars)
             : (userMessage == null ? '' : JSON.stringify(userMessage).slice(0, maxInputChars));
-        if (!safeUserContent || !safeUserContent.trim()) return 'New Chat';
+        if (!safeUserContent || !safeUserContent.trim()) return null;
         // Title generation is a tool-free task. State that explicitly so the
         // model doesn't try to "use" tools or emit code blocks — observed when
         // a tool-heavy chat's transcript primes it toward code output.
@@ -74,32 +74,75 @@ class LLMClient {
         if (systemPrompt && systemPrompt.trim()) {
             titleSystemPrompt = /no tools/i.test(systemPrompt) ? systemPrompt : `${systemPrompt}\n\n${toolFreeNote}`;
         }
-        const messages = [
+        return [
             { role: 'system', content: titleSystemPrompt },
             { role: 'user', content: safeUserContent },
         ];
-        const result = await this.chat(modelId, messages, {
-            maxTokens: 60,
-            temperature: 0.3,
-            budgetTokens: 0,           // Disable thinking — title gen is trivial
-            reasoningEffort: 'none',   // Disable reasoning for OpenAI models too
-            ...chatOpts,
-        });
-        const raw = result.content || '';
-        // Defensive sanitisation — the model has been observed returning a
-        // truncated HTML/code block when asked for a title in a tool-heavy
-        // session. Strip code-fence prefixes, collapse to a single line, drop
-        // anything that looks like a tag, and cap length.
-        let cleaned = raw.trim().replace(/[\"']/g, '');
-        // If it opens with a code fence ("```html", "```js", "```\n…") it's
-        // almost certainly hallucinated source code, not a title.
+    }
+
+    /** Defensive title sanitisation — strip code fences/tags, collapse, cap. */
+    _sanitiseTitle(raw) {
+        let cleaned = (raw || '').trim().replace(/[\"']/g, '');
+        // If it opens with a code fence it's almost certainly hallucinated code.
         if (/^```/.test(cleaned)) return 'New Chat';
-        // Strip any leftover HTML tags before length-capping.
         cleaned = cleaned.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
         if (!cleaned) return 'New Chat';
-        // Cap to a reasonable conversation-list length.
         if (cleaned.length > 80) cleaned = cleaned.slice(0, 80).trim();
         return cleaned;
+    }
+
+    /**
+     * Generate a title using an ALREADY-RESOLVED provider/adapter — the exact
+     * same primitives the direct-chat tier path uses (getProviderForModel +
+     * getAdapter → adapter.chat(apiKey, apiUrl, modelId, msgs, { …, apiVersion })).
+     * Callers that have already resolved the provider (e.g. directChat, which
+     * shares the conversation's adapter) pass it in so there's no second
+     * lookup and no chance of a divergent resolution.
+     * @param {{adapter, apiKey, apiUrl, modelId, apiVersion}} provider
+     */
+    async generateTitleWithProvider(provider, userMessage, systemPrompt, options = {}) {
+        const { adapter, apiKey, apiUrl, modelId, apiVersion } = provider || {};
+        if (!adapter || !modelId) return 'New Chat';
+        const { maxInputChars = 500, ...chatOpts } = options;
+        const messages = this._buildTitleMessages(userMessage, systemPrompt, maxInputChars);
+        if (!messages) return 'New Chat';
+        try {
+            const result = await adapter.chat(apiKey, apiUrl, modelId, messages, {
+                maxTokens: 64,
+                temperature: 0.3,
+                budgetTokens: 0,           // Disable thinking — title gen is trivial
+                reasoningEffort: 'none',   // Disable reasoning for OpenAI models too
+                apiVersion: apiVersion || undefined,
+                ...chatOpts,
+            });
+            return this._sanitiseTitle(result.content || '');
+        } catch (e) {
+            console.error('[LLMClient.generateTitle] inference failed:', e.message);
+            return 'New Chat';
+        }
+    }
+
+    /**
+     * Generate a short title for a conversation. Resolves the provider the same
+     * way the chat-tier path does (via _resolve → getProviderForModel +
+     * getAdapter, now including apiVersion) and delegates to
+     * generateTitleWithProvider, so a provider error returns 'New Chat' instead
+     * of bubbling.
+     */
+    async generateTitle(modelId, userMessage, systemPrompt, options = {}) {
+        let r;
+        try {
+            r = await this._resolve(modelId);
+        } catch (e) {
+            console.error('[LLMClient.generateTitle] provider resolution failed:', e.message);
+            return 'New Chat';
+        }
+        return this.generateTitleWithProvider(
+            { adapter: r.adapter, apiKey: r.apiKey, apiUrl: r.baseUrl, modelId: r.modelId || modelId, apiVersion: r.apiVersion },
+            userMessage,
+            systemPrompt,
+            options,
+        );
     }
 
     /**
