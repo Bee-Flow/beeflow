@@ -206,7 +206,11 @@ function requireFeature(featureName) {
         if (resolution.error === 'tier_unavailable') {
             return res.status(503).json({ error: 'tier_unavailable', retry_after: 1 });
         }
-        if (!tiers.tierHasFeature(resolution.tier, featureName)) {
+        // Plan-level grants (the plan's allowed_features) extend the tier, so a
+        // plan that lists this feature unlocks it for its orgs even below the
+        // feature's natural tier. Mirrors hasFeature() + /license/status.
+        const grantedByPlan = await license.orgGrantsFeature(resolution.orgIds, featureName);
+        if (!tiers.tierHasFeature(resolution.tier, featureName) && !grantedByPlan) {
             const required = findRequiredTierForFeature(featureName) || 'enterprise';
             console.warn(`[license] feature_locked user=${req.session?.user?.id} feature=${featureName} required=${required} current=${resolution.tier} orgs=${JSON.stringify(resolution.orgTiers)} candidateOrgIds=${JSON.stringify(resolution.orgIds)}`);
             return res.status(403).json({

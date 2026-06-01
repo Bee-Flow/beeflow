@@ -83,14 +83,26 @@ router.get('/my-permissions', requireAuth, async (req, res) => {
     try {
         const { resolveBestTierForRequest } = require('../license/middleware');
         const licenseTiers = require('../license/tiers');
+        const license = require('../license');
         const { listCompoundGatedFeatures } = require('../core/betaFeatures');
-        const { tier } = await resolveBestTierForRequest(req);
+        const resolution = await resolveBestTierForRequest(req);
+        const tier = resolution.tier;
+        // Plan-level grants (the plan's allowed_features) extend the tier, so a
+        // feature listed in the org's plan counts as licensed even below its
+        // natural tier. Fetch the union once per org (not per feature) — this
+        // mirrors hasFeature() / requireFeature() / /license/status so the UI
+        // gate and the API gates agree.
+        const grantedFeatures = new Set();
+        for (const orgId of (resolution.orgIds || [])) {
+            for (const f of await license.getOrgGrantedFeatures(orgId)) grantedFeatures.add(f);
+        }
         // Derived from the BETA_FEATURES registry — every entry with a
         // licenseFeature is automatically reflected here. Adding a new
         // compound-gated feature requires only a registry edit, never a
         // change to this endpoint.
         for (const g of listCompoundGatedFeatures()) {
-            const hasLicense = licenseTiers.tierHasFeature(tier, g.licenseFeature);
+            const hasLicense = licenseTiers.tierHasFeature(tier, g.licenseFeature)
+                || grantedFeatures.has(g.licenseFeature);
             const hasBeta = betaFeatures.includes(g.id);
             canUseFeature[g.id] = hasLicense && hasBeta;
         }

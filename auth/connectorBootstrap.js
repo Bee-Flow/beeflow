@@ -321,6 +321,45 @@ async function ensureOrgAdminUser(org, { ncAdminEmail, ncAdminUid, ncAdminDispla
     return await userStore.getUser(user.id);
 }
 
+// Best-effort provision EVERY other NC admin (besides the primary, already
+// ensured by the caller) as an org_admin, so any admin — not just the one who
+// installed — can onboard/use Bee Flow. `ncAdmins` is the list the connector
+// (v≥0.1.35) sends in the bootstrap body; older connectors omit it and we no-op.
+// Per-admin failures are logged and SKIPPED — a seat-cap or a cross-org email
+// conflict on a secondary admin must never fail the whole install. Admins count
+// as normal seats: ensureOrgAdminUser → createUserWithSeatCheck enforces the cap,
+// so over-cap admins are simply not created (and surface the same way standalone).
+// Pure: the secondary admins worth provisioning — trimmed, lower-cased email,
+// deduped by uid, with the primary and any email-less entry dropped. Exported
+// for unit tests.
+function _selectSecondaryAdmins(ncAdmins, primaryUid) {
+    if (!Array.isArray(ncAdmins)) return [];
+    const seen = new Set();
+    const out = [];
+    for (const a of ncAdmins) {
+        const uid = String(a?.uid || '').trim();
+        const email = String(a?.email || '').trim().toLowerCase();
+        if (!uid || !email || uid === primaryUid || seen.has(uid)) continue;
+        seen.add(uid);
+        out.push({ uid, email, displayName: String(a?.displayName || '').trim() || uid });
+    }
+    return out;
+}
+
+async function ensureAdditionalOrgAdmins(org, ncAdmins, primaryUid) {
+    for (const a of _selectSecondaryAdmins(ncAdmins, primaryUid)) {
+        try {
+            await ensureOrgAdminUser(org, {
+                ncAdminEmail: a.email,
+                ncAdminUid: a.uid,
+                ncAdminDisplayName: a.displayName,
+            });
+        } catch (e) {
+            console.warn(`[ConnectorBootstrap] skipped extra NC admin ${a.uid} for org ${org.id}: ${e.message}`);
+        }
+    }
+}
+
 // Bind an existing un-bound org to this NC instance. Used by the approval
 // handler in ncBindingRoutes.js. Replaces what used to be the inline
 // "adopt existing org" branch.
@@ -457,6 +496,7 @@ router.post('/connector/bootstrap', bootstrapLimiter, async (req, res) => {
             });
             throw e;
         }
+        await ensureAdditionalOrgAdmins(boundOrg, req.body?.ncAdmins, ncAdminUid);
         const tenantKey = await getOrMintTenantKey(boundOrg.id);
         console.log(`[ConnectorBootstrap] pairing_code_redeemed org=${boundOrg.id} ncInstance=${ncInstanceId}`);
         return res.json({
@@ -483,6 +523,7 @@ router.post('/connector/bootstrap', bootstrapLimiter, async (req, res) => {
             });
             throw e;
         }
+        await ensureAdditionalOrgAdmins(org, req.body?.ncAdmins, ncAdminUid);
         const tenantKey = await getOrMintTenantKey(org.id);
         if (connectorCallbackUrl && org.connector_callback_url !== connectorCallbackUrl) {
             await userStore.updateOrganization(org.id, { connectorCallbackUrl });
@@ -609,6 +650,7 @@ router.post('/connector/bootstrap', bootstrapLimiter, async (req, res) => {
                 });
                 throw e;
             }
+            await ensureAdditionalOrgAdmins(raced, req.body?.ncAdmins, ncAdminUid);
             const tenantKey = await getOrMintTenantKey(raced.id);
             console.log(`[ConnectorBootstrap] fresh_org_race_resolved org=${raced.id} ncInstance=${ncInstanceId}`);
             return res.json({
@@ -641,6 +683,7 @@ router.post('/connector/bootstrap', bootstrapLimiter, async (req, res) => {
         });
         throw e;
     }
+    await ensureAdditionalOrgAdmins(org, req.body?.ncAdmins, ncAdminUid);
     const tenantKey = await getOrMintTenantKey(org.id);
     return res.json({
         tenantKey,
@@ -945,6 +988,8 @@ module.exports.helpers = {
     PENDING_TTL_SECONDS,
     getOrMintTenantKey,
     ensureOrgAdminUser,
+    ensureAdditionalOrgAdmins,
+    _selectSecondaryAdmins,
     bindOrgToNcInstance,
     defaultProvisioningMode,
     resolveProvisioningMode,

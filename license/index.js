@@ -264,14 +264,46 @@ function resolveTierFromLicense(lic) {
     return tiers.isValidTier(lic.tier) ? tiers.normalizeTier(lic.tier) : COMMUNITY_FALLBACK;
 }
 
+// A subscription plan can grant individual features BEYOND what its tier
+// includes, via the plan's `allowed_features` list (the same additive grant
+// list the encryption gate in loginRoutes.js reads). The tier-based feature
+// checks union these plan-level grants in, so a plan that lists e.g.
+// "webpages" grants it to its orgs even on a lower tier — this is what makes
+// "a feature enabled in the subscription works" hold for connector orgs whose
+// tier (Free → community) doesn't natively include the feature. Org-scoped
+// only — plan grants are an organisation concept.
+async function getOrgGrantedFeatures(organizationId) {
+    if (!organizationId) return [];
+    try {
+        const limits = await getUserStore().getEffectiveLimits(organizationId);
+        return (limits && Array.isArray(limits.allowed_features)) ? limits.allowed_features : [];
+    } catch (e) {
+        if (e && e.code === '42P01') return []; // missing table on a fresh install — benign
+        return [];
+    }
+}
+
+async function orgGrantsFeature(orgIds, feature) {
+    const ids = Array.isArray(orgIds) ? orgIds : (orgIds ? [orgIds] : []);
+    for (const orgId of ids) {
+        if (!orgId) continue;
+        const granted = await getOrgGrantedFeatures(orgId);
+        if (granted.includes(feature)) return true;
+    }
+    return false;
+}
+
 /**
  * Returns true when the org/user has access to a named feature given their
- * current tier. Both `organizationId` and `userId` may be passed; the
- * higher of the two tiers wins (covers single-user installs in an org).
+ * current tier OR an explicit plan-level grant. Both `organizationId` and
+ * `userId` may be passed; the higher of the two tiers wins (covers single-user
+ * installs in an org).
  */
 async function hasFeature(scope, feature) {
     const tier = await resolveTier(scope);
-    return tiers.tierHasFeature(tier, feature);
+    if (tiers.tierHasFeature(tier, feature)) return true;
+    const orgId = typeof scope === 'string' ? scope : scope?.organizationId;
+    return orgGrantsFeature(orgId, feature);
 }
 
 async function hasTier(scope, requiredTier) {
@@ -402,13 +434,25 @@ async function getLicenseStatus({ organizationId = null, userId = null, orgIds =
     }
 
     const source = lic ? 'license_key' : (subscriptionShape ? 'stripe_subscription' : 'default');
+    // Union the tier's features with any plan-level grants (allowed_features) on
+    // the orgs this user touches, so the SPA's hasLicenseFeature() matches the
+    // backend gates (hasFeature / requireFeature) — both now honour plan grants.
+    const tierFeatures = tiers.getFeaturesForTier(tier);
+    let grantedFeatures = [];
+    for (const orgId of candidateOrgIds) {
+        const g = await getOrgGrantedFeatures(orgId);
+        if (g.length) grantedFeatures = grantedFeatures.concat(g);
+    }
+    const features = grantedFeatures.length
+        ? Array.from(new Set([...tierFeatures, ...grantedFeatures]))
+        : tierFeatures;
     return {
         tier,
         source,
         scope: scope || subscriptionScope,
         license: lic ? publicLicenseShape(lic) : null,
         subscription: subscriptionShape,
-        features: tiers.getFeaturesForTier(tier),
+        features,
         limits: tiers.getLimitsForTier(tier),
         // `serverOverride` is false here (this path runs when no governing
         // server licence applies), but `serverLicense` still surfaces an
@@ -624,6 +668,8 @@ module.exports = {
     getBestTierForOrgs,
     resolveTier,
     hasFeature,
+    orgGrantsFeature,
+    getOrgGrantedFeatures,
     hasTier,
     getLicenseStatus,
     getMaxSeatsForOrg,

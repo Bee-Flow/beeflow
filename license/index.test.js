@@ -74,8 +74,10 @@ const fakeStore = {
 const fakeUserStore = {
     _orgSubs: {},
     _consumerSubs: {},
+    _limits: {},
     async getOrgSubscription(orgId) { return this._orgSubs[orgId] || null; },
     async getConsumerSubscription(userId) { return this._consumerSubs[userId] || null; },
+    async getEffectiveLimits(orgId) { return this._limits[orgId] || null; },
 };
 
 // Intercept require('./store') and require('../stores/userStore') from any
@@ -154,6 +156,24 @@ const now = Math.floor(Date.now() / 1000);
     assert.ok(!status.features.includes('web_search_guard'), 'web_search_guard is enterprise (second wave)');
     assert.ok(!status.features.includes('advanced_usage_monitoring'), 'advanced_usage_monitoring is enterprise (second wave)');
     assert.strictEqual(status.limits.max_users, -1, 'community is uncapped');
+
+    // ── Plan-level feature grant extends the tier (allowed_features) ─────
+    // A community-tier org whose plan grants a feature via allowed_features
+    // gets it even though the tier itself doesn't include it. This is what
+    // makes "a feature enabled in the subscription works" hold for connector
+    // orgs on the Free/community tier.
+    fakeUserStore._limits['org_grant'] = { allowed_features: ['voice_chat'] };
+    assert.strictEqual(await license.hasFeature({ organizationId: 'org_grant' }, 'voice_chat'), true,
+        'plan allowed_features grants voice_chat to a community org');
+    assert.strictEqual(await license.hasFeature({ organizationId: 'org_grant' }, 'swarm'), false,
+        'a feature NOT in allowed_features stays gated');
+    assert.strictEqual(await license.hasFeature({ organizationId: 'org_unknown' }, 'voice_chat'), false,
+        'no grant and not in tier → feature stays gated');
+    assert.strictEqual(await license.orgGrantsFeature(['org_grant'], 'voice_chat'), true);
+    assert.strictEqual(await license.orgGrantsFeature(['org_unknown'], 'voice_chat'), false);
+    const grantStatus = await license.getLicenseStatus({ organizationId: 'org_grant' });
+    assert.ok(grantStatus.features.includes('voice_chat'), 'granted feature surfaces in /license/status.features');
+    assert.ok(grantStatus.features.includes('chat_basic'), 'tier features remain alongside grants');
 
     // ── Activate a legacy Pro license → resolves as enterprise ─────────
     const proToken = sign({
