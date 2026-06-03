@@ -31,6 +31,7 @@ const userStore = require('../stores/userStore');
 const configStore = require('../stores/configStore');
 const encryption = require('./encryption');
 const orgRolesConfig = require('../config/orgRoles.json');
+const { checkConnectorSignupAllowed } = require('./signupGuards');
 
 // True iff the request's Nextcloud uid is THIS org's recorded NC admin. Used to
 // let the org admin past the NC_ONBOARDING_PENDING gate so onboarding can never
@@ -331,6 +332,16 @@ async function connectorJwtMiddleware(req, res, next) {
                     return res.status(403).json({
                         error: 'Your Nextcloud account is not provisioned in Bee Flow yet. Ask your Bee Flow administrator to invite you.',
                     });
+                }
+                // Geo-blocking for connector signups — evaluated against the
+                // connecting Nextcloud server's location (req.ip). Gates only the
+                // creation of a NEW user; existing users and the admin carve-out
+                // above are never geo-checked. Fail-open and never throws so the
+                // connector can't break on a geo hiccup. See signupGuards.js.
+                const geoGate = await checkConnectorSignupAllowed(req);
+                if (!geoGate.ok) {
+                    console.log(`[ConnectorJWT] Geo-blocked auto-provision for ${payload.email} (org=${orgId}, country=${geoGate.country || 'unknown'})`);
+                    return res.status(geoGate.status).json({ error: geoGate.error, code: geoGate.code });
                 }
                 const ncUid = reqNcUid;
                 const status = (org.nc_new_user_default_status === 'pending') ? 'pending' : 'active';

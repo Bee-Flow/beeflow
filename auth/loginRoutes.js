@@ -13,6 +13,7 @@ const userStore = require('../stores/userStore');
 const configStore = require('../stores/configStore');
 const { loadConfig, saveConfig, requireAuth, requireAdmin, getUserPermissions } = require('./permissions');
 const { getOrCreateUserDEKCompat, setupSSOUserDEK, unlockSSOUserDEK, unlockWithRecoveryKey, secureClear } = require('./encryption');
+const { checkWebSignupAllowed, getSignupAccessConfig } = require('./signupGuards');
 
 /**
  * Check if encryption is enabled for a user based on their org's subscription plan.
@@ -140,6 +141,9 @@ router.get('/setup-status', async (req, res) => {
     const allowConsumerSignups = envAllowSignups ? ((await configStore.getConfig('signup_consumer_enabled')) ?? true) : false;
     const waitlistEnabled = (await configStore.getConfig('signup_waitlist_enabled')) ?? false;
     const consumerLoginMethods = (await configStore.getConfig('consumer_login_methods')) ?? ['password', 'google', 'microsoft'];
+    // Connector-only mode blocks all web signups (org, consumer, OAuth) — hide
+    // the "Create Account" button by reporting allowSignups=false below.
+    const connectorOnly = (await configStore.getConfig('signup_connector_only')) ?? false;
 
     // Self-hosted deploys have a single tenant — surface its branding pre-auth
     // so the login page and initial loading screen can render the customer's
@@ -164,9 +168,10 @@ router.get('/setup-status', async (req, res) => {
         serverUrl,
         deploymentMode,
         branding,
-        allowSignups: allowOrgSignups || allowConsumerSignups,
+        allowSignups: (allowOrgSignups || allowConsumerSignups) && !connectorOnly,
         allowOrgSignups,
         allowConsumerSignups,
+        connectorOnly,
         waitlistEnabled,
         consumerLoginMethods,
         allowPasswordLogin: process.env.ALLOW_PASSWORD_LOGIN !== 'false',
@@ -788,6 +793,9 @@ router.post('/pending-signup', async (req, res) => {
     if (process.env.ALLOW_SIGNUPS === 'false') {
         return res.status(403).json({ error: 'Account creation is disabled on this server.' });
     }
+    // Connector-only + geo gating (OAuth signup entry point)
+    const gate = await checkWebSignupAllowed(req);
+    if (!gate.ok) return res.status(gate.status).json({ error: gate.error, code: gate.code });
     const { signupType, authMethod, newOrgName, orgDetails } = req.body;
 
     // Consumer OAuth signup
@@ -835,7 +843,18 @@ router.get('/admin/signup-settings', requireAdmin, async (req, res) => {
         const consumerEnabled = (await configStore.getConfig('signup_consumer_enabled')) ?? true;
         const waitlistEnabled = (await configStore.getConfig('signup_waitlist_enabled')) ?? false;
         const consumerLoginMethods = (await configStore.getConfig('consumer_login_methods')) ?? ['password', 'google', 'microsoft'];
-        res.json({ allowOrgSignups: orgEnabled, allowConsumerSignups: consumerEnabled, waitlistEnabled, consumerLoginMethods });
+        const access = await getSignupAccessConfig();
+        res.json({
+            allowOrgSignups: orgEnabled,
+            allowConsumerSignups: consumerEnabled,
+            waitlistEnabled,
+            consumerLoginMethods,
+            connectorOnly: access.connectorOnly,
+            geoMode: access.geoMode,
+            geoCountries: access.geoCountries,
+            geoBlockUnknown: access.geoBlockUnknown,
+            geoApplyConnector: access.geoApplyConnector,
+        });
     } catch (err) {
         console.error('[Auth] Failed to get signup settings:', err.message);
         res.status(500).json({ error: 'Failed to load signup settings' });
@@ -844,7 +863,19 @@ router.get('/admin/signup-settings', requireAdmin, async (req, res) => {
 
 router.put('/admin/signup-settings', requireAdmin, async (req, res) => {
     try {
-        const { allowOrgSignups, allowConsumerSignups, waitlistEnabled, consumerLoginMethods } = req.body;
+        const { allowOrgSignups, allowConsumerSignups, waitlistEnabled, consumerLoginMethods,
+                connectorOnly, geoMode, geoCountries, geoBlockUnknown, geoApplyConnector } = req.body;
+
+        // Snapshot current values for the audit trail before mutating.
+        const snapshot = async () => ({
+            signup_org_enabled: (await configStore.getConfig('signup_org_enabled')) ?? true,
+            signup_consumer_enabled: (await configStore.getConfig('signup_consumer_enabled')) ?? true,
+            signup_waitlist_enabled: (await configStore.getConfig('signup_waitlist_enabled')) ?? false,
+            consumer_login_methods: (await configStore.getConfig('consumer_login_methods')) ?? ['password', 'google', 'microsoft'],
+            ...(await getSignupAccessConfig()),
+        });
+        const oldValues = await snapshot();
+
         if (typeof allowOrgSignups === 'boolean') {
             await configStore.setConfig('signup_org_enabled', allowOrgSignups);
         }
@@ -858,7 +889,32 @@ router.put('/admin/signup-settings', requireAdmin, async (req, res) => {
             const valid = consumerLoginMethods.filter(m => ['password', 'google', 'microsoft'].includes(m));
             await configStore.setConfig('consumer_login_methods', valid);
         }
-        console.log(`[Auth] Signup settings updated — org: ${allowOrgSignups}, consumer: ${allowConsumerSignups}, waitlist: ${waitlistEnabled}, consumerMethods: ${consumerLoginMethods}`);
+        // ── Connector-only + geo-blocking ──
+        if (typeof connectorOnly === 'boolean') {
+            await configStore.setConfig('signup_connector_only', connectorOnly);
+        }
+        if (typeof geoMode === 'string' && ['off', 'allowlist', 'blocklist'].includes(geoMode)) {
+            await configStore.setConfig('signup_geo_mode', geoMode);
+        }
+        if (Array.isArray(geoCountries)) {
+            const valid = [...new Set(geoCountries
+                .filter(c => typeof c === 'string')
+                .map(c => c.trim().toUpperCase())
+                .filter(c => /^[A-Z]{2}$/.test(c)))];
+            await configStore.setConfig('signup_geo_countries', valid);
+        }
+        if (typeof geoBlockUnknown === 'boolean') {
+            await configStore.setConfig('signup_geo_block_unknown', geoBlockUnknown);
+        }
+        if (typeof geoApplyConnector === 'boolean') {
+            await configStore.setConfig('signup_geo_apply_connector', geoApplyConnector);
+        }
+
+        // Audit the change (best-effort; logAccessAudit never throws).
+        const newValues = await snapshot();
+        await userStore.logAccessAudit('signup.access_settings_updated', 'signup_settings', 'global', req.session?.user?.id, oldValues, newValues, null);
+
+        console.log(`[Auth] Signup settings updated — org: ${allowOrgSignups}, consumer: ${allowConsumerSignups}, waitlist: ${waitlistEnabled}, connectorOnly: ${connectorOnly}, geoMode: ${geoMode}`);
         res.json({ success: true });
     } catch (err) {
         console.error('[Auth] Failed to save signup settings:', err.message);
@@ -953,6 +1009,14 @@ router.post('/signup', async (req, res) => {
         if (!inviteData) {
             return res.status(400).json({ error: 'Invalid or expired invitation. Please request a new one.' });
         }
+    }
+
+    // ── Connector-only + geo gating ──────────────────────────────
+    // Invited users bypass (an invite is an explicit, trusted admin action —
+    // consistent with how invites already skip the org/consumer/waitlist gates).
+    if (!inviteData) {
+        const gate = await checkWebSignupAllowed(req);
+        if (!gate.ok) return res.status(gate.status).json({ error: gate.error, code: gate.code });
     }
 
     let groups = [];

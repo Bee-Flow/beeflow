@@ -27,6 +27,7 @@ const {
     resolveExistingSSOUser,
     resolveOrgByEmailDomain,
 } = require('./ssoUserResolver');
+const { checkWebSignupAllowed } = require('./signupGuards');
 
 /**
  * Persist long-lived OAuth tokens into the routine credential vault. Called
@@ -838,6 +839,15 @@ router.get('/callback/:provider', async (req, res) => {
             });
             console.log(`[OAuth/${provider}] Matched existing user via branch=${branch} → ${existingUser.id} (azureUserId=${existingUser.azureUserId || 'none'}, org=${existingUser.organizationId || 'none'})`);
         } else {
+            // A truly new OAuth user = a signup. Enforce connector-only mode and
+            // geo policy (same as the password / pending-signup paths) before we
+            // create the account. Existing users matched above are never gated.
+            const gate = await checkWebSignupAllowed(req);
+            if (!gate.ok) {
+                console.log(`[OAuth/${provider}] Signup blocked (${gate.code}) for ${user.email || 'unknown'}`);
+                const reason = gate.code === 'CONNECTOR_ONLY' ? 'signup_connector_only' : 'signup_geo_blocked';
+                return res.redirect(`${returnTo}?error=${reason}`);
+            }
             // Truly new user — derive a stable local id and pre-resolve the
             // organization by email domain so the record isn't orphaned.
             const localId = deriveLocalUserId(user.email, user.azureUserId);

@@ -90,6 +90,39 @@ function deepMerge(base, override) {
     return out;
 }
 
+// Merge a sparse, text-only locale OVERRIDE onto BASE content. Unlike
+// deepMerge (which replaces arrays wholesale), this is purpose-built for the
+// per-locale translation layer:
+//   - Structure is driven entirely by BASE: arrays merge by index (base
+//     length wins, missing/extra override slots fall back to base), objects
+//     recurse over base's key set only. So icons/links/styles/order are never
+//     lost — they always come from the default-locale base.
+//   - Text wins from the override only when it's a NON-EMPTY string, so a
+//     cleared translation (empty string) reverts to the source text.
+// Keep this in sync with the client mirror in
+// agent-hub/src/components/admin/ProductWebsite/localeMerge.js.
+function mergeLocaleContent(base, override) {
+    if (override === undefined || override === null) return base;
+    if (Array.isArray(base)) {
+        if (!Array.isArray(override)) return base;
+        return base.map((el, i) =>
+            i < override.length ? mergeLocaleContent(el, override[i]) : el);
+    }
+    if (Array.isArray(override)) return base;
+    if (isPlainObject(base)) {
+        if (!isPlainObject(override)) return base;
+        const out = { ...base };
+        for (const k of Object.keys(base)) {
+            if (Object.prototype.hasOwnProperty.call(override, k)) {
+                out[k] = mergeLocaleContent(base[k], override[k]);
+            }
+        }
+        return out;
+    }
+    if (typeof override === 'string' && override.trim() !== '') return override;
+    return base;
+}
+
 function normalizeSlug(raw) {
     return String(raw || '')
         .toLowerCase()
@@ -641,6 +674,15 @@ async function setPageLocaleOverride(siteId, pageId, locale, override) {
         version: LOCALE_OVERRIDE_VERSION,
         blocks: isPlainObject(override.blocks) ? override.blocks : {},
     };
+    // SEO meta translations (metaTitle / metaDescription) live alongside the
+    // block overrides on the page-locale key. Strings only — anything else is
+    // dropped so the override stays a pure text patch.
+    if (isPlainObject(override.seo)) {
+        const seo = {};
+        if (typeof override.seo.metaTitle === 'string') seo.metaTitle = override.seo.metaTitle;
+        if (typeof override.seo.metaDescription === 'string') seo.metaDescription = override.seo.metaDescription;
+        if (Object.keys(seo).length) sanitized.seo = seo;
+    }
     await configStore.setConfig(pageLocaleKey(siteId, pageId, locale), sanitized);
 }
 async function deletePageLocaleOverride(siteId, pageId, locale) {
@@ -927,8 +969,10 @@ async function resolveEffective(siteId, slug, locale, ctx) {
     let header = deepMerge(clone(SITE_DEFAULTS.header), site.header);
     let footer = deepMerge(clone(SITE_DEFAULTS.footer), site.footer);
     if (siteOverride) {
-        if (siteOverride.header) header = deepMerge(header, siteOverride.header);
-        if (siteOverride.footer) footer = deepMerge(footer, siteOverride.footer);
+        // Locale chrome overrides are sparse text-only patches: merge by index
+        // so nav/footer link structure (kind/url/style) stays owned by base.
+        if (siteOverride.header) header = mergeLocaleContent(header, siteOverride.header);
+        if (siteOverride.footer) footer = mergeLocaleContent(footer, siteOverride.footer);
     }
     header = resolveLinksInTree(header, site.pages);
     footer = resolveLinksInTree(footer, site.pages);
@@ -946,19 +990,24 @@ async function resolveEffective(siteId, slug, locale, ctx) {
     }
 
     let blocks = pageDoc.blocks.map(b => clone(b));
-    if (reqLocale !== defaultLocale) {
-        const override = await ctx.getPageLocaleOverride(entry.id, reqLocale);
-        if (override?.blocks) {
-            blocks = blocks.map(b => {
-                const ov = override.blocks[b.id];
-                if (!ov) return b;
-                return { ...b, content: deepMerge(b.content, ov.content || {}) };
-            });
-        }
+    // Fetched once and reused for block content + SEO translation below.
+    const pageOverride = reqLocale !== defaultLocale
+        ? await ctx.getPageLocaleOverride(entry.id, reqLocale)
+        : null;
+    if (pageOverride?.blocks) {
+        blocks = blocks.map(b => {
+            const ov = pageOverride.blocks[b.id];
+            if (!ov) return b;
+            return { ...b, content: mergeLocaleContent(b.content, ov.content || {}) };
+        });
     }
 
     let title = pageDoc.title;
     if (siteOverride?.pageTitles?.[entry.id]) title = siteOverride.pageTitles[entry.id];
+
+    // SEO meta is translatable too — merge the page override's `seo` patch.
+    let seo = pageDoc.seo;
+    if (pageOverride?.seo) seo = mergeLocaleContent(pageDoc.seo, pageOverride.seo);
 
     blocks = blocks.map(b => ({ ...b, content: resolveLinksInTree(b.content, site.pages) }));
 
@@ -970,7 +1019,7 @@ async function resolveEffective(siteId, slug, locale, ctx) {
         hideHeader: !!entry.hideHeader,
         hideFooter: !!entry.hideFooter,
         isNotFound: !!entry.isNotFound,
-        seo: pageDoc.seo,
+        seo,
         blocks,
     };
     return { found: true, page, header, footer, cookieBanner, pages: publicPages, design };
@@ -1484,6 +1533,6 @@ module.exports = {
     // import / export
     exportSite, importSite,
     // helpers / constants for tests
-    makeBlock, resolveLink,
+    makeBlock, resolveLink, mergeLocaleContent,
     BLOCK_TYPE_IDS, RESERVED_SLUGS,
 };

@@ -64,6 +64,7 @@ const path = require('path');
 const bodyParser = require('body-parser');
 
 const cmsStore = require('../stores/cmsStore');
+const cmsTranslate = require('../core/cmsTranslate');
 const configStore = require('../stores/configStore');
 const languageStore = require('../stores/languageStore');
 const storageStore = require('../stores/storageStore');
@@ -83,10 +84,13 @@ const importJsonParser = bodyParser.json({ limit: '2mb' });
 // shouldn't be able to exhaust storage / DB capacity in seconds. Per-
 // user windows are intentionally generous so a legit power user editing
 // a site is never rate-limited.
-const uploadLimiter    = perUserRateLimit({ windowMs: 60_000, max: 60 });
-const importLimiter    = perUserRateLimit({ windowMs: 60_000, max: 10 });
-const duplicateLimiter = perUserRateLimit({ windowMs: 60_000, max: 20 });
-const publishLimiter   = perUserRateLimit({ windowMs: 60_000, max: 30 });
+const uploadLimiter      = perUserRateLimit({ windowMs: 60_000, max: 60 });
+const importLimiter      = perUserRateLimit({ windowMs: 60_000, max: 10 });
+const duplicateLimiter   = perUserRateLimit({ windowMs: 60_000, max: 20 });
+const publishLimiter     = perUserRateLimit({ windowMs: 60_000, max: 30 });
+// AI translation hits the LLM (one or more batched calls), so it's costlier
+// than an ordinary save — keep its window tighter.
+const aiTranslateLimiter = perUserRateLimit({ windowMs: 60_000, max: 20 });
 
 // ── Live-site selection ──────────────────────────────────────────
 //
@@ -423,6 +427,91 @@ async function deleteSiteLocale(req, res) {
         await cmsStore.deleteSiteLocaleOverride(req.siteId, req.params.locale.toLowerCase());
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
+}
+
+// ── AI auto-translate ────────────────────────────────────────────────
+// Pre-fills a page/site locale override by translating the default-locale
+// text through the LLM. Existing manual translations are preserved. The
+// resulting override is persisted and returned so the editor can fold it in.
+
+// Resolve the human-readable language name for a locale code (for the prompt).
+async function localeName(locale) {
+    try {
+        const locales = await languageStore.getAvailableLocales();
+        return locales.find(l => l.code === locale)?.name || locale;
+    } catch (_) { return locale; }
+}
+
+async function postPageAiTranslate(req, res) {
+    try {
+        const locale = String(req.params.locale || '').toLowerCase();
+        const defaultLocale = await cmsStore.getDefaultLocale();
+        if (!locale) return res.status(400).json({ error: 'locale required' });
+        if (locale === defaultLocale) {
+            return res.status(400).json({ error: 'Cannot translate the default locale' });
+        }
+        const pageDoc = await cmsStore.getPage(req.siteId, req.params.id);
+        if (!pageDoc) return res.status(404).json({ error: 'Page not found' });
+
+        const existingOverride = await cmsStore.getPageLocaleOverride(req.siteId, req.params.id, locale);
+        const result = await cmsTranslate.aiTranslatePage({
+            pageDoc,
+            existingOverride,
+            modelTier: (req.body || {}).modelTier,
+            languageName: await localeName(locale),
+            locale,
+        });
+        await cmsStore.setPageLocaleOverride(req.siteId, req.params.id, locale, result.override);
+        res.json({
+            success: true,
+            override: result.override,
+            translated: result.translated,
+            total: result.total,
+            errors: result.errors,
+            message: result.errors > 0
+                ? `Translated ${result.translated} fields with ${result.errors} batch error(s)`
+                : `Translated ${result.translated} fields`,
+        });
+    } catch (err) {
+        console.error('[cms ai-translate page]', err.message);
+        res.status(500).json({ error: err.message });
+    }
+}
+
+async function postSiteAiTranslate(req, res) {
+    try {
+        const locale = String(req.params.locale || '').toLowerCase();
+        const defaultLocale = await cmsStore.getDefaultLocale();
+        if (!locale) return res.status(400).json({ error: 'locale required' });
+        if (locale === defaultLocale) {
+            return res.status(400).json({ error: 'Cannot translate the default locale' });
+        }
+        const siteDoc = await cmsStore.getProject(req.siteId);
+        if (!siteDoc) return res.status(404).json({ error: 'Site not found' });
+
+        const existingOverride = await cmsStore.getSiteLocaleOverride(req.siteId, locale);
+        const result = await cmsTranslate.aiTranslateSite({
+            siteDoc,
+            existingOverride,
+            modelTier: (req.body || {}).modelTier,
+            languageName: await localeName(locale),
+            locale,
+        });
+        await cmsStore.setSiteLocaleOverride(req.siteId, locale, result.override);
+        res.json({
+            success: true,
+            override: result.override,
+            translated: result.translated,
+            total: result.total,
+            errors: result.errors,
+            message: result.errors > 0
+                ? `Translated ${result.translated} fields with ${result.errors} batch error(s)`
+                : `Translated ${result.translated} fields`,
+        });
+    } catch (err) {
+        console.error('[cms ai-translate site]', err.message);
+        res.status(500).json({ error: err.message });
+    }
 }
 
 async function postPage(req, res) {
@@ -901,12 +990,14 @@ router.put('/admin/site', putSiteDoc);
 router.get('/admin/graph', getGraph);
 router.put('/admin/site/locale/:locale', putSiteLocale);
 router.delete('/admin/site/locale/:locale', deleteSiteLocale);
+router.post('/admin/site/ai-translate/:locale', aiTranslateLimiter, postSiteAiTranslate);
 
 // Pages — order matters: literal '/order' before ':id' wildcard.
 router.post('/admin/pages', postPage);
 router.put('/admin/pages/order', putPagesOrder);
 router.put('/admin/pages/:id/locale/:locale', putPageLocale);
 router.delete('/admin/pages/:id/locale/:locale', deletePageLocale);
+router.post('/admin/pages/:id/ai-translate/:locale', aiTranslateLimiter, postPageAiTranslate);
 router.put('/admin/pages/:id/meta', putPageMeta);
 router.put('/admin/pages/:id/homepage', putPageHomepage);
 router.delete('/admin/pages/:id', deletePageHandler);
@@ -952,6 +1043,7 @@ router.post('/sites/:siteId/pages', postPage);
 router.put('/sites/:siteId/pages/order', putPagesOrder);
 router.put('/sites/:siteId/pages/:id/locale/:locale', putPageLocale);
 router.delete('/sites/:siteId/pages/:id/locale/:locale', deletePageLocale);
+router.post('/sites/:siteId/pages/:id/ai-translate/:locale', aiTranslateLimiter, postPageAiTranslate);
 router.put('/sites/:siteId/pages/:id/meta', putPageMeta);
 router.put('/sites/:siteId/pages/:id/homepage', putPageHomepage);
 router.delete('/sites/:siteId/pages/:id', deletePageHandler);
@@ -961,6 +1053,7 @@ router.put('/sites/:siteId/pages/:id', putPage);
 // Site chrome (header/footer) and locale overrides.
 router.put('/sites/:siteId/site/locale/:locale', putSiteLocale);
 router.delete('/sites/:siteId/site/locale/:locale', deleteSiteLocale);
+router.post('/sites/:siteId/site/ai-translate/:locale', aiTranslateLimiter, postSiteAiTranslate);
 
 // Page graph for the sitemap diagram.
 router.get('/sites/:siteId/graph', getGraph);
