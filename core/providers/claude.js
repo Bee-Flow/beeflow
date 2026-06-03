@@ -91,7 +91,7 @@ class ClaudeProvider extends BaseProvider {
         if (content == null) return "";
         if (typeof content === "string") return content;
         if (Array.isArray(content)) {
-            return content.map(block => {
+            const blocks = content.map(block => {
                 // Convert OpenAI image_url → Claude native image block.
                 // Preserve cache_control if the caller marked it (directChat
                 // tags the last attachment block to extend the cache prefix).
@@ -120,6 +120,13 @@ class ClaudeProvider extends BaseProvider {
                 }
                 return block;
             }).filter(Boolean);
+            // Never hand the SDK an empty content array — Anthropic rejects it and
+            // the whole request fails ("Error generating response"). This happened
+            // when the only content was an image whose data URL couldn't be parsed,
+            // e.g. a pasted image with an unexpected data-URL shape (BFSF-189).
+            return blocks.length > 0
+                ? blocks
+                : [{ type: 'text', text: '[Attachment could not be processed]' }];
         }
         return JSON.stringify(content);
     }

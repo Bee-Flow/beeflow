@@ -342,14 +342,28 @@ function parseExpiresAt(input) {
     return d;
 }
 
-// List all external shares for a webpage. Owner-only.
+// List external shares for a webpage. The owner sees their own shares in full;
+// a non-owner who can READ the page (org/group-published) sees that the page has
+// links and their status, but not the owner's chosen recipient emails (BFSF-188).
+// Creating/refreshing/revoking links stays owner-only (handlers below).
 router.get('/:id/public-shares', requireAuth, async (req, res) => {
     try {
         const userId = req.session.user.id;
-        const wp = await webpageStore.getWebpage(req.params.id, userId);
+        // Owner-scoped first (preserves owner-only semantics); fall back to the
+        // same read-visibility check used by GET /:id for published pages.
+        let wp = await webpageStore.getWebpage(req.params.id, userId);
+        let isOwner = !!wp;
+        if (!wp) {
+            const raw = await webpageStore.getWebpageRaw(req.params.id);
+            const { orgIds, userGroups } = await resolveAudienceContext(req);
+            const orgIdArr = orgIds instanceof Set ? [...orgIds] : (Array.isArray(orgIds) ? orgIds : []);
+            if (raw && webpageStore.canReadWebpage(raw, userId, userGroups, orgIdArr)) wp = raw;
+        }
         if (!wp) return res.status(404).json({ error: 'Webpage not found' });
-        const shares = await publicShareStore.listSharesForWebpage(req.params.id, userId);
-        res.json({ shares });
+        const shares = await publicShareStore.listSharesForWebpage(req.params.id, isOwner ? userId : null);
+        // Don't leak the owner's recipient allow-list to other org members.
+        const safeShares = isOwner ? shares : shares.map(({ allowedEmails, ...rest }) => rest);
+        res.json({ shares: safeShares });
     } catch (err) {
         console.error('[Webpages] List public shares failed:', err);
         res.status(500).json({ error: 'Failed to list public shares' });

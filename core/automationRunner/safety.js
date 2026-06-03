@@ -178,7 +178,7 @@ function _regexHits(text, policy) {
  * returns { value, tokenMap, blocked, categories }. Throws GuardrailBlockError
  * on a block action (unless dry-run, where it annotates instead).
  */
-async function _guardValue(value, policy, auditBase, { direction, scopeOn, mode }) {
+async function _guardValue(value, policy, auditBase, { direction, scopeOn, mode, seedTokenMap }) {
     if (!policy.piiEnabled && !policy.regexRules.length) return { value, tokenMap: null, blocked: false, categories: [] };
     if (scopeOn === false) return { value, tokenMap: null, blocked: false, categories: [] };
 
@@ -221,12 +221,17 @@ async function _guardValue(value, policy, auditBase, { direction, scopeOn, mode 
             }
             // tokenize/redact each string leaf, accumulating a shared token map.
             const { tokenizeText } = require('../piiDetection');
-            let tokenMap = {};
+            // Seed numbering from a prior map (e.g. the ai_step's input tokens) so
+            // freshly-tokenized PII continues the sequence (`[email_2]`) instead of
+            // re-minting `[email_1]` and colliding with an echoed input token. Merge
+            // (rather than overwrite) per leaf so a multi-leaf value keeps every
+            // token across leaves and the seed.
+            let tokenMap = seedTokenMap && typeof seedTokenMap === 'object' ? { ...seedTokenMap } : {};
             const transformed = await mapStringLeavesAsync(value, async (s) => {
                 const d2 = await _detectPii(s, policy);
                 if (!d2) return s;
                 const { tokenizedText, tokenMap: tm } = tokenizeText(s, d2.entities, tokenMap);
-                tokenMap = tm;
+                tokenMap = { ...tokenMap, ...tm };
                 return tokenizedText;
             });
             _logGuardrail(auditBase, { violation_type: 'pii', categories: cats, direction, action_taken: 'redacted', isDryRun });
@@ -268,18 +273,20 @@ async function guardAiInput(messages, policy, auditBase, mode) {
 
 /**
  * Guard an ai_step's output. On block (default action) throws; otherwise returns
- * the (possibly redacted) output. The caller is responsible for restoreTokens()
- * before writing the value downstream (so the model saw tokens but downstream
- * steps see real values).
+ * the (possibly redacted) output plus the tokenMap of any PII it tokenized. The
+ * caller is responsible for restoreTokens() before writing the value downstream
+ * (so the model saw tokens but downstream steps see real values). Pass the input
+ * tokenMap as `seedTokenMap` so output tokens continue the input numbering and the
+ * two maps can be merged for restoration without collisions.
  */
-async function guardAiOutput(content, policy, auditBase, mode) {
-    if (!policy.piiEnabled && !policy.regexRules.length) return { content, blocked: false };
-    if (policy.scope.agentOutput === false) return { content, blocked: false };
-    const guarded = await _guardValue(content, policy, auditBase, { direction: 'output', scopeOn: true, mode });
+async function guardAiOutput(content, policy, auditBase, mode, seedTokenMap = null) {
+    if (!policy.piiEnabled && !policy.regexRules.length) return { content, tokenMap: null, blocked: false };
+    if (policy.scope.agentOutput === false) return { content, tokenMap: null, blocked: false };
+    const guarded = await _guardValue(content, policy, auditBase, { direction: 'output', scopeOn: true, mode, seedTokenMap });
     if (guarded.wouldBlock && mode !== 'dry_run') {
         throw new GuardrailBlockError(`Blocked: AI step output contained sensitive data (${(guarded.categories || []).join(', ')})`, { violationType: 'pii', categories: guarded.categories, scope: 'output' });
     }
-    return { content: guarded.value, blocked: !!guarded.wouldBlock, categories: guarded.categories };
+    return { content: guarded.value, tokenMap: guarded.tokenMap, blocked: !!guarded.wouldBlock, categories: guarded.categories };
 }
 
 /**

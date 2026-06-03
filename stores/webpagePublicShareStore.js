@@ -237,16 +237,18 @@ async function createShare({ webpageId, createdBy, organizationId, accessMode, p
 }
 
 /**
- * List active and revoked/expired shares for a given webpage, owner-scoped.
+ * List active and revoked/expired shares for a given webpage. Pass `createdBy`
+ * to scope to one creator (the owner's own links); pass null/undefined to list
+ * every share on the webpage (used for read-visibility to non-owners — callers
+ * must strip sensitive fields like allowedEmails themselves).
  */
-async function listSharesForWebpage(webpageId, createdBy) {
+async function listSharesForWebpage(webpageId, createdBy = null) {
     await initDB();
-    const rows = await getAll(
-        `SELECT * FROM webpage_public_shares
-         WHERE webpage_id = $1 AND created_by = $2
-         ORDER BY created_at DESC`,
-        [webpageId, createdBy]
-    );
+    const params = [webpageId];
+    let sql = `SELECT * FROM webpage_public_shares WHERE webpage_id = $1`;
+    if (createdBy) { params.push(createdBy); sql += ` AND created_by = $${params.length}`; }
+    sql += ` ORDER BY created_at DESC`;
+    const rows = await getAll(sql, params);
     return rows.map(mapRow);
 }
 

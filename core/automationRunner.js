@@ -790,16 +790,22 @@ async function execAiStep(step, ctx, runState, mode) {
         }
     }
 
-    // ── Safety: guard model output (agentOutput scope), then restore any input
-    // tokens so downstream steps see real values (the model saw placeholders).
-    const aiOut = await safety.guardAiOutput(output, policy, auditBase, mode);
+    // ── Safety: guard model output (agentOutput scope), then restore tokens so
+    // downstream steps see real values (the model saw placeholders). Restore BOTH
+    // the input tokens the model may have echoed AND any PII the output guard itself
+    // tokenized — the latter is seeded from the input map so the two namespaces never
+    // collide. Egress re-tokenization is re-applied per-policy at the downstream
+    // integration_action (restoreForEgress), so restoring here is safe. Without this,
+    // PII the model emitted (e.g. an email) leaks downstream as a literal `[email_1]`.
+    const aiOut = await safety.guardAiOutput(output, policy, auditBase, mode, aiGuard.tokenMap);
     output = aiOut.content;
-    if (aiGuard.tokenMap && Object.keys(aiGuard.tokenMap).length) {
+    const combinedTokenMap = { ...(aiGuard.tokenMap || {}), ...(aiOut.tokenMap || {}) };
+    if (Object.keys(combinedTokenMap).length) {
         try {
             const { restoreTokens } = require('./piiDetection');
             output = typeof output === 'string'
-                ? restoreTokens(output, aiGuard.tokenMap)
-                : JSON.parse(restoreTokens(JSON.stringify(output), aiGuard.tokenMap));
+                ? restoreTokens(output, combinedTokenMap)
+                : JSON.parse(restoreTokens(JSON.stringify(output), combinedTokenMap));
         } catch (_) { /* leave tokenized rather than crash */ }
     }
 

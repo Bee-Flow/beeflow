@@ -164,7 +164,10 @@ async function setAgentPublished(id, isPublished, ownerId, sharedGroups = undefi
 
 async function getPublishedAgentsForUser(userGroups = [], userOrgId = null, resolvedOrgIds = null) {
     await initDB();
-    const allPublished = await getAll("SELECT * FROM agents WHERE is_published = TRUE AND owner_id NOT IN ('system', 'swarm') ORDER BY name ASC");
+    // Defensive: exclude orphaned agents whose owner no longer exists (e.g. left
+    // behind by a pre-fix user deletion) so they can't surface as ghost agents in
+    // a re-created user's library (BFSF-181).
+    const allPublished = await getAll("SELECT a.* FROM agents a WHERE a.is_published = TRUE AND a.owner_id NOT IN ('system', 'swarm') AND EXISTS (SELECT 1 FROM users u WHERE u.id = a.owner_id) ORDER BY a.name ASC");
 
     // Use pre-resolved org IDs if provided (from resolveUserOrgIds), otherwise build from params
     let userOrgIds;

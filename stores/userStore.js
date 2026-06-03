@@ -829,6 +829,15 @@ async function deleteUser(userId) {
     // and remove any shares that target this user directly.
     try { await run('DELETE FROM projects WHERE owner_id = $1', [userId]); } catch (e) { /* table may not exist */ }
     try { await run(`DELETE FROM project_shares WHERE shared_with_type = 'user' AND shared_with_id = $1`, [userId]); } catch (e) { /* table may not exist */ }
+    // Agents owned by this user. Without this they become orphans with a
+    // non-existent owner; a future user re-created with the same id would inherit
+    // them as ghost agents in the library (BFSF-181). Mirror the org-delete
+    // cascade: drop each agent's conversations first, then the agents.
+    try {
+        const ownedAgents = await getAll('SELECT id FROM agents WHERE owner_id = $1', [userId]);
+        for (const agent of ownedAgents) { try { await run('DELETE FROM agent_conversations WHERE agent_id = $1', [agent.id]); } catch (_) { } }
+        await run('DELETE FROM agents WHERE owner_id = $1', [userId]);
+    } catch (e) { /* table may not exist */ }
 
     try {
         const notificationStore = require('./notificationStore');
