@@ -36,6 +36,7 @@ const SITE_DEFAULTS = {
             text: 'My Website',
             textColor: '',     // empty = inherit from CSS
             fontSize: 'medium',// 'small' | 'medium' | 'large'
+            url: '/',
         },
         // Legacy single-CTA fields kept so old sites' lazy migration can
         // read them when seeding `ctas`. New sites just use `ctas` below.
