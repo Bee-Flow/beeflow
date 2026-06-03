@@ -22,9 +22,13 @@ CREATE TABLE IF NOT EXISTS notifications (
     category TEXT NOT NULL DEFAULT 'info',
     title TEXT NOT NULL,
     message TEXT DEFAULT '',
+    link TEXT,
     read BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Backfill the link column on databases created before it existed.
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS link TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_user_read ON notifications(user_id, read);
@@ -52,21 +56,23 @@ initDB().catch(err => console.error('[NotificationStore] Failed to init:', err.m
 
 /**
  * Create a notification.
- * @param {{ userId: string, taskId?: string, category?: string, title: string, message?: string }} data
+ * @param {{ userId: string, taskId?: string, category?: string, title: string, message?: string, link?: string }} data
+ *   link — optional in-app path the client navigates to when the notification is
+ *          opened (e.g. `/app/settings/help_support?thread=<id>`).
  */
-async function createNotification({ userId, taskId, category = 'info', title, message = '' }) {
+async function createNotification({ userId, taskId, category = 'info', title, message = '', link = null }) {
     await initDB();
     const id = crypto.randomUUID();
     const validCategories = ['info', 'heads_up', 'urgent', 'ai_task'];
     const cat = validCategories.includes(category) ? category : 'info';
 
     await pool.query(
-        `INSERT INTO notifications (id, user_id, task_id, category, title, message)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [id, userId, taskId || null, cat, title, message]
+        `INSERT INTO notifications (id, user_id, task_id, category, title, message, link)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [id, userId, taskId || null, cat, title, message, link || null]
     );
     console.log(`[NotificationStore] Created [${cat}]: "${title}" for user ${userId}`);
-    return { id, userId, taskId, category: cat, title, message, read: false, created_at: new Date().toISOString() };
+    return { id, userId, taskId, category: cat, title, message, link: link || null, read: false, created_at: new Date().toISOString() };
 }
 
 /**

@@ -50,6 +50,12 @@ function _shortId(id) {
     return (id || '').toString().slice(0, 8);
 }
 
+// Collapse a reply body into a single-line excerpt for a notification preview.
+function _notifExcerpt(text, max = 500) {
+    const s = (text || '').toString().replace(/\s+/g, ' ').trim();
+    return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 function isSuperAdmin(req) {
@@ -498,7 +504,9 @@ router.post('/threads', publicCreateLimiter, async (req, res) => {
                             taskId: thread.id,
                             category: 'info',
                             title: result.escalated ? 'Bee Flow Support — a human will reply' : 'Bee Flow Support — AI replied',
-                            message: val.subject,
+                            // Show the actual inbound reply, not the user's own subject line.
+                            message: _notifExcerpt(result.message.body) || val.subject,
+                            link: `/app/settings/help_support?thread=${thread.id}`,
                         }).catch(() => {});
                     }
                     _emit('thread_updated', { threadId: thread.id });
@@ -660,7 +668,9 @@ router.post('/threads/:id/messages', async (req, res) => {
                     taskId: thread.id,
                     category: 'info',
                     title: 'Bee Flow Support replied',
-                    message: thread.subject,
+                    // Preview the staff reply itself, not the thread subject.
+                    message: _notifExcerpt(body) || thread.subject,
+                    link: `/app/settings/help_support?thread=${thread.id}`,
                 }).catch(() => {});
             }
         } else if (!staff) {
@@ -674,7 +684,7 @@ router.post('/threads/:id/messages', async (req, res) => {
                     taskId: thread.id,
                     category: 'heads_up',
                     title: 'Customer replied',
-                    message: thread.subject,
+                    message: _notifExcerpt(body) || thread.subject,
                 }).catch(() => {});
             } else {
                 notifyStaff({
@@ -703,6 +713,19 @@ router.post('/threads/:id/messages', async (req, res) => {
                                 },
                                 { kind: 'ai_reply', threadId: thread.id, messageId: result.message.id },
                             );
+                            // Notify the requester of the follow-up reply too — previously
+                            // only the very first AI reply created a bell notification, so
+                            // later replies landed silently.
+                            if (thread.requester_user_id) {
+                                notificationStore.createNotification({
+                                    userId: thread.requester_user_id,
+                                    taskId: thread.id,
+                                    category: 'info',
+                                    title: result.escalated ? 'Bee Flow Support — a human will reply' : 'Bee Flow Support — AI replied',
+                                    message: _notifExcerpt(result.message.body),
+                                    link: `/app/settings/help_support?thread=${thread.id}`,
+                                }).catch(() => {});
+                            }
                             _emit('thread_updated', { threadId: thread.id });
                         }
                     })
