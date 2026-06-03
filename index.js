@@ -465,6 +465,7 @@ app.use('/api/support', require('./routes/support'));
 
 // Tests Studio — Playwright generation + runs. Beta-gated + enterprise feature.
 app.use('/api/tests', requireLicenseFeature('playwright_tests'), requireBetaFeature('playwright_tests'), require('./routes/tests'));
+app.use('/api/security', requireLicenseFeature('security_scan'), requireBetaFeature('security_scan'), require('./routes/securityScans'));
 
 app.use('/', require('./routes/knowledge'));
 app.use('/api/kb', require('./routes/knowledgeBases'));
@@ -807,6 +808,35 @@ app.listen(PORT, '0.0.0.0', () => {
         }
     } catch (e) {
         console.warn('[Server] Failed to start test-run drain scheduler:', e.message);
+    }
+
+    // Security-scan drain — claims security_scan_jobs outbox rows and runs the
+    // selected scanner engines (OWASP ZAP / Nuclei / testssl.sh) in isolated
+    // containers. Same outbox + backoff + reaper pattern as the test-run drain.
+    // Set SECURITY_DRAIN_IN_API=false when a dedicated scan-runner worker owns it.
+    try {
+        const scanDrainInApi = process.env.SECURITY_DRAIN_IN_API !== 'false';
+        const SCAN_DRAIN_INTERVAL_MS = parseInt(process.env.SECURITY_DRAIN_TICK_INTERVAL_MS || '15000', 10);
+        const SCAN_REAP_INTERVAL_MS = parseInt(process.env.SECURITY_REAP_INTERVAL_MS || '120000', 10);
+        const scanRunner = require('./workers/scanRunner');
+
+        if (scanDrainInApi) {
+            const runScanDrain = async () => {
+                try {
+                    const r = await scanRunner.drainOnce();
+                    if (r?.processed) console.log(`[ScanRunner] processed=${r.processed}`);
+                } catch (e) { console.error('[ScanRunner] tick error:', e.message); }
+            };
+            setTimeout(runScanDrain, 22_000).unref();
+            setInterval(runScanDrain, SCAN_DRAIN_INTERVAL_MS).unref();
+            scanRunner.reapRunners().catch(() => {});
+            setInterval(() => scanRunner.reapRunners().catch(() => {}), SCAN_REAP_INTERVAL_MS).unref();
+            console.log(`[Server] Security-scan drain scheduler started (interval=${SCAN_DRAIN_INTERVAL_MS}ms)`);
+        } else {
+            console.log('[Server] Security-scan drain disabled in API (SECURITY_DRAIN_IN_API=false) — dedicated worker owns it');
+        }
+    } catch (e) {
+        console.warn('[Server] Failed to start security-scan drain scheduler:', e.message);
     }
 
     // Non-invasive self-check of every org Privacy Shield blob. Logs warnings
