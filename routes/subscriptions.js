@@ -1150,6 +1150,44 @@ router.get('/orgs/:orgId/usage', async (req, res) => {
     }
 });
 
+// GET /api/subscriptions/orgs/:orgId/effective-access — resolved, read-only
+// view of which compound-gated features actually WORK for the org under its
+// current plan. Mirrors the `canUseFeature` derivation in
+// loginRoutes.js (/auth/my-permissions) exactly — reuses the same helpers so
+// the admin view never drifts from what users really get.
+router.get('/orgs/:orgId/effective-access', requireAuthOrOrgMember, async (req, res) => {
+    try {
+        const { orgId } = req.params;
+        const license = require('../license');
+        const licenseTiers = require('../license/tiers');
+        const { listCompoundGatedFeatures, getEffectiveOrgBetaAllowList } = require('../core/betaFeatures');
+
+        const tier = await license.resolveTier({ organizationId: orgId });
+        // getOrgGrantedFeatures already unions the plan's allowed_features AND
+        // (on cloud) the licence features derived from the plan's beta
+        // allow-list — same source the licence gate reads.
+        const granted = new Set(await license.getOrgGrantedFeatures(orgId));
+        const betaAllow = new Set(await getEffectiveOrgBetaAllowList(orgId));
+
+        const features = listCompoundGatedFeatures().map(g => {
+            const hasLicense = licenseTiers.tierHasFeature(tier, g.licenseFeature) || granted.has(g.licenseFeature);
+            const betaAllowed = betaAllow.has(g.id);
+            return {
+                id: g.id,
+                name: g.name,
+                licenseFeature: g.licenseFeature,
+                hasLicense,
+                betaAllowed,
+                effective: hasLicense && betaAllowed,
+            };
+        });
+        res.json({ tier, features });
+    } catch (e) {
+        console.error('[Subscriptions] effective-access error:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // ═══════════════════════════════════════
 //  Audit Log
 // ═══════════════════════════════════════

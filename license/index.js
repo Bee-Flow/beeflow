@@ -35,6 +35,17 @@ function getUserStore() {
     return _userStore;
 }
 
+// Lazy-required to break the betaFeatures ↔ license import cycle: betaFeatures
+// already lazy-requires this module via _licenseModule(), so resolving it at
+// module-load time here would deadlock during boot. Used by
+// getOrgGrantedFeatures to map the org's subscription-led beta allow-list back
+// to the licence features those compound betas carry.
+let _beta = null;
+function getBetaModule() {
+    if (!_beta) _beta = require('../core/betaFeatures');
+    return _beta;
+}
+
 // ── Server-wide licence override ────────────────────────────────────────
 //
 // A super-admin on a self-hosted install can activate ONE licence row
@@ -274,13 +285,42 @@ function resolveTierFromLicense(lic) {
 // only — plan grants are an organisation concept.
 async function getOrgGrantedFeatures(organizationId) {
     if (!organizationId) return [];
+    const set = new Set();
+    let limits = null;
+    // (a) Additive plan grants — the plan's `allowed_features` list (the core
+    // feature chips). Mode-agnostic: this is the legitimate licence-grant
+    // mechanism on both cloud and self-hosted.
     try {
-        const limits = await getUserStore().getEffectiveLimits(organizationId);
-        return (limits && Array.isArray(limits.allowed_features)) ? limits.allowed_features : [];
+        limits = await getUserStore().getEffectiveLimits(organizationId);
+        if (limits && Array.isArray(limits.allowed_features)) {
+            for (const f of limits.allowed_features) set.add(f);
+        }
     } catch (e) {
-        if (e && e.code === '42P01') return []; // missing table on a fresh install — benign
-        return [];
+        if (!(e && e.code === '42P01')) { /* swallow non-missing-table errors as before */ }
     }
+    // (b) Cloud only: derive licence features from the plan's beta allow-list
+    // (`allowed_beta_features`, surfaced on the effective limits above so we
+    // don't refetch the subscription). A compound beta (one with a
+    // `licenseFeature`) that the subscription grants must ALSO satisfy the
+    // licence gate — otherwise an enterprise-tier feature like `webpages`
+    // granted on a Free/community plan would 403 `feature_locked` at the
+    // licence gate even though the subscription clearly includes it.
+    //   - array  → grant the licenseFeature of each listed compound beta
+    //   - null   → unrestricted plan: grant every compound licenseFeature
+    //   - absent → no plan / legacy: derive nothing (leave undefined off)
+    // Guarded off on self-hosted so the admin beta grant never leaks into the
+    // licence gate there. Uses only the static registry mapping — no extra DB.
+    if (!serverLicenseGovernsOrgs() && limits && limits.allowed_beta_features !== undefined) {
+        try {
+            const compound = getBetaModule().listCompoundGatedFeatures();
+            const allow = limits.allowed_beta_features; // array | null (unrestricted)
+            const allowSet = Array.isArray(allow) ? new Set(allow) : null;
+            for (const f of compound) {
+                if (allowSet === null || allowSet.has(f.id)) set.add(f.licenseFeature);
+            }
+        } catch (_) { /* benign — preserve existing behaviour */ }
+    }
+    return [...set];
 }
 
 async function orgGrantsFeature(orgIds, feature) {

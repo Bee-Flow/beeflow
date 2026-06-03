@@ -62,6 +62,19 @@ function _licenseModule() {
     return _license;
 }
 
+// True only when a server-wide licence governs every org (self-hosted). On
+// cloud each org pays its own subscription, so this is false and the
+// subscription leads. Fails safe to `false` (cloud) if the licence module
+// can't be resolved — matching getEffectiveOrgBetaAllowList's default.
+function serverLicenseGovernsOrgsSafe() {
+    try {
+        const lic = _licenseModule();
+        return !!(lic.serverLicenseGovernsOrgs && lic.serverLicenseGovernsOrgs());
+    } catch (_) {
+        return false;
+    }
+}
+
 /**
  * True iff the resolved tier for the given scope is at or above the beta
  * floor. Caller passes the scope it already has — `tierHint` short-circuits
@@ -361,14 +374,19 @@ async function getUserBetaFeatures(userId, session = null, { tierHint = null } =
         if (group?.organizationId) orgIds.add(group.organizationId);
     }
 
-    // Intersection of the super-admin allow-list with the org-admin
-    // "active" subset — both must include a feature for it to be
-    // available to users in the org. The super-admin grant is the sole
-    // gate: a feature the platform admin hasn't granted to the org can
-    // never be enabled here, even by the org admin.
-    // GA-lifecycle features auto-enable when they're in the allowed set —
-    // org admins can still flip them off explicitly, but they don't need to
-    // toggle them on. This is the off-switch / GA-promotion mechanism.
+    // Resolve the org's effective beta features.
+    //
+    //   - cloud: the SUBSCRIPTION leads. A feature in the plan's allow-list
+    //     (getEffectiveOrgBetaAllowList) is enabled for the whole org, full
+    //     stop — there is no second org-admin opt-in. The org-admin "active"
+    //     subset is non-load-bearing on cloud (the org-admin beta toggles are
+    //     read-only there); this keeps "a feature enabled in the subscription
+    //     just works" true end-to-end.
+    //   - self-hosted: unchanged. The super-admin allow-list AND the org-admin
+    //     "active" subset must BOTH include a feature for it to be available.
+    //     GA-lifecycle features auto-enable when allowed (org admins can flip
+    //     them off explicitly, but don't need to opt in).
+    const serverGoverns = serverLicenseGovernsOrgsSafe();
     const gaSet = new Set(
         BETA_FEATURES.filter(f => f.lifecycle === BetaLifecycle.GA).map(f => f.id)
     );
@@ -377,9 +395,14 @@ async function getUserBetaFeatures(userId, session = null, { tierHint = null } =
         const userStore = require('../stores/userStore');
         for (const orgId of orgIds) {
             const allowed = await getEffectiveOrgBetaAllowList(orgId);
+            const allowedSet = new Set(allowed);
+            if (!serverGoverns) {
+                // Cloud: subscription is leading — allow-list membership ⇒ on.
+                for (const fid of allowedSet) featureSet.add(fid);
+                continue;
+            }
             const active = await userStore.getOrgEnabledBetaFeatures(orgId);
             const activeSet = new Set(active);
-            const allowedSet = new Set(allowed);
             for (const fid of allowedSet) {
                 if (activeSet.has(fid)) { featureSet.add(fid); continue; }
                 // GA: auto-active unless org-admin has explicitly turned it
@@ -426,9 +449,10 @@ async function userHasBetaFeature(userId, featureId, session = null) {
 /**
  * Check whether an organization has a beta feature available. Used by
  * background runners (automations, schedulers) where there's no user session
- * to pass through `userHasBetaFeature`. Applies the same intersection rule:
- * the super-admin allow-list must contain the feature AND the org-admin
- * must have it in the active subset.
+ * to pass through `userHasBetaFeature`. Mirrors `getUserBetaFeatures`:
+ *   - cloud: the subscription leads — allow-list membership ⇒ available.
+ *   - self-hosted: the super-admin allow-list AND the org-admin active subset
+ *     must both contain the feature (GA features auto-enable when allowed).
  */
 async function orgHasBetaFeature(orgId, featureId, { tierHint = null } = {}) {
     if (!orgId) return false;
@@ -441,10 +465,17 @@ async function orgHasBetaFeature(orgId, featureId, { tierHint = null } = {}) {
     }
     try {
         const aliases = resolveFeatureAliases(featureId);
+        const allowed = new Set(await getEffectiveOrgBetaAllowList(orgId));
+        if (!serverLicenseGovernsOrgsSafe()) {
+            // Cloud: subscription is leading — allow-list membership is enough.
+            for (const id of aliases) {
+                if (allowed.has(id)) return true;
+            }
+            return false;
+        }
         const gaSet = new Set(
             BETA_FEATURES.filter(f => f.lifecycle === BetaLifecycle.GA).map(f => f.id)
         );
-        const allowed = new Set(await getEffectiveOrgBetaAllowList(orgId));
         const userStore = require('../stores/userStore');
         let active = [];
         try { active = await userStore.getOrgEnabledBetaFeatures(orgId); }

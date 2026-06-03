@@ -1159,14 +1159,33 @@ router.delete('/app-password', requireAuth, async (req, res) => {
 
 const { BETA_FEATURES, getOrgBetaFeatures, setOrgBetaFeatures, getEffectiveOrgBetaAllowList } = require('../core/betaFeatures');
 
-// Get the full beta feature registry + per-org assignments
+// Whether a server-wide licence governs every org (self-hosted). On cloud
+// each org's SUBSCRIPTION leads, so the per-org beta allow-list written here
+// has no runtime effect — the panel becomes read-only and writes are blocked.
+function betaGovernedBySubscription() {
+    try {
+        const lic = require('../license');
+        return !(lic.serverLicenseGovernsOrgs && lic.serverLicenseGovernsOrgs());
+    } catch (_) {
+        return true; // default cloud → subscription-governed
+    }
+}
+
+// Get the full beta feature registry + per-org assignments.
+// On cloud the assignments shown are the RESOLVED subscription allow-list
+// (getEffectiveOrgBetaAllowList) — the real truth — rather than the
+// admin-managed `organizations.beta_features` column, which is ignored at
+// runtime there. `governed` tells the UI to render read-only on cloud.
 router.get('/beta-features', requireAdmin, async (req, res) => {
+    const governed = betaGovernedBySubscription();
     const orgs = await userStore.getAllOrganizations();
     const assignments = {};
     for (const org of orgs) {
-        assignments[org.id] = await getOrgBetaFeatures(org.id);
+        assignments[org.id] = governed
+            ? await getEffectiveOrgBetaAllowList(org.id)
+            : await getOrgBetaFeatures(org.id);
     }
-    res.json({ registry: BETA_FEATURES, assignments });
+    res.json({ registry: BETA_FEATURES, assignments, governed });
 });
 
 // Set beta features for an organization (super-admin allow-list).
@@ -1175,6 +1194,15 @@ router.get('/beta-features', requireAdmin, async (req, res) => {
 router.put('/organizations/:orgId/beta-features', requireAdmin, async (req, res) => {
     const { orgId } = req.params;
     const { features } = req.body;
+
+    // On cloud the subscription plan is authoritative; reject the write so it
+    // can't silently no-op. Edit the org's plan in Subscriptions instead.
+    if (betaGovernedBySubscription()) {
+        return res.status(409).json({
+            error: 'governed_by_subscription',
+            message: "Beta access is set by the organization's subscription plan on this deployment.",
+        });
+    }
 
     if (!Array.isArray(features)) {
         return res.status(400).json({ error: 'features must be an array of feature IDs' });
@@ -1274,9 +1302,17 @@ router.put('/organizations/:orgId/active-integrations', requireOrgAdmin('orgId')
 router.get('/organizations/:orgId/active-beta-features', requireOrgAdmin('orgId'), async (req, res) => {
     try {
         const { orgId } = req.params;
+        const governed = betaGovernedBySubscription();
+        if (governed) {
+            // Cloud: the subscription plan's allow-list is the source of truth
+            // and every allowed beta is on. Report it read-only (governed) so
+            // the org-admin panel renders the plan-granted set without toggles.
+            const allowed = await getEffectiveOrgBetaAllowList(orgId);
+            return res.json({ allowed, enabled: allowed, registry: BETA_FEATURES, governed });
+        }
         const allowed = await getOrgBetaFeatures(orgId); // returns string[] of IDs
         const enabled = await userStore.getOrgEnabledBetaFeatures(orgId);
-        res.json({ allowed, enabled, registry: BETA_FEATURES });
+        res.json({ allowed, enabled, registry: BETA_FEATURES, governed });
     } catch (e) {
         console.error('[ActiveBetaFeatures] GET error:', e.message);
         res.status(500).json({ error: e.message });
@@ -1286,6 +1322,14 @@ router.get('/organizations/:orgId/active-beta-features', requireOrgAdmin('orgId'
 router.put('/organizations/:orgId/active-beta-features', requireOrgAdmin('orgId'), async (req, res) => {
     try {
         const { orgId } = req.params;
+        // On cloud, plan-granted betas are always on (the active subset is
+        // non-load-bearing). The org-admin beta toggles are read-only there.
+        if (betaGovernedBySubscription()) {
+            return res.status(409).json({
+                error: 'governed_by_subscription',
+                message: "Beta features are set by your subscription plan on this deployment.",
+            });
+        }
         const { enabled } = req.body || {};
         if (!Array.isArray(enabled)) {
             return res.status(400).json({ error: 'enabled must be an array of feature IDs' });
@@ -1341,6 +1385,7 @@ async function resolveActiveFeaturesContext(req) {
             allowedBetaFeatures: [], enabledBetaFeatures: [],
             allowedIntegrations: [], enabledIntegrations: [],
             betaRegistry: BETA_FEATURES,
+            betaGoverned: betaGovernedBySubscription(),
         };
     }
 
@@ -1380,11 +1425,18 @@ async function resolveActiveFeaturesContext(req) {
     }
     const allowedBetaFeatures = Array.from(new Set(grantedAllowList));
 
+    // On cloud the subscription leads and every allowed beta is on, so the
+    // panel renders the beta tab read-only with the full grant shown as
+    // enabled. Self-hosted keeps the org-admin's saved active subset.
+    const betaGoverned = betaGovernedBySubscription();
+
     return {
         orgId,
-        allowedBetaFeatures, enabledBetaFeatures,
+        allowedBetaFeatures,
+        enabledBetaFeatures: betaGoverned ? allowedBetaFeatures : enabledBetaFeatures,
         allowedIntegrations: planCappedInt, enabledIntegrations,
         betaRegistry: BETA_FEATURES,
+        betaGoverned,
     };
 }
 
@@ -1435,7 +1487,10 @@ router.put('/me/active-features', requireAuth, async (req, res) => {
         const planEntitlements = require('../services/planEntitlements');
         const caps = await planEntitlements.getOrgCaps(ctx.orgId);
 
-        if (Array.isArray(betaEnabled)) {
+        // On cloud the subscription governs beta access — ignore any beta
+        // changes (the panel renders that tab read-only). Integration toggles
+        // below still apply. Self-hosted keeps the org-admin opt-in.
+        if (Array.isArray(betaEnabled) && !ctx.betaGoverned) {
             // ctx.allowedBetaFeatures is already the authoritative ceiling:
             // super-admin grants override the plan cap, and freeForAll
             // defaults are pre-intersected with the cap. No second cap pass.

@@ -2122,6 +2122,12 @@ async function getEffectiveLimits(orgId) {
     effective.max_messages_by_type = Object.keys(mergedByType).length > 0 ? mergedByType : null;
     effective.allowed_features = sub.allowed_features || (plan ? plan.allowed_features : []);
     effective.allowed_models = sub.allowed_models || (plan ? plan.allowed_models : []);
+    // Surface the plan's beta allow-list so the licence layer can derive the
+    // licence-feature grants that compound betas carry (see
+    // license/index.js getOrgGrantedFeatures). Mirrors getEffectiveOrgBetaAllowList:
+    // null = unrestricted (all betas). Only present when a plan governs — a
+    // custom/no-plan subscription leaves it undefined so no betas are derived.
+    if (plan) effective.allowed_beta_features = plan.allowed_beta_features ?? null;
     return effective;
 }
 
