@@ -303,6 +303,27 @@ const BLOCK_DEFAULTS = {
         ctaLabel: 'Kies plan',
         emptyText: 'Geen plannen beschikbaar',
     },
+
+    // Customer Support — public AI-first support form. Submits to
+    // POST /api/support/threads (source: 'marketing'); the AI replies inline
+    // and a human takes over on escalation. Kept in sync with the admin
+    // panel's BLOCK_DEFAULTS in editors.jsx.
+    'customer-support': {
+        title: 'Talk to us',
+        lead: 'Question about pricing, custom deployments, or anything else? Send us a note — our AI assistant replies within seconds, and a human picks it up if needed.',
+        nameLabel: 'Your name',
+        namePlaceholder: 'Jane Doe',
+        emailLabel: 'Email',
+        emailPlaceholder: 'you@company.com',
+        subjectLabel: 'Subject',
+        subjectPlaceholder: 'How can we help?',
+        messageLabel: 'Message',
+        messagePlaceholder: "Tell us about your team, what you're trying to do, and any constraints.",
+        submitLabel: 'Send to Bee Flow',
+        successTitle: "Thanks — we've got your message",
+        successBody: "Our AI assistant is looking through our knowledge base right now and you'll receive an email reply within a few minutes. If it can't fully resolve your question, a Bee Flow teammate will take over.",
+        backgroundVariant: 'surface',
+    },
 };
 
 // ── Block type catalogue (drives the "Add block" picker) ─────────────
@@ -322,6 +343,7 @@ const BLOCK_TYPES = [
     { type: 'cta-banner',   label: 'CTA Banner',     icon: 'Rocket',           category: 'Conversion' },
     { type: 'live-component', label: 'Live Component', icon: 'Code',           category: 'Content' },
     { type: 'pricing',      label: 'Pricing',        icon: 'CreditCard',    category: 'Conversion' },
+    { type: 'customer-support', label: 'Customer Support', icon: 'LifeBuoy', category: 'Conversion' },
 ];
 
 const BLOCK_TYPE_IDS = BLOCK_TYPES.map(t => t.type);

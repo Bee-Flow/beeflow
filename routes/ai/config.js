@@ -1411,6 +1411,11 @@ router.get('/user-settings', requireAuth, async (req, res) => {
     // Personal Simple Mode preference — strips the UI down to chat + agents
     const simpleMode = !!(await configStore.getConfig(`simple_mode_user_${userId}`));
 
+    // Has the user seen the new-user product tour? Stored per-user in the DB so
+    // it persists across devices (the OnboardingTour also keeps a localStorage
+    // flash-guard, but this is the authoritative source).
+    const hasSeenIntroTour = !!(await configStore.getConfig(`has_seen_intro_tour_user_${userId}`));
+
     // Check if EU models are configured at all (admin must set these up)
     let hasEuModelsConfigured = false;
     try {
@@ -1440,12 +1445,14 @@ router.get('/user-settings', requireAuth, async (req, res) => {
         hasEuModelsConfigured,
         // Simple Mode (personal UI preference)
         simpleMode,
+        // New-user product tour seen flag (personal UI preference)
+        hasSeenIntroTour,
     });
 });
 
 router.post('/user-settings', requireAuth, async (req, res) => {
     const userId = req.session.user.id;
-    const { firefliesApiKey, youtrackUrl, youtrackToken, gammaApiKey, signrequestSubdomain, signrequestToken, enabledApps, simpleMode } = req.body;
+    const { firefliesApiKey, youtrackUrl, youtrackToken, gammaApiKey, signrequestSubdomain, signrequestToken, enabledApps, simpleMode, hasSeenIntroTour } = req.body;
 
     if (firefliesApiKey !== undefined) {
         await configStore.setSecret(`fireflies_api_key_user_${userId}`, firefliesApiKey || '');
@@ -1482,6 +1489,10 @@ router.post('/user-settings', requireAuth, async (req, res) => {
 
     if (simpleMode !== undefined) {
         await configStore.setConfig(`simple_mode_user_${userId}`, !!simpleMode);
+    }
+
+    if (hasSeenIntroTour !== undefined) {
+        await configStore.setConfig(`has_seen_intro_tour_user_${userId}`, !!hasSeenIntroTour);
     }
 
     res.json({ success: true });
