@@ -16,11 +16,12 @@
 const BaseProvider = require('./base');
 const crypto = require('crypto');
 
-// Models that support thinking/reasoning — Gemini 3.x uses thinkingLevel
+// Models that support thinking/reasoning — Gemini 3.x uses thinkingLevel.
+// Match any 3.x minor version (3, 3.1, 3.5, …) so new releases like
+// gemini-3.5-flash don't silently fall through to "no thinking config".
 const THINKING_MODEL_PATTERNS_3X = [
-    /gemini-3\.1-pro/,
-    /gemini-3-flash/,
-    /gemini-3\.1-flash/,
+    /gemini-3(\.\d+)?-pro/,
+    /gemini-3(\.\d+)?-flash/,
 ];
 
 // Gemini 2.5 models use thinkingBudget instead

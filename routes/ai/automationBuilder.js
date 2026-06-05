@@ -265,7 +265,7 @@ router.post('/stream', requireAuth, builderRateLimit, async (req, res) => {
         // suggestion would just produce a step that never runs). Super admins
         // bypass, mirroring the runtime tool gate.
         let webSearchAllowed = !!webSearchEnabled;
-        if (webSearchAllowed && !session?.isAdmin && session?.user?.role !== 'admin') {
+        if (webSearchAllowed && !req.session?.isAdmin && req.session?.user?.role !== 'admin') {
             try {
                 const license = require('../../license');
                 webSearchAllowed = await license.hasFeature({ organizationId: userOrgForTiers, userId }, 'web_search');
