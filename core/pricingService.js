@@ -88,6 +88,10 @@ function getModelPricing(modelId, providerType) {
     const _extract = (entry) => ({
         input: (entry.input_cost_per_token || 0) * 1_000_000,
         output: (entry.output_cost_per_token || 0) * 1_000_000,
+        // Per-model cached-read rate (e.g. Gemini 2.5/3.x = 10% of input).
+        // 0 when the provider doesn't publish one → callers fall back to the
+        // provider discount heuristic in modelCosts.getCacheDiscount().
+        cacheRead: (entry.cache_read_input_token_cost || 0) * 1_000_000,
     });
     const _valid = (entry) => entry && (entry.input_cost_per_token != null || entry.output_cost_per_token != null);
 
@@ -144,6 +148,7 @@ function getAllModelPricing() {
         result[modelId] = {
             input: (entry.input_cost_per_token || 0) * 1_000_000,
             output: (entry.output_cost_per_token || 0) * 1_000_000,
+            cacheRead: (entry.cache_read_input_token_cost || 0) * 1_000_000,
             provider: entry.litellm_provider || null,
         };
     }

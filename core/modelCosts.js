@@ -130,8 +130,10 @@ function getCacheDiscount(model) {
     const m = model.toLowerCase();
     // Anthropic/Claude: cache reads cost 10% of normal input
     if (/claude/.test(m)) return 0.1;
-    // Google/Gemini: cached content costs 25% of normal input
-    if (/gemini/.test(m)) return 0.25;
+    // Google/Gemini: 2.5/3.x cached reads cost 10% of input (90% off);
+    // legacy 2.0 was 25% (75% off). Only used when the pricing data has no
+    // explicit cache_read rate — see computeCost's rates.cacheRead preference.
+    if (/gemini/.test(m)) return /gemini-(2\.5|3)/.test(m) ? 0.1 : 0.25;
     // OpenAI: cached prompts cost 50% of normal input
     if (/gpt|o\d/.test(m)) return 0.5;
     // Default: no discount (treat cached same as uncached)
@@ -188,12 +190,24 @@ function computeCost(model, promptTokens = 0, completionTokens = 0, cachedTokens
     // promptTokens as the canonical "uncached + cached + cache-write" sum and
     // subtract the cache pieces to get the uncached portion.
     const uncachedInput = Math.max(0, promptTokens - cachedTokens - cacheCreationTokens);
-    const cacheReadRate = rates.input * getCacheDiscount(model);
+    const cacheReadRate = _cacheReadRate(model, rates);
     const cacheWriteRate = rates.input * getCacheWriteMultiplier(model, cacheTtl);
     return ((uncachedInput / 1_000_000) * rates.input)
          + ((cachedTokens / 1_000_000) * cacheReadRate)
          + ((cacheCreationTokens / 1_000_000) * cacheWriteRate)
          + ((completionTokens / 1_000_000) * rates.output);
+}
+
+/**
+ * Resolve the per-token cached-read rate. Prefer the model's explicit
+ * cache_read rate from the pricing data (accurate per model, auto-updating);
+ * fall back to the provider discount heuristic when it's absent.
+ */
+function _cacheReadRate(model, rates) {
+    if (rates && Number.isFinite(rates.cacheRead) && rates.cacheRead > 0) {
+        return rates.cacheRead;
+    }
+    return rates.input * getCacheDiscount(model);
 }
 
 /**
@@ -211,7 +225,7 @@ function computeCostSplit(model, promptTokens = 0, completionTokens = 0, cachedT
         _warnUnknownModel(model);
     }
     const uncachedInput = Math.max(0, promptTokens - cachedTokens - cacheCreationTokens);
-    const cacheReadRate = rates.input * getCacheDiscount(model);
+    const cacheReadRate = _cacheReadRate(model, rates);
     const cacheWriteRate = rates.input * getCacheWriteMultiplier(model, cacheTtl);
     return {
         input_cost: ((uncachedInput / 1_000_000) * rates.input)
@@ -230,13 +244,13 @@ function getAllModelCosts() {
     const pricingData = getAllModelPricing();
     const custom = getCustomOverrides();
 
-    // Start with community pricing data (just input/output, drop provider)
+    // Start with community pricing data (input/output + cached-read rate, drop provider)
     const merged = {};
     for (const [key, val] of Object.entries(pricingData)) {
-        merged[key] = { input: val.input, output: val.output };
+        merged[key] = { input: val.input, output: val.output, cacheRead: val.cacheRead };
     }
 
-    // Apply custom overrides on top
+    // Apply custom overrides on top (may omit cacheRead → frontend falls back to input)
     for (const [key, val] of Object.entries(custom)) {
         merged[key] = val;
     }
