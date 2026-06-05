@@ -749,6 +749,8 @@ leading search step just to look up data that's already in the payload.`,
                     afterStepId: { type: 'string', description: 'Insert after this step id. Default: last step.' },
                     tool: { type: 'string', description: 'Exact tool name from the catalog (e.g. gmail_search, gmail_compose, calendar_create_event).' },
                     inputs: { type: 'object', description: `Map of input-name to a binding object. ${BINDING_HINT}` },
+                    branch: { type: 'string', enum: ['then', 'else'], description: 'When afterStepId is a condition: which branch this step begins. Omit to auto-fill (then first, else second).' },
+                    caseName: { type: 'string', description: 'When afterStepId is a switch: the case name (or "default") this step begins.' },
                     label: { type: 'string', description: 'Short human-readable label for the diagram.' },
                 },
                 required: ['tool'],
@@ -770,6 +772,8 @@ leading search step just to look up data that's already in the payload.`,
                     modelTier: { type: 'string', enum: ['auto', 'fast', 'standard', 'thinking'], description: 'Default: auto (mirrors direct chat — classifier picks fast/standard/thinking based on prompt complexity).' },
                     allowTools: { type: 'boolean', description: 'Default false. When true the AI step can call the user\'s integration tools (web search, gmail_search, etc.). Use sparingly — most steps should bind upstream integration_action output instead.' },
                     tools: { type: 'array', items: { type: 'string' }, description: 'Optional allowlist of tool names the AI step may call. Empty / omitted = whatever allowTools dictates.' },
+                    branch: { type: 'string', enum: ['then', 'else'], description: 'When afterStepId is a condition: which branch this step begins. Omit to auto-fill (then first, else second).' },
+                    caseName: { type: 'string', description: 'When afterStepId is a switch: the case name (or "default") this step begins.' },
                     label: { type: 'string' },
                 },
                 required: ['prompt'],
@@ -780,7 +784,7 @@ leading search step just to look up data that's already in the payload.`,
         type: 'function',
         function: {
             name: 'builder_add_condition',
-            description: 'Append an if/else branch. The expr is a restricted JS expression — supports member access, comparisons, &&, ||, ?:, math. NO function calls. EXAMPLES: "steps.parse.output.amount > 1000", "steps.s1.output.count == 0", "loop.email.subject == \\"Urgent\\"". After adding, call builder_add_action / builder_add_ai_step / builder_add_notification with afterStepId pointing to this condition\'s id to grow the "then" branch; the "else" branch is built by passing thenStepId/elseStepId on this same call.',
+            description: 'Append an if/else branch. The expr is a restricted JS expression — supports member access, comparisons, &&, ||, ?:, math. NO function calls. EXAMPLES: "steps.parse.output.amount > 1000", "steps.s1.output.count == 0", "loop.email.subject == \\"Urgent\\"". To grow a branch, call builder_add_action / builder_add_ai_step / builder_add_notification with afterStepId set to this condition\'s id — the edge is AUTO-labelled "then" on the first append and "else" on the second. Pass branch:"then"|"else" on that call to be explicit. Use thenStepId/elseStepId here only to wire EXISTING steps as branches.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -807,6 +811,8 @@ leading search step just to look up data that's already in the payload.`,
                     itemVar: { type: 'string', description: 'Loop variable name; available inside body as loop.<itemVar>.' },
                     body: { type: 'array', description: 'Sub-DAG step objects (linear). Each must include "type". "id" is auto-assigned if missing.' },
                     maxIterations: { type: 'integer', description: 'Cap, default 100, max 1000.' },
+                    branch: { type: 'string', enum: ['then', 'else'], description: 'When afterStepId is a condition: which branch this step begins. Omit to auto-fill (then first, else second).' },
+                    caseName: { type: 'string', description: 'When afterStepId is a switch: the case name (or "default") this step begins.' },
                     label: { type: 'string' },
                 },
                 required: ['overRef', 'itemVar'],
@@ -826,6 +832,8 @@ leading search step just to look up data that's already in the payload.`,
                     inputs: { type: 'object' },
                     outputSchema: { type: 'object' },
                     allowedTools: { type: 'array', items: { type: 'string' }, description: 'Tool names this step may call via ctx.integrations.<tool>(args).' },
+                    branch: { type: 'string', enum: ['then', 'else'], description: 'When afterStepId is a condition: which branch this step begins. Omit to auto-fill (then first, else second).' },
+                    caseName: { type: 'string', description: 'When afterStepId is a switch: the case name (or "default") this step begins.' },
                     label: { type: 'string' },
                 },
                 required: ['code'],
@@ -844,6 +852,8 @@ leading search step just to look up data that's already in the payload.`,
                     title: { type: 'string', description: 'Template string. Supports {{steps.<id>.output.<path>}}.' },
                     body: { type: 'string', description: 'Template string. Supports {{steps.<id>.output.<path>}}.' },
                     channels: { type: 'array', items: { type: 'string' }, description: 'Default: ["notification"].' },
+                    branch: { type: 'string', enum: ['then', 'else'], description: 'When afterStepId is a condition: which branch this step begins. Omit to auto-fill (then first, else second).' },
+                    caseName: { type: 'string', description: 'When afterStepId is a switch: the case name (or "default") this step begins.' },
                     label: { type: 'string' },
                 },
                 required: ['title'],
@@ -924,7 +934,7 @@ leading search step just to look up data that's already in the payload.`,
         type: 'function',
         function: {
             name: 'builder_add_switch',
-            description: 'Append a multi-way branch. Evaluates expr and routes to the first matching case. Each case is { name, value }. Wire each case to its next step by passing nextStepIds: { "<caseName>": "<stepId>", "default": "<stepId>" }. EXAMPLE: {expr:"trigger.output.priority",cases:[{name:"urgent",value:"high"},{name:"normal",value:"medium"}],defaultBranch:"fallback"}.',
+            description: 'Append a multi-way branch. Evaluates expr and routes to the first matching case. Each case is { name, value }. Wire each case to its next step by passing nextStepIds: { "<caseName>": "<stepId>", "default": "<stepId>" }. EXAMPLE: {expr:"trigger.output.priority",cases:[{name:"urgent",value:"high"},{name:"normal",value:"medium"}],defaultBranch:"fallback"}. To grow a case branch by appending a NEW step, call an add tool with afterStepId set to this switch\'s id AND caseName set to the case it belongs to — otherwise the edge is unlabelled and that case dead-ends.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -1052,6 +1062,8 @@ arrayRef is a path string (e.g. "steps.search.output.results"), NOT a binding ob
                     keyField: { type: 'string', description: 'dedupe only: field to dedup by; omit for deep-equality dedup.' },
                     field: { type: 'string', description: 'aggregate and summarize: field name on each item.' },
                     fn: { type: 'string', enum: ['sum', 'count', 'avg', 'min', 'max'], description: 'summarize only: which statistic to compute.' },
+                    branch: { type: 'string', enum: ['then', 'else'], description: 'When afterStepId is a condition: which branch this step begins. Omit to auto-fill (then first, else second).' },
+                    caseName: { type: 'string', description: 'When afterStepId is a switch: the case name (or "default") this step begins.' },
                     label: { type: 'string' },
                 },
                 required: ['op', 'arrayRef'],
@@ -1122,10 +1134,37 @@ function applyTrigger(draft, args) {
     return { trigger: draft.trigger };
 }
 
-function appendAfter(draft, afterStepId, step) {
+/**
+ * Build the edge connecting `fromId` → `toId`, labelling it correctly when
+ * `fromId` is a branching step. Appending a step after a condition (the
+ * documented way to grow a branch) MUST produce a labelled edge — the runner
+ * routes conditions with a strict `e.label === 'then'/'else'` match
+ * (automationRunner.js nextEdgesFor), so an unlabelled edge would dead-end.
+ * Auto-infers the label (then first, else second) and accepts an explicit
+ * `branch` override; switches use `caseName`. Non-branching predecessors get
+ * a plain `{from, to}` edge — identical to the previous behaviour.
+ */
+function branchEdgeFor(draft, fromId, toId, { branch, caseName } = {}) {
+    const edge = { from: fromId, to: toId };
+    const pred = (draft.steps || []).find(s => s.id === fromId);
+    if (pred && pred.type === 'condition') {
+        let label = (branch === 'then' || branch === 'else') ? branch : null;
+        if (!label) {
+            const labels = new Set((draft.edges || []).filter(e => e.from === fromId).map(e => e.label));
+            label = labels.has('then') ? 'else' : 'then';
+        }
+        edge.label = label;
+    } else if (pred && pred.type === 'switch' && typeof caseName === 'string' && caseName) {
+        edge.label = caseName === 'default' ? 'case:default' : `case:${caseName}`;
+        edge.caseName = caseName;
+    }
+    return edge;
+}
+
+function appendAfter(draft, afterStepId, step, opts = {}) {
     const lastId = afterStepId || lastStepId(draft);
     draft.steps.push(step);
-    draft.edges.push({ from: lastId, to: step.id });
+    draft.edges.push(branchEdgeFor(draft, lastId, step.id, opts));
     return step;
 }
 
@@ -1140,7 +1179,7 @@ function applyAddAction(draft, args) {
         label: args.label || args.tool,
         sideEffect: isSideEffect(args.tool),
     };
-    appendAfter(draft, args.afterStepId, step);
+    appendAfter(draft, args.afterStepId, step, { branch: args.branch, caseName: args.caseName });
     return { added: step };
 }
 
@@ -1165,7 +1204,7 @@ function applyAddAi(draft, args) {
         allowTools: !!args.allowTools,
         tools: Array.isArray(args.tools) ? args.tools.filter(t => typeof t === 'string') : null,
     };
-    appendAfter(draft, args.afterStepId, step);
+    appendAfter(draft, args.afterStepId, step, { branch: args.branch, caseName: args.caseName });
     return { added: step };
 }
 
@@ -1173,7 +1212,9 @@ function applyAddCondition(draft, args) {
     const step = { id: newId('cond'), type: 'condition', expr: args.expr, label: args.label || 'Condition' };
     const lastId = args.afterStepId || lastStepId(draft);
     draft.steps.push(step);
-    draft.edges.push({ from: lastId, to: step.id });
+    // Route the incoming edge through branchEdgeFor so chaining a condition
+    // directly after another condition/switch still labels the branch.
+    draft.edges.push(branchEdgeFor(draft, lastId, step.id, { branch: args.branch, caseName: args.caseName }));
     if (args.thenStepId) draft.edges.push({ from: step.id, to: args.thenStepId, label: 'then' });
     if (args.elseStepId) draft.edges.push({ from: step.id, to: args.elseStepId, label: 'else' });
     return { added: step };
@@ -1208,7 +1249,7 @@ function applyAddLoop(draft, args) {
         maxIterations: args.maxIterations || 100,
         label: args.label || `Loop over ${args.overRef}`,
     };
-    appendAfter(draft, args.afterStepId, step);
+    appendAfter(draft, args.afterStepId, step, { branch: args.branch, caseName: args.caseName });
     return { added: step };
 }
 
@@ -1227,7 +1268,7 @@ function applyAddCode(draft, args) {
         limits: { cpuMs: 1000, memoryMb: 64, wallMs: 5000 },
         label: args.label || 'Custom code',
     };
-    appendAfter(draft, args.afterStepId, step);
+    appendAfter(draft, args.afterStepId, step, { branch: args.branch, caseName: args.caseName });
     return { added: step };
 }
 
@@ -1240,7 +1281,7 @@ function applyAddNotification(draft, args) {
         channels: Array.isArray(args.channels) ? args.channels : ['notification'],
         label: args.label || 'Notify',
     };
-    appendAfter(draft, args.afterStepId, step);
+    appendAfter(draft, args.afterStepId, step, { branch: args.branch, caseName: args.caseName });
     return { added: step };
 }
 
@@ -1250,7 +1291,7 @@ function applyAddSet(draft, args) {
     const { inputs: fields, error } = validateAndFixBindings(args.fields || {}, draft);
     if (error) return { error };
     const step = { id: newId('set'), type: 'set', fields, label: args.label || 'Edit fields' };
-    appendAfter(draft, args.afterStepId, step);
+    appendAfter(draft, args.afterStepId, step, { branch: args.branch, caseName: args.caseName });
     return { added: step };
 }
 
@@ -1267,19 +1308,19 @@ function applyAddDateTime(draft, args) {
         unit: typeof args.unit === 'string' ? args.unit : undefined,
         label: args.label || 'Date & Time',
     };
-    appendAfter(draft, args.afterStepId, step);
+    appendAfter(draft, args.afterStepId, step, { branch: args.branch, caseName: args.caseName });
     return { added: step };
 }
 
 function applyAddWait(draft, args) {
     const step = { id: newId('wait'), type: 'wait', seconds: Math.max(1, Math.min(86400, Number(args.seconds) || 1)), label: args.label || 'Wait' };
-    appendAfter(draft, args.afterStepId, step);
+    appendAfter(draft, args.afterStepId, step, { branch: args.branch, caseName: args.caseName });
     return { added: step };
 }
 
 function applyAddStopError(draft, args) {
     const step = { id: newId('stop'), type: 'stop_error', message: args.message, label: args.label || 'Stop and error' };
-    appendAfter(draft, args.afterStepId, step);
+    appendAfter(draft, args.afterStepId, step, { branch: args.branch, caseName: args.caseName });
     return { added: step };
 }
 
@@ -1294,7 +1335,9 @@ function applyAddSwitch(draft, args) {
     };
     const lastId = args.afterStepId || lastStepId(draft);
     draft.steps.push(step);
-    draft.edges.push({ from: lastId, to: step.id });
+    // Route the incoming edge through branchEdgeFor so chaining a switch
+    // directly after a condition/switch still labels the branch.
+    draft.edges.push(branchEdgeFor(draft, lastId, step.id, { branch: args.branch, caseName: args.caseName }));
     // Wire any provided case targets in one shot.
     const next = args.nextStepIds || {};
     for (const caseName of Object.keys(next)) {
@@ -1308,7 +1351,7 @@ function applyAddSwitch(draft, args) {
 
 function applyAddFilter(draft, args) {
     const step = { id: newId('filt'), type: 'filter', arrayRef: args.arrayRef, expr: args.expr, label: args.label || 'Filter' };
-    appendAfter(draft, args.afterStepId, step);
+    appendAfter(draft, args.afterStepId, step, { branch: args.branch, caseName: args.caseName });
     return { added: step };
 }
 
@@ -1321,25 +1364,25 @@ function applyAddLimit(draft, args) {
         mode: args.mode === 'last' ? 'last' : 'first',
         label: args.label || 'Limit',
     };
-    appendAfter(draft, args.afterStepId, step);
+    appendAfter(draft, args.afterStepId, step, { branch: args.branch, caseName: args.caseName });
     return { added: step };
 }
 
 function applyAddDedupe(draft, args) {
     const step = { id: newId('ded'), type: 'dedupe', arrayRef: args.arrayRef, keyField: typeof args.keyField === 'string' ? args.keyField : undefined, label: args.label || 'Remove duplicates' };
-    appendAfter(draft, args.afterStepId, step);
+    appendAfter(draft, args.afterStepId, step, { branch: args.branch, caseName: args.caseName });
     return { added: step };
 }
 
 function applyAddAggregate(draft, args) {
     const step = { id: newId('agg'), type: 'aggregate', arrayRef: args.arrayRef, field: args.field, label: args.label || 'Aggregate' };
-    appendAfter(draft, args.afterStepId, step);
+    appendAfter(draft, args.afterStepId, step, { branch: args.branch, caseName: args.caseName });
     return { added: step };
 }
 
 function applyAddSummarize(draft, args) {
     const step = { id: newId('sum'), type: 'summarize', arrayRef: args.arrayRef, field: args.field, op: args.op, label: args.label || 'Summarize' };
-    appendAfter(draft, args.afterStepId, step);
+    appendAfter(draft, args.afterStepId, step, { branch: args.branch, caseName: args.caseName });
     return { added: step };
 }
 
@@ -1351,7 +1394,7 @@ function applyAddSummarize(draft, args) {
 function applyAddArrayOp(draft, args) {
     const op = args && typeof args.op === 'string' ? args.op : null;
     if (!op) return { error: 'op is required (filter|limit|dedupe|aggregate|summarize)' };
-    const common = { afterStepId: args.afterStepId, arrayRef: args.arrayRef, label: args.label };
+    const common = { afterStepId: args.afterStepId, arrayRef: args.arrayRef, label: args.label, branch: args.branch, caseName: args.caseName };
     switch (op) {
         case 'filter':
             if (typeof args.expr !== 'string') return { error: 'filter op requires expr (restricted JS, references item.<field>)' };

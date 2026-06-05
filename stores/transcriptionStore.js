@@ -59,6 +59,16 @@ async function initDB() {
         await exec(`CREATE INDEX IF NOT EXISTS idx_transcriptions_org ON transcriptions(organization_id)`);
         await exec(`CREATE INDEX IF NOT EXISTS idx_transcriptions_published ON transcriptions(is_published) WHERE is_published = true`);
         await exec(`CREATE INDEX IF NOT EXISTS idx_transcriptions_shared_groups ON transcriptions USING GIN (shared_groups)`);
+        // Source provenance + dedup. `source` distinguishes plain uploads from
+        // Nextcloud / Talk imports; `source_uri` is the canonical dedup key
+        // (e.g. talk://<token>/<file>) so the same recording isn't transcribed
+        // twice by manual import + auto-ingest. `talk_room_token` drives
+        // write-back to the originating conversation.
+        await exec(`ALTER TABLE transcriptions ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'upload'`);
+        await exec(`ALTER TABLE transcriptions ADD COLUMN IF NOT EXISTS source_uri TEXT`);
+        await exec(`ALTER TABLE transcriptions ADD COLUMN IF NOT EXISTS talk_room_token TEXT`);
+        // Partial unique index — NULL source_uri (normal uploads) stays unconstrained.
+        await exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_transcriptions_source_uri ON transcriptions(source_uri) WHERE source_uri IS NOT NULL`);
     } catch (e) {
         // Column might already exist — fine.
     }
@@ -76,16 +86,36 @@ initDB().catch(err => console.error('[TranscriptionStore] Init error:', err.mess
 
 // ── CRUD ─────────────────────────────────────────────────
 
-async function createTranscription({ userId, organizationId, title, fileName, language, durationSeconds, speakerCount, segmentCount, fullText, transcript, segments, speakers, summary, status, audioPath, provider, actionItems }) {
+async function createTranscription({ userId, organizationId, title, fileName, language, durationSeconds, speakerCount, segmentCount, fullText, transcript, segments, speakers, summary, status, audioPath, provider, actionItems, source, sourceUri, talkRoomToken }) {
     await initDB();
     const id = crypto.randomUUID();
-    await run(
-        `INSERT INTO transcriptions (id, user_id, organization_id, title, file_name, language, duration_seconds, speaker_count, segment_count, full_text, transcript, segments, speakers, summary, status, audio_path, provider, action_items)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
-        [id, userId, organizationId || null, title || fileName || 'Untitled', fileName, language || 'nl', durationSeconds || 0, speakerCount || 0, segmentCount || 0, fullText || '', transcript || '', JSON.stringify(segments || []), JSON.stringify(speakers || []), summary || '', status || 'completed', audioPath || '', provider || 'voxtral', JSON.stringify(actionItems || [])]
+    const { rowCount } = await run(
+        `INSERT INTO transcriptions (id, user_id, organization_id, title, file_name, language, duration_seconds, speaker_count, segment_count, full_text, transcript, segments, speakers, summary, status, audio_path, provider, action_items, source, source_uri, talk_room_token)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+         ON CONFLICT (source_uri) WHERE source_uri IS NOT NULL DO NOTHING`,
+        [id, userId, organizationId || null, title || fileName || 'Untitled', fileName, language || 'nl', durationSeconds || 0, speakerCount || 0, segmentCount || 0, fullText || '', transcript || '', JSON.stringify(segments || []), JSON.stringify(speakers || []), summary || '', status || 'completed', audioPath || '', provider || 'voxtral', JSON.stringify(actionItems || []), source || 'upload', sourceUri || null, talkRoomToken || null]
     );
+    // Lost the race (same source_uri already ingested concurrently) — return the winner.
+    if (rowCount === 0 && sourceUri) {
+        const existing = await getOne('SELECT id, user_id, organization_id FROM transcriptions WHERE source_uri = $1', [sourceUri]);
+        if (existing) {
+            console.log(`[TranscriptionStore] Dedup hit for ${sourceUri} → existing ${existing.id}`);
+            return { id: existing.id, userId: existing.user_id, organizationId: existing.organization_id || null, dedup: true };
+        }
+    }
     console.log(`[TranscriptionStore] Created transcription "${title}" (${status || 'completed'}) via ${provider || 'voxtral'} for user ${userId}`);
-    return { id, userId, organizationId: organizationId || null, title, fileName, language, durationSeconds, speakerCount, segmentCount, status: status || 'completed', provider: provider || 'voxtral', createdAt: new Date().toISOString() };
+    return { id, userId, organizationId: organizationId || null, title, fileName, language, durationSeconds, speakerCount, segmentCount, status: status || 'completed', provider: provider || 'voxtral', source: source || 'upload', sourceUri: sourceUri || null, talkRoomToken: talkRoomToken || null, createdAt: new Date().toISOString() };
+}
+
+/**
+ * Lookup a transcription by its canonical source URI. Used as the cheap
+ * pre-check before downloading + transcribing a Nextcloud/Talk recording so
+ * the same file isn't processed twice.
+ */
+async function getTranscriptionBySourceUri(sourceUri) {
+    if (!sourceUri) return null;
+    await initDB();
+    return getOne('SELECT id, user_id, organization_id, title FROM transcriptions WHERE source_uri = $1', [sourceUri]);
 }
 
 async function getTranscriptions(userId, { limit = 50, offset = 0, orgIds = [], userGroupIds = [], isSuperAdmin = false } = {}) {
@@ -95,7 +125,7 @@ async function getTranscriptions(userId, { limit = 50, offset = 0, orgIds = [], 
     if (isSuperAdmin) {
         const rows = await getAll(
             `SELECT id, user_id, organization_id, title, file_name, language, duration_seconds, speaker_count, segment_count,
-                    shared_with, is_published, shared_groups, created_at, updated_at, provider, status,
+                    shared_with, is_published, shared_groups, created_at, updated_at, provider, status, source, talk_room_token,
                     LEFT(COALESCE(full_text, ''), 2000) AS full_text_snippet
              FROM transcriptions
              ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
@@ -126,7 +156,7 @@ async function getTranscriptions(userId, { limit = 50, offset = 0, orgIds = [], 
     }
     const rows = await getAll(
         `SELECT id, user_id, organization_id, title, file_name, language, duration_seconds, speaker_count, segment_count,
-                shared_with, is_published, shared_groups, created_at, updated_at, provider, status,
+                shared_with, is_published, shared_groups, created_at, updated_at, provider, status, source, talk_room_token,
                 LEFT(COALESCE(full_text, ''), 2000) AS full_text_snippet
          FROM transcriptions
          WHERE ${clauses.join(' OR ')}
@@ -183,6 +213,9 @@ function shapeRow(r, userId) {
         organizationId: r.organization_id || null,
         actionItems: typeof r.action_items === 'string' ? JSON.parse(r.action_items) : (r.action_items || []),
         tags: typeof r.tags === 'string' ? JSON.parse(r.tags) : (r.tags || []),
+        source: r.source || 'upload',
+        sourceUri: r.source_uri || null,
+        talkRoomToken: r.talk_room_token || null,
         isOwner: r.user_id === userId,
         ownerId: r.user_id,
     };
@@ -251,6 +284,8 @@ function mapRow(r) {
         segmentCount: r.segment_count,
         status: r.status || 'completed',
         provider: r.provider || 'voxtral',
+        source: r.source || 'upload',
+        talkRoomToken: r.talk_room_token || null,
         isPublished: !!r.is_published,
         sharedGroups: typeof r.shared_groups === 'string' ? JSON.parse(r.shared_groups || '[]') : (r.shared_groups || []),
         organizationId: r.organization_id || null,
@@ -266,6 +301,7 @@ module.exports = {
     createTranscription,
     getTranscriptions,
     getTranscription,
+    getTranscriptionBySourceUri,
     updateTranscription,
     setPublished,
     deleteTranscription,

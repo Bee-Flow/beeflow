@@ -309,7 +309,7 @@ function validateDefinition(def, { availableTools = null, toolRequiredParams = n
             const out = def.edges.filter(e => e.from === step.id);
             const labels = new Set(out.map(e => e.label));
             if (!labels.has('then') && !labels.has('else')) {
-                pushE({ code: 'condition.dead_branch', severity: 'error', path: at + '.edges', message: `Step ${step.id}: condition has no 'then' or 'else' edges — both branches dead-end.`, hint: 'Pass thenStepId and/or elseStepId on the condition, or use builder_add_* with afterStepId set to this condition id and an explicit edge label.' });
+                pushE({ code: 'condition.dead_branch', severity: 'error', path: at + '.edges', message: `Step ${step.id}: condition has no 'then' or 'else' edges — both branches dead-end.`, hint: 'Append the next step with afterStepId set to this condition id (the edge auto-labels then, then else), or pass thenStepId/elseStepId to wire existing steps.' });
             } else if (!labels.has('then') || !labels.has('else')) {
                 pushW({ code: 'condition.partial_branch', severity: 'warning', path: at + '.edges', message: `Step ${step.id}: condition has only one branch wired — the other will dead-end.`, hint: 'Wire both then and else, or remove the condition if a one-sided check is intended.' });
             }

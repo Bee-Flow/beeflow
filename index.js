@@ -455,6 +455,9 @@ app.use('/share', require('./routes/publicViewer'));
 // Meeting Notes beta feature gate
 const { requireBetaFeature } = require('./core/betaFeatures');
 app.use('/api/transcriptions', requireLicenseFeature('meeting_notes'), requireBetaFeature('meeting_notes'), require('./routes/transcriptions'));
+// Nextcloud Talk → Meeting Notes settings (org + user toggles). Gated by the
+// same licence feature as the notes themselves.
+app.use('/api/talk-notes-settings', requireLicenseFeature('meeting_notes'), require('./routes/talkNotesSettings'));
 app.use('/api/skills', requireLicenseFeature('skills'), requireBetaFeature('skills'), require('./routes/skills'));
 // ITIL Ticket Assistant (formerly Email Knowledge Base). Both mount paths point
 // to the same router while the `email_knowledge_base` beta-flag alias is live;

@@ -223,6 +223,20 @@ router.post('/stream', requireAuth, builderRateLimit, async (req, res) => {
             return res.end();
         }
 
+        // Capability floor: assembling a typed DAG is far harder than chat, so
+        // when the user left the builder on 'auto' we must not run on a
+        // small/fast model — those emit malformed bindings and loop to the
+        // iteration cap. Bump up to the first non-small tier. An explicit user
+        // tier choice is always honoured. See builderModelProfiles.js.
+        if (modelTier === 'auto' || !modelTier) {
+            const floored = applyBuilderTierFloor(resolvedTier, modelId, tiers);
+            if (floored.modelId !== modelId) {
+                console.log(`[AutomationBuilder] Auto floor: bumped small "${resolvedTier}" → "${floored.tier}" (${floored.modelId})`);
+                resolvedTier = floored.tier;
+                modelId = floored.modelId;
+            }
+        }
+
         const cfg = await getProviderForModel(modelId);
         const adapter = getAdapter(cfg.providerType, cfg.url);
 
@@ -350,12 +364,27 @@ router.post('/stream', requireAuth, builderRateLimit, async (req, res) => {
             // iteration 2 onward it's 'auto' — the model legitimately
             // needs to emit text once it's done mutating the draft.
             const turnToolChoice = (iter === 0 && profile.forceFirstToolCall) ? 'required' : 'auto';
-            const response = await adapter.chat(cfg.apiKey, cfg.url, modelId, messages, {
-                maxTokens: 4096,
-                temperature: typeof profile.temperature === 'number' ? profile.temperature : 0.2,
-                tools,
-                toolChoice: turnToolChoice,
-            });
+            let response;
+            try {
+                response = await chatWithRetry(adapter, cfg, modelId, messages, {
+                    // 8192 (was 4096): a complex turn can chain several tool
+                    // calls whose JSON arguments don't fit in 4k — truncation
+                    // there produces invalid tool-call JSON. The extra headroom
+                    // makes that rare; the parse guard below catches the rest.
+                    maxTokens: 8192,
+                    temperature: typeof profile.temperature === 'number' ? profile.temperature : 0.2,
+                    tools,
+                    toolChoice: turnToolChoice,
+                });
+            } catch (chatErr) {
+                // Transient provider failures (429/5xx/timeout) that survived
+                // the bounded retry. Don't crash the whole turn — the draft is
+                // persisted after every mutation, so end gracefully and let the
+                // user resend. Falls through to the snapshot-persist + `done`.
+                console.error('[AutomationBuilder] chat failed after retries:', chatErr.message);
+                send('error', { error: 'The AI provider had a temporary problem. Your draft is saved — please send your message again.', transient: true });
+                break;
+            }
 
             // Stream assistant content tokens (whole-message; we don't have
             // streaming chat for tool-calling on every adapter, so emit once).
@@ -378,10 +407,20 @@ router.post('/stream', requireAuth, builderRateLimit, async (req, res) => {
                 let mutatedThisIter = false;
                 for (const tc of response.toolCalls) {
                     const name = tc.function.name;
-                    let args = {};
-                    try { args = typeof tc.function.arguments === 'string' ? JSON.parse(tc.function.arguments) : tc.function.arguments; }
-                    catch { args = {}; }
+                    const { args, truncated } = parseToolArgs(tc.function.arguments, name);
                     let toolResult;
+                    if (truncated) {
+                        // Arguments didn't parse as JSON — almost always a
+                        // mid-call truncation. Running the tool with empty args
+                        // yields a confusing generic error and a blind retry;
+                        // instead tell the model exactly what happened so it
+                        // resends just this one call. Still push a tool message
+                        // so the assistant turn stays well-formed.
+                        toolResult = { error: `Your arguments for ${name} were not valid JSON (likely truncated mid-call). Resend just THIS single tool call with complete, valid JSON arguments.`, _truncated: true };
+                        send('tool_call', { name, arguments: {}, result: toolResult });
+                        messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(toolResult) });
+                        continue;
+                    }
                     try {
                         if (webpageInspectorEnabled && isWebpageAutomationTool(name)) {
                             toolResult = await executeWebpageAutomationTool(name, args, webpageInspectorCtx);
@@ -538,6 +577,81 @@ function mutates(toolName) {
     ].includes(toolName);
 }
 
+// Tools that legitimately take NO arguments — an empty/missing args string is
+// valid for these, so a JSON-parse "failure" on an empty string must NOT be
+// treated as a truncation.
+const PARAMLESS_BUILDER_TOOLS = new Set(['builder_summarise', 'builder_finalize', 'builder_request_dry_run']);
+
+/**
+ * Parse a tool call's `arguments` defensively. Returns `{ args, truncated }`.
+ * `truncated` is true only when a NON-EMPTY arguments string fails to parse
+ * for a tool that actually takes parameters — the signature of a model
+ * response cut off mid-call. Empty args for a parameterless tool are valid.
+ */
+function parseToolArgs(raw, toolName) {
+    if (raw && typeof raw === 'object') return { args: raw, truncated: false };
+    if (typeof raw !== 'string') return { args: {}, truncated: false };
+    const trimmed = raw.trim();
+    if (trimmed === '' || trimmed === '{}') return { args: {}, truncated: false };
+    try { return { args: JSON.parse(trimmed), truncated: false }; }
+    catch { return { args: {}, truncated: !PARAMLESS_BUILDER_TOOLS.has(toolName) }; }
+}
+
+// Transient provider errors (rate limits, 5xx, network blips) shouldn't kill
+// an entire builder turn — the user would lose their in-progress conversation.
+// Permanent errors (auth/validation 4xx) are not worth retrying.
+function isTransientChatError(err) {
+    const status = err && (err.status || err.statusCode);
+    if (typeof status === 'number') {
+        if ([408, 429, 500, 502, 503, 504].includes(status)) return true;
+        if (status >= 400 && status < 500) return false; // auth/validation — permanent
+    }
+    const msg = String((err && err.message) || '').toLowerCase();
+    return /\b(408|429|500|502|503|504)\b/.test(msg)
+        || /(rate.?limit|overloaded|too many requests|timeout|timed out|temporarily|econnreset|etimedout|enotfound|eai_again|socket hang up|fetch failed|network error|aborted)/.test(msg);
+}
+
+/**
+ * Call adapter.chat with a bounded retry on transient errors and exponential
+ * backoff + jitter. `baseDelayMs` is injectable so tests run fast.
+ */
+async function chatWithRetry(adapter, cfg, modelId, messages, options, { retries = 2, baseDelayMs = 500 } = {}) {
+    let lastErr;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            return await adapter.chat(cfg.apiKey, cfg.url, modelId, messages, options);
+        } catch (e) {
+            lastErr = e;
+            if (attempt === retries || !isTransientChatError(e)) throw e;
+            const delay = baseDelayMs * Math.pow(2, attempt) + Math.floor(Math.random() * 250);
+            console.warn(`[AutomationBuilder] chat attempt ${attempt + 1} failed (${e.message}); retrying in ${delay}ms`);
+            await new Promise(r => setTimeout(r, delay));
+        }
+    }
+    throw lastErr;
+}
+
+// Tier keys tried, in order, when flooring a small auto-resolved model up to a
+// capable one. The first whose configured model is non-small wins.
+const BUILDER_FLOOR_TIER_ORDER = ['standard', 'thinking', 'deep_thinking', 'writer', 'pro', 'smart'];
+
+/**
+ * Floor an auto-resolved builder model to at least a non-small capability
+ * band. Returns `{ tier, modelId }` — unchanged when `modelId` is already
+ * non-small, or when the org has no non-small tier configured (don't break a
+ * small-only org).
+ */
+function applyBuilderTierFloor(resolvedTier, modelId, tiers) {
+    const { classifyModel } = require('../../automation/builderModelProfiles');
+    if (classifyModel(modelId) !== 'small') return { tier: resolvedTier, modelId };
+    for (const key of BUILDER_FLOOR_TIER_ORDER) {
+        if (key.startsWith('custom:') || key === 'swarm') continue;
+        const cand = tiers?.[key]?.modelId;
+        if (cand && classifyModel(cand) !== 'small') return { tier: key, modelId: cand };
+    }
+    return { tier: resolvedTier, modelId };
+}
+
 function sanitizeHistory(history) {
     if (!Array.isArray(history)) return [];
     return history
@@ -687,3 +801,5 @@ async function buildCatalogForUser(userId, session) {
 }
 
 module.exports = router;
+// Internals exposed for unit tests (server/routes/ai/automationBuilder.test.js).
+module.exports._test = { parseToolArgs, isTransientChatError, chatWithRetry, applyBuilderTierFloor };

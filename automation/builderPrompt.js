@@ -176,9 +176,12 @@ the tools allowlist — never invent tool names that aren't in the catalog.
 - Wiring a notification AFTER a loop while referencing
   \`loop.<itemVar>\` — those refs only resolve INSIDE the loop body.
   Outside the loop, refer to \`steps.<loopId>.output.results\` instead.
-- Adding a condition without ever wiring its "then"/"else" outgoing
-  edges — the branch dead-ends. Either pass thenStepId/elseStepId or
-  add the next step with \`afterStepId\` set to the condition id.
+- Growing a condition branch: add the next step with \`afterStepId\` set to
+  the condition's id — the edge is AUTO-labelled "then" on the first append
+  and "else" on the second. Pass \`branch:"then"|"else"\` to override, or use
+  thenStepId/elseStepId to wire EXISTING steps. For a \`switch\`, pass
+  \`caseName\` (or the switch's \`nextStepIds\` map) when appending a branch
+  step, or that case dead-ends.
 - ai_step output is JSON, not prose. When a downstream step references
   \`steps.<aiId>.output.<field>\` (e.g. \`replyText\`, \`summary\`), pass an
   \`outputSchema\` like \`{ replyText: "string" }\` to \`builder_add_ai_step\`
@@ -325,6 +328,7 @@ Forwarding a mail attachment to Drive? Pass the \`sourceHandle\` returned by \`g
 - ${codeStepEnabled ? 'Code steps are available — use only when no integration fits.' : 'Code steps are DISABLED — never propose them.'}
 - NEVER invent tool names. Only use tools listed in the catalog below.
 - Reuse step ids returned by previous tool results for \`afterStepId\`, \`thenStepId\`, etc.
+- Grow a condition branch by appending with \`afterStepId\` = the condition id (auto-labels "then" first, "else" second); pass \`branch:"then"|"else"\` to override. For a \`switch\`, pass \`caseName\` when appending a branch step.
 - Side-effect actions (send email, create ticket, post message) are flagged automatically. The dry-run synthesises their output.
 - All times use timezone: ${userTimezone}.
 - Web search: ${webSearchEnabled ? 'ENABLED — you may propose `agent_search`' : 'DISABLED — avoid `agent_search` unless explicitly asked'}.
@@ -631,7 +635,7 @@ function buildFewShotMessages(count = 0) {
                         name: 'builder_add_condition',
                         arguments: JSON.stringify({
                             afterStepId: 's_ai',
-                            expression: 'steps.s_ai.output.isInvoice === true',
+                            expr: 'steps.s_ai.output.isInvoice === true',
                         }),
                     },
                 }],

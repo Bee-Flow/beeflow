@@ -1,6 +1,6 @@
 /**
  * Nextcloud Mail Tools — list / read / search / send mail via the Mail app's
- * REST API (/index.php/apps/mail/api/v1/...). Mirrors the Gmail tool surface
+ * REST API (/index.php/apps/mail/api/...). Mirrors the Gmail tool surface
  * so prompts that work for "search my inbox" / "summarise this email" /
  * "save this PDF attachment to /Documents" port across the two providers.
  *
@@ -224,7 +224,7 @@ async function executeNextcloudMailTool(toolName, args, userId, session) {
 
     switch (toolName) {
         case 'nextcloud_mail_list_accounts': {
-            const res = await ncFetch(api(baseUrl, '/v1/accounts'), { headers: baseHeaders });
+            const res = await ncFetch(api(baseUrl, '/accounts'), { headers: baseHeaders });
             if (res.status === 401) return { error: authError };
             if (res.status === 404) return { error: 'Nextcloud Mail app is not installed/enabled on this server.' };
             if (!res.ok) return { error: `Mail accounts list failed (${res.status})` };
@@ -243,7 +243,7 @@ async function executeNextcloudMailTool(toolName, args, userId, session) {
 
         case 'nextcloud_mail_list_mailboxes': {
             if (args.accountId == null) return { error: 'accountId is required' };
-            const url = api(baseUrl, `/v1/mailboxes?accountId=${encodeURIComponent(args.accountId)}`);
+            const url = api(baseUrl, `/mailboxes?accountId=${encodeURIComponent(args.accountId)}`);
             const res = await ncFetch(url, { headers: baseHeaders });
             if (res.status === 401) return { error: authError };
             if (res.status === 404) return { error: `Mail account not found: ${args.accountId}` };
@@ -277,7 +277,7 @@ async function executeNextcloudMailTool(toolName, args, userId, session) {
             };
             if (args.query) body.query = String(args.query);
 
-            const res = await ncFetch(api(baseUrl, `/v1/mailboxes/${encodeURIComponent(args.mailboxId)}/sync`), {
+            const res = await ncFetch(api(baseUrl, `/mailboxes/${encodeURIComponent(args.mailboxId)}/sync`), {
                 method: 'POST',
                 headers: { ...baseHeaders, 'Content-Type': 'application/json' },
                 body: JSON.stringify(body),
@@ -293,7 +293,7 @@ async function executeNextcloudMailTool(toolName, args, userId, session) {
 
         case 'nextcloud_mail_read': {
             if (args.messageId == null) return { error: 'messageId is required' };
-            const res = await ncFetch(api(baseUrl, `/v1/messages/${encodeURIComponent(args.messageId)}/body`), {
+            const res = await ncFetch(api(baseUrl, `/messages/${encodeURIComponent(args.messageId)}/body`), {
                 headers: baseHeaders,
             });
             if (res.status === 401) return { error: authError };
@@ -320,7 +320,7 @@ async function executeNextcloudMailTool(toolName, args, userId, session) {
 
         case 'nextcloud_mail_read_attachment': {
             if (args.messageId == null || !args.attachmentId) return { error: 'messageId and attachmentId are required' };
-            const url = api(baseUrl, `/v1/messages/${encodeURIComponent(args.messageId)}/attachment/${encodeURIComponent(args.attachmentId)}`);
+            const url = api(baseUrl, `/messages/${encodeURIComponent(args.messageId)}/attachment/${encodeURIComponent(args.attachmentId)}`);
             const res = await ncFetch(url, { headers: { ...baseHeaders, 'Accept': '*/*' } });
             if (res.status === 401) return { error: authError };
             if (res.status === 404) return { error: 'Attachment not found.' };
@@ -376,7 +376,7 @@ async function executeNextcloudMailTool(toolName, args, userId, session) {
             if (args.messageId == null || !args.attachmentId || !args.targetPath) {
                 return { error: 'messageId, attachmentId, and targetPath are required' };
             }
-            const url = api(baseUrl, `/v1/messages/${encodeURIComponent(args.messageId)}/attachment/${encodeURIComponent(args.attachmentId)}`);
+            const url = api(baseUrl, `/messages/${encodeURIComponent(args.messageId)}/attachment/${encodeURIComponent(args.attachmentId)}`);
             const res = await ncFetch(url, {
                 method: 'POST',
                 headers: { ...baseHeaders, 'Content-Type': 'application/json' },
@@ -415,7 +415,7 @@ async function executeNextcloudMailTool(toolName, args, userId, session) {
 
             // Step 1: create a draft. The Mail app's outbox endpoint takes a
             // draft id, so we always go via this two-step path.
-            const draftRes = await ncFetch(api(baseUrl, '/v1/outbox'), {
+            const draftRes = await ncFetch(api(baseUrl, '/outbox'), {
                 method: 'POST',
                 headers: { ...baseHeaders, 'Content-Type': 'application/json' },
                 body: JSON.stringify(draftBody),
@@ -429,8 +429,9 @@ async function executeNextcloudMailTool(toolName, args, userId, session) {
             const outboxId = draft?.id ?? draft?.data?.id;
             if (!outboxId) return { error: 'Mail draft created but no outbox id returned', detail: draft };
 
-            // Step 2: dispatch the outbox message immediately.
-            const sendRes = await ncFetch(api(baseUrl, `/v1/outbox/${encodeURIComponent(outboxId)}/send`), {
+            // Step 2: dispatch the outbox message immediately. The send route
+            // is `POST /api/outbox/{id}` (named outbox#send) — no /send suffix.
+            const sendRes = await ncFetch(api(baseUrl, `/outbox/${encodeURIComponent(outboxId)}`), {
                 method: 'POST',
                 headers: baseHeaders,
             });
@@ -449,7 +450,7 @@ async function executeNextcloudMailTool(toolName, args, userId, session) {
             if (args.junk !== undefined) flags.junk = !!args.junk;
             if (Object.keys(flags).length === 0) return { error: 'at least one flag (seen/flagged/junk) must be provided' };
 
-            const res = await ncFetch(api(baseUrl, `/v1/messages/${encodeURIComponent(args.messageId)}/flags`), {
+            const res = await ncFetch(api(baseUrl, `/messages/${encodeURIComponent(args.messageId)}/flags`), {
                 method: 'PUT',
                 headers: { ...baseHeaders, 'Content-Type': 'application/json' },
                 body: JSON.stringify({ flags }),
@@ -464,7 +465,7 @@ async function executeNextcloudMailTool(toolName, args, userId, session) {
             if (args.messageId == null || args.destMailboxId == null) {
                 return { error: 'messageId and destMailboxId are required' };
             }
-            const res = await ncFetch(api(baseUrl, `/v1/messages/${encodeURIComponent(args.messageId)}/move`), {
+            const res = await ncFetch(api(baseUrl, `/messages/${encodeURIComponent(args.messageId)}/move`), {
                 method: 'POST',
                 headers: { ...baseHeaders, 'Content-Type': 'application/json' },
                 body: JSON.stringify({ destMailboxId: args.destMailboxId }),
