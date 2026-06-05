@@ -28,16 +28,42 @@ router.use('/', agentChatRoutes);
 router.use('/', directChatRoutes);
 
 router.use('/', templateChatRoutes);
-// Notebook chat feature gate
+// Notebook chat feature gate. Mirrors the licence gate on the /api/notebooks*
+// mounts (server/index.js) so notebook chat is also disabled when the org's
+// tier/subscription doesn't grant `notebooks`. The licence check runs first so
+// the SPA gets the actionable `feature_locked` body it already knows how to
+// render; the configStore flag remains an operator kill-switch.
+const license = require('../license');
+const { resolveBestTierForRequest } = require('../license/middleware');
 const notebookChatGate = async (req, res, next) => {
     if (!req.path.startsWith('/chat/notebook')) return next();
+    if (!req.session?.isAuthenticated) return next(); // let auth middleware reject
+    try {
+        const resolution = await resolveBestTierForRequest(req);
+        if (resolution.error === 'tier_unavailable') {
+            return res.status(503).json({ error: 'tier_unavailable', retry_after: 1 });
+        }
+        const grantedByPlan = await license.orgGrantsFeature(resolution.orgIds, 'notebooks');
+        if (!license.tiers.tierHasFeature(resolution.tier, 'notebooks') && !grantedByPlan) {
+            return res.status(403).json({
+                error: 'feature_locked',
+                feature: 'notebooks',
+                current: resolution.tier,
+                upgrade_url: process.env.LICENSE_UPGRADE_URL || 'https://beeflow.nl/pricing',
+            });
+        }
+    } catch (e) {
+        // Fail closed on a real licence-resolution error rather than silently
+        // granting access (matches requireFeature semantics).
+        return res.status(503).json({ error: 'tier_unavailable', retry_after: 1 });
+    }
     try {
         const configStore = require('../stores/configStore');
         const enabled = await configStore.getConfig('feature_notebooks_enabled');
         if (enabled === false) {
             return res.status(403).json({ error: 'Notebooks feature is disabled' });
         }
-    } catch (_) { /* fail open */ }
+    } catch (_) { /* fail open on the operator kill-switch only */ }
     next();
 };
 router.use(notebookChatGate);

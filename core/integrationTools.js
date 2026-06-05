@@ -25,6 +25,7 @@ const { buildN8nTools } = require('../integrations/n8nTools');
 const { N8N_WORKFLOW_TOOLS, getN8nToolPermission } = require('../integrations/n8nWorkflowTools');
 const { hasPermission } = require('../auth/permissions');
 const { AGENT_SEARCH_TOOLS } = require('../integrations/agentSearchTools');
+const license = require('../license');
 const { REGEX_GENERATOR_TOOLS } = require('../integrations/regexGeneratorTools');
 const { IMAGE_GEN_TOOLS } = require('../routes/ai/imageGenTool');
 const { VIDEO_GEN_TOOLS } = require('../routes/ai/videoGenTool');
@@ -258,12 +259,34 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig, rout
         (searchProvider === 'agent-search' && hasAgentSearchUrl) ||
         canFallbackToNode
     );
-    if (searchAvailable && isAppOn('agent-search')) {
+    // Web Search is a licensed feature: enterprise tier OR an explicit plan
+    // grant (allowed_features → `web_search`). This is the single chokepoint
+    // every chat/agent/routine/builder path funnels through, so withholding the
+    // tool here disables web search everywhere when the org isn't entitled.
+    // Super admins (and the `__system__` scope they run under) bypass. Fails
+    // closed — if entitlement can't be resolved we withhold rather than leak a
+    // paid capability.
+    const wsSuperAdmin = isAdmin || session?.user?.role === 'admin';
+    let webSearchEntitled = wsSuperAdmin;
+    if (!webSearchEntitled) {
+        try {
+            const wsScope = { userId };
+            if (userOrgId && userOrgId !== '__system__') wsScope.organizationId = userOrgId;
+            webSearchEntitled = await license.hasFeature(wsScope, 'web_search');
+        } catch (e) {
+            console.warn(`[IntegrationTools] web_search entitlement lookup failed user=${userId} org=${userOrgId} error=${e.message}`);
+            webSearchEntitled = false;
+        }
+    }
+    if (webSearchEntitled && searchAvailable && isAppOn('agent-search')) {
         addTools(AGENT_SEARCH_TOOLS);
         if (canFallbackToNode) {
             console.warn('[IntegrationTools] agent_search registered via node-search fallback: provider=agent-search but SEARCH_SERVICE_URL/agent_search_url is empty. Using serper_api_key directly. Set search_provider=node-search explicitly to silence this.');
         }
-    } else if (isAppOn('agent-search') && searchProvider !== 'disabled') {
+    } else if (webSearchEntitled && isAppOn('agent-search') && searchProvider !== 'disabled') {
+        // Only diagnose provider/credential gaps when the org IS entitled —
+        // otherwise the "NOT registered" warnings would fire on every
+        // community/un-granted request and read as a misconfiguration.
         if (searchProvider === 'agent-search') {
             console.warn('[IntegrationTools] agent_search NOT registered: provider=agent-search but SEARCH_SERVICE_URL is not set, no agent_search_url admin config, and no serper_api_key for node-search fallback. The model will not have web search. Set SEARCH_SERVICE_URL, or set serper_api_key + search_provider=node-search.');
         } else if (searchProvider === 'bing') {

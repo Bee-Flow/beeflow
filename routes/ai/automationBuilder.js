@@ -245,12 +245,24 @@ router.post('/stream', requireAuth, builderRateLimit, async (req, res) => {
             ? filterCatalogForUser(catalog, message, draftWrap.def)
             : catalog;
         const buildPrompt = profile.promptVariant === 'lean' ? buildLeanSystemPrompt : buildFullSystemPrompt;
+        // Web search is a licensed feature — don't let the builder propose
+        // `agent_search` steps when the org isn't entitled (the tool is also
+        // withheld at runtime by core/integrationTools.js, so an ungated
+        // suggestion would just produce a step that never runs). Super admins
+        // bypass, mirroring the runtime tool gate.
+        let webSearchAllowed = !!webSearchEnabled;
+        if (webSearchAllowed && !session?.isAdmin && session?.user?.role !== 'admin') {
+            try {
+                const license = require('../../license');
+                webSearchAllowed = await license.hasFeature({ organizationId: userOrgForTiers, userId }, 'web_search');
+            } catch (_) { webSearchAllowed = false; }
+        }
         const sys = buildPrompt({
             catalog: promptCatalog,
             codeStepEnabled,
             userTimezone: timezone || 'Europe/Amsterdam',
             existingDraftSummary: summary,
-            webSearchEnabled: !!webSearchEnabled,
+            webSearchEnabled: webSearchAllowed,
             disabledMedia: disabledMedia || {},
         });
 

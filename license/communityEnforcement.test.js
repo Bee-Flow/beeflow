@@ -27,6 +27,7 @@ const FEATURES = [
     'notebooks',
     'projects',
     'pii_tokenize',
+    'web_search',
     'web_search_guard',
     'advanced_usage_monitoring',
     'playwright_tests',
