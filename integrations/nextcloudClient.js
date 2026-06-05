@@ -290,7 +290,17 @@ async function resolveConnectorAuth(session) {
         const RAW_METHODS = new Set(['GET', 'POST']);
         const needsTunnel = !RAW_METHODS.has(method);
         const wireMethod = needsTunnel ? 'POST' : method;
-        const message = `${ts}\n${method}\n${pathOnly}\n${ncUid}`;
+        // Sign the HMAC over the DECODED path. The Nextcloud/HaRP proxy that
+        // fronts the connector percent-decodes the URL before the connector
+        // verifies it (e.g. `%40` → `@`), so signing the encoded form makes the
+        // signature mismatch for any path containing reserved chars — calendar
+        // event UIDs end in `@host`, and calendars can be named like emails
+        // (`tomkooy@beeflow.nl`). Decoding on both ends makes the HMAC invariant
+        // to the proxy's encoding; reads (no escapes) are unchanged. Malformed
+        // escapes fall back to the raw path. The connector accepts both forms.
+        let signedPath = pathOnly;
+        try { signedPath = decodeURIComponent(pathOnly); } catch (_) { /* keep raw */ }
+        const message = `${ts}\n${method}\n${signedPath}\n${ncUid}`;
         const sig = crypto.createHmac('sha256', tenantKey).update(message).digest('hex');
         const headers = {
             ...(options.headers || {}),
