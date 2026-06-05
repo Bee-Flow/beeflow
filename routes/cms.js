@@ -69,7 +69,6 @@ const configStore = require('../stores/configStore');
 const languageStore = require('../stores/languageStore');
 const storageStore = require('../stores/storageStore');
 const { hasPermission } = require('../auth/permissions');
-const { serverLicenseGovernsOrgs } = require('../license');
 const { perUserRateLimit } = require('../utils/perUserRateLimit');
 const { sanitizeSvg } = require('../utils/svgSanitizer');
 
@@ -862,7 +861,10 @@ router.get('/site', async (req, res) => {
         // goes straight to /app. `appOnly` tells RootPathGate to redirect there
         // (it runs outside LicenseProvider so it can't read deployment mode on
         // its own). Emitted on every shape so the flag is present regardless of
-        // whether a site is live.
+        // whether a site is live. The license module is lazy-required (never at
+        // module top-level) to preserve boot ordering — it pulls in heavy
+        // userStore DB init that must load after this route, not during it.
+        const { serverLicenseGovernsOrgs } = require('../license');
         const appOnly = serverLicenseGovernsOrgs();
         // Disable caching here — content updates from the admin should
         // appear immediately. Re-introduce a short TTL once edits push a

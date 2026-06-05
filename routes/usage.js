@@ -4,7 +4,6 @@ const usageStore = require('../stores/usageStore');
 const userStore = require('../stores/userStore');
 const { resolveUserOrgIds } = require('../auth');
 const { computeCostSplit } = require('../core/modelCosts');
-const { serverLicenseGovernsOrgs } = require('../license');
 
 // Resolve the markup factor to apply when redacting customer-facing usage
 // responses. Admin callers see raw figures; org / consumer callers see
@@ -75,7 +74,11 @@ function redactRows(rows, factor) {
 async function maybeRedact(req, payload, kind) {
     // Self-hosted: no Stripe markup/reselling exists, so there's nothing to
     // redact — the operator sees raw tokens/cost. Redaction is purely a cloud
-    // billing concern (serverLicenseGovernsOrgs() === self-hosted).
+    // billing concern (serverLicenseGovernsOrgs() === self-hosted). The license
+    // module is lazy-required (never at module top-level) to preserve boot
+    // ordering — it pulls in heavy userStore DB init that must load after this
+    // route module, not during it.
+    const { serverLicenseGovernsOrgs } = require('../license');
     if (serverLicenseGovernsOrgs()) return payload;
     if (await isAdminCaller(req)) return payload;
     const markup = await getCustomerMarkup(req);
