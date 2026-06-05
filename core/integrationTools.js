@@ -23,7 +23,7 @@ const { SIGNREQUEST_TOOLS } = require('../integrations/signrequestTools');
 const { GAMMA_TOOLS } = require('../integrations/gammaTools');
 const { buildN8nTools } = require('../integrations/n8nTools');
 const { N8N_WORKFLOW_TOOLS, getN8nToolPermission } = require('../integrations/n8nWorkflowTools');
-const { hasPermission } = require('../auth/permissions');
+const { hasPermission, resolveUserOrgIds } = require('../auth/permissions');
 const { AGENT_SEARCH_TOOLS } = require('../integrations/agentSearchTools');
 const license = require('../license');
 const { REGEX_GENERATOR_TOOLS } = require('../integrations/regexGeneratorTools');
@@ -266,13 +266,32 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig, rout
     // Super admins (and the `__system__` scope they run under) bypass. Fails
     // closed — if entitlement can't be resolved we withhold rather than leak a
     // paid capability.
+    //
+    // We resolve the user's FULL org set (direct organizationId AND group-based
+    // memberships) the same way the licence middleware does — a connector /
+    // multi-tenant user is usually linked to their org via a group, so the
+    // direct `userOrgId` is null and a naive single-org check would wrongly deny
+    // web search even though the org's plan grants it.
     const wsSuperAdmin = isAdmin || session?.user?.role === 'admin';
     let webSearchEntitled = wsSuperAdmin;
     if (!webSearchEntitled) {
         try {
-            const wsScope = { userId };
-            if (userOrgId && userOrgId !== '__system__') wsScope.organizationId = userOrgId;
-            webSearchEntitled = await license.hasFeature(wsScope, 'web_search');
+            const resolved = await resolveUserOrgIds({ session });
+            if (resolved === null) {
+                webSearchEntitled = true; // super admin (resolveUserOrgIds null sentinel)
+            } else {
+                const orgIds = [...resolved];
+                if (userOrgId && userOrgId !== '__system__' && !orgIds.includes(userOrgId)) orgIds.push(userOrgId);
+                if (orgIds.length) {
+                    const bestTier = await license.getBestTierForOrgs(orgIds);
+                    webSearchEntitled = license.tiers.tierHasFeature(bestTier, 'web_search')
+                        || await license.orgGrantsFeature(orgIds, 'web_search');
+                }
+                // Consumer (org-less) fallback — resolves the user's own subscription tier.
+                if (!webSearchEntitled && userId) {
+                    webSearchEntitled = await license.hasFeature({ userId }, 'web_search');
+                }
+            }
         } catch (e) {
             console.warn(`[IntegrationTools] web_search entitlement lookup failed user=${userId} org=${userOrgId} error=${e.message}`);
             webSearchEntitled = false;
