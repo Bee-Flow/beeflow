@@ -181,6 +181,25 @@ router.put('/:id', requireAuth, async (req, res) => {
             metadataUpdate[`${slot}Size`] = size;
         }
 
+        // Re-snapshot any active public shares so a published page reflects the
+        // edit immediately. The snapshot used to be written only at share
+        // creation, so recipients saw the stale version until they cleared their
+        // browser cache (BFSF-190). Fire-and-forget — never blocks the save.
+        if (Object.keys(slotUpdates).length > 0) {
+            (async () => {
+                try {
+                    const shares = await publicShareStore.listSharesForWebpage(id, userId);
+                    for (const sh of (shares || [])) {
+                        if (sh.revokedAt) continue;
+                        await webpageSnapshot.writeSnapshot({ shareId: sh.id, webpageId: id, ownerId: userId })
+                            .catch(e => console.warn(`[Webpages] re-snapshot failed for share ${sh.id}:`, e.message));
+                    }
+                } catch (e) {
+                    console.warn('[Webpages] re-snapshot enumeration failed:', e.message);
+                }
+            })();
+        }
+
         const ok = await webpageStore.updateWebpageMetadata(id, userId, metadataUpdate);
         if (!ok && Object.keys(slotUpdates).length === 0) {
             return res.status(400).json({ error: 'No fields to update' });

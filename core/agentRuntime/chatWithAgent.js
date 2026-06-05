@@ -88,7 +88,7 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
     const orgPiiEnabled = !!orgShield?.enabled;
     if (aiConfigForPii?.piiDetectionEnabled || orgPiiEnabled) {
         try {
-            const piiResult = await validateInputForPii(messages.slice(-3), orgPiiEnabled, orgShield);
+            const piiResult = await validateInputForPii(messages.slice(-3), orgPiiEnabled, orgShield, userAuth?.piiActionOverride || null);
 
             if (piiResult && piiResult.tokenizedText) {
                 // Redact/tokenize mode: replace last user message with tokenized version

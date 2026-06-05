@@ -32,6 +32,7 @@ const { isAgentSearchTool, executeAgentSearchTool } = require('../integrations/a
 const { isRegexGeneratorTool, executeRegexGeneratorTool } = require('../integrations/regexGeneratorTools');
 const { executeWorkspaceTool } = require('../integrations/workspaceTools');
 const { isKbSearchTool, executeKbSearchTool } = require('../integrations/kbSearchTools');
+const { isKbIngestTool, executeKbIngestTool } = require('../integrations/kbIngestTools');
 const { isRechtspraakTool, executeRechtspraakTool } = require('../integrations/rechtspraakTools');
 const { isEurlexTool, executeEurlexTool } = require('../integrations/eurlexTools');
 const { isKamerstukkenTool, executeKamerstukkenTool } = require('../integrations/kamerstukkenTools');
@@ -361,6 +362,11 @@ async function executeTool(toolName, toolArgs, context = {}) {
             agentId,
             conversationId: context.conversationId,
         });
+    }
+
+    // ─── KB Ingest Tool (routine-only WRITE; Support Studio template) ───
+    if (isKbIngestTool(toolName)) {
+        return await executeKbIngestTool(toolName, toolArgs, { orgId, userId });
     }
 
     // ─── Dutch legal sources (anonymous public APIs) ──────────────

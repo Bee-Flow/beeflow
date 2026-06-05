@@ -350,7 +350,14 @@ class OpenAIProvider extends BaseProvider {
                     }
                     if (tc.id) toolCallAccumulator[idx].id = tc.id;
                     if (tc.function?.name) toolCallAccumulator[idx].name = tc.function.name;
-                    if (tc.function?.arguments) toolCallAccumulator[idx].arguments += tc.function.arguments;
+                    if (tc.function?.arguments) {
+                        toolCallAccumulator[idx].arguments += tc.function.arguments;
+                        // Surface in-progress args so callers can live-stream a tool
+                        // arg (e.g. notebook_write content) as it generates. Ignored
+                        // by consumers that don't handle it.
+                        const _acc = toolCallAccumulator[idx];
+                        if (_acc.name) onEvent('tool_args_delta', { name: _acc.name, partial: _acc.arguments });
+                    }
                 }
             }
             // Check for finish_reason to emit accumulated tool calls
@@ -358,16 +365,24 @@ class OpenAIProvider extends BaseProvider {
             if (finishReason) streamFinishReason = finishReason;
             if (finishReason === 'tool_calls' || finishReason === 'stop') {
                 for (const [, tc] of Object.entries(toolCallAccumulator)) {
-                    if (tc.name) {
-                        let input = {};
-                        try { input = JSON.parse(tc.arguments || '{}'); } catch (e) { }
-                        onEvent('tool_use', {
-                            id: tc.id,
-                            name: tc.name,
-                            input,
-                        });
-                        console.log(`[OpenAI] Stream tool_use: ${tc.name}`);
+                    // Skip nameless tool calls (a malformed/garbled stream from a
+                    // low-quality model). Also DROP — rather than emit input:{} for —
+                    // a call whose accumulated arguments aren't valid JSON: a poisoned
+                    // tool call gets echoed back to the provider next round and can
+                    // trigger an upstream 400 / spin loop (BFSF-143).
+                    if (!tc.name || !String(tc.name).trim()) {
+                        console.warn('[OpenAI] Dropping nameless streamed tool call');
+                        continue;
                     }
+                    let input;
+                    try {
+                        input = JSON.parse(tc.arguments || '{}');
+                    } catch (e) {
+                        console.warn(`[OpenAI] Dropping tool_use ${tc.name}: invalid JSON args (${e.message})`);
+                        continue;
+                    }
+                    onEvent('tool_use', { id: tc.id, name: tc.name, input });
+                    console.log(`[OpenAI] Stream tool_use: ${tc.name}`);
                 }
             }
         }

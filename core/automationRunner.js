@@ -441,6 +441,7 @@ async function execIntegrationAction(step, ctx, runState, mode) {
                 userId: ctx.userId,
                 session: ctx.session,
                 isAdmin: !!ctx.session?.isAdmin || ctx.session?.user?.role === 'admin',
+                routineStep: true,
             });
             ctx.allowedToolNames = new Set((r.tools || []).map(t => t?.function?.name).filter(Boolean));
         } catch (e) {

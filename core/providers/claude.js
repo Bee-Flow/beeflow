@@ -537,6 +537,10 @@ class ClaudeProvider extends BaseProvider {
                         // Accumulate tool call JSON arguments
                         if (currentToolUse) {
                             currentToolUse.arguments += event.delta.partial_json;
+                            // Surface the in-progress arguments so callers can live-
+                            // stream a tool arg (e.g. notebook_write content) as it is
+                            // generated. Consumers that don't handle it ignore it.
+                            onEvent('tool_args_delta', { name: currentToolUse.name, partial: currentToolUse.arguments });
                         }
                     }
                 } else if (event.type === 'content_block_start') {
@@ -565,16 +569,28 @@ class ClaudeProvider extends BaseProvider {
                         onEvent('thinking_start', { partId: currentThinking.partId, redacted: true });
                     }
                 } else if (event.type === 'content_block_stop') {
-                    // Emit accumulated tool call when block ends
+                    // Emit accumulated tool call when block ends. Drop a nameless
+                    // block, or one whose accumulated arguments aren't valid JSON,
+                    // instead of emitting input:{} — a poisoned tool call echoed back
+                    // next round can trigger an upstream 400 / spin loop (BFSF-143).
                     if (currentToolUse) {
-                        let input = {};
-                        try { input = JSON.parse(currentToolUse.arguments || '{}'); } catch (e) { }
-                        onEvent('tool_use', {
-                            id: currentToolUse.id,
-                            name: currentToolUse.name,
-                            input,
-                        });
-                        console.log(`[Claude] Stream tool_use: ${currentToolUse.name}`);
+                        let input;
+                        let _drop = false;
+                        if (!currentToolUse.name || !String(currentToolUse.name).trim()) {
+                            console.warn('[Claude] Dropping nameless streamed tool call');
+                            _drop = true;
+                        } else {
+                            try { input = JSON.parse(currentToolUse.arguments || '{}'); }
+                            catch (e) { console.warn(`[Claude] Dropping tool_use ${currentToolUse.name}: invalid JSON args (${e.message})`); _drop = true; }
+                        }
+                        if (!_drop) {
+                            onEvent('tool_use', {
+                                id: currentToolUse.id,
+                                name: currentToolUse.name,
+                                input,
+                            });
+                            console.log(`[Claude] Stream tool_use: ${currentToolUse.name}`);
+                        }
                         currentToolUse = null;
                     } else if (currentThinking) {
                         onEvent('thinking_stop', {

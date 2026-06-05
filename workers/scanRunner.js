@@ -93,13 +93,19 @@ async function runEngines({ scanId, engines, targetUrl, tmpRoot }) {
     for (let i = 0; i < engines.length; i++) {
         const descriptor = engines[i];
         // Bail out of the remaining engines if the user cancelled mid-scan.
-        if (await securityScanStore.isCancelRequested(scanId).catch(() => false)) {
+        // isCancelRequested is synchronous (in-memory Set) — no .catch().
+        if (securityScanStore.isCancelRequested(scanId)) {
             cancelled = true;
             break;
         }
 
         const subWorkdir = path.join(tmpRoot, engineSlug(descriptor, i));
         await fs.promises.mkdir(subWorkdir, { recursive: true }).catch(() => {});
+        // The API/worker runs as root but the scanner images run as a non-root
+        // user (e.g. ZAP = uid 1000). The engine bind-mounts this dir at its
+        // report path and must be able to WRITE report.json + its own working
+        // files there, so open the mounted dir up to the container's user.
+        await fs.promises.chmod(subWorkdir, 0o777).catch(() => {});
 
         await securityScanStore.appendProgress(scanId, `[scan] starting engine ${descriptor.engine}${descriptor.intensity ? ` (${descriptor.intensity})` : ''}`).catch(() => {});
 
@@ -137,10 +143,63 @@ async function runEngines({ scanId, engines, targetUrl, tmpRoot }) {
     return { rawReports, cancelled };
 }
 
+// ── Agent mode ─────────────────────────────────────────────────────
+//
+// AI-driven scan: Claude drives a long-lived ZAP daemon (REST API) + a
+// free-form tools sandbox step-by-step, streaming each action/scanstat/terminal
+// event live. The daemon + sandbox carry this scan's bf.scanId label, so the
+// cancel poll's killScan() and the reaper tear them down too; we also cleanup()
+// explicitly in finally. Returns the same outcome shape as quick mode.
+async function runAgentMode({ scanId, targetUrl, engines, userId, organizationId, tmpRoot, startedAt }) {
+    const securityScanDriver = require('../services/securityScanDriver');
+    const onLine = (line) => securityScanStore.appendProgress(scanId, line).catch(() => {});
+    let daemon = null;
+    let sandbox = null;
+    try {
+        await securityScanStore.appendProgress(scanId, '[scan] starting ZAP daemon (this can take ~30s)…').catch(() => {});
+        daemon = await scanRunner.startZapDaemon({ scanId, onLine });
+        await securityScanStore.appendProgress(scanId, '[scan] starting tools sandbox…').catch(() => {});
+        sandbox = await scanRunner.startToolsSandbox({ scanId, onLine });
+
+        // Adapter the driver calls for its nuclei_run / testssl_run tools. opts
+        // is ignored for these engines (no intensity); the engine writes its
+        // report into a per-engine sub-workdir (chmod 0777 so the non-root
+        // scanner image can write it) which we read back.
+        const runEngine = async (engine /*, opts */) => {
+            const sub = path.join(tmpRoot, `agent-${engine}`);
+            await fs.promises.mkdir(sub, { recursive: true }).catch(() => {});
+            await fs.promises.chmod(sub, 0o777).catch(() => {});
+            const r = await scanRunner.runEngineContainer({
+                scanId, engine, intensity: null, workdir: sub, targetUrl,
+                onLine,
+                timeoutMs: ENGINE_TIMEOUT_MS,
+            });
+            let json = null;
+            try { json = JSON.parse(await fs.promises.readFile(path.join(sub, 'report.json'), 'utf-8')); } catch (_) { /* missing/corrupt */ }
+            return { json, exitCode: r.exitCode, timedOut: r.timedOut };
+        };
+
+        return await securityScanDriver.runAgentScan({
+            scanId, targetUrl, engines, userId, organizationId,
+            maxSteps: null,
+            zap: { baseUrl: daemon.baseUrl, apiKey: daemon.apiKey },
+            terminal: { exec: sandbox.exec },
+            // NOTE: do NOT pass onLine here — the driver's log() already writes
+            // every line to the store via appendProgress; passing appendProgress
+            // again as onLine would double every line in the progress stream.
+            runEngine,
+        });
+    } finally {
+        if (daemon) { try { await daemon.cleanup(); } catch (_) {} }
+        if (sandbox) { try { await sandbox.cleanup(); } catch (_) {} }
+    }
+}
+
 // ── Drain loop ────────────────────────────────────────────────────
 
 async function processScan(claim) {
-    const { scan_id: scanId, user_id: userId, organization_id: organizationId, target_url: targetUrl, engines: rawEngines, metadata: rawMetadata } = claim;
+    const { scan_id: scanId, user_id: userId, organization_id: organizationId, target_url: targetUrl, engines: rawEngines, metadata: rawMetadata, mode: rawMode } = claim;
+    const mode = rawMode === 'agent' ? 'agent' : 'quick';
 
     // Re-check the SSRF guard at claim time — the row may have sat queued long
     // enough for DNS to start resolving to a private address, and the guard is
@@ -194,6 +253,9 @@ async function processScan(claim) {
 
     let outcome;
     try {
+      if (mode === 'agent') {
+        outcome = await runAgentMode({ scanId, targetUrl, engines, userId, organizationId, tmpRoot, startedAt });
+      } else {
         const { rawReports, cancelled } = await runEngines({ scanId, engines, targetUrl, tmpRoot });
 
         if (cancelled) {
@@ -248,6 +310,7 @@ async function processScan(claim) {
 
             outcome = { status: 'completed', reportJson, reportWebpageId, severitySummary };
         }
+      }
     } catch (e) {
         outcome = { status: 'error', error: `worker_exception: ${e.message}` };
     } finally {

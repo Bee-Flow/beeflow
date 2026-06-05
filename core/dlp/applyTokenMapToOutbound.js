@@ -96,4 +96,33 @@ function applyTokenMapToMessages({ conversationId, messages }) {
     return (messages || []).map(m => ({ ...m, content: _applyToContent(m.content, replace) }));
 }
 
-module.exports = { applyTokenMapToOutbound, applyTokenMapToMessages, buildReverseReplacer };
+/**
+ * Reverse direction (token → real value) for OUTBOUND tool-call arguments.
+ *
+ * DLP tokenises sensitive values in the user prompt into placeholders like
+ * `[email_1]` and instructs the model to echo them verbatim. The streamed text
+ * reply and tool RESULTS are un-tokenised before the user sees them, but the
+ * arguments the model passes INTO a write-side tool (docs/sheets/gmail/calendar)
+ * were never restored — so `[email_1]` was written verbatim into the Google Doc
+ * (BFSF-171). This deep-walks the parsed args object and restores every string.
+ *
+ * Callers should NOT apply this to web/agent-search query args, to keep real PII
+ * off external search providers.
+ */
+function untokeniseToolArgs(args, convMap) {
+    if (!convMap || !Object.keys(convMap).length) return args;
+    const { restoreTokens } = require('../piiDetection');
+    const walk = (v) => {
+        if (typeof v === 'string') return restoreTokens(v, convMap);
+        if (Array.isArray(v)) return v.map(walk);
+        if (v && typeof v === 'object') {
+            const out = {};
+            for (const k of Object.keys(v)) out[k] = walk(v[k]);
+            return out;
+        }
+        return v;
+    };
+    return walk(args);
+}
+
+module.exports = { applyTokenMapToOutbound, applyTokenMapToMessages, buildReverseReplacer, untokeniseToolArgs };

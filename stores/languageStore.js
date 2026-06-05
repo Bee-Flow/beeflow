@@ -13,8 +13,14 @@ const configStore = require('./configStore');
 
 // ── Default locale list (seeded on first access) ────────────────
 
+// Seed the four baseline locales so the Preferences "Interface Language" row
+// (gated on locales.length > 1) is visible out of the box. Untranslated locales
+// degrade gracefully — useTranslation falls back to English per key (BFSF-200).
 const DEFAULT_LOCALES = [
-    { code: 'en', name: 'English', isDefault: true }
+    { code: 'en', name: 'English', isDefault: true },
+    { code: 'nl', name: 'Nederlands' },
+    { code: 'de', name: 'Deutsch' },
+    { code: 'fr', name: 'Français' },
 ];
 
 // ── Common locale catalog for the "Add Language" dropdown ───────
@@ -61,6 +67,18 @@ async function getAvailableLocales() {
     if (!locales || !Array.isArray(locales) || locales.length === 0) {
         await configStore.setConfig('i18n_locales', DEFAULT_LOCALES);
         return DEFAULT_LOCALES;
+    }
+    // Non-destructive merge for existing deployments seeded with English-only:
+    // ensure the baseline locales (en/nl/de/fr) are always present so the
+    // language selector becomes visible, without removing/overriding any
+    // admin-added locale or the chosen default (BFSF-200). Idempotent.
+    const have = new Set(locales.map(l => l && l.code));
+    const missing = DEFAULT_LOCALES
+        .filter(l => !have.has(l.code))
+        .map(l => ({ code: l.code, name: l.name }));  // drop isDefault — never introduce a 2nd default
+    if (missing.length) {
+        locales = [...locales, ...missing];
+        await configStore.setConfig('i18n_locales', locales);
     }
     return locales;
 }

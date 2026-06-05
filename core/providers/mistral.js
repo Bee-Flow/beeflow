@@ -250,7 +250,13 @@ class MistralProvider extends BaseProvider {
                     // Name comes once in the first chunk — set, don't append
                     if (tc.function?.name) toolCallAccumulator[idx].name = tc.function.name;
                     // Arguments stream in across multiple chunks — append
-                    if (tc.function?.arguments) toolCallAccumulator[idx].arguments += tc.function.arguments;
+                    if (tc.function?.arguments) {
+                        toolCallAccumulator[idx].arguments += tc.function.arguments;
+                        // Surface in-progress args for live-streaming a tool arg
+                        // (e.g. notebook_write content). Ignored if unhandled.
+                        const _acc = toolCallAccumulator[idx];
+                        if (_acc.name) onEvent('tool_args_delta', { name: _acc.name, partial: _acc.arguments });
+                    }
                 }
             }
             // Emit accumulated tool calls on finish

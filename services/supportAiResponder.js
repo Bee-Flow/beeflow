@@ -61,6 +61,123 @@ async function _resolveConfig() {
     return { agentId: agentId || null, kbIds: Array.isArray(kbIds) ? kbIds : [] };
 }
 
+const REPLY_MODES = ['draft', 'auto_confident', 'autonomous'];
+
+function _normalizeConfig(c) {
+    return {
+        agentId: c.agentId || null,
+        kbIds: Array.isArray(c.kbIds) ? c.kbIds : [],
+        replyMode: REPLY_MODES.includes(c.replyMode) ? c.replyMode : 'draft',
+        autoresolveThreshold: Number(c.autoresolveThreshold) || DEFAULT_AUTORESOLVE_THRESHOLD,
+        v2Enabled: !!c.v2Enabled,
+        toolsEnabled: c.toolsEnabled !== undefined ? !!c.toolsEnabled : !!c.v2Enabled,
+    };
+}
+
+/**
+ * Resolve the effective per-run config. A caller that owns a thread tied to a
+ * tenant inbox injects `config` (or a `resolveConfig` async fn). When neither
+ * is given we fall back to the GLOBAL configStore keys — Bee Flow's own company
+ * inbox, `replyMode: 'legacy'`, behaviour unchanged.
+ */
+async function _resolveEffectiveConfig(thread, opts = {}) {
+    if (opts.config) return _normalizeConfig(opts.config);
+    if (typeof opts.resolveConfig === 'function') {
+        const c = await opts.resolveConfig(thread);
+        if (c) return _normalizeConfig(c);
+    }
+    const { agentId, kbIds } = await _resolveConfig();
+    const threshold = Number(await configStore.getConfig('support_ai_autoresolve_threshold')) || DEFAULT_AUTORESOLVE_THRESHOLD;
+    const v2Enabled = !!(await configStore.getConfig('support_ai_v2_enabled'));
+    return { agentId, kbIds, replyMode: 'legacy', autoresolveThreshold: threshold, v2Enabled, toolsEnabled: v2Enabled };
+}
+
+/**
+ * Run KB search + the agent loop and parse the candidate reply. Pure of any
+ * thread mutation — the caller decides what to do with the result based on the
+ * inbox's reply mode. Returns the parsed candidate (or throws on a hard agent
+ * error so the caller can escalate).
+ */
+async function _composeAiReply({ thread, messages, lastRequester, cfg, aiUserId }) {
+    let kbHits = [];
+    try {
+        kbHits = await _withTimeout(
+            quickKBSearch(aiUserId, cfg.kbIds, lastRequester.body, { topK: 4 }),
+            KB_SEARCH_TIMEOUT_MS,
+            'quickKBSearch',
+        );
+    } catch (e) {
+        console.warn('[SupportAI] quickKBSearch failed:', e.message);
+    }
+
+    const kbContext = kbHits.length
+        ? `\n\n[Reference material — only cite if directly relevant:]\n${kbHits.map((h, i) => `(${i + 1}) ${h.title}\n${h.content}`).join('\n\n')}`
+        : '';
+
+    const requesterLine = thread.requester_user_id
+        ? `Logged-in user${thread.organization_id ? ` (org id: ${thread.organization_id})` : ''}.`
+        : (thread.source === 'email' ? `Customer reached the team by email.` : `Anonymous requester (came in via marketing form).`);
+
+    const transcript = messages.map(m => {
+        const who = m.author_kind === 'requester' ? 'Customer'
+            : m.author_kind === 'ai' ? 'AI (previous turn)'
+                : m.author_kind === 'staff' ? 'Support staff'
+                    : 'System';
+        return `${who}: ${m.body}`;
+    }).join('\n\n');
+
+    const userMessage = `You are answering a customer-support thread.
+
+${requesterLine}
+Subject: ${thread.subject}
+
+Full conversation so far:
+${transcript}
+${kbContext}
+
+Reply only to the customer's most recent message. If the knowledge base does not contain a confident answer, or the question involves account-specific actions you can't safely perform (billing changes, password resets, account deletion, custom-deal pricing, anything escalation-worthy), respond briefly and end your reply with the exact token [ESCALATE: <short reason>]. ${cfg.toolsEnabled ? 'You may use the available read-only support tools to look up the customer, their organization, subscription, and the knowledge base before answering. ' : ''}If you are confident your reply fully resolves the customer's issue and no human follow-up is needed, append the exact token [RESOLVED] on its own line at the very end. Otherwise answer concisely and cite the KB section by title where applicable.`;
+
+    // A support reply is first-party processing of the customer's OWN email
+    // (their address/IBAN/order ids legitimately appear in the thread), sent to
+    // the org's already-trusted LLM and returned to the data subject. Bypass the
+    // PII hard-block so the responder can actually answer — the org-wide block
+    // guard is meant for interactive user→LLM chat, not this flow. (Tokenize is
+    // not used here: non-streaming chatWithAgent doesn't de-tokenize output, so
+    // tokens would leak into the customer reply.)
+    const chatAuth = { userOrgId: thread.organization_id || null, piiActionOverride: 'allow' };
+    if (cfg.toolsEnabled) {
+        chatAuth.extraTools = SUPPORT_TOOLS;
+        chatAuth.supportThreadId = thread.id;
+    }
+
+    const result = await _withTimeout(
+        chatWithAgent(cfg.agentId, aiUserId, userMessage, chatAuth),
+        CHAT_AGENT_TIMEOUT_MS,
+        'chatWithAgent',
+    );
+    const aiResultRaw = (result && (result.content || result.response || result.message)) || '';
+    const modelUsed = (result && result.model) || null;
+
+    const escalateMatch = aiResultRaw.match(ESCALATE_RE);
+    const resolvedMatch = aiResultRaw.match(RESOLVED_RE);
+    const cleanBody = _stripEscalateToken(aiResultRaw).replace(RESOLVED_RE, '').trim();
+    const tooShort = cleanBody.length < 20;
+    const escalated = !!escalateMatch || tooShort || (kbHits.length === 0 && cleanBody.length < 60);
+    const escalateReason = escalateMatch?.[1]?.trim()
+        || (tooShort ? 'empty_or_too_short' : (kbHits.length === 0 ? 'no_kb_grounding' : null));
+    const threshold = cfg.autoresolveThreshold || DEFAULT_AUTORESOLVE_THRESHOLD;
+    const topScore = kbHits.length ? (kbHits[0].score || 0) : 0;
+    // Autonomous mode trusts the agent's [RESOLVED] verdict and closes the
+    // ticket without the KB-confidence gate; other modes still require the top
+    // KB hit to clear the threshold before auto-resolving.
+    const aiResolved = !escalated && !!resolvedMatch
+        && (cfg.replyMode === 'autonomous' || topScore >= threshold);
+    const finalBody = cleanBody || 'I was not able to draft a confident response — a human will follow up shortly.';
+    const citations = kbHits.map(h => ({ title: h.title, score: h.score, source_uri: h.source_uri }));
+
+    return { finalBody, escalated, escalateReason, aiResolved, citations, modelUsed, topScore, kbCount: kbHits.length };
+}
+
 async function _safeRecordEvent(payload) {
     try {
         if (typeof supportStore.recordThreadEvent === 'function') {
@@ -191,10 +308,10 @@ async function runAiAutoResponder(threadId, opts = {}) {
             return null;
         }
 
-        const { agentId, kbIds } = await _resolveConfig();
-        if (!agentId) {
+        const cfg = await _resolveEffectiveConfig(thread, opts);
+        if (!cfg.agentId) {
             await _escalate(threadId, 'AI not configured', {
-                systemMessage: 'AI auto-responder is not configured (no support_ai_agent_id). Escalated to staff.',
+                systemMessage: 'AI auto-responder is not configured (no agent selected). Escalated to staff.',
             });
             settled = true;
             return null;
@@ -202,70 +319,15 @@ async function runAiAutoResponder(threadId, opts = {}) {
 
         await supportStore.updateThread(threadId, { status: 'ai_responding' });
 
-        const aiUserId = opts.aiUserId || `support-ai:${thread.id}`;
+        const aiUserId = opts.aiUserId || `support-ai:${thread.inbox_id || 'co'}:${thread.id}`;
 
-        // KB pre-search — best-effort with hard timeout. Missing KB context
-        // just means the AI works without grounding (which itself becomes an
-        // escalation signal further down).
-        let kbHits = [];
+        // Run KB search + agent loop. A hard agent error escalates (legacy) /
+        // surfaces to the caller.
+        let composed;
         try {
-            kbHits = await _withTimeout(
-                quickKBSearch(aiUserId, kbIds, lastRequester.body, { topK: 4 }),
-                KB_SEARCH_TIMEOUT_MS,
-                'quickKBSearch',
-            );
+            composed = await _composeAiReply({ thread, messages, lastRequester, cfg, aiUserId });
         } catch (e) {
-            console.warn('[SupportAI] quickKBSearch failed:', e.message);
-        }
-
-        const kbContext = kbHits.length
-            ? `\n\n[Reference material — only cite if directly relevant:]\n${kbHits.map((h, i) => `(${i + 1}) ${h.title}\n${h.content}`).join('\n\n')}`
-            : '';
-
-        const requesterLine = thread.requester_user_id
-            ? `Logged-in user${thread.organization_id ? ` (org id: ${thread.organization_id})` : ''}.`
-            : `Anonymous requester (came in via marketing form).`;
-
-        const transcript = messages.map(m => {
-            const who = m.author_kind === 'requester' ? 'Customer'
-                : m.author_kind === 'ai' ? 'AI (previous turn)'
-                    : m.author_kind === 'staff' ? 'Bee Flow staff'
-                        : 'System';
-            return `${who}: ${m.body}`;
-        }).join('\n\n');
-
-        const v2Enabled = !!(await configStore.getConfig('support_ai_v2_enabled'));
-
-        const userMessage = `You are answering a Bee Flow customer-support thread.
-
-${requesterLine}
-Subject: ${thread.subject}
-
-Full conversation so far:
-${transcript}
-${kbContext}
-
-Reply only to the customer's most recent message. If the knowledge base does not contain a confident answer, or the question involves account-specific actions you can't safely perform (billing changes, password resets, account deletion, custom-deal pricing, anything escalation-worthy), respond briefly and end your reply with the exact token [ESCALATE: <short reason>]. ${v2Enabled ? 'You may use the available read-only support tools to look up the customer, their organization, subscription, and the knowledge base before answering. ' : ''}If you are confident your reply fully resolves the customer's issue and no human follow-up is needed, append the exact token [RESOLVED] on its own line at the very end. Otherwise answer concisely and cite the KB section by title where applicable.`;
-
-        // v2: expose read-only support tools + thread context to the agent loop.
-        const chatAuth = { userOrgId: thread.organization_id || null };
-        if (v2Enabled) {
-            chatAuth.extraTools = SUPPORT_TOOLS;
-            chatAuth.supportThreadId = thread.id;
-        }
-
-        let aiResultRaw = '';
-        let modelUsed = null;
-        try {
-            const result = await _withTimeout(
-                chatWithAgent(agentId, aiUserId, userMessage, chatAuth),
-                CHAT_AGENT_TIMEOUT_MS,
-                'chatWithAgent',
-            );
-            aiResultRaw = (result && (result.content || result.response || result.message)) || '';
-            modelUsed = (result && result.model) || null;
-        } catch (e) {
-            console.error('[SupportAI] chatWithAgent failed:', e.message);
+            console.error('[SupportAI] _composeAiReply failed:', e.message);
             await _escalate(threadId, `ai_error: ${e.message}`, {
                 systemMessage: `AI auto-responder failed (${e.message}). Escalated to staff.`,
             });
@@ -273,54 +335,56 @@ Reply only to the customer's most recent message. If the knowledge base does not
             return null;
         }
 
-        const escalateMatch = aiResultRaw.match(ESCALATE_RE);
-        const resolvedMatch = aiResultRaw.match(RESOLVED_RE);
-        const cleanBody = _stripEscalateToken(aiResultRaw).replace(RESOLVED_RE, '').trim();
-        // Empty / extremely short answers are unreliable — treat as escalation.
-        const tooShort = cleanBody.length < 20;
-        const escalated = !!escalateMatch || tooShort || (kbHits.length === 0 && cleanBody.length < 60);
-        const escalateReason = escalateMatch?.[1]?.trim()
-            || (tooShort ? 'empty_or_too_short' : (kbHits.length === 0 ? 'no_kb_grounding' : null));
+        const { finalBody, escalated, escalateReason, aiResolved, citations, modelUsed, topScore, kbCount } = composed;
 
-        // Auto-resolve only when the AI is confident AND the top KB hit clears
-        // the configured similarity threshold. Customer still confirms via CSAT.
-        const threshold = Number(await configStore.getConfig('support_ai_autoresolve_threshold')) || DEFAULT_AUTORESOLVE_THRESHOLD;
-        const topScore = kbHits.length ? (kbHits[0].score || 0) : 0;
-        const aiResolved = !escalated && !!resolvedMatch && topScore >= threshold;
-
-        const finalBody = cleanBody || 'I was not able to draft a confident response — a human will follow up shortly.';
-
-        const citations = kbHits.map(h => ({
-            title: h.title,
-            score: h.score,
-            source_uri: h.source_uri,
-        }));
+        // Reply-mode gate — decide deliver vs. human-review draft. Legacy (Bee
+        // Flow's own company inbox) always yields a deliverable message; the
+        // route SMTP-sends it. Tenant inboxes pick per inbox config.
+        const mode = cfg.replyMode || 'legacy';
+        let wantsDraft;
+        if (mode === 'legacy') wantsDraft = false;
+        else if (mode === 'draft') wantsDraft = true;
+        else if (mode === 'auto_confident') wantsDraft = escalated || topScore < cfg.autoresolveThreshold;
+        else /* autonomous */ wantsDraft = escalated;
 
         const aiMsg = await supportStore.appendMessage({
             threadId,
             authorKind: 'ai',
-            authorDisplay: 'Bee Flow AI',
+            authorDisplay: mode === 'legacy' ? 'Bee Flow AI' : 'AI assistant',
             body: finalBody,
             kbCitations: citations,
             aiModel: modelUsed,
-            aiConfidence: kbHits.length ? Math.min(1, kbHits[0].score || 0) : null,
+            aiConfidence: kbCount ? Math.min(1, topScore) : null,
+            // Tenant inboxes carry delivery intent on the message: 'queued' →
+            // caller (sync engine / route) sends via the mailbox then flips it
+            // to {ok:true}; 'draft' is never delivered. Legacy leaves it null
+            // (route SMTP-sends + records status separately).
+            emailSendStatus: mode === 'legacy' ? null : { state: wantsDraft ? 'draft' : 'queued' },
         });
 
         await _safeRecordEvent({
             threadId,
             actorUserId: null,
             actorKind: 'system',
-            action: 'ai_reply',
+            action: wantsDraft ? 'ai_draft' : 'ai_reply',
             payload: {
-                model: modelUsed,
-                escalated,
-                resolved: aiResolved,
+                model: modelUsed, mode,
+                escalated, resolved: aiResolved,
                 escalateReason: escalated ? (escalateReason || 'low_confidence') : null,
-                citationCount: citations.length,
+                citationCount: citations.length, confidence: topScore,
             },
         });
 
-        if (escalated) {
+        if (wantsDraft) {
+            // Human reviews + sends. Same transition as an escalation
+            // (awaiting_agent + auto-assign) but nothing is sent to the customer.
+            await supportStore.updateThread(threadId, {
+                status: 'awaiting_agent',
+                ai_handled: true,
+                ai_escalated_reason: escalated ? (escalateReason || 'low_confidence') : null,
+            });
+            try { await _maybeAutoAssign(threadId); } catch (e) { console.warn('[SupportAI] auto-assign failed:', e.message); }
+        } else if (escalated) {
             await _escalate(threadId, escalateReason || 'low_confidence');
         } else if (aiResolved) {
             await supportStore.updateThread(threadId, {
@@ -345,7 +409,7 @@ Reply only to the customer's most recent message. If the knowledge base does not
         Promise.resolve().then(() => _autoTag(thread, lastRequester.body, finalBody)).catch(() => {});
 
         settled = true;
-        return { message: aiMsg, escalated, escalateReason, resolved: aiResolved };
+        return { message: aiMsg, escalated, escalateReason, resolved: aiResolved, mode, sent: !wantsDraft, confidence: topScore };
     } catch (outerErr) {
         // Catch-all — any unexpected throw (DB hiccup, bad config, etc.).
         console.error('[SupportAI] runAiAutoResponder unexpected error:', outerErr.message);

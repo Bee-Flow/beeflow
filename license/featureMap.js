@@ -48,6 +48,7 @@ module.exports = {
     '/api/email-kb': { gate: 'ticket_assistant', beta: 'itil_ticket_assistant', notes: 'Alias of /api/ticket-assistant' },
     '/api/tests': { gate: 'playwright_tests', beta: 'playwright_tests', notes: 'Enterprise tier + beta opt-in — Studio Tests tab (Playwright generation + runs)' },
     '/api/security': { gate: 'security_scan', beta: 'security_scan', notes: 'Enterprise tier + beta opt-in — Studio Security Scan tab (OWASP ZAP / Nuclei / testssl.sh in isolated containers)' },
+    '/api/support-inbox': { gate: 'support_inbox', beta: 'support_inbox', notes: 'Enterprise tier + beta opt-in — Studio Support tab (tenant customer-support inbox: connect Gmail/Outlook mailbox, inbound→ticket, AI reply, KB-ingest routine). Org-level support_inbox permission additionally gates per-user access.' },
 
     // ── Intentionally ungated (community-tier core functionality) ────
     '/api/usage': { gate: 'advanced_usage_monitoring', beta: null, notes: 'Base /api/usage paths (summary/timeline/users/sources/agents/models/...) are ungated for the Overview tab. The /api/usage/{guardrails,integrations,azure-services}/* sub-paths are gated to advanced_usage_monitoring (enterprise+) via a path-aware middleware in server/index.js — Safety, Integrations, Azure-services tabs. Same gate applies to /api/terminations and /api/feedback (Terminations + Feedback tabs).' },

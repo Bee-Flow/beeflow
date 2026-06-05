@@ -16,6 +16,7 @@ const {
 const configStore = require('../../stores/configStore');
 const { getAdapter } = require('../../core/providers');
 const notebookStore = require('../../stores/notebookStore');
+const { startSseHeartbeat } = require('../../core/sseHelpers');
 
 const { NOTEBOOK_DOC_TOOLS, NOTEBOOK_ADD_SOURCE_TOOL, executeNotebookDocTool } = require('../../integrations/notebookDocTools');
 const { AGENT_SEARCH_TOOLS, executeAgentSearchTool, isAgentSearchTool } = require('../../integrations/agentSearchTools');
@@ -192,6 +193,9 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
     const send = (event, data) => {
         res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     };
+    // Keep the stream warm through the NC AppAPI proxy during long reasoning /
+    // doc-edit turns so it isn't idle-timed-out into a 504 (BFSF-221/177).
+    startSseHeartbeat(res);
 
     // Persist a verified authority into the matter's bronnenlijst when a
     // retrieval tool returns a real record (a successful _get IS verification).
@@ -729,7 +733,16 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
         const chatOptions = {
             maxTokens: tierSettings.maxTokens || tierDefaults.maxTokens,
             temperature: tierSettings.temperature !== undefined ? tierSettings.temperature : tierDefaults.temperature,
+            // Pass an explicit reasoning effort. Without it, Claude 4.x adaptive
+            // thinking defaults to 'medium' and can burn the entire (fast-tier,
+            // 4096-token) budget on thinking, ending the stream with EMPTY content
+            // and no document edit — the "stuck in reasoning" symptom (BFSF-177).
+            reasoningEffort: req.body.reasoningEffort || tierSettings.reasoningEffort || tierDefaults.reasoningEffort || 'low',
         };
+        // Give thinking + answer headroom so a low tier doesn't share a tiny pot.
+        if (chatOptions.reasoningEffort && chatOptions.reasoningEffort !== 'none') {
+            chatOptions.maxTokens = Math.max(chatOptions.maxTokens || 0, 8192);
+        }
 
         // Track mutable document content (updated by doc tools across rounds).
         let currentDocContent = documentContent || '';
@@ -889,6 +902,17 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
                     }).catch(() => {});
                 }
             }
+        }
+
+        // Never end a notebook turn with a silent empty bubble. The reasoningEffort
+        // fix above prevents the common "thinking consumed the whole budget" case;
+        // if content is still empty (and no doc edit was made), emit a clear
+        // fallback so the message finalizes instead of hanging on "Thinking…"
+        // (BFSF-177).
+        if (!fullContent || !fullContent.trim()) {
+            const _fallback = "I couldn't produce a response for that. Please try rephrasing your request.";
+            send('content', { text: _fallback });
+            fullContent = _fallback;
         }
 
         send('done', {});

@@ -389,7 +389,31 @@ function matchNextcloudUserStatusFilter(payload, filter) {
  * shallow `matchFilter` for anything we haven't taught explicit semantics
  * — keeps webhook providers (msgraph, github) working unchanged.
  */
+/**
+ * support.ticket.resolved — fires when a tenant Support-inbox ticket is resolved.
+ * Filter: { inboxId?, categoryEquals?, priorityEquals?, resolvedBy? ('ai'|'staff'),
+ *           tagIncludes?, minMessages?, requireGenuineContact? }.
+ * `requireGenuineContact` defaults to true: a resolved ticket only matches when
+ * the dispatcher stamped `genuineContact:true` (a real customer↔agent exchange
+ * with a sent reply). Set it false to also ingest non-customer-contact threads.
+ */
+function matchSupportTicketResolvedFilter(payload, filter) {
+    const f = (filter && typeof filter === 'object') ? filter : {};
+    if (!payload) return false;
+    if (f.inboxId && payload.inboxId !== f.inboxId) return false;
+    if (f.categoryEquals && payload.category !== f.categoryEquals) return false;
+    if (f.priorityEquals && payload.priority !== f.priorityEquals) return false;
+    if (f.resolvedBy && payload.resolvedBy !== f.resolvedBy) return false;
+    if (f.tagIncludes && !(Array.isArray(payload.tags) && payload.tags.includes(f.tagIncludes))) return false;
+    if (typeof f.minMessages === 'number' && (payload.messageCount || 0) < f.minMessages) return false;
+    // Genuine customer contact required by default — belt-and-suspenders with the
+    // dispatch-time gate (which already skips emit when contact isn't genuine).
+    if (f.requireGenuineContact !== false && payload.genuineContact !== true) return false;
+    return true;
+}
+
 function pickMatcher(provider, event) {
+    if (provider === 'support' && event === 'ticket.resolved') return matchSupportTicketResolvedFilter;
     if (provider === 'gmail' && event === 'mail.new') return matchGmailMailFilter;
     if (provider === 'gmail' && event === 'label.added') return matchGmailLabelFilter;
     if (provider === 'google-calendar' && event === 'event.changed')  return matchCalendarChangedFilter;
@@ -507,6 +531,50 @@ async function dispatchTicketAssistantEvent(event, payload = {}, orgId = null) {
             runs.push({ subId: sub.id, runId: run?.id });
         } catch (e) {
             console.error('[TriggerBus] TA dispatch error:', e.message);
+        }
+    }
+    return runs;
+}
+
+/**
+ * Dispatch an internal Support-inbox app event (provider 'support'), org-scoped.
+ * Mirrors dispatchTicketAssistantEvent but for the tenant Support studio. A
+ * resolved ticket fans out only to automations owned within the same org.
+ */
+async function dispatchSupportEvent(event, payload = {}, orgId = null) {
+    if (!event) return [];
+    const subs = await automationStore.getSubscriptionsForProvider('support', event);
+    if (subs.length === 0) return [];
+
+    const userStore = require('../stores/userStore');
+    const orgCache = new Map();
+    const lookupOrg = async (uid) => {
+        if (orgCache.has(uid)) return orgCache.get(uid);
+        const u = await userStore.getUser(uid).catch(() => null);
+        const o = u?.organizationId || null;
+        orgCache.set(uid, o);
+        return o;
+    };
+
+    const runs = [];
+    const matcher = pickMatcher('support', event);
+    for (const sub of subs) {
+        if (orgId) {
+            const subOrg = await lookupOrg(sub.userId);
+            if (subOrg !== orgId) continue;
+        }
+        if (!matcher(payload, sub.filter)) continue;
+        const automation = await automationStore.getAutomation(sub.automationId);
+        if (!automation || !automation.isActive || automation.isDraft) continue;
+        const runner = require('../core/automationRunner');
+        try {
+            const run = await runner.executeAutomation(automation, {
+                triggerKind: 'app_event',
+                triggerPayload: { provider: 'support', event, ...payload },
+            });
+            runs.push({ subId: sub.id, runId: run?.id });
+        } catch (e) {
+            console.error('[TriggerBus] support dispatch error:', e.message);
         }
     }
     return runs;
@@ -1651,6 +1719,7 @@ async function fetchLatestNextcloudMatch(userId, event, filter) {
 module.exports = {
     dispatchEvent,
     dispatchTicketAssistantEvent,
+    dispatchSupportEvent,
     runPollingPass,
     renewExpiringSubscriptions,
     provisionSubscription,
@@ -1675,6 +1744,7 @@ module.exports = {
     matchNextcloudNotificationFilter,
     matchNextcloudCommentFilter,
     matchNextcloudTagFilter,
+    matchSupportTicketResolvedFilter,
     matchNextcloudCalendarFilter,
     matchNextcloudCalendarUpcomingFilter,
     matchNextcloudDeckCardFilter,

@@ -37,7 +37,7 @@ const { WEBPAGE_DB_TOOLS, isDbTool, executeDbTool } = require('../../integration
 const { PROPOSE_WEBPAGE_PLAN_TOOL, executeProposeWebpagePlan } = require('../../integrations/webpagePlanTool');
 const guardrailEventStore = require('../../stores/guardrailEventStore');
 const { buildTokenPreservationAddendum } = require('../../core/dlp/tokenPreservationPrompt');
-const { applyTokenMapToMessages } = require('../../core/dlp/applyTokenMapToOutbound');
+const { applyTokenMapToMessages, untokeniseToolArgs } = require('../../core/dlp/applyTokenMapToOutbound');
 
 /**
  * Build a short, TOOL-FREE transcript for conversation-title generation:
@@ -86,6 +86,8 @@ function compactToolResultForLLM(toolResult) {
 }
 const { getIntegrationTools, buildToolHint } = require('../../core/integrationTools');
 const { emitPhase, emitPhaseEnd, withPhase } = require('../../core/agentRuntime/phaseEvents');
+const { startSseHeartbeat } = require('../../core/sseHelpers');
+const { hasPermission } = require('../../auth/permissions');
 const { getUserAuth } = require('../../utils/routeHelpers');
 const { checkRegexPatterns } = require('../../core/guardrails');
 const { checkSubscriptionLimits, resolveOrgId } = require('../../core/limits');
@@ -171,7 +173,7 @@ Best practices: Start with hero, surface key stats early, group content in secti
 ## Tool Usage
 Do NOT describe what you *could* do — just do it. When a user requests an action you have a tool for — call it immediately. Only ask for clarification when critical parameters are genuinely ambiguous.
 
-**Images**: When asked to generate, create, or draw an image, call generate_image immediately. Describe the scene richly in the prompt.
+**Images**: If you have an image-generation tool (generate_image) available and the user asks you to generate, create, or draw an image, call it immediately and describe the scene richly in the prompt. If no such tool is available, say image generation isn't available — never fake an image with HTML, CSS, Canvas, WebGL, or SVG.
 
 **Audio & Music**: When asked to create music, songs, beats, or spoken audio, call the appropriate ElevenLabs tool (elevenlabs_music, elevenlabs_tts, elevenlabs_sfx). Audio plays inline automatically — do NOT try to embed audio links in your response text.
 
@@ -191,6 +193,47 @@ Always respond in the same language the user writes in. If the user writes in Du
 function requireAuth(req, res, next) {
     if (req.session && req.session.user) return next();
     res.status(401).json({ error: 'Unauthorized' });
+}
+
+/**
+ * Extract a (possibly unterminated) JSON string field from a partial JSON
+ * fragment that is still streaming in. Used to live-stream a tool argument
+ * (e.g. notebook_write's `content`) before the full tool call is complete.
+ * Returns the decoded string value, or null if the field hasn't started yet.
+ */
+function extractPartialJsonString(partial, field) {
+    if (typeof partial !== 'string') return null;
+    const keyRe = new RegExp(`"${field}"\\s*:\\s*"`);
+    const m = keyRe.exec(partial);
+    if (!m) return null;
+    let out = '';
+    for (let i = m.index + m[0].length; i < partial.length; i++) {
+        const c = partial[i];
+        if (c === '\\') {
+            const next = partial[i + 1];
+            if (next === undefined) break;            // incomplete escape at the tail
+            if (next === 'n') out += '\n';
+            else if (next === 't') out += '\t';
+            else if (next === 'r') out += '\r';
+            else if (next === 'b') out += '\b';
+            else if (next === 'f') out += '\f';
+            else if (next === '"') out += '"';
+            else if (next === '\\') out += '\\';
+            else if (next === '/') out += '/';
+            else if (next === 'u') {
+                const hex = partial.slice(i + 2, i + 6);
+                if (hex.length < 4) break;            // incomplete \uXXXX at the tail
+                out += String.fromCharCode(parseInt(hex, 16));
+                i += 4;
+            } else out += next;
+            i += 1;                                    // skip the escaped char
+        } else if (c === '"') {
+            break;                                     // closing quote → string complete
+        } else {
+            out += c;
+        }
+    }
+    return out;
 }
 
 // ─── Streaming Direct Chat ───────────────────────────────────────
@@ -512,6 +555,10 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
     const send = (event, data) => {
         res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     };
+    // Keep the stream warm through the NC AppAPI proxy during long, silent tool
+    // loops (e.g. webpage builds) so it isn't idle-timed-out into a 504 that the
+    // client misreports as "Error generating response." (BFSF-221).
+    startSseHeartbeat(res);
 
     // Emit on every turn so the "How I got this answer" panel always knows
     // which concrete model produced this reply, including for fixed tiers.
@@ -690,9 +737,15 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         const userSimpleMode = !!(await configStore.getConfig(`simple_mode_user_${userId}`));
 
         // ─── Built-in: workspace tools ────────────────────────────────
-        // Only inject notebook tools if the feature is enabled
+        // Only inject notebook tools if the feature is enabled AND the user
+        // actually has the use_notebooks permission. Without the permission
+        // check, a user with no notebook access still received the tools and
+        // could trigger a write that force-opened a panel they aren't entitled
+        // to (BFSF-207). This is the authoritative gate — if the tool isn't in
+        // the toolset, the model cannot call it.
         const notebooksEnabled = (await configStore.getConfig('feature_notebooks_enabled')) !== false;
-        if (!userSimpleMode && notebooksEnabled) {
+        const canUseNotebooks = notebooksEnabled && await hasPermission(userId, 'use_notebooks', req.session);
+        if (!userSimpleMode && canUseNotebooks) {
             for (const wsTool of WORKSPACE_TOOLS) {
                 if (!directChatTools.find(t => t.function.name === wsTool.function.name)) {
                     directChatTools.push(wsTool);
@@ -803,6 +856,25 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
             const before = directChatTools.length;
             directChatTools = directChatTools.filter(t => !/^notebook_/.test(t.function?.name || ''));
             console.log(`[DirectChat] Notebook tools stripped for attachment-Q&A turn (${before} → ${directChatTools.length} tools)`);
+        }
+
+        // ─── Deterministic notebook-write gate (BFSF-169) ────────────────
+        // Notebook writes used to be guarded ONLY by the system prompt, so the
+        // model occasionally wrote to the user's document unprompted. Keep
+        // notebook_read available, but only offer the WRITE tools when the user
+        // shows explicit notebook-write intent OR the panel is already open this
+        // turn (i.e. they're actively working in it). Otherwise a spontaneous
+        // write is impossible because the tool simply isn't present.
+        const _notebookPanelOpen = notebookspaceContent !== undefined;
+        const _notebookWriteIntent = _msgHasWriteIntent
+            || /(notebook|notitie|noteer|kladblok)/i.test(typeof message === 'string' ? message : '');
+        if (!stripsNotebookTools && !_notebookPanelOpen && !_notebookWriteIntent) {
+            const _writeNames = new Set(['notebook_write', 'notebook_replace', 'notebook_insert']);
+            const before = directChatTools.length;
+            directChatTools = directChatTools.filter(t => !_writeNames.has(t.function?.name || ''));
+            if (directChatTools.length !== before) {
+                console.log(`[DirectChat] Notebook WRITE tools stripped (no write-intent, panel closed) ${before} → ${directChatTools.length}`);
+            }
         }
 
         // ─── Progressive tool disclosure ─────────────────────────────────
@@ -1017,7 +1089,7 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         //   - notebookspaceContent: the panel is currently open. `undefined`
         //     means closed; `""` is "open but blank".
         let notebookspaceContext = '';
-        if (notebooksEnabled && notebookspaceAvailable) {
+        if (canUseNotebooks && notebookspaceAvailable) {
             notebookspaceContext = `\n\n[NOTEBOOK CAPABILITY]
 A Notebook panel is available in the user's UI. Tools:
 - notebook_read: Read content. Modes: "outline" (default—headings+stats), "section" (one section by heading), "search" (find text), "full" (entire doc). Use outline first, then section/search for targeted access.
@@ -1033,7 +1105,7 @@ CRITICAL — WHEN TO WRITE TO THE NOTEBOOK:
 
 When you DO use a notebook tool (after an explicit request), do NOT also write the document text in your chat reply. Acknowledge briefly (one short sentence) and stop — the user reads the result in the Notebook panel. Use Markdown inside the notebook for headings, bold, tables, lists, code blocks.`;
         }
-        if (notebooksEnabled && notebookspaceContent !== undefined) {
+        if (canUseNotebooks && notebookspaceContent !== undefined) {
             notebookspaceContext += `\n\n[NOTEBOOK OPEN]
 The Notebook panel is currently open. Current rules for edits: 1) Before notebook_replace, use notebook_read mode="search" or mode="section" to get exact text. 2) Copy find_text EXACTLY from read output. 3) For partial edits always prefer notebook_replace over notebook_write. 4) After any notebook tool call, your chat reply is at most one short confirmation sentence — do not repeat the new or modified content.`;
             if (notebookspaceSelection && notebookspaceSelection.trim()) {
@@ -1102,9 +1174,23 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
         // Providers that join system messages (Gemini, OpenAI Responses) still
         // see the same effective prompt; Claude's extractSystem emits per-
         // message blocks with the right cache_control on the stable one.
+        // Capability-honesty addenda (BFSF-176/125/127): tell the model the
+        // truth about which media tools are actually registered so it doesn't
+        // invent an image via HTML/WebGL when generate_image is absent, and
+        // steer Gmail attachment reads to the real tool rather than a
+        // hallucinated convert_document_to_text.
+        const _toolNames = new Set(directChatTools.map(t => t.function?.name).filter(Boolean));
+        let capabilityContext = '';
+        if (!_toolNames.has('generate_image') && !_toolNames.has('generate_video')) {
+            capabilityContext += `\n\n[MEDIA GENERATION UNAVAILABLE]\nYou do NOT currently have an image or video generation tool. If the user asks you to generate, create, or draw an image or video, tell them it is unavailable on this workspace (an admin can enable it). Do NOT attempt to produce the media via HTML, CSS, Canvas, WebGL, SVG, create_webpage, or any other code-based workaround.`;
+        }
+        if ([..._toolNames].some(n => n.startsWith('gmail_'))) {
+            capabilityContext += `\n\n[GMAIL / ATTACHMENTS]\nTo read an email body use gmail_read; to extract text from an email attachment use gmail_read_attachment. Do NOT call any generic convert/terminal/document-conversion tool — those do not exist. Uploaded chat files already have their text provided to you inline.`;
+        }
+
         emitPhaseEnd(send, 'building_prompt', Date.now() - _spT);
         let messages = [
-            { role: 'system', content: basePrompt + toolHint + memoryContext + houseStyleContext + notebookspaceContext + projectContext + skillsContext },
+            { role: 'system', content: basePrompt + toolHint + memoryContext + houseStyleContext + notebookspaceContext + projectContext + skillsContext + capabilityContext },
             { role: 'system', content: `Now: ${_nowStr}` },
         ];
 
@@ -1809,6 +1895,23 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                             text: `[Spreadsheet: ${att.name} — failed to process: ${e.message}]`
                         });
                     }
+                } else if (att.source === 'gmail' && att.content) {
+                    // Gmail email — GmailPicker sends the body as plain text
+                    // (type 'text/plain'). Inject it directly like Google Drive
+                    // does; otherwise it fell into the generic branch below,
+                    // which base64-decoded the plaintext into garbage and the
+                    // model never saw the email (BFSF-87).
+                    const safeMail = await _scanExtracted(att.content, undefined, att.name);
+                    const mailText = `--- Gmail: ${att.name} ---\n${safeMail}\n--- End of ${att.name} ---`;
+                    contentParts.push({ type: 'text', text: mailText });
+                    await pushAttachment({ name: att.name, type: 'gmail' }, mailText);
+                } else if (att.content && att.type && att.type.startsWith('text/') && !String(att.content).startsWith('data:')) {
+                    // Other plain-text attachments (text/plain, text/markdown…) —
+                    // inline as text instead of base64-decoding into garbage (BFSF-87).
+                    const safeTxt = await _scanExtracted(att.content, undefined, att.name);
+                    const txt = `--- ${att.name} ---\n${safeTxt}\n--- End of ${att.name} ---`;
+                    contentParts.push({ type: 'text', text: txt });
+                    await pushAttachment({ name: att.name, type: att.type }, txt);
                 } else if (att.content) {
                     // Generic file — upload to RustFS for persistent access
                     const base64Data = att.content.split(',')[1] || att.content;
@@ -1962,24 +2065,15 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
             emitPhaseEnd(send, 'processing_attachments', Date.now() - _attT);
         }
 
-        // Add terminal tools when integrations that handle attachments
-        // (Gmail, etc.) are loaded — for convert_document_to_text etc.
-        // Note: terminal containers removed, but terminal tools module may still exist
-        const hasIntegrationWithAttachments = directChatTools.some(t =>
-            t.function?.name?.startsWith('gmail_') || t.function?.name?.startsWith('drive_')
-        );
-        if (hasIntegrationWithAttachments) {
-            try {
-                const { TERMINAL_TOOLS } = require('../../terminal/tools');
-                for (const tTool of TERMINAL_TOOLS) {
-                    if (!directChatTools.find(t => t.function.name === tTool.function.name)) {
-                        directChatTools.push(tTool);
-                    }
-                }
-            } catch (e) {
-                // Terminal tools module not available
-            }
-        }
+        // NOTE: a previous block here tried to inject TERMINAL_TOOLS
+        // (convert_document_to_text, etc.) via require('../../terminal/tools')
+        // when Gmail/Drive tools were present. That module does not exist, so
+        // the require always threw MODULE_NOT_FOUND and the catch silently
+        // swallowed it — dead code that injected nothing. It also let the model
+        // believe a generic document-conversion tool existed, so it tried to
+        // call one and surfaced "I don't have the tool!" (BFSF-127). Removed.
+        // The real path for Gmail attachments is gmail_read_attachment; the
+        // system prompt now steers the model there (see GMAIL/ATTACHMENT note).
 
         // ─── Unicode Smuggling Defense ───────────────────────────────
         // Must run FIRST — before moderation, PII, and regex guardrails.
@@ -2852,6 +2946,16 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                         const toolName = toolCall.function?.name || toolCall.name;
                         let toolArgs = {};
                         try { toolArgs = JSON.parse(toolCall.function?.arguments || '{}'); } catch (e) { }
+                        // Restore DLP tokens in outbound tool args so write-side tools
+                        // (docs/sheets/gmail/calendar) get the real value, not the
+                        // [email_1] placeholder (BFSF-171). Search queries keep their
+                        // tokens so PII isn't leaked to external search providers.
+                        if (!/^(agent_search|web_search|search|brave_search)$/i.test(toolName || '')) {
+                            try {
+                                const _argMap = require('../../core/dlp/dlpRunner').getConversationTokenMap(convId);
+                                if (_argMap && Object.keys(_argMap).length) toolArgs = untokeniseToolArgs(toolArgs, _argMap);
+                            } catch (_) { /* best-effort */ }
+                        }
 
                         console.log(`[DirectChat] Executing tool: ${toolName}`, toolArgs);
                         send('tool_start', { name: toolName, args: toolArgs });
@@ -3096,10 +3200,15 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                                 collectedEmailDrafts.push(toolResult.draft);
                             }
                         }
-                        // Emit calendar_draft SSE event for user approval (with dedup)
+                        // Emit calendar_draft SSE event for user approval (with dedup).
+                        // Key on the REAL draft fields (action/title/startTime/endTime/
+                        // eventId) — the old key read summary/start/end which calendar
+                        // drafts never carry, so the dedup was a no-op and the model
+                        // re-calling the tool across rounds duplicated the card (BFSF-123).
                         if (toolResult._action === 'calendar_draft') {
-                            const draftKey = JSON.stringify({ summary: toolResult.draft?.summary, start: toolResult.draft?.start, end: toolResult.draft?.end });
-                            const alreadySent = collectedCalendarDrafts.some(d => JSON.stringify({ summary: d.summary, start: d.start, end: d.end }) === draftKey);
+                            const calKey = (d) => JSON.stringify({ action: d?.action, title: d?.title, startTime: d?.startTime, endTime: d?.endTime, eventId: d?.eventId });
+                            const draftKey = calKey(toolResult.draft);
+                            const alreadySent = collectedCalendarDrafts.some(d => calKey(d) === draftKey);
                             if (!alreadySent) {
                                 send('calendar_draft', toolResult.draft);
                                 collectedCalendarDrafts.push(toolResult.draft);
@@ -3189,7 +3298,32 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                 : (directChatTools.length > 0 ? streamGuard.toolChoice : undefined),
         };
 
+        // ── Live notebook streaming (BFSF-208 enhancement) ──────────────
+        // As notebook_write's `content` argument streams in, push throttled
+        // partial updates to the Notebook panel so the user watches the document
+        // being written instead of it popping in fully-formed at the end. Only
+        // Claude/OpenAI/Mistral stream partial tool args; Gemini delivers them
+        // complete, so there the panel just fills in once at tool completion.
+        let _nbStreamLastLen = 0;
+        let _nbStreamLastAt = 0;
+        const _maybeStreamNotebook = (toolName, partialArgs) => {
+            if (!canUseNotebooks || toolName !== 'notebook_write') return;
+            const content = extractPartialJsonString(partialArgs, 'content');
+            if (!content) return;
+            const now = Date.now();
+            // Throttle: emit only when it grew enough or enough time elapsed, so
+            // we stream smoothly without flooding the SSE channel.
+            if (content.length - _nbStreamLastLen < 24 && now - _nbStreamLastAt < 120) return;
+            _nbStreamLastLen = content.length;
+            _nbStreamLastAt = now;
+            send('workspace_update', { content, streaming: true });
+        };
+
         const streamCallback = (type, data) => {
+            if (type === 'tool_args_delta') {
+                _maybeStreamNotebook(data?.name, data?.partial);
+                return;
+            }
             if (type === 'text') {
                 // Pipeline mute: drop text deltas while a step-machine round is
                 // still walking the pipeline. Tool calls always pass. This is
@@ -3350,6 +3484,10 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
         // stream. Captures outer closures (fullContent, thinkingContent,
         // streamToolCalls, muteAssistantText, thinkingParts, lastResponseId).
         const followStreamCallback = (type, data) => {
+            if (type === 'tool_args_delta') {
+                _maybeStreamNotebook(data?.name, data?.partial);
+                return;
+            }
             if (type === 'text') {
                 if (muteAssistantText) return;
                 fullContent += data.text;
@@ -3471,6 +3609,14 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                 const toolName = toolCall.function?.name;
                 let toolArgs = {};
                 try { toolArgs = JSON.parse(toolCall.function?.arguments || '{}'); } catch (e) { }
+                // Restore DLP tokens in outbound tool args (BFSF-171) — see the
+                // non-streamed loop above. Search queries keep their tokens.
+                if (!/^(agent_search|web_search|search|brave_search)$/i.test(toolName || '')) {
+                    try {
+                        const _argMap = require('../../core/dlp/dlpRunner').getConversationTokenMap(convId);
+                        if (_argMap && Object.keys(_argMap).length) toolArgs = untokeniseToolArgs(toolArgs, _argMap);
+                    } catch (_) { /* best-effort */ }
+                }
 
                 console.log(`[DirectChat] Executing streamed tool: ${toolName}`, toolArgs);
                 send('tool_start', { name: toolName, args: toolArgs });
@@ -3721,10 +3867,13 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                         collectedEmailDrafts.push(toolResult.draft);
                     }
                 }
-                // Emit calendar_draft SSE event for user approval (with dedup)
+                // Emit calendar_draft SSE event for user approval (with dedup).
+                // Key on the real draft fields (action/title/startTime/endTime/
+                // eventId), not the never-present summary/start/end (BFSF-123).
                 if (toolResult._action === 'calendar_draft') {
-                    const draftKey = JSON.stringify({ summary: toolResult.draft?.summary, start: toolResult.draft?.start, end: toolResult.draft?.end });
-                    const alreadySent = collectedCalendarDrafts.some(d => JSON.stringify({ summary: d.summary, start: d.start, end: d.end }) === draftKey);
+                    const calKey = (d) => JSON.stringify({ action: d?.action, title: d?.title, startTime: d?.startTime, endTime: d?.endTime, eventId: d?.eventId });
+                    const draftKey = calKey(toolResult.draft);
+                    const alreadySent = collectedCalendarDrafts.some(d => calKey(d) === draftKey);
                     if (!alreadySent) {
                         send('calendar_draft', toolResult.draft);
                         collectedCalendarDrafts.push(toolResult.draft);
@@ -4238,13 +4387,11 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
             const _titleIsPlaceholder = !conv.title || !String(conv.title).trim() || /^new chat$/i.test(String(conv.title).trim());
             console.log(`[DirectChat] Title check: assistantReplies=${_assistantReplies}, currentTitle="${conv.title || ''}", placeholder=${_titleIsPlaceholder}, moderationViolation=${!!moderationViolation}`);
 
-            if (_assistantReplies === 1) {
-                // First reply — seed a neutral placeholder, NO title LLM call yet.
-                if (_titleIsPlaceholder) {
-                    try { await agentStore.updateDirectConversationTitle(convId, 'New Chat', userId); } catch (_) { /* non-fatal */ }
-                    send('title', { title: 'New Chat', conversationId: convId });
-                }
-            } else if (_assistantReplies >= 2 && _titleIsPlaceholder && !moderationViolation) {
+            if (_assistantReplies >= 1 && _titleIsPlaceholder && !moderationViolation) {
+                // Generate the real title as soon as there is one complete
+                // exchange. This used to wait for the SECOND assistant reply, so
+                // the very common single-turn chat stayed "New Chat" forever and
+                // the sidebar never reflected the topic without a refresh (BFSF-209).
                 // Second reply — generate the real title from the conversation,
                 // using the SAME model selection + inference path as the chat
                 // tier (getProviderForModel + getAdapter + adapter.chat). The
@@ -4294,8 +4441,10 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                     }
                 } catch (e) {
                     console.error('[DirectChat] Title generation failed:', e.message, e.stack);
+                    // Fallback so the sidebar isn't left blank if title-gen fails.
+                    try { await agentStore.updateDirectConversationTitle(convId, 'New Chat', userId); send('title', { title: 'New Chat', conversationId: convId }); } catch (_) { /* non-fatal */ }
                 }
-            } else if (_assistantReplies >= 2 && _titleIsPlaceholder && moderationViolation) {
+            } else if (_assistantReplies >= 1 && _titleIsPlaceholder && moderationViolation) {
                 // Moderation violation on a still-unnamed chat — safe generic title.
                 const safeTitle = 'New Chat';
                 try { await agentStore.updateDirectConversationTitle(convId, safeTitle, userId); } catch (_) { /* non-fatal */ }

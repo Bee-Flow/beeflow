@@ -50,6 +50,13 @@ app.use((req, res, next) => {
     next();
 });
 
+// Disable Express's automatic ETag on responses. The NC AppAPI PHP/Apache hop
+// can otherwise revalidate a dynamic JSON GET with If-None-Match and replay a
+// stale 304 body even though we send Cache-Control: no-store — which made the
+// chat-history sidebar and other lists show stale data until a hard refresh
+// (BFSF-209). no-store + no ETag means the proxy can't serve a cached body.
+app.disable('etag');
+
 // Dynamic, per-user API responses must never be cached by the browser or any
 // intermediary. In the Nextcloud connector path (browser → NC AppAPI proxy →
 // connector → here) these JSON GETs carried no Cache-Control, so the browser
@@ -466,6 +473,9 @@ app.use('/api/support', require('./routes/support'));
 // Tests Studio — Playwright generation + runs. Beta-gated + enterprise feature.
 app.use('/api/tests', requireLicenseFeature('playwright_tests'), requireBetaFeature('playwright_tests'), require('./routes/tests'));
 app.use('/api/security', requireLicenseFeature('security_scan'), requireBetaFeature('security_scan'), require('./routes/securityScans'));
+// Support Studio — tenant customer-support inbox (Studio → Support). Enterprise
+// tier + beta opt-in; the org-level support_inbox permission is enforced inside.
+app.use('/api/support-inbox', requireLicenseFeature('support_inbox'), requireBetaFeature('support_inbox'), require('./routes/supportInbox'));
 
 app.use('/', require('./routes/knowledge'));
 app.use('/api/kb', require('./routes/knowledgeBases'));
@@ -947,6 +957,16 @@ app.listen(PORT, '0.0.0.0', () => {
         startTicketAssistantSync();
     } catch (err) {
         console.warn('[Server] Ticket Assistant sync engine load failed:', err.message);
+    }
+    // Support Studio inbox sync — polls connected tenant mailboxes and turns
+    // inbound email into support tickets. Set SUPPORT_INBOX_SYNC_IN_API=false
+    // when a dedicated worker owns it.
+    try {
+        if (process.env.SUPPORT_INBOX_SYNC_IN_API !== 'false') {
+            require('./services/supportInboxSyncEngine').startSupportInboxSync();
+        }
+    } catch (err) {
+        console.warn('[Server] Support inbox sync engine load failed:', err.message);
     }
     // Customer Support SLA enforcer — policy-driven first-response/resolution
     // breach detection on a 60s tick (replaces the old 15-min at-risk warner).

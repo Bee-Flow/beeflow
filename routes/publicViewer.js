@@ -492,7 +492,16 @@ router.get('/:token/extras/*path', async (req, res) => {
 
         res.setHeader('Content-Type', obj.contentType || 'application/octet-stream');
         res.setHeader('X-Content-Type-Options', 'nosniff');
-        res.setHeader('Cache-Control', 'private, max-age=300');
+        // Revalidate instead of blindly caching for 5 minutes: after an owner
+        // re-snapshots an updated page, returning viewers were stuck with the old
+        // extra assets (images/fonts) until the window lapsed (BFSF-190). An
+        // ETag on the snapshot bytes lets unchanged assets still 304 cheaply.
+        const _etag = obj.etag || (obj.bytes ? `"${require('crypto').createHash('sha1').update(obj.bytes).digest('hex')}"` : null);
+        if (_etag) {
+            res.setHeader('ETag', _etag);
+            if (req.headers['if-none-match'] === _etag) return res.status(304).end();
+        }
+        res.setHeader('Cache-Control', 'private, no-cache, must-revalidate');
         res.send(obj.bytes);
     } catch (err) {
         console.error('[PublicViewer] extras GET failed:', err);

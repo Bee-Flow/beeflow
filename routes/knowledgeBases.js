@@ -429,7 +429,13 @@ router.get('/:id', requireAuth, async (req, res) => {
         if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
 
         const documents = await kbStore.listDocuments(kb.id);
-        res.json({ ...kb, documents });
+        // The single-KB query (getKB) doesn't compute the chunk/document
+        // aggregates that the list endpoint does, so the detail header showed
+        // "0 chunks" even for indexed docs (BFSF-213). Derive them from the
+        // already-loaded documents so the response matches the list view.
+        const total_chunks = documents.reduce((s, d) => s + (d.chunk_count || 0), 0);
+        const document_count = documents.length;
+        res.json({ ...kb, total_chunks, document_count, documents });
     } catch (e) {
         console.error('[KB] Get error:', e.message);
         res.status(500).json({ error: e.message });

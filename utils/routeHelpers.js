@@ -68,6 +68,8 @@ async function getUserAuth(req) {
     if (req.session?.appPassword) {
         userAuth.appPasswordUsername = req.session.appPassword.username;
         userAuth.appPassword = req.session.appPassword.password;
+        // A per-user Nextcloud URL stored alongside the credential wins over org config.
+        if (req.session.appPassword.url) userAuth.nextcloudUrl = req.session.appPassword.url;
     } else {
         // Otherwise look up from userStore
         const userId = req.session?.user?.id;
@@ -77,6 +79,7 @@ async function getUserAuth(req) {
             if (appPasswordData) {
                 userAuth.appPasswordUsername = appPasswordData.username;
                 userAuth.appPassword = appPasswordData.password;
+                if (appPasswordData.url) userAuth.nextcloudUrl = appPasswordData.url;
             }
         }
     }

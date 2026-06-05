@@ -79,6 +79,9 @@ const Permissions = Object.freeze({
     MANAGE_COMPONENTS: 'manage_components',
     MANAGE_KNOWLEDGE: 'manage_knowledge',
     MANAGE_APPS: 'manage_apps',
+    // Org-level: tenant customer-support inbox (Studio → Support). Distinct
+    // from the super-admin ADMIN_SUPPORT (Bee Flow's own company inbox).
+    SUPPORT_INBOX: 'support_inbox',
     USE_NOTEBOOKS: 'use_notebooks',
     USE_N8N_TOOLS: 'use_n8n_tools',
     MODIFY_N8N_WORKFLOWS: 'modify_n8n_workflows',
@@ -120,6 +123,7 @@ const SYSTEM_PERMISSIONS = [
     { id: 'manage_components', name: 'Manage Components', description: 'Create and edit workflow components', group: 'actions' },
     { id: 'manage_knowledge', name: 'Manage Knowledge', description: 'Create, edit, delete, and ingest knowledge bases', group: 'actions' },
     { id: 'manage_apps', name: 'Manage Apps', description: 'Create and publish apps', group: 'actions' },
+    { id: 'support_inbox', name: 'Support Inbox', description: 'Org: connect a support mailbox and triage, reply to, and resolve customer tickets in the Studio Support tab', group: 'actions' },
     { id: 'use_notebooks', name: 'Use Notebooks', description: 'Create, edit, and delete personal notebooks', group: 'actions' },
     // Deprecated since Phase 3: webpages access is now gated solely by the `webpages` beta
     // feature on the user's organisation. Kept in the registry for one release so existing

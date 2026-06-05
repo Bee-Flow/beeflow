@@ -166,6 +166,34 @@ CREATE TABLE IF NOT EXISTS support_assignment_state (
     last_assignee_user_id TEXT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- iteration 5: tenant Support studio — a non-global-admin org runs its OWN
+-- customer-support inbox by connecting external mailbox(es) (Gmail/Outlook).
+-- Bee Flow's own company inbox keeps inbox_id NULL; a tenant inbox sets
+-- inbox_id to a support_inboxes row (created by supportInboxStore). inbox_id is
+-- a plain UUID with NO foreign key — supportInboxStore.initDB() may run after
+-- this batch, so a FK would risk "relation support_inboxes does not exist".
+-- Orphan cleanup on inbox delete is handled in the application layer.
+ALTER TABLE support_threads ADD COLUMN IF NOT EXISTS inbox_id UUID;
+ALTER TABLE support_threads ADD COLUMN IF NOT EXISTS rfc822_message_id TEXT;
+ALTER TABLE support_threads ADD COLUMN IF NOT EXISTS provider_thread_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_support_threads_inbox ON support_threads(inbox_id, last_message_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_support_threads_provider_thread
+    ON support_threads(inbox_id, provider_thread_id) WHERE provider_thread_id IS NOT NULL;
+
+-- Email threading + idempotency on inbound/outbound messages.
+ALTER TABLE support_messages ADD COLUMN IF NOT EXISTS rfc822_message_id TEXT;
+ALTER TABLE support_messages ADD COLUMN IF NOT EXISTS in_reply_to TEXT;
+ALTER TABLE support_messages ADD COLUMN IF NOT EXISTS email_references TEXT;
+ALTER TABLE support_messages ADD COLUMN IF NOT EXISTS provider_message_id TEXT;
+ALTER TABLE support_messages ADD COLUMN IF NOT EXISTS attachments JSONB DEFAULT '[]'::jsonb;
+-- Idempotency: a provider message is recorded at most once per thread. Makes
+-- inbound sync safe under History/delta overlap, retries, and crashes.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_support_messages_provider_msg
+    ON support_messages(thread_id, provider_message_id) WHERE provider_message_id IS NOT NULL;
+-- Fast reply-correlation lookup (In-Reply-To / References → our stored msg id).
+CREATE INDEX IF NOT EXISTS idx_support_messages_rfc822
+    ON support_messages(rfc822_message_id) WHERE rfc822_message_id IS NOT NULL;
 `;
 
 let initialized = false;
@@ -174,6 +202,17 @@ async function initDB() {
     if (initialized) return;
     try {
         await pool.query(INIT_SQL);
+        // Widen the source CHECK to admit inbound 'email' (tenant Support inboxes).
+        // Drop-then-add so it's idempotent across reboots; existing rows
+        // ('in_app'/'marketing') satisfy the superset. Kept out of INIT_SQL
+        // because a bare ADD CONSTRAINT would abort the whole batch on reboot.
+        try {
+            await pool.query(`ALTER TABLE support_threads DROP CONSTRAINT IF EXISTS support_threads_source_check`);
+            await pool.query(`ALTER TABLE support_threads ADD CONSTRAINT support_threads_source_check
+                              CHECK (source IN ('in_app','marketing','email'))`);
+        } catch (cErr) {
+            console.warn('[SupportStore] source CHECK widening error (safe on fresh DB):', cErr.message);
+        }
         initialized = true;
         console.log('[SupportStore] PostgreSQL initialized');
     } catch (err) {
@@ -232,26 +271,73 @@ async function createThread({
     priority = 'normal',
     requesterIp = null,
     requesterUa = null,
+    // iteration 5: tenant Support inbox (email-sourced) threading
+    inboxId = null,
+    rfc822MessageId = null,
+    providerThreadId = null,
 }) {
     await initDB();
     if (!requesterEmail) throw new Error('requesterEmail is required');
     if (!subject) throw new Error('subject is required');
-    if (!['in_app', 'marketing'].includes(source)) throw new Error('invalid source');
+    if (!['in_app', 'marketing', 'email'].includes(source)) throw new Error('invalid source');
 
     const { rows } = await pool.query(
         `INSERT INTO support_threads
             (organization_id, requester_user_id, requester_email, requester_name,
              requester_org_role, requester_org_name,
-             source, subject, priority, requester_ip, requester_ua, status, last_message_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'open',now())
+             source, subject, priority, requester_ip, requester_ua,
+             inbox_id, rfc822_message_id, provider_thread_id, status, last_message_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'open',now())
          RETURNING *`,
         [organizationId, requesterUserId, requesterEmail, requesterName,
             requesterOrgRole, requesterOrgName,
-            source, subject, priority, requesterIp, requesterUa]
+            source, subject, priority, requesterIp, requesterUa,
+            inboxId, rfc822MessageId, providerThreadId]
     );
     const row = rows[0];
-    console.log(`[SupportStore] Thread created ${row.id} (${source}) for ${requesterEmail}`);
+    console.log(`[SupportStore] Thread created ${row.id} (${source}${inboxId ? `, inbox ${inboxId}` : ''}) for ${requesterEmail}`);
     return row;
+}
+
+/**
+ * Find a thread in an inbox whose provider thread id (Gmail threadId / Graph
+ * conversationId) matches — the cheap second-tier threading hint.
+ */
+async function findThreadByProviderThread(inboxId, providerThreadId) {
+    await initDB();
+    if (!inboxId || !providerThreadId) return null;
+    const { rows } = await pool.query(
+        `SELECT * FROM support_threads WHERE inbox_id = $1 AND provider_thread_id = $2 LIMIT 1`,
+        [inboxId, providerThreadId]
+    );
+    return rows[0] || null;
+}
+
+/**
+ * Find a thread by correlating an inbound In-Reply-To / References id against a
+ * message (or thread) we previously stored in this inbox — the primary,
+ * RFC-correct threading path.
+ */
+async function findThreadByRfcMessageId(inboxId, rfc822MessageIds = []) {
+    await initDB();
+    const ids = (Array.isArray(rfc822MessageIds) ? rfc822MessageIds : [rfc822MessageIds])
+        .map(x => String(x || '').trim()).filter(Boolean);
+    if (!inboxId || !ids.length) return null;
+    const { rows } = await pool.query(
+        `SELECT t.* FROM support_threads t
+          JOIN support_messages m ON m.thread_id = t.id
+         WHERE t.inbox_id = $1 AND m.rfc822_message_id = ANY($2::text[])
+         ORDER BY m.created_at DESC LIMIT 1`,
+        [inboxId, ids]
+    );
+    if (rows[0]) return rows[0];
+    // Also try the thread's own first-message id.
+    const { rows: t2 } = await pool.query(
+        `SELECT * FROM support_threads
+          WHERE inbox_id = $1 AND rfc822_message_id = ANY($2::text[]) LIMIT 1`,
+        [inboxId, ids]
+    );
+    return t2[0] || null;
 }
 
 async function getThread(id) {
@@ -270,6 +356,12 @@ async function listThreads({
     q = null,
     limit = 100,
     offset = 0,
+    // iteration 5: tenant Support inbox scoping. inboxId → a single inbox;
+    // inboxIdIn → any of several inboxes (org "all inboxes" view); inboxIsNull
+    // true → Bee Flow's own company inbox only (admin), false → tenant inboxes only.
+    inboxId = null,
+    inboxIdIn = null,
+    inboxIsNull = null,
 } = {}) {
     await initDB();
     const where = [];
@@ -280,6 +372,13 @@ async function listThreads({
         where.push(`status = ANY($${params.length}::text[])`);
     }
     if (organizationId) { params.push(organizationId); where.push(`organization_id = $${params.length}`); }
+    if (inboxId) { params.push(inboxId); where.push(`inbox_id = $${params.length}`); }
+    if (inboxIdIn && inboxIdIn.length) {
+        params.push(inboxIdIn);
+        where.push(`inbox_id = ANY($${params.length}::uuid[])`);
+    }
+    if (inboxIsNull === true) { where.push(`inbox_id IS NULL`); }
+    else if (inboxIsNull === false) { where.push(`inbox_id IS NOT NULL`); }
     if (requesterUserId) { params.push(requesterUserId); where.push(`requester_user_id = $${params.length}`); }
     if (assigneeUserId) { params.push(assigneeUserId); where.push(`assignee_user_id = $${params.length}`); }
     if (requesterEmail) { params.push(requesterEmail.toLowerCase()); where.push(`LOWER(requester_email) = $${params.length}`); }
@@ -343,6 +442,13 @@ async function appendMessage({
     kbCitations = [],
     aiConfidence = null,
     aiModel = null,
+    // iteration 5: email threading + idempotency
+    rfc822MessageId = null,
+    inReplyTo = null,
+    emailReferences = null,
+    providerMessageId = null,
+    attachments = [],
+    emailSendStatus = null,
 }) {
     await initDB();
     if (!['requester', 'ai', 'staff', 'system'].includes(authorKind)) {
@@ -353,12 +459,22 @@ async function appendMessage({
     const { rows } = await pool.query(
         `INSERT INTO support_messages
             (thread_id, author_kind, author_user_id, author_display,
-             body, body_html, internal_note, kb_citations, ai_confidence, ai_model)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10)
+             body, body_html, internal_note, kb_citations, ai_confidence, ai_model,
+             rfc822_message_id, in_reply_to, email_references, provider_message_id,
+             attachments, email_send_status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15::jsonb,$16::jsonb)
+         ON CONFLICT (thread_id, provider_message_id) WHERE provider_message_id IS NOT NULL
+         DO NOTHING
          RETURNING *`,
         [threadId, authorKind, authorUserId, authorDisplay,
-            body, bodyHtml, internalNote, JSON.stringify(kbCitations || []), aiConfidence, aiModel]
+            body, bodyHtml, internalNote, JSON.stringify(kbCitations || []), aiConfidence, aiModel,
+            rfc822MessageId, inReplyTo, emailReferences, providerMessageId,
+            JSON.stringify(attachments || []),
+            emailSendStatus ? JSON.stringify(emailSendStatus) : null]
     );
+    // ON CONFLICT DO NOTHING returns no row when the provider message was already
+    // ingested (idempotent inbound sync) — signal that to the caller.
+    if (!rows.length) return null;
     // Only non-internal messages bump last_message_at (internal notes are
     // staff-only and shouldn't move the SLA clock from the requester's POV).
     if (!internalNote) {
@@ -382,11 +498,16 @@ async function getThreadMessages(threadId, { includeInternal = false } = {}) {
     return rows;
 }
 
-async function countThreadsByStatus({ organizationId = null } = {}) {
+async function countThreadsByStatus({ organizationId = null, inboxId = null, inboxIdIn = null, inboxIsNull = null } = {}) {
     await initDB();
     const params = [];
-    let where = '';
-    if (organizationId) { params.push(organizationId); where = `WHERE organization_id = $1`; }
+    const clauses = [];
+    if (organizationId) { params.push(organizationId); clauses.push(`organization_id = $${params.length}`); }
+    if (inboxId) { params.push(inboxId); clauses.push(`inbox_id = $${params.length}`); }
+    if (inboxIdIn && inboxIdIn.length) { params.push(inboxIdIn); clauses.push(`inbox_id = ANY($${params.length}::uuid[])`); }
+    if (inboxIsNull === true) { clauses.push(`inbox_id IS NULL`); }
+    else if (inboxIsNull === false) { clauses.push(`inbox_id IS NOT NULL`); }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
     const { rows } = await pool.query(
         `SELECT status, COUNT(*)::int AS count FROM support_threads ${where} GROUP BY status`,
         params
@@ -428,6 +549,24 @@ async function setMessageEmailStatus(messageId, status) {
         `UPDATE support_messages SET email_send_status = $1::jsonb WHERE id = $2`,
         [JSON.stringify(status || {}), messageId]
     );
+}
+
+/**
+ * Record delivery outcome + outbound provider/RFC822 ids on an OUTBOUND message
+ * (staff or AI reply we just sent). Storing the minted Message-ID lets a
+ * customer's reply thread back via In-Reply-To/References as well as the
+ * provider thread id. All fields optional.
+ */
+async function setMessageDelivery(messageId, { emailSendStatus = null, rfc822MessageId = null, providerMessageId = null } = {}) {
+    await initDB();
+    const sets = [];
+    const params = [];
+    if (emailSendStatus !== null) { params.push(JSON.stringify(emailSendStatus)); sets.push(`email_send_status = $${params.length}::jsonb`); }
+    if (rfc822MessageId !== null) { params.push(rfc822MessageId); sets.push(`rfc822_message_id = $${params.length}`); }
+    if (providerMessageId !== null) { params.push(providerMessageId); sets.push(`provider_message_id = $${params.length}`); }
+    if (!sets.length) return;
+    params.push(messageId);
+    await pool.query(`UPDATE support_messages SET ${sets.join(', ')} WHERE id = $${params.length}`, params);
 }
 
 /**
@@ -812,10 +951,16 @@ async function getAndAdvanceRoundRobin(organizationId, candidateUserIds = []) {
 
 // ── Insights / dashboard aggregates ─────────────────────────────────────────
 
-async function getInsights({ organizationId = null } = {}) {
+async function getInsights({ organizationId = null, inboxId = null, inboxIdIn = null, inboxIsNull = null } = {}) {
     await initDB();
-    const orgFilter = organizationId ? `AND organization_id = $1` : '';
-    const params = organizationId ? [organizationId] : [];
+    const clauses = [];
+    const params = [];
+    if (organizationId) { params.push(organizationId); clauses.push(`organization_id = $${params.length}`); }
+    if (inboxId) { params.push(inboxId); clauses.push(`inbox_id = $${params.length}`); }
+    if (inboxIdIn && inboxIdIn.length) { params.push(inboxIdIn); clauses.push(`inbox_id = ANY($${params.length}::uuid[])`); }
+    if (inboxIsNull === true) { clauses.push(`inbox_id IS NULL`); }
+    else if (inboxIsNull === false) { clauses.push(`inbox_id IS NOT NULL`); }
+    const orgFilter = clauses.length ? `AND ${clauses.join(' AND ')}` : '';
 
     const csat = await pool.query(
         `SELECT
@@ -872,10 +1017,13 @@ module.exports = {
     getThreadMessages,
     countThreadsByStatus,
     findSlaAtRiskThreads,
+    findThreadByProviderThread,
+    findThreadByRfcMessageId,
     buildAccessToken,
     verifyAccessToken,
     firstStaffReplyTransition,
     setMessageEmailStatus,
+    setMessageDelivery,
     recordThreadEvent,
     listThreadEvents,
     // iteration 4

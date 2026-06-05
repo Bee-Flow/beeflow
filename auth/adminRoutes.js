@@ -1063,15 +1063,36 @@ router.get('/permissions', requireAdmin, async (req, res) => {
 
 // === App Password Management ===
 
+// Normalise a user-supplied Nextcloud base URL: default to https://, drop any
+// path/query/hash and trailing slashes so it concatenates cleanly with the
+// OCS/WebDAV paths the integration appends. Returns null for blank input and
+// undefined when the value can't be parsed as an http(s) URL.
+function normalizeNextcloudUrl(raw) {
+    if (!raw || !String(raw).trim()) return null;
+    let value = String(raw).trim();
+    if (!/^https?:\/\//i.test(value)) value = 'https://' + value;
+    try {
+        const parsed = new URL(value);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return undefined;
+        if (!parsed.hostname) return undefined;
+        const path = parsed.pathname.replace(/\/+$/, '');
+        return parsed.origin + path;
+    } catch (_) {
+        return undefined;
+    }
+}
+
 router.get('/app-password-status', requireAuth, async (req, res) => {
     const userId = req.session.user?.id;
     if (!userId) {
-        return res.json({ hasAppPassword: false, isNextcloudUser: false });
+        return res.json({ hasAppPassword: false, isNextcloudUser: false, nextcloudUrl: '' });
     }
 
+    const appPasswordData = await userStore.getAppPassword(userId);
     res.json({
-        hasAppPassword: await userStore.hasAppPassword(userId),
-        isNextcloudUser: !!req.session.accessToken
+        hasAppPassword: !!appPasswordData,
+        isNextcloudUser: !!req.session.accessToken,
+        nextcloudUrl: appPasswordData?.url || ''
     });
 });
 
@@ -1138,13 +1159,19 @@ router.post('/create-app-password', requireAuth, async (req, res) => {
 });
 
 router.post('/save-app-password', requireAuth, async (req, res) => {
-    const { username, password } = req.body;
+    const { username, password, url } = req.body;
     if (!username || !password) {
         return res.status(400).json({ error: 'Username and password are required' });
     }
 
+    // url is optional — blank leaves resolution to the org-wide config.
+    const nextcloudUrl = normalizeNextcloudUrl(url);
+    if (nextcloudUrl === undefined) {
+        return res.status(400).json({ error: 'Enter a valid Nextcloud URL (e.g. https://cloud.example.com)' });
+    }
+
     const userId = req.session.user?.id;
-    await userStore.storeAppPassword(userId, username, password);
+    await userStore.storeAppPassword(userId, username, password, nextcloudUrl);
     res.json({ success: true, message: 'App password saved securely' });
 });
 

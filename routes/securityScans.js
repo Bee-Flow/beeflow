@@ -47,9 +47,20 @@ router.use(requireAuth);
 
 router.post('/scans', async (req, res) => {
     try {
-        const { targetUrl, engines, authorized = false, metadata = null } = req.body || {};
+        const body = req.body || {};
+        const { targetUrl, authorized = false, metadata = null } = body;
+        let engines = body.engines;
+        // 'quick' = the deterministic one-shot pipeline; 'agent' = the live,
+        // AI-driven scan that drives a ZAP daemon + tools sandbox step-by-step.
+        const mode = body.mode === 'agent' ? 'agent' : 'quick';
         if (!targetUrl || typeof targetUrl !== 'string') {
             return res.status(400).json({ error: 'targetUrl is required' });
+        }
+        // Agent mode drives a ZAP daemon by default and treats nuclei/testssl as
+        // optional tools, so a missing engine list is fine — default to ZAP so
+        // the engine validation + report header have something concrete.
+        if (mode === 'agent' && (!Array.isArray(engines) || engines.length === 0)) {
+            engines = [{ engine: 'zap' }];
         }
         if (scanRunner.isPrivateTarget(targetUrl)) {
             return res.status(400).json({
@@ -113,6 +124,7 @@ router.post('/scans', async (req, res) => {
             engines: normalizedEngines,
             authorized: true,
             metadata,
+            mode,
         });
 
         // Fast-path: kick the worker once for this row so users don't wait

@@ -35,6 +35,7 @@ async function initDB() {
             organization_id TEXT,
             target_url TEXT NOT NULL,
             engines JSONB,
+            mode TEXT NOT NULL DEFAULT 'quick',
             status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','running','completed','error','cancelled')),
             report_json JSONB,
             report_webpage_id TEXT,
@@ -61,6 +62,9 @@ async function initDB() {
     } catch (_) {}
     try {
         await exec(`ALTER TABLE security_scans ADD COLUMN IF NOT EXISTS severity_summary JSONB`);
+    } catch (_) {}
+    try {
+        await exec(`ALTER TABLE security_scans ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'quick'`);
     } catch (_) {}
 
     await exec(`
@@ -148,6 +152,7 @@ function mapScanRow(r) {
         organizationId: r.organization_id || null,
         targetUrl: r.target_url,
         engines: parseJSON(r.engines, []),
+        mode: r.mode || 'quick',
         status: r.status,
         reportJson: parseJSON(r.report_json, null),
         reportWebpageId: r.report_webpage_id || null,
@@ -182,7 +187,7 @@ function mapArtifactRow(r) {
  * Atomically create a scan row + matching outbox row in one transaction.
  * Returns the new scan id.
  */
-async function createScan({ userId, organizationId = null, targetUrl, engines, authorized = false, metadata = null }) {
+async function createScan({ userId, organizationId = null, targetUrl, engines, authorized = false, metadata = null, mode = 'quick' }) {
     await initDB();
     if (!userId) throw new Error('userId required');
     if (!targetUrl) throw new Error('targetUrl required');
@@ -194,9 +199,9 @@ async function createScan({ userId, organizationId = null, targetUrl, engines, a
     try {
         await client.query('BEGIN');
         await client.query(
-            `INSERT INTO security_scans (id, user_id, organization_id, target_url, engines, status, authorized, metadata)
-             VALUES ($1, $2, $3, $4, $5::jsonb, 'queued', $6, $7::jsonb)`,
-            [scanId, userId, organizationId, targetUrl, JSON.stringify(engines), !!authorized, metadata ? JSON.stringify(metadata) : null]
+            `INSERT INTO security_scans (id, user_id, organization_id, target_url, engines, mode, status, authorized, metadata)
+             VALUES ($1, $2, $3, $4, $5::jsonb, $6, 'queued', $7, $8::jsonb)`,
+            [scanId, userId, organizationId, targetUrl, JSON.stringify(engines), mode === 'agent' ? 'agent' : 'quick', !!authorized, metadata ? JSON.stringify(metadata) : null]
         );
         await client.query(
             `INSERT INTO security_scan_jobs (id, scan_id, attempt_count, next_attempt_at)
@@ -351,7 +356,7 @@ async function claimDueJobs({ batchSize = 5, perUserCap = 1e9, orgCap = 1e9, glo
             active_total AS (SELECT COUNT(*) c FROM active),
             candidates AS (
                 SELECT j.id AS job_id, j.scan_id, j.attempt_count, j.next_attempt_at,
-                       s.user_id, s.organization_id, s.target_url, s.engines, s.status, s.authorized, s.metadata, s.created_at,
+                       s.user_id, s.organization_id, s.target_url, s.engines, s.mode, s.status, s.authorized, s.metadata, s.created_at,
                        COALESCE(au.c, 0) AS user_active,
                        COALESCE(ao.c, 0) AS org_active,
                        ROW_NUMBER() OVER (PARTITION BY s.user_id ORDER BY j.next_attempt_at ASC) AS user_rank,
@@ -376,7 +381,7 @@ async function claimDueJobs({ batchSize = 5, perUserCap = 1e9, orgCap = 1e9, glo
                  LIMIT GREATEST(0, $3::int - (SELECT c FROM active_total))::int
             )
             SELECT j.id AS job_id, j.scan_id, j.attempt_count,
-                   s.user_id, s.organization_id, s.target_url, s.engines, s.status, s.authorized, s.metadata, s.created_at
+                   s.user_id, s.organization_id, s.target_url, s.engines, s.mode, s.status, s.authorized, s.metadata, s.created_at
               FROM security_scan_jobs j
               JOIN security_scans s ON s.id = j.scan_id
              WHERE j.id IN (SELECT job_id FROM eligible)

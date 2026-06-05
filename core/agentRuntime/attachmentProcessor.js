@@ -184,6 +184,17 @@ async function processAttachments(attachments = [], lastMsg, userId = null, opts
             if (!imageUrl) {
                 console.log(`[AttachmentProcessor] RustFS unavailable — using base64 for ${att.name || 'unnamed'}`);
             }
+        } else if ((att.source === 'gmail' || (att.type && att.type.startsWith('text/'))) && typeof att.content === 'string' && !att.content.startsWith('data:')) {
+            // Gmail email / plain-text attachment — content is already text.
+            // Inline it directly instead of base64-decoding the plaintext into
+            // garbage in the generic document branch below (BFSF-87).
+            const scanned = await maybeScan({ text: att.content, pages: undefined, filename: att.name });
+            const safeText = scanned.action === 'tokenize' ? scanned.text : att.content;
+            const textBlock = lastMsg.content.find(c => c.type === 'text');
+            const appendText = `\n\n[${att.source === 'gmail' ? 'Gmail' : 'Attachment'}: ${att.name}]\n---\n${safeText}\n---\n`;
+            if (textBlock) textBlock.text += appendText;
+            else lastMsg.content.push({ type: 'text', text: appendText });
+            await persistExtractionOntoSidecar(att, safeText, persistedByLive, userId);
         } else {
             try {
                 const { parseDocument } = require('./documentParser');

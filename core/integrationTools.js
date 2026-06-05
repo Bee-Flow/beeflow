@@ -31,6 +31,7 @@ const { VIDEO_GEN_TOOLS } = require('../routes/ai/videoGenTool');
 const { ELEVENLABS_TOOLS } = require('../routes/ai/elevenLabsTools');
 const { WORKSPACE_TOOLS } = require('../integrations/workspaceTools');
 const { KB_SEARCH_TOOLS } = require('../integrations/kbSearchTools');
+const { KB_INGEST_TOOLS } = require('../integrations/kbIngestTools');
 const { MAPS_TOOLS } = require('../integrations/mapsTools');
 const { LINKEDIN_TOOLS } = require('../integrations/linkedinTools');
 const { GITHUB_TOOLS } = require('../integrations/githubTools');
@@ -60,7 +61,7 @@ const { TUCHTRECHT_TOOLS } = require('../integrations/tuchtrechtTools');
 const { userHasBetaFeature } = require('./betaFeatures');
 
 // IDs that are exempt from org-level gating (admin-only tools, internal utilities)
-const ORG_EXEMPT_APPS = ['workspace', 'regex-gen'];
+const ORG_EXEMPT_APPS = ['workspace', 'regex-gen', 'kb-ingest'];
 
 // Integrations auto-enabled for users with an existing saved enabled-apps list
 // (they were added after the user saved their list, so they wouldn't be in it).
@@ -78,7 +79,7 @@ const AUTO_ENABLED_APPS = ['agent-search', 'workspace', 'image-gen', 'music-gen'
  * @param {boolean} options.isAdmin      - Whether user is admin
  * @returns {Object} { tools: Array, n8nOrgId: string|null }
  */
-async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
+async function getIntegrationTools({ userId, session, isAdmin, agentConfig, routineStep = false }) {
     const tools = [];
     let n8nOrgId = null;
 
@@ -352,6 +353,13 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
         addTools(KB_SEARCH_TOOLS);
     }
 
+    // KB Ingest — routine-only WRITE tool (Support Studio "solved tickets → KB"
+    // template). Never surfaced to chat agents (routineStep gate) and only to
+    // holders of the org-level support_inbox permission.
+    if (routineStep && isAppOn('kb-ingest') && await hasPermission(userId, 'support_inbox', session)) {
+        addTools(KB_INGEST_TOOLS);
+    }
+
     // LinkedIn — requires user OAuth tokens
     const hasLinkedIn = !!(await configStore.getSecret(`linkedin_access_token_user_${userId}`));
     if (hasLinkedIn && isAppOn('linkedin')) {
@@ -382,16 +390,21 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig }) {
         // app password is required; the org's nc_base_url is the binding.
         const isConnectorUser = session?.user?.provider === 'nextcloud_connector'
             || !!session?.connectorOrgId;
-        if (oauthCfg.nextcloudUrl || isConnectorUser) {
+        // A user who saved their own app password may also carry a per-user
+        // Nextcloud URL (Settings → Connections), which makes NC reachable even
+        // when the org-wide oauth.nextcloudUrl is unset. Look it up once so it
+        // can both open the gate and signal the connection.
+        const userStoreLocal = require('../stores/userStore');
+        const ncCreds = isConnectorUser ? null : await userStoreLocal.getAppPassword(userId);
+        const hasNcUrl = !!(oauthCfg.nextcloudUrl || ncCreds?.url);
+        if (hasNcUrl || isConnectorUser) {
             let nextcloudConnected = false;
             if (isConnectorUser) {
                 nextcloudConnected = true;
             } else if (session?.oauthProvider === 'nextcloud' && session?.accessToken) {
                 nextcloudConnected = true;
-            } else {
-                const userStoreLocal = require('../stores/userStore');
-                const ncCreds = await userStoreLocal.getAppPassword(userId);
-                if (ncCreds?.username && ncCreds?.password) nextcloudConnected = true;
+            } else if (ncCreds?.username && ncCreds?.password) {
+                nextcloudConnected = true;
             }
             if (nextcloudConnected) {
                 if (isAppOn('nextcloud')) addTools(NEXTCLOUD_TOOLS);

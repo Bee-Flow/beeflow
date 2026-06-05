@@ -279,6 +279,46 @@ const TEMPLATES = [
             edges: [{ from: 'trg', to: 'fetch' }, { from: 'fetch', to: 'summarise' }, { from: 'summarise', to: 'post' }],
         },
     },
+    // ── Support ───────────────────────────────────────────────────────────
+    {
+        id: 'support-ticket-to-kb',
+        title: 'Resolved tickets → knowledge base',
+        description: 'When a support ticket is resolved (genuine customer conversations only) → AI distils a concise ITIL-style "problem + solution" article → saved to the chosen knowledge base with a source link back to the ticket. Near-identical articles are merged, not duplicated.',
+        category: 'Support',
+        icon: 'BookOpen',
+        tags: ['support', 'ai', 'knowledge-base'],
+        definition: {
+            trigger: { id: 'trg', type: 'trigger', kind: 'app_event', appEvent: { provider: 'support', event: 'ticket.resolved', filter: {} } },
+            steps: [
+                step('distill', 'ai_step', {
+                    label: 'Distil problem + solution',
+                    prompt: 'You receive a RESOLVED customer-support conversation (Customer and Agent turns only). Write one concise, reusable ITIL-style knowledge base article. Return STRICT JSON with exactly these fields: "title" (a short, concrete title — improve the subject) and "article" (Markdown using only ## headers, with these sections in order, omitting any that do not apply: ## Problem, ## Cause, ## Solution, ## Prevention).\n\nHard rules:\n- Write impersonally — no actors or pronouns referring to people (no customer/agent/user/he/she/they).\n- Never invent facts not present in the source; never speculate about the cause — include ## Cause only when it is clearly inferable.\n- Each instruction appears exactly once; no overlap between sections.\n- Remove all personal data and contact info (names, emails, phone numbers, addresses, account/relation numbers) and all technical or security identifiers (IPs, MACs, serials, asset tags, tokens, passwords, MFA codes, keys).\n- Detect the language of the conversation and write BOTH title and article in that SAME language.\nOutput only the JSON object.',
+                    inputs: {
+                        transcript: { kind: 'ref', path: 'trigger.output.transcript' },
+                        subject: { kind: 'ref', path: 'trigger.output.subject' },
+                    },
+                    outputSchema: { type: 'object', properties: { title: { type: 'string' }, article: { type: 'string' } } },
+                }),
+                step('ingest', 'integration_action', {
+                    tool: 'knowledge_base_ingest',
+                    label: 'Save to knowledge base',
+                    inputs: {
+                        // Empty literal → the user picks their KB in Quick config (or from
+                        // the Support settings panel); activation is blocked until set
+                        // (param_missing). Intended.
+                        knowledgeBaseId: { kind: 'literal', value: '' },
+                        title: { kind: 'ref', path: 'steps.distill.output.title' },
+                        content: { kind: 'ref', path: 'steps.distill.output.article' },
+                        sourceUri: { kind: 'template', value: 'support://ticket/{{trigger.output.threadId}}' },
+                        lang: { kind: 'literal', value: 'auto' },
+                        // Near-duplicate of a different ticket → merge into one richer article.
+                        nearDuplicateStrategy: { kind: 'literal', value: 'merge' },
+                    },
+                }),
+            ],
+            edges: [{ from: 'trg', to: 'distill' }, { from: 'distill', to: 'ingest' }],
+        },
+    },
 ];
 
 const CATEGORIES = Array.from(new Set(TEMPLATES.map(t => t.category)));
@@ -291,6 +331,8 @@ function coarseIntegrationFromTool(tool) {
     if (tool.startsWith('drive')) return 'google-drive';
     if (tool.startsWith('gcal') || tool.startsWith('calendar')) return 'google-calendar';
     if (tool.startsWith('webpage')) return 'webpages';
+    if (tool.startsWith('knowledge_base')) return 'kb-ingest';
+    if (tool.startsWith('support_')) return 'support';
     return String(tool).split('_')[0] || null;
 }
 

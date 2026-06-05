@@ -339,7 +339,7 @@ async function detectPii(text, enabledCategories = null, confidenceThreshold = D
     }
 }
 
-async function validateInputForPii(messages, agentPiiEnabled = false, orgShieldConfig = null) {
+async function validateInputForPii(messages, agentPiiEnabled = false, orgShieldConfig = null, overridePiiAction = null) {
     const aiConfig = await getAIConfig();
 
     // Loud entry trace so admins can see PII gates firing in logs.
@@ -359,7 +359,16 @@ async function validateInputForPii(messages, agentPiiEnabled = false, orgShieldC
         return null;
     }
 
-    const piiAction = orgShieldConfig?.piiDetectionAction || aiConfig.piiDetectionAction || 'block';
+    // overridePiiAction lets a trusted internal flow set the action per-call
+    // (takes precedence over org/AI config). The support auto-responder passes
+    // 'allow' — a support reply is legitimate first-party processing of the
+    // customer's OWN email (their address/IBAN/order ids), so it must not be
+    // hard-blocked. 'allow' short-circuits before any scan/block/tokenize.
+    const piiAction = overridePiiAction || orgShieldConfig?.piiDetectionAction || aiConfig.piiDetectionAction || 'block';
+    if (piiAction === 'allow') {
+        console.log('[PiiDetection] gate=ALLOW (per-call override) — skipping scan');
+        return null;
+    }
 
     const lastUserMessage = messages.slice().reverse().find(m => m.role === 'user');
     if (!lastUserMessage) {

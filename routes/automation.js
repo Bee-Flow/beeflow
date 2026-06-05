@@ -279,7 +279,7 @@ router.get('/catalog', async (req, res) => {
         const { getIntegrationTools } = require('../core/integrationTools');
         let userToolNames = new Set();
         try {
-            const result = await getIntegrationTools({ userId, session, isAdmin: !!req.session?.isAdmin });
+            const result = await getIntegrationTools({ userId, session, isAdmin: !!req.session?.isAdmin, routineStep: true });
             for (const t of (result.tools || [])) {
                 if (t?.function?.name) userToolNames.add(t.function.name);
             }
@@ -347,7 +347,7 @@ router.get('/catalog', async (req, res) => {
                 { kind: 'schedule', label: 'On a schedule' },
                 { kind: 'manual', label: 'Run manually' },
                 { kind: 'webhook', label: 'Webhook URL' },
-                { kind: 'app_event', providers: ['gmail', 'google-calendar', 'google-drive', 'msgraph', 'github', 'nextcloud', 'ticket-assistant'] },
+                { kind: 'app_event', providers: ['gmail', 'google-calendar', 'google-drive', 'msgraph', 'github', 'nextcloud', 'ticket-assistant', 'support'] },
                 { kind: 'agent_call', label: 'Callable by AI agent or direct chat (exposed as a tool)' },
             ],
             flags: { code: codeFlag, automations: automationsFlag },

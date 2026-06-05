@@ -718,6 +718,20 @@ const KnowledgeBasesStore = {
     },
 
     /**
+     * Find the most recent document in a KB with a given source_uri. Used by the
+     * support→KB routine to UPDATE (replace chunks) rather than duplicate when a
+     * ticket is re-resolved. Returns the row or null.
+     */
+    findDocumentBySourceUri: async (kbId, sourceUri) => {
+        await initDB();
+        if (!kbId || !sourceUri) return null;
+        return getOne(
+            `SELECT * FROM documents WHERE knowledge_base_id = $1 AND source_uri = $2 ORDER BY id DESC LIMIT 1`,
+            [kbId, sourceUri]
+        );
+    },
+
+    /**
      * Update chunk count for a document after ingestion.
      */
     updateChunkCount: async (docId, chunkCount) => {

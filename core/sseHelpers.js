@@ -42,6 +42,41 @@ function setupSSE(res) {
 }
 
 /**
+ * Keep a long, idle SSE stream alive through intermediaries.
+ *
+ * The Nextcloud AppAPI PHP proxy (and some gateways) idle-time-out a silent
+ * connection, which 504'd long webpage/notebook builds and surfaced as a false
+ * "Error generating response." in the chat (BFSF-221). We write an SSE comment
+ * frame (`: ping\n\n`) every `intervalMs`; comment frames are ignored by
+ * EventSource and our fetch-based SSE parser, so they keep the socket warm
+ * without affecting the event stream. Returns stop() to clear the timer; it is
+ * also cleared automatically on res close/finish/error.
+ *
+ * @param {Object} res - Express response (after headers are written)
+ * @param {number} [intervalMs=15000]
+ * @returns {Function} stop
+ */
+function startSseHeartbeat(res, intervalMs = 15000) {
+    let timer = null;
+    const stop = () => {
+        if (timer) { clearInterval(timer); timer = null; }
+    };
+    timer = setInterval(() => {
+        try {
+            if (res.writableEnded || res.destroyed) { stop(); return; }
+            res.write(': ping\n\n');
+        } catch (_e) {
+            stop();
+        }
+    }, intervalMs);
+    if (timer.unref) timer.unref();  // don't keep the event loop alive for pings
+    res.on('close', stop);
+    res.on('finish', stop);
+    res.on('error', stop);
+    return stop;
+}
+
+/**
  * Send an SSE error and end the response (for limit errors etc.)
  * @param {Object} res - Express response
  * @param {string} error - Error message
@@ -148,4 +183,4 @@ async function getOrCreateAgentConversation(agent, conversationId, userId, encry
     return conversation;
 }
 
-module.exports = { setupSSE, sendSSEError, persistAndTitle, getOrCreateAgentConversation };
+module.exports = { setupSSE, sendSSEError, startSseHeartbeat, persistAndTitle, getOrCreateAgentConversation };

@@ -23,6 +23,7 @@ const {
 const configStore = require('../../stores/configStore');
 const { getAdapter } = require('../../core/providers');
 const webpageStore = require('../../stores/webpageStore');
+const { startSseHeartbeat } = require('../../core/sseHelpers');
 
 const {
     WEBPAGE_DOC_TOOLS,
@@ -141,7 +142,13 @@ router.post('/chat/webpage/stream', requireAuth, async (req, res) => {
     // Sanitise mode — fall back to 'auto' for unknown values.
     const chatMode = ['ask', 'auto', 'plan'].includes(rawChatMode) ? rawChatMode : 'auto';
 
-    if (!message) return res.status(400).json({ error: 'Message required' });
+    // Accept attachment-only turns (e.g. pasting an image with no text) — mirrors
+    // the direct-chat guard. Previously an empty `message` 400'd before the SSE
+    // stream opened, which the client surfaced as "Error generating response."
+    // even though the image was valid (BFSF-189).
+    if (!message && (!Array.isArray(attachments) || attachments.length === 0)) {
+        return res.status(400).json({ error: 'Message or attachments required' });
+    }
     if (!webpageId) return res.status(400).json({ error: 'Webpage ID required' });
 
     const webpage = await webpageStore.getWebpage(webpageId, userId);
@@ -233,6 +240,9 @@ router.post('/chat/webpage/stream', requireAuth, async (req, res) => {
     const send = (event, data) => {
         res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     };
+    // Keep the stream warm through the NC AppAPI proxy during long, silent
+    // webpage builds so it isn't idle-timed-out into a 504 (BFSF-221).
+    startSseHeartbeat(res);
 
     if (modelTier === 'auto') {
         send('model_selected', { tier: resolvedTier, modelId });
@@ -363,6 +373,8 @@ RUNTIME CONSTRAINTS — READ ONCE, OBEY ALWAYS
    Use in-memory variables for state. CDN fetches are allowed.
 5. Reference styles and scripts however you like — \`<link href="style.css">\` and \`<script src="script.js"></script>\` work in the downloaded zip; the in-app preview inlines them automatically.
 6. Default to a clean, modern aesthetic when the user's brief is sparse: sensible spacing, readable typography, accessible color contrast (WCAG AA), responsive on mobile.
+7. BEE FLOW HOUSE STYLE — apply this by default unless the user specifies their own look. A calm, professional productivity-tool aesthetic: a restrained palette declared as CSS custom properties in :root (a single brand accent colour, a dark neutral for text, light neutrals for surfaces), generous whitespace, a modern sans-serif system font stack, rounded corners and subtle shadows. Do NOT use purple, violet, or indigo. Define tokens once in modules/theme.css (or style.css :root) and reference them everywhere so the page is consistently branded.
+8. IMAGES — you do NOT have a library of real images and you cannot guarantee any external image URL exists. NEVER invent or hotlink arbitrary external <img> URLs (random unsplash/example.com/stock paths) — they 404 or load the wrong picture. Instead prefer inline SVG, CSS gradients/shapes, or emoji for decoration; when a raster placeholder is genuinely needed use a deterministic placeholder service such as https://placehold.co/WIDTHxHEIGHT. ALWAYS add an onerror handler to every <img> so a failed load degrades gracefully, e.g. onerror="this.style.visibility='hidden'". For internal navigation, only link to anchor ids that actually exist in the page (every href="#x" must have a matching id="x").
 
 ────────────────────────────────────────
 FILES — DEFAULT TO MODULAR LAYOUTS

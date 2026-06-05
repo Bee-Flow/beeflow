@@ -36,7 +36,7 @@ const { processAttachments } = require('./attachmentProcessor');
 const { hydrateHistoryAttachments } = require('./historyHydrator');
 const { compactMessages } = require('../compaction');
 const { buildTokenPreservationAddendum } = require('../dlp/tokenPreservationPrompt');
-const { applyTokenMapToOutbound } = require('../dlp/applyTokenMapToOutbound');
+const { applyTokenMapToOutbound, untokeniseToolArgs } = require('../dlp/applyTokenMapToOutbound');
 
 // ─────────────────────────────────────────────────────────────────
 // Per-conversation write serializer.
@@ -1770,6 +1770,16 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         };
                     }
 
+                    // Restore DLP tokens in outbound tool args so write-side tools
+                    // get the real value, not the [email_1] placeholder (BFSF-171).
+                    // Search queries keep their tokens (PII off external search).
+                    if (!/^(agent_search|web_search|search|brave_search)$/i.test(toolName || '')) {
+                        try {
+                            const _argMap = require('../dlp/dlpRunner').getConversationTokenMap(conversation?.id);
+                            if (_argMap && Object.keys(_argMap).length) toolArgs = untokeniseToolArgs(toolArgs, _argMap);
+                        } catch (_) { /* best-effort */ }
+                    }
+
                     const fixedParams = toolParamsMap[toolName] || null;
                     // Don't log fixedParams directly — they often contain secrets (API keys,
                     // tokens, OAuth refresh creds). Just log whether they were present.
@@ -1975,10 +1985,13 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                             _emailDrafts.push({ ...finalToolResult.draft, status: 'pending' });
                         }
                     }
-                    // Emit calendar_draft SSE event for user approval (with dedup)
+                    // Emit calendar_draft SSE event for user approval (with dedup).
+                    // Key on the real draft fields, not the never-present
+                    // summary/start/end which made dedup a no-op (BFSF-123).
                     if (finalToolResult?._action === 'calendar_draft') {
-                        const draftKey = _stableStringify({ summary: finalToolResult.draft?.summary, start: finalToolResult.draft?.start, end: finalToolResult.draft?.end });
-                        const alreadySent = _calendarDrafts.some(d => _stableStringify({ summary: d.summary, start: d.start, end: d.end }) === draftKey);
+                        const calKey = (d) => _stableStringify({ action: d?.action, title: d?.title, startTime: d?.startTime, endTime: d?.endTime, eventId: d?.eventId });
+                        const draftKey = calKey(finalToolResult.draft);
+                        const alreadySent = _calendarDrafts.some(d => calKey(d) === draftKey);
                         if (!alreadySent) {
                             onEvent('calendar_draft', finalToolResult.draft);
                             _calendarDrafts.push({ ...finalToolResult.draft, status: 'pending' });

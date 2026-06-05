@@ -130,6 +130,7 @@ const TIER_FEATURES = {
         'projects',
         'playwright_tests',
         'security_scan',
+        'support_inbox',
         // MCP server marketplace — Enterprise beta. Gated server-side on the
         // /ai/.../mcp-servers* routes and at runtime in directChatToolStack.js
         // (no MCP tools reach a Community agent), with a beta opt-in registered

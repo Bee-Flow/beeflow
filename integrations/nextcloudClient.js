@@ -66,10 +66,16 @@ function isNextcloudOAuthSession(session) {
     return !!getNextcloudCredsRef(session);
 }
 
-async function getBaseUrl() {
-    const oauth = (await configStore.getConfig('oauth')) || {};
-    const url = (oauth.nextcloudUrl || '').replace(/\/+$/, '');
-    if (!url) throw new Error('Nextcloud URL not configured. Ask an admin to set it under Admin → Authentication.');
+// Resolve the Nextcloud base URL. A per-user URL (saved alongside the app
+// password in Settings → Connections) takes precedence; otherwise fall back to
+// the org-wide oauth.nextcloudUrl. Pass `overrideUrl` from the user's creds.
+async function getBaseUrl(overrideUrl) {
+    let url = (overrideUrl || '').trim().replace(/\/+$/, '');
+    if (!url) {
+        const oauth = (await configStore.getConfig('oauth')) || {};
+        url = (oauth.nextcloudUrl || '').replace(/\/+$/, '');
+    }
+    if (!url) throw new Error('Nextcloud URL not configured. Add your Nextcloud URL in Settings → Connections, or ask an admin to set the organisation default.');
     return url;
 }
 
@@ -273,13 +279,16 @@ async function resolveConnectorAuth(session) {
         const ts = Math.floor(Date.now() / 1000);
         const method = (options.method || 'GET').toUpperCase();
         // Nextcloud's AppAPI proxy (which fronts the connector's /nc/* route for
-        // SaaS→NC callbacks) forwards standard HTTP verbs but rejects WebDAV
-        // methods (PROPFIND/REPORT/MKCOL/MOVE/COPY/…) with 405. Tunnel those over
-        // POST + X-HTTP-Method-Override; the connector restores the real method
-        // before it reaches Nextcloud (where DAV works fine). The HMAC is signed
-        // over the REAL method so the connector can verify it after un-tunnelling.
-        const STANDARD_METHODS = new Set(['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']);
-        const needsTunnel = !STANDARD_METHODS.has(method);
+        // SaaS→NC callbacks) only reliably forwards GET and POST raw. Every other
+        // verb — the WebDAV methods (PROPFIND/REPORT/MKCOL/MOVE/COPY/…) AND the
+        // write verbs (PUT/DELETE/PATCH) — is rejected (PROPFIND/REPORT surface as
+        // 405; PUT/DELETE/PATCH as 401), so reads work but writes fail. Tunnel
+        // everything except GET/POST over POST + X-HTTP-Method-Override; the
+        // connector restores the real method before it reaches Nextcloud (where
+        // DAV/writes work fine). The HMAC is signed over the REAL method so the
+        // connector can verify it after un-tunnelling.
+        const RAW_METHODS = new Set(['GET', 'POST']);
+        const needsTunnel = !RAW_METHODS.has(method);
         const wireMethod = needsTunnel ? 'POST' : method;
         const message = `${ts}\n${method}\n${pathOnly}\n${ncUid}`;
         const sig = crypto.createHmac('sha256', tenantKey).update(message).digest('hex');
@@ -318,9 +327,9 @@ async function resolveAuth(session, userId) {
         // fall through to legacy paths if connector binding incomplete
     }
 
-    const baseUrl = await getBaseUrl();
-
     if (isNextcloudOAuthSession(session)) {
+        // OAuth always targets the org-configured instance the user logged into.
+        const baseUrl = await getBaseUrl();
         const uid = await resolveUid(session, baseUrl);
         return {
             mode: 'bearer',
@@ -337,8 +346,10 @@ async function resolveAuth(session, userId) {
     const userStore = require('../stores/userStore');
     const creds = await userStore.getAppPassword(userId);
     if (!creds || !creds.username || !creds.password) {
-        throw new Error('Nextcloud not connected. Log in via Nextcloud OAuth, or add your username and app password in Settings → Integrations.');
+        throw new Error('Nextcloud not connected. Log in via Nextcloud OAuth, or add your username and app password in Settings → Connections.');
     }
+    // Prefer the URL the user saved with their app password; org default otherwise.
+    const baseUrl = await getBaseUrl(creds.url);
     const auth = 'Basic ' + Buffer.from(`${creds.username}:${creds.password}`).toString('base64');
     const basicFetch = async (url, options = {}) => {
         const doOnce = () => fetch(url, {
@@ -373,7 +384,7 @@ async function resolveBasicAuthOrNull(userId) {
     const userStore = require('../stores/userStore');
     const creds = await userStore.getAppPassword(userId);
     if (!creds || !creds.username || !creds.password) return null;
-    const baseUrl = await getBaseUrl();
+    const baseUrl = await getBaseUrl(creds.url);
     const auth = 'Basic ' + Buffer.from(`${creds.username}:${creds.password}`).toString('base64');
     const basicFetch = async (url, options = {}) => {
         const doOnce = () => fetch(url, {

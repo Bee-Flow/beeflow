@@ -93,6 +93,26 @@ async function compactMessages(messages, options = {}) {
         ...systemMessages,
     ];
 
+    // Pin the user's ORIGINAL request verbatim so a long, multi-turn chat never
+    // loses the stated goal when older turns are folded into the lossy fast-tier
+    // summary — the model would otherwise drift and ask the user to restate it
+    // (BFSF-154). Skip if that first user turn is still in the retained window.
+    const _firstUserMsg = convMessages.find(m => m && m.role === 'user');
+    if (_firstUserMsg && !recentMessages.includes(_firstUserMsg)) {
+        let _goalText = '';
+        if (typeof _firstUserMsg.content === 'string') _goalText = _firstUserMsg.content;
+        else if (Array.isArray(_firstUserMsg.content)) {
+            _goalText = _firstUserMsg.content
+                .filter(b => b && b.type === 'text' && typeof b.text === 'string')
+                .map(b => b.text).join(' ');
+        }
+        _goalText = (_goalText || '').replace(/\s+/g, ' ').trim().slice(0, 1000);
+        if (_goalText) {
+            compacted.push({ role: 'user', content: `[Original request — treat this as the authoritative goal for the whole conversation; never ask the user to restate it]\n${_goalText}` });
+            compacted.push({ role: 'assistant', content: 'Understood — I will keep that original goal in mind.' });
+        }
+    }
+
     if (newSummary || hoistedImages.length > 0 || hoistedAttachments.length > 0) {
         const summaryText = newSummary
             ? `[Conversation Summary — earlier messages have been compacted]\n${newSummary}`

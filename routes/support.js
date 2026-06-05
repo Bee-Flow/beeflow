@@ -536,14 +536,19 @@ router.get('/threads', async (req, res) => {
         }
         const { status, q, assignee, limit, offset } = req.query;
         const statusList = status ? status.split(',').map(s => s.trim()).filter(Boolean) : null;
+        // Isolation: this is Bee Flow's OWN company inbox. Tenant Support-studio
+        // inboxes live in the same tables with inbox_id set — exclude them so the
+        // super-admin never sees a tenant's customer tickets (and vice-versa, the
+        // tenant routes force inbox_id IS NOT NULL). See server/routes/supportInbox.js.
         const threads = await supportStore.listThreads({
             statusIn: statusList && statusList.length ? statusList : null,
             q: q || null,
             assigneeUserId: assignee || null,
+            inboxIsNull: true,
             limit: limit ? parseInt(limit, 10) : 100,
             offset: offset ? parseInt(offset, 10) : 0,
         });
-        const counts = await supportStore.countThreadsByStatus();
+        const counts = await supportStore.countThreadsByStatus({ inboxIsNull: true });
         res.json({ threads, counts });
     } catch (err) {
         console.error('[Support] GET /threads error:', err);
@@ -851,6 +856,8 @@ router.patch('/threads/:id', async (req, res) => {
                     category: 'info',
                     title: 'Your support request was resolved',
                     message: thread.subject,
+                    // Make the "resolved" bell clickable like the reply notifs (BFSF-191).
+                    link: `/app/settings/help_support?thread=${thread.id}`,
                 }).catch(() => {});
             }
         }
@@ -906,6 +913,9 @@ router.get('/stream', async (req, res) => {
         sse.sendEvent('ready', { at: Date.now() });
 
         listener = ({ event, data }) => {
+            // Company inbox only — tenant Support-studio inbox events carry an
+            // inboxId and are streamed by /api/support-inbox/stream instead.
+            if (data && data.inboxId) return;
             try { sse.sendEvent(event, { ...data, at: Date.now() }); }
             catch { cleanup(); }
         };
@@ -1422,7 +1432,7 @@ router.get('/insights', async (req, res) => {
         if (!(await _hasAdminSupport(req))) {
             return res.status(403).json({ error: 'admin_support permission required' });
         }
-        const insights = await supportStore.getInsights();
+        const insights = await supportStore.getInsights({ inboxIsNull: true });
         res.json(insights);
     } catch (err) {
         console.error('[Support] GET /insights error:', err.message);
