@@ -87,7 +87,6 @@ for (const f of [
     'notebooks',
     'projects',
     'pii_tokenize',
-    'web_search',
     'web_search_guard',
     'advanced_usage_monitoring',
 ]) {
@@ -121,7 +120,6 @@ for (const f of [
     'notebooks',
     'projects',
     'pii_tokenize',
-    'web_search',
     'web_search_guard',
     'advanced_usage_monitoring',
     'guardrails_dlp',
@@ -194,7 +192,6 @@ assert.strictEqual(t.tierHasFeature('community', 'component_designer'), false);
 assert.strictEqual(t.tierHasFeature('community', 'notebooks'), false);
 assert.strictEqual(t.tierHasFeature('community', 'projects'), false, 'projects is now enterprise');
 assert.strictEqual(t.tierHasFeature('community', 'pii_tokenize'), false);
-assert.strictEqual(t.tierHasFeature('community', 'web_search'), false, 'web_search is now enterprise (gated tool)');
 assert.strictEqual(t.tierHasFeature('community', 'web_search_guard'), false);
 assert.strictEqual(t.tierHasFeature('community', 'advanced_usage_monitoring'), false);
 assert.strictEqual(t.tierHasFeature('community', 'sso_saml'), false);
@@ -205,7 +202,6 @@ assert.strictEqual(t.tierHasFeature('enterprise', 'component_designer'), true);
 assert.strictEqual(t.tierHasFeature('enterprise', 'notebooks'), true);
 assert.strictEqual(t.tierHasFeature('enterprise', 'projects'), true);
 assert.strictEqual(t.tierHasFeature('enterprise', 'pii_tokenize'), true);
-assert.strictEqual(t.tierHasFeature('enterprise', 'web_search'), true);
 assert.strictEqual(t.tierHasFeature('enterprise', 'web_search_guard'), true);
 assert.strictEqual(t.tierHasFeature('enterprise', 'advanced_usage_monitoring'), true);
 assert.strictEqual(t.tierHasFeature('enterprise', 'sso_saml'), true);

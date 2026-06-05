@@ -140,12 +140,6 @@ const TIER_FEATURES = {
         // flag is the source of truth for the routes; orgPrivacyShield.js
         // and the four /api/usage sub-routes enforce these gates.
         'pii_tokenize',
-        // The ability to use the web-search tool (`agent_search`) at all.
-        // Enterprise tier or an explicit plan grant (allowed_features) unlocks
-        // it; the tool is withheld at injection time otherwise — see
-        // core/integrationTools.js. Distinct from `web_search_guard`, which is
-        // the PII filter applied to queries once searching is allowed.
-        'web_search',
         'web_search_guard',
         'advanced_usage_monitoring',
         // Compliance / admin block (unchanged).
