@@ -173,6 +173,10 @@ router.post('/events/nextcloud', captureRawNc, async (req, res) => {
             event,
             payload: payload || {},
             userId: user?.id || null,
+            // Carry the org so background side-effects (e.g. Talk recording
+            // auto-ingest) can resolve org-scoped settings even when the
+            // ncUid → Bee Flow user mapping failed (bot/federated actor).
+            orgId: org.id,
         });
         // Stamp last_push_at on every nextcloud subscription this user
         // owns for this event so the polling-fallback detector knows the

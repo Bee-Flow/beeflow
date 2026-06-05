@@ -275,8 +275,26 @@ async function resolveUserFirstName(userId) {
 
 function safeUnlink(p) { try { fs.unlinkSync(p); } catch (_) {} }
 
+/**
+ * If `ncPath` sits under the Talk recordings folder as
+ * `<recordingFolder>/<token>/<file>`, return the room token; else null.
+ * Talk stores each call's recording in a per-room-token subfolder.
+ */
+function parseTalkRoomToken(ncPath, recordingFolder = '/Talk') {
+    if (!ncPath) return null;
+    const norm = (p) => '/' + String(p).split('/').filter(Boolean).join('/');
+    const folder = norm(recordingFolder);
+    const full = norm(ncPath);
+    if (!full.toLowerCase().startsWith(folder.toLowerCase() + '/')) return null;
+    const rest = full.slice(folder.length + 1).split('/').filter(Boolean);
+    if (rest.length < 2) return null; // need <token>/<file>
+    const token = rest[0];
+    return /^[A-Za-z0-9]+$/.test(token) ? token : null;
+}
+
 module.exports = {
     ingestNextcloudRecording,
+    parseTalkRoomToken,
     ACCEPTED_RECORDING_EXTS,
     IngestError,
 };

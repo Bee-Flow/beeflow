@@ -396,4 +396,40 @@ function trigger() {
     assert.ok(!validateDefinition(mk('talk.mention.received')).warnings.some(w => w.code === 'trigger.app_event_undeliverable'), 'no deliverableEvents option → not checked');
 }
 
+// ── FIX 1: branch-labelled condition/switch edges satisfy the wiring checks ──
+{
+    // Condition with both then + else labelled edges (what branch-aware
+    // appends now produce) — no dead_branch / partial_branch.
+    const def = {
+        trigger: trigger(),
+        steps: [
+            { id: 'c1', type: 'condition', expr: 'trigger.output.x == 1' },
+            { id: 'a1', type: 'notification', title: 'yes' },
+            { id: 'a2', type: 'notification', title: 'no' },
+        ],
+        edges: [
+            { from: 'trg', to: 'c1' },
+            { from: 'c1', to: 'a1', label: 'then' },
+            { from: 'c1', to: 'a2', label: 'else' },
+        ],
+    };
+    const r = validateDefinition(def);
+    assert.ok(!r.errors.some(e => e.code === 'condition.dead_branch'), 'labelled then/else → no dead_branch');
+    assert.ok(!r.warnings.some(e => e.code === 'condition.partial_branch'), 'labelled then/else → no partial_branch');
+
+    // Switch with a case:<name> labelled edge → no no_branches error.
+    const sw = {
+        trigger: trigger(),
+        steps: [
+            { id: 's1', type: 'switch', expr: 'trigger.output.p', cases: [{ name: 'urgent', value: 'high' }] },
+            { id: 'n1', type: 'notification', title: 'urgent!' },
+        ],
+        edges: [
+            { from: 'trg', to: 's1' },
+            { from: 's1', to: 'n1', label: 'case:urgent', caseName: 'urgent' },
+        ],
+    };
+    assert.ok(!validateDefinition(sw).errors.some(e => e.code === 'switch.no_branches'), 'labelled case edge → no switch.no_branches');
+}
+
 console.log('validate.test.js — all checks passed');

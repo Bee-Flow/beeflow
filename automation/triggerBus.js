@@ -452,7 +452,20 @@ function pickMatcher(provider, event) {
     return matchFilter;
 }
 
-async function dispatchEvent({ provider, event, payload = {}, userId = null }) {
+async function dispatchEvent({ provider, event, payload = {}, userId = null, orgId = null }) {
+    // Side-effect tap: a new Nextcloud file might be a Talk call recording we
+    // should auto-transcribe into Meeting Notes. This runs independently of
+    // user-created automation subscriptions and must never block their
+    // fan-out, so it is fire-and-forget with its own error handling.
+    if (provider === 'nextcloud' && event === 'file.new') {
+        try {
+            require('../core/meetingNotes/talkAutoIngest').maybeIngest({ payload, userId, orgId })
+                .catch(e => console.error('[TalkAutoIngest] tap error:', e.message));
+        } catch (e) {
+            console.error('[TalkAutoIngest] tap load error:', e.message);
+        }
+    }
+
     const subs = await automationStore.getSubscriptionsForProvider(provider, event);
     const runs = [];
     const baseMatcher = pickMatcher(provider, event);

@@ -1221,8 +1221,9 @@ router.patch('/:id/speakers', requireAuth, async (req, res) => {
 // app-password and ExApp-connector sessions all work transparently.
 
 const AUDIO_EXTS = ['.mp3', '.wav', '.m4a', '.ogg', '.webm', '.flac', '.mp4', '.mpeg', '.aac'];
-// Includes Talk's video recording containers (.ogv/.mkv) on top of AUDIO_EXTS.
-const { ACCEPTED_RECORDING_EXTS } = require('../core/meetingNotes/ingestNextcloudRecording');
+// Recording ingest helpers (single source of truth for accepted extensions +
+// Talk room-token path parsing) live with the ingest pipeline.
+const { ACCEPTED_RECORDING_EXTS, parseTalkRoomToken } = require('../core/meetingNotes/ingestNextcloudRecording');
 
 /** Resolve the configured Talk recordings folder (org+user scoped, default /Talk). */
 async function resolveRecordingFolder(orgId, userId) {
@@ -1231,22 +1232,6 @@ async function resolveRecordingFolder(orgId, userId) {
         const s = await resolveTalkNotesSettings({ orgId, userId });
         return s.recordingFolder || '/Talk';
     } catch (_) { return '/Talk'; }
-}
-
-/**
- * If `ncPath` sits under the Talk recordings folder as
- * `<recordingFolder>/<token>/<file>`, return the room token; else null.
- */
-function parseTalkRoomToken(ncPath, recordingFolder = '/Talk') {
-    if (!ncPath) return null;
-    const norm = (p) => '/' + String(p).split('/').filter(Boolean).join('/');
-    const folder = norm(recordingFolder);
-    const full = norm(ncPath);
-    if (!full.toLowerCase().startsWith(folder.toLowerCase() + '/')) return null;
-    const rest = full.slice(folder.length + 1).split('/').filter(Boolean);
-    if (rest.length < 2) return null; // need <token>/<file>
-    const token = rest[0];
-    return /^[A-Za-z0-9]+$/.test(token) ? token : null;
 }
 
 router.get('/nextcloud-audio-files', requireAuth, async (req, res) => {
@@ -1312,6 +1297,85 @@ router.get('/nextcloud-audio-files', requireAuth, async (req, res) => {
         res.json({ folder, count: items.length, items });
     } catch (err) {
         console.error('[Transcriptions] NC list error:', err.message);
+        if (err.message === 'NOT_CONNECTED') {
+            return res.status(400).json({ error: 'Nextcloud not connected for this account' });
+        }
+        res.status(500).json({ error: err.message });
+    }
+});
+
+const VIDEO_EXTS = ['.mp4', '.webm', '.ogv', '.mkv', '.mpeg'];
+
+// List Nextcloud Talk call recordings, grouped by conversation (room token).
+// Talk stores each call's recording at <recordingFolder>/<roomToken>/<file>,
+// so a recursive PROPFIND of the recordings folder + room-token parsing yields
+// the per-room recordings the user can import into Meeting Notes.
+router.get('/nextcloud-talk-recordings', requireAuth, async (req, res) => {
+    const userId = req.session.user.id;
+    try {
+        const userOrgId = await resolveUserOrgFromReq(req);
+        const folder = (req.query.folder || await resolveRecordingFolder(userOrgId, userId)).toString();
+
+        const ncClient = require('../integrations/nextcloudClient');
+        const ctx = await ncClient.resolveAuth(req.session, userId);
+        const root = ncClient.webdavRoot(ctx.baseUrl, ctx.uid);
+        const segs = folder.split('/').filter(Boolean).map(encodeURIComponent);
+        const url = `${root}/${segs.join('/')}${segs.length ? '/' : ''}`;
+        const propfind = `<?xml version="1.0"?>
+<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+  <d:prop><d:displayname/><d:getcontentlength/><d:getcontenttype/><d:getlastmodified/><d:resourcetype/></d:prop>
+</d:propfind>`;
+        // Depth: infinity walks the per-room subfolders in one round-trip.
+        const r = await ctx.fetch(url, {
+            method: 'PROPFIND',
+            headers: { 'Depth': 'infinity', 'Content-Type': 'application/xml; charset=utf-8' },
+            body: propfind,
+        });
+        if (r.status === 404) return res.json({ folder, count: 0, rooms: [] }); // no recordings yet
+        if (r.status === 401) return res.status(401).json({ error: ctx.authError || 'Nextcloud auth failed' });
+        if (!r.ok) return res.status(502).json({ error: `Nextcloud PROPFIND failed (${r.status})` });
+
+        const xml = await r.text();
+        const filesRoot = `/remote.php/dav/files/${ctx.uid}/`;
+        const roomsMap = new Map();
+        const blocks = xml.split(/<d:response[^>]*>/i).slice(1);
+        for (const block of blocks) {
+            const hrefMatch = block.match(/<d:href>([^<]+)<\/d:href>/i);
+            if (!hrefMatch) continue;
+            const href = decodeURIComponent(hrefMatch[1]);
+            if (/<d:resourcetype>\s*<d:collection\s*\/>\s*<\/d:resourcetype>/i.test(block)) continue; // folders
+
+            const name = decodeURIComponent(href.split('/').filter(Boolean).pop() || '');
+            const ext = path.extname(name).toLowerCase();
+            if (!ACCEPTED_RECORDING_EXTS.includes(ext)) continue;
+
+            const idx = href.indexOf(filesRoot);
+            const filePath = idx !== -1 ? '/' + href.slice(idx + filesRoot.length) : href;
+            const token = parseTalkRoomToken(filePath, folder);
+            if (!token) continue;
+
+            const sizeMatch = block.match(/<d:getcontentlength>(\d+)<\/d:getcontentlength>/i);
+            const lmMatch   = block.match(/<d:getlastmodified>([^<]+)<\/d:getlastmodified>/i);
+
+            if (!roomsMap.has(token)) roomsMap.set(token, []);
+            roomsMap.get(token).push({
+                name,
+                path: filePath,
+                size: sizeMatch ? Number(sizeMatch[1]) : null,
+                lastModified: lmMatch ? lmMatch[1] : null,
+                kind: VIDEO_EXTS.includes(ext) ? 'video' : 'audio',
+            });
+        }
+
+        const rooms = Array.from(roomsMap.entries()).map(([token, recordings]) => {
+            recordings.sort((a, b) => (b.lastModified || '').localeCompare(a.lastModified || ''));
+            return { token, recordings, lastModified: recordings[0]?.lastModified || null };
+        });
+        rooms.sort((a, b) => (b.lastModified || '').localeCompare(a.lastModified || ''));
+
+        res.json({ folder, count: rooms.reduce((n, rm) => n + rm.recordings.length, 0), rooms });
+    } catch (err) {
+        console.error('[Transcriptions] Talk recordings list error:', err.message);
         if (err.message === 'NOT_CONNECTED') {
             return res.status(400).json({ error: 'Nextcloud not connected for this account' });
         }
