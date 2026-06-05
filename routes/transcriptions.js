@@ -117,7 +117,6 @@ async function resolveUserOrgFromReq(req) {
 // Nextcloud Talk auto-ingest can reuse the exact same logic.
 const {
     resolveSmartModel,
-    resolveFastModel,
     identifySpeakerNames,
     generateMeetingSummary,
     generateMeetingTitle,
