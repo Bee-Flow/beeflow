@@ -69,6 +69,7 @@ const configStore = require('../stores/configStore');
 const languageStore = require('../stores/languageStore');
 const storageStore = require('../stores/storageStore');
 const { hasPermission } = require('../auth/permissions');
+const { serverLicenseGovernsOrgs } = require('../license');
 const { perUserRateLimit } = require('../utils/perUserRateLimit');
 const { sanitizeSvg } = require('../utils/svgSanitizer');
 
@@ -857,12 +858,18 @@ router.get('/site', async (req, res) => {
         // Note: this is decoupled from the admin's active project — admins
         // can edit a different site without affecting what the public sees.
         const siteId = await getLiveSiteId();
+        // Self-hosted installs have no public marketing site — the root domain
+        // goes straight to /app. `appOnly` tells RootPathGate to redirect there
+        // (it runs outside LicenseProvider so it can't read deployment mode on
+        // its own). Emitted on every shape so the flag is present regardless of
+        // whether a site is live.
+        const appOnly = serverLicenseGovernsOrgs();
         // Disable caching here — content updates from the admin should
         // appear immediately. Re-introduce a short TTL once edits push a
         // version bump or cache key.
         res.setHeader('Cache-Control', 'no-store');
         if (!siteId) {
-            return res.json({ enabled: false });
+            return res.json({ enabled: false, appOnly });
         }
 
         const defaultLocale = await cmsStore.getDefaultLocale();
@@ -893,6 +900,7 @@ router.get('/site', async (req, res) => {
         if (v2) {
             return res.json({
                 enabled: true,
+                appOnly,
                 defaultLocale,
                 locale,
                 found: eff.found,
@@ -906,6 +914,7 @@ router.get('/site', async (req, res) => {
         }
         return res.json({
             enabled: true,
+            appOnly,
             // `found` lets the front-end distinguish "slug exists but has no
             // blocks" (render anyway) from "slug doesn't match any page"
             // (fall through to the BeeFlow app router) when path-routing.
