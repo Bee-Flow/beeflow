@@ -45,6 +45,39 @@ function esc(v) {
         .replace(/'/g, '&#39;');
 }
 
+/**
+ * Minimal, dependency-free markdown → HTML for the agent-written assessment.
+ * SECURITY: the model's text is untrusted, so we esc() FIRST and only then add
+ * our own tags for a tiny safe subset (headings, bold/italic, inline code,
+ * bullet/numbered lists, paragraphs). No raw HTML from the model ever survives.
+ */
+function renderMarkdown(md) {
+    const src = String(md || '').replace(/\r\n/g, '\n').trim();
+    if (!src) return '';
+    const inline = (s) => esc(s)
+        .replace(/`([^`]+)`/g, '<code>$1</code>')
+        .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+        .replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+    const out = [];
+    let para = [];
+    let list = null; // 'ul' | 'ol'
+    const flushPara = () => { if (para.length) { out.push(`<p>${inline(para.join(' '))}</p>`); para = []; } };
+    const flushList = () => { if (list) { out.push(`</${list}>`); list = null; } };
+    for (const raw of src.split('\n')) {
+        const line = raw.trimEnd();
+        const h = /^(#{1,3})\s+(.*)$/.exec(line);
+        const ul = /^\s*[-*]\s+(.*)$/.exec(line);
+        const ol = /^\s*\d+[.)]\s+(.*)$/.exec(line);
+        if (line.trim() === '') { flushPara(); flushList(); continue; }
+        if (h) { flushPara(); flushList(); const lvl = Math.min(6, h[1].length + 2); out.push(`<h${lvl}>${inline(h[2])}</h${lvl}>`); continue; }
+        if (ul) { flushPara(); if (list !== 'ul') { flushList(); out.push('<ul>'); list = 'ul'; } out.push(`<li>${inline(ul[1])}</li>`); continue; }
+        if (ol) { flushPara(); if (list !== 'ol') { flushList(); out.push('<ol>'); list = 'ol'; } out.push(`<li>${inline(ol[1])}</li>`); continue; }
+        flushList(); para.push(line);
+    }
+    flushPara(); flushList();
+    return out.join('\n');
+}
+
 function sha256(s) {
     return crypto.createHash('sha256').update(s || '', 'utf8').digest('hex');
 }
@@ -298,9 +331,10 @@ function fmtTimestamp(ts) {
  * @param {string} p.startedAt
  * @param {string} p.finishedAt
  */
-function renderReportHtml({ targetUrl, engines, findings, severitySummary, startedAt, finishedAt }) {
+function renderReportHtml({ targetUrl, engines, findings, severitySummary, startedAt, finishedAt, narrative }) {
     const host = hostOf(targetUrl);
     const safeFindings = Array.isArray(findings) ? findings : [];
+    const assessmentHtml = renderMarkdown(narrative);
     const summary = severitySummary || { high: 0, medium: 0, low: 0, informational: 0 };
     const engineList = Array.isArray(engines) ? engines : [];
 
@@ -400,7 +434,11 @@ function renderReportHtml({ targetUrl, engines, findings, severitySummary, start
             </p>
             <div class="cards">${cards}</div>
         </section>
-
+${assessmentHtml ? `
+        <section class="assessment" aria-label="Assessment">
+            <h2>Assessment</h2>
+            <div class="prose">${assessmentHtml}</div>
+        </section>` : ''}
         <section class="findings" aria-label="Findings">
             <h2>Findings</h2>
             <table class="findings__table">
@@ -488,9 +526,19 @@ code {
 .report__meta dt { color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; }
 .report__meta dd { margin: 0.15rem 0 0; font-weight: 600; color: var(--ink); }
 
-.summary, .findings { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; }
+.summary, .assessment, .findings { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; }
 h2 { margin: 0 0 1rem; font-size: 1.15rem; letter-spacing: -0.01em; }
 .summary__lead { margin: 0 0 1.25rem; color: var(--ink-soft); }
+
+.prose { color: var(--ink-soft); line-height: 1.65; }
+.prose h3, .prose h4, .prose h5, .prose h6 { margin: 1.25rem 0 0.5rem; color: var(--ink); letter-spacing: -0.01em; }
+.prose h3 { font-size: 1.02rem; } .prose h4 { font-size: 0.95rem; } .prose h5, .prose h6 { font-size: 0.9rem; }
+.prose p { margin: 0 0 0.85rem; }
+.prose ul, .prose ol { margin: 0 0 0.85rem; padding-left: 1.4rem; }
+.prose li { margin: 0.2rem 0; }
+.prose code { background: var(--bg); border: 1px solid var(--line); border-radius: 5px; padding: 0.05rem 0.3rem; font-size: 0.88em; }
+.prose strong { color: var(--ink); }
+.prose > :first-child { margin-top: 0; } .prose > :last-child { margin-bottom: 0; }
 
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 0.85rem; }
 .card { border: 1px solid var(--line); border-radius: 10px; padding: 1rem; text-align: center; background: var(--bg); }

@@ -187,6 +187,19 @@ function icsTimeToISO(time) {
     return time.toJSDate().toISOString();
 }
 
+// A Nextcloud Talk meeting link is `…/call/<token>`. When a calendar event has
+// a Talk conversation, the URL lives in DESCRIPTION and/or the custom
+// X-MAILCLIENT-ONLINE-MEETING property (not LOCATION) — check all of them.
+const TALK_CALL_URL_RE = /\/call\/([A-Za-z0-9]+)/;
+function talkTokenFromTexts(...texts) {
+    for (const t of texts) {
+        if (!t) continue;
+        const m = String(t).match(TALK_CALL_URL_RE);
+        if (m) return m[1];
+    }
+    return null;
+}
+
 function eventFromIcal(vevent) {
     const ev = new ICAL.Event(vevent);
     const attendees = (ev.attendees || []).map((p) => {
@@ -202,6 +215,8 @@ function eventFromIcal(vevent) {
             email: String(val).replace(/^mailto:/i, ''),
         };
     }
+    let xMeeting = null;
+    try { xMeeting = vevent.getFirstPropertyValue('x-mailclient-online-meeting'); } catch (_) { /* no x-prop */ }
     return {
         uid: ev.uid || null,
         summary: ev.summary || null,
@@ -212,6 +227,8 @@ function eventFromIcal(vevent) {
         dtend: icsTimeToISO(ev.endDate),
         organizer,
         allDay: !!(ev.startDate && ev.startDate.isDate),
+        // Talk room token if this event is linked to a Talk conversation.
+        talkToken: talkTokenFromTexts(ev.description, ev.location, xMeeting),
     };
 }
 

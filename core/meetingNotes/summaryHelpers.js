@@ -37,14 +37,23 @@ async function resolveFastModel(userOrgId = null) {
 
 /**
  * Use the fast-tier LLM to identify speaker names from transcript context.
+ *
+ * `participantNames` is the real attendee roster (e.g. from the Nextcloud Talk
+ * participants API). When provided, the model maps diarized speaker IDs to
+ * those exact names — far more accurate than guessing from the transcript.
  */
-async function identifySpeakerNames(transcript, speakerIds, language, userName, userOrgId = null) {
+async function identifySpeakerNames(transcript, speakerIds, language, userName, userOrgId = null, participantNames = []) {
     try {
         const modelId = await resolveFastModel(userOrgId);
 
         const speakerList = speakerIds.join(', ');
         const userHint = userName
             ? `\n\nSTRONG HINT: The person who recorded this meeting is named "${userName}". They are almost certainly one of the speakers. Identify which speaker ID(s) belong to "${userName}" by looking at who speaks most, who introduces the meeting, or who uses first-person statements. Map those IDs to "${userName}".`
+            : '';
+
+        const roster = Array.isArray(participantNames) ? participantNames.filter(Boolean) : [];
+        const rosterHint = roster.length
+            ? `\n\nKNOWN ATTENDEES (this meeting's actual participant list): ${roster.join(', ')}. Prefer mapping speaker IDs to these exact names. Only invent a "Speaker A/B" label if a voice clearly does not match any attendee.`
             : '';
 
         const systemPrompt = `You are a transcript analyst. Identify who is actually SPEAKING in this transcript.
@@ -59,7 +68,7 @@ DIARIZATION: One person often gets multiple speaker IDs. Map them all to the sam
 Rules:
 1. Map EVERY speaker_ID to a first name (or "Speaker A", "Speaker B" if unknown).
 2. Multiple IDs can map to the same name — this is expected.
-3. Never return null. All IDs must get a value.${userHint}
+3. Never return null. All IDs must get a value.${userHint}${rosterHint}
 
 Return ONLY a JSON object: {"speaker_1": "Tom", "speaker_2": "Gerard", "speaker_3": "Tom"}
 No explanation, no markdown, ONLY valid JSON.`;

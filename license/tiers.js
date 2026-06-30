@@ -107,6 +107,11 @@ const TIER_FEATURES = {
         // Community-exempt from BETA_TIER_FLOOR; the two gates move together.
         'automations',
         'agent_routines',
+        // Learning Center (Bee Flow Academy) is part of the free Community core so
+        // self-hosted installs keep it; on cloud the subscription's
+        // allowed_beta_features decides (see core/betaFeatures.js learning_center,
+        // a GA beta whose compound licence term lives here).
+        'learning_center',
     ],
     enterprise: [
         // Studio-class features promoted from community in the tier
@@ -131,10 +136,15 @@ const TIER_FEATURES = {
         'playwright_tests',
         'security_scan',
         'support_inbox',
-        // MCP server marketplace — Enterprise beta. Gated server-side on the
-        // /ai/.../mcp-servers* routes and at runtime in directChatToolStack.js
-        // (no MCP tools reach a Community agent), with a beta opt-in registered
-        // in core/betaFeatures.js.
+        // Lead Studio — Enterprise + beta opt-in. AI lead generation +
+        // enrichment with a collaborative, checkable lead list. Org-level
+        // lead_studio permission additionally gates per-user access.
+        'lead_studio',
+        // MCP server marketplace — Enterprise. This flag now gates ONLY the
+        // super-admin INSTALL surface (the /ai/.../mcp-servers* routes via
+        // requireMcp). Org USAGE is no longer tier-gated: once installed, an MCP
+        // server is a plain integration (id `mcp:<id>`) added to a plan's
+        // allowed_integrations and granted via the normal integration path.
         'mcp_marketplace',
         // Privacy Shield clamps + Usage tabs — second wave. The licence
         // flag is the source of truth for the routes; orgPrivacyShield.js

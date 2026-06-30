@@ -74,29 +74,27 @@ async function renderThumbnail({ userId, webpageId }) {
 
     const doc = composeDoc(slots.html, slots.css, slots.js);
 
-    let browser = null;
+    const browserProvider = require('../services/browserProvider');
     try {
-        const { chromium } = require('playwright');
-        browser = await chromium.launch({
-            headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-        });
-        const context = await browser.newContext({
-            viewport: VIEWPORT,
-            deviceScaleFactor: 1,
-            // Run with a clean origin — the iframe sandbox in the editor uses
-            // about:blank-equivalent isolation, so do the same here.
-            javaScriptEnabled: true,
-        });
-        const page = await context.newPage();
-        // Cap navigation + JS so a broken page can't hang the worker forever.
-        page.setDefaultTimeout(RENDER_TIMEOUT_MS);
-        await page.setContent(doc, { waitUntil: 'load', timeout: RENDER_TIMEOUT_MS });
-        // A short settle window for late JS (animations, font load) without
-        // burning seconds when nothing is happening.
-        await page.waitForTimeout(700);
-
-        const fullShot = await page.screenshot({ type: 'png', fullPage: false });
+        const fullShot = await browserProvider.withContext(
+            {
+                viewport: VIEWPORT,
+                deviceScaleFactor: 1,
+                // Run with a clean origin — the iframe sandbox in the editor uses
+                // about:blank-equivalent isolation, so do the same here.
+                javaScriptEnabled: true,
+            },
+            async (context) => {
+                const page = await context.newPage();
+                // Cap navigation + JS so a broken page can't hang the worker forever.
+                page.setDefaultTimeout(RENDER_TIMEOUT_MS);
+                await page.setContent(doc, { waitUntil: 'load', timeout: RENDER_TIMEOUT_MS });
+                // A short settle window for late JS (animations, font load) without
+                // burning seconds when nothing is happening.
+                await page.waitForTimeout(700);
+                return page.screenshot({ type: 'png', fullPage: false });
+            }
+        );
 
         let resized = fullShot;
         try {
@@ -119,8 +117,6 @@ async function renderThumbnail({ userId, webpageId }) {
         console.log(`[Thumbnail] rendered ${webpageId} (${resized.length} bytes, sha ${sha.slice(0, 8)})`);
     } catch (err) {
         console.warn(`[Thumbnail] render failed for ${webpageId}: ${err.message}`);
-    } finally {
-        try { if (browser) await browser.close(); } catch (_) { /* ignore */ }
     }
 }
 
@@ -145,4 +141,5 @@ function scheduleThumbnail({ userId, webpageId, delayMs = DEBOUNCE_MS }) {
 module.exports = {
     scheduleThumbnail,
     renderThumbnail,
+    composeDoc, // reused by webpageRender.js for the on-demand screenshot tool
 };

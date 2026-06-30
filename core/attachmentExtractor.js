@@ -45,6 +45,16 @@ function isSpreadsheet(att) {
     return (att.type && (att.type.includes('spreadsheetml') || att.type.includes('ms-excel') || att.type === 'text/csv' || att.type === 'application/csv'))
         || /\.(xlsx|xls|csv)$/i.test(att.name || '');
 }
+function isImage(att) {
+    return (att.type && att.type.startsWith('image/'))
+        || /\.(png|jpe?g|gif|webp|tiff?|bmp|heic|heif)$/i.test(att.name || '');
+}
+// Plain-text-ish formats we can decode directly. csv / xls* are handled as
+// spreadsheets above, so this is text / markdown / json / code / xml.
+function isPlainText(att) {
+    return (att.type && (att.type.startsWith('text/') || att.type === 'application/json' || att.type === 'application/xml'))
+        || /\.(txt|md|markdown|json|log|ya?ml|xml|html?|tsv|rtf)$/i.test(att.name || '');
+}
 
 function decodeBase64(content) {
     const b64 = content.includes(',') ? content.split(',')[1] : content;
@@ -181,6 +191,43 @@ async function extractOfficeDoc(buffer, att) {
     return { kind: 'failed', reason: 'Office document extraction failed', meta: {} };
 }
 
+// ─── Image pipeline ─────────────────────────────────────────
+// Connectors (Gmail, Drive, Nextcloud) can hand us image attachments —
+// scans, photos of receipts, screenshots. The source API returns the raw
+// bytes for any type, so the only thing needed is OCR. Azure DI handles
+// PNG/JPG/TIFF/BMP; Mistral OCR handles image/*. No vision fallback here —
+// these callers want text, not an images-for-vision handoff (chat uploads
+// keep their own vision path upstream of this module).
+async function extractImage(buffer, att) {
+    const azureText = await tryAzure(buffer, att.name);
+    if (azureText) {
+        return { kind: 'text', text: azureText, source: 'azure', meta: { extractedChars: azureText.length } };
+    }
+    const base64 = att.content.includes(',') ? att.content.split(',')[1] : att.content;
+    const mistralText = await tryMistralOcr(base64, att.type || 'image/png', att.name);
+    if (mistralText) {
+        return { kind: 'text', text: mistralText, source: 'mistral', meta: { extractedChars: mistralText.length } };
+    }
+    return { kind: 'failed', reason: 'image attachment, no OCR provider configured', meta: { type: att.type } };
+}
+
+// ─── Plain-text pipeline ────────────────────────────────────
+function extractPlainText(buffer, att) {
+    const text = buffer.toString('utf-8');
+    return { kind: 'text', text, source: 'utf8', meta: { extractedChars: text.length } };
+}
+
+// Strip control characters that don't belong in extracted text. NUL (\u0000)
+// in particular is fatal downstream: PostgreSQL rejects it in text / jsonb
+// columns ("unsupported Unicode escape sequence"), so a single CID-font NUL
+// in a PDF would otherwise blow up run-step persistence. Keep tab / newline /
+// carriage-return; drop the rest of the C0 range.
+function stripControlChars(s) {
+    if (typeof s !== 'string') return s;
+    // eslint-disable-next-line no-control-regex
+    return s.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '');
+}
+
 // ─── Public API ─────────────────────────────────────────────
 /**
  * @param {{ name: string, type: string, content: string }} att
@@ -193,12 +240,17 @@ async function extractAttachment(att, opts = {}) {
     }
     const buffer = decodeBase64(att.content);
 
-    if (isPdf(att)) return extractPdf(buffer, att, opts);
-    if (isDocx(att) || isSpreadsheet(att)) return extractOfficeDoc(buffer, att);
+    let result;
+    if (isPdf(att)) result = await extractPdf(buffer, att, opts);
+    else if (isDocx(att) || isSpreadsheet(att)) result = await extractOfficeDoc(buffer, att);
+    else if (isImage(att)) result = await extractImage(buffer, att);
+    else if (isPlainText(att)) result = extractPlainText(buffer, att);
+    else result = { kind: 'failed', reason: 'unsupported type for this extractor', meta: { type: att.type } };
 
-    // Anything else — let the caller handle (images/text files already have
-    // their own paths upstream).
-    return { kind: 'failed', reason: 'unsupported type for this extractor', meta: { type: att.type } };
+    if (result && result.kind === 'text' && typeof result.text === 'string') {
+        result.text = stripControlChars(result.text);
+    }
+    return result;
 }
 
 /**
@@ -211,6 +263,7 @@ function formatTextHeader(att, result) {
         azure: 'Azure Document Intelligence',
         mistral: 'Mistral OCR',
         documentParser: 'document parser',
+        utf8: 'plain text',
     }[result.source] || result.source;
     const pages = result.meta?.numPages ? `, ${result.meta.numPages} pages` : '';
     const chars = result.meta?.extractedChars || result.meta?.totalChars;
@@ -238,4 +291,6 @@ module.exports = {
     isPdf,
     isDocx,
     isSpreadsheet,
+    isImage,
+    isPlainText,
 };

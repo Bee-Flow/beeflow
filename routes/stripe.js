@@ -226,11 +226,25 @@ router.post('/checkout', requireCloud, stripeIpLimiter, requireAuth, stripeUserL
 
         if (isConsumer) {
             // ── Consumer Checkout ──
+            // Right-of-withdrawal waiver (CRD art. 16(m) / BW 6:230p): to start a
+            // paid digital service immediately, the consumer must expressly request
+            // immediate performance and acknowledge losing the 14-day right of
+            // withdrawal. Required (and recorded) for paid plans only.
+            const consentGuards = require('../auth/consentGuards');
+            const isPaidPlan = (plan.price && plan.price > 0) || plan.billing_model === 'metered';
+            if (isPaidPlan) {
+                const w = consentGuards.validateWaiver(req.body.withdrawalWaiver);
+                if (!w.ok) return res.status(w.status).json({ error: w.error, code: w.code });
+            }
+
             const existingSub = await userStore.getConsumerSubscription(user.id);
             const stripeCustomerId = existingSub?.stripe_customer_id || null;
 
-            const successUrl = customSuccessUrl || `${origin}/app/settings?tab=consumer_license&checkout=success&session_id={CHECKOUT_SESSION_ID}`;
-            const cancelUrl = `${origin}/app/settings?tab=consumer_license&checkout=cancelled`;
+            // Use the real path segment (/app/settings/account/license), not a
+            // ?tab= query param — the settings router reads the pathname only, so
+            // the query form dropped the user on Preferences post-payment (BFSF-244).
+            const successUrl = customSuccessUrl || `${origin}/app/settings/account/license?checkout=success&session_id={CHECKOUT_SESSION_ID}`;
+            const cancelUrl = `${origin}/app/settings/account/license?checkout=cancelled`;
 
             const session = await createWithResync({
                 plan,
@@ -244,14 +258,21 @@ router.post('/checkout', requireCloud, stripeIpLimiter, requireAuth, stripeUserL
                 stripeCustomerId,
             });
 
+            // Record the withdrawal-waiver acceptance once the session exists.
+            if (isPaidPlan) {
+                try { await consentGuards.recordWaiver({ userId: user.id, email: user.email, req }); }
+                catch (e) { console.error('[Stripe] waiver record failed:', e.message); }
+            }
+
             res.json({ url: session.url, sessionId: session.id });
         } else {
             // ── Organization Checkout ──
             const existingSub = await userStore.getOrgSubscription(orgId);
             const stripeCustomerId = existingSub?.stripe_customer_id || null;
 
-            const successUrl = customSuccessUrl || `${origin}/app/settings?tab=license&checkout=success&session_id={CHECKOUT_SESSION_ID}`;
-            const cancelUrl = `${origin}/app/settings?tab=license&checkout=cancelled`;
+            // Real path segment (/app/settings/organisation/license) — see BFSF-244.
+            const successUrl = customSuccessUrl || `${origin}/app/settings/organisation/license?checkout=success&session_id={CHECKOUT_SESSION_ID}`;
+            const cancelUrl = `${origin}/app/settings/organisation/license?checkout=cancelled`;
 
             const orgs = await userStore.getAllOrganizations();
             const org = orgs.find(o => o.id === orgId);
@@ -383,6 +404,63 @@ router.post('/portal', requireCloud, stripeIpLimiter, requireAuth, stripeUserLim
     }
 });
 
+// ── GET /invoices — list the caller's invoices for the in-app billing view ───
+router.get('/invoices', requireCloud, requireAuth, async (req, res) => {
+    try {
+        if (!(await stripeService.isEnabled())) return res.json({ invoices: [] });
+
+        const user = req.session.user;
+        const orgId = await resolveOrgIdForUser(req);
+        const isConsumer = !!user?.isConsumerAccount || !orgId;
+
+        const sub = isConsumer
+            ? await userStore.getConsumerSubscription(user.id)
+            : await userStore.getOrgSubscription(orgId);
+        const customerId = sub?.stripe_customer_id;
+        if (!customerId) return res.json({ invoices: [] }); // no billing account yet
+
+        const invoices = await stripeService.listInvoices(customerId, { limit: 24 });
+        res.json({ invoices });
+    } catch (err) {
+        console.error('[Stripe] Invoices error:', err);
+        res.status(500).json({ error: err.message || 'Failed to load invoices' });
+    }
+});
+
+// ── GET /invoices/:id/pdf — stream a single invoice PDF for the in-app viewer ─
+// Proxies the Stripe-hosted PDF (a) to enforce ownership against the caller's
+// own Stripe customer and (b) so the frontend can render it inline in a modal
+// without a disk download. The frontend fetches this via authFetch/cloudFetch
+// into a same-origin blob; `inline` disposition keeps it embeddable.
+router.get('/invoices/:id/pdf', requireCloud, requireAuth, async (req, res) => {
+    try {
+        if (!(await stripeService.isEnabled())) return res.status(400).json({ error: 'Stripe payments are not enabled' });
+
+        const user = req.session.user;
+        const orgId = await resolveOrgIdForUser(req);
+        const isConsumer = !!user?.isConsumerAccount || !orgId;
+
+        const sub = isConsumer
+            ? await userStore.getConsumerSubscription(user.id)
+            : await userStore.getOrgSubscription(orgId);
+        const customerId = sub?.stripe_customer_id;
+        if (!customerId) return res.status(404).json({ error: 'No billing account found' });
+
+        const pdf = await stripeService.getInvoicePdf(req.params.id, { customerId });
+        if (!pdf) return res.status(404).json({ error: 'Invoice PDF not available' });
+
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `inline; filename="${pdf.filename}"`);
+        res.setHeader('Cache-Control', 'private, max-age=60');
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        return res.send(pdf.buffer);
+    } catch (err) {
+        if (err.code === 'invoice_forbidden') return res.status(403).json({ error: 'Not your invoice' });
+        console.error('[Stripe] Invoice PDF error:', err);
+        res.status(500).json({ error: err.message || 'Failed to load invoice PDF' });
+    }
+});
+
 // ── POST /webhook — Handle Stripe Webhook Events ─────────────────────────────
 // NOTE: This route needs raw body — handled by mounting express.raw() in index.js
 
@@ -419,6 +497,11 @@ router.post('/webhook', async (req, res) => {
             // Stripe-dashboard/API direct creates emit `created`, not `updated`.
             // Route through the same handler so the local row reconciles.
             case 'customer.subscription.created':
+                await handleSubscriptionUpdated(event.data.object);
+                // Notify the configured admin address that a new subscription
+                // started — only on `created`, and idempotently per subscription.
+                await _notifyAdminNewSubscriptionOnce(event.data.object);
+                break;
             case 'customer.subscription.updated':
                 await handleSubscriptionUpdated(event.data.object);
                 break;
@@ -902,6 +985,18 @@ async function handleCustomerUpdated(customer) {
         const orgId = subs[0].organization_id;
         const updates = {};
         if (customer.email) updates.email = customer.email;
+        if (customer.phone) updates.phone = customer.phone;
+        // Mirror an address edited in the Billing Portal back to the org's
+        // structured columns (legacy `address` = line1) so Org Info stays in
+        // sync. Only write the parts Stripe actually returned.
+        const a = customer.address;
+        if (a && (a.line1 || a.postal_code || a.city || a.country)) {
+            if (a.line1 != null) updates.address = a.line1;
+            updates.billingLine2 = a.line2 || '';
+            updates.billingPostalCode = a.postal_code || '';
+            updates.billingCity = a.city || '';
+            updates.billingCountry = a.country || '';
+        }
         if (Object.keys(updates).length === 0) return;
         await require('../stores/userStore').updateOrganization(orgId, updates);
         await userStore.logSubscriptionAudit(
@@ -1105,6 +1200,83 @@ async function _sendTrialEndingEmailOnce({ scope, orgId, userId, subscription, t
 }
 
 /**
+ * Idempotently email the admin when a new subscription is created. The
+ * recipient is configured in Admin → Subscriptions → Stripe
+ * (`subscription_notify_email`); empty = notifications off. Claims a
+ * per-subscription notification slot first so a webhook redelivery never
+ * re-sends. All failures are swallowed — a notification must never 5xx Stripe.
+ */
+async function _notifyAdminNewSubscriptionOnce(subscription) {
+    try {
+        const configStore = require('../stores/configStore');
+        const to = (await configStore.getConfig('subscription_notify_email') || '').trim();
+        if (!to) return; // notifications disabled
+
+        const subscriberType = getSubscriberType(subscription.metadata);
+        const scope = subscriberType === 'consumer' ? 'consumer' : 'org';
+        const targetType = scope === 'consumer' ? 'consumer' : 'organization';
+        const targetId = scope === 'consumer'
+            ? subscription.metadata?.beeflow_user_id
+            : subscription.metadata?.beeflow_org_id;
+        if (!targetId) return;
+
+        // Key per-subscription so a later, genuinely new subscription for the
+        // same customer still notifies (a redelivered webhook is already
+        // deduped by recordStripeEventProcessed on event.id).
+        const claimed = await userStore.claimNotification(
+            targetType, targetId, `admin_new_subscription:${subscription.id}`,
+            null, { sub_id: subscription.id },
+        );
+        if (!claimed) return; // already notified for this subscription
+
+        // Resolve a friendly customer name.
+        let targetName = null;
+        if (scope === 'consumer') {
+            try { const u = await userStore.getUser(targetId); targetName = u?.displayName || u?.username || u?.email || null; } catch (_) {}
+        } else {
+            try { const org = await userStore.getOrganization(targetId); targetName = org?.name || null; } catch (_) {}
+        }
+
+        // Resolve plan details. Prefer the matched BeeFlow plan (by Stripe
+        // price id); fall back to the Stripe price object on the subscription.
+        const priceObj = subscription.items?.data?.[0]?.price || null;
+        let planName = null, price = null, currency = null, interval = null, trialDays = null;
+        try {
+            const plans = await userStore.getAllPlans();
+            const plan = priceObj ? plans.find(p => p.stripe_price_id && p.stripe_price_id === priceObj.id) : null;
+            if (plan) {
+                planName = plan.name;
+                price = plan.price;
+                currency = plan.currency || 'EUR';
+                interval = plan.billing_interval || (priceObj?.recurring?.interval === 'year' ? 'yearly' : 'monthly');
+                trialDays = plan.trial_days || null;
+            }
+        } catch (_) {}
+        if (!planName && priceObj) {
+            planName = priceObj.nickname || 'Subscription';
+            if (typeof priceObj.unit_amount === 'number') price = priceObj.unit_amount / 100;
+            currency = (priceObj.currency || 'eur').toUpperCase();
+            interval = priceObj.recurring?.interval === 'year' ? 'yearly' : 'monthly';
+        }
+        if (subscription.status === 'trialing' && subscription.trial_end) {
+            trialDays = Math.max(0, Math.ceil((subscription.trial_end * 1000 - Date.now()) / 86400000));
+        }
+
+        const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
+        const { sendSubscriptionStartedAdminEmail } = require('../utils/emailService');
+        const result = await sendSubscriptionStartedAdminEmail({
+            to, scope, targetName, planName, price, currency, interval, trialDays,
+            adminUrl: `${clientHost}/app/admin/subscriptions`,
+        });
+        if (!result?.success) {
+            console.warn(`[Stripe Webhook] admin new-subscription email failed: ${result?.error || 'unknown'}`);
+        }
+    } catch (e) {
+        console.warn('[Stripe Webhook] _notifyAdminNewSubscriptionOnce error:', e.message);
+    }
+}
+
+/**
  * charge.refunded — flip the subscription's payment_status to 'refunded'.
  * Match by stripe_subscription_id on the charge's invoice → subscription
  * link, falling back to stripe_customer_id.
@@ -1267,6 +1439,21 @@ async function handleSubscriptionDeleted(subscription) {
 }
 
 async function handleSubscriptionDeletedForOrg(orgId, subscription) {
+    // BFSF-226: a no-card trial that ends without payment (or any never-paid
+    // subscription) should drop the org back to the capped Free plan rather than
+    // be left `cancelled` (locked-out / unlimited if the row is later cleared).
+    // A previously-paid subscription that the customer actively cancelled keeps
+    // the cancelled state. "Never paid" = local payment_status was never 'paid'.
+    const existing = await userStore.getOrgSubscription(orgId).catch(() => null);
+    const everPaid = existing?.payment_status === 'paid';
+    if (!everPaid) {
+        const downgraded = await userStore.downgradeOrgToFreePlan(orgId, { changedBy: 'stripe_webhook', reason: 'trial_ended_no_payment' });
+        if (downgraded) {
+            console.log(`[Stripe Webhook] Never-paid subscription ended for org ${orgId} → downgraded to Free`);
+            return;
+        }
+        // No Free plan to fall back to — fall through to the cancelled state.
+    }
     await userStore.setOrgSubscription(orgId, {
         status: 'cancelled',
         payment_status: 'cancelled',

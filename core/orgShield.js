@@ -36,22 +36,34 @@ function _licenseModule() {
  */
 async function applyTierClampsToShield(shield, { organizationId, userId } = {}) {
     if (!shield || typeof shield !== 'object') return shield;
-    let hasPiiTokenize = false;
     let hasWebSearchGuard = false;
     try {
         const lic = _licenseModule();
         const tier = await lic.resolveTier({ organizationId, userId });
-        hasPiiTokenize = lic.tiers.tierHasFeature(tier, 'pii_tokenize');
         hasWebSearchGuard = lic.tiers.tierHasFeature(tier, 'web_search_guard');
     } catch (_) {
-        // fail closed — leave both `false`, strictest clamps apply
+        // fail closed — leave `false`, strictest clamp applies
     }
-    if (!hasPiiTokenize && shield.piiDetectionAction && shield.piiDetectionAction !== 'block') {
-        shield.piiDetectionAction = 'block';
-    }
+    // NOTE: we deliberately do NOT clamp `piiDetectionAction` down to 'block'
+    // here. An explicitly-saved "tokenize" is honored everywhere (text chat
+    // already reads the raw config and tokenizes; clamping only the attachment /
+    // file path produced the "files get blocked but text tokenizes" split).
+    // Entitlement is gated where the admin SELECTS the action (the SPA's
+    // `canTokenizePii`, which is grant- + operator-floor-aware); tokenizing is a
+    // privacy/safety action, so honoring the chosen value is the safe default.
     if (!hasWebSearchGuard) {
         shield.webSearchGuardEnabled = false;
         shield.webSearchGuardPiiCategories = [];
+        // Tool-call PII blocking for EXTERNAL tools is the generalization of
+        // Web Search Guard, so it shares the same licence gate. Internal-tool
+        // blocking stays available on every tier (the data never leaves the
+        // box, and it's the differentiator a community org would want).
+        if (shield.toolPiiPolicy && shield.toolPiiPolicy.external) {
+            shield.toolPiiPolicy = {
+                ...shield.toolPiiPolicy,
+                external: { blockCategories: [] },
+            };
+        }
     }
     return shield;
 }
@@ -146,6 +158,11 @@ async function resolveOrgShield(orgId) {
         webSearchGuardPiiCategories: (Array.isArray(shield.webSearchGuardPiiCategories) && shield.webSearchGuardPiiCategories.length > 0)
             ? shield.webSearchGuardPiiCategories
             : (Array.isArray(shield.piiDetectionCategories) ? shield.piiDetectionCategories : []),
+        // Per-tool-class PII block policy: PII categories the org refuses to
+        // send into a tool. `external` = tools that leave the box (web search,
+        // Gmail, MCP, n8n…); `internal` = on-box tools (notebook/workspace/
+        // local integrations). Generalizes the legacy Web-Search Guard.
+        toolPiiPolicy: synthesizeToolPiiPolicy(shield),
         // DLP (Data Loss Prevention) — interactive outbound scanner before
         // prompts reach external LLMs. Default off so existing orgs are unaffected.
         dlpEnabled: !!shield.dlpEnabled,
@@ -212,6 +229,82 @@ function synthesizePrivacyFields(shield, orgId) {
 }
 
 const _legacyLogged = new Set();
+
+/**
+ * Resolve the per-tool-class PII block policy from a stored shield doc.
+ * Read-only (never mutates the stored doc), mirroring synthesizePrivacyFields.
+ *
+ * Canonical shape:
+ *   { external: { blockCategories: string[] }, internal: { blockCategories: string[] } }
+ *
+ * Backward-compat: when no explicit `toolPiiPolicy` is stored, absorb the
+ * legacy Web-Search Guard list into the EXTERNAL class — but ONLY when the
+ * guard was actively blocking (`webSearchGuardEnabled === true`). Monitor-only
+ * orgs (categories picked but guard disabled) must NOT silently become
+ * blocking orgs, so they resolve to an empty policy.
+ */
+function synthesizeToolPiiPolicy(shield) {
+    const empty = { external: { blockCategories: [] }, internal: { blockCategories: [] } };
+    if (!shield || typeof shield !== 'object') return empty;
+    const norm = (v) => ({
+        blockCategories: (v && Array.isArray(v.blockCategories))
+            ? v.blockCategories.filter(c => typeof c === 'string')
+            : [],
+    });
+    const stored = shield.toolPiiPolicy;
+    if (stored && typeof stored === 'object' && (stored.external || stored.internal)) {
+        return { external: norm(stored.external), internal: norm(stored.internal) };
+    }
+    if (shield.webSearchGuardEnabled === true) {
+        const legacy = (Array.isArray(shield.webSearchGuardPiiCategories) && shield.webSearchGuardPiiCategories.length > 0)
+            ? shield.webSearchGuardPiiCategories
+            : (Array.isArray(shield.piiDetectionCategories) ? shield.piiDetectionCategories : []);
+        return { external: { blockCategories: legacy.filter(c => typeof c === 'string') }, internal: { blockCategories: [] } };
+    }
+    return empty;
+}
+
+/**
+ * Classify a tool as 'external' (data leaves the org) or 'internal' (stays
+ * on-box). Reuses integrationToolMap.resolveIntegration: it returns null for
+ * internal-prefixed/unknown tools and sets `isLocal` for on-box integrations.
+ *
+ * Web-search tools are forced 'external' explicitly so the absorbed Web Search
+ * Guard always fires; keep this regex in sync with the chatStream tool loop.
+ *
+ * Pure + side-effect-free (lazy-requires the map to avoid a circular import).
+ */
+function classifyToolClass(toolName) {
+    if (/^(agent_search|web_search|search|brave_search)$/i.test(toolName || '')) return 'external';
+    let meta = null;
+    try { meta = require('./integrationToolMap').resolveIntegration(toolName, {}); } catch (_) { /* treat as internal */ }
+    if (!meta) return 'internal';            // internal/unknown tools (notebook_*, workspace_*, set_*, regex_*)
+    if (meta.isLocal === true) return 'internal'; // local integrations (Nextcloud family, on-box whisper, …)
+    return 'external';                       // any resolved integration leaving the box
+}
+
+/**
+ * Decide whether a tool call must be refused given the categories of PII
+ * detected in its (real-value) arguments and the resolved tool block policy.
+ *
+ * @param {string} toolName
+ * @param {string[]} detectedCategories  canonical PII category ids (entity.category)
+ * @param {object} policy                resolved toolPiiPolicy from resolveOrgShield
+ * @returns {{ blocked: boolean, blockedCategories: string[], toolClass: string }}
+ */
+function isBlockedForTool(toolName, detectedCategories, policy) {
+    const toolClass = classifyToolClass(toolName);
+    if (!policy || !Array.isArray(detectedCategories) || detectedCategories.length === 0) {
+        return { blocked: false, blockedCategories: [], toolClass };
+    }
+    const blockList = (policy[toolClass] && Array.isArray(policy[toolClass].blockCategories))
+        ? policy[toolClass].blockCategories
+        : [];
+    if (blockList.length === 0) return { blocked: false, blockedCategories: [], toolClass };
+    const set = new Set(blockList);
+    const hits = [...new Set(detectedCategories)].filter(c => set.has(c));
+    return { blocked: hits.length > 0, blockedCategories: hits, toolClass };
+}
 
 /**
  * Merge org shield rules with agent/direct-chat rules.
@@ -372,6 +465,9 @@ async function resolveUserShield(userId) {
         monitorIntegrations: false,
         showRawPayload: !!shield.showRawPayload,
         webSearchGuardPiiCategories: [],
+        // Consumer accounts get no tool-class PII blocking (an org-only
+        // feature) — return the empty shape so callers can read it uniformly.
+        toolPiiPolicy: { external: { blockCategories: [] }, internal: { blockCategories: [] } },
         dlpEnabled: false,
         dlpScope: 'external',
         dlpMode: 'ask',
@@ -379,7 +475,7 @@ async function resolveUserShield(userId) {
         dlpAllowlistedHosts: [],
         customSensitiveTerms: [],
         // Canonical Privacy fields (mirror of org synth path).
-        privacyScanEnabled: piiEnabled,
+        privacyScanEnabled: !!shield.enabled,
         privacyAction: shield.piiDetectionAction === 'block' ? 'block' : 'redact',
         privacyScope: 'external',
         privacyFailureMode: 'fail_closed',
@@ -398,4 +494,4 @@ async function resolveShieldFor({ orgId, userId }) {
     return resolveUserShield(userId);
 }
 
-module.exports = { resolveOrgShield, resolveUserShield, resolveShieldFor, mergeWithOrgShield, selfCheckOrgShields, applyTierClampsToShield };
+module.exports = { resolveOrgShield, resolveUserShield, resolveShieldFor, mergeWithOrgShield, selfCheckOrgShields, applyTierClampsToShield, synthesizeToolPiiPolicy, classifyToolClass, isBlockedForTool };

@@ -18,7 +18,7 @@
 
 const { evaluate } = require('./expr');
 
-const REF_RE = /^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*|\[(?:[0-9]+|"[^"]*"|'[^']*')\])*$/;
+const REF_RE = /^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*|\[(?:[0-9]+|\*|"[^"]*"|'[^']*')\])*$/;
 
 // Defensive deep-clone for binding values. Without this, an object literal
 // in a definition (`{kind:'literal', value:{...}}`) would be returned by
@@ -32,33 +32,26 @@ function cloneLiteral(value) {
 }
 
 /**
- * Walk a dotted/bracketed path on an object. Used by both ref-resolution
- * and the inside of {{...}} templates. Tolerates undefined intermediates.
+ * Tokenize a dotted/bracketed path into prop / index / wildcard tokens.
+ * Returns null on a malformed path (unclosed bracket).
  */
-function walkPath(path, root) {
-    if (!path || typeof path !== 'string') return undefined;
-    if (!REF_RE.test(path)) return undefined;
-    let cur = root;
+function tokenizePath(path) {
+    const tokens = [];
     let i = 0;
     let buf = '';
-    const flush = () => {
-        if (buf.length === 0) return;
-        cur = cur == null ? undefined : cur[buf];
-        buf = '';
-    };
+    const flush = () => { if (buf.length) { tokens.push({ type: 'prop', key: buf }); buf = ''; } };
     while (i < path.length) {
         const c = path[i];
         if (c === '.') { flush(); i++; continue; }
         if (c === '[') {
             flush();
             const close = path.indexOf(']', i);
-            if (close < 0) return undefined;
+            if (close < 0) return null;
             const raw = path.slice(i + 1, close);
-            let key;
-            if (raw.startsWith('"') && raw.endsWith('"')) key = raw.slice(1, -1);
-            else if (raw.startsWith("'") && raw.endsWith("'")) key = raw.slice(1, -1);
-            else key = parseInt(raw, 10);
-            cur = cur == null ? undefined : cur[key];
+            if (raw === '*') tokens.push({ type: 'wild' });
+            else if (raw.startsWith('"') && raw.endsWith('"')) tokens.push({ type: 'prop', key: raw.slice(1, -1) });
+            else if (raw.startsWith("'") && raw.endsWith("'")) tokens.push({ type: 'prop', key: raw.slice(1, -1) });
+            else tokens.push({ type: 'prop', key: parseInt(raw, 10) });
             i = close + 1;
             continue;
         }
@@ -66,7 +59,48 @@ function walkPath(path, root) {
         i++;
     }
     flush();
+    return tokens;
+}
+
+/**
+ * Resolve a token list against a value. A `[*]` wildcard maps the rest of
+ * the path over each element of the current array and flattens the result
+ * one level — so `steps.read.output.results[*].output.attachments` (each
+ * element yielding an array) collapses into a single flat array of
+ * attachments, which is exactly what a downstream "for each" needs.
+ */
+function resolveTokens(tokens, cur) {
+    for (let t = 0; t < tokens.length; t++) {
+        const tok = tokens[t];
+        if (tok.type === 'wild') {
+            if (!Array.isArray(cur)) return undefined;
+            const rest = tokens.slice(t + 1);
+            const out = [];
+            for (const el of cur) {
+                const m = resolveTokens(rest, el);
+                if (m === undefined) continue;
+                if (Array.isArray(m)) out.push(...m);
+                else out.push(m);
+            }
+            return out;
+        }
+        if (cur == null) return undefined;
+        cur = cur[tok.key];
+    }
     return cur;
+}
+
+/**
+ * Walk a dotted/bracketed path on an object. Used by both ref-resolution
+ * and the inside of {{...}} templates. Tolerates undefined intermediates,
+ * and supports `[*]` wildcards for flattening across arrays.
+ */
+function walkPath(path, root) {
+    if (!path || typeof path !== 'string') return undefined;
+    if (!REF_RE.test(path)) return undefined;
+    const tokens = tokenizePath(path);
+    if (!tokens) return undefined;
+    return resolveTokens(tokens, root);
 }
 
 /**
@@ -140,9 +174,18 @@ function resolveInputs(inputs, runState, opts = {}) {
  * it on `runState._templateWarnings` (if the array exists) so the runner
  * can surface a per-run warning summary; `AUTOMATION_DEBUG_BINDINGS=1`
  * additionally logs to the server console.
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.leaveUnresolved] — when true, a `{{token}}` whose
+ *   path resolves to `undefined` is returned VERBATIM (braces and all)
+ *   rather than blanked. Used for AI-step prompts so a literal `{{...}}`
+ *   the builder typed (and any not-yet-available reference) isn't silently
+ *   deleted from the instruction text. Default false keeps the historical
+ *   blank-on-miss behaviour for notification/stop_error callers.
  */
-function interpolateTemplate(template, runState) {
-    return String(template).replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_, path) => {
+function interpolateTemplate(template, runState, opts = {}) {
+    const { leaveUnresolved = false } = opts;
+    return String(template).replace(/\{\{\s*([^}]+?)\s*\}\}/g, (whole, path) => {
         const trimmed = path.trim();
         const v = walkPath(trimmed, runState);
         if (v === undefined) {
@@ -152,7 +195,7 @@ function interpolateTemplate(template, runState) {
             if (process.env.AUTOMATION_DEBUG_BINDINGS) {
                 console.warn(`[bind] template path "${trimmed}" resolved to undefined`);
             }
-            return '';
+            return leaveUnresolved ? whole : '';
         }
         return v === null ? '' : (typeof v === 'object' ? JSON.stringify(v) : String(v));
     });

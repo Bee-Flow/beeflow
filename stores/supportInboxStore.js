@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS support_inboxes (
     kb_ingest_enabled BOOLEAN DEFAULT false,          -- distil resolved tickets into a KB
     kb_ingest_kb_id UUID,                             -- target knowledge base for ingestion
     kb_ingest_routine_id UUID,                        -- the auto-provisioned routine (one per inbox)
+    shared_groups JSONB NOT NULL DEFAULT '[]'::jsonb, -- org groups allowed to work this inbox; [] = open to all org support staff
     created_at TIMESTAMPTZ DEFAULT now(),
     updated_at TIMESTAMPTZ DEFAULT now()
 );
@@ -74,6 +75,37 @@ async function initDB() {
             `ALTER TABLE support_inboxes ADD COLUMN IF NOT EXISTS kb_ingest_enabled BOOLEAN DEFAULT false`,
             `ALTER TABLE support_inboxes ADD COLUMN IF NOT EXISTS kb_ingest_kb_id UUID`,
             `ALTER TABLE support_inboxes ADD COLUMN IF NOT EXISTS kb_ingest_routine_id UUID`,
+            // Per-inbox enabled-tools set (supersedes the single tools_enabled
+            // checkbox): tokens like 'builtin:read','builtin:action','integration:<id>'.
+            `ALTER TABLE support_inboxes ADD COLUMN IF NOT EXISTS enabled_tool_ids JSONB DEFAULT '[]'::jsonb`,
+            // Designated operator: the org member whose connected integrations the
+            // support AI may use. Integration tool calls execute under this identity
+            // (their OAuth tokens / per-user keys / org). NULL = no integration tools.
+            `ALTER TABLE support_inboxes ADD COLUMN IF NOT EXISTS operator_user_id TEXT DEFAULT NULL`,
+            // Non-support classification (opt-in): tag + route inbound that isn't
+            // a genuine customer request out of the default inbox.
+            `ALTER TABLE support_inboxes ADD COLUMN IF NOT EXISTS classify_non_support_enabled BOOLEAN DEFAULT false`,
+            `ALTER TABLE support_inboxes ADD COLUMN IF NOT EXISTS classify_sensitivity NUMERIC(3,2) DEFAULT 0.85`,
+            `ALTER TABLE support_inboxes ADD COLUMN IF NOT EXISTS classify_suppress_autoreply BOOLEAN DEFAULT true`,
+            `ALTER TABLE support_inboxes ADD COLUMN IF NOT EXISTS known_good_senders JSONB DEFAULT '[]'::jsonb`,
+            // Historical response-time scan (aggregate-only, on-demand). Only the
+            // scan engine writes these (via dedicated setters — kept off UPDATABLE).
+            `ALTER TABLE support_inboxes ADD COLUMN IF NOT EXISTS scan_status TEXT DEFAULT 'idle'`,
+            `ALTER TABLE support_inboxes ADD COLUMN IF NOT EXISTS scan_progress JSONB DEFAULT '{}'::jsonb`,
+            `ALTER TABLE support_inboxes ADD COLUMN IF NOT EXISTS scan_result JSONB`,
+            `ALTER TABLE support_inboxes ADD COLUMN IF NOT EXISTS scan_after TIMESTAMPTZ`,
+            `ALTER TABLE support_inboxes ADD COLUMN IF NOT EXISTS scan_locked_until TIMESTAMPTZ`,
+            // Per-inbox group access control. [] = open to any org member with the
+            // support_inbox permission (preserves prior behaviour); a non-empty
+            // array restricts the inbox to members of those org groups.
+            `ALTER TABLE support_inboxes ADD COLUMN IF NOT EXISTS shared_groups JSONB NOT NULL DEFAULT '[]'::jsonb`,
+            // Add the CHECK separately so re-runs on an existing column are safe.
+            `DO $$ BEGIN
+               IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'support_inboxes_scan_status_chk') THEN
+                 ALTER TABLE support_inboxes ADD CONSTRAINT support_inboxes_scan_status_chk
+                   CHECK (scan_status IN ('idle','queued','running','done','error'));
+               END IF;
+             END $$;`,
         ]) {
             await pool.query(sql).catch(e => console.warn('[SupportInboxStore] migration skipped:', e.message));
         }
@@ -125,8 +157,10 @@ function decryptTokens(encryptedStr) {
 // Columns safe to return to the client (never the encrypted token blob).
 const PUBLIC_COLS = `id, organization_id, created_by, provider, email_address, display_name,
     auth_method, provider_config, default_agent_id, kb_ids, reply_mode, autoresolve_threshold,
-    tools_enabled, signature, folder_filter, sync_interval_minutes, sync_status, sync_error,
+    tools_enabled, enabled_tool_ids, operator_user_id, signature, folder_filter, sync_interval_minutes, sync_status, sync_error,
     last_sync_at, active, kb_ingest_enabled, kb_ingest_kb_id, kb_ingest_routine_id,
+    classify_non_support_enabled, classify_sensitivity, classify_suppress_autoreply, known_good_senders,
+    scan_status, scan_progress, scan_result, scan_after, shared_groups,
     created_at, updated_at,
     (encrypted_tokens IS NOT NULL) AS connected`;
 
@@ -190,8 +224,13 @@ async function getInboxWithTokens(id) {
 }
 
 const UPDATABLE = ['display_name', 'default_agent_id', 'reply_mode', 'autoresolve_threshold',
-    'tools_enabled', 'signature', 'folder_filter', 'sync_interval_minutes', 'active',
-    'provider_config', 'email_address'];
+    'tools_enabled', 'enabled_tool_ids', 'operator_user_id', 'signature', 'folder_filter', 'sync_interval_minutes', 'active',
+    'provider_config', 'email_address',
+    // Non-support classification config (the only scan-adjacent fields a client
+    // may write; all scan_* state stays off this list and is engine-owned).
+    'classify_non_support_enabled', 'classify_sensitivity', 'classify_suppress_autoreply', 'known_good_senders'];
+
+const JSONB_UPDATABLE = new Set(['folder_filter', 'provider_config', 'enabled_tool_ids', 'known_good_senders']);
 
 async function updateInbox(id, updates = {}, organizationId = null) {
     await initDB();
@@ -200,7 +239,7 @@ async function updateInbox(id, updates = {}, organizationId = null) {
     let idx = 2;
     for (const key of UPDATABLE) {
         if (updates[key] === undefined) continue;
-        const isJsonb = key === 'folder_filter' || key === 'provider_config';
+        const isJsonb = JSONB_UPDATABLE.has(key);
         sets.push(isJsonb ? `${key} = $${idx}::jsonb` : `${key} = $${idx}`);
         vals.push(isJsonb ? JSON.stringify(updates[key]) : updates[key]);
         idx++;
@@ -242,6 +281,26 @@ async function setKbAutomation(id, { enabled, kbId, routineId } = {}, organizati
     if (organizationId) { vals.push(organizationId); where += ` AND organization_id = $${vals.length}`; }
     const { rows } = await pool.query(
         `UPDATE support_inboxes SET ${sets.join(', ')} ${where} RETURNING ${PUBLIC_COLS}`,
+        vals
+    );
+    return rows[0] || null;
+}
+
+/**
+ * Set the per-inbox group access list. Kept off the public PATCH allowlist
+ * (UPDATABLE) so a forged `shared_groups` in a normal settings PATCH body is
+ * ignored — access can only change via the dedicated /access endpoint, which
+ * validates the group ids against the inbox's org first. Pass [] to open the
+ * inbox to all org support staff.
+ */
+async function setSharedGroups(id, sharedGroups = [], organizationId = null) {
+    await initDB();
+    const clean = Array.from(new Set((Array.isArray(sharedGroups) ? sharedGroups : []).filter(Boolean)));
+    const vals = [id, JSON.stringify(clean)];
+    let where = `WHERE id = $1`;
+    if (organizationId) { vals.push(organizationId); where += ` AND organization_id = $${vals.length}`; }
+    const { rows } = await pool.query(
+        `UPDATE support_inboxes SET shared_groups = $2::jsonb, updated_at = now() ${where} RETURNING ${PUBLIC_COLS}`,
         vals
     );
     return rows[0] || null;
@@ -330,6 +389,81 @@ async function updateSyncState(inboxId, { syncStatus, syncError, lastSyncAt } = 
     await pool.query(`UPDATE support_inboxes SET ${sets.join(', ')} WHERE id = $1`, vals);
 }
 
+// ── Historical scan helpers (engine-owned; clients can't write scan_* via PATCH) ─
+
+/**
+ * Queue a scan: set status='queued' + the look-back anchor, clearing any prior
+ * result/progress. Returns the public row. Caller validates org scope.
+ */
+async function queueScan(inboxId, { scanAfter } = {}) {
+    await initDB();
+    const { rows } = await pool.query(
+        `UPDATE support_inboxes
+            SET scan_status = 'queued',
+                scan_after = $2,
+                scan_progress = '{}'::jsonb,
+                scan_result = NULL,
+                updated_at = now()
+          WHERE id = $1
+          RETURNING ${PUBLIC_COLS}`,
+        [inboxId, scanAfter || null]
+    );
+    return rows[0] || null;
+}
+
+/** Claim the next queued scan with a TTL lease (mirrors acquireSyncLock). */
+async function acquireScanLock(inboxId, ttlMinutes = 30) {
+    await initDB();
+    const { rows } = await pool.query(
+        `UPDATE support_inboxes
+            SET scan_status = 'running',
+                scan_locked_until = now() + ($2 || ' minutes')::interval,
+                updated_at = now()
+          WHERE id = $1
+            AND scan_status IN ('queued','running')
+            AND (scan_locked_until IS NULL OR scan_locked_until <= now())
+          RETURNING scan_locked_until`,
+        [inboxId, String(ttlMinutes)]
+    );
+    return { acquired: rows.length > 0 };
+}
+
+async function releaseScanLock(inboxId) {
+    await initDB();
+    await pool.query(
+        `UPDATE support_inboxes SET scan_locked_until = NULL, updated_at = now() WHERE id = $1`,
+        [inboxId]
+    );
+}
+
+/** Inboxes with a queued scan whose lease is free (drained off the sync tick). */
+async function getDueScans() {
+    await initDB();
+    const { rows } = await pool.query(
+        `SELECT * FROM support_inboxes
+          WHERE active = true
+            AND encrypted_tokens IS NOT NULL
+            AND scan_status = 'queued'
+            AND (scan_locked_until IS NULL OR scan_locked_until <= now())
+          ORDER BY updated_at ASC
+          LIMIT 5`
+    );
+    return rows;
+}
+
+/** Write scan progress/status/result. Engine-only. */
+async function setScanState(inboxId, { status, progress, result } = {}) {
+    await initDB();
+    const sets = ['updated_at = now()'];
+    const vals = [inboxId];
+    let idx = 2;
+    if (status !== undefined) { sets.push(`scan_status = $${idx}`); vals.push(status); idx++; }
+    if (progress !== undefined) { sets.push(`scan_progress = $${idx}::jsonb`); vals.push(JSON.stringify(progress)); idx++; }
+    if (result !== undefined) { sets.push(`scan_result = $${idx}::jsonb`); vals.push(result == null ? null : JSON.stringify(result)); idx++; }
+    if (sets.length === 1) return;
+    await pool.query(`UPDATE support_inboxes SET ${sets.join(', ')} WHERE id = $1`, vals);
+}
+
 module.exports = {
     initDB,
     createInbox,
@@ -338,6 +472,7 @@ module.exports = {
     getInboxWithTokens,
     updateInbox,
     setKbAutomation,
+    setSharedGroups,
     updateTokens,
     deleteInbox,
     getDueInboxes,
@@ -345,6 +480,11 @@ module.exports = {
     releaseSyncLock,
     updateIncrementalCursor,
     updateSyncState,
+    queueScan,
+    acquireScanLock,
+    releaseScanLock,
+    getDueScans,
+    setScanState,
     encryptTokens,
     decryptTokens,
 };

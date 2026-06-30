@@ -55,6 +55,12 @@ const INTEGRATION_PREFIXES = {
     youtrack_:      { integration: 'youtrack',        label: 'YouTrack',            serverFn: (_a, ctx) => ctx?.youtrackUrl || null },
     signrequest_:   { integration: 'signrequest',     label: 'SignRequest',         server: 'api.signrequest.com' },
     gamma_:         { integration: 'gamma',           label: 'Gamma',               server: 'gamma.app' },
+    // AFAS host is per-customer ({nr}.rest.afas.online); null lets the
+    // probe-captured tls_servername be the truth (same rationale as YouTrack).
+    afas_:          { integration: 'afas_profit',     label: 'AFAS Profit',         serverFn: () => null },
+    // NMBRS host depends on the API mode (api.nmbrs.nl SOAP / api.nmbrsapp.com
+    // REST); null lets the probe-captured tls_servername be the truth.
+    nmbrs_:         { integration: 'nmbrs',           label: 'NMBRS',               serverFn: () => null },
     linkedin_:      { integration: 'linkedin',        label: 'LinkedIn',            server: 'api.linkedin.com' },
     github_:        { integration: 'github',          label: 'GitHub',              server: 'api.github.com' },
 
@@ -120,6 +126,67 @@ const INTEGRATION_TOOL_MAP = {
         serverFn: () => 'data.rechtspraak.nl',
         direction: 'both',
         dataCategories: 'citation, ecli',
+    },
+
+    // ── AFAS Profit (read-only GetConnectors) ────────────────
+    // ERP environments hold HR/payroll/finance records — tag the categories
+    // explicitly so the egress dashboard and PII scan reflect the sensitivity.
+    afas_list_connectors: {
+        integration: 'afas_profit',
+        label: 'AFAS Profit',
+        serverFn: () => null,
+        direction: 'received',
+        dataCategories: 'erp_business_data',
+    },
+    afas_describe_connector: {
+        integration: 'afas_profit',
+        label: 'AFAS Profit',
+        serverFn: () => null,
+        direction: 'received',
+        dataCategories: 'erp_business_data',
+    },
+    afas_query: {
+        integration: 'afas_profit',
+        label: 'AFAS Profit',
+        serverFn: () => null,
+        direction: 'received',
+        dataCategories: 'erp_business_data, hr, finance',
+    },
+
+    // ── NMBRS (read-only payroll/HR) ─────────────────────────
+    // Payroll/HR records are highly sensitive (names, salaries, contracts) —
+    // tag the categories so the egress dashboard and PII scan reflect that.
+    nmbrs_list_debtors: {
+        integration: 'nmbrs', label: 'NMBRS', serverFn: () => null,
+        direction: 'received', dataCategories: 'hr',
+    },
+    nmbrs_list_companies: {
+        integration: 'nmbrs', label: 'NMBRS', serverFn: () => null,
+        direction: 'received', dataCategories: 'hr',
+    },
+    nmbrs_list_employees: {
+        integration: 'nmbrs', label: 'NMBRS', serverFn: () => null,
+        direction: 'received', dataCategories: 'hr, pii',
+    },
+    nmbrs_get_employee: {
+        integration: 'nmbrs', label: 'NMBRS', serverFn: () => null,
+        direction: 'received', dataCategories: 'hr, pii',
+    },
+    nmbrs_list_employee_contracts: {
+        integration: 'nmbrs', label: 'NMBRS', serverFn: () => null,
+        direction: 'received', dataCategories: 'hr, pii',
+    },
+    nmbrs_list_employee_salaries: {
+        integration: 'nmbrs', label: 'NMBRS', serverFn: () => null,
+        direction: 'received', dataCategories: 'hr, payroll, pii',
+    },
+    nmbrs_list_employee_wage_components: {
+        integration: 'nmbrs', label: 'NMBRS', serverFn: () => null,
+        direction: 'received', dataCategories: 'hr, payroll, pii',
+    },
+    nmbrs_list_payslips: {
+        integration: 'nmbrs', label: 'NMBRS', serverFn: () => null,
+        direction: 'received', dataCategories: 'hr, payroll, pii',
     },
 
     // ── Legacy email tools (generic provider) ────────────────

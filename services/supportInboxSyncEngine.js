@@ -245,6 +245,13 @@ async function ingestNormalized(inbox, n) {
     });
     if (!appended) return false; // duplicate (already ingested) — no-op
 
+    // Audit: inbound email entered the conversation (system actor). Fire-and-forget.
+    supportStore.recordAuditEvent({
+        organizationId: inbox.organization_id, inboxId: inbox.id, threadId: thread.id,
+        actorKind: 'system', action: 'email_ingested',
+        payload: { from: n.from, subject: n.subject, isNew, providerMessageId: n.providerMessageId || null },
+    }).catch(() => {});
+
     if (!isNew) {
         // A new inbound message always returns the ticket to the agent queue.
         // If it was resolved/closed, the customer's reply REOPENS it (clear the
@@ -263,8 +270,27 @@ async function ingestNormalized(inbox, n) {
     }
     _emit(isNew ? 'thread_created' : 'thread_updated', inbox.id, { threadId: thread.id });
 
-    // Per-inbox AI responder (fire-and-forget; delivery handled below).
-    triggerAi(inbox, thread).catch(e => console.warn('[SupportInboxSync] AI trigger failed:', e.message));
+    // Per-inbox AI responder (fire-and-forget; delivery handled below). For NEW
+    // threads, first run the optional non-support classifier; if it routes the
+    // ticket out of the inbox and the inbox suppresses auto-reply, skip the AI
+    // entirely. Detached so ingest stays loop-safe and never blocks on the LLM.
+    (async () => {
+        try {
+            if (isNew && inbox.classify_non_support_enabled) {
+                const supportClassifier = require('./supportClassifier');
+                const { filtered } = await supportClassifier.maybeFilterNonSupport(inbox, thread, {
+                    subject: n.subject, body: bodyText, fromAddress: n.from, fromName: n.fromName,
+                });
+                if (filtered) {
+                    _emit('thread_updated', inbox.id, { threadId: thread.id });
+                    if (inbox.classify_suppress_autoreply !== false) return; // don't auto-reply to non-support mail
+                }
+            }
+            await triggerAi(inbox, thread);
+        } catch (e) {
+            console.warn('[SupportInboxSync] AI trigger failed:', e.message);
+        }
+    })();
     return true;
 }
 
@@ -277,6 +303,7 @@ async function triggerAi(inbox, thread) {
         autoresolveThreshold: Number(inbox.autoresolve_threshold) || 0.78,
         v2Enabled: !!inbox.tools_enabled,
         toolsEnabled: !!inbox.tools_enabled,
+        enabledToolIds: Array.isArray(inbox.enabled_tool_ids) ? inbox.enabled_tool_ids : [],
     };
     const result = await runAiAutoResponder(thread.id, { config: cfg });
     _emit('thread_updated', inbox.id, { threadId: thread.id });

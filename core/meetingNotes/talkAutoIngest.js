@@ -48,8 +48,6 @@ async function maybeIngest({ payload, userId = null, orgId = null }) {
     const token = parseTalkRoomToken(ncPath, settings.recordingFolder);
     if (!token) return;
 
-    if (!settings.autoTranscribe) return;
-
     // ── Attribution ──────────────────────────────────────
     // Prefer the mapped event actor; fall back to the org's default owner when
     // the recording was created by a bot/federated actor we can't map.
@@ -59,6 +57,16 @@ async function maybeIngest({ payload, userId = null, orgId = null }) {
         return;
     }
     if (!orgId) orgId = await resolveOrgIdForUser(ownerId);
+
+    // ── Gate ─────────────────────────────────────────────
+    // Transcribe if the folder-level autoTranscribe is on, OR if WE started this
+    // recording via auto-record (an "armed" token) — so auto-record always
+    // produces a note even when autoTranscribe is off.
+    let armed = false;
+    if (!settings.autoTranscribe) {
+        try { armed = await require('./talkAutoRecord').isArmed(ownerId, token); } catch (_) { armed = false; }
+        if (!armed) return;
+    }
 
     // ── Dedup ────────────────────────────────────────────
     const sourceUri = `talk://${token}/${path.basename(ncPath)}`;
@@ -83,6 +91,8 @@ async function maybeIngest({ payload, userId = null, orgId = null }) {
         });
         if (out?.dedup) console.log(`[TalkAutoIngest] already ingested ${sourceUri}`);
         else console.log(`[TalkAutoIngest] created Meeting Note ${out?.id} from ${sourceUri}` + (out?.writeBack ? ` (write-back: ${out.writeBack.ok ? 'ok' : out.writeBack.error})` : ''));
+        // Clear the armed flag now that this room's recording has been ingested.
+        if (armed) { try { await require('./talkAutoRecord').disarmToken(ownerId, token); } catch (_) {} }
     } catch (err) {
         // Surface, don't swallow — but keep it out of the dispatcher's path.
         console.error(`[TalkAutoIngest] ingest failed for ${ncPath} [${err.code || 'error'}]: ${err.message}`);

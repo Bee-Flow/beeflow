@@ -14,9 +14,14 @@ const FormData = require('form-data');
 const https = require('https');
 const http = require('http');
 
+// TLS is verified by default. Self-signed / internal n8n instances must
+// explicitly opt in via N8N_ALLOW_INSECURE_TLS=1 — never disable verification
+// globally, since the n8n API key + workflow payloads travel over this socket.
+const N8N_ALLOW_INSECURE_TLS = process.env.N8N_ALLOW_INSECURE_TLS === '1';
+
 function getAgent(url) {
     if (typeof url === 'string' && url.startsWith('http://')) return new http.Agent();
-    return new https.Agent({ rejectUnauthorized: false });
+    return new https.Agent({ rejectUnauthorized: !N8N_ALLOW_INSECURE_TLS });
 }
 
 // ─── n8n API Client ────────────────────────────────────────────

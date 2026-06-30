@@ -26,7 +26,8 @@ function _escape(s) {
 
 function _shell({ title, intro, body, ctaLabel, ctaUrl, footer }) {
     const clientHost = _clientHost();
-    const logoUrl = `${clientHost}/bee-flow-logo.svg`;
+    // PNG, not SVG: most mail clients (Gmail/Outlook) strip SVG. Served from agent-hub/public/.
+    const logoUrl = `${clientHost}/bee-flow-logo.png`;
     const cta = (ctaLabel && ctaUrl)
         ? `<table width="100%" cellpadding="0" cellspacing="0">
             <tr><td align="center">

@@ -129,6 +129,34 @@ async function checkConnectorSignupAllowed(req) {
     }
 }
 
+// Resolve the locale to use for a new account's transactional emails.
+// Priority: explicit body.locale (validated against configured locales) →
+// org_default_locale → first language of the Accept-Language header → 'en'.
+// Always returns a non-empty string; getEffectiveEmailTemplate falls back to
+// English per field if the locale has no overrides.
+async function resolveSignupLocale(req, explicitLocale) {
+    try {
+        const languageStore = require('../stores/languageStore');
+        const locales = await languageStore.getAvailableLocales();
+        const known = new Set((locales || []).map(l => l && l.code).filter(Boolean));
+
+        const candidate = (explicitLocale ?? req?.body?.locale);
+        if (typeof candidate === 'string' && known.has(candidate)) return candidate;
+
+        const orgDefault = await configStore.getConfig('org_default_locale');
+        if (typeof orgDefault === 'string' && known.has(orgDefault)) return orgDefault;
+
+        const accept = req?.headers?.['accept-language'];
+        if (typeof accept === 'string' && accept.trim()) {
+            const first = accept.split(',')[0].trim().split('-')[0].toLowerCase();
+            if (known.has(first)) return first;
+        }
+    } catch (e) {
+        console.warn('[SignupGuards] resolveSignupLocale failed (falling back to en):', e.message);
+    }
+    return 'en';
+}
+
 module.exports = {
     getSignupAccessConfig,
     evaluateGeo,
@@ -136,5 +164,6 @@ module.exports = {
     clientIp,
     checkWebSignupAllowed,
     checkConnectorSignupAllowed,
+    resolveSignupLocale,
     GEO_MODES,
 };

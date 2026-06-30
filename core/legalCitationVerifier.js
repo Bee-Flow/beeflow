@@ -145,7 +145,12 @@ async function verifyText(text, { notebookId } = {}) {
                     verified: outcome.status === 'verified',
                     verificationMethod: method,
                 });
-            } catch (e) { /* persistence best-effort */ }
+            } catch (e) {
+                // Don't silently swallow: a transient DB error here would leave a
+                // hallucinated (notFound) cite un-flagged in the bronnenlijst,
+                // which is the exact failure this verifier exists to prevent.
+                console.error(`[LegalCitationVerifier] persist failed for ${t.token} (${outcome.status}) in notebook ${notebookId}: ${e.message}`);
+            }
         }
 
         const entry = { token: t.token, kind: outcome.kind || t.kind, status: outcome.status };

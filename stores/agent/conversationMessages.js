@@ -197,12 +197,33 @@ async function migrateConversationIfNeeded(conversationId, type, messagesArray) 
     await initMessagesTable();
     if (!messagesArray || messagesArray.length === 0) return false;
 
+    const parentTable = type === 'direct' ? 'direct_conversations' : 'agent_conversations';
+
     // Check if already migrated
     const existing = await getOne(
         'SELECT id FROM conversation_messages WHERE conversation_id = $1 LIMIT 1',
         [conversationId]
     );
-    if (existing) return false; // already has rows
+    if (existing) {
+        // BFSF-179: heal the stuck messages_migrated flag. The Phase-4
+        // dual-write (replaceMessages) populates this table on every message,
+        // so rows existing here doesn't mean the flag was ever set — leaving
+        // recent conversations permanently flagged unmigrated and excluded
+        // from search Strategy A. Only flip the flag when the table provably
+        // mirrors the blob (exact row-count match); on any mismatch do
+        // nothing and retry on a later read — self-converging, never destructive.
+        const countRow = await getOne(
+            'SELECT COUNT(*)::int AS n FROM conversation_messages WHERE conversation_id = $1',
+            [conversationId]
+        );
+        if (countRow && countRow.n === messagesArray.length) {
+            await run(
+                `UPDATE ${parentTable} SET messages_migrated = TRUE WHERE id = $1`,
+                [conversationId]
+            );
+        }
+        return false; // already has rows
+    }
 
     const rows = messagesToRows(conversationId, type, messagesArray);
 
@@ -210,7 +231,6 @@ async function migrateConversationIfNeeded(conversationId, type, messagesArray) 
     await _bulkInsert(rows, null, 'ON CONFLICT (id) DO NOTHING');
 
     // Mark as migrated on the parent table
-    const parentTable = type === 'direct' ? 'direct_conversations' : 'agent_conversations';
     await run(
         `UPDATE ${parentTable} SET messages_migrated = TRUE WHERE id = $1`,
         [conversationId]

@@ -218,6 +218,26 @@ async function setConfig(key, value) {
 }
 
 /**
+ * Batched plain-config read: one SELECT for many keys. Returns { [key]: value }
+ * with getConfig's JSON-parse semantics; absent keys are simply omitted.
+ * Deliberately BYPASSES the per-key cache in both directions — bulk callers
+ * (e.g. org-wide learning aggregation) would otherwise flush the hot cache with
+ * hundreds of one-shot entries. Not for secrets (no decryption).
+ */
+async function getConfigsByKeys(keys) {
+    const wanted = Array.isArray(keys) ? keys.filter((k) => typeof k === 'string' && k) : [];
+    if (!wanted.length) return {};
+    await initDB();
+    const rows = await getAll('SELECT key, value FROM config WHERE key = ANY($1::text[])', [wanted]);
+    const out = {};
+    for (const row of rows || []) {
+        try { out[row.key] = JSON.parse(row.value); }
+        catch (_) { out[row.key] = row.value; }
+    }
+    return out;
+}
+
+/**
  * Heuristic: extract `{orgId, integration}` from a secret key when it follows
  * one of our known naming conventions. The key set evolves; this is best-
  * effort so the audit entry carries useful context without forcing every
@@ -347,6 +367,14 @@ async function getSecret(key) {
     await initDB();
     const row = await getOne('SELECT value FROM config WHERE key = $1', [key]);
     if (!row || !row.value) {
+        // Dual-read: a legacy per-user key with no `config` row may be backed by
+        // a named integration connection (configStore stays authoritative when a
+        // row IS present). Lazy require breaks the configStore↔connection cycle.
+        // Not cached — a connection's value can change without busting this key.
+        try {
+            const fromConn = await require('./integrationConnectionStore').getLegacySecretValue(key);
+            if (fromConn !== undefined) return fromConn;
+        } catch (_) { /* fall through to null */ }
         _cacheSet(`__secret__${key}`, null);
         return null;
     }
@@ -491,8 +519,18 @@ const SECRET_KEY_PATTERNS = [
     /^smtp_pass/i,
 ];
 
+// Keys that incidentally match a SECRET_KEY_PATTERN (e.g. they contain the
+// substring "_password_") but are NOT secrets — they're policy flags/toggles
+// read via the PLAIN getConfig path (no decryption). Encrypting them would make
+// the reader see a truthy `config-v1` envelope object instead of the real value
+// (e.g. boolean false), silently inverting the setting. Keep them plaintext.
+const SECRET_KEY_EXCEPTIONS = new Set([
+    'require_mfa_for_password_accounts',
+]);
+
 function _looksLikeSecretKey(key) {
     if (!key || typeof key !== 'string') return false;
+    if (SECRET_KEY_EXCEPTIONS.has(key)) return false;
     return SECRET_KEY_PATTERNS.some(re => re.test(key));
 }
 
@@ -553,6 +591,7 @@ console.log('[ConfigStore] Initialized (PostgreSQL)');
 
 module.exports = {
     getConfig,
+    getConfigsByKeys,
     setConfig,
     deleteConfig,
     getAllConfig,

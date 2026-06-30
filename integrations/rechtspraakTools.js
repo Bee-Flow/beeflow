@@ -208,9 +208,17 @@ async function rechtspraakSearch(args) {
     if (subjectUri) qs.set('subject', subjectUri);
     if (creatorUri) qs.set('creator', creatorUri);
     // The feed expects repeated `date=YYYY-MM-DD` params for a range — first
-    // is the from-bound, second is the to-bound (inclusive on both sides).
-    if (args.from) qs.append('date', String(args.from));
-    if (args.to) qs.append('date', String(args.to));
+    // is the from-bound, second is the to-bound (inclusive on both sides). A
+    // SINGLE `date` is treated by the feed as an EXACT day → ~0 hits, so a
+    // one-sided filter (the common "from only" call, which the model almost
+    // always makes) must STILL emit both bounds: pair a missing `from` with an
+    // early floor and a missing `to` with today, turning it into an open-ended
+    // range. Verified against the live feed: from-only returned 0, the paired
+    // range returns the expected hits.
+    if (args.from || args.to) {
+        qs.append('date', String(args.from || '1900-01-01'));
+        qs.append('date', String(args.to || new Date().toISOString().slice(0, 10)));
+    }
 
     const url = `${SEARCH_URL}?${qs.toString()}`;
     let xml;

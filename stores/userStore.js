@@ -174,13 +174,42 @@ async function initDB() {
             payload TEXT,
             sent_at TIMESTAMPTZ DEFAULT NOW(),
             UNIQUE (target_type, target_id, kind)
+        );
+
+        -- Append-only consent ledger. One row per legal document accepted at a
+        -- given moment (signup clickwrap, OAuth pending-signup, invite, re-consent
+        -- or paid-checkout withdrawal waiver). Deliberately has NO uniqueness — the
+        -- full acceptance history IS the legal evidence that discharges the Dutch
+        -- "ter hand stellen" burden of proof (BW 6:233/6:234) and GDPR
+        -- accountability. Mirrors access_audit_log.
+        CREATE TABLE IF NOT EXISTS consent_acceptances (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            email TEXT,
+            account_type TEXT NOT NULL,
+            doc_id TEXT NOT NULL,
+            doc_version INTEGER NOT NULL,
+            doc_sha256 TEXT,
+            method TEXT NOT NULL,
+            route TEXT,
+            ip TEXT,
+            user_agent TEXT,
+            organization_id TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW()
         )
     `);
     try { await exec(`CREATE INDEX IF NOT EXISTS idx_access_audit_log_org_time ON access_audit_log (organization_id, created_at DESC)`); } catch (_) { /* exists */ }
     try { await exec(`CREATE INDEX IF NOT EXISTS idx_access_audit_log_target ON access_audit_log (target_type, target_id, created_at DESC)`); } catch (_) { /* exists */ }
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_consent_acceptances_user ON consent_acceptances (user_id, created_at DESC)`); } catch (_) { /* exists */ }
+    try { await exec(`CREATE INDEX IF NOT EXISTS idx_consent_acceptances_doc ON consent_acceptances (doc_id, doc_version, created_at DESC)`); } catch (_) { /* exists */ }
 
     // ── Column migrations (safe for existing DBs) ─────────────────────────────
     try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'`); } catch (e) { /* column already exists */ }
+    // Cached summary { docId: acceptedVersion } for fast re-consent detection.
+    // The consent_acceptances ledger remains the authoritative legal evidence.
+    try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS "accepted_legal_versions" TEXT DEFAULT '{}'`); } catch (e) { /* column already exists */ }
+    // Optional/marketing consent state { consentId: { granted, version, updatedAt } }.
+    try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS "optional_consents" TEXT DEFAULT '{}'`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS "activeIconPackId" TEXT`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "autoApproveSSO" TEXT DEFAULT '0'`); } catch (e) { /* column already exists */ }
     // Pooled vs per-user AI-usage budget. '1' = org-wide pool (default,
@@ -202,6 +231,33 @@ async function initDB() {
     // these with the allow-list before letting tools/routes through.
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "org_enabled_integrations" TEXT DEFAULT '[]'`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "org_enabled_beta_features" TEXT DEFAULT '[]'`); } catch (e) { /* column already exists */ }
+
+    // ── Unified entitlement grant layer ──
+    // org_granted_capabilities holds the org-wide ("All members") grants for the
+    // CORE and MCP capability kinds (integration/beta grants keep their existing
+    // org_enabled_* columns above). The resolver (server/core/entitlements.js)
+    // intersects these with the plan/license ceiling. Grant-only by design — see
+    // the unified entitlement plan. Backfill seeds the user-facing core toggles
+    // that were implicitly on-for-everyone before this layer existed, so no org
+    // loses access to notebooks/projects/component_designer on first boot.
+    // DEFAULT carries the user-facing core toggles so BOTH existing rows (Postgres
+    // backfills them from the populated default on ADD COLUMN) AND newly-created
+    // orgs grant notebooks/projects/component_designer to all members out of the
+    // box — preserving today's "everyone gets these core features" behaviour. The
+    // UPDATE is a belt-and-suspenders pass for a column that pre-existed at '[]'.
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "org_granted_capabilities" TEXT DEFAULT '["notebooks","projects","component_designer"]'`); } catch (e) { /* column already exists */ }
+    try {
+        await exec(`UPDATE organizations
+            SET "org_granted_capabilities" = '["notebooks","projects","component_designer"]'
+            WHERE "org_granted_capabilities" = '[]' OR "org_granted_capabilities" IS NULL`);
+    } catch (e) { /* non-fatal — backfill retries next boot once the column exists */ }
+
+    // org_available_capabilities = the per-org ACCESS MENU set by the super-admin:
+    // which matrix capabilities (within the plan/license ceiling) this org may use.
+    // It is NOT a grant (it doesn't give anyone the capability) — it's the upper
+    // bound the org-admin distributes within. NULL = no restriction (the org may
+    // use everything its ceiling allows), preserving prior behaviour on upgrade.
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS "org_available_capabilities" TEXT DEFAULT NULL`); } catch (e) { /* column already exists */ }
 
     // One-shot backfill: any org that already has a super-admin allow-list
     // gets that list copied into the new "enabled" column so today's
@@ -232,6 +288,13 @@ async function initDB() {
     // disable specific Nextcloud tools for members of a group. Empty array
     // means "inherit org-wide setting".
     try { await exec(`ALTER TABLE groups ADD COLUMN IF NOT EXISTS "disabled_integrations" TEXT DEFAULT '[]'`); } catch (e) { /* column already exists */ }
+    // Per-group GRANT list (all capability kinds: core/beta/integration/mcp).
+    // The org-admin Access & Permissions matrix writes this; the resolver unions
+    // each user's groups' grants and intersects with the ceiling. Grant-only —
+    // there is no per-group "disable" in the new model. The legacy
+    // disabled_integrations column above is still honoured by the resolver as a
+    // transitional NC opt-out (enable-wins) so existing deployments don't loosen.
+    try { await exec(`ALTER TABLE groups ADD COLUMN IF NOT EXISTS "granted_capabilities" TEXT DEFAULT '[]'`); } catch (e) { /* column already exists */ }
     try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS "azureUserId" TEXT`); } catch (e) { /* column already exists */ }
 
     // ── Nextcloud connector binding (instance ↔ org, NC uid ↔ user) ──
@@ -364,6 +427,36 @@ async function initDB() {
     // after cancelling the first.
     try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS trial_used_at TIMESTAMPTZ`); } catch (e) { }
     try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_used_at TIMESTAMPTZ`); } catch (e) { }
+    // ── Structured billing address ──
+    // The legacy `address` column is reused as line1 (street + number). These
+    // add the remaining structured parts so we can populate the Stripe
+    // Customer's `address` (country is mandatory for Stripe Tax) and pre-fill
+    // checkout + the billing portal.
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS billing_line2 TEXT`); } catch (e) { }
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS billing_postal_code TEXT`); } catch (e) { }
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS billing_city TEXT`); } catch (e) { }
+    try { await exec(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS billing_country TEXT`); } catch (e) { }
+    // ── MFA (TOTP) + self-service password reset ──
+    // mfa_secret is the base32 TOTP secret, encrypted at rest (configStore
+    // envelope). mfa_recovery_codes is a JSON array of bcrypt-hashed one-time
+    // codes. password_reset_token_hash is SHA-256(token); the raw token only
+    // ever lives in the emailed link.
+    try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_enabled BOOLEAN DEFAULT FALSE`); } catch (e) { }
+    try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_secret TEXT`); } catch (e) { }
+    try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_enrolled_at TIMESTAMPTZ`); } catch (e) { }
+    try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_recovery_codes TEXT`); } catch (e) { }
+    try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_recovery_codes_generated_at TIMESTAMPTZ`); } catch (e) { }
+    try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_token_hash TEXT`); } catch (e) { }
+    try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_expires_at TIMESTAMPTZ`); } catch (e) { }
+    // ── Email verification + locale ──
+    // email_verification_token_hash is SHA-256(token); the raw token only ever
+    // lives in the emailed verification link. email_verified_at marks the
+    // confirmation timestamp (null = unverified). preferred_locale is the
+    // language the user picked at signup — used to render transactional emails.
+    try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verification_token_hash TEXT`); } catch (e) { }
+    try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verification_expires_at TIMESTAMPTZ`); } catch (e) { }
+    try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ`); } catch (e) { }
+    try { await exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_locale TEXT`); } catch (e) { }
     // Trial history — email-scoped, all-time. The trial_used_at column on
     // orgs/users is ephemeral (gone when the row is hard-deleted), so a
     // delete-and-recreate with the same email defeats the one-shot gate.
@@ -389,6 +482,11 @@ async function initDB() {
     // applied when the plan is assigned. NULL = unrestricted (legacy plans).
     try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS allowed_integrations TEXT`); } catch (e) { }
     try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS allowed_beta_features TEXT`); } catch (e) { }
+    // DEPRECATED: allowed_mcp_servers — MCP servers are integrations now, so
+    // their `mcp:<id>` ids live in allowed_integrations. Column kept dormant
+    // (no destructive drop); the one-time migration folds any existing values
+    // into allowed_integrations. Not read or written by code anymore.
+    try { await exec(`ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS allowed_mcp_servers TEXT`); } catch (e) { }
     // Pay-as-you-go (PAYG) plans: bill per actual usage with a markup % on
     // top of raw AI provider cost. `billing_model='metered'` swings the
     // plan onto a Stripe Billing Meter price; `markup_percent` applies on
@@ -761,6 +859,23 @@ async function getUserByEmail(email) {
     };
 }
 
+// Look up a user by the SHA-256 hash of a password-reset token. Returns the
+// raw row (callers check password_reset_expires_at). No JSON parsing needed.
+async function getUserByPasswordResetToken(tokenHash) {
+    if (!tokenHash) return null;
+    await initDB();
+    return getOne('SELECT * FROM users WHERE password_reset_token_hash = $1', [tokenHash]);
+}
+
+// Look up a user by the SHA-256 hash of an email-verification token. Returns
+// the raw row (callers check email_verification_expires_at). The raw token
+// only ever lives in the emailed verification link.
+async function getUserByEmailVerificationToken(tokenHash) {
+    if (!tokenHash) return null;
+    await initDB();
+    return getOne('SELECT * FROM users WHERE email_verification_token_hash = $1', [tokenHash]);
+}
+
 async function createUser(userData) {
     await initDB();
     const { id, username, passwordHash, displayName, firstName, lastName, email, phone, avatar, avatarType, role, groups, orgRole, organizationId, ncUid, provider, autoProvisioned } = userData;
@@ -806,11 +921,30 @@ async function deleteUser(userId) {
     console.log(`[UserStore] Cleaning up data for deleted user '${userId}'...`);
     try {
         const configStore = require('./configStore');
+
+        // Learning Center: revoke public certificate verify pages BEFORE
+        // dropping the records — the reverse-lookup index rows are keyed by
+        // token hash and would otherwise keep a deleted user's name publicly
+        // resolvable at /verify/<token> forever.
+        try {
+            const certBlob = await configStore.getConfig(`learning_certificate_user_${userId}`);
+            for (const record of Object.values(certBlob || {})) {
+                if (record?.verifyTokenHash) {
+                    await configStore.deleteConfig(`learning_cert_lookup_${record.verifyTokenHash}`);
+                }
+            }
+        } catch (e) { console.error('[UserStore] Failed to revoke cert lookups:', e.message); }
+
         const configKeys = [
             `fireflies_api_key_user_${userId}`, `youtrack_url_user_${userId}`, `youtrack_token_user_${userId}`,
             `signrequest_subdomain_user_${userId}`, `signrequest_token_user_${userId}`,
             `gamma_api_key_user_${userId}`, `gads_developer_token_user_${userId}`, `gads_manager_id_user_${userId}`,
             `gads_customer_id_user_${userId}`, `enabled_apps_user_${userId}`,
+            // Learning Center (progress blob, exercise ledger, certificates,
+            // intro-tour flags) — contains the user's name on cert records.
+            `learning_progress_user_${userId}`, `learning_exercises_user_${userId}`,
+            `learning_certificate_user_${userId}`, `learning_intro_migrated_user_${userId}`,
+            `has_seen_intro_tour_user_${userId}`,
         ];
         for (const key of configKeys) await configStore.deleteConfig(key);
     } catch (e) { console.error('[UserStore] Failed to clean user config keys:', e.message); }
@@ -880,6 +1014,13 @@ async function updateUser(userId, updates) {
         dekLockoutUntil: 'dekLockoutUntil', opaqueRecord: 'opaqueRecord', kdfMode: 'kdfMode',
         status: 'status', activeIconPackId: 'activeIconPackId', azureUserId: 'azureUserId',
         ncUid: 'nc_uid', provider: 'provider', autoProvisioned: 'auto_provisioned',
+        // MFA (TOTP) + self-service password reset
+        mfaEnabled: 'mfa_enabled', mfaSecret: 'mfa_secret', mfaEnrolledAt: 'mfa_enrolled_at',
+        mfaRecoveryCodes: 'mfa_recovery_codes', mfaRecoveryCodesGeneratedAt: 'mfa_recovery_codes_generated_at',
+        passwordResetTokenHash: 'password_reset_token_hash', passwordResetExpiresAt: 'password_reset_expires_at',
+        // Email verification + locale
+        emailVerificationTokenHash: 'email_verification_token_hash', emailVerificationExpiresAt: 'email_verification_expires_at',
+        emailVerifiedAt: 'email_verified_at', preferredLocale: 'preferred_locale',
     };
 
     for (const [jsKey, dbCol] of Object.entries(colMap)) {
@@ -896,6 +1037,28 @@ async function updateUser(userId, updates) {
         const fullColMap = { ...colMap, groups: 'groups', wrappedDEK: 'wrappedDEK', masterWrappedDEK: 'masterWrappedDEK', recoveryWrappedDEK: 'recoveryWrappedDEK' };
         const q = dynamicUpdate('users', userId, updateMap, fullColMap);
         if (q) await run(q.sql, q.params);
+
+        // Per-seat plans rebill when the active-user count changes. Creation and
+        // deletion already trigger a Stripe seat sync; status transitions
+        // (approve a pending user, SSO activation, NC group activate/deactivate)
+        // funnel through here, so this is the single chokepoint that keeps
+        // billing immediate for those paths too. Only fire when the status
+        // actually crosses the active boundary. Fire-and-forget — a Stripe
+        // outage must never block the user update; the 15-min drift cron is the
+        // backstop. proration_behavior:'create_prorations' charges on increase
+        // and credits on decrease.
+        if (updates.status !== undefined && existing.organizationId) {
+            const wasActive = (existing.status ?? 'active') === 'active';
+            const nowActive = (updates.status ?? existing.status ?? 'active') === 'active';
+            if (wasActive !== nowActive) {
+                Promise.resolve().then(async () => {
+                    try {
+                        const { syncSeatQuantityForOrg } = require('../services/stripeService');
+                        await syncSeatQuantityForOrg(existing.organizationId);
+                    } catch (_) { /* best-effort */ }
+                });
+            }
+        }
         return true;
     } catch (e) { console.error(e); return false; }
 }
@@ -907,6 +1070,12 @@ function parseOrg(o) {
         defaultGroups: parseJSON(o.defaultGroups, []),
         allowSignup: o.allowSignup === '1' || o.allowSignup === true,
         autoApproveSSO: o.autoApproveSSO === '1' || o.autoApproveSSO === true,
+        // Structured billing address (legacy `address` is line1). camelCase
+        // aliases so the frontend reads them the same way as address/kvk/vat.
+        billingLine2: o.billing_line2 || '',
+        billingPostalCode: o.billing_postal_code || '',
+        billingCity: o.billing_city || '',
+        billingCountry: o.billing_country || '',
         // Default '1' = pooled (matches legacy behaviour) when the column
         // is null on rows older than the migration.
         usagePooled: (o.usage_pooled ?? '1') !== '0',
@@ -915,6 +1084,9 @@ function parseOrg(o) {
         ncSyncExcludedGroups: parseJSON(o.nc_sync_excluded_groups, []),
         orgEnabledIntegrations: parseJSON(o.org_enabled_integrations, []),
         orgEnabledBetaFeatures: parseJSON(o.org_enabled_beta_features, []),
+        orgGrantedCapabilities: parseJSON(o.org_granted_capabilities, []),
+        // null = no restriction (org may use everything its ceiling allows).
+        orgAvailableCapabilities: o.org_available_capabilities == null ? null : parseJSON(o.org_available_capabilities, null),
     };
 }
 
@@ -929,6 +1101,15 @@ async function getAllOrganizations() {
     await initDB();
     const rows = await getAll('SELECT * FROM organizations');
     return rows.map(parseOrg);
+}
+
+// Returns the single organisation's id iff EXACTLY one org exists (single-tenant
+// self-hosted), else null. Cheap (no parseOrg, LIMIT 2) — used by the entitlements
+// resolver to bind a no-org global admin to the only org's access ceiling.
+async function getSingleOrgId() {
+    await initDB();
+    const rows = await getAll('SELECT id FROM organizations LIMIT 2');
+    return rows.length === 1 ? rows[0].id : null;
 }
 
 // Find an un-bound organisation that "owns" an email domain, used by the
@@ -989,17 +1170,29 @@ async function createOrganization(orgData) {
         // without ever consulting subscriptions.
         try {
             const subscriptionsEnabled = (process.env.DEPLOYMENT_MODE || 'cloud') === 'cloud';
-            const defaultPlan = subscriptionsEnabled
-                ? await getOne('SELECT id FROM subscription_plans WHERE is_default = TRUE LIMIT 1')
-                : null;
-            if (defaultPlan) {
-                await setOrgSubscription(id, { plan_id: defaultPlan.id, status: 'active' });
-                console.log(`[UserStore] Auto-assigned default plan '${defaultPlan.id}' to new org '${id}'`);
-                // Seed integrations + beta-feature enablement from the plan
-                // so new orgs immediately have the right defaults switched on.
-                try {
-                    await require('../services/planEntitlements').applyPlanToOrg(id, defaultPlan.id, { mode: 'reset' });
-                } catch (e) { console.warn('[UserStore] applyPlanToOrg (default plan) failed:', e.message); }
+            // BFSF-226: resolve the default org plan via the shared helper, which
+            // falls back to the cheapest org plan if the is_default invariant was
+            // lost. This guarantees a new cloud org never lands with no
+            // subscription row (→ getEffectiveLimits null → unlimited access).
+            const defaultPlanId = subscriptionsEnabled ? await getDefaultOrgPlanId() : null;
+            if (defaultPlanId) {
+                const assigned = await setOrgSubscription(id, { plan_id: defaultPlanId, status: 'active' });
+                if (assigned) {
+                    console.log(`[UserStore] Auto-assigned default plan '${defaultPlanId}' to new org '${id}'`);
+                    // Seed integrations + beta-feature enablement from the plan
+                    // so new orgs immediately have the right defaults switched on.
+                    try {
+                        await require('../services/planEntitlements').applyPlanToOrg(id, defaultPlanId, { mode: 'reset' });
+                    } catch (e) { console.warn('[UserStore] applyPlanToOrg (default plan) failed:', e.message); }
+                } else {
+                    // setOrgSubscription returns false (not throws) on DB error, so
+                    // the surrounding try/catch won't fire. Surface it loudly: the
+                    // org has no subscription row and is uncapped until a plan is
+                    // assigned (the exact BFSF-226 failure we're guarding against).
+                    console.error(`[UserStore] FAILED to assign default plan '${defaultPlanId}' to new org '${id}' — org has NO subscription row and is uncapped. Assign a plan via Admin → Subscriptions → Organizations.`);
+                }
+            } else if (subscriptionsEnabled) {
+                console.warn(`[UserStore] No subscription plans exist — new org '${id}' created WITHOUT a plan (unlimited until one is assigned). Run server/seed-plans.js or the default-org-plan migration.`);
             }
         } catch (e) { console.warn('[UserStore] Failed to auto-assign default plan:', e.message); }
         // Fire-and-forget: if a global trial-offer plan is configured for orgs,
@@ -1034,7 +1227,7 @@ async function updateOrganization(orgId, updates) {
     await initDB();
     const ex = await getOne('SELECT id FROM organizations WHERE id = $1', [orgId]);
     if (!ex) return false;
-    const colMap = { name: 'name', description: 'description', tagline: 'tagline', address: 'address', email: 'email', phone: 'phone', website: 'website', kvk: 'kvk', vat: 'vat', logo: 'logo', footerText: 'footerText', authMethod: 'authMethod', connectorCallbackUrl: 'connector_callback_url', ncSyncMode: 'nc_sync_mode', ncNewUserDefaultStatus: 'nc_new_user_default_status', ncLastSyncAt: 'nc_last_sync_at', ncInstanceId: 'nc_instance_id', ncBaseUrl: 'nc_base_url', ncAdminUid: 'nc_admin_uid', ncProvisionedAt: 'nc_provisioned_at', ncOnboardingCompletedAt: 'nc_onboarding_completed_at', deploymentMode: 'deployment_mode', selectedPlanId: 'selected_plan_id', status: 'status' };
+    const colMap = { name: 'name', description: 'description', tagline: 'tagline', address: 'address', billingLine2: 'billing_line2', billingPostalCode: 'billing_postal_code', billingCity: 'billing_city', billingCountry: 'billing_country', email: 'email', phone: 'phone', website: 'website', kvk: 'kvk', vat: 'vat', logo: 'logo', footerText: 'footerText', authMethod: 'authMethod', connectorCallbackUrl: 'connector_callback_url', ncSyncMode: 'nc_sync_mode', ncNewUserDefaultStatus: 'nc_new_user_default_status', ncLastSyncAt: 'nc_last_sync_at', ncInstanceId: 'nc_instance_id', ncBaseUrl: 'nc_base_url', ncAdminUid: 'nc_admin_uid', ncProvisionedAt: 'nc_provisioned_at', ncOnboardingCompletedAt: 'nc_onboarding_completed_at', deploymentMode: 'deployment_mode', selectedPlanId: 'selected_plan_id', status: 'status' };
     const updateMap = {};
     for (const [k, v] of Object.entries(colMap)) { if (updates[k] !== undefined) updateMap[k] = updates[k]; }
     if (updates.defaultGroups !== undefined) updateMap.defaultGroups = JSON.stringify(updates.defaultGroups);
@@ -1088,6 +1281,47 @@ async function setOrgEnabledBetaFeatures(orgId, ids) {
     const { rowCount } = await run(
         'UPDATE organizations SET "org_enabled_beta_features" = $1 WHERE id = $2',
         [JSON.stringify(clean), orgId]
+    );
+    return rowCount > 0;
+}
+
+// Org-wide ("All members") grants for the CORE + MCP capability kinds. The
+// integration/beta everyone-grants live in the org_enabled_* columns above;
+// this column carries the rest so the Access & Permissions matrix has one
+// place to write core/mcp everyone-grants.
+async function getOrgGrantedCapabilities(orgId) {
+    await initDB();
+    const o = await getOne('SELECT "org_granted_capabilities" FROM organizations WHERE id = $1', [orgId]);
+    return parseJSON(o?.org_granted_capabilities, []);
+}
+
+async function setOrgGrantedCapabilities(orgId, ids) {
+    await initDB();
+    const clean = Array.isArray(ids) ? Array.from(new Set(ids.filter(Boolean))) : [];
+    const { rowCount } = await run(
+        'UPDATE organizations SET "org_granted_capabilities" = $1 WHERE id = $2',
+        [JSON.stringify(clean), orgId]
+    );
+    return rowCount > 0;
+}
+
+// Per-org ACCESS MENU (super-admin controlled): which matrix capabilities the
+// org may use, within the plan/license ceiling. Returns null when unrestricted
+// (the org may use everything its ceiling allows). Setting null clears the
+// restriction; setting an array narrows it.
+async function getOrgAvailableCapabilities(orgId) {
+    await initDB();
+    const o = await getOne('SELECT "org_available_capabilities" FROM organizations WHERE id = $1', [orgId]);
+    if (!o || o.org_available_capabilities == null) return null;
+    return parseJSON(o.org_available_capabilities, null);
+}
+
+async function setOrgAvailableCapabilities(orgId, ids) {
+    await initDB();
+    const value = ids == null ? null : JSON.stringify(Array.from(new Set((Array.isArray(ids) ? ids : []).filter(Boolean))));
+    const { rowCount } = await run(
+        'UPDATE organizations SET "org_available_capabilities" = $1 WHERE id = $2',
+        [value, orgId]
     );
     return rowCount > 0;
 }
@@ -1602,6 +1836,7 @@ async function getAllGroups() {
         allowedAgentTypes: parseJSON(g.allowedAgentTypes, []),
         allowedTiers: parseJSON(g.allowedTiers, []),
         disabled_integrations: parseJSON(g.disabled_integrations, []),
+        granted_capabilities: parseJSON(g.granted_capabilities, []),
     }));
 }
 
@@ -1634,7 +1869,8 @@ async function updateGroup(groupId, updates) {
     if (updates.allowedAgentTypes !== undefined) updateMap.allowedAgentTypes = JSON.stringify(updates.allowedAgentTypes);
     if (updates.allowedTiers !== undefined) updateMap.allowedTiers = JSON.stringify(updates.allowedTiers);
     if (updates.disabledIntegrations !== undefined) updateMap.disabledIntegrations = JSON.stringify(updates.disabledIntegrations);
-    const fullColMap = { ...colMap, organizationId: 'organizationId', permissions: 'permissions', roles: 'roles', allowedAgentTypes: 'allowedAgentTypes', allowedTiers: 'allowedTiers', disabledIntegrations: 'disabled_integrations' };
+    if (updates.grantedCapabilities !== undefined) updateMap.grantedCapabilities = JSON.stringify(updates.grantedCapabilities);
+    const fullColMap = { ...colMap, organizationId: 'organizationId', permissions: 'permissions', roles: 'roles', allowedAgentTypes: 'allowedAgentTypes', allowedTiers: 'allowedTiers', disabledIntegrations: 'disabled_integrations', grantedCapabilities: 'granted_capabilities' };
     try {
         const q = dynamicUpdate('groups', groupId, updateMap, fullColMap);
         if (q) await run(q.sql, q.params);
@@ -2025,6 +2261,21 @@ async function setOrgSubscription(orgId, data) {
             if (data.payment_attempt_count !== undefined) updateMap.payment_attempt_count = data.payment_attempt_count;
             if (data.last_payment_failure_at !== undefined) updateMap.last_payment_failure_at = data.last_payment_failure_at;
             if (data.past_due_since !== undefined) updateMap.past_due_since = data.past_due_since;
+            // BFSF-245/249: assigning or changing a plan must re-provision the
+            // org's usage limits. The per-row max_* columns are *overrides* that
+            // getEffectiveLimits prefers over the plan, so stale values left from
+            // a previous (e.g. Free) plan would otherwise cap a paying subscriber
+            // at the old limits (€2 cost cap, 5 agents, 3 KB). When a plan is
+            // (re)assigned and the caller passed no explicit per-org override,
+            // clear the override columns so the newly-assigned plan governs.
+            // Deliberate admin overrides — which pass these fields explicitly, or
+            // edit limits without changing plan_id — are preserved untouched.
+            const LIMIT_OVERRIDE_COLS = ['max_messages_per_month', 'max_messages_by_type', 'max_tokens_per_month', 'max_cost_per_month', 'max_users', 'max_agents', 'max_knowledge_sources'];
+            const callerSetAnyLimit = LIMIT_OVERRIDE_COLS.some(c => data[c] !== undefined);
+            const planIsChanging = data.plan_id !== undefined && data.plan_id !== existing.plan_id;
+            if (planIsChanging && !callerSetAnyLimit) {
+                for (const c of LIMIT_OVERRIDE_COLS) updateMap[c] = null;
+            }
             updateMap.updated_at = now;
             const colMap = { plan_id: 'plan_id', status: 'status', max_messages_per_month: 'max_messages_per_month', max_messages_by_type: 'max_messages_by_type', max_tokens_per_month: 'max_tokens_per_month', max_cost_per_month: 'max_cost_per_month', max_users: 'max_users', max_agents: 'max_agents', max_knowledge_sources: 'max_knowledge_sources', allowed_features: 'allowed_features', allowed_models: 'allowed_models', billing_cycle_start: 'billing_cycle_start', notes: 'notes', trial_end_date: 'trial_end_date', stripe_customer_id: 'stripe_customer_id', stripe_subscription_id: 'stripe_subscription_id', payment_status: 'payment_status', manual_override_until: 'manual_override_until', manual_override_by: 'manual_override_by', stripe_seat_quantity: 'stripe_seat_quantity', cancel_at_period_end: 'cancel_at_period_end', cancel_at: 'cancel_at', current_period_end: 'current_period_end', pending_plan_id: 'pending_plan_id', pending_plan_effective: 'pending_plan_effective', stripe_schedule_id: 'stripe_schedule_id', payment_attempt_count: 'payment_attempt_count', last_payment_failure_at: 'last_payment_failure_at', past_due_since: 'past_due_since', updated_at: 'updated_at' };
             const q = dynamicUpdate('organization_subscriptions', orgId, updateMap, colMap, 'organization_id');
@@ -2114,18 +2365,35 @@ async function getEffectiveLimits(orgId) {
     for (const field of LIMIT_FIELDS) {
         effective[field] = sub[field] !== null && sub[field] !== undefined ? sub[field] : (plan ? plan[field] : null);
     }
-    // Per-seat plans: the org-wide message cap is computed as
-    // per_seat_cap × seat_count. Prefer the Stripe-billed quantity (kept in
-    // sync by the customer.subscription.updated webhook) so the cap matches
-    // the bill even when the local user count drifts; fall back to the live
-    // active-user count if no Stripe quantity is recorded yet.
-    if (plan?.per_seat && plan?.max_messages_per_seat != null) {
+    // Per-seat plans scale limits by the billed seat count. Prefer the
+    // Stripe-billed quantity (kept in sync by the customer.subscription.updated
+    // webhook) so caps match the invoice even when the local user count drifts;
+    // fall back to the live active-user count if no Stripe quantity is recorded.
+    if (plan?.per_seat) {
         const billedSeats = sub.stripe_seat_quantity ?? null;
-        const seats = billedSeats ?? await getActiveSeatCount(orgId);
-        effective.max_messages_per_month = Number(plan.max_messages_per_seat) * Number(seats);
+        const seats = Number(billedSeats ?? await getActiveSeatCount(orgId)) || 1;
         effective.seat_count = seats;
         effective.per_seat = true;
-        effective.max_messages_per_seat = plan.max_messages_per_seat;
+        if (plan.max_messages_per_seat != null) {
+            effective.max_messages_per_month = Number(plan.max_messages_per_seat) * seats;
+            effective.max_messages_per_seat = plan.max_messages_per_seat;
+        }
+    }
+
+    // AI cost cap = the value the License page shows, so enforcement and display
+    // never diverge. Precedence: explicit subscription override > subscription
+    // price (× seats for per-seat plans) > flat plan cap. Customers see this as
+    // "what you pay = how much AI you may consume"; the markup stays internal
+    // (limits.js compares post-markup billed cost against this cap).
+    {
+        const explicitCap = Number(sub.max_cost_per_month);
+        if (Number.isFinite(explicitCap) && explicitCap > 0) {
+            effective.max_cost_per_month = explicitCap;
+        } else if (Number(plan?.price) > 0) {
+            const seats = effective.per_seat ? (Number(effective.seat_count) || 1) : 1;
+            effective.max_cost_per_month = Number(plan.price) * seats;
+        }
+        // else: keep the flat plan.max_cost_per_month set by the LIMIT_FIELDS loop
     }
     const planByType = plan?.max_messages_by_type || {};
     const subByType = sub.max_messages_by_type || {};
@@ -2386,6 +2654,85 @@ async function getAccessAuditLog(opts = {}) {
     return rows.map(r => ({ ...r, old_values: parseJSON(r.old_values, null), new_values: parseJSON(r.new_values, null) }));
 }
 
+// ── Consent ledger ────────────────────────────────────────────────────────
+// Append-only record of legal-document acceptances. Never throws (best-effort,
+// like logAccessAudit) but the consent GATE itself is hard — callers must
+// validate consent BEFORE creating the account and only call this to record it.
+
+async function recordConsentAcceptance(row) {
+    try {
+        await initDB();
+        const id = crypto.randomUUID();
+        await run(
+            `INSERT INTO consent_acceptances
+                (id, user_id, email, account_type, doc_id, doc_version, doc_sha256, method, route, ip, user_agent, organization_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+            [
+                id,
+                row.userId,
+                row.email || null,
+                row.accountType,
+                row.docId,
+                Number(row.docVersion),
+                row.docSha256 || null,
+                row.method,
+                row.route || null,
+                row.ip || null,
+                row.userAgent || null,
+                row.organizationId || null,
+            ]
+        );
+        return id;
+    } catch (e) { console.error('[UserStore] Consent ledger error:', e.message); return null; }
+}
+
+async function getConsentAcceptances(userId, limit = 200) {
+    await initDB();
+    const rows = await getAll(
+        `SELECT * FROM consent_acceptances WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2`,
+        [userId, limit]
+    );
+    return rows;
+}
+
+// Admin-facing ledger view across all users (optionally filtered by doc).
+async function listConsentAcceptances({ docId = null, limit = 100, offset = 0 } = {}) {
+    await initDB();
+    const params = [];
+    let sql = 'SELECT * FROM consent_acceptances';
+    let idx = 1;
+    if (docId) { sql += ` WHERE doc_id = $${idx++}`; params.push(docId); }
+    sql += ` ORDER BY created_at DESC LIMIT $${idx++} OFFSET $${idx++}`;
+    params.push(limit, offset);
+    return await getAll(sql, params);
+}
+
+// Optional (marketing) consents — current state cached on the user row; the
+// consent_acceptances ledger holds the grant/withdraw audit trail.
+async function getOptionalConsents(userId) {
+    await initDB();
+    const row = await getOne(`SELECT optional_consents FROM users WHERE id = $1`, [userId]);
+    return parseJSON(row?.optional_consents, {}) || {};
+}
+
+async function setOptionalConsents(userId, map) {
+    await initDB();
+    await run(`UPDATE users SET optional_consents = $1 WHERE id = $2`, [JSON.stringify(map || {}), userId]);
+}
+
+// Cached { docId: acceptedVersion } summary on the user row — fast re-consent
+// detection without scanning the ledger.
+async function getConsentSummary(userId) {
+    await initDB();
+    const row = await getOne(`SELECT accepted_legal_versions FROM users WHERE id = $1`, [userId]);
+    return parseJSON(row?.accepted_legal_versions, {}) || {};
+}
+
+async function setConsentSummary(userId, map) {
+    await initDB();
+    await run(`UPDATE users SET accepted_legal_versions = $1 WHERE id = $2`, [JSON.stringify(map || {}), userId]);
+}
+
 async function getAuditLog(opts = {}) {
     await initDB();
     const { targetType, targetId, limit = 50, offset = 0 } = opts;
@@ -2633,16 +2980,26 @@ async function expireOverdueTrials() {
     );
     for (const row of orgsExpiring) {
         try {
-            await run(
-                `UPDATE organization_subscriptions
-                    SET status = 'suspended', payment_status = 'trial_expired', updated_at = $2
-                  WHERE organization_id = $1`,
-                [row.organization_id, nowIso]
-            );
-            try { require('./usageStore').invalidatePaygCache(row.organization_id, null); } catch (_) { /* circular-load safe */ }
+            // BFSF-226: an expired no-card trial drops to the capped Free plan
+            // (usable) rather than `suspended` (locked-out). downgradeOrgToFreePlan
+            // invalidates the PAYG cache and audits the transition. The primary
+            // path is the Stripe `subscription.deleted` webhook; this tick is the
+            // backstop for trials stuck in an odd state.
+            const downgraded = await downgradeOrgToFreePlan(row.organization_id, { changedBy: 'system', reason: 'trial_expired' });
+            if (!downgraded) {
+                // No Free plan to fall back to — preserve the prior suspend
+                // behaviour so the org doesn't keep an unlimited trial.
+                await run(
+                    `UPDATE organization_subscriptions
+                        SET status = 'suspended', payment_status = 'trial_expired', updated_at = $2
+                      WHERE organization_id = $1`,
+                    [row.organization_id, nowIso]
+                );
+                try { require('./usageStore').invalidatePaygCache(row.organization_id, null); } catch (_) { /* circular-load safe */ }
+            }
             await logSubscriptionAudit(
                 'trial_expired', 'organization', row.organization_id, 'system', null,
-                { trial_end_date: row.trial_end_date, transitioned_to: 'suspended' }
+                { trial_end_date: row.trial_end_date, transitioned_to: downgraded ? 'free' : 'suspended' }
             );
         } catch (e) {
             console.error('[UserStore] expireOverdueTrials org error:', row.organization_id, e.message);
@@ -2677,6 +3034,87 @@ async function expireOverdueTrials() {
     }
 
     return { orgs: orgsExpiring.length, consumers: consumersExpiring.length };
+}
+
+// ── Default org plan resolution + downgrade-to-Free ──────────────────────────
+// The capped Free org plan is the floor every cloud org falls back to: at
+// signup (createOrganization), when a no-card trial ends without payment, and
+// when a never-paid Stripe subscription is deleted. Centralised here so the
+// lookup + cheapest-plan fallback stay identical across all call sites
+// (BFSF-226). Consumers don't need this — checkConsumerLimits always floors
+// them at the `__consumer_default__` plan regardless of subscription state.
+async function getDefaultOrgPlanId() {
+    await initDB();
+    // Preferred: the operator-designated default org plan.
+    let row = await getOne(
+        `SELECT id FROM subscription_plans
+          WHERE is_default = TRUE AND (plan_type = 'organization' OR plan_type IS NULL)
+          LIMIT 1`
+    );
+    if (row?.id) return row.id;
+    // Fallback: the cheapest org plan, so a new/expired org stays capped even
+    // if the single-default invariant was lost by inconsistent seeding.
+    row = await getOne(
+        `SELECT id FROM subscription_plans
+          WHERE (plan_type = 'organization' OR plan_type IS NULL)
+          ORDER BY price ASC NULLS LAST, created_at ASC
+          LIMIT 1`
+    );
+    return row?.id || null;
+}
+
+/**
+ * Downgrade an org to the capped Free plan (BFSF-226). Used when a no-card
+ * trial expires or a never-paid Stripe subscription is deleted, so the org
+ * lands on a usable, capped plan instead of being left unlimited (no row) or
+ * locked-out (suspended/cancelled).
+ *
+ * Keeps stripe_customer_id so a later upgrade reuses the same customer; clears
+ * the dead subscription/trial/schedule bookkeeping. setOrgSubscription's
+ * plan-change path clears stale per-org limit overrides so the Free plan caps
+ * govern (BFSF-245). Best-effort: returns the resolved subscription, or null
+ * if no default plan exists (logged) so callers can fall back.
+ */
+async function downgradeOrgToFreePlan(orgId, { changedBy = 'system', reason = 'downgrade_to_free' } = {}) {
+    await initDB();
+    const freeId = await getDefaultOrgPlanId();
+    if (!freeId) {
+        console.warn(`[UserStore] downgradeOrgToFreePlan: no default org plan found for org ${orgId} — left unchanged`);
+        return null;
+    }
+    const before = await getOrgSubscription(orgId);
+    // Respect an admin manual-override hold, mirroring the Stripe webhook path's
+    // setOrgSubscriptionRespectingOverride. Return the unchanged row (truthy) so
+    // callers treat it as handled and skip their suspend/cancel fallback rather
+    // than clobbering the admin's pin.
+    if (isManualOverrideActive(before)) {
+        console.log(`[UserStore] downgradeOrgToFreePlan: manual override active for org ${orgId} — skipped`);
+        return before;
+    }
+    const ok = await setOrgSubscription(orgId, {
+        plan_id: freeId,
+        status: 'active',
+        payment_status: null,
+        stripe_subscription_id: null,
+        trial_end_date: null,
+        cancel_at_period_end: false,
+        cancel_at: null,
+        pending_plan_id: null,
+        pending_plan_effective: null,
+        stripe_schedule_id: null,
+    });
+    // setOrgSubscription swallows DB errors and returns false. Surface that as
+    // null so callers fall back (suspend/cancel) instead of logging a phantom
+    // downgrade and leaving stale state.
+    if (!ok) {
+        console.warn(`[UserStore] downgradeOrgToFreePlan: setOrgSubscription failed for org ${orgId}`);
+        return null;
+    }
+    try { await require('../services/planEntitlements').applyPlanToOrg(orgId, freeId, { mode: 'reset' }); }
+    catch (e) { console.warn(`[UserStore] downgradeOrgToFreePlan applyPlanToOrg failed for ${orgId}:`, e.message); }
+    try { require('./usageStore').invalidatePaygCache(orgId, null); } catch (_) { /* circular-load safe */ }
+    await logSubscriptionAudit('downgrade_to_free', 'organization', orgId, changedBy, before, { plan_id: freeId, reason });
+    return await getOrgSubscription(orgId);
 }
 
 // Stripe transitions a subscription from `incomplete` → `incomplete_expired`
@@ -3039,11 +3477,13 @@ async function createUserWithSeatCheck(userData, { strict = true } = {}) {
 }
 
 module.exports = {
-    getAllUsers, getAllUserAvatars, getUser, getUserByEmail, createUser, updateUser, deleteUser,
+    getAllUsers, getAllUserAvatars, getUser, getUserByEmail, getUserByPasswordResetToken, getUserByEmailVerificationToken, createUser, updateUser, deleteUser,
     createUserWithSeatCheck, SeatCapExceededError, PlanInUseError,
-    getAllOrganizations, getOrganization, getOrganizationByNcInstanceId, createOrganization, updateOrganization, deleteOrganization,
+    getAllOrganizations, getSingleOrgId, getOrganization, getOrganizationByNcInstanceId, createOrganization, updateOrganization, deleteOrganization,
     findUnboundOrgByEmailDomain,
     getOrgEnabledIntegrations, setOrgEnabledIntegrations, getOrgEnabledBetaFeatures, setOrgEnabledBetaFeatures,
+    getOrgGrantedCapabilities, setOrgGrantedCapabilities,
+    getOrgAvailableCapabilities, setOrgAvailableCapabilities,
     getUserByNcUid,
     createPendingNcBinding, getPendingNcBinding, getPendingNcBindingForOrg,
     createPendingNcVerification, verifyPendingNcCode, resetNcVerificationCode,
@@ -3060,12 +3500,15 @@ module.exports = {
     getConsumerSubscription, setConsumerSubscription, deleteConsumerSubscription, getAllConsumerSubscriptions,
     getBillingPeriod, logSubscriptionAudit, getAuditLog, getUnresolvedLicenseIssuanceFailures,
     logAccessAudit, getAccessAuditLog, claimNotification,
+    recordConsentAcceptance, getConsentAcceptances, listConsentAcceptances, getConsentSummary, setConsentSummary,
+    getOptionalConsents, setOptionalConsents,
     markTrialUsed, hasOrgUsedTrial, hasUserUsedTrial,
     hasEmailUsedTrial, recordTrialHistory, backfillTrialHistory, backfillAutoProvisionedNcOrgNames,
     recordStripeEventProcessed,
     recordPaymentFailureForOrg, recordPaymentFailureForConsumer,
     resetPaymentFailureForOrg, resetPaymentFailureForConsumer,
     suspendPastDueSubscriptions, expireOverdueTrials, cancelStaleIncompleteSubscriptions,
+    getDefaultOrgPlanId, downgradeOrgToFreePlan,
     findSubscriptionByStripeCustomerId, clearStripeCustomerIdForOrg, clearStripeCustomerIdForConsumer,
     isManualOverrideActive,
     setOrgSubscriptionRespectingOverride, setConsumerSubscriptionRespectingOverride,

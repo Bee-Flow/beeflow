@@ -19,7 +19,9 @@ const notebookChatRoutes = require('./ai/notebookChat');
 const webpageChatRoutes = require('./ai/webpageChat');
 const voiceRoutes = require('./ai/voice');
 const swarmsRoutes = require('./ai/swarms');
-const { requireBetaFeature } = require('../core/betaFeatures');
+const learningRoutes = require('./ai/learning');
+const learningAdminRoutes = require('./ai/learningAdmin');
+const { requireCapability } = require('../core/entitlements');
 
 // Mount all sub-routes
 router.use('/', configRoutes);
@@ -28,35 +30,14 @@ router.use('/', agentChatRoutes);
 router.use('/', directChatRoutes);
 
 router.use('/', templateChatRoutes);
-// Notebook chat feature gate. Mirrors the licence gate on the /api/notebooks*
-// mounts (server/index.js) so notebook chat is also disabled when the org's
-// tier/subscription doesn't grant `notebooks`. The licence check runs first so
-// the SPA gets the actionable `feature_locked` body it already knows how to
-// render; the configStore flag remains an operator kill-switch.
-const license = require('../license');
-const { resolveBestTierForRequest } = require('../license/middleware');
-const notebookChatGate = async (req, res, next) => {
-    if (!req.path.startsWith('/chat/notebook')) return next();
-    if (!req.session?.isAuthenticated) return next(); // let auth middleware reject
-    try {
-        const resolution = await resolveBestTierForRequest(req);
-        if (resolution.error === 'tier_unavailable') {
-            return res.status(503).json({ error: 'tier_unavailable', retry_after: 1 });
-        }
-        const grantedByPlan = await license.orgGrantsFeature(resolution.orgIds, 'notebooks');
-        if (!license.tiers.tierHasFeature(resolution.tier, 'notebooks') && !grantedByPlan) {
-            return res.status(403).json({
-                error: 'feature_locked',
-                feature: 'notebooks',
-                current: resolution.tier,
-                upgrade_url: process.env.LICENSE_UPGRADE_URL || 'https://beeflow.nl/pricing',
-            });
-        }
-    } catch (e) {
-        // Fail closed on a real licence-resolution error rather than silently
-        // granting access (matches requireFeature semantics).
-        return res.status(503).json({ error: 'tier_unavailable', retry_after: 1 });
-    }
+// Notebook chat feature gate. Resolves `notebooks` through the ONE entitlements
+// resolver (requireCapability) — identical to the /api/notebooks* mounts — so
+// notebook chat agrees with them on cloud (subscription) and self-hosted
+// (licence). The capability check runs first so the SPA gets the actionable
+// `feature_locked` body; the configStore flag stays a separate operator
+// kill-switch and runs only after the entitlement passes.
+const notebookCapGate = requireCapability('notebooks');
+const notebookKillSwitch = async (req, res, next) => {
     try {
         const configStore = require('../stores/configStore');
         const enabled = await configStore.getConfig('feature_notebooks_enabled');
@@ -66,23 +47,23 @@ const notebookChatGate = async (req, res, next) => {
     } catch (_) { /* fail open on the operator kill-switch only */ }
     next();
 };
+const notebookChatGate = (req, res, next) => {
+    if (!req.path.startsWith('/chat/notebook')) return next();
+    // requireCapability sends feature_locked/feature_disabled/503 on denial and
+    // calls our continuation only on success → then the operator kill-switch.
+    return notebookCapGate(req, res, () => notebookKillSwitch(req, res, next));
+};
 router.use(notebookChatGate);
 router.use('/', notebookChatRoutes);
 
-// Webpage chat — gated per-organization via the beta-feature registry. Path-
+// Webpage chat — gated through the same `webpages` capability as the
+// /api/webpages mount, so the AI build path and the list/CRUD API can never
+// disagree (the split that made the page render while its API 403'd). Path-
 // scoped so the gate only fires on /chat/webpage/* and not on the rest of /ai.
-const { userHasBetaFeature: userHasWebpagesBeta } = require('../core/betaFeatures');
-const webpageChatGate = async (req, res, next) => {
+const webpageCapGate = requireCapability('webpages');
+const webpageChatGate = (req, res, next) => {
     if (!req.path.startsWith('/chat/webpage')) return next();
-    if (!req.session?.user) return res.status(401).json({ error: 'Not authenticated' });
-    try {
-        if (await userHasWebpagesBeta(req.session.user.id, 'webpages', req.session)) {
-            return next();
-        }
-        return res.status(403).json({ error: "Beta feature 'webpages' is not enabled for your organization" });
-    } catch (_) {
-        return res.status(403).json({ error: "Beta feature 'webpages' is not enabled for your organization" });
-    }
+    return webpageCapGate(req, res, next);
 };
 router.use(webpageChatGate);
 router.use('/', webpageChatRoutes);
@@ -90,11 +71,23 @@ router.use('/', webpageChatRoutes);
 // Voice Chat (Beta) — gated on org-level beta feature flag.
 // Further gated on a configured Mistral API key by the voice router itself.
 // Mounted at /voice so the beta gate only affects /ai/voice/* requests.
-router.use('/voice', requireBetaFeature('voice_chat'), voiceRoutes);
+router.use('/voice', requireCapability('voice_chat'), voiceRoutes);
 
 // Swarm Agents (Beta) — gated on org-level beta feature flag. The discovery
 // endpoint also returns [] when the gate is disabled, so the sidebar simply
 // hides the "Swarms" section for non-eligible users.
-router.use('/swarms', requireBetaFeature('swarm'), swarmsRoutes);
+router.use('/swarms', requireCapability('swarm'), swarmsRoutes);
+
+// Academy Custom Courses (Beta) — org-admin authoring CRUD + publish. Must be
+// mounted BEFORE '/learning': router.use('/learning') also matches
+// '/learning/admin/*' paths, so with the other order the learning_center gate
+// and router would intercept admin requests first. Org-admin auth is enforced
+// inside the router (requirePrimaryOrgAdmin).
+router.use('/learning/admin', requireCapability('learning_custom_content'), learningAdminRoutes);
+
+// Learning Center — AI coach (grade/hint), achievements + certificate issuance.
+// Gated on the `learning_center` capability so it can be enabled/disabled per
+// subscription plan. Auth + rate limiting are enforced inside the router.
+router.use('/learning', requireCapability('learning_center'), learningRoutes);
 
 module.exports = router;

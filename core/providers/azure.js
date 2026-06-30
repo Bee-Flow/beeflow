@@ -12,12 +12,10 @@
  *   - endpoint: Azure OpenAI resource URL (e.g. https://resource.openai.azure.com/)
  *   - apiKey: Azure API key
  *   - apiVersion: API version. Defaults to a recent dated preview
- *     (2025-04-01-preview) that the installed `openai` SDK (v4.x) supports on
- *     the dated Azure surface (`/openai/responses`, `/openai/deployments/...`).
- *     The v1 GA surface ('preview' → `/openai/v1/...`) is recognised by the
- *     gate below but requires openai-node v5.x to route correctly; until that
- *     upgrade, prefer the dated value. A dated version can be pinned per
- *     provider for back-compat.
+ *     (2025-04-01-preview) on the dated Azure surface (`/openai/responses`,
+ *     `/openai/deployments/...`). openai-node v5+ also routes the v1 GA surface
+ *     ('preview' → `/openai/v1/...`); we keep the dated default for back-compat
+ *     and can switch to 'preview' (globally or per provider) when desired.
  *   - deployment: The deployment name (same as model name for Azure)
  *
  * Responses API support:
@@ -35,9 +33,9 @@
 
 const OpenAIProvider = require('./openai');
 
-// Default api-version. Dated preview that the installed openai SDK (v4.x)
-// supports on the dated Azure surface. Switch to 'preview' once openai-node
-// v5.x (with native /openai/v1/ routing) is adopted.
+// Default api-version on the dated Azure surface. openai-node v5+ can also
+// route the v1 GA surface via apiVersion 'preview' (/openai/v1/...); kept dated
+// here for back-compat — switch to 'preview' to adopt v1 GA.
 const DEFAULT_API_VERSION = '2025-04-01-preview';
 // Oldest dated api-version that supports the Responses API.
 const RESPONSES_API_MIN_VERSION = '2025-03-01';

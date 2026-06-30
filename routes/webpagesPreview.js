@@ -47,6 +47,8 @@ const { searchWebpageKB } = require('../core/webpageKnowledgeSearch');
 const usageStore = require('../stores/usageStore');
 const { executeTool } = require('../core/toolDispatcher');
 const { findOwnerOfTool, loadTools, TOOL_REGISTRY } = require('../automation/toolRegistry');
+const { resolveRuntime } = require('../integrations/webpageFramework');
+const { executeApiHandler } = require('../integrations/webpageApiRuntime');
 const { getProviderForModel } = require('../core/aiAgent');
 const { getAdapter } = require('../core/providers');
 
@@ -127,6 +129,46 @@ router.get('/:id/db/schema', requirePreviewToken, async (req, res) => {
         res.json(schema);
     } catch (err) {
         res.status(400).json({ error: err.message });
+    }
+});
+
+// ── Light-tier backend: api/<route>.js handlers ──────────────────────
+//
+// The page calls /api/webpages-preview/:id/app/<route>; we run the matching
+// api/<route>.js handler in an isolated-vm sandbox (acts-as-author). Only the
+// light runtime tier uses this — the full tier proxies /app/* to the project's
+// Node container instead (see the runtime manager).
+router.all('/:id/app/*rest', requirePreviewToken, async (req, res) => {
+    const { webpageId } = req.previewClaims;
+    try {
+        const rest = req.params.rest;
+        const route = Array.isArray(rest) ? rest.join('/') : (rest || '');
+
+        // Gate to the light tier — the full tier serves its own backend.
+        const wp = await webpageStore.getWebpageRaw(webpageId);
+        if (resolveRuntime(wp) === 'full') {
+            return res.status(409).json({ error: 'This project uses the full runtime tier; its backend runs in the project container.' });
+        }
+
+        const out = await executeApiHandler({
+            webpageId,
+            route,
+            req: {
+                method: req.method,
+                path: route,
+                query: req.query || {},
+                body: (req.body && typeof req.body === 'object') ? req.body : {},
+            },
+        });
+        if (out.headers) {
+            for (const [k, v] of Object.entries(out.headers)) {
+                try { res.setHeader(k, v); } catch (_) { /* ignore bad header */ }
+            }
+        }
+        res.status(out.status || 200).json(out.body);
+    } catch (err) {
+        console.error('[WebpagesPreview] api handler failed:', err);
+        res.status(500).json({ error: 'Handler execution failed' });
     }
 });
 

@@ -53,6 +53,28 @@ function requireAuth(req, res, next) {
     res.status(401).json({ error: 'Unauthorized' });
 }
 
+// Re-snapshot every active public share for a webpage so published pages
+// reflect the latest content. Fire-and-forget — never blocks the response.
+// Originally only the primary-slot save (PUT /:id) triggered this, but a
+// react-mui app lives ENTIRELY in extra files, so it must also run on
+// extra-file edits or react shares would render the version captured at share
+// creation forever. `ownerId` is the page owner (all callers here are
+// owner-only mutations).
+function reSnapshotWebpageShares(webpageId, ownerId) {
+    (async () => {
+        try {
+            const shares = await publicShareStore.listSharesForWebpage(webpageId, ownerId);
+            for (const sh of (shares || [])) {
+                if (sh.revokedAt) continue;
+                await webpageSnapshot.writeSnapshot({ shareId: sh.id, webpageId, ownerId })
+                    .catch(e => console.warn(`[Webpages] re-snapshot failed for share ${sh.id}:`, e.message));
+            }
+        } catch (e) {
+            console.warn('[Webpages] re-snapshot enumeration failed:', e.message);
+        }
+    })();
+}
+
 // Access control: the beta-feature gate at server/index.js (`requireBetaFeature('webpages')`)
 // is the single source of truth. The previous `requirePermission('use_webpages')` here was
 // redundant and blocked org members who had the beta enabled but not the legacy permission.
@@ -65,8 +87,16 @@ router.use(requireActiveOrgForMutations());
 router.post('/', requireAuth, async (req, res) => {
     try {
         const userId = req.session.user.id;
-        const { name, description, instructions } = req.body;
-        const webpage = await webpageStore.createWebpage({ userId, name, description, instructions });
+        const { name, description, instructions, framework, runtime } = req.body;
+        // Record the framework + runtime tier in settings so the chat handler and
+        // preview pipeline know how to build this project. Absent/invalid values
+        // fall back to the safe defaults (vanilla/light) — see webpageFramework.js.
+        const { FRAMEWORKS, RUNTIMES, DEFAULT_NEW_FRAMEWORK, DEFAULT_RUNTIME } = require('../integrations/webpageFramework');
+        const settings = {
+            framework: FRAMEWORKS.includes(framework) ? framework : DEFAULT_NEW_FRAMEWORK,
+            runtime: RUNTIMES.includes(runtime) ? runtime : DEFAULT_RUNTIME,
+        };
+        const webpage = await webpageStore.createWebpage({ userId, name, description, instructions, settings });
         res.json({ success: true, webpage });
     } catch (err) {
         console.error('[Webpages] Create failed:', err);
@@ -186,18 +216,7 @@ router.put('/:id', requireAuth, async (req, res) => {
         // creation, so recipients saw the stale version until they cleared their
         // browser cache (BFSF-190). Fire-and-forget — never blocks the save.
         if (Object.keys(slotUpdates).length > 0) {
-            (async () => {
-                try {
-                    const shares = await publicShareStore.listSharesForWebpage(id, userId);
-                    for (const sh of (shares || [])) {
-                        if (sh.revokedAt) continue;
-                        await webpageSnapshot.writeSnapshot({ shareId: sh.id, webpageId: id, ownerId: userId })
-                            .catch(e => console.warn(`[Webpages] re-snapshot failed for share ${sh.id}:`, e.message));
-                    }
-                } catch (e) {
-                    console.warn('[Webpages] re-snapshot enumeration failed:', e.message);
-                }
-            })();
+            reSnapshotWebpageShares(id, userId);
         }
 
         const ok = await webpageStore.updateWebpageMetadata(id, userId, metadataUpdate);
@@ -262,6 +281,14 @@ router.patch('/:id/publish', requireAuth, async (req, res) => {
         }
 
         const { isPublished, sharedGroups } = req.body || {};
+
+        // NOTE: React + Material UI pages ARE publishable to an org/group. That
+        // audience views the page as authenticated users through the same
+        // framework-aware, sandboxed preview the owner uses (WebpagePreview →
+        // buildWebpagePreview), which bundles + runs the React app. The JS-
+        // stripping that would blank a React page applies ONLY to the anonymous
+        // `/share/:token` snapshot (webpageSnapshot.writeSnapshot omits JS by
+        // design) — a separate, opt-in external-share flow, not this publish.
 
         // Stamp organization_id on first publish. When publishing to specific
         // groups, derive the org from THOSE groups — not from the owner's
@@ -382,7 +409,18 @@ router.get('/:id/public-shares', requireAuth, async (req, res) => {
         const shares = await publicShareStore.listSharesForWebpage(req.params.id, isOwner ? userId : null);
         // Don't leak the owner's recipient allow-list to other org members.
         const safeShares = isOwner ? shares : shares.map(({ allowedEmails, ...rest }) => rest);
-        res.json({ shares: safeShares });
+        // Attach the share URL where the raw token is recoverable (encrypted
+        // at rest, BFSF-188). Legacy/revoked/expired shares get url: null —
+        // findByToken independently rejects dead tokens at view time anyway.
+        const tokens = await publicShareStore.getRetrievableTokens(req.params.id);
+        const now = Date.now();
+        const withUrls = safeShares.map(s => ({
+            ...s,
+            url: (tokens[s.id] && !s.revokedAt && !(s.expiresAt && new Date(s.expiresAt).getTime() < now))
+                ? buildShareUrl(req, tokens[s.id])
+                : null,
+        }));
+        res.json({ shares: withUrls });
     } catch (err) {
         console.error('[Webpages] List public shares failed:', err);
         res.status(500).json({ error: 'Failed to list public shares' });
@@ -521,14 +559,26 @@ router.delete('/:id/public-shares/:shareId', requireAuth, async (req, res) => {
 router.get('/:id/files', requireAuth, async (req, res) => {
     try {
         const userId = req.session.user.id;
-        const wp = await webpageStore.getWebpage(req.params.id, userId);
+        // Owner OR org/group-published reader — same visibility as GET /:id, so
+        // shared-page viewers can load the React src/ files their preview needs.
+        let wp = await webpageStore.getWebpage(req.params.id, userId);
+        if (!wp) {
+            const raw = await webpageStore.getWebpageRaw(req.params.id);
+            const { orgIds, userGroups } = await resolveAudienceContext(req);
+            const orgIdArr = orgIds instanceof Set ? [...orgIds] : (Array.isArray(orgIds) ? orgIds : []);
+            if (raw && webpageStore.canReadWebpage(raw, userId, userGroups, orgIdArr)) {
+                wp = raw;
+            }
+        }
         if (!wp) return res.status(404).json({ error: 'Webpage not found' });
+        // Extra-file bytes live under the OWNER's RustFS prefix, not the caller's.
+        const ownerId = wp.userId;
         const path = req.query.path;
         if (!path) {
             const list = await webpageStore.listExtraFiles(req.params.id);
             return res.json({ files: list });
         }
-        const file = await webpageStore.readExtraFile({ webpageId: req.params.id, userId, path });
+        const file = await webpageStore.readExtraFile({ webpageId: req.params.id, userId: ownerId, path });
         if (!file) return res.status(404).json({ error: 'File not found' });
         if (file.meta.isText) {
             return res.json({ meta: file.meta, content: file.text });
@@ -558,6 +608,8 @@ router.put('/:id/files', requireAuth, async (req, res) => {
             path: path.trim(),
             content,
         });
+        // React-mui apps live in extra files, so refresh public-share snapshots.
+        reSnapshotWebpageShares(req.params.id, userId);
         res.json({ file });
     } catch (err) {
         // upsertExtraFile validates the path and surfaces clear messages
@@ -579,10 +631,77 @@ router.delete('/:id/files', requireAuth, async (req, res) => {
         if (typeof path !== 'string' || !path.trim()) return res.status(400).json({ error: 'path is required' });
         const ok = await webpageStore.deleteExtraFile({ webpageId: req.params.id, userId, path: path.trim() });
         if (!ok) return res.status(404).json({ error: 'File not found' });
+        reSnapshotWebpageShares(req.params.id, userId);
         res.json({ success: true });
     } catch (err) {
         console.error('[Webpages] Delete extra file failed:', err);
         res.status(500).json({ error: 'Failed to delete file' });
+    }
+});
+
+// Upload a BINARY asset (image, font, audio, …) as an extra file. Multipart so
+// raw bytes never round-trip through JSON/base64 in the request. Owner-only.
+// Returns the file meta + base64 content so the client can build a data: URL
+// for the preview without a follow-up GET. The store derives the MIME from the
+// path extension and stores it as a binary (is_text=false) extra.
+router.post('/:id/assets', requireAuth, upload.single('file'), async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const wp = await webpageStore.getWebpage(req.params.id, userId);
+        if (!wp) return res.status(404).json({ error: 'Webpage not found' });
+        if (wp.userId !== userId) return res.status(403).json({ error: 'Read-only' });
+        if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+        const path = (req.body?.path || '').trim();
+        if (!path) return res.status(400).json({ error: 'path is required' });
+        const file = await webpageStore.upsertBinaryExtraFile({
+            webpageId: req.params.id,
+            userId,
+            path,
+            buffer: req.file.buffer,
+            mimeType: req.file.mimetype,
+        });
+        // Binary assets are inlined into the react bundle, so refresh snapshots.
+        reSnapshotWebpageShares(req.params.id, userId);
+        res.json({ file, contentBase64: req.file.buffer.toString('base64') });
+    } catch (err) {
+        const status = /(primary slot|relative|may not|contains|too long|required|empty|segment)/i.test(err.message) ? 400 : 500;
+        if (status === 500) console.error('[Webpages] Asset upload failed:', err);
+        res.status(status).json({ error: err.message || 'Failed to upload asset' });
+    }
+});
+
+// Move/rename an extra file server-side (text OR binary) without round-tripping
+// bytes through the client. Owner-only. Reads the source, writes it at the new
+// path, then deletes the source.
+router.post('/:id/assets/move', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const wp = await webpageStore.getWebpage(req.params.id, userId);
+        if (!wp) return res.status(404).json({ error: 'Webpage not found' });
+        if (wp.userId !== userId) return res.status(403).json({ error: 'Read-only' });
+        const from = (req.body?.from || '').trim();
+        const to = (req.body?.to || '').trim();
+        if (!from || !to) return res.status(400).json({ error: 'from and to are required' });
+        if (from === to) return res.status(400).json({ error: 'from and to are identical' });
+        const existingDest = await webpageStore.getExtraFile(req.params.id, to);
+        if (existingDest) return res.status(409).json({ error: `A file already exists at "${to}"` });
+        const src = await webpageStore.readExtraFile({ webpageId: req.params.id, userId, path: from });
+        if (!src) return res.status(404).json({ error: 'Source file not found' });
+        let file;
+        if (src.meta.isText) {
+            file = await webpageStore.upsertExtraFile({ webpageId: req.params.id, userId, path: to, content: src.text });
+        } else {
+            file = await webpageStore.upsertBinaryExtraFile({
+                webpageId: req.params.id, userId, path: to, buffer: src.bytes, mimeType: src.meta.mimeType,
+            });
+        }
+        await webpageStore.deleteExtraFile({ webpageId: req.params.id, userId, path: from });
+        reSnapshotWebpageShares(req.params.id, userId);
+        res.json({ file });
+    } catch (err) {
+        const status = /(primary slot|relative|may not|contains|too long|required|empty|segment)/i.test(err.message) ? 400 : 500;
+        if (status === 500) console.error('[Webpages] Asset move failed:', err);
+        res.status(status).json({ error: err.message || 'Failed to move file' });
     }
 });
 
@@ -597,9 +716,23 @@ router.delete('/:id/files', requireAuth, async (req, res) => {
 router.post('/:id/preview-token', requireAuth, async (req, res) => {
     try {
         const userId = req.session.user.id;
-        const wp = await webpageStore.getWebpage(req.params.id, userId);
+        // Owner OR org/group-published reader — same visibility as GET /:id, so
+        // shared-page viewers get a token and their React preview can call the
+        // bridges (without it, dbToken=null and the preview renders blank).
+        let wp = await webpageStore.getWebpage(req.params.id, userId);
+        if (!wp) {
+            const raw = await webpageStore.getWebpageRaw(req.params.id);
+            const { orgIds, userGroups } = await resolveAudienceContext(req);
+            const orgIdArr = orgIds instanceof Set ? [...orgIds] : (Array.isArray(orgIds) ? orgIds : []);
+            if (raw && webpageStore.canReadWebpage(raw, userId, userGroups, orgIdArr)) {
+                wp = raw;
+            }
+        }
         if (!wp) return res.status(404).json({ error: 'Webpage not found' });
-        const { token, expiresAt } = issuePreviewToken({ userId, webpageId: wp.id });
+        // Scope the token to the page OWNER so all authorized viewers read/write
+        // the SAME per-page database (webpageDbStore keys by the token's userId).
+        // AI/automations/integrations already act as the author independently.
+        const { token, expiresAt } = issuePreviewToken({ userId: wp.userId, webpageId: wp.id });
         res.json({ token, expiresAt, webpageId: wp.id });
     } catch (err) {
         console.error('[Webpages] Preview token failed:', err);

@@ -1,25 +1,29 @@
 /**
- * Agent Test Driver — Claude drives Playwright step-by-step.
+ * Agent Test Driver — an LLM drives Playwright step-by-step.
  *
  * The user picks a YouTrack issue, GitHub issue/PR, or pastes a spec; the
  * worker resolves the source body and hands it to runAgentMode() as the
- * instruction. We then run an Anthropic tool-use loop: Claude emits one
- * pw_* tool call at a time, we execute it against a live Chromium page,
- * stream a JPEG frame + structured action log over SSE, and feed the
- * tool_result back into the next turn.
+ * instruction. We then run a provider-agnostic tool-use loop through the
+ * unified adapter layer (core/providers): the model the "thinking" tier
+ * resolves to — Claude, Mistral/Devstral, OpenAI, Google, whatever serves it —
+ * emits one pw_* tool call at a time, we execute it against a live Chromium
+ * page, stream a JPEG frame + structured action log over SSE, and feed the
+ * tool result back into the next turn. The loop speaks the OpenAI tool-calling
+ * shape; each adapter translates to its own wire format, so there is no
+ * Claude-only gate.
  *
- * The loop ends when Claude calls `pw_done`, when MAX_STEPS is reached,
+ * The loop ends when the model calls `pw_done`, when MAX_STEPS is reached,
  * or when the worker is timed out by the parent.
  *
- * No new npm deps — uses the @anthropic-ai/sdk we already ship and the
- * existing `playwright` package (already installed via Dockerfile).
+ * No new npm deps — the unified adapter layer (and the @anthropic-ai/sdk it
+ * wraps for the Claude path) plus the existing `playwright` package already
+ * ship with the app.
  */
 
 const fs = require('fs');
 const path = require('path');
 
 const testRunStore = require('../stores/testRunStore');
-const configStore = require('../stores/configStore');
 const { resolveModelForTier } = require('../core/modelResolver');
 
 const EXPLORER_PROMPT_PATH = path.join(__dirname, '..', 'prompts', 'test-explorer-prompt.md');
@@ -112,6 +116,23 @@ const TOOLS = [
         },
     },
 ];
+
+// Convert the Anthropic-style TOOLS schema (name/description/input_schema) to
+// the provider-agnostic OpenAI function-calling shape the unified adapter layer
+// expects. The Claude adapter converts it back to input_schema internally;
+// OpenAI/Mistral/Google use it as-is. Derived from TOOLS so the schema stays a
+// single source of truth (and the test keeps asserting on TOOLS).
+function _toUnifiedTools(tools) {
+    return (Array.isArray(tools) ? tools : []).map((t) => ({
+        type: 'function',
+        function: {
+            name: t.name,
+            description: t.description || '',
+            parameters: t.input_schema || { type: 'object', properties: {} },
+        },
+    }));
+}
+const UNIFIED_TOOLS = _toUnifiedTools(TOOLS);
 
 // ── Tool dispatcher ──────────────────────────────────────────────
 
@@ -285,29 +306,42 @@ async function runAgentMode({ runId, targetUrl, instructions, userId, organizati
     try { playwright = require('playwright'); }
     catch (_) { return { status: 'error', error: 'playwright_not_installed' }; }
 
-    let Anthropic;
-    try { Anthropic = require('@anthropic-ai/sdk'); }
-    catch (_) { return { status: 'error', error: 'anthropic_sdk_not_installed' }; }
+    // Resolve the configured "thinking" tier to a concrete model, then route it
+    // to whichever provider actually serves it (Claude, Mistral/Devstral, OpenAI,
+    // Google, …) through the unified adapter layer. The loop below is provider-
+    // agnostic: it speaks the OpenAI tool-calling shape and each adapter
+    // translates to its own wire format (the Claude adapter converts the
+    // tool_calls ⇆ tool_use blocks internally), so the model the tier points at
+    // is the model that drives the browser — no Claude-only gate.
+    const { getAdapter } = require('../core/providers');
+    const { getProviderForModel } = require('../core/aiAgent');
 
-    const apiKey = await configStore.getSecret('claude_api_key').catch(() => null);
-    if (!apiKey) {
+    const resolved = await resolveModelForTier('tier:thinking', { userOrgId: organizationId, userId });
+    let modelId = resolved || FALLBACK_MODEL;
+    let provider = null;
+    try {
+        provider = await getProviderForModel(modelId);
+    } catch (e) {
+        // The tier points at a model no configured provider serves — fall back to
+        // the known-good Claude model rather than failing the run.
+        await testRunStore.appendProgress(runId, `[agent] model "${modelId}" is not served by any configured provider — falling back to ${FALLBACK_MODEL}`);
+        modelId = FALLBACK_MODEL;
+        try { provider = await getProviderForModel(modelId); }
+        catch (_) {
+            return {
+                status: 'error',
+                error: 'no_provider_for_model: Agent mode needs a configured model provider. Set one under Admin → AI Config.',
+            };
+        }
+    }
+    if (!provider || (!provider.apiKey && !provider.serviceAccountKey)) {
         return {
             status: 'error',
-            error: 'claude_api_key_not_configured: Agent mode requires the Anthropic Claude API key. Set it under Admin → AI Config.',
+            error: 'provider_api_key_not_configured: Agent mode requires a model provider with credentials. Set one under Admin → AI Config.',
         };
     }
-
-    // The agent loop uses the Anthropic SDK directly, which only speaks to
-    // Claude models — if the configured tier resolves to OpenAI / Gemini /
-    // anything else, the SDK will either 404 or return non-tool-use output
-    // and the loop silently does nothing. Validate and fall back.
-    const resolved = await resolveModelForTier('tier:thinking', { userOrgId: organizationId, userId });
-    const isClaude = (m) => typeof m === 'string' && /^claude/i.test(m);
-    const modelId = isClaude(resolved) ? resolved : FALLBACK_MODEL;
-    if (resolved && !isClaude(resolved)) {
-        await testRunStore.appendProgress(runId, `[agent] tier:thinking resolved to "${resolved}" which is not a Claude model — falling back to ${FALLBACK_MODEL}`);
-    }
-    const client = new Anthropic({ apiKey });
+    const adapter = getAdapter(provider.providerType, provider.url);
+    await testRunStore.appendProgress(runId, `[agent] using model ${modelId} via ${provider.providerName || provider.providerType || 'provider'}`);
     const findings = [];
     const stepLog = [];
     let browser, ctx, page;
@@ -322,19 +356,20 @@ async function runAgentMode({ runId, targetUrl, instructions, userId, organizati
     };
 
     try {
-        // When a cdpEndpoint is supplied the browser runs inside an isolated
-        // runner container and we drive it remotely — the untrusted target site
-        // never touches this process. Falls back to a local launch only on
-        // host-mode deployments (no docker socket).
+        // When a cdpEndpoint is supplied the browser runs inside a per-run
+        // isolated runner container and we drive it remotely — the untrusted
+        // target site never touches this process. Host mode falls back to the
+        // shared singleton browser (also remote, never in-process).
         if (cdpEndpoint) {
             browser = await playwright.chromium.connect(cdpEndpoint);
+            ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
         } else {
-            browser = await playwright.chromium.launch({
-                headless: true,
-                args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-            });
+            // Host fallback: no Chromium is baked into the image, so drive the
+            // shared singleton browser. Only the context is ours to close — the
+            // shared browser/connection is owned by browserProvider.
+            const browserProvider = require('./browserProvider');
+            ctx = await browserProvider.newSharedContext({ viewport: { width: 1280, height: 800 } });
         }
-        ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
 
         // Block cross-origin navigation requests defensively at the network
         // layer — the per-tool guard catches pw_navigate, this catches the
@@ -389,7 +424,12 @@ async function runAgentMode({ runId, targetUrl, instructions, userId, organizati
             ? Object.keys(credentials).filter(k => typeof credentials[k] === 'string' && credentials[k].length > 0).map(k => k.toUpperCase())
             : [];
         const userMessage = _buildSeedMessage({ targetUrl, instructions, sourceMeta, availablePlaceholders });
-        const messages = [{ role: 'user', content: userMessage }];
+        // OpenAI-style history: a leading system message (the Claude adapter
+        // extracts it into the `system` param; OpenAI/Mistral pass it through)
+        // plus the seed user turn.
+        const messages = [];
+        if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+        messages.push({ role: 'user', content: userMessage });
 
         let stopReason = null;
         let stepCount = 0;
@@ -405,12 +445,10 @@ async function runAgentMode({ runId, targetUrl, instructions, userId, organizati
             stepCount += 1;
             let response;
             try {
-                response = await client.messages.create({
-                    model: modelId,
-                    max_tokens: 4096,
-                    system: systemPrompt,
-                    tools: TOOLS,
-                    messages,
+                response = await adapter.chat(provider.apiKey, provider.url, modelId, messages, {
+                    maxTokens: 4096,
+                    tools: UNIFIED_TOOLS,
+                    toolChoice: 'auto',
                 });
             } catch (e) {
                 await testRunStore.appendProgress(runId, `[agent] llm error: ${e.message}`);
@@ -424,14 +462,37 @@ async function runAgentMode({ runId, targetUrl, instructions, userId, organizati
                 break;
             }
 
-            stopReason = response.stop_reason;
-            messages.push({ role: 'assistant', content: response.content });
+            stopReason = response.stopReason ?? response.raw?.choices?.[0]?.finish_reason ?? null;
 
-            const toolUses = (response.content || []).filter(b => b?.type === 'tool_use');
-            const textBlocks = (response.content || []).filter(b => b?.type === 'text').map(b => b.text).filter(Boolean);
+            // Replay the assistant turn in the OpenAI tool-calling shape. The
+            // Claude adapter converts tool_calls → tool_use blocks on the next
+            // request; OpenAI/Mistral consume it natively.
+            const toolCalls = Array.isArray(response.toolCalls) ? response.toolCalls : [];
+            messages.push({
+                role: 'assistant',
+                content: typeof response.content === 'string' ? response.content : '',
+                ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+            });
+
+            const textBlocks = (typeof response.content === 'string' && response.content.trim())
+                ? [response.content.trim()]
+                : [];
             for (const t of textBlocks) {
                 if (t.trim()) await testRunStore.appendProgress(runId, `[agent] ${t.trim().slice(0, 400)}`);
             }
+
+            // Normalize each tool call to { id, name, input } regardless of
+            // provider — arguments arrive as a JSON string in the OpenAI shape.
+            const toolUses = toolCalls.map((tc) => {
+                const fn = tc.function || tc;
+                let input = {};
+                try {
+                    input = typeof fn.arguments === 'string'
+                        ? JSON.parse(fn.arguments || '{}')
+                        : (fn.arguments || fn.input || {});
+                } catch (_) { input = {}; }
+                return { id: tc.id, name: fn.name, input };
+            });
             if (toolUses.length === 0) {
                 // Two cases land here:
                 //   1) Claude said "I'm done" via text — legitimate, just stop.
@@ -457,7 +518,7 @@ async function runAgentMode({ runId, targetUrl, instructions, userId, organizati
                 break;
             }
 
-            const toolResults = [];
+            const toolMessages = [];
             for (const tu of toolUses) {
                 if (testRunStore.isCancelRequested(runId)) { cancelled = true; break; }
                 // The tool input that *goes to Claude* and to logs always uses
@@ -478,18 +539,20 @@ async function runAgentMode({ runId, targetUrl, instructions, userId, organizati
 
                 if (result?.done) doneRequested = true;
 
-                toolResults.push({
-                    type: 'tool_result',
-                    tool_use_id: tu.id,
+                // OpenAI tool-result shape; the Claude adapter maps each
+                // role:'tool' message to a Claude tool_result block (paired by
+                // tool_call_id). The prompt keeps the agent to one tool per turn.
+                toolMessages.push({
+                    role: 'tool',
+                    tool_call_id: tu.id,
                     content: JSON.stringify(result).slice(0, 8000),
-                    is_error: !result?.ok,
                 });
 
                 await emitFrame(action);
             }
 
             if (cancelled) break;
-            messages.push({ role: 'user', content: toolResults });
+            messages.push(...toolMessages);
         }
 
         if (cancelled) {

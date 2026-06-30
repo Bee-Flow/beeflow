@@ -911,14 +911,24 @@ class GoogleProvider extends BaseProvider {
 
         console.log(`[Google] Video generation: "${prompt.substring(0, 80)}" (model: ${model})`);
 
+        // Build the generation config. Veo 3.1 honours aspectRatio (16:9/9:16),
+        // resolution (720p/1080p), durationSeconds (4/6/8), generateAudio, and
+        // negativePrompt — forward each only when supplied so unset options fall
+        // back to the model defaults. (GenerateVideosConfig — @google/genai)
+        const videoConfig = {
+            aspectRatio: options.aspectRatio || '16:9',
+            numberOfVideos: 1,
+        };
+        if (options.durationSeconds) videoConfig.durationSeconds = options.durationSeconds;
+        if (options.resolution) videoConfig.resolution = options.resolution;
+        if (typeof options.generateAudio === 'boolean') videoConfig.generateAudio = options.generateAudio;
+        if (options.negativePrompt) videoConfig.negativePrompt = options.negativePrompt;
+
         // Start the long-running operation
         let operation = await ai.models.generateVideos({
             model,
             prompt,
-            config: {
-                aspectRatio: options.aspectRatio || '16:9',
-                numberOfVideos: 1,
-            },
+            config: videoConfig,
         });
 
         // Poll until complete (max ~10 minutes for complex videos)

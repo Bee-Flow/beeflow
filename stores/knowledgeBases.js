@@ -364,9 +364,13 @@ const KnowledgeBasesStore = {
         // Group restriction (shared_groups) is applied in JS by callers via filterByGroupAccess.
         const f = buildFilters(3);
         const u = buildSystemUnion(3 + f.params.length);
+        // Org admins see every KB in their org (drafts included); regular
+        // members see only PUBLISHED org KBs. Owner KBs always included.
+        // (isOrgAdmin is a server-resolved boolean, never user input.)
+        const orgDraftClause = opts.isOrgAdmin ? '' : ' AND kb.is_published = TRUE';
         return getAll(
             `${baseSelect}
-             WHERE (kb.tenant_id = $1 OR (kb.organization_id = ANY($2) AND kb.is_published = TRUE))${f.sql}${u.sql}
+             WHERE (kb.tenant_id = $1 OR (kb.organization_id = ANY($2)${orgDraftClause}))${f.sql}${u.sql}
              ORDER BY created_at DESC`,
             [tenantId, orgIdArray, ...f.params, ...u.params]
         );
@@ -381,9 +385,9 @@ const KnowledgeBasesStore = {
      * @param {string} userId - The user's ID
      * @param {Array<string>} userGroups - Group IDs the user belongs to
      */
-    filterByGroupAccess: (kbs, userId, userGroups = []) => {
+    filterByGroupAccess: (kbs, userId, userGroups = [], opts = {}) => {
         if (!Array.isArray(kbs)) return [];
-        return kbs.filter(kb => KnowledgeBasesStore.canUserAccessKB(kb, userId, undefined, userGroups));
+        return kbs.filter(kb => KnowledgeBasesStore.canUserAccessKB(kb, userId, opts.orgIds, userGroups, { isOrgAdmin: opts.isOrgAdmin }));
     },
 
     /**
@@ -398,7 +402,7 @@ const KnowledgeBasesStore = {
      *   already constrained the query by org, so only group rules need to run).
      * @param {Array<string>} userGroups - Group ids the user belongs to
      */
-    canUserAccessKB: (kb, userId, orgIds = undefined, userGroups = []) => {
+    canUserAccessKB: (kb, userId, orgIds = undefined, userGroups = [], opts = {}) => {
         if (!kb) return false;
         // System-managed KBs hold public reference content (e.g. Dutch
         // legislation). Read access is granted to any authenticated user; the
@@ -409,6 +413,12 @@ const KnowledgeBasesStore = {
         if (kb.tenant_id === userId) return true;
         // Super admin
         if (orgIds === null) return true;
+        // Org admins always see every KB in their organisation — including
+        // unpublished drafts and group-restricted KBs (read access). Scoped to
+        // the admin's own org(s); a member's personal (no-org) KB stays private.
+        if (opts.isOrgAdmin && kb.organization_id && orgIds instanceof Set && orgIds.has(kb.organization_id)) {
+            return true;
+        }
         // Direct-fetch path: must be in the KB's org
         if (orgIds instanceof Set) {
             if (!kb.organization_id || !orgIds.has(kb.organization_id)) return false;
@@ -422,6 +432,27 @@ const KnowledgeBasesStore = {
         return groups.some(g => userGroups.includes(g));
     },
 
+    /**
+     * "Is this user allowed to MANAGE this KB's settings?" (BFSF-214).
+     * Deliberately separate from canUserAccessKB: draft status gates READING
+     * content, not managing settings. Non-owner managers must belong to the
+     * KB's org AND hold manage_knowledge (checked by the caller via
+     * hasPermission and passed in as a boolean so this stays pure/testable).
+     *
+     * @param {object} kb - Row from knowledge_bases
+     * @param {string} userId - Requesting user's id
+     * @param {Set|null} orgIds - resolveUserOrgIds(req) result; null = super admin
+     * @param {boolean} hasManagePermission - hasPermission(userId,'manage_knowledge')
+     */
+    canUserManageKB: (kb, userId, orgIds, hasManagePermission) => {
+        if (!kb) return false;
+        if (kb.tenant_id === userId) return true;          // owner
+        if (orgIds === null) return true;                  // super admin
+        if (!kb.organization_id) return false;             // personal KB of someone else
+        if (!(orgIds instanceof Set) || !orgIds.has(kb.organization_id)) return false; // must share org
+        return !!hasManagePermission;
+    },
+
     getKB: async (id) => {
         await initDB();
         return getOne('SELECT * FROM knowledge_bases WHERE id = $1', [id]);
@@ -430,17 +461,21 @@ const KnowledgeBasesStore = {
     updateKB: async (id, { name, description, categoryId, icon, usageContexts }) => {
         await initDB();
         const usageJson = Array.isArray(usageContexts) ? JSON.stringify(usageContexts) : null;
+        // categoryId: undefined = leave as-is, explicit null = clear back to
+        // NULL (BFSF-214) — COALESCE alone can't express the clear, so a
+        // boolean flag drives a CASE for that column.
+        const clearCategory = categoryId === null;
         return getOne(
             `UPDATE knowledge_bases
              SET name = COALESCE($2, name),
                  description = COALESCE($3, description),
-                 category_id = COALESCE($4, category_id),
+                 category_id = CASE WHEN $7 THEN NULL ELSE COALESCE($4, category_id) END,
                  icon = COALESCE($5, icon),
                  usage_contexts = COALESCE($6::jsonb, usage_contexts),
                  updated_at = now()
              WHERE id = $1
              RETURNING *`,
-            [id, name, description, categoryId, icon, usageJson]
+            [id, name, description, categoryId, icon, usageJson, clearCategory]
         );
     },
 

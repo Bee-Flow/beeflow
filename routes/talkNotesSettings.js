@@ -46,7 +46,20 @@ async function isOrgAdmin(req, orgId) {
 router.get('/user/me', requireAuth, async (req, res) => {
     try {
         const config = await talkNotes.getUserSettings(req.session.user.id);
-        res.json(config);
+        // Surface whether the user has a Nextcloud connection at all (to hide the
+        // section for non-NC accounts) and whether the Talk recording backend is
+        // available (to gate the auto-record toggle).
+        let nextcloudConnected = false;
+        let recordingEnabled = false;
+        try {
+            const ncClient = require('../integrations/nextcloudClient');
+            nextcloudConnected = await ncClient.isConnected(req.session, req.session.user.id);
+            if (nextcloudConnected) {
+                const talk = require('../integrations/nextcloudTalkTools');
+                recordingEnabled = (await talk.getTalkRecordingCapability(req.session, req.session.user.id)).recordingEnabled;
+            }
+        } catch (_) { /* treat as not connected */ }
+        res.json({ ...config, nextcloudConnected, recordingEnabled });
     } catch (e) {
         console.error('[TalkNotesSettings] user GET error:', e.message);
         res.status(500).json({ error: e.message });

@@ -27,6 +27,7 @@ const multer = require('multer');
 const crypto = require('crypto');
 
 const notebookStore = require('../stores/notebookStore');
+const notebookConversationStore = require('../stores/notebookConversationStore');
 const storageStore = require('../stores/storageStore');
 const transcriptionStore = require('../stores/transcriptionStore');
 const kbStore = require('../stores/knowledgeBases');
@@ -89,6 +90,58 @@ router.get('/:id', requireAuth, async (req, res) => {
     }
 });
 
+// ── In-notebook chat history (persistent, encrypted) ─────────────────────
+// Returns the durable conversation for this notebook (regular or legal_matter)
+// so the chat panel can rehydrate on page load / notebook switch instead of
+// starting from an empty React state. Ownership is enforced via getNotebook.
+router.get('/:id/conversation', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const notebook = await notebookStore.getNotebook(req.params.id, userId);
+        if (!notebook) return res.status(404).json({ error: 'Notebook not found' });
+        const encryptionKey = req.session.encryptionKey || null;
+        const messages = await notebookConversationStore.getMessages(req.params.id, userId, encryptionKey);
+        // Stored assistant content is TOKENIZED (defense-in-depth inside the
+        // encrypted blob); restore `[person_1]` → real values for display, using
+        // the notebook's persisted PII token map (hydrated from notebooks.pii_token_map).
+        // User messages are stored real, so restore is a no-op for them.
+        let outMessages = messages;
+        try {
+            const dlpRunner = require('../core/dlp/dlpRunner');
+            const map = await dlpRunner.getConversationTokenMapAsync(req.params.id);
+            if (map && Object.keys(map).length) {
+                const { restoreTokens } = require('../core/piiDetection');
+                outMessages = messages.map(m => (typeof m.content === 'string'
+                    ? { ...m, content: restoreTokens(m.content, map) }
+                    : m));
+            }
+        } catch (e) {
+            console.warn('[Notebooks] token restore on conversation load failed:', e.message);
+        }
+        res.json({ messages: outMessages });
+    } catch (err) {
+        console.error('[Notebooks] Get conversation failed:', err);
+        res.status(500).json({ error: 'Failed to load conversation' });
+    }
+});
+
+// Clear the persisted in-notebook conversation ("new chat" in the panel).
+router.delete('/:id/conversation', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const notebook = await notebookStore.getNotebook(req.params.id, userId);
+        if (!notebook) return res.status(404).json({ error: 'Notebook not found' });
+        await notebookConversationStore.deleteForNotebook(req.params.id, userId);
+        // Drop the accumulated PII token map too, so a fresh chat doesn't inherit
+        // stale `[person_1]` → value mappings from the cleared conversation.
+        try { require('../core/dlp/dlpRunner').clearConversationState(req.params.id); } catch (_) { /* best-effort */ }
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[Notebooks] Clear conversation failed:', err);
+        res.status(500).json({ error: 'Failed to clear conversation' });
+    }
+});
+
 router.put('/:id', requireAuth, async (req, res) => {
     try {
         const userId = req.session.user.id;
@@ -134,6 +187,15 @@ router.delete('/:id', requireAuth, async (req, res) => {
                 }
             }
         }
+
+        // Drop the persisted in-notebook conversation so a deleted notebook
+        // leaves no orphaned chat history.
+        try { await notebookConversationStore.deleteForNotebook(req.params.id); } catch (e) {
+            console.warn('[Notebooks] Conversation cleanup failed:', e.message);
+        }
+        // Drop the in-process PII token map (the row's pii_token_map goes away with
+        // the cascading notebook delete; this clears the cached copy + flag).
+        try { require('../core/dlp/dlpRunner').clearConversationState(req.params.id); } catch (_) { /* best-effort */ }
 
         res.json({ success: true });
     } catch (err) {
@@ -386,7 +448,7 @@ router.post('/:id/sources/:sid/retry', requireAuth, async (req, res) => {
         if (!source || source.notebookId !== nb.id) return res.status(404).json({ error: 'Source not found' });
 
         // Reset state so the UI immediately shows the spinner.
-        await notebookStore.updateSource(source.id, { status: 'processing', error: null });
+        await notebookStore.updateSource(source.id, { status: 'processing', stage: 'queued', error: null });
         res.json({ success: true });
 
         // Dispatch retry in the background so the HTTP request doesn't stall.
@@ -406,7 +468,14 @@ router.post('/:id/sources/:sid/retry', requireAuth, async (req, res) => {
                     const mimeType = source.metadata?.mimeType || 'application/octet-stream';
                     await ingestFileSource(nb.id, source.id, userId, buffer, source.fileName || source.name, mimeType);
                 } else {
-                    throw new Error('This source type cannot be retried — please re-add it.');
+                    // Text / meeting / drive sources now keep their extracted text,
+                    // so retry re-ingests from the stored copy.
+                    const stored = await notebookStore.getSourceContent(source.id);
+                    if (stored && stored.trim()) {
+                        await ingestTextSource(nb.id, source.id, userId, stored, source.name);
+                    } else {
+                        throw new Error('This source type cannot be retried — please re-add it.');
+                    }
                 }
             } catch (e) {
                 console.error(`[Notebooks] Retry failed for source ${source.id}:`, e.message);
@@ -435,12 +504,98 @@ router.post('/:id/sources/:sid/cancel', requireAuth, async (req, res) => {
 
         await notebookStore.updateSource(source.id, {
             status: 'error',
+            stage: 'error',
             error: 'Cancelled by user',
         });
         res.json({ success: true });
     } catch (err) {
         console.error('[Notebooks] Cancel source failed:', err);
         res.status(500).json({ error: 'Failed to cancel source' });
+    }
+});
+
+// Shared cleanup for a deleted source: storage bytes + KB document chunks.
+async function cleanupSourceArtifacts(nb, source, userId) {
+    if (source.storageKey) {
+        try {
+            if (!source.storageKey.startsWith('local:')) await storageStore.deleteFile(source.storageKey);
+        } catch (e) { console.warn('[Notebooks] Storage cleanup:', e.message); }
+    }
+    const kbIds = nb.knowledgeBaseIds || [];
+    for (const kbId of kbIds) {
+        try {
+            const doc = await findDocumentBySourceUri(kbId, source.id);
+            if (doc) await deleteDocumentChunks(kbId, doc.id, userId);
+        } catch (e) { console.warn(`[Notebooks] KB chunk cleanup for source ${source.id}:`, e.message); }
+    }
+}
+
+// ── Source content (preview) ────────────────────────────────────
+router.get('/:id/sources/:sid/content', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const nb = await notebookStore.getNotebook(req.params.id, userId);
+        if (!nb) return res.status(404).json({ error: 'Notebook not found' });
+        const source = await notebookStore.getSource(req.params.sid);
+        if (!source || source.notebookId !== nb.id) return res.status(404).json({ error: 'Source not found' });
+        const content = await notebookStore.getSourceContent(source.id);
+        res.json({ content: content || '', name: source.name, type: source.type });
+    } catch (err) {
+        console.error('[Notebooks] Get source content failed:', err);
+        res.status(500).json({ error: 'Failed to load source content' });
+    }
+});
+
+// ── Reorder sources (must precede the /:sid rename route) ────────
+router.patch('/:id/sources/reorder', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const nb = await notebookStore.getNotebook(req.params.id, userId);
+        if (!nb) return res.status(404).json({ error: 'Notebook not found' });
+        const { orderedIds } = req.body || {};
+        if (!Array.isArray(orderedIds)) return res.status(400).json({ error: 'orderedIds must be an array' });
+        await notebookStore.reorderSources(nb.id, orderedIds);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[Notebooks] Reorder sources failed:', err);
+        res.status(500).json({ error: 'Failed to reorder sources' });
+    }
+});
+
+// ── Rename a source ─────────────────────────────────────────────
+router.patch('/:id/sources/:sid', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const nb = await notebookStore.getNotebook(req.params.id, userId);
+        if (!nb) return res.status(404).json({ error: 'Notebook not found' });
+        const source = await notebookStore.getSource(req.params.sid);
+        if (!source || source.notebookId !== nb.id) return res.status(404).json({ error: 'Source not found' });
+        const name = String(req.body?.name || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+        if (!name) return res.status(400).json({ error: 'Name is required' });
+        await notebookStore.updateSource(source.id, { name });
+        res.json({ success: true, name });
+    } catch (err) {
+        console.error('[Notebooks] Rename source failed:', err);
+        res.status(500).json({ error: 'Failed to rename source' });
+    }
+});
+
+// ── Bulk delete sources ─────────────────────────────────────────
+router.post('/:id/sources/bulk-delete', requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.user.id;
+        const nb = await notebookStore.getNotebook(req.params.id, userId);
+        if (!nb) return res.status(404).json({ error: 'Notebook not found' });
+        const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+        let deleted = 0;
+        for (const sid of ids) {
+            const source = await notebookStore.deleteSource(sid);
+            if (source && source.notebookId === nb.id) { await cleanupSourceArtifacts(nb, source, userId); deleted++; }
+        }
+        res.json({ success: true, deleted });
+    } catch (err) {
+        console.error('[Notebooks] Bulk delete sources failed:', err);
+        res.status(500).json({ error: 'Failed to delete sources' });
     }
 });
 
@@ -455,31 +610,7 @@ router.delete('/:id/sources/:sid', requireAuth, async (req, res) => {
         const source = await notebookStore.deleteSource(req.params.sid);
         if (!source) return res.status(404).json({ error: 'Source not found' });
 
-        // Clean up file storage
-        if (source.storageKey) {
-            try {
-                if (!source.storageKey.startsWith('local:')) {
-                    await storageStore.deleteFile(source.storageKey);
-                }
-            } catch (e) { console.warn('[Notebooks] Storage cleanup:', e.message); }
-        }
-
-        // Clean up KB document chunks (source ID was stored as source_uri during ingestion)
-        const kbIds = nb.knowledgeBaseIds || [];
-        if (kbIds.length > 0) {
-            for (const kbId of kbIds) {
-                try {
-                    const doc = await findDocumentBySourceUri(kbId, source.id);
-                    if (doc) {
-                        await deleteDocumentChunks(kbId, doc.id, userId);
-                        console.log(`[Notebooks] Cleaned up KB document ${doc.id} for source ${source.id}`);
-                    }
-                } catch (e) {
-                    console.warn(`[Notebooks] KB chunk cleanup for source ${source.id}:`, e.message);
-                }
-            }
-        }
-
+        await cleanupSourceArtifacts(nb, source, userId);
         res.json({ success: true });
     } catch (err) {
         console.error('[Notebooks] Delete source failed:', err);

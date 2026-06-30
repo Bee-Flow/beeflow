@@ -93,6 +93,34 @@ Module._load = function patchedLoad2(request, parent, isMain) {
 
 const beta = require('./betaFeatures');
 
+// The beta helpers are now THIN WRAPPERS that delegate to the unified resolver
+// (server/core/entitlements.js). The resolution math itself is covered by
+// core/entitlements.test.js; here we monkeypatch the resolver's two entry points
+// so we can assert (a) the wrappers delegate with the right capId/context, and
+// (b) orphan ids without a registry row still take the legacy allow-list path.
+// `ent.registry` is left as the REAL registry so getCapability() drives the
+// registry-vs-orphan branch exactly as in production.
+const ent = require('./entitlements');
+let mockHasCapability = async () => false;
+let requireCapabilityCalls = [];
+ent.hasCapability = async (capId, ctx) => mockHasCapability(capId, ctx);
+ent.requireCapability = (capId) => {
+    requireCapabilityCalls.push(capId);
+    return async (req, res, next) => {
+        const ok = await mockHasCapability(capId, {
+            userId: req.session?.user?.id,
+            orgId: req.session?.user?.organizationId,
+            session: req.session,
+            req,
+        });
+        if (ok) return next();
+        // requireCapability's real deny vocabulary (feature_locked vs
+        // feature_disabled) is asserted in entitlements.test.js; the sentinel
+        // just needs a deny path for the delegation assertions below.
+        return res.status(403).json({ error: 'feature_disabled', feature: capId });
+    };
+};
+
 // ── Fixtures ────────────────────────────────────────────────────────────
 function resetMocks() {
     mockTier = 'community';
@@ -117,18 +145,18 @@ function buildRes() {
 (async () => {
     // ── getUserBetaFeatures ─────────────────────────────────────────────
 
-    // Community tier → only the n8n-style free-builder GA features
-    // (automations + agent_routines), even when the org has *enterprise* betas
-    // both allowed and active. The free-builder set is derived from the
-    // registry + the licence tier (GA betas whose licenceFeature is in the
-    // Community tier), so it ignores the org allow-list below the floor.
+    // Community tier → only the GA features whose licence feature is in the
+    // Community tier (the n8n-style free builder — automations + agent_routines —
+    // plus the Learning Center, also free Community core), even when the org has
+    // *enterprise* betas both allowed and active. The set is derived from the
+    // registry + the licence tier, so it ignores the org allow-list below the floor.
     resetMocks();
     mockTier = 'community';
     mockOrgBetaFeatures = ['meeting_notes', 'voice_chat'];
     mockOrgActiveFeatures = ['meeting_notes', 'voice_chat'];
     let features = await beta.getUserBetaFeatures('u1', { user: mockUser });
-    assert.deepStrictEqual(features.sort(), ['agent_routines', 'automations'],
-        'community must yield exactly the free-builder GA features (n8n-style)');
+    assert.deepStrictEqual(features.sort(), ['agent_routines', 'automations', 'learning_center'],
+        'community must yield exactly the Community GA features');
     assert.ok(!features.includes('meeting_notes') && !features.includes('voice_chat'),
         'community must NOT yield enterprise betas even when org-allowed/active');
 
@@ -165,84 +193,97 @@ function buildRes() {
     assert.deepStrictEqual(features.sort(), ['voice_chat'],
         'tierHint must bypass resolveTier; no throw expected');
 
-    // ── orgHasBetaFeature ────────────────────────────────────────────────
-
-    // Community → false even when both lists include it.
+    // ── userHasBetaFeature / orgHasBetaFeature — delegation to the resolver ──
+    // Registry-backed ids resolve through ent.hasCapability (the single source of
+    // truth, tested in entitlements.test.js). Here we assert the wrappers forward
+    // the right capId/context and return the resolver's verdict verbatim.
     resetMocks();
-    mockTier = 'community';
-    mockOrgBetaFeatures = ['webpages'];
-    mockOrgActiveFeatures = ['webpages'];
-    assert.strictEqual(await beta.orgHasBetaFeature('org1', 'webpages'), false,
-        'orgHasBetaFeature must return false on community');
+    let seen = [];
+    mockHasCapability = async (capId, ctx) => { seen.push({ capId, ctx }); return capId === 'webpages'; };
+    assert.strictEqual(await beta.userHasBetaFeature('u1', 'webpages', { user: { id: 'u1', organizationId: 'org1' } }), true,
+        'userHasBetaFeature delegates: webpages → resolver true');
+    assert.strictEqual(await beta.userHasBetaFeature('u1', 'voice_chat', { user: { id: 'u1', organizationId: 'org1' } }), false,
+        'userHasBetaFeature delegates: voice_chat → resolver false');
+    assert.ok(seen.some(s => s.capId === 'webpages' && s.ctx.userId === 'u1' && s.ctx.orgId === 'org1'),
+        'userHasBetaFeature passes userId + session-derived orgId to the resolver');
 
-    // Enterprise + allow + active → true.
     resetMocks();
-    mockTier = 'enterprise';
-    mockOrgBetaFeatures = ['webpages'];
-    mockOrgActiveFeatures = ['webpages'];
+    seen = [];
+    mockHasCapability = async (capId, ctx) => { seen.push({ capId, ctx }); return capId === 'webpages'; };
     assert.strictEqual(await beta.orgHasBetaFeature('org1', 'webpages'), true,
-        'orgHasBetaFeature must return true when tier+allow+active align');
+        'orgHasBetaFeature delegates: webpages → resolver true');
+    assert.strictEqual(await beta.orgHasBetaFeature('org1', 'swarm'), false,
+        'orgHasBetaFeature delegates: swarm → resolver false');
+    assert.ok(seen.some(s => s.capId === 'webpages' && s.ctx.orgId === 'org1'),
+        'orgHasBetaFeature passes orgId to the resolver');
 
-    // Background callers fail quiet on tier-resolve failure.
+    // Background user-based lookup (null session) resolves the user's primary org
+    // so the org grant layer is populated (mirrors the legacy org sweep).
     resetMocks();
-    mockResolveThrows = true;
-    assert.strictEqual(await beta.orgHasBetaFeature('org1', 'webpages'), false,
-        'orgHasBetaFeature must fail-quiet (return false) on resolve error');
+    seen = [];
+    mockUser = { id: 'u1', organizationId: 'org9', role: 'member', groups: '[]' };
+    mockHasCapability = async (capId, ctx) => { seen.push(ctx); return true; };
+    await beta.userHasBetaFeature('u1', 'webpages', null);
+    assert.strictEqual(seen[0]?.orgId, 'org9',
+        'null-session userHasBetaFeature resolves the user primary org for the resolver');
 
-    // ── requireBetaFeature middleware ────────────────────────────────────
-
-    // Community session → structured feature_locked body with reason.
+    // ── Orphan id (no registry row, e.g. 'templates') keeps the legacy allow-
+    //    list path — the resolver can't express it, so getUserBetaFeatures owns it.
     resetMocks();
-    mockTier = 'community';
-    mockOrgBetaFeatures = ['meeting_notes'];
-    mockOrgActiveFeatures = ['meeting_notes'];
+    mockTier = 'enterprise';
+    mockOrgBetaFeatures = ['templates'];
+    mockOrgActiveFeatures = ['templates'];
+    mockHasCapability = async () => { throw new Error('resolver must NOT be consulted for orphan ids'); };
+    assert.strictEqual(await beta.userHasBetaFeature('u1', 'templates', { user: mockUser }), true,
+        'orphan templates uses the legacy allow-list membership (resolver not consulted)');
+    resetMocks();
+    mockTier = 'enterprise';
+    mockOrgBetaFeatures = [];
+    mockOrgActiveFeatures = [];
+    assert.strictEqual(await beta.userHasBetaFeature('u1', 'templates', { user: mockUser }), false,
+        'orphan templates false when not in the org allow-list');
+
+    // ── requireBetaFeature — delegation + orphan fallback ────────────────────
+    // Registry id → returns the unified requireCapability gate.
+    resetMocks();
+    requireCapabilityCalls = [];
+    mockHasCapability = async (capId) => capId === 'meeting_notes';
     {
+        const gate = beta.requireBetaFeature('meeting_notes');
+        assert.ok(requireCapabilityCalls.includes('meeting_notes'),
+            'requireBetaFeature(registry id) delegates to requireCapability');
         const req = { session: { user: { id: 'u1', organizationId: 'org1' } } };
         const res = buildRes();
         let nextCalled = false;
-        await beta.requireBetaFeature('meeting_notes')(req, res, () => { nextCalled = true; });
-        assert.strictEqual(nextCalled, false, 'community must NOT pass beta middleware');
+        await gate(req, res, () => { nextCalled = true; });
+        assert.strictEqual(nextCalled, true, 'granted capability reaches the handler');
+    }
+    // Denied → the unified gate responds (no legacy prose string).
+    resetMocks();
+    mockHasCapability = async () => false;
+    {
+        const gate = beta.requireBetaFeature('meeting_notes');
+        const req = { session: { user: { id: 'u1', organizationId: 'org1' } } };
+        const res = buildRes();
+        let nextCalled = false;
+        await gate(req, res, () => { nextCalled = true; });
+        assert.strictEqual(nextCalled, false, 'denied capability blocks the handler');
         assert.strictEqual(res.statusCode, 403);
-        assert.strictEqual(res.body?.error, 'feature_locked');
-        assert.strictEqual(res.body?.feature, 'meeting_notes');
-        assert.strictEqual(res.body?.reason, 'beta_requires_enterprise');
-        assert.strictEqual(res.body?.required, 'enterprise');
-        assert.ok(typeof res.body?.upgrade_url === 'string' && res.body.upgrade_url.length > 0,
-            'upgrade_url must be present');
     }
-
-    // Enterprise session with org-admin opt-in → next() called.
+    // Orphan id → legacy middleware (membership-based next / prose 403).
     resetMocks();
     mockTier = 'enterprise';
-    mockOrgBetaFeatures = ['meeting_notes'];
-    mockOrgActiveFeatures = ['meeting_notes'];
-    {
-        const req = { session: { user: { id: 'u1', organizationId: 'org1' } } };
-        const res = buildRes();
-        let nextCalled = false;
-        await beta.requireBetaFeature('meeting_notes')(req, res, () => { nextCalled = true; });
-        assert.strictEqual(nextCalled, true, 'enterprise must reach handler');
-        assert.strictEqual(res.statusCode, null);
-    }
-
-    // Enterprise session WITHOUT org-admin opt-in → old-style 403 (not the
-    // feature_locked tier message), so the UI can route to "ask your org
-    // admin" rather than "upgrade your plan".
-    resetMocks();
-    mockTier = 'enterprise';
-    mockOrgBetaFeatures = []; // not even allowed
+    mockOrgBetaFeatures = [];
     mockOrgActiveFeatures = [];
     {
         const req = { session: { user: { id: 'u1', organizationId: 'org1' } } };
         const res = buildRes();
         let nextCalled = false;
-        await beta.requireBetaFeature('meeting_notes')(req, res, () => { nextCalled = true; });
-        assert.strictEqual(nextCalled, false);
+        await beta.requireBetaFeature('templates')(req, res, () => { nextCalled = true; });
+        assert.strictEqual(nextCalled, false, 'orphan templates not in allow-list → blocked');
         assert.strictEqual(res.statusCode, 403);
-        assert.notStrictEqual(res.body?.error, 'feature_locked',
-            'enterprise-with-no-org-opt-in must NOT be reported as a tier problem');
         assert.match(res.body?.error || '', /not enabled for your organization/,
-            'should return the org-admin-help message');
+            'orphan fallback keeps the legacy ask-your-admin message');
     }
 
     console.log('✓ core/betaFeatures.test.js — all assertions passed');

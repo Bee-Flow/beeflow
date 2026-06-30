@@ -61,6 +61,15 @@ Module._load = function patchedLoad(request, parent, isMain) {
 
 const beta = require('./betaFeatures');
 
+// userHasBetaFeature / orgHasBetaFeature are thin wrappers over the unified
+// resolver now. The resolver's real cloud math (subscription-leading ceiling +
+// the community-tier compound-AND fix) is covered by core/entitlements.test.js;
+// here we stub the resolver to mirror the plan allow-list so the wrapper
+// delegation reads naturally in cloud terms. getUserBetaFeatures (still the
+// owner of the /auth/my-permissions allow-list) is exercised directly below.
+const ent = require('./entitlements');
+ent.hasCapability = async (capId) => (Array.isArray(mockPlanBeta) ? mockPlanBeta.includes(capId) : true);
+
 function reset() {
     mockUser = { id: 'u1', organizationId: 'org1', role: 'member', groups: '[]' };
     mockPlanBeta = ['webpages'];

@@ -106,7 +106,13 @@ async function getOrgFilter(req) {
 
 // Build filters from request query params
 function buildRequestFilters(req) {
-    const filters = { ...getDateFilters(req.query.days) };
+    // Prefer an explicit absolute window (startDate/endDate) when the client
+    // sends one — this makes custom / historical ranges accurate instead of the
+    // days-relative window anchored at "now". Falls back to ?days= otherwise.
+    // Mirrors the pattern already used in server/routes/terminations.js.
+    const filters = (req.query.startDate && req.query.endDate)
+        ? { startDate: req.query.startDate, endDate: req.query.endDate }
+        : { ...getDateFilters(req.query.days) };
     if (req.query.user) filters.userId = req.query.user;
     if (req.query.agent) filters.agentId = req.query.agent;
     if (req.query.model) filters.model = req.query.model;

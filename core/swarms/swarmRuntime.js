@@ -303,6 +303,13 @@ async function runWorker({
                     temperature: isSynthesiser ? 0.4 : 0.3,
                     tools: workerTools.length > 0 ? workerTools : undefined,
                     toolChoice: workerTools.length > 0 ? 'auto' : undefined,
+                    // Stable per-(run, worker) prompt-cache routing key: the
+                    // worker's system prompt + initial message prefix is identical
+                    // across tool-call rounds, so this lifts the OpenAI prefix
+                    // cache hit-rate across rounds. Ignored by non-OpenAI adapters.
+                    // Account-scoped routing hint — cannot leak across tenants.
+                    promptCacheKey: swarmRunId ? `swarm-${swarmRunId}-${workerId}` : undefined,
+                    userId,
                 }, streamCallback);
             } catch (streamErr) {
                 streamErrorMessage = streamErr?.error?.message || streamErr?.message || 'Stream failed';

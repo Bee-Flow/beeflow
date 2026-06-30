@@ -118,6 +118,26 @@ async function getTranscriptionBySourceUri(sourceUri) {
     return getOne('SELECT id, user_id, organization_id, title FROM transcriptions WHERE source_uri = $1', [sourceUri]);
 }
 
+/**
+ * Most recent transcription created from a given Talk room token (used by the
+ * "Upcoming meetings" view to show a "recorded → note" status). Scoped to the
+ * owner so the meetings view only reflects the current user's notes.
+ */
+async function getTranscriptionByTalkRoomToken(talkRoomToken, userId = null) {
+    if (!talkRoomToken) return null;
+    await initDB();
+    if (userId) {
+        return getOne(
+            'SELECT id, user_id, title, created_at FROM transcriptions WHERE talk_room_token = $1 AND user_id = $2 ORDER BY created_at DESC LIMIT 1',
+            [talkRoomToken, userId],
+        );
+    }
+    return getOne(
+        'SELECT id, user_id, title, created_at FROM transcriptions WHERE talk_room_token = $1 ORDER BY created_at DESC LIMIT 1',
+        [talkRoomToken],
+    );
+}
+
 async function getTranscriptions(userId, { limit = 50, offset = 0, orgIds = [], userGroupIds = [], isSuperAdmin = false } = {}) {
     await initDB();
     // Super admins (resolveUserOrgIds === null) see every transcription
@@ -302,6 +322,7 @@ module.exports = {
     getTranscriptions,
     getTranscription,
     getTranscriptionBySourceUri,
+    getTranscriptionByTalkRoomToken,
     updateTranscription,
     setPublished,
     deleteTranscription,

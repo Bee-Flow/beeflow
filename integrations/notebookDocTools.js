@@ -1,280 +1,168 @@
 /**
- * Notebook Document Tools
- * Provides notebook_doc_read, notebook_doc_write, notebook_doc_replace, and notebook_add_source
- * tools for AI interaction with the TipTap-based notebook editor.
- * 
- * Unlike workspace tools (which use markdown), these operate on HTML content
- * matching TipTap's internal format.
+ * Notebook Document Tools — Markdown edition.
+ *
+ * The AI reads and writes the document as BeeFlow-Flavored Markdown (BFM): far
+ * fewer tokens than TipTap HTML for the same rendered result, and a much more
+ * robust find/replace (substring match on the markdown the AI actually sees).
+ *
+ * The editor remains the source of truth and still speaks HTML, so the executor
+ * converts Markdown → HTML for the doc-update the client applies. This keeps the
+ * client apply path (and the TipTap fallback) unchanged while capturing the
+ * token win on the input side (read + system prompt + emitted edits).
  */
+
+const { markdownToHtml, htmlToMarkdown } = require('../core/markdown');
+
+const BFM_CHEATSHEET =
+  'Use Markdown:\n' +
+  '- # / ## / ### headings, **bold**, *italic*, ~~strike~~, `code`, ==highlight==\n' +
+  '- lists: "- item", "1. item", task lists "- [ ] todo" / "- [x] done"\n' +
+  '- > blockquote, --- divider, [text](url) links, | tables | with |---| rows\n' +
+  '- ```mermaid fenced blocks for diagrams, $inline$ / $$block$$ for math\n' +
+  '- images: ![alt](src){w=400 align=center wrap} (attrs optional)';
 
 const NOTEBOOK_DOC_TOOLS = [
-    {
-        type: 'function',
-        function: {
-            name: 'notebook_doc_read',
-            description: 'Read the current content of the notebook document editor. The document is a rich-text editor (TipTap) visible to the user. Use this BEFORE any write or replace operation to see the exact current content.',
-            parameters: {
-                type: 'object',
-                properties: {},
-                required: []
-            }
-        }
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'notebook_doc_write',
-            description: 'Write or replace the ENTIRE content of the notebook document editor. Use TipTap-compatible HTML:\n- <p>paragraph</p>\n- <h1>, <h2>, <h3> for headings\n- <strong>bold</strong>, <em>italic</em>, <u>underline</u>\n- <s>strikethrough</s>, <mark>highlight</mark>\n- <ul><li><p>bullet</p></li></ul> (list items MUST contain <p>)\n- <ol><li><p>numbered</p></li></ol>\n- <blockquote><p>quote</p></blockquote>\n- <a href="url" target="_blank" rel="noopener noreferrer">link text</a>\n- <hr> for horizontal dividers\n- <code>inline code</code>, <pre><code>code block</code></pre>\n\nWARNING: This replaces ALL document content. For partial edits, use notebook_doc_replace.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    content: {
-                        type: 'string',
-                        description: 'The full HTML content to write to the document. This replaces the entire document content. Use TipTap-compatible HTML tags for formatting.'
-                    },
-                    title: {
-                        type: 'string',
-                        description: 'Optional short description of what was written (e.g. "Summary Report", "Meeting Notes"). Shown to the user.'
-                    }
-                },
-                required: ['content']
-            }
-        }
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'notebook_doc_replace',
-            description: 'Replace a specific portion of the notebook document. Use this when the user asks to edit, rewrite, fix, or modify a specific section. This preserves all other content. The find_text should match the plain text content (HTML tags are stripped for matching). The replace_text should be TipTap-compatible HTML.\n\nIMPORTANT: Always call notebook_doc_read first to see exact content before replacing.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    find_text: {
-                        type: 'string',
-                        description: 'The text to find in the document. This is matched against the plain-text content (HTML tags stripped). Must be an exact match of existing text.'
-                    },
-                    replace_text: {
-                        type: 'string',
-                        description: 'The new HTML content to replace the found text with. Use TipTap-compatible HTML for formatting. Set to empty string to delete the text.'
-                    }
-                },
-                required: ['find_text', 'replace_text']
-            }
-        }
-    }
-];
-
-/**
- * Tool to add web search results or other text directly as a notebook source.
- * This allows the AI to research with web search and directly pass the results as a data source.
- */
-const NOTEBOOK_ADD_SOURCE_TOOL = {
+  {
     type: 'function',
     function: {
-        name: 'notebook_add_source',
-        description: 'Add content as a new source to the notebook. Use this to directly pass web search results, research findings, or any text content as a notebook source for future reference. The content will be indexed and available for citation in future queries. For tax notebooks: ALWAYS include the metadata object with structured financial fields — this powers the dashboard stats.',
-        parameters: {
-            type: 'object',
-            properties: {
-                name: {
-                    type: 'string',
-                    description: 'A short descriptive name for the source (e.g. "MoveMove Factuur 265029963", "GitHub Invoice INV-2026-04")'
-                },
-                content: {
-                    type: 'string',
-                    description: 'The full text content to add as a source. For invoices, include all extracted financial data. For web search results, pass the complete text.'
-                },
-                metadata: {
-                    type: 'object',
-                    description: 'Structured metadata for the source. For tax notebooks, ALWAYS populate the financial fields below — they power the dashboard statistics.',
-                    properties: {
-                        taxCategory: {
-                            type: 'string',
-                            description: 'Classification: "income" for sales/revenue invoices, "expense" for cost/purchase invoices'
-                        },
-                        amount: {
-                            type: 'number',
-                            description: 'Amount excluding BTW/VAT (e.g. 7.50)'
-                        },
-                        btwAmount: {
-                            type: 'number',
-                            description: 'BTW/VAT amount (e.g. 1.58)'
-                        },
-                        btwRate: {
-                            type: 'number',
-                            description: 'BTW rate as percentage: 0, 9, or 21'
-                        },
-                        totalAmount: {
-                            type: 'number',
-                            description: 'Total amount including BTW (e.g. 9.08)'
-                        },
-                        vendor: {
-                            type: 'string',
-                            description: 'Vendor/customer name (e.g. "MoveMove", "GitHub")'
-                        },
-                        invoiceNumber: {
-                            type: 'string',
-                            description: 'Invoice/receipt number'
-                        },
-                        invoiceDate: {
-                            type: 'string',
-                            description: 'Invoice date in YYYY-MM-DD format'
-                        },
-                        isInvoice: {
-                            type: 'boolean',
-                            description: 'Whether this document is an invoice'
-                        },
-                        sourceType: {
-                            type: 'string',
-                            description: 'Origin: "gmail", "drive", "upload", or "manual"'
-                        },
-                        emailMessageId: {
-                            type: 'string',
-                            description: 'Gmail message ID — used for deduplication to prevent re-processing'
-                        },
-                        driveFileId: {
-                            type: 'string',
-                            description: 'Google Drive file ID — used for deduplication'
-                        }
-                    }
-                }
-            },
-            required: ['name', 'content']
-        }
-    }
+      name: 'notebook_doc_read',
+      description: 'Read the current notebook document as Markdown. Call this BEFORE any write or replace so you match the exact current text.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'notebook_doc_write',
+      description: 'Replace the ENTIRE notebook document with new Markdown content. ' + BFM_CHEATSHEET + '\nFor partial edits use notebook_doc_replace instead.',
+      parameters: {
+        type: 'object',
+        properties: {
+          content: { type: 'string', description: 'The full document as Markdown. Replaces all current content.' },
+          title: { type: 'string', description: 'Optional short label of what was written (shown to the user).' },
+        },
+        required: ['content'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'notebook_doc_replace',
+      description: 'Replace a specific portion of the document, preserving everything else. find_text is matched against the document Markdown (call notebook_doc_read first). replace_text is Markdown (empty string deletes).',
+      parameters: {
+        type: 'object',
+        properties: {
+          find_text: { type: 'string', description: 'Exact Markdown/text to find (from notebook_doc_read).' },
+          replace_text: { type: 'string', description: 'New Markdown to substitute. Empty string to delete.' },
+        },
+        required: ['find_text', 'replace_text'],
+      },
+    },
+  },
+];
+
+// notebook_add_source is unchanged (content/metadata source ingestion).
+const NOTEBOOK_ADD_SOURCE_TOOL = {
+  type: 'function',
+  function: {
+    name: 'notebook_add_source',
+    description: 'Add content as a new source to the notebook (web results, research findings, extracted invoice data). Indexed for future citation. For tax notebooks ALWAYS include the metadata financial fields — they power the dashboard stats.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Short descriptive name for the source.' },
+        content: { type: 'string', description: 'Full text content to add as a source.' },
+        metadata: {
+          type: 'object',
+          description: 'Structured metadata. For tax notebooks ALWAYS populate the financial fields.',
+          properties: {
+            taxCategory: { type: 'string', description: '"income" or "expense"' },
+            amount: { type: 'number', description: 'Amount excluding BTW/VAT' },
+            btwAmount: { type: 'number', description: 'BTW/VAT amount' },
+            btwRate: { type: 'number', description: 'BTW rate: 0, 9, or 21' },
+            totalAmount: { type: 'number', description: 'Total including BTW' },
+            vendor: { type: 'string', description: 'Vendor/customer name' },
+            invoiceNumber: { type: 'string', description: 'Invoice/receipt number' },
+            invoiceDate: { type: 'string', description: 'Invoice date YYYY-MM-DD' },
+            isInvoice: { type: 'boolean', description: 'Whether this is an invoice' },
+            sourceType: { type: 'string', description: '"gmail", "drive", "upload", or "manual"' },
+            emailMessageId: { type: 'string', description: 'Gmail message ID (dedup)' },
+            driveFileId: { type: 'string', description: 'Google Drive file ID (dedup)' },
+          },
+        },
+      },
+      required: ['name', 'content'],
+    },
+  },
 };
 
 /**
- * Execute a notebook document tool call.
- * Unlike workspace tools, these use an in-memory document content passed via context
- * rather than database storage (the frontend is the source of truth for the editor).
+ * Execute a notebook document tool.
+ * @param {string} toolName
+ * @param {object} args
+ * @param {string} documentContent  current document HTML (editor source of truth)
+ * @param {string} [documentMd]     canonical Markdown mirror (derived if absent)
  */
-function executeNotebookDocTool(toolName, args, documentContent) {
-    if (toolName === 'notebook_doc_read') {
-        if (!documentContent || !documentContent.trim() || documentContent === '<p></p>') {
-            return { content: '', message: 'The document is currently empty.' };
-        }
-        return { content: documentContent };
+function executeNotebookDocTool(toolName, args, documentContent, documentMd) {
+  const docMd = (documentMd != null && documentMd !== '')
+    ? documentMd
+    : htmlToMarkdown(documentContent || '');
+
+  if (toolName === 'notebook_doc_read') {
+    if (!docMd || !docMd.trim()) return { content: '', format: 'markdown', message: 'The document is currently empty.' };
+    return { content: docMd, format: 'markdown' };
+  }
+
+  if (toolName === 'notebook_doc_write') {
+    const md = args.content || '';
+    const title = args.title || 'Document';
+    return { _action: 'notebook_doc_update', content: markdownToHtml(md), contentMd: md, title, message: `Document updated: "${title}"` };
+  }
+
+  if (toolName === 'notebook_doc_replace') {
+    const findText = args.find_text;
+    const replaceText = args.replace_text ?? '';
+    if (!findText) return { error: 'find_text is required for notebook_doc_replace.' };
+    if (!docMd || !docMd.trim()) return { error: 'The document is empty. Use notebook_doc_write to create content first.' };
+
+    let newMd = null;
+    if (docMd.includes(findText)) {
+      newMd = docMd.replace(findText, replaceText);
+    } else {
+      const norm = (t) => t.replace(/\s+/g, ' ').trim();
+      if (norm(docMd).includes(norm(findText))) {
+        // Whitespace-flexible regex (markdown rarely has interleaving tags).
+        const re = new RegExp(findText.trim().split(/\s+/).map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s+'), 's');
+        const m = docMd.match(re);
+        if (m) newMd = docMd.replace(m[0], replaceText);
+      }
     }
 
-    if (toolName === 'notebook_doc_write') {
-        const content = args.content || '';
-        const title = args.title || 'Document';
-        return {
-            _action: 'notebook_doc_update',
-            content,
-            title,
-            message: `Document updated: "${title}"`
-        };
+    if (newMd == null) {
+      const norm = (t) => t.replace(/\s+/g, ' ').trim();
+      const words = norm(findText).split(' ').filter(Boolean);
+      let suggestion = '';
+      if (words.length >= 2) {
+        const needle = words.slice(0, Math.min(4, words.length)).join(' ').toLowerCase();
+        const idx = norm(docMd).toLowerCase().indexOf(needle);
+        if (idx >= 0) suggestion = norm(docMd).slice(idx, idx + Math.min(160, norm(findText).length + 60));
+      }
+      const hint = suggestion
+        ? ` The document contains something similar starting with: "${suggestion.slice(0, 160)}…" — use that exact text.`
+        : ' Call notebook_doc_read first to see the exact current Markdown, then retry.';
+      return { error: `Could not find "${findText.slice(0, 100)}${findText.length > 100 ? '…' : ''}" in the document.${hint}` };
     }
 
-    if (toolName === 'notebook_doc_replace') {
-        const findText = args.find_text;
-        const replaceText = args.replace_text ?? '';
+    return {
+      _action: 'notebook_doc_update',
+      content: markdownToHtml(newMd),
+      contentMd: newMd,
+      message: replaceText ? 'Document text replaced successfully.' : 'Document text removed successfully.',
+    };
+  }
 
-        if (!findText) {
-            return { error: 'find_text is required for notebook_doc_replace.' };
-        }
-
-        if (!documentContent) {
-            return { error: 'The document is empty. Use notebook_doc_write to create content first.' };
-        }
-
-        // Strip HTML tags for text matching. Entity decoding covers the common
-        // cases; anything else should compare close enough via the normalized
-        // whitespace pass below. Critically: we strip BOTH sides so the outer
-        // presence-check works whether the AI passes plain text (from the
-        // editor selection) or verbatim HTML (from notebook_doc_read).
-        const stripHtml = (html) => html.replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
-        const normalized = (t) => t.replace(/\s+/g, ' ').trim();
-        const findNorm = normalized(stripHtml(findText));
-        const plainNorm = normalized(stripHtml(documentContent));
-
-        if (plainNorm.includes(findNorm)) {
-            let newContent = documentContent;
-
-            // Try exact match within HTML first — cheapest and safest when the
-            // AI copied the text verbatim from notebook_doc_read.
-            if (documentContent.includes(findText)) {
-                newContent = documentContent.replace(findText, replaceText);
-            } else {
-                // Build a regex that matches the text with optional HTML tags in between.
-                const escapedParts = findText.split(/\s+/).map(word =>
-                    word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-                );
-                const flexibleRegex = new RegExp(
-                    escapedParts.join('(?:<[^>]*>|\\s)*'),
-                    's'
-                );
-                const match = documentContent.match(flexibleRegex);
-                if (match) {
-                    newContent = documentContent.replace(match[0], replaceText);
-                } else {
-                    // Last resort: paragraph-level find by normalized text.
-                    const paragraphs = documentContent.split(/(<\/?(?:p|h[1-3]|li|blockquote|ul|ol)(?:\s[^>]*)?>)/);
-                    let found = false;
-                    let startIdx = -1, endIdx = -1;
-                    let accumulated = '';
-
-                    for (let i = 0; i < paragraphs.length; i++) {
-                        const stripped = stripHtml(paragraphs[i]).trim();
-                        if (!stripped) continue;
-                        accumulated += (accumulated ? ' ' : '') + stripped;
-                        if (startIdx === -1 && normalized(accumulated).includes(findNorm.substring(0, Math.min(20, findNorm.length)))) {
-                            startIdx = i;
-                        }
-                        if (startIdx !== -1 && normalized(accumulated).includes(findNorm)) {
-                            endIdx = i;
-                            found = true;
-                            break;
-                        }
-                    }
-
-                    if (found) {
-                        const before = paragraphs.slice(0, startIdx).join('');
-                        const after = paragraphs.slice(endIdx + 1).join('');
-                        newContent = before + replaceText + after;
-                    } else {
-                        // Shouldn't really reach here — the outer `plainNorm.includes(findNorm)`
-                        // guard already confirmed the text is present somewhere. But if it
-                        // does, give the AI a pointer rather than a dead end.
-                        return {
-                            error: `Text was detected in the document but could not be replaced at an HTML boundary. Try shortening find_text to a single paragraph worth of text, or call notebook_doc_read then copy the exact text.`,
-                        };
-                    }
-                }
-            }
-
-            return {
-                _action: 'notebook_doc_update',
-                content: newContent,
-                message: replaceText ? 'Document text replaced successfully.' : 'Document text removed successfully.'
-            };
-        }
-
-        // Help the AI self-correct: suggest the closest matching phrase from
-        // the document so it can retry notebook_doc_replace with the right
-        // find_text. The naive approach here picks the document chunk whose
-        // leading whitespace-normalized prefix overlaps most with find_text.
-        const words = findNorm.split(' ').filter(Boolean);
-        let suggestion = '';
-        if (words.length >= 2) {
-            const needle = words.slice(0, Math.min(4, words.length)).join(' ').toLowerCase();
-            const plainLc = plainNorm.toLowerCase();
-            const idx = plainLc.indexOf(needle);
-            if (idx >= 0) {
-                suggestion = plainNorm.slice(idx, idx + Math.min(160, findNorm.length + 60));
-            }
-        }
-        const hint = suggestion
-            ? ` The document contains something similar starting with: "${suggestion.slice(0, 160)}…" — use that exact text as find_text.`
-            : ' Call notebook_doc_read first to see the exact current content, then retry.';
-        return {
-            error: `Could not find "${findText.substring(0, 100)}${findText.length > 100 ? '…' : ''}" in the document.${hint}`,
-        };
-    }
-
-    return { error: `Unknown notebook document tool: ${toolName}` };
+  return { error: `Unknown notebook document tool: ${toolName}` };
 }
 
 module.exports = { NOTEBOOK_DOC_TOOLS, NOTEBOOK_ADD_SOURCE_TOOL, executeNotebookDocTool };

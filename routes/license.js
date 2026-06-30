@@ -92,7 +92,7 @@ router.get('/status', licenseLimiter, async (req, res) => {
             const resolved = await resolveUserOrgIds(req);
             if (resolved instanceof Set) orgIds = [...resolved];
         } catch (_) { /* ignore — fall back to direct org only */ }
-        const status = await license.getLicenseStatus({ organizationId: orgId, userId, orgIds });
+        const status = await license.getLicenseStatus({ organizationId: orgId, userId, orgIds, superAdmin: isSuperAdmin(req) });
         res.json(status);
     } catch (e) {
         console.error('[License] status error:', e);
@@ -145,7 +145,7 @@ router.post('/activate', licenseLimiter, async (req, res) => {
                     message: 'A community-tier server licence has no effect (community is the default floor).',
                 });
             }
-            const status = await license.getLicenseStatus({ organizationId: orgId, userId });
+            const status = await license.getLicenseStatus({ organizationId: orgId, userId, superAdmin: isSuperAdmin(req) });
             return res.json({ activated, status });
         }
 
@@ -166,6 +166,7 @@ router.post('/activate', licenseLimiter, async (req, res) => {
         const status = await license.getLicenseStatus({
             organizationId: resolvedScope === 'organization' ? orgId : null,
             userId: resolvedScope === 'consumer' ? userId : null,
+            superAdmin: isSuperAdmin(req),
         });
         res.json({ activated, status });
     } catch (e) {

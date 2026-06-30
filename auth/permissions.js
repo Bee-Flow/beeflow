@@ -162,7 +162,7 @@ const OAUTH_PROVIDERS = {
         authUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
         tokenUrl: 'https://oauth2.googleapis.com/token',
         userInfoUrl: 'https://openidconnect.googleapis.com/v1/userinfo',
-        scopes: ['openid', 'email', 'profile', 'https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.send', 'https://www.googleapis.com/auth/gmail.compose', 'https://www.googleapis.com/auth/calendar', 'https://www.googleapis.com/auth/presentations', 'https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/documents', 'https://www.googleapis.com/auth/contacts', 'https://www.googleapis.com/auth/contacts.readonly']
+        scopes: ['openid', 'email', 'profile', 'https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.send', 'https://www.googleapis.com/auth/gmail.compose', 'https://www.googleapis.com/auth/gmail.modify', 'https://www.googleapis.com/auth/calendar', 'https://www.googleapis.com/auth/presentations', 'https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/documents', 'https://www.googleapis.com/auth/contacts', 'https://www.googleapis.com/auth/contacts.readonly']
     },
     microsoft: {
         name: 'Microsoft',
@@ -218,6 +218,7 @@ function saveConfig(config) {
 
 // Middleware to check authentication
 const { getRedis } = require('../db');
+const _metrics = require('../core/httpMetrics');
 const USER_CHECK_TTL = 5; // seconds
 const PERM_CACHE_TTL = 30; // seconds — permission cache TTL
 
@@ -387,14 +388,16 @@ async function getUserPermissions(userId, session = null) {
     try {
         if (r) {
             const cached = await r.get(permCacheKey);
-            if (cached) return JSON.parse(cached);
+            if (cached) { _metrics.recordCache('permissions', true); return JSON.parse(cached); }
         } else {
             const cached = _permCache.get(userId);
             if (cached && (Date.now() - cached.ts) <= PERM_CACHE_TTL * 1000) {
+                _metrics.recordCache('permissions', true);
                 return cached.perms;
             }
         }
     } catch (_) { /* cache miss — resolve from DB */ }
+    _metrics.recordCache('permissions', false);
 
     try {
         const user = await userStore.getUser(userId);
@@ -781,6 +784,33 @@ async function resolvePrimaryOrgId(req) {
 }
 
 /**
+ * Param-less variant of requireOrgAdmin for routes that always operate on the
+ * CALLER's own org (no :id in the path): the caller must be an org admin (or
+ * super admin) and belong to an organization. Resolves that org and attaches
+ * it as `req.primaryOrgId` for the handler. Super admins act on their own
+ * primary org too — there is deliberately no cross-org override here.
+ */
+function requirePrimaryOrgAdmin() {
+    return async (req, res, next) => {
+        if (!req.session?.user) return res.status(401).json({ error: 'Unauthorized' });
+        const userId = req.session.user.id;
+        const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
+        if (!isSuperAdmin) {
+            const user = await userStore.getUser(userId);
+            if (!user || !isOrgAdminRole(user.orgRole)) {
+                return res.status(403).json({ error: 'Organization admin access required' });
+            }
+        }
+        const orgId = await resolvePrimaryOrgId(req)
+            || req.session.user.organizationId
+            || null;
+        if (!orgId) return res.status(400).json({ error: 'No organization for this account' });
+        req.primaryOrgId = orgId;
+        next();
+    };
+}
+
+/**
  * Studio authorization helper: throws a 403-shaped Error if the requesting
  * user does not belong to `orgId`. If `orgId` is falsy, falls back to the
  * user's primary org. Returns the validated orgId.
@@ -872,6 +902,7 @@ module.exports = {
     resolveUserOrgIds,
     resolvePrimaryOrgId,
     requireOrgAdmin,
+    requirePrimaryOrgAdmin,
     assertUserCanUseOrg,
     validateSharedGroupsForOrg,
     invalidatePermissionCache,

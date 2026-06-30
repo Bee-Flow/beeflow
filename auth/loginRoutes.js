@@ -7,13 +7,16 @@
 
 const express = require('express');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const router = express.Router();
 
 const userStore = require('../stores/userStore');
 const configStore = require('../stores/configStore');
+const mfa = require('./mfa');
 const { loadConfig, saveConfig, requireAuth, requireAdmin, getUserPermissions } = require('./permissions');
 const { getOrCreateUserDEKCompat, setupSSOUserDEK, unlockSSOUserDEK, unlockWithRecoveryKey, secureClear } = require('./encryption');
-const { checkWebSignupAllowed, getSignupAccessConfig } = require('./signupGuards');
+const { checkWebSignupAllowed, getSignupAccessConfig, resolveSignupLocale } = require('./signupGuards');
+const consentGuards = require('./consentGuards');
 
 /**
  * Check if encryption is enabled for a user based on their org's subscription plan.
@@ -68,47 +71,39 @@ router.get('/my-permissions', requireAuth, async (req, res) => {
         }
     } catch (_) { }
 
-    // Resolve beta features for this user
+    // Derive the beta-feature list AND the canUseFeature map from the ONE unified
+    // resolver (the same resolveEntitlements that requireCapability enforces), so
+    // the SPA's UI gates agree with every API gate. Previously these were computed
+    // from a parallel resolver (getUserBetaFeatures + tier/grant math); that
+    // second path could drift, which is what made a page render while its API 403'd.
     let betaFeatures = [];
-    try {
-        const { getUserBetaFeatures } = require('../core/betaFeatures');
-        betaFeatures = await getUserBetaFeatures(userId, req.session);
-    } catch (_) { }
-
-    // Compute a server-aligned `canUseFeature` map for features that the server
-    // gates with `requireLicenseFeature(X) + requireBetaFeature(Y)`. The frontend
-    // should drive UI visibility off this — checking betaFeatures alone leaves
-    // the UI showing for users whose org lacks the licence, then every API call
-    // 403s and the page looks broken.
     const canUseFeature = {};
     try {
-        const { resolveBestTierForRequest } = require('../license/middleware');
-        const licenseTiers = require('../license/tiers');
-        const license = require('../license');
+        const entitlements = require('../core/entitlements');
         const { listCompoundGatedFeatures } = require('../core/betaFeatures');
-        const resolution = await resolveBestTierForRequest(req);
-        const tier = resolution.tier;
-        // Plan-level grants (the plan's allowed_features) extend the tier, so a
-        // feature listed in the org's plan counts as licensed even below its
-        // natural tier. Fetch the union once per org (not per feature) — this
-        // mirrors hasFeature() / requireFeature() / /license/status so the UI
-        // gate and the API gates agree.
-        const grantedFeatures = new Set();
-        for (const orgId of (resolution.orgIds || [])) {
-            for (const f of await license.getOrgGrantedFeatures(orgId)) grantedFeatures.add(f);
-        }
-        // Derived from the BETA_FEATURES registry — every entry with a
-        // licenseFeature is automatically reflected here. Adding a new
-        // compound-gated feature requires only a registry edit, never a
-        // change to this endpoint.
-        for (const g of listCompoundGatedFeatures()) {
-            const hasLicense = licenseTiers.tierHasFeature(tier, g.licenseFeature)
-                || grantedFeatures.has(g.licenseFeature);
-            const hasBeta = betaFeatures.includes(g.id);
-            canUseFeature[g.id] = hasLicense && hasBeta;
+        const snap = await entitlements.resolveEntitlements({
+            userId,
+            orgId: req.session.user?.organizationId || req.session.user?.orgId || null,
+            session: req.session,
+            req,
+        });
+        if (snap && !snap.degraded) {
+            // The granted beta capabilities (effective.beta) — exactly what the
+            // API allows. Drives `user.betaFeatures.includes('X')` UI checks.
+            betaFeatures = Array.isArray(snap.effective?.beta) ? snap.effective.beta.slice() : [];
+            // canUseFeature[id] = the capability is effective (the compound
+            // licence-AND-beta decision is already folded in by the resolver).
+            for (const g of listCompoundGatedFeatures()) {
+                canUseFeature[g.id] = entitlements.snapshotHas(snap, g.id);
+            }
+        } else {
+            // Transient resolver outage — fall back to the legacy beta list so the
+            // UI isn't hard-locked (the API still enforces authoritatively).
+            try { betaFeatures = await require('../core/betaFeatures').getUserBetaFeatures(userId, req.session); } catch (_) { /* leave empty */ }
         }
     } catch (err) {
-        console.warn('[Auth] my-permissions — canUseFeature resolution failed:', err?.message);
+        console.warn('[Auth] my-permissions — entitlement resolution failed:', err?.message);
+        try { betaFeatures = await require('../core/betaFeatures').getUserBetaFeatures(userId, req.session); } catch (_) { /* leave empty */ }
     }
 
     res.json({ permissions: perms, groups: userGroups, organizations: userOrgIds, allowedAgentTypes, betaFeatures, canUseFeature, orgRole: user?.orgRole || '' });
@@ -138,7 +133,7 @@ router.get('/setup-status', async (req, res) => {
     // ── Granular signup toggles (database-backed, fallback to env) ──
     const envAllowSignups = process.env.ALLOW_SIGNUPS !== 'false';
     const allowOrgSignups = envAllowSignups ? ((await configStore.getConfig('signup_org_enabled')) ?? true) : false;
-    const allowConsumerSignups = envAllowSignups ? ((await configStore.getConfig('signup_consumer_enabled')) ?? true) : false;
+    const allowConsumerSignups = envAllowSignups ? ((await configStore.getConfig('signup_consumer_enabled')) ?? false) : false;
     const waitlistEnabled = (await configStore.getConfig('signup_waitlist_enabled')) ?? false;
     const consumerLoginMethods = (await configStore.getConfig('consumer_login_methods')) ?? ['password', 'google', 'microsoft'];
     // Connector-only mode blocks all web signups (org, consumer, OAuth) — hide
@@ -297,33 +292,74 @@ router.post('/admin-login', async (req, res) => {
         return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    // Set session
+    // ── MFA gate ──
+    // If the account has TOTP enabled, hold off on establishing the
+    // authenticated session: stash a pending blob (incl. the password so the
+    // DEK can be derived after the second factor) and ask the client for a
+    // code. NOTE: OPAQUE logins don't pass through here yet — MFA enforcement
+    // for the OPAQUE path is a follow-up.
+    const mfaRow = storedUser || (user.id === 'admin' ? await userStore.getUser('admin') : null);
+    if (mfaRow && mfaRow.mfa_enabled) {
+        req.session.mfaPending = { userId: user.id, isAdmin, user, password };
+        return req.session.save((err) => {
+            if (err) console.error('Session save error:', err);
+            res.json({ mfaRequired: true });
+        });
+    }
+
+    return finalizeLogin(req, res, { user, isAdmin, storedUser, password });
+});
+
+/**
+ * Establish the authenticated session after credentials (and MFA, when
+ * enabled) have been verified. Extracted from /admin-login so the MFA
+ * verify-login path reuses the exact same session-completion logic
+ * (waitlist gate, DEK derivation, recovery-key surfacing).
+ */
+async function finalizeLogin(req, res, { user, isAdmin, storedUser, password }) {
     req.session.isAuthenticated = true;
     req.session.isAdmin = isAdmin;
-    req.session.user = {
-        ...user,
-        isAdmin
-    };
+    req.session.user = { ...user, isAdmin };
 
     // ── Block waitlisted / pending users ──
-    if (storedUser && (storedUser.status === 'waitlist' || storedUser.status === 'pending')) {
+    // Org founders/owners (orgRole 'org_admin') and system admins are never
+    // gated: the founder of an organisation IS its admin/owner, so there's no
+    // one above them to approve — same rationale as the signup-side waitlist
+    // bypass. Without this, a founder whose row is ever left at pending/waitlist
+    // gets re-flagged on every login (the flag persists in the PG session), so
+    // they hit "Awaiting Approval" after each deploy with no way out.
+    const isOwnerOrAdmin = isAdmin || storedUser?.role === 'admin' || storedUser?.orgRole === 'org_admin';
+    // ── Block unverified accounts ──
+    // A fresh signup whose email isn't confirmed yet cannot log in. Distinct
+    // from waitlist/pending so the SPA shows a "verify your email / resend"
+    // state, not "awaiting approval". No DEK is derived here — that happens on
+    // the first real login after verification flips the row to 'active'.
+    // Owners/admins bypass, same rationale as the waitlist gate below.
+    if (storedUser && storedUser.status === 'unverified' && !isOwnerOrAdmin) {
+        req.session.isAuthenticated = false;
+        req.session.isAdmin = false;
+        req.session.user = null;
+        return req.session.save((err) => {
+            if (err) console.error('Session save error:', err);
+            res.json({ success: false, emailVerificationRequired: true });
+        });
+    }
+    if (storedUser && (storedUser.status === 'waitlist' || storedUser.status === 'pending') && !isOwnerOrAdmin) {
         req.session.pendingApproval = true;
-        req.session.save((err) => {
+        return req.session.save((err) => {
             if (err) console.error('Session save error:', err);
             res.json({ success: true, pendingApproval: true, user: req.session.user });
         });
-        return;
     }
     // Derive and store encryption key — only when encryption is enabled for user's plan
     const encryptionEnabled = await isEncryptionEnabledForUser(user.id);
     try {
         if (!encryptionEnabled) {
             // Encryption disabled for this user's plan — skip DEK
-            req.session.save((err) => {
+            return req.session.save((err) => {
                 if (err) console.error('Session save error:', err);
                 res.json({ success: true, user: req.session.user });
             });
-            return;
         }
 
         // Ensure admin user exists in users table (for DEK storage)
@@ -332,12 +368,8 @@ router.post('/admin-login', async (req, res) => {
             if (!adminRow) {
                 const config = await loadConfig();
                 await userStore.createUser({
-                    id: 'admin',
-                    username: 'admin',
-                    displayName: 'Administrator',
-                    passwordHash: config.admin.passwordHash,
-                    role: 'admin',
-                    groups: []
+                    id: 'admin', username: 'admin', displayName: 'Administrator',
+                    passwordHash: config.admin.passwordHash, role: 'admin', groups: [],
                 });
             }
         }
@@ -347,21 +379,214 @@ router.post('/admin-login', async (req, res) => {
             return res.status(401).json({ error: 'Invalid credentials' });
         }
         req.session.encryptionKey = result.encryptionKey;
-        req.session.save((err) => {
+        return req.session.save((err) => {
             if (err) {
                 console.error('Session save error:', err);
                 return res.status(500).json({ error: 'Failed to save session' });
             }
             // Include recovery key in response if DEK was just created or migrated
             const response = { success: true, user: req.session.user };
-            if (result.recoveryKey) {
-                response.recoveryKey = result.recoveryKey;
-            }
+            if (result.recoveryKey) response.recoveryKey = result.recoveryKey;
             res.json(response);
         });
     } catch (err) {
         console.error('[Auth] DEK operation failed:', err.message);
         return res.status(500).json({ error: 'Encryption initialization failed' });
+    }
+}
+
+// MFA — verify the second factor for a pending password login, then complete
+// the session via the shared finalizeLogin path. Gated by session.mfaPending
+// (set by /admin-login) rather than requireAuth (the session isn't
+// authenticated yet).
+router.post('/mfa/verify-login', async (req, res) => {
+    const pending = req.session.mfaPending;
+    if (!pending) return res.status(401).json({ error: 'No pending MFA login' });
+    try {
+        const userRow = await userStore.getUser(pending.userId);
+        if (!userRow || !userRow.mfa_enabled) {
+            delete req.session.mfaPending;
+            return res.status(400).json({ error: 'MFA is not enabled for this account' });
+        }
+        const { code } = req.body || {};
+        const secret = mfa.decryptSecret(userRow.mfa_secret);
+        let ok = mfa.verifyTotp(secret, code);
+        if (!ok) {
+            // Fall back to a one-time recovery code (consumes it).
+            const updated = await mfa.consumeRecoveryCode(userRow.mfa_recovery_codes, code);
+            if (updated) {
+                await userStore.updateUser(pending.userId, { mfaRecoveryCodes: JSON.stringify(updated) });
+                ok = true;
+            }
+        }
+        if (!ok) return res.status(401).json({ error: 'Invalid code' });
+
+        const { user, isAdmin, password } = pending;
+        delete req.session.mfaPending;
+        return finalizeLogin(req, res, { user, isAdmin, storedUser: userRow, password });
+    } catch (err) {
+        console.error('[Auth] MFA verify-login error:', err.message);
+        return res.status(500).json({ error: 'MFA verification failed' });
+    }
+});
+
+// ── Self-service password reset ──────────────────────────────────────────
+// Request a reset link. Always responds 200 (never reveals whether an email
+// exists). The raw token only ever appears in the emailed link; the DB stores
+// SHA-256(token) with a 1-hour expiry.
+router.post('/forgot-password', async (req, res) => {
+    const respond = () => res.json({ success: true });
+    try {
+        const { email } = req.body || {};
+        if (!email || typeof email !== 'string') return respond();
+        const user = await userStore.getUserByEmail(email.trim());
+        // Only password accounts can reset (skip OAuth-only / SSO accounts and
+        // accounts without an email on file).
+        if (!user || !user.email || !user.passwordHash) return respond();
+
+        const token = crypto.randomBytes(32).toString('hex');
+        const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+        const expires = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+        await userStore.updateUser(user.id, {
+            passwordResetTokenHash: tokenHash,
+            passwordResetExpiresAt: expires,
+        });
+
+        const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
+        // Point at the SPA login route, which reads `?reset=<token>` and shows the
+        // "set new password" form (LoginPage.jsx). `/?reset=` lands on the marketing
+        // homepage, which ignores the param, so recovery silently dead-ends (BFSF-239).
+        const resetUrl = `${clientHost}/login?reset=${token}`;
+        const { sendPasswordResetEmail } = require('../utils/emailService');
+        sendPasswordResetEmail({ email: user.email, displayName: user.displayName, resetUrl })
+            .catch(e => console.warn('[Auth] reset email failed:', e.message));
+        return respond();
+    } catch (err) {
+        console.error('[Auth] forgot-password error:', err.message);
+        return respond();
+    }
+});
+
+// Complete a reset with a valid token + a new password.
+router.post('/reset-password', async (req, res) => {
+    const { token, newPassword } = req.body || {};
+    if (!token || !newPassword) return res.status(400).json({ error: 'Token and new password are required' });
+    if (String(newPassword).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    try {
+        const tokenHash = crypto.createHash('sha256').update(String(token)).digest('hex');
+        const user = await userStore.getUserByPasswordResetToken(tokenHash);
+        if (!user || !user.password_reset_expires_at || new Date(user.password_reset_expires_at).getTime() < Date.now()) {
+            return res.status(400).json({ error: 'This reset link is invalid or has expired. Request a new one.' });
+        }
+        const passwordHash = await bcrypt.hash(String(newPassword), 10);
+        await userStore.updateUser(user.id, {
+            passwordHash,
+            passwordResetTokenHash: null,
+            passwordResetExpiresAt: null,
+            passwordResetRequired: 0,
+        });
+        console.log(`[Auth] Password reset completed for user ${user.id}`);
+        return res.json({ success: true });
+    } catch (err) {
+        console.error('[Auth] reset-password error:', err.message);
+        return res.status(500).json({ error: 'Failed to reset password' });
+    }
+});
+
+// ── Email verification ───────────────────────────────────────────────────
+// Confirm an account's email via the emailed link. Path-style token + a
+// 302-redirect that drops the token from the URL (same rationale as
+// /redeem-invite): the raw token never lands in the SPA address bar, the
+// Referer header, or proxy access logs. On success the account flips to
+// 'active' and the welcome email is sent (once) in the user's locale.
+router.get('/verify-email/:token', async (req, res) => {
+    const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
+    try {
+        const raw = String(req.params.token || '');
+        const tokenHash = crypto.createHash('sha256').update(raw).digest('hex');
+        const user = await userStore.getUserByEmailVerificationToken(tokenHash);
+        if (!user) {
+            // No matching token. Could be already-consumed (one-shot) — but we
+            // can't tell which user, so treat as invalid/expired.
+            return res.redirect(`${clientHost}/login?error=verify_expired`);
+        }
+        // Already verified (double-click / token not yet cleared): idempotent success.
+        if (user.status !== 'unverified') {
+            return res.redirect(`${clientHost}/login?verified=1`);
+        }
+        if (!user.email_verification_expires_at || new Date(user.email_verification_expires_at).getTime() < Date.now()) {
+            return res.redirect(`${clientHost}/login?error=verify_expired`);
+        }
+
+        await userStore.updateUser(user.id, {
+            status: 'active',
+            emailVerifiedAt: new Date().toISOString(),
+            emailVerificationTokenHash: null,
+            emailVerificationExpiresAt: null,
+        });
+        console.log(`[Auth] Email verified for user ${user.id}`);
+        try {
+            await userStore.logAccessAudit('user.email_verified', 'user', user.id, user.id, null, { email: user.email }, user.organizationId || null);
+        } catch (_) { /* best-effort */ }
+
+        // Welcome email (once) — now that the account is active.
+        if (user.email) {
+            Promise.resolve().then(async () => {
+                try {
+                    const claimed = await userStore.claimNotification('user', user.id, 'welcome_email', user.email);
+                    if (!claimed) return;
+                    const orgName = user.organizationId ? (await userStore.getOrganization(user.organizationId))?.name : '';
+                    const { sendWelcomeEmail } = require('../utils/emailService');
+                    await sendWelcomeEmail({ email: user.email, displayName: user.displayName, loginUrl: clientHost, orgName, locale: user.preferred_locale });
+                } catch (e) { console.warn('[Auth] welcome email after verify failed:', e.message); }
+            });
+        }
+
+        return res.redirect(`${clientHost}/login?verified=1`);
+    } catch (err) {
+        console.error('[Auth] verify-email error:', err.message);
+        return res.redirect(`${clientHost}/login?error=verify_error`);
+    }
+});
+
+// Resend a verification link. Always responds 200 (never reveals whether an
+// account exists or its status). Throttled: refuses to regenerate if a token
+// was issued in the last 60 seconds.
+router.post('/resend-verification', async (req, res) => {
+    const respond = () => res.json({ success: true });
+    try {
+        const { email } = req.body || {};
+        if (!email || typeof email !== 'string') return respond();
+        const user = await userStore.getUserByEmail(email.trim());
+        if (!user || user.status !== 'unverified' || !user.email || !user.passwordHash) return respond();
+
+        // Throttle: if the current token is younger than 60s (24h TTL), skip.
+        if (user.email_verification_expires_at) {
+            const issuedAt = new Date(user.email_verification_expires_at).getTime() - 24 * 60 * 60 * 1000;
+            if (Date.now() - issuedAt < 60 * 1000) return respond();
+        }
+
+        const token = crypto.randomBytes(32).toString('hex');
+        const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+        const expires = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+        await userStore.updateUser(user.id, {
+            emailVerificationTokenHash: tokenHash,
+            emailVerificationExpiresAt: expires,
+        });
+
+        const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
+        const verifyUrl = `${clientHost}/auth/verify-email/${token}`;
+        const orgName = user.organizationId ? (await userStore.getOrganization(user.organizationId))?.name : '';
+        const { sendVerificationEmail } = require('../utils/emailService');
+        sendVerificationEmail({ email: user.email, displayName: user.displayName, verifyUrl, orgName, locale: user.preferred_locale })
+            .catch(e => console.warn('[Auth] resend verification email failed:', e.message));
+        try {
+            await userStore.logAccessAudit('user.verification_resent', 'user', user.id, user.id, null, { email: user.email }, user.organizationId || null);
+        } catch (_) { /* best-effort */ }
+        return respond();
+    } catch (err) {
+        console.error('[Auth] resend-verification error:', err.message);
+        return respond();
     }
 });
 
@@ -457,6 +682,47 @@ router.get('/user', async (req, res) => {
             noOrganization: req.session.noOrganization || false,
             isConsumerAccount: !freshUser?.organizationId && !req.session.noOrganization && (process.env.DEPLOYMENT_MODE || 'cloud') === 'cloud',
             pendingApproval: req.session.pendingApproval || false,
+            // Forced MFA enrollment for username/password accounts. Derived LIVE
+            // from the fresh DB row (not a sticky session flag — that's the bug
+            // class we just fixed for pendingApproval), so it self-clears the
+            // moment the user enrols. SSO accounts are exempt (their IdP owns
+            // MFA). The built-in admin is included even before it has a users
+            // row. Gated by an admin toggle, default ON.
+            mfaSetupRequired: await (async () => {
+                try {
+                    const configStore = require('../stores/configStore');
+                    const required = (await configStore.getConfig('require_mfa_for_password_accounts')) ?? true;
+                    if (!required) return false;
+                    if (freshUser?.mfa_enabled) return false;            // already enrolled
+                    const isSso = !!req.session.oauthProvider ||
+                                  (freshUser?.provider && freshUser.provider !== 'local');
+                    if (isSso) return false;                             // Google/Microsoft own MFA
+                    if (req.session.isAdmin || freshUser?.role === 'admin') return true; // admin included (row may not exist yet)
+                    return !!freshUser?.passwordHash;                    // local password account
+                } catch (_) { return false; }
+            })(),
+            // Re-consent gate. When a consent-bound legal document's version is
+            // bumped, surface the stale docs so the SPA renders <ReconsentGate/>.
+            // Derived LIVE from the user's accepted-versions summary vs the
+            // registry, so it self-clears the instant they accept. Exempt: the
+            // platform admin, NC connector-provisioned users (covered by their
+            // org's acceptance), and pending/waitlist users (not yet provisioned).
+            ...(await (async () => {
+                try {
+                    if (req.session.isAdmin || freshUser?.role === 'admin') return { needsReconsent: false };
+                    const ap = freshUser?.auto_provisioned;
+                    const isConnector = freshUser?.provider === 'nextcloud' || ap === true || ap === 't' || ap === 1;
+                    const status = freshUser?.status || 'active';
+                    if (isConnector || status === 'pending' || status === 'waitlist' || req.session.pendingApproval) {
+                        return { needsReconsent: false };
+                    }
+                    const accountType = (freshUser?.orgRole === 'org_admin')
+                        ? 'org_admin'
+                        : (freshUser?.organizationId ? 'org_member' : 'consumer');
+                    const r = await consentGuards.needsReconsent(freshUser.id, accountType);
+                    return { needsReconsent: r.needsReconsent, reconsentDocs: r.docs };
+                } catch (_) { return { needsReconsent: false }; }
+            })()),
             // NC App Store onboarding wizard gate. When the connector has
             // bootstrapped a fresh org but the admin hasn't completed the
             // 4-step setup wizard yet, we surface that to the SPA so it
@@ -575,6 +841,149 @@ router.get('/user', async (req, res) => {
             user: null,
             isOAuthConfigured: !!(config.oauth.clientId && config.oauth.clientSecret)
         });
+    }
+});
+
+// POST /auth/accept-terms — record re-acceptance of updated legal documents.
+// Posted by the <ReconsentGate/> modal. Validates against the CURRENT registry
+// for the user's account type, writes ledger rows (method 'reconsent') and
+// refreshes the user's accepted-versions summary.
+router.post('/accept-terms', async (req, res) => {
+    if (!req.session.isAuthenticated || !req.session.user) {
+        return res.status(401).json({ error: 'Not authenticated' });
+    }
+    try {
+        const freshUser = await userStore.getUser(req.session.user.id);
+        if (!freshUser) return res.status(401).json({ error: 'Not authenticated' });
+
+        const accountType = (freshUser.orgRole === 'org_admin')
+            ? 'org_admin'
+            : (freshUser.organizationId ? 'org_member' : 'consumer');
+
+        // The gate already presented the (subset of) stale documents; we only
+        // require the affirmative tick here. recordConsent then re-affirms the
+        // full required set at the current versions, clearing needsReconsent.
+        const accepted = req.body?.consent?.accepted === true || req.body?.accepted === true;
+        const v = consentGuards.validateConsent({ accepted }, accountType);
+        if (!v.ok) return res.status(v.status).json({ error: v.error, code: v.code, missing: v.missing });
+
+        await consentGuards.recordConsent({
+            userId: freshUser.id,
+            email: freshUser.email,
+            accountType,
+            req,
+            method: 'reconsent',
+            organizationId: freshUser.organizationId || null,
+        });
+
+        res.json({ success: true });
+    } catch (e) {
+        console.error('[accept-terms] error:', e.message);
+        res.status(500).json({ error: 'Failed to record acceptance' });
+    }
+});
+
+// GET /auth/consents — full consent status for the settings consent center.
+// Returns the required documents (with the user's accepted version + date), the
+// optional (marketing) consents with current state, and the needsReconsent flag.
+router.get('/consents', async (req, res) => {
+    if (!req.session.isAuthenticated || !req.session.user) {
+        return res.status(401).json({ error: 'Not authenticated' });
+    }
+    try {
+        const documentRegistry = require('../legal/documentRegistry');
+        const legalDocs = require('../i18n/defaults/legalDocs');
+        const freshUser = await userStore.getUser(req.session.user.id);
+        if (!freshUser) return res.status(401).json({ error: 'Not authenticated' });
+
+        const accountType = (freshUser.orgRole === 'org_admin')
+            ? 'org_admin'
+            : (freshUser.organizationId ? 'org_member' : 'consumer');
+
+        const required = documentRegistry.requiredDocsFor(accountType);
+        const summary = await userStore.getConsentSummary(freshUser.id);
+
+        // Latest acceptance timestamp per docId (rows come back created_at DESC).
+        const ledger = await userStore.getConsentAcceptances(freshUser.id, 500);
+        const latestAt = {};
+        for (const row of ledger) {
+            if (row.doc_id && !(row.doc_id in latestAt)) latestAt[row.doc_id] = row.created_at;
+        }
+
+        const documents = required.map(d => {
+            const def = legalDocs.getLegalDefault(d.docId) || {};
+            const acceptedVersion = summary[d.docId] != null ? Number(summary[d.docId]) : null;
+            return {
+                docId: d.docId,
+                title: def.title || d.docId,
+                version: d.version,
+                route: def.route || d.urlPath,
+                acceptedVersion,
+                accepted: acceptedVersion === Number(d.version),
+                acceptedAt: latestAt[d.docId] || null,
+                upToDate: acceptedVersion === Number(d.version),
+            };
+        });
+
+        const optState = await userStore.getOptionalConsents(freshUser.id);
+        const optional = documentRegistry.optionalConsents()
+            .filter(c => c.enabled !== false)
+            .map(c => ({
+                id: c.id,
+                category: c.category,
+                version: c.version,
+                labelKey: c.labelKey || null,
+                granted: !!(optState[c.id] && optState[c.id].granted),
+                updatedAt: (optState[c.id] && optState[c.id].updatedAt) || null,
+            }));
+
+        const rec = await consentGuards.needsReconsent(freshUser.id, accountType);
+        res.json({ accountType, documents, optional, needsReconsent: rec.needsReconsent });
+    } catch (e) {
+        console.error('[consents] error:', e.message);
+        res.status(500).json({ error: 'Failed to load consents' });
+    }
+});
+
+// POST /auth/consents/optional — grant/withdraw an optional (marketing) consent.
+// body: { id, granted }. Records a grant/withdraw ledger row and updates state.
+router.post('/consents/optional', async (req, res) => {
+    if (!req.session.isAuthenticated || !req.session.user) {
+        return res.status(401).json({ error: 'Not authenticated' });
+    }
+    try {
+        const documentRegistry = require('../legal/documentRegistry');
+        const { id, granted } = req.body || {};
+        const consent = documentRegistry.getOptionalConsent(id);
+        if (!consent || consent.enabled === false) {
+            return res.status(400).json({ error: 'Unknown consent' });
+        }
+        const freshUser = await userStore.getUser(req.session.user.id);
+        if (!freshUser) return res.status(401).json({ error: 'Not authenticated' });
+
+        const grantedBool = granted === true;
+        await userStore.recordConsentAcceptance({
+            userId: freshUser.id,
+            email: freshUser.email,
+            accountType: freshUser.organizationId ? 'org' : 'consumer',
+            docId: consent.id,
+            docVersion: consent.version,
+            docSha256: null,
+            method: grantedBool ? 'consent_grant' : 'consent_withdraw',
+            route: req.originalUrl,
+            ip: consentGuards.auditClientIp(req),
+            userAgent: req.headers['user-agent'] || null,
+            organizationId: freshUser.organizationId || null,
+        });
+
+        const state = await userStore.getOptionalConsents(freshUser.id);
+        state[consent.id] = { granted: grantedBool, version: consent.version, updatedAt: new Date().toISOString() };
+        await userStore.setOptionalConsents(freshUser.id, state);
+
+        res.json({ success: true, id: consent.id, granted: grantedBool });
+    } catch (e) {
+        console.error('[consents/optional] error:', e.message);
+        res.status(500).json({ error: 'Failed to update consent' });
     }
 });
 
@@ -798,13 +1207,22 @@ router.post('/pending-signup', async (req, res) => {
     if (!gate.ok) return res.status(gate.status).json({ error: gate.error, code: gate.code });
     const { signupType, authMethod, newOrgName, orgDetails } = req.body;
 
+    // ── Legal consent gate (OAuth entry) ─────────────────────────
+    // Validate the acceptance now and carry it through the session into the JIT
+    // OAuth callback, where the actual user row is created and the ledger written.
+    const consentAccountType = signupType === 'consumer' ? 'consumer' : 'org_admin';
+    {
+        const v = consentGuards.validateConsent(req.body.consent, consentAccountType);
+        if (!v.ok) return res.status(v.status).json({ error: v.error, code: v.code, missing: v.missing });
+    }
+
     // Consumer OAuth signup
     if (signupType === 'consumer') {
-        const consumerSignupsEnabled = (await configStore.getConfig('signup_consumer_enabled')) ?? true;
+        const consumerSignupsEnabled = (await configStore.getConfig('signup_consumer_enabled')) ?? false;
         if (!consumerSignupsEnabled) {
             return res.status(403).json({ error: 'Consumer registration is currently disabled.' });
         }
-        req.session.pendingSignup = { signupType: 'consumer', authMethod: authMethod || 'google' };
+        req.session.pendingSignup = { signupType: 'consumer', authMethod: authMethod || 'google', consent: { accepted: true, accountType: 'consumer' } };
         return req.session.save((err) => {
             if (err) {
                 console.error('[PendingSignup] Session save error:', err);
@@ -823,7 +1241,7 @@ router.post('/pending-signup', async (req, res) => {
     if (!newOrgName) {
         return res.status(400).json({ error: 'Organization name is required' });
     }
-    req.session.pendingSignup = { newOrgName, orgDetails: orgDetails || {} };
+    req.session.pendingSignup = { newOrgName, orgDetails: orgDetails || {}, consent: { accepted: true, accountType: 'org_admin' } };
     req.session.save((err) => {
         if (err) {
             console.error('[PendingSignup] Session save error:', err);
@@ -840,20 +1258,36 @@ router.post('/pending-signup', async (req, res) => {
 router.get('/admin/signup-settings', requireAdmin, async (req, res) => {
     try {
         const orgEnabled = (await configStore.getConfig('signup_org_enabled')) ?? true;
-        const consumerEnabled = (await configStore.getConfig('signup_consumer_enabled')) ?? true;
+        const consumerEnabled = (await configStore.getConfig('signup_consumer_enabled')) ?? false;
         const waitlistEnabled = (await configStore.getConfig('signup_waitlist_enabled')) ?? false;
+        const emailVerificationEnabled = (await configStore.getConfig('signup_email_verification_enabled')) ?? false;
+        // Whether the platform can actually send the verification email — the UI
+        // uses this to warn that the toggle is a no-op without service email.
+        let serviceEmailConfigured = false;
+        try { serviceEmailConfigured = (await require('../utils/emailService').getServiceEmailConfig()).configured; } catch (_) { /* ignore */ }
+        const requireMfaForPasswordAccounts = (await configStore.getConfig('require_mfa_for_password_accounts')) ?? true;
         const consumerLoginMethods = (await configStore.getConfig('consumer_login_methods')) ?? ['password', 'google', 'microsoft'];
         const access = await getSignupAccessConfig();
+        // The ALLOW_SIGNUPS env var is a global kill-switch the public
+        // /setup-status applies but these DB toggles don't reflect — surface it
+        // so the admin can see *why* the Create Account button is hidden.
+        const allowSignupsEnv = process.env.ALLOW_SIGNUPS !== 'false';
         res.json({
             allowOrgSignups: orgEnabled,
             allowConsumerSignups: consumerEnabled,
             waitlistEnabled,
+            emailVerificationEnabled,
+            serviceEmailConfigured,
+            requireMfaForPasswordAccounts,
             consumerLoginMethods,
             connectorOnly: access.connectorOnly,
             geoMode: access.geoMode,
             geoCountries: access.geoCountries,
             geoBlockUnknown: access.geoBlockUnknown,
             geoApplyConnector: access.geoApplyConnector,
+            // Effective signup state after all overrides (env + connector-only).
+            allowSignupsEnv,
+            effectiveAllowSignups: (orgEnabled || consumerEnabled) && !access.connectorOnly && allowSignupsEnv,
         });
     } catch (err) {
         console.error('[Auth] Failed to get signup settings:', err.message);
@@ -863,14 +1297,16 @@ router.get('/admin/signup-settings', requireAdmin, async (req, res) => {
 
 router.put('/admin/signup-settings', requireAdmin, async (req, res) => {
     try {
-        const { allowOrgSignups, allowConsumerSignups, waitlistEnabled, consumerLoginMethods,
+        const { allowOrgSignups, allowConsumerSignups, waitlistEnabled, emailVerificationEnabled, requireMfaForPasswordAccounts, consumerLoginMethods,
                 connectorOnly, geoMode, geoCountries, geoBlockUnknown, geoApplyConnector } = req.body;
 
         // Snapshot current values for the audit trail before mutating.
         const snapshot = async () => ({
             signup_org_enabled: (await configStore.getConfig('signup_org_enabled')) ?? true,
-            signup_consumer_enabled: (await configStore.getConfig('signup_consumer_enabled')) ?? true,
+            signup_consumer_enabled: (await configStore.getConfig('signup_consumer_enabled')) ?? false,
             signup_waitlist_enabled: (await configStore.getConfig('signup_waitlist_enabled')) ?? false,
+            signup_email_verification_enabled: (await configStore.getConfig('signup_email_verification_enabled')) ?? false,
+            require_mfa_for_password_accounts: (await configStore.getConfig('require_mfa_for_password_accounts')) ?? true,
             consumer_login_methods: (await configStore.getConfig('consumer_login_methods')) ?? ['password', 'google', 'microsoft'],
             ...(await getSignupAccessConfig()),
         });
@@ -884,6 +1320,12 @@ router.put('/admin/signup-settings', requireAdmin, async (req, res) => {
         }
         if (typeof waitlistEnabled === 'boolean') {
             await configStore.setConfig('signup_waitlist_enabled', waitlistEnabled);
+        }
+        if (typeof emailVerificationEnabled === 'boolean') {
+            await configStore.setConfig('signup_email_verification_enabled', emailVerificationEnabled);
+        }
+        if (typeof requireMfaForPasswordAccounts === 'boolean') {
+            await configStore.setConfig('require_mfa_for_password_accounts', requireMfaForPasswordAccounts);
         }
         if (Array.isArray(consumerLoginMethods)) {
             const valid = consumerLoginMethods.filter(m => ['password', 'google', 'microsoft'].includes(m));
@@ -1019,6 +1461,19 @@ router.post('/signup', async (req, res) => {
         if (!gate.ok) return res.status(gate.status).json({ error: gate.error, code: gate.code });
     }
 
+    // ── Legal consent gate (clickwrap) ───────────────────────────
+    // Re-derive the account type server-side and validate against the document
+    // registry — never trust the client's claimed required-doc list. Invited
+    // users still accept (an invite is org-scoped). Only the NC connector JIT
+    // path is exempt, and it does not go through this route.
+    const consentAccountType = newOrgName ? 'org_admin'
+        : (organizationId || inviteData) ? 'org_member'
+            : 'consumer';
+    {
+        const v = consentGuards.validateConsent(req.body.consent, consentAccountType);
+        if (!v.ok) return res.status(v.status).json({ error: v.error, code: v.code, missing: v.missing });
+    }
+
     let groups = [];
     let orgId = inviteData ? inviteData.organization_id : organizationId;
 
@@ -1077,40 +1532,14 @@ router.post('/signup', async (req, res) => {
             console.log(`[Signup] Assigned default plan '${defaultPlan.name}' to org ${orgId}`);
         }
 
-        // Configure privacy shield based on selected level
-        const privacyLevel = od.privacyLevel || 'off';
-        if (privacyLevel !== 'off') {
-            const configStore = require('../stores/configStore');
-            const BASIC_CATEGORIES = ['violence_and_threats', 'hate_and_discrimination', 'dangerous_and_criminal_content', 'selfharm', 'sexual', 'health', 'financial', 'law'];
-            const STRICT_CATEGORIES = [...BASIC_CATEGORIES, 'pii'];
-            const selectedCategories = privacyLevel === 'strict' ? STRICT_CATEGORIES : BASIC_CATEGORIES;
-
-            // For strict mode, auto-include PII-related regex collections
-            let autoCollectionIds = [];
-            if (privacyLevel === 'strict') {
-                try {
-                    const { getAIConfig } = require('../core/aiAgent');
-                    const aiCfg = await getAIConfig();
-                    const collections = aiCfg.regexGuardrails?.collections || [];
-                    autoCollectionIds = collections
-                        .filter(c => c.name && c.name.toLowerCase().includes('pii'))
-                        .map(c => c.id);
-                } catch (e) { /* ignore */ }
-            }
-
-            const shieldConfig = {
-                enabled: true,
-                collectionIds: autoCollectionIds,
-                scope: { userInput: true, agentOutput: true },
-                action: 'delete',
-                moderationEnabled: true,
-                moderationCategories: selectedCategories,
-                euModeEnabled: !!od.euModeEnabled,
-                updatedAt: new Date().toISOString(),
-                updatedBy: 'system-signup',
-            };
+        // Configure the org Privacy Shield from the wizard's PII-detection
+        // choices. Writes the real piiDetection* fields the runtime consumes
+        // (identical to Settings → Privacy Shield); null = shield off.
+        const { buildSignupShieldConfig } = require('../core/signupShield');
+        const shieldConfig = buildSignupShieldConfig(od);
+        if (shieldConfig) {
             await configStore.setConfig(`org_privacy_shield_${orgId}`, shieldConfig);
-            console.log(`[Signup] Privacy shield set to '${privacyLevel}' for org ${orgId}`);
+            console.log(`[Signup] Privacy shield for org ${orgId}: ${shieldConfig.piiDetectionCategories.length} PII categories, action=${shieldConfig.piiDetectionAction}`);
         }
 
         // User gets org_admin role — no default group is created
@@ -1128,7 +1557,7 @@ router.post('/signup', async (req, res) => {
         var userStatus = (inviteData || org.allowSignup) ? 'active' : 'pending';
     } else if ((process.env.DEPLOYMENT_MODE || 'cloud') === 'cloud') {
         // ── Granular check: consumer signups ──
-        const consumerSignupsEnabled = (await configStore.getConfig('signup_consumer_enabled')) ?? true;
+        const consumerSignupsEnabled = (await configStore.getConfig('signup_consumer_enabled')) ?? false;
         if (!consumerSignupsEnabled) {
             return res.status(403).json({ error: 'Consumer account registration is currently disabled.' });
         }
@@ -1144,12 +1573,42 @@ router.post('/signup', async (req, res) => {
     const passwordHash = await bcrypt.hash(password, 10);
     let resolvedStatus = typeof userStatus !== 'undefined' ? userStatus : 'active';
 
-    // ── Waitlist override (invited users bypass) ──
-    if (resolvedStatus === 'active' && !inviteData) {
+    // ── Waitlist override ──
+    // Invited users and new-org founders bypass the waitlist: an invite is its
+    // own approval, and the founder of a new organisation IS its admin/owner,
+    // so there's no one else to approve them. The waitlist still gates consumer
+    // signups and people self-joining an existing org.
+    if (resolvedStatus === 'active' && !inviteData && !newOrgName) {
         const waitlistOn = (await configStore.getConfig('signup_waitlist_enabled')) ?? false;
         if (waitlistOn) {
             resolvedStatus = 'waitlist';
             console.log(`[Signup] Waitlist mode — user '${username}' placed on waitlist`);
+        }
+    }
+
+    // ── Email verification gate ──
+    // When enabled (and service email is configured), a fresh local password
+    // signup with an email is created 'unverified' and must confirm via a link
+    // before it can log in. Fail-open: if the toggle is off, there's no email,
+    // it's an invited user (already trusted), or service email isn't set up,
+    // skip verification so no one is ever locked out. Only layered on accounts
+    // that would otherwise go straight to 'active' (waitlist/pending already gate).
+    let needsVerification = false;
+    if (resolvedStatus === 'active' && email && !inviteData) {
+        const verifyOn = (await configStore.getConfig('signup_email_verification_enabled')) ?? false;
+        if (verifyOn) {
+            try {
+                const { getServiceEmailConfig } = require('../utils/emailService');
+                const svc = await getServiceEmailConfig();
+                if (svc.configured) {
+                    needsVerification = true;
+                    resolvedStatus = 'unverified';
+                } else {
+                    console.warn('[Signup] email verification enabled but service email not configured — skipping (fail-open)');
+                }
+            } catch (e) {
+                console.warn('[Signup] verification gate check failed — skipping (fail-open):', e.message);
+            }
         }
     }
 
@@ -1179,6 +1638,51 @@ router.post('/signup', async (req, res) => {
             return res.status(403).json({ error: 'seat_cap_exceeded', current: e.current, max: e.max });
         }
         throw e;
+    }
+
+    // ── Record legal consent (append-only ledger) ────────────────
+    // The gate above already enforced acceptance; record one ledger row per
+    // required document now that the user row exists. Done before the auto-login
+    // session save so the evidence persists even if the session save later fails.
+    try {
+        await consentGuards.recordConsent({
+            userId: newUser.id,
+            email: newUser.email,
+            accountType: consentAccountType,
+            req,
+            method: inviteToken ? 'invite' : 'clickwrap',
+            organizationId: orgId || null,
+        });
+    } catch (e) { console.error('[Signup] consent record failed:', e.message); }
+
+    // ── Persist preferred locale + (optionally) issue verification token ──
+    // preferred_locale drives the language of this user's transactional emails
+    // (verification, welcome, and later password reset).
+    const preferredLocale = await resolveSignupLocale(req);
+    try { await userStore.updateUser(newUser.id, { preferredLocale }); }
+    catch (e) { console.warn('[Signup] failed to persist preferred locale:', e.message); }
+
+    if (needsVerification) {
+        try {
+            const token = crypto.randomBytes(32).toString('hex');
+            const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+            const expires = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+            await userStore.updateUser(newUser.id, {
+                emailVerificationTokenHash: tokenHash,
+                emailVerificationExpiresAt: expires,
+            });
+            const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
+            const verifyUrl = `${clientHost}/auth/verify-email/${token}`;
+            const orgName = orgId ? (await userStore.getOrganization(orgId))?.name : '';
+            const { sendVerificationEmail } = require('../utils/emailService');
+            sendVerificationEmail({ email, displayName: newUser.displayName, verifyUrl, orgName, locale: preferredLocale })
+                .catch(e => console.warn('[Signup] verification email failed:', e.message));
+            try {
+                await userStore.logAccessAudit('user.email_verification_sent', 'user', newUser.id, newUser.id, null, { email }, orgId || null);
+            } catch (_) { /* best-effort */ }
+        } catch (e) {
+            console.error('[Signup] failed to issue verification token:', e.message);
+        }
     }
 
     // ── Auto-grant consumer trial (fire-and-forget) ─────────────
@@ -1224,6 +1728,14 @@ router.post('/signup', async (req, res) => {
         }
     }
 
+    // ── Email verification required — do NOT log in, do NOT create a DEK ──
+    // The account exists as 'unverified'. The DEK is derived on the first real
+    // login after the user confirms via the emailed link. The SPA shows a
+    // "check your inbox" state and offers POST /auth/resend-verification.
+    if (needsVerification) {
+        return res.json({ success: true, emailVerificationRequired: true });
+    }
+
     // If user is pending approval or waitlisted, notify but don't fully log in
     if (resolvedStatus === 'pending' || resolvedStatus === 'waitlist') {
         req.session.isAuthenticated = true;
@@ -1239,6 +1751,23 @@ router.post('/signup', async (req, res) => {
             res.json({ success: true, pendingApproval: true, user: req.session.user });
         });
         return;
+    }
+
+    // ── Welcome email (once) for accounts that are active on creation ──
+    // (Verified signups get their welcome at verify time instead.) Guarded by
+    // claimNotification so refreshes/retries never double-send.
+    if (email) {
+        const welcomeLocale = preferredLocale;
+        Promise.resolve().then(async () => {
+            try {
+                const claimed = await userStore.claimNotification('user', newUser.id, 'welcome_email', email);
+                if (!claimed) return;
+                const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
+                const orgName = orgId ? (await userStore.getOrganization(orgId))?.name : '';
+                const { sendWelcomeEmail } = require('../utils/emailService');
+                await sendWelcomeEmail({ email, displayName: newUser.displayName, loginUrl: clientHost, orgName, locale: welcomeLocale });
+            } catch (e) { console.warn('[Signup] welcome email failed:', e.message); }
+        });
     }
 
     // Auto-login after signup
@@ -1296,7 +1825,7 @@ router.get('/invite/:token', async (req, res) => {
     }
 });
 
-// Invitation landing handler. The email link is `/api/auth/redeem-invite/<token>`
+// Invitation landing handler. The email link is `/auth/redeem-invite/<token>`
 // (path-style — the token is on the URL path, not in a query string). This
 // endpoint validates the token, stashes it in the session, and 302-redirects
 // to the SPA login route WITHOUT the token in the URL. That keeps the token

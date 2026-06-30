@@ -12,51 +12,17 @@
  * org's vault; rotating one org doesn't touch the others.
  */
 
-const crypto = require('crypto');
 const { run, getOne, getAll, exec } = require('../db');
 
-// ── Per-org key derivation ──────────────────────────────────────────
-function _orgVaultKey(orgId) {
-    if (!orgId) throw new Error('routineCredentialStore: orgId required');
-    const master = process.env.MASTER_ENCRYPTION_KEY;
-    if (!master) throw new Error('MASTER_ENCRYPTION_KEY env var is required for routine vault');
-    return crypto.createHmac('sha256', master)
-        .update(`beeflow:routine-vault:v1:org:${orgId}`)
-        .digest();
-}
-
-function _encrypt(plaintext, orgId) {
-    if (!plaintext) return null;
-    const key = _orgVaultKey(orgId);
-    const iv = crypto.randomBytes(12);
-    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-    const data = Buffer.concat([cipher.update(String(plaintext), 'utf8'), cipher.final()]);
-    return JSON.stringify({
-        _encrypted: 'routine-vault-v1',
-        iv: iv.toString('hex'),
-        authTag: cipher.getAuthTag().toString('hex'),
-        data: data.toString('hex'),
-    });
-}
-
-function _decrypt(stored, orgId) {
-    if (!stored) return null;
-    let envelope;
-    try { envelope = JSON.parse(stored); } catch (_) { return null; }
-    if (!envelope || envelope._encrypted !== 'routine-vault-v1') return null;
-    try {
-        const key = _orgVaultKey(orgId);
-        const iv = Buffer.from(envelope.iv, 'hex');
-        const authTag = Buffer.from(envelope.authTag, 'hex');
-        const data = Buffer.from(envelope.data, 'hex');
-        const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-        decipher.setAuthTag(authTag);
-        return decipher.update(data) + decipher.final('utf8');
-    } catch (err) {
-        console.warn(`[RoutineCredentialStore] decrypt failed for org ${orgId}: ${err.message}`);
-        return null;
-    }
-}
+// ── Per-org key derivation — shared with integrationConnectionStore ──
+// The envelope/key scheme lives in orgVault so routine_credentials and
+// integration_connections ciphertext are interchangeable (same `routine-vault-v1`
+// envelope, same per-org key). These thin aliases preserve the original names
+// + `_internals` export below.
+const orgVault = require('./orgVault');
+const _orgVaultKey = orgVault.orgVaultKey;
+const _encrypt = orgVault.encrypt;
+const _decrypt = orgVault.decrypt;
 
 // ── Schema ──────────────────────────────────────────────────────────
 let initialized = false;

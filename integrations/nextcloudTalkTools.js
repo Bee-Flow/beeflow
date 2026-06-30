@@ -61,6 +61,49 @@ const NEXTCLOUD_TALK_TOOLS = [
     {
         type: 'function',
         function: {
+            name: 'nextcloud_talk_list_participants',
+            description: 'List the participants of a Talk room (display names, actor ids, participant type, in-call flags). Use to attribute speakers or check who is a moderator.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    token: { type: 'string', description: 'Room token.' }
+                },
+                required: ['token']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_talk_start_recording',
+            description: 'Start recording the active call in a Talk room. Moderator/owner only; requires the recording backend. status: 2 = audio-only, 1 = video.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    token: { type: 'string', description: 'Room token.' },
+                    status: { type: 'integer', description: '2 = audio-only (default), 1 = video.' }
+                },
+                required: ['token']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'nextcloud_talk_stop_recording',
+            description: 'Stop the active call recording in a Talk room. Moderator/owner only.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    token: { type: 'string', description: 'Room token.' }
+                },
+                required: ['token']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
             name: 'nextcloud_talk_list_messages',
             description: 'Fetch the most recent messages from a Talk room. Returns id, actor, message text, mentions, reactions, parent (for replies), timestamp.',
             parameters: {
@@ -193,10 +236,89 @@ function mapRoom(r) {
         unreadMention: r.unreadMention,
         lastActivity: r.lastActivity,
         lastMessage: r.lastMessage ? { id: r.lastMessage.id, actor: r.lastMessage.actorDisplayName, message: r.lastMessage.message, timestamp: r.lastMessage.timestamp } : null,
-        participantType: r.participantType,
+        participantType: r.participantType,   // 1=owner, 2=moderator (may start recording)
         canStartCall: r.canStartCall,
         readOnly: r.readOnly,
+        // Call + recording state (used by auto-record). callRecording: 0 none,
+        // 1 video, 2 audio, 3 starting-video, 4 starting-audio.
+        hasCall: !!r.hasCall,
+        callFlag: r.callFlag,
+        callRecording: r.callRecording,
+        callStartTime: r.callStartTime,
+        // objectType 'event' (+ objectId '<startUnix>#<endUnix>') when the room
+        // was created from a calendar event.
+        objectType: r.objectType || '',
+        objectId: r.objectId || '',
     };
+}
+
+function mapParticipant(p) {
+    return {
+        attendeeId: p.attendeeId,
+        actorType: p.actorType,
+        actorId: p.actorId,
+        displayName: p.displayName || p.actorId,
+        participantType: p.participantType,   // 1 owner, 2 moderator
+        // inCall bitmask: 1 in-call, 2 provides audio, 4 provides video, 8 SIP.
+        inCall: p.inCall,
+        lastPing: p.lastPing,
+    };
+}
+
+/**
+ * Classify a recording start/stop OCS response into a stable result shape.
+ * Verified error semantics: 403 → not a moderator; 400 with OCS message
+ * `config` → recording backend not enabled; `call` → no active call.
+ */
+async function classifyRecordingResponse(res, authError, okExtra = {}) {
+    if (res.status === 401) return { error: 'unauthorized', message: authError };
+    if (res.status === 403) return { error: 'not_moderator', message: 'Only a moderator/owner can control recording.' };
+    if (res.status === 404) return { error: 'room_not_found' };
+    if (res.status === 400) {
+        const body = await readJsonSafe(res);
+        const msg = body?.ocs?.meta?.message || '';
+        if (msg === 'config') return { error: 'recording_backend_unavailable', message: 'The Nextcloud recording backend is not configured.' };
+        if (msg === 'call') return { error: 'no_active_call', message: 'There is no active call to record.' };
+        return { error: 'bad_request', message: msg || 'Recording request rejected.', detail: body };
+    }
+    if (!res.ok && res.status !== 200 && res.status !== 201) {
+        const body = await readJsonSafe(res);
+        return { error: `recording_failed_${res.status}`, detail: body };
+    }
+    return { success: true, ...okExtra };
+}
+
+// Per-instance capability cache (recording-v1 is instance-global, not per user).
+const _capCache = new Map(); // baseUrl → { ts, val }
+const CAP_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * Whether the Talk recording backend is available on this instance.
+ * Returns { recordingEnabled, features }.
+ */
+async function getTalkRecordingCapability(session, userId) {
+    let ctx;
+    try { ctx = await ncClient.resolveAuth(session, userId); }
+    catch (_) { return { recordingEnabled: false, features: [] }; }
+    const baseUrl = ctx.baseUrl;
+    const cached = _capCache.get(baseUrl);
+    if (cached && (Date.now() - cached.ts) < CAP_TTL_MS) return cached.val;
+    try {
+        const res = await ctx.fetch(`${baseUrl}/ocs/v2.php/cloud/capabilities?format=json`, { headers: COMMON_HEADERS });
+        if (!res.ok) {
+            const val = { recordingEnabled: false, features: [] };
+            _capCache.set(baseUrl, { ts: Date.now(), val });
+            return val;
+        }
+        const data = await readJsonSafe(res);
+        const spreed = data?.ocs?.data?.capabilities?.spreed || {};
+        const features = Array.isArray(spreed.features) ? spreed.features : [];
+        const val = { recordingEnabled: features.includes('recording-v1'), features };
+        _capCache.set(baseUrl, { ts: Date.now(), val });
+        return val;
+    } catch (_) {
+        return { recordingEnabled: false, features: [] };
+    }
 }
 
 function mapMessage(m) {
@@ -264,6 +386,39 @@ async function executeNextcloudTalkTool(toolName, args, userId, session) {
             }
             const data = await readJsonSafe(res);
             return data?.ocs?.data ? { success: true, room: mapRoom(data.ocs.data) } : { success: true, raw: data };
+        }
+
+        case 'nextcloud_talk_list_participants': {
+            if (!args.token) return { error: 'token is required' };
+            const res = await ncFetch(`${v4(baseUrl)}/room/${encodeURIComponent(args.token)}/participants?format=json`, { headers: COMMON_HEADERS });
+            if (res.status === 401) return { error: authError };
+            if (res.status === 404) return { error: `Room not found: ${args.token}` };
+            if (!res.ok) return { error: `Talk participants fetch failed (${res.status})` };
+            const data = await readJsonSafe(res);
+            const participants = Array.isArray(data?.ocs?.data) ? data.ocs.data.map(mapParticipant) : [];
+            return { token: args.token, count: participants.length, participants };
+        }
+
+        case 'nextcloud_talk_start_recording': {
+            if (!args.token) return { error: 'token is required' };
+            // status: 2 = audio-only, 1 = video (Nextcloud's numbering — audio is
+            // the higher value, intentionally not "fixed").
+            const status = args.status === 1 ? 1 : 2;
+            const res = await ncFetch(`${v1(baseUrl)}/recording/${encodeURIComponent(args.token)}?format=json`, {
+                method: 'POST',
+                headers: { ...COMMON_HEADERS, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ status }),
+            });
+            return classifyRecordingResponse(res, authError, { started: true, status });
+        }
+
+        case 'nextcloud_talk_stop_recording': {
+            if (!args.token) return { error: 'token is required' };
+            const res = await ncFetch(`${v1(baseUrl)}/recording/${encodeURIComponent(args.token)}?format=json`, {
+                method: 'DELETE',
+                headers: COMMON_HEADERS,
+            });
+            return classifyRecordingResponse(res, authError, { stopped: true });
         }
 
         case 'nextcloud_talk_list_messages': {
@@ -382,4 +537,5 @@ module.exports = {
     NEXTCLOUD_TALK_TOOLS,
     executeNextcloudTalkTool,
     isNextcloudTalkTool,
+    getTalkRecordingCapability,
 };

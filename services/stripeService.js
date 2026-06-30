@@ -294,6 +294,75 @@ function resolveStripeTaxId(rawVat) {
     return null;
 }
 
+/**
+ * Build a Stripe `address` object from an organisation's structured billing
+ * fields. The legacy `address` column is treated as line1 (street + number).
+ *
+ * Stripe Tax REQUIRES a country, so we return null unless `billing_country`
+ * is present — callers then fall back to Checkout's billing_address_collection
+ * + customer_update:{address:'auto'} instead of attaching an invalid address.
+ * Empty sub-fields are omitted (Stripe rejects empty strings on some keys).
+ *
+ * @param {object} org - parsed organisation row (camelCase + raw columns)
+ * @returns {{line1?, line2?, postal_code?, city?, country}|null}
+ */
+function buildStripeAddress(org) {
+    if (!org) return null;
+    const country = (org.billingCountry || org.billing_country || '').trim().toUpperCase();
+    if (!country) return null;
+    const addr = { country };
+    const line1 = (org.address || '').trim();
+    const line2 = (org.billingLine2 || org.billing_line2 || '').trim();
+    const postal = (org.billingPostalCode || org.billing_postal_code || '').trim();
+    const city = (org.billingCity || org.billing_city || '').trim();
+    if (line1) addr.line1 = line1;
+    if (line2) addr.line2 = line2;
+    if (postal) addr.postal_code = postal;
+    if (city) addr.city = city;
+    return addr;
+}
+
+/**
+ * Push an organisation's name/email/phone/address onto its Stripe Customer so
+ * Checkout and the Billing Portal pre-fill, and Stripe Tax has a valid address.
+ * No-op (non-fatal) when the org has no Stripe customer yet — the address is
+ * then attached at checkout-time instead. Mirrors the idempotent, swallow-and-
+ * warn style of the VAT tax_id sync.
+ *
+ * @param {string} orgId
+ * @param {{stripeCustomerId?: string}} [opts]
+ */
+async function pushOrgBillingToStripe(orgId, { stripeCustomerId } = {}) {
+    if (!orgId) return;
+    try {
+        const userStore = require('../stores/userStore');
+        const org = await userStore.getOrganization(orgId);
+        if (!org) return;
+
+        let customerId = stripeCustomerId || null;
+        if (!customerId) {
+            try {
+                const sub = await userStore.getOrgSubscription(orgId);
+                customerId = sub?.stripe_customer_id || null;
+            } catch (e) { /* no subscription row yet */ }
+        }
+        if (!customerId) return; // nothing attached — checkout will set it
+
+        const updates = {};
+        if (org.name) updates.name = org.name;
+        if (org.email) updates.email = org.email;
+        if (org.phone) updates.phone = org.phone;
+        const address = buildStripeAddress(org);
+        if (address) updates.address = address;
+        if (Object.keys(updates).length === 0) return;
+
+        const stripe = await getClient();
+        await stripe.customers.update(customerId, updates);
+    } catch (e) {
+        console.warn(`[Stripe] pushOrgBillingToStripe(${orgId}) failed: ${e.message}`);
+    }
+}
+
 // Anchor every new subscription's billing cycle to the 1st of next month
 // (UTC). Stripe automatically pro-rates the partial period from "now" to
 // the anchor, so the first invoice reflects only the days actually used —
@@ -401,6 +470,25 @@ async function createCheckoutSession({ plan, orgId, orgName, userId, subscriberT
                     console.warn(`[Stripe] attaching VAT for org ${orgId} failed: ${e.message}`);
                 }
             }
+
+            // Sync the org's structured billing address + phone onto the
+            // customer so Checkout and the Billing Portal pre-fill, and Stripe
+            // Tax has a valid address. Covers reused/pre-existing customers too
+            // (the create call above only sets name/email). Non-fatal: checkout
+            // still proceeds via billing_address_collection + customer_update.
+            if (effectiveCustomerId) {
+                try {
+                    const billingUpdates = {};
+                    if (org?.phone) billingUpdates.phone = org.phone;
+                    const address = buildStripeAddress(org);
+                    if (address) billingUpdates.address = address;
+                    if (Object.keys(billingUpdates).length > 0) {
+                        await stripe.customers.update(effectiveCustomerId, billingUpdates);
+                    }
+                } catch (e) {
+                    console.warn(`[Stripe] syncing billing address for org ${orgId} failed: ${e.message}`);
+                }
+            }
         } catch (e) {
             console.warn(`[Stripe] org customer resolution skipped: ${e.message}`);
         }
@@ -438,10 +526,33 @@ async function createCheckoutSession({ plan, orgId, orgName, userId, subscriberT
         // Allow B2B customers to enter VAT numbers (covers customers we
         // didn't pre-attach a VAT for above).
         sessionParams.tax_id_collection = { enabled: true };
+        // When a Customer is pre-attached, Stripe Tax requires an address ON
+        // that Customer. billing_address_collection alone does NOT write the
+        // entered address back to an existing Customer — customer_update does.
+        // Without this, session creation is rejected with "Automatic tax
+        // calculation in Checkout requires a valid address on the Customer".
+        // (Invalid alongside customer_email, so guard on `customer`.)
+        if (sessionParams.customer) {
+            sessionParams.customer_update = { address: 'auto', name: 'auto' };
+        }
     }
 
     // Allow promo codes
     sessionParams.allow_promotion_codes = true;
+
+    // BFSF-243: make the recurring nature explicit on the hosted checkout.
+    // Stripe otherwise renders a subscription checkout much like a one-off
+    // payment; Dutch business customers expect an explicit "automatische
+    // incasso" disclosure to avoid confusion, disputes and chargebacks.
+    // `locale: 'auto'` keeps Stripe's own UI in the customer's language; the
+    // submit-button note is kept bilingual (NL/EN) and well under the 1200-char
+    // limit. The in-app pre-checkout callout carries the localised version.
+    sessionParams.locale = 'auto';
+    sessionParams.custom_text = {
+        submit_button: {
+            message: 'Maandabonnement met automatische incasso: je gekozen betaalmethode wordt elke periode automatisch belast tot je opzegt. — Recurring monthly subscription, billed automatically each period until you cancel.',
+        },
+    };
 
     return stripe.checkout.sessions.create(sessionParams);
 }
@@ -482,14 +593,36 @@ async function createTrialSubscription({ plan, subscriberType, subscriberId, org
     if (subscriberType === 'consumer') metadata.beeflow_user_id = subscriberId;
     else metadata.beeflow_org_id = subscriberId;
 
+    // For org trials, pull the org's stored billing address + phone so the
+    // Stripe Customer (and thus the portal) is pre-filled and Stripe Tax has
+    // a valid address. Non-fatal lookup.
+    let org = null;
+    if (subscriberType === 'organization' && subscriberId) {
+        try { org = await require('../stores/userStore').getOrganization(subscriberId); }
+        catch (e) { /* non-fatal — fall back to name/email only */ }
+    }
+    const trialAddress = buildStripeAddress(org);
+
     let customerId = stripeCustomerId || null;
     if (!customerId) {
         const customer = await stripe.customers.create({
-            email: userEmail || undefined,
-            name: orgName || undefined,
+            email: userEmail || org?.email || undefined,
+            name: orgName || org?.name || undefined,
+            phone: org?.phone || undefined,
+            ...(trialAddress ? { address: trialAddress } : {}),
             metadata,
         });
         customerId = customer.id;
+    } else if (org && (trialAddress || org.phone)) {
+        // Reused customer — refresh address/phone so the portal pre-fills.
+        try {
+            const updates = {};
+            if (org.phone) updates.phone = org.phone;
+            if (trialAddress) updates.address = trialAddress;
+            await stripe.customers.update(customerId, updates);
+        } catch (e) {
+            console.warn(`[Stripe] trial billing sync for org ${subscriberId} failed: ${e.message}`);
+        }
     }
 
     const subscription = await stripe.subscriptions.create({
@@ -535,6 +668,67 @@ async function createPortalSession(stripeCustomerId, returnUrl) {
         customer: stripeCustomerId,
         return_url: returnUrl,
     });
+}
+
+/**
+ * List a customer's invoices for the in-app billing view. Returns a slim,
+ * UI-ready projection (no raw Stripe objects). Draft/zero invoices are
+ * filtered out so customers only see issued invoices they can download.
+ *
+ * @param {string} stripeCustomerId
+ * @param {{ limit?: number }} opts
+ * @returns {Promise<Array<{ id, number, created, amountPaid, amountDue, currency, status, hostedInvoiceUrl, invoicePdf }>>}
+ */
+async function listInvoices(stripeCustomerId, { limit = 24 } = {}) {
+    if (!stripeCustomerId) return [];
+    const stripe = await getClient();
+    const res = await stripe.invoices.list({ customer: stripeCustomerId, limit });
+    return (res?.data || [])
+        .filter(inv => inv.status && inv.status !== 'draft')
+        .map(inv => ({
+            id: inv.id,
+            number: inv.number || null,
+            created: inv.created ? new Date(inv.created * 1000).toISOString() : null,
+            amountPaid: typeof inv.amount_paid === 'number' ? inv.amount_paid / 100 : null,
+            amountDue: typeof inv.amount_due === 'number' ? inv.amount_due / 100 : null,
+            currency: (inv.currency || 'eur').toUpperCase(),
+            status: inv.status, // paid | open | uncollectible | void
+            hostedInvoiceUrl: inv.hosted_invoice_url || null,
+            invoicePdf: inv.invoice_pdf || null,
+        }));
+}
+
+/**
+ * Fetch a single invoice's PDF bytes for the in-app viewer (BFSF-250). Verifies
+ * the invoice belongs to `customerId` before returning anything (ownership leak
+ * guard), then downloads the Stripe-hosted `invoice_pdf` server-side so the
+ * route can stream it inline (Stripe's own PDF URLs set headers that block
+ * cross-origin embedding).
+ *
+ * @param {string} invoiceId
+ * @param {{ customerId?: string }} opts
+ * @returns {Promise<{ buffer: Buffer, number: string, filename: string } | null>}
+ */
+async function getInvoicePdf(invoiceId, { customerId } = {}) {
+    const stripe = await getClient();
+    const invoice = await stripe.invoices.retrieve(invoiceId);
+    if (!invoice) return null;
+    // invoice.customer is a string id unless expanded; normalise either shape.
+    const invCustomer = typeof invoice.customer === 'string' ? invoice.customer : invoice.customer?.id;
+    // When an ownership check is requested, require an exact match. A missing
+    // invoice.customer (orphan invoice) must NOT pass — otherwise a caller could
+    // fetch an unassigned invoice's PDF.
+    if (customerId && invCustomer !== customerId) {
+        const err = new Error('Invoice does not belong to this customer');
+        err.code = 'invoice_forbidden';
+        throw err;
+    }
+    if (!invoice.invoice_pdf) return null;
+    const resp = await fetch(invoice.invoice_pdf);
+    if (!resp.ok) throw new Error(`Failed to fetch invoice PDF from Stripe (${resp.status})`);
+    const buffer = Buffer.from(await resp.arrayBuffer());
+    const number = invoice.number || invoiceId;
+    return { buffer, number, filename: `invoice-${number}.pdf` };
 }
 
 /**
@@ -867,7 +1061,10 @@ module.exports = {
     reportPaygUsage,
     createCheckoutSession,
     createTrialSubscription,
+    pushOrgBillingToStripe,
     createPortalSession,
+    listInvoices,
+    getInvoicePdf,
     retrieveCheckoutSession,
     syncSeatQuantityForOrg,
     updateSubscriptionPlan,

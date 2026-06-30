@@ -318,66 +318,56 @@ async function fetchUrlContent(url) {
 }
 
 /**
- * Fetch URL content using Playwright headless Chromium.
+ * Fetch URL content using a remote headless Chromium (via browserProvider).
  * Waits for the page to load + JS to render, then extracts the HTML.
+ *
+ * The browser runs in an isolated container, so navigating to arbitrary
+ * user-supplied URLs never happens inside the API process.
  *
  * @param {string} url
  * @returns {Promise<{content: string, title: string, resolvedUrl: string}>}
  */
 async function fetchWithPlaywright(url) {
-    const { chromium } = require('playwright');
+    const browserProvider = require('../services/browserProvider');
 
-    let browser;
-    try {
-        browser = await chromium.launch({
-            headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-        });
-
-        const context = await browser.newContext({
+    return browserProvider.withContext(
+        {
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        });
+        },
+        async (context) => {
+            const page = await context.newPage();
 
-        const page = await context.newPage();
+            // Navigate and wait for network to settle (JS rendering complete)
+            await page.goto(url, {
+                waitUntil: 'networkidle',
+                timeout: 30000,
+            });
 
-        // Navigate and wait for network to settle (JS rendering complete)
-        await page.goto(url, {
-            waitUntil: 'networkidle',
-            timeout: 30000,
-        });
+            // Additional wait for late-rendering SPAs
+            await page.waitForTimeout(2000);
 
-        // Additional wait for late-rendering SPAs
-        await page.waitForTimeout(2000);
+            const pageTitle = await page.title();
+            const resolvedUrl = page.url();
 
-        const pageTitle = await page.title();
-        const resolvedUrl = page.url();
+            // Get the fully rendered HTML
+            const html = await page.content();
 
-        // Get the fully rendered HTML
-        const html = await page.content();
+            // Convert rendered HTML to markdown
+            const { htmlToMarkdown } = require('../utils/htmlToMarkdown');
+            const result = htmlToMarkdown(html, resolvedUrl, { includeLinks: true, includeImages: false });
+            let content = result.markdown;
 
-        await browser.close();
-        browser = null;
+            if (pageTitle && !content.startsWith(`# ${pageTitle}`)) {
+                content = `# ${pageTitle}\n\n${content}`;
+            }
 
-        // Convert rendered HTML to markdown
-        const { htmlToMarkdown } = require('../utils/htmlToMarkdown');
-        const result = htmlToMarkdown(html, resolvedUrl, { includeLinks: true, includeImages: false });
-        let content = result.markdown;
-
-        if (pageTitle && !content.startsWith(`# ${pageTitle}`)) {
-            content = `# ${pageTitle}\n\n${content}`;
+            return {
+                content,
+                title: result.title || pageTitle,
+                resolvedUrl,
+            };
         }
-
-        return {
-            content,
-            title: result.title || pageTitle,
-            resolvedUrl,
-        };
-    } catch (err) {
-        if (browser) {
-            try { await browser.close(); } catch (_) {}
-        }
-        throw err;
-    }
+    );
 }
 
 /**

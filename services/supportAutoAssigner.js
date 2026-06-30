@@ -50,13 +50,37 @@ async function _eligibleStaffForOrg(orgId) {
     return ids;
 }
 
+async function _userGroups(userId) {
+    try {
+        const u = await userStore.getUser(userId);
+        if (!u) return [];
+        if (Array.isArray(u.groups)) return u.groups;
+        if (typeof u.groups === 'string') { try { return JSON.parse(u.groups || '[]'); } catch { return []; } }
+    } catch { /* ignore */ }
+    return [];
+}
+
 /**
  * Return the next staff user id to assign for an org, advancing the cursor.
  * Returns null when no eligible staff exist.
+ *
+ * When the inbox is group-restricted (`sharedGroups` non-empty), candidates are
+ * narrowed to members of those groups so a ticket is never auto-assigned to
+ * someone who would then be denied access to it. Falls back to all eligible
+ * staff if no group member is support-capable (a stranded ticket is worse than a
+ * slightly out-of-policy assignment).
  */
-async function pickNextAssignee(orgId) {
-    const candidates = await _eligibleStaffForOrg(orgId || null);
+async function pickNextAssignee(orgId, { sharedGroups = [] } = {}) {
+    let candidates = await _eligibleStaffForOrg(orgId || null);
     if (!candidates.length) return null;
+    if (Array.isArray(sharedGroups) && sharedGroups.length) {
+        const inGroup = [];
+        for (const id of candidates) {
+            const g = await _userGroups(id);
+            if (g.some(x => sharedGroups.includes(x))) inGroup.push(id);
+        }
+        if (inGroup.length) candidates = inGroup;
+    }
     return supportStore.getAndAdvanceRoundRobin(orgId || null, candidates);
 }
 

@@ -104,6 +104,19 @@ function groupForTool(tool) {
         return { key: `mcp:${serverId}`, label: `${label} (MCP)`, desc: 'tools from a connected MCP server' };
     }
 
+    // Custom org integrations (AI Integration Builder) are dynamic too — one
+    // group per integration, keyed by the slug parsed out of cint_<slug>_<tool>.
+    if (name.startsWith('cint_')) {
+        let slug = null;
+        try {
+            const { parsePrefixedName } = require('../integrations/customIntegrationRunner');
+            slug = parsePrefixedName(name)?.slug || null;
+        } catch (_) { /* fail soft — fall back to a raw split below */ }
+        if (!slug) slug = name.split('_')[1] || 'unknown';
+        const label = slug.replace(/[-_]/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        return { key: `custom:${slug}`, label: `${label} (Custom)`, desc: 'tools from a custom org integration' };
+    }
+
     for (const g of LAZY_GROUPS) {
         const ok = g.match ? g.match(name) : name.startsWith(g.prefix);
         if (ok) return { key: g.key, label: g.label, desc: g.desc };

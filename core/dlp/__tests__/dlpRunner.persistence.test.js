@@ -24,17 +24,21 @@ const dbCalls = {
 // Each test sets these to control the SELECT response from the mock.
 let getOneAgentResult = null;
 let getOneDirectResult = null;
+let getOneNotebookResult = null;
 // Each test sets these to control which UPDATE "matches" (rowCount > 0).
 let updateAgentRowCount = 0;
 let updateDirectRowCount = 0;
+let updateNotebookRowCount = 0;
 
 function resetMockDb() {
     dbCalls.run.length = 0;
     dbCalls.getOne.length = 0;
     getOneAgentResult = null;
     getOneDirectResult = null;
+    getOneNotebookResult = null;
     updateAgentRowCount = 0;
     updateDirectRowCount = 0;
+    updateNotebookRowCount = 0;
 }
 
 const mockDb = {
@@ -42,12 +46,14 @@ const mockDb = {
         dbCalls.run.push({ sql, params });
         if (/agent_conversations/i.test(sql)) return { rowCount: updateAgentRowCount };
         if (/direct_conversations/i.test(sql)) return { rowCount: updateDirectRowCount };
+        if (/notebooks/i.test(sql)) return { rowCount: updateNotebookRowCount };
         return { rowCount: 0 };
     },
     getOne: async (sql, params) => {
         dbCalls.getOne.push({ sql, params });
         if (/agent_conversations/i.test(sql)) return getOneAgentResult;
         if (/direct_conversations/i.test(sql)) return getOneDirectResult;
+        if (/notebooks/i.test(sql)) return getOneNotebookResult;
         return null;
     },
     // dlpRunner only touches `run` and `getOne`; provide stubs for the rest
@@ -114,6 +120,49 @@ async function testMergeFallsBackToDirectTable() {
     assert.match(writes[1].sql, /direct_conversations/i);
 }
 
+async function testMergeFallsBackToNotebookTable() {
+    resetMockDb();
+    const convId = 'nb-' + Date.now();
+    // Neither agent nor direct has a row; the notebook row does (a legal_matter
+    // / notebook keys its map on the notebook id).
+    updateAgentRowCount = 0;
+    updateDirectRowCount = 0;
+    updateNotebookRowCount = 1;
+
+    dlpRunner.clearConversationState(convId);
+    await tick();
+    resetMockDb();
+    updateAgentRowCount = 0;
+    updateDirectRowCount = 0;
+    updateNotebookRowCount = 1;
+
+    dlpRunner.mergeTokenMap(convId, { '[person_1]': 'M. van Zanten' });
+    await tick();
+
+    const writes = dbCalls.run.filter(c => /pii_token_map/i.test(c.sql) && !/=\s*NULL/i.test(c.sql));
+    assert.strictEqual(writes.length, 3, 'expected 3 UPDATEs (agent → direct → notebooks)');
+    assert.match(writes[0].sql, /agent_conversations/i);
+    assert.match(writes[1].sql, /direct_conversations/i);
+    assert.match(writes[2].sql, /notebooks/i);
+    const stored = JSON.parse(writes[2].params[0]);
+    assert.deepStrictEqual(stored, { '[person_1]': 'M. van Zanten' });
+}
+
+async function testHydrateFromNotebookTable() {
+    resetMockDb();
+    const convId = 'nb-h-' + Date.now();
+    // Only the notebooks table has the stored map.
+    getOneAgentResult = null;
+    getOneDirectResult = null;
+    getOneNotebookResult = { pii_token_map: { '[person_2]': 'T. Kooy' } };
+
+    assert.deepStrictEqual(dlpRunner.getConversationTokenMap(convId), {});
+    const map = await dlpRunner.getConversationTokenMapAsync(convId);
+    assert.deepStrictEqual(map, { '[person_2]': 'T. Kooy' });
+    // Both fallbacks must have been queried before the notebooks hit.
+    assert.ok(dbCalls.getOne.some(c => /notebooks/i.test(c.sql)), 'notebooks SELECT should have run');
+}
+
 async function testHydrateFromDb() {
     resetMockDb();
     const convId = 'conv-H-' + Date.now();
@@ -154,15 +203,18 @@ async function testClearNullsDbColumn() {
     await tick();
 
     const nullings = dbCalls.run.filter(c => /pii_token_map\s*=\s*NULL/i.test(c.sql));
-    assert.strictEqual(nullings.length, 2, 'expected NULL update on both tables');
+    assert.strictEqual(nullings.length, 3, 'expected NULL update on all three tables');
     assert.match(nullings[0].sql, /agent_conversations/i);
     assert.match(nullings[1].sql, /direct_conversations/i);
+    assert.match(nullings[2].sql, /notebooks/i);
 }
 
 (async () => {
     const tests = [
         ['mergeTokenMap writes through to agent_conversations', testMergeWritesThroughAgentTable],
         ['mergeTokenMap falls back to direct_conversations when no agent row', testMergeFallsBackToDirectTable],
+        ['mergeTokenMap falls back to notebooks when no agent/direct row', testMergeFallsBackToNotebookTable],
+        ['getConversationTokenMapAsync hydrates from the notebooks table', testHydrateFromNotebookTable],
         ['getConversationTokenMapAsync hydrates from DB on first call', testHydrateFromDb],
         ['hydration is cached — second async call does not re-query', testHydrateCacheSkipsSecondQuery],
         ['clearConversationState nulls the DB column on both tables', testClearNullsDbColumn],

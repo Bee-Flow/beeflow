@@ -38,13 +38,54 @@ const conversationTokenMaps = new Map(); // conversationId → Map<token, origin
 const _hydratedConversations = new Set();
 let _hydrationInFlight = new Map(); // convId → Promise resolved when the SELECT lands
 
-const MAX_TOKENS_PER_CONV = 500;
+// Cap on distinct PII tokens accumulated per conversation. Raised from 500
+// once tool RESULTS and KB chunks (not just the user message) started minting
+// tokens: a single KB-heavy / multi-tool turn can add hundreds of result
+// tokens, and front-first eviction at 500 would drop the user's turn-1
+// `[email_1]` — silently breaking its restore on the response and on later
+// tool args (BFSF-171 class bug). 2000 keeps that margin comfortable for any
+// realistic conversation; eviction only triggers in pathological cases.
+const MAX_TOKENS_PER_CONV = 2000;
+
+// Notebook / legal-matter maps accumulate tokens from the document body, every
+// retrieved KB chunk, AND the chat — a single dossier is exactly the worst case
+// the 2000 cap was sized against. Give notebook-bound ids more headroom so a
+// long-running matter doesn't front-evict its turn-1 tokens (which would leave a
+// raw `[person_1]` un-restorable). Ids are auto-marked when their map is found in
+// / written to the `notebooks` table (see _hydrateFromDb / _writeMapToDb).
+const MAX_TOKENS_PER_NOTEBOOK = 5000;
+const _notebookBoundIds = new Set();
+function _capFor(conversationId) {
+    return _notebookBoundIds.has(conversationId) ? MAX_TOKENS_PER_NOTEBOOK : MAX_TOKENS_PER_CONV;
+}
 
 function _ensureTokenMap(conversationId) {
     if (!conversationId) return new Map();
     let map = conversationTokenMaps.get(conversationId);
     if (!map) { map = new Map(); conversationTokenMaps.set(conversationId, map); }
     return map;
+}
+
+// Conversations for which we've already logged a "no matching row to persist
+// into" warning, so the message fires at most once each (benign for
+// notebook-scoped maps whose id is a notebookId — see _writeMapToDb).
+const _persistWarned = new Set();
+
+// Lazily emit an operator-facing guardrail event for token-map persistence /
+// eviction problems. Lazy-required so the common (no-error) path never pulls in
+// the store — that keeps the persistence unit tests (which mock `../../db`)
+// clean, and never lets telemetry break the chat path.
+function _emitTokenMapEvent(conversationId, action_taken, extra = {}) {
+    try {
+        const store = require('../../stores/guardrailEventStore');
+        store.logGuardrailEvent({
+            conversation_id: conversationId,
+            violation_type: 'pii_tokenmap',
+            action_taken,
+            source: 'pii',
+            violation_categories: extra.reason ? String(extra.reason).slice(0, 200) : null,
+        }).catch(() => {});
+    } catch (_) { /* never let telemetry break the chat path */ }
 }
 
 function _mergeIntoTokenMap(conversationId, incoming) {
@@ -54,9 +95,20 @@ function _mergeIntoTokenMap(conversationId, incoming) {
         map.set(token, original);
     }
     // Cheap LRU-ish cap: trim from the insertion-order front if we exceed the cap.
-    while (map.size > MAX_TOKENS_PER_CONV) {
+    const cap = _capFor(conversationId);
+    let evicted = 0;
+    while (map.size > cap) {
         const firstKey = map.keys().next().value;
         map.delete(firstKey);
+        evicted++;
+    }
+    if (evicted > 0) {
+        // Eviction means an earlier `[category_N]` can no longer be restored —
+        // the user may be shown a raw placeholder, or a later tool arg that
+        // references it can no longer be detokenised. Surface it instead of
+        // silently dropping tokens (this was a silent correctness bug).
+        console.warn(`[DlpRunner] token-map cap (${cap}) exceeded for conv ${conversationId}; evicted ${evicted} oldest token(s) — earlier placeholders may no longer restore`);
+        _emitTokenMapEvent(conversationId, 'token_evicted', { reason: `evicted ${evicted} at cap ${MAX_TOKENS_PER_CONV}` });
     }
 }
 
@@ -88,12 +140,35 @@ async function _writeMapToDb(conversationId) {
             [payload, conversationId],
         );
         if (agentResult?.rowCount > 0) return;
-        await run(
+        const directResult = await run(
             'UPDATE direct_conversations SET pii_token_map = $1::jsonb WHERE id = $2',
             [payload, conversationId],
         );
+        if (directResult?.rowCount > 0) return;
+        // Notebook / legal-matter chat keys the map on the notebook id, which is
+        // the `notebooks.id` (a legal_matter is a notebook). Persist there so the
+        // doc/source/chat tokens survive a reload + restart (the "Part 2A" the
+        // warning below anticipated). Plaintext JSONB, matching the two tables above.
+        const notebookResult = await run(
+            'UPDATE notebooks SET pii_token_map = $1::jsonb WHERE id = $2',
+            [payload, conversationId],
+        );
+        if (notebookResult?.rowCount > 0) { _notebookBoundIds.add(conversationId); return; }
+        // Neither table had a matching row, so the map lives in-process ONLY and
+        // a restart would lose it — the user would then see `[email_1]` forever.
+        // Warn once per conversation (kept a warn, not a guardrail alert,
+        // because notebook-scoped maps are keyed by a notebookId that legitimately
+        // isn't a conversation row until Part 2A wires persistence).
+        if (!_persistWarned.has(conversationId)) {
+            _persistWarned.add(conversationId);
+            console.warn(`[DlpRunner] token-map persist found no conversation row for ${conversationId} (${map.size} token(s) held in-process only)`);
+        }
     } catch (err) {
+        // A real DB error (not just "no row") — escalate to an operator-visible
+        // guardrail event. Silent failure here is the #1 way a conversation
+        // becomes permanently unrestorable.
         console.warn(`[DlpRunner] DB write-through failed for conv ${conversationId}: ${err.message}`);
+        _emitTokenMapEvent(conversationId, 'persist_failed', { reason: err.message });
     }
 }
 
@@ -108,6 +183,13 @@ async function _hydrateFromDb(conversationId) {
             const { getOne } = _db();
             let row = await getOne('SELECT pii_token_map FROM agent_conversations WHERE id = $1', [conversationId]);
             if (!row) row = await getOne('SELECT pii_token_map FROM direct_conversations WHERE id = $1', [conversationId]);
+            if (!row) {
+                // A notebook row always exists for a valid notebook (the legal
+                // matter / notebook itself), even before any token is minted —
+                // mark it bound so the higher per-notebook cap applies from turn 1.
+                row = await getOne('SELECT pii_token_map FROM notebooks WHERE id = $1', [conversationId]);
+                if (row) _notebookBoundIds.add(conversationId);
+            }
             const stored = row?.pii_token_map;
             if (stored && typeof stored === 'object') {
                 // `node-postgres` parses JSONB into a plain object automatically.
@@ -173,6 +255,7 @@ function clearConversationState(conversationId) {
             const { run } = _db();
             await run('UPDATE agent_conversations SET pii_token_map = NULL WHERE id = $1', [conversationId]);
             await run('UPDATE direct_conversations SET pii_token_map = NULL WHERE id = $1', [conversationId]);
+            await run('UPDATE notebooks SET pii_token_map = NULL WHERE id = $1', [conversationId]);
         } catch (err) {
             console.warn(`[DlpRunner] DB clear failed for conv ${conversationId}: ${err.message}`);
         }

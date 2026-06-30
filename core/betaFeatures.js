@@ -140,7 +140,27 @@ const BETA_FEATURES = [
     { id: 'playwright_tests', name: 'Playwright Tests (Beta)', description: 'Generate and run Playwright tests against external sites from conversations, GitHub commits, YouTrack issues or free text. Includes an explore mode that drives a Chromium browser without pre-generated tests and reports findings.', licenseFeature: 'playwright_tests', lifecycle: BetaLifecycle.BETA },
     { id: 'security_scan', name: 'Security Scan (Beta)', description: 'Run an automated website security audit (OWASP ZAP, Nuclei, testssl.sh) against a URL you are authorised to scan. Each engine runs in an isolated container; findings are aggregated into a rendered webpage report. Passive baseline by default; active/intrusive scanning is opt-in and operator-gated.', licenseFeature: 'security_scan', lifecycle: BetaLifecycle.BETA },
     { id: 'support_inbox', name: 'Customer Support Inbox (Beta)', description: 'Run your own customer-support desk in the Studio: connect support mailbox(es) (Gmail/Outlook), turn inbound email into tickets, and reply with an AI agent grounded in your knowledge base. Configurable per inbox (draft / auto-send / autonomous) with SLA, assignment, and a routine template that distils solved tickets into KB articles.', licenseFeature: 'support_inbox', lifecycle: BetaLifecycle.BETA },
+    { id: 'lead_studio', name: 'Lead Studio (Beta)', description: 'AI-gestuurde lead-generatie in de Studio: maak een campagne met criteria (branche, type, omvang, locatie), de AI zoekt bedrijven via web search en verrijkt elk met eigenaar + contactgegevens (KvK, Hunter/Apollo, LinkedIn via Apify). Resultaten landen als een gestructureerde, gezamenlijk afvinkbare leadlijst — meerdere teamleden werken realtime samen: toewijzen, status, notities, verifiëren. Model-tier selecteerbaar per campagne; gerechtvaardigd-belang grondslag met retentielimiet.', licenseFeature: 'lead_studio', lifecycle: BetaLifecycle.BETA },
     { id: 'mcp_marketplace', name: 'MCP Server Marketplace', description: 'Browse, install and manage Model Context Protocol (MCP) servers (GitHub, Slack, Postgres, Playwright, and dozens more) to extend AI agent capabilities. Installed servers expose their tools to agents in chat. Enterprise beta — a later implementation still stabilising.', licenseFeature: 'mcp_marketplace', lifecycle: BetaLifecycle.BETA },
+    // Learning Center (Bee Flow Academy) — courses, AI coach, badges and shareable
+    // certificates. GA (stable, not a "beta") so it can be toggled per subscription
+    // plan via "Included beta features" yet still ships on self-hosted: the licence
+    // feature `learning_center` sits in the community tier (see tiers.js), so the
+    // self-hosted GA-community filter includes it. On cloud the subscription's
+    // allowed_beta_features is the sole authority (compound check removed).
+    { id: 'learning_center', name: 'Learning Center', description: 'Bee Flow Academy — hands-on courses with an AI coach, badges, XP levels, and shareable completion certificates. Gates the Settings → Learning Center page, the lesson player, and the achievements/certificate APIs.', licenseFeature: 'learning_center', lifecycle: BetaLifecycle.GA },
+    // Academy custom courses — org-authored content (slides/quizzes/exercises
+    // only; no tour steps, those need code-bound DOM anchors). Quiz answer keys
+    // and exercise rubrics live server-side in learningContentStore; published
+    // courses overlay the built-in catalog via GET /ai/learning/catalog.
+    { id: 'learning_custom_content', name: 'Academy Custom Courses (Beta)', description: 'Let org admins author their own Academy courses (slides, quizzes, AI-coached exercises) in Settings → Organisation → Academy. Published courses appear in members\' Learning Center alongside the built-in catalog; quiz answers and exercise rubrics stay server-side. Requires the Learning Center.', licenseFeature: 'learning_center', lifecycle: BetaLifecycle.BETA },
+    // AI Integration Builder — deliberately NO licenseFeature: on cloud the
+    // plan's allowed_beta_features is the sole authority; on self-hosted the
+    // enterprise tier gets all betas. The built integrations themselves are
+    // granted as ordinary 'custom:<uuid>' integration capabilities (see
+    // capabilityRegistry.listCustomIntegrationCapabilities) — this beta gates
+    // only the builder surface and the per-org ceiling injection.
+    { id: 'ai_integration_builder', name: 'AI Integration Builder', description: 'Org admins build custom org-scoped integrations (REST or remote MCP) with an AI builder agent. Gates the builder UI and APIs; built integrations are granted like normal integrations.', lifecycle: BetaLifecycle.BETA },
 ];
 
 function getFeatureLifecycle(featureOrId) {
@@ -277,8 +297,12 @@ async function getEffectiveOrgBetaAllowList(orgId) {
     } catch (e) {
         console.warn('[BetaFeatures] effective allow-list (subscription) lookup failed:', e.message);
     }
-    // No subscription/plan → fall back to the admin-managed grant.
-    return getOrgBetaFeatures(orgId);
+    // Cloud, no resolvable subscription/plan → base tier only: NO betas. The
+    // subscription is the sole source of truth on cloud, so the org-level beta
+    // toggle (organizations.beta_features) is NOT load-bearing here — an org
+    // without a plan gets nothing beyond base capabilities. (Self-hosted already
+    // returned the admin-managed org grant via the serverGoverns branch above.)
+    return [];
 }
 
 /**
@@ -336,15 +360,21 @@ async function getUserBetaFeatures(userId, session = null, { tierHint = null } =
     const cachedTier = cached?.value?.tier && cached.expiresAt > Date.now() ? cached.value.tier : null;
     const effectiveHint = tierHint || cachedTier;
     const orgIdForResolve = user.organizationId || (Array.isArray(user.groups) ? null : null);
-    if (!(await _scopeAllowsBeta({ userId, organizationId: orgIdForResolve, tierHint: effectiveHint }))) {
-        // Below the enterprise beta floor (a Community install), the only betas
-        // available are the GA features whose licence feature is part of the
-        // Community tier — the n8n-style free builder (Automations + Agent
-        // Routines). Everything else stays Enterprise-gated. Derived from the
-        // registry + the licence tier so it self-tracks tiers.js (no hand-
-        // maintained id list). These GA features have no per-org opt-in on
-        // Community (the Beta admin panel is itself Enterprise), so they pass
-        // through directly rather than going through the org allow-list below.
+    // Self-hosted ONLY: below the enterprise beta floor (a Community install),
+    // the only betas available are the GA features whose licence feature is part
+    // of the Community tier — the n8n-style free builder (Automations + Agent
+    // Routines). Everything else stays Enterprise-gated. Derived from the
+    // registry + the licence tier so it self-tracks tiers.js (no hand-maintained
+    // id list).
+    //
+    // On CLOUD this tier floor does NOT apply: the SUBSCRIPTION is the source of
+    // truth, so a plan may include enterprise betas (e.g. webpages) on a
+    // community-priced tier. We fall through to the org allow-list resolution
+    // below (getEffectiveOrgBetaAllowList), and the entitlements ceiling's
+    // compound-licence term — derived from the same plan beta list — backs it.
+    // Short-circuit eval skips _scopeAllowsBeta entirely on cloud.
+    if (serverLicenseGovernsOrgsSafe()
+        && !(await _scopeAllowsBeta({ userId, organizationId: orgIdForResolve, tierHint: effectiveHint }))) {
         const lic = _licenseModule();
         return BETA_FEATURES
             .filter(f => getFeatureLifecycle(f) === BetaLifecycle.GA
@@ -420,6 +450,32 @@ async function getUserBetaFeatures(userId, session = null, { tierHint = null } =
         throw new FeatureServiceUnavailableError(err);
     }
 
+    // Per-group beta grants (grant-only, additive). A beta granted to one of the
+    // user's groups becomes available even if it isn't enabled org-wide — as long
+    // as it is within that org's allow-list/ceiling. Only reached for enterprise+
+    // (the community short-circuit above already returned), so the compound
+    // license term is satisfied by the tier. Scoped per the group's own org.
+    try {
+        const betaIdSet = new Set(BETA_FEATURES.map(f => f.id));
+        const allowCache = new Map();
+        for (const gid of groupIds) {
+            const group = allGroups.find(g => g.id === gid);
+            if (!group || !group.organizationId || !orgIds.has(group.organizationId)) continue;
+            const granted = Array.isArray(group.granted_capabilities) ? group.granted_capabilities : [];
+            if (granted.length === 0) continue;
+            let allowed = allowCache.get(group.organizationId);
+            if (!allowed) {
+                allowed = new Set(await getEffectiveOrgBetaAllowList(group.organizationId));
+                allowCache.set(group.organizationId, allowed);
+            }
+            for (const capId of granted) {
+                if (betaIdSet.has(capId) && allowed.has(capId)) featureSet.add(capId);
+            }
+        }
+    } catch (err) {
+        console.warn('[BetaFeatures] per-group beta grant resolution failed:', err.message);
+    }
+
     return [...featureSet];
 }
 
@@ -443,9 +499,36 @@ function resolveFeatureAliases(featureId) {
  * 'itil_ticket_assistant') are treated as equivalent.
  */
 async function userHasBetaFeature(userId, featureId, session = null) {
+    const ent = require('./entitlements');
+    // Unified path: for any capability with a registry row, the single resolver
+    // (resolveEntitlements) is the source of truth — identical to the route-mount
+    // requireCapability gate, so the inline check and the API gate can never
+    // drift (this is what made the webpages page render while its API 403'd).
+    if (ent.registry.getCapability(featureId)) {
+        // Reconstruct request context from the session so the resolver does the
+        // full multi-org (primary + group orgs) resolution and reuses the
+        // per-session cache. resolveBestTierForRequest / resolveUserOrgIds read
+        // only req.session, so a synthetic { session } req is faithful.
+        const req = session ? { session } : null;
+        let orgId = session?.user?.organizationId || session?.user?.orgId || null;
+        if (!orgId && userId && !req) {
+            // Background caller (null session): resolve the user's primary org so
+            // the subscription/org grant layer is populated (mirrors the legacy
+            // org sweep). Group-org sweep is covered by the request path above.
+            try { const u = await require('../stores/userStore').getUser(userId); orgId = u?.organizationId || null; } catch (_) { /* fail closed below */ }
+        }
+        return ent.hasCapability(featureId, { userId, orgId, session, req });
+    }
+    // Orphan id without a registry row (e.g. 'templates'): preserve the raw plan/
+    // org beta allow-list membership the resolver can't express. getUserBetaFeatures
+    // is intentionally left unchanged for exactly this path.
     const aliases = resolveFeatureAliases(featureId);
-    const userFeatures = await getUserBetaFeatures(userId, session);
-    return userFeatures.some(id => aliases.has(id));
+    try {
+        const userFeatures = await getUserBetaFeatures(userId, session);
+        return userFeatures.some(id => aliases.has(id));
+    } catch (_) {
+        return false;
+    }
 }
 
 /**
@@ -458,35 +541,30 @@ async function userHasBetaFeature(userId, featureId, session = null) {
  */
 async function orgHasBetaFeature(orgId, featureId, { tierHint = null } = {}) {
     if (!orgId) return false;
-    // Tier short-circuit — background callers fail-quiet (matches the
-    // existing catch-all return-false at the bottom of this function).
+    const ent = require('./entitlements');
+    // Unified path: delegate org-wide capability checks (background runners,
+    // schedulers) to the single resolver so they agree with requireCapability.
+    if (ent.registry.getCapability(featureId)) {
+        return ent.hasCapability(featureId, { orgId, tierHint });
+    }
+    // Orphan id (no registry row): preserve the raw allow-list membership the
+    // resolver can't express, with the original cloud/self-hosted branching.
     try {
         if (!(await _scopeAllowsBeta({ organizationId: orgId, tierHint }))) return false;
-    } catch (_) {
-        return false;
-    }
-    try {
         const aliases = resolveFeatureAliases(featureId);
         const allowed = new Set(await getEffectiveOrgBetaAllowList(orgId));
         if (!serverLicenseGovernsOrgsSafe()) {
-            // Cloud: subscription is leading — allow-list membership is enough.
-            for (const id of aliases) {
-                if (allowed.has(id)) return true;
-            }
+            for (const id of aliases) { if (allowed.has(id)) return true; }
             return false;
         }
-        const gaSet = new Set(
-            BETA_FEATURES.filter(f => f.lifecycle === BetaLifecycle.GA).map(f => f.id)
-        );
+        const gaSet = new Set(BETA_FEATURES.filter(f => f.lifecycle === BetaLifecycle.GA).map(f => f.id));
         const userStore = require('../stores/userStore');
         let active = [];
-        try { active = await userStore.getOrgEnabledBetaFeatures(orgId); }
-        catch (_) { active = []; }
+        try { active = await userStore.getOrgEnabledBetaFeatures(orgId); } catch (_) { active = []; }
         const activeSet = new Set(active);
         for (const id of aliases) {
             if (!allowed.has(id)) continue;
             if (activeSet.has(id)) return true;
-            // GA: allowed + (not explicitly inactive) → enabled.
             if (gaSet.has(id)) return true;
         }
         return false;
@@ -509,20 +587,29 @@ async function orgHasBetaFeature(orgId, featureId, { tierHint = null } = {}) {
  * Now those failures surface as transient errors customers can retry.
  */
 function requireBetaFeature(featureId) {
+    const ent = require('./entitlements');
+    // Unified path: for any registered capability, delegate to the single
+    // capability gate so beta route mounts emit the same vocabulary
+    // (feature_locked / feature_disabled / entitlement_unavailable) as every
+    // other gate and resolve through the one source of truth. requireCapability
+    // throws on an unknown id, so this branch is taken only for real features.
+    if (ent.registry.getCapability(featureId)) {
+        return ent.requireCapability(featureId);
+    }
+    // Legacy fallback — orphan ids without a registry row (e.g. 'templates',
+    // pending a product tier decision). Preserves the original beta-membership
+    // semantics and response shapes via the unchanged getUserBetaFeatures.
     return async (req, res, next) => {
         if (!req.session?.user) {
             return res.status(401).json({ error: 'Not authenticated' });
         }
         const userId = req.session.user?.id;
         try {
-            if (await userHasBetaFeature(userId, featureId, req.session)) {
+            const feats = await getUserBetaFeatures(userId, req.session);
+            const aliases = resolveFeatureAliases(featureId);
+            if (feats.some(id => aliases.has(id))) {
                 return next();
             }
-            // Distinguish "your tier doesn't allow beta features at all" from
-            // "your org admin hasn't enabled this one" so the frontend can
-            // route to the right CTA (upgrade vs. ask-your-admin). Reuses the
-            // resolution the previous call already produced via the session
-            // cache so this is just a tier comparison, not a second resolve.
             const serverVerForCache = _licenseModule().getServerLicenseVersion ? _licenseModule().getServerLicenseVersion() : 0;
             const cached = req.session?.[`_lic:${userId}:v${serverVerForCache}`];
             const cachedTier = cached?.expiresAt > Date.now() ? cached.value?.tier : null;

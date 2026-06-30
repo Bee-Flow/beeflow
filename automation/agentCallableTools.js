@@ -110,6 +110,69 @@ function sanitizeToolName(name) {
         .slice(0, 64) || 'automation_unnamed';
 }
 
+// ── Reusable Steps (kind='block') as chat/agent tools ──────
+//
+// A published Step the owner marked expose_as_tool=true becomes a function
+// tool, named from its title, with a JSON-schema built from its layer_input
+// params. Owner-only in v1 so it runs under the caller's own identity.
+
+function paramTypeToJsonSchema(type) {
+    switch (type) {
+        case 'number': case 'integer': return 'number';
+        case 'boolean': return 'boolean';
+        case 'object': return 'object';
+        case 'array': return 'array';
+        default: return 'string';
+    }
+}
+
+function stepToTool(step) {
+    if (!step || !step.id) return null;
+    const name = sanitizeToolName(step.title ? `step_${step.title}` : `step_${step.id}`);
+    const properties = {};
+    const required = [];
+    for (const p of (step.params || [])) {
+        if (!p || !p.name) continue;
+        properties[p.name] = { type: paramTypeToJsonSchema(p.type), description: p.description || '' };
+        if (p.required) required.push(p.name);
+    }
+    const parameters = { type: 'object', properties, ...(required.length ? { required } : {}), additionalProperties: false };
+    return {
+        type: 'function',
+        function: {
+            name,
+            description: step.description || `Run the "${step.title || 'Untitled'}" Step.`,
+            parameters,
+        },
+        // Routing metadata — not sent to the LLM.
+        __step: { id: step.id, userId: step.ownerId },
+    };
+}
+
+/**
+ * The published Steps a user exposed as chat tools. v1: owner-only, so we ask
+ * the store for the caller's callable Steps (org list empty → owner rows only)
+ * and keep the ones flagged expose_as_tool.
+ */
+async function getStepToolsForUser(userId) {
+    if (!userId) return [];
+    const callable = await automationStore.getCallableStepsForUser(userId, { orgIds: [] }).catch(() => []);
+    const tools = [];
+    for (const s of callable) {
+        if (s.ownerId !== userId || !s.exposeAsTool) continue;
+        const tool = stepToTool(s);
+        if (tool) tools.push(tool);
+    }
+    return tools;
+}
+
+/** Invoke a Step tool — runs the published definition under the caller. */
+async function dispatchStepTool(stepMeta, args, ctx) {
+    if (!stepMeta?.id) throw new Error('dispatchStepTool: missing Step id');
+    const automationRunner = require('../core/automationRunner');
+    return await automationRunner.runStepAsTool(stepMeta.id, args || {}, { userId: ctx?.userId || stepMeta.userId });
+}
+
 function normalizeParameters(schema) {
     // Builder gives us a JSON-schema-like object. Default to "any object"
     // when the routine author hasn't declared one yet — the agent will
@@ -126,4 +189,7 @@ module.exports = {
     automationToTool,
     getAgentCallableToolsForUser,
     dispatchAgentCallableTool,
+    stepToTool,
+    getStepToolsForUser,
+    dispatchStepTool,
 };

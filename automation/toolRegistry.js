@@ -35,6 +35,8 @@ const TOOL_REGISTRY = [
     { app: 'youtrack',                label: 'YouTrack',               module: '../integrations/youtrackTools',             arrayName: 'YOUTRACK_TOOLS',             enabledKey: 'youtrack' },
     { app: 'signrequest',             label: 'SignRequest',            module: '../integrations/signrequestTools',          arrayName: 'SIGNREQUEST_TOOLS',          enabledKey: 'signrequest' },
     { app: 'gamma',                   label: 'Gamma',                  module: '../integrations/gammaTools',                arrayName: 'GAMMA_TOOLS',                enabledKey: 'gamma' },
+    { app: 'afas-profit',             label: 'AFAS Profit',            module: '../integrations/afasTools',                 arrayName: 'AFAS_TOOLS',                 enabledKey: 'afas-profit' },
+    { app: 'nmbrs',                   label: 'NMBRS',                  module: '../integrations/nmbrsTools',                arrayName: 'NMBRS_TOOLS',                enabledKey: 'nmbrs' },
     { app: 'agent-search',            label: 'Web Search',             module: '../integrations/agentSearchTools',          arrayName: 'AGENT_SEARCH_TOOLS',         enabledKey: 'agent-search',         availableTo: ['agent', 'routine_step'] },
     { app: 'maps',                    label: 'Google Maps',            module: '../integrations/mapsTools',                 arrayName: 'MAPS_TOOLS',                 enabledKey: 'google-maps' },
     { app: 'linkedin',                label: 'LinkedIn',               module: '../integrations/linkedinTools',             arrayName: 'LINKEDIN_TOOLS',             enabledKey: 'linkedin' },
@@ -85,6 +87,30 @@ function loadTools(entry) {
 }
 
 /**
+ * Return the set of tool NAMES provided by the given app ids. Used to
+ * intersect a broad tool list (e.g. getIntegrationTools output) down to an
+ * explicit allow-list of integrations by exact tool name — robust against the
+ * underscored-vs-hyphenated integration-id mismatch elsewhere (integrationToolMap
+ * uses 'google_calendar'; the catalog + isAppOn use 'google-calendar').
+ *
+ * @param {string[]} appIds - catalog/enabledKey ids (e.g. ['gmail','google-calendar'])
+ * @returns {Set<string>} tool names
+ */
+function toolNamesForApps(appIds) {
+    const wanted = new Set(Array.isArray(appIds) ? appIds : []);
+    const names = new Set();
+    if (!wanted.size) return names;
+    for (const entry of TOOL_REGISTRY) {
+        if (!wanted.has(entry.app)) continue;
+        for (const t of loadTools(entry)) {
+            const n = t?.function?.name;
+            if (n) names.add(n);
+        }
+    }
+    return names;
+}
+
+/**
  * Find the registry entry that owns a specific tool name.
  * Returns null if no app claims the tool.
  */
@@ -122,6 +148,7 @@ module.exports = {
     TOOL_REGISTRY,
     DEFAULT_AVAILABILITY,
     loadTools,
+    toolNamesForApps,
     findOwnerOfTool,
     availabilityFor,
     availableForContext,

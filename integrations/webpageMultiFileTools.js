@@ -38,7 +38,7 @@ const WEBPAGE_MULTI_FILE_TOOLS = [
         type: 'function',
         function: {
             name: 'webpage_create_file',
-            description: 'Create or overwrite an EXTRA file at a relative path. Use for additional files like components/header.html, assets/logo.svg, data/products.json, modules/utils.js. Folders are created implicitly from the path.\n\nNOT for the three primary slots — use webpage_file_write({ file: "html"|"css"|"js" }) for those instead. Reserved paths (index.html, style.css, script.js) are rejected.\n\nNo packages, no build step. Vanilla files only. Binary content is not supported via this tool — only text. For images, the user uploads them as sources or you reference external CDN URLs.',
+            description: 'Create or overwrite an EXTRA file at a relative path. Use for additional files like components/Header.jsx, modules/state.js, src/App.jsx, data/products.json, assets/logo.svg. Folders are created implicitly from the path.\n\nNOT for the three primary slots — use webpage_file_write({ file: "html"|"css"|"js" }) for those instead. Reserved paths (index.html, style.css, script.js) are rejected.\n\nTEXT files only (HTML, CSS, JS, JSX, TS, TSX, JSON, SVG, MD, …). Binary assets (PNG/JPG/fonts/audio) are NOT created here — the user uploads those and you reference them at their path (call webpage_list_assets to see them). In a react-mui project, create src/main.jsx (the entry), src/App.jsx, and components under src/.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -53,6 +53,14 @@ const WEBPAGE_MULTI_FILE_TOOLS = [
                 },
                 required: ['path', 'content'],
             },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'webpage_list_assets',
+            description: 'List the uploaded binary assets in this project (images, fonts, audio, …) that the user has added. Returns each asset\'s path, MIME type and size so you can reference it at its real path — e.g. <img src="assets/logo.png"> (vanilla) or import logoUrl from "./assets/logo.png" (react-mui). Call this before adding images; do NOT invent external image URLs. Returns an empty list when the user has not uploaded any assets — then fall back to inline SVG, CSS gradients, emoji, or https://placehold.co/WIDTHxHEIGHT.',
+            parameters: { type: 'object', properties: {} },
         },
     },
     {
@@ -136,6 +144,19 @@ async function executeMultiFileTool(toolName, args, { webpageId, userId }) {
         return {
             files: [...primary, ...extraList],
             message: `Project has ${primary.length} primary slot${primary.length === 1 ? '' : 's'} + ${extraList.length} extra file${extraList.length === 1 ? '' : 's'}.`,
+        };
+    }
+
+    if (toolName === 'webpage_list_assets') {
+        const extras = await webpageStore.listExtraFiles(webpageId);
+        const assets = extras
+            .filter(e => !e.isText)
+            .map(e => ({ path: e.path, mimeType: e.mimeType, size: e.size }));
+        return {
+            assets,
+            message: assets.length
+                ? `${assets.length} uploaded asset${assets.length === 1 ? '' : 's'}. Reference them at their path; do not invent external image URLs.`
+                : 'No uploaded assets yet. Use inline SVG, CSS, emoji, or https://placehold.co/WIDTHxHEIGHT instead of inventing image URLs.',
         };
     }
 

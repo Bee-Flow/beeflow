@@ -256,30 +256,25 @@ async function validateAgentConfigReferences(agent, config) {
 
     const ownerId = agent.owner_id;
     const agentOrgId = agent.organization_id || null;
-    const owner = await userStore.getUser(ownerId).catch(() => null);
-    const ownerOrgIds = new Set();
-    if (owner?.organizationId) ownerOrgIds.add(owner.organizationId);
-    let ownerGroups = [];
-    if (owner) {
-        ownerGroups = Array.isArray(owner.groups)
-            ? owner.groups
-            : (() => { try { return JSON.parse(owner.groups || '[]'); } catch { return []; } })();
-        if (ownerGroups.length > 0) {
-            const allGroups = await userStore.getAllGroups().catch(() => []);
-            for (const gid of ownerGroups) {
-                const g = allGroups.find(x => x.id === gid);
-                if (g?.organizationId) ownerOrgIds.add(g.organizationId);
-            }
-        }
-    }
-
     // ── Knowledge base references ──
+    // Anti-leak invariant: a linked KB must belong to the AGENT'S organisation
+    // (org-governed content — org admins curate which org KBs an agent uses),
+    // be owned by the agent owner (their personal KB), or be a public system KB.
+    // Block ONLY cross-org KBs. We deliberately do NOT require the owner to pass
+    // the KB's publish/shared_groups gates — those govern per-user *retrieval* at
+    // query time, not whether the KB may be referenced. (The previous
+    // canUserAccessKB(owner) check rejected same-org drafts / group-restricted
+    // KBs whenever the agent owner wasn't in the KB's shared_groups, which broke
+    // KB-linking on agents owned by users outside those per-role groups.)
     const kbIds = Array.isArray(config.knowledge_base_ids) ? config.knowledge_base_ids.filter(Boolean) : [];
     if (kbIds.length > 0) {
         const kbStore = require('../../stores/knowledgeBases');
         for (const kbId of kbIds) {
             const kb = await kbStore.getKB(kbId).catch(() => null);
-            if (!kb || !kbStore.canUserAccessKB(kb, ownerId, ownerOrgIds, ownerGroups)) {
+            const sameOrg = !!(kb && kb.organization_id && agentOrgId && kb.organization_id === agentOrgId);
+            const ownedByOwner = !!(kb && kb.tenant_id === ownerId);
+            const isSystem = !!(kb && kbStore.isSystemKB(kb));
+            if (!kb || !(sameOrg || ownedByOwner || isSystem)) {
                 errors.push(`knowledge base ${kbId}`);
             }
         }

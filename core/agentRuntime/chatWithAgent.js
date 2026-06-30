@@ -218,17 +218,52 @@ async function chatWithAgent(agentId, userId, userMessage, userAuth = {}) {
 
                     console.log(`[Agent] Executing tool: ${toolName}`, toolArgs, fixedParams ? `(with fixed: ${JSON.stringify(fixedParams)})` : '');
 
+                    // Connection lending (GATED, default off): a shared agent run
+                    // by another user may borrow the OWNER's named connection for
+                    // this tool (full delegation). Inert — and zero DB cost —
+                    // unless INTEGRATION_CONNECTION_LENDING_ENABLED is set, in
+                    // which case effUserId/effOrgId fall back to exactly today's
+                    // values. Never overrides an explicit acting identity.
+                    let effUserId = userAuth?.integrationUserId || userId;
+                    let effOrgId = userAuth?.integrationOrgId || null;
+                    let lentConnection = null;
+                    try {
+                        const cr = require('../connectionResolution');
+                        if (cr.isLendingEnabled() && !userAuth?.integrationUserId) {
+                            if (!userAuth.__runCtx) userAuth.__runCtx = await cr.runningUserContext(userId);
+                            const ov = await cr.resolveEffectiveIdentity({
+                                toolName, runningUserId: userId,
+                                runningUserOrgId: userAuth.__runCtx.orgId,
+                                runningUserGroups: userAuth.__runCtx.groups,
+                                ownerUserId: agent.owner_id || null,
+                                resourceType: 'agent', resourceId: agentId,
+                            });
+                            if (ov) { effUserId = ov.integrationUserId; effOrgId = ov.integrationOrgId; lentConnection = ov; }
+                        }
+                    } catch (_) { /* fail closed to bring-your-own */ }
+
                     let toolResult;
                     try {
                         // Use unified tool dispatcher — supports integrations + components
                         const { executeTool: dispatchTool } = require('../toolDispatcher');
                         toolResult = await dispatchTool(toolName, toolArgs, {
-                            userId,
+                            // Integration tools may run under an explicit acting
+                            // identity (e.g. the Support inbox's designated
+                            // operator) so per-user OAuth / API keys / n8n org
+                            // resolve correctly. This is decoupled from the
+                            // conversation/usage `userId` above so per-thread
+                            // bucketing is preserved. Only set when a caller
+                            // injects it; every other caller is unaffected.
+                            // effUserId/effOrgId also carry a borrowed (lent)
+                            // connection identity when lending resolves one.
+                            userId: effUserId,
                             session: userAuth?.session,
                             userAuth,
+                            orgId: effOrgId,
                             fixedParams: fixedParams,
                             agentId,
                             supportThreadId: userAuth?.supportThreadId || null,
+                            lentConnection,
                         });
                     } catch (err) {
                         console.error(`[Agent] Tool execution failed for ${toolName}:`, err);

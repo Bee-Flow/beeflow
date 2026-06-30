@@ -413,7 +413,15 @@ async function executeWorkspaceTool(toolName, args, context) {
             const existing = await getWorkspace(conversationId);
             const denied = denyIfCrossUser(existing);
             if (denied) return denied;
-            await setWorkspace(conversationId, content, existing);
+            const saved = await setWorkspace(conversationId, content, existing);
+            if (!saved) {
+                console.error('[NotebookTool] Write not persisted (0 rows updated):', { conversationId, notebookId: existing?.notebookId || null });
+                return {
+                    error: 'Notebook save FAILED — the change was NOT persisted (the linked notebook may have been deleted or is not accessible). Do not tell the user the notebook was updated; report the failure instead.',
+                    _nbWriteFailed: true,
+                    _revertContent: existing?.content || ''
+                };
+            }
             const words = wordCount(content);
             return {
                 _action: 'workspace_update',
@@ -484,7 +492,15 @@ async function executeWorkspaceTool(toolName, args, context) {
                 return { error: `Invalid position: ${position}. Use "start", "end", or "after".` };
             }
 
-            await setWorkspace(conversationId, newContent, workspace);
+            const saved = await setWorkspace(conversationId, newContent, workspace);
+            if (!saved) {
+                console.error('[NotebookTool] Insert not persisted (0 rows updated):', { conversationId, notebookId: workspace?.notebookId || null });
+                return {
+                    error: 'Notebook save FAILED — the change was NOT persisted (the linked notebook may have been deleted or is not accessible). Do not tell the user the notebook was updated; report the failure instead.',
+                    _nbWriteFailed: true,
+                    _revertContent: workspace?.content || ''
+                };
+            }
             const words = wordCount(insertContent);
             return {
                 _action: 'workspace_update',
@@ -633,7 +649,15 @@ async function executeWorkspaceTool(toolName, args, context) {
                 }
             }
 
-            await setWorkspace(conversationId, newContent, workspace);
+            const saved = await setWorkspace(conversationId, newContent, workspace);
+            if (!saved) {
+                console.error('[NotebookTool] Replace not persisted (0 rows updated):', { conversationId, notebookId: workspace?.notebookId || null });
+                return {
+                    error: 'Notebook save FAILED — the change was NOT persisted (the linked notebook may have been deleted or is not accessible). Do not tell the user the notebook was updated; report the failure instead.',
+                    _nbWriteFailed: true,
+                    _revertContent: workspace?.content || ''
+                };
+            }
             const action = replaceText ? 'replaced' : 'removed';
             return {
                 _action: 'workspace_update',

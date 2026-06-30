@@ -32,6 +32,10 @@ const ELEVENLABS_TOOLS = [
                     instrumental: {
                         type: 'boolean',
                         description: 'If true, generate instrumental only (no vocals). Default: false.'
+                    },
+                    model: {
+                        type: 'string',
+                        description: 'Music model. Options: "music_v1" (default), "music_v2" (higher quality).'
                     }
                 },
                 required: ['prompt']
@@ -57,6 +61,17 @@ const ELEVENLABS_TOOLS = [
                     model: {
                         type: 'string',
                         description: 'Model ID. Options: "eleven_flash_v2_5" (fast, low latency), "eleven_v3" (highest quality), "eleven_multilingual_v2" (29 languages). Default: eleven_flash_v2_5.'
+                    },
+                    voice_settings: {
+                        type: 'object',
+                        description: 'Optional fine-tuning of the delivery.',
+                        properties: {
+                            speed: { type: 'number', description: 'Speaking rate, 0.7 (slow) to 1.2 (fast). 1.0 = normal.' },
+                            stability: { type: 'number', description: '0–1. Lower = more expressive/variable, higher = more consistent.' },
+                            similarity_boost: { type: 'number', description: '0–1. How closely to match the original voice.' },
+                            style: { type: 'number', description: '0–1. Style exaggeration.' },
+                            use_speaker_boost: { type: 'boolean', description: 'Boost similarity to the speaker.' }
+                        }
                     }
                 },
                 required: ['text']
@@ -90,6 +105,24 @@ const ELEVENLABS_TOOLS = [
 
 function isElevenLabsTool(name) {
     return name === 'elevenlabs_music' || name === 'elevenlabs_tts' || name === 'elevenlabs_sfx';
+}
+
+/**
+ * Normalize a voice-settings object to the camelCase shape the SDK expects,
+ * accepting either snake_case (LLM/agent) or camelCase (UI) input. Returns
+ * undefined when nothing usable is present.
+ */
+function normalizeVoiceSettings(vs) {
+    if (!vs || typeof vs !== 'object') return undefined;
+    const out = {};
+    if (vs.speed != null) out.speed = vs.speed;
+    if (vs.stability != null) out.stability = vs.stability;
+    const sim = vs.similarityBoost ?? vs.similarity_boost;
+    if (sim != null) out.similarityBoost = sim;
+    if (vs.style != null) out.style = vs.style;
+    const spk = vs.useSpeakerBoost ?? vs.use_speaker_boost;
+    if (spk != null) out.useSpeakerBoost = spk;
+    return Object.keys(out).length ? out : undefined;
 }
 
 function _saveAudioLocal(buffer, ext, prefix) {
@@ -155,12 +188,13 @@ async function executeElevenLabsTool(toolName, toolArgs, send, req, nanoBananaSe
         if (toolName === 'elevenlabs_music') {
             promptText = toolArgs.prompt;
             source = 'elevenlabs_music';
-            model = 'eleven_music_v1';
+            model = toolArgs.model || elSettings.musicModel || 'music_v1';
 
-            console.log(`[ElevenLabs Tool] Music: "${promptText.substring(0, 80)}"`);
+            console.log(`[ElevenLabs Tool] Music: "${promptText.substring(0, 80)}" (${model})`);
             result = await elevenlabsProvider.generateSong(apiKey, promptText, {
                 duration_seconds: toolArgs.duration_seconds || elSettings.musicDuration || 30,
                 instrumental: toolArgs.instrumental !== undefined ? toolArgs.instrumental : (elSettings.instrumental || false),
+                model: toolArgs.model || elSettings.musicModel || undefined,
             });
 
         } else if (toolName === 'elevenlabs_tts') {
@@ -168,10 +202,11 @@ async function executeElevenLabsTool(toolName, toolArgs, send, req, nanoBananaSe
             source = 'elevenlabs_tts';
             model = toolArgs.model || elSettings.ttsModel || 'eleven_flash_v2_5';
 
-            console.log(`[ElevenLabs Tool] TTS: "${promptText.substring(0, 80)}"`);
+            console.log(`[ElevenLabs Tool] TTS: "${promptText.substring(0, 80)}" (${model})`);
             result = await elevenlabsProvider.textToSpeech(apiKey, promptText, {
                 voice_id: toolArgs.voice_id || elSettings.ttsVoice,
                 model,
+                voiceSettings: normalizeVoiceSettings(toolArgs.voice_settings),
             });
 
         } else if (toolName === 'elevenlabs_sfx') {

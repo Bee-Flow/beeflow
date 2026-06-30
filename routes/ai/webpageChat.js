@@ -32,6 +32,15 @@ const {
 } = require('../../integrations/webpageDocTools');
 const { PROPOSE_WEBPAGE_PLAN_TOOL, executeProposeWebpagePlan } = require('../../integrations/webpagePlanTool');
 const {
+    resolveFramework,
+    resolveRuntime,
+    buildRuntimePromptBlock,
+    WEBPAGE_SET_FRAMEWORK_TOOL,
+    WEBPAGE_SET_RUNTIME_TOOL,
+    isFrameworkTool,
+    executeFrameworkTool,
+} = require('../../integrations/webpageFramework');
+const {
     WEBPAGE_MULTI_FILE_TOOLS,
     executeMultiFileTool,
     isMultiFileTool,
@@ -42,6 +51,7 @@ const {
     isDbTool,
 } = require('../../integrations/webpageDbTools');
 const { AGENT_SEARCH_TOOLS, executeAgentSearchTool, isAgentSearchTool } = require('../../integrations/agentSearchTools');
+const { WEBPAGE_SCREENSHOT_TOOL, executeScreenshotTool, isScreenshotTool } = require('../../integrations/webpageScreenshotTools');
 const {
     WEBPAGE_BRIDGE_TOOLS,
     executeBridgeTool,
@@ -349,6 +359,12 @@ For very large changes you can still narrate your approach in a sentence or two 
 
         emitPhase(send, 'building_prompt');
         const _spT = Date.now();
+        // Framework + runtime tier drive which build/preview contract the AI
+        // must obey. Vanilla (default) keeps the classic HTML/CSS/JS rules;
+        // react-mui swaps in the React + Material UI contract.
+        const framework = resolveFramework(webpage);
+        const runtime = resolveRuntime(webpage);
+        const runtimeBlock = buildRuntimePromptBlock({ framework, runtime, filesBlock });
         const systemPrompt = `You are a precise, efficient webpage-building assistant. Today is ${today}.
 
 ────────────────────────────────────────
@@ -359,61 +375,17 @@ ${webpage.description ? `Description: ${webpage.description}` : ''}${webpage.ins
 
 The page is rendered live in a sandboxed iframe visible to the user while you work. Every webpage_file_write / replace / patch you call updates the preview in real time.
 
-────────────────────────────────────────
-RUNTIME CONSTRAINTS — READ ONCE, OBEY ALWAYS
-────────────────────────────────────────
-1. Vanilla HTML / CSS / JavaScript only. There is NO build step.
-2. NO package installation. No \`npm install\`, no \`yarn add\`, no \`require()\` of node modules, no bundler. If you need a library, use a CDN \`<script>\` tag inside the HTML (e.g. \`<script src="https://cdn.jsdelivr.net/...">\`).
-3. NO TypeScript, JSX, SCSS, LESS, or any language that needs compilation.
-4. The preview iframe runs with \`sandbox="allow-scripts allow-forms"\` and NO \`allow-same-origin\`. That means:
-   - \`document.cookie\`, \`localStorage\`, \`sessionStorage\` are unavailable inside the page.
-   - \`fetch()\` to the host app or any same-origin URL fails (CORS / opaque origin).
-   - \`parent.window\` access throws SecurityError.
-   - \`<form>\` is allowed but submission cannot navigate to a real URL (target origin is \`null\`). ALWAYS call \`event.preventDefault()\` in the form's submit handler and do the actual work via \`window.beeflowDB\` / fetch-to-CDN / in-page state. Never rely on the form's \`action\` attribute.
-   Use in-memory variables for state. CDN fetches are allowed.
-5. Reference styles and scripts however you like — \`<link href="style.css">\` and \`<script src="script.js"></script>\` work in the downloaded zip; the in-app preview inlines them automatically.
-6. Default to a clean, modern aesthetic when the user's brief is sparse: sensible spacing, readable typography, accessible color contrast (WCAG AA), responsive on mobile.
-7. BEE FLOW HOUSE STYLE — apply this by default unless the user specifies their own look. A calm, professional productivity-tool aesthetic: a restrained palette declared as CSS custom properties in :root (a single brand accent colour, a dark neutral for text, light neutrals for surfaces), generous whitespace, a modern sans-serif system font stack, rounded corners and subtle shadows. Do NOT use purple, violet, or indigo. Define tokens once in modules/theme.css (or style.css :root) and reference them everywhere so the page is consistently branded.
-8. IMAGES — you do NOT have a library of real images and you cannot guarantee any external image URL exists. NEVER invent or hotlink arbitrary external <img> URLs (random unsplash/example.com/stock paths) — they 404 or load the wrong picture. Instead prefer inline SVG, CSS gradients/shapes, or emoji for decoration; when a raster placeholder is genuinely needed use a deterministic placeholder service such as https://placehold.co/WIDTHxHEIGHT. ALWAYS add an onerror handler to every <img> so a failed load degrades gracefully, e.g. onerror="this.style.visibility='hidden'". For internal navigation, only link to anchor ids that actually exist in the page (every href="#x" must have a matching id="x").
+${runtimeBlock}
 
 ────────────────────────────────────────
-FILES — DEFAULT TO MODULAR LAYOUTS
+VISUAL VERIFICATION — you can SEE your work
 ────────────────────────────────────────
-${filesBlock}
-
-The three primary slots (\`index.html\`, \`style.css\`, \`script.js\`) are the entry points. They should stay small — wire components together, hold the top-level layout, declare the runtime config. Anything bigger than a few sections of CSS, more than a handful of UI sections, or any logic that has its own identity belongs in its own file under a sensible folder. Smaller files = surgical partial edits, less context noise per turn, less risk of clobbering unrelated code.
-
-Recommended starter layout, even for "small" pages:
-  components/        HTML partials for individual sections (hero, features, footer, …) — see RUNTIME CONTRACT below
-  modules/           Focused JS files (state.js, ui.js, api.js, …) referenced from index.html via <script src="…">
-  modules/           …or stylesheet partials (theme.css, layout.css, components.css) referenced via <link href="…">
-  data/              .json content the script reads (menu.json, copy.json, …)
-  assets/            images, fonts, SVGs
-
-Rule of thumb: aim for files under ~200 lines. If a slot or extra file is creeping past that and the content is coherent enough to split, split it.
-
-────────────────────────────────────────
-RUNTIME CONTRACT FOR EXTRAS — read carefully, get this wrong and the preview breaks
-────────────────────────────────────────
-The preview iframe runs sandboxed with NO same-origin, so it CANNOT \`fetch()\` extra files. Extras are inlined into the page at compose time, only when their path is referenced by a recognised tag in \`index.html\`:
-
-• CSS extras → reference via \`<link rel="stylesheet" href="modules/theme.css">\` in index.html. The compiler substitutes the link with an inline <style> block.
-• JS extras → reference via \`<script src="modules/state.js"></script>\` in index.html. Substituted with an inline <script>.
-• Binary assets (images, fonts, SVGs, audio…) → reference via \`src=\` / \`href=\` on any tag. Substituted with a data: URL.
-• .json / .md / other text extras → only usable by JS that embeds them as a string at build/edit time. They are NOT auto-fetched. If script.js needs the JSON, paste the parsed object into a \`<script>\` block in index.html (e.g. \`<script>window.__menu = { ... };</script>\`) or hardcode it in modules/state.js. Do NOT write \`fetch("data/menu.json")\` — it will fail silently.
-• HTML partials in \`components/*.html\` are NOT auto-inlined. Treat them as your own reference scratchpad: write the component there, then copy/paste the markup into index.html at the right location. Updating the partial alone will NOT update the page; you must edit index.html for the change to show. (You can still split components this way — it keeps each file small and gives you a clear "library" to copy from.)
-
-Worked example — bakery landing page split into ~6 small files:
-  index.html         shell + sections copied from components/, with <link>/<script src> for modules/
-  style.css          page-level layout + tokens
-  script.js          bootstrap + event wiring; imports app behaviour from modules/
-  modules/theme.css  colour tokens + typography, referenced via <link href="modules/theme.css">
-  modules/menu.js    menu data + render fn, referenced via <script src="modules/menu.js">
-  components/hero.html       reference partial (copy into index.html)
-  components/contact.html    reference partial (copy into index.html)
-  assets/logo.svg    referenced via <img src="assets/logo.svg"> → data URL
-
-This stays under ~150 lines per file with clean diff cards for each edit.
+You have webpage_screenshot({ viewport, fullPage }) — it renders the CURRENT page in a real headless browser and returns an actual image of it, plus any console/runtime errors. Use it as a feedback loop, not a formality:
+• After a BATCH of edits that change layout or styling, take a screenshot and actually LOOK at it. Fix what's wrong: overflow, overlap, clipped text, poor contrast, misalignment, cramped or excessive spacing, broken images.
+• Check responsiveness by screenshotting viewport:'mobile' and viewport:'tablet' for any page meant to adapt.
+• The screenshot reports console + runtime errors and shows the in-page error panel if the app failed to render — if any appear, FIX them before telling the user you're done.
+• Data bridges (beeflowDB/beeflowApp) are stubbed to empty in this render, so data-driven lists look empty — judge the layout and chrome, not the data.
+• Don't screenshot after every tiny change — batch your edits, then verify. Iterate: screenshot → spot problems → fix → screenshot again until it looks polished.
 
 ────────────────────────────────────────
 EDITING TOOLS — partial edits are the default, full rewrites are the exception
@@ -554,6 +526,23 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
         emitPhaseEnd(send, 'building_prompt', Date.now() - _spT);
         let messages = [{ role: 'system', content: systemPrompt }];
 
+        // ── Privacy Shield for attachments + response restore ──────────────
+        // Webpage chat had NO PII pipeline. Mirror directChat: scan extracted
+        // attachment text (tokenize PII / block per org policy) before it enters
+        // the prompt, and restore tokens on the streamed reply. Token-scoped on
+        // webpageId so the scan's mergeTokenMap + the un-tokeniser share a map.
+        const _dlpConvId = webpageId || `wp-${require('crypto').randomUUID()}`;
+        const { resolveShieldFor: _resolveShieldFor } = require('../../core/orgShield');
+        const _psShield = await _resolveShieldFor({ orgId: userOrgForTiers, userId }).catch(() => null);
+        const { scanAttachmentText: _scanAttText } = require('../../core/dlp/attachmentScanner');
+        const _dlpActive = !!_psShield?.enabled;
+        const _scanExtracted = async (text, filename) => {
+            if (!_dlpActive || !text) return text;
+            const r = await _scanAttText({ text, filename, orgShield: _psShield, conversationId: _dlpConvId });
+            if (r.action === 'block') { const e = new Error('attachment blocked'); e.code = 'ATTACHMENT_PII_BLOCKED'; e.filename = filename; e.summary = r.summary; throw e; }
+            return r.action === 'tokenize' ? r.text : text;
+        };
+
         // Plan-execution turn: the user clicked Approve & build on a previously
         // proposed plan. Inject a system-style authorisation so the AI proceeds
         // straight to webpage_file_write / replace / patch without proposing
@@ -585,10 +574,12 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
 
             const contentParts = [];
             if (message) contentParts.push({ type: 'text', text: message });
+            try {
             for (const att of attachments) {
                 try {
                     if (att.type && att.type.startsWith('image/') && att.content) {
                         if (modelSupportsVision) {
+                            // Image PII not scanned (deferred).
                             contentParts.push({ type: 'image_url', image_url: { url: att.content } });
                         } else {
                             contentParts.push({ type: 'text', text: `[Attached image: ${att.name || 'image'} — current model has no vision; ask the user to switch to a vision-capable model to analyse it.]` });
@@ -605,9 +596,13 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
                         const result = await extractAttachment(att, { modelSupportsVision });
                         console.log(`[WebpageChat] Attachment ${att.name} extraction → kind=${result.kind}, source=${result.source || 'n/a'}`);
                         if (result.kind === 'text') {
-                            const docText = `${formatTextHeader(att, result)}\n---\n${result.text}\n---`;
+                            const safe = await _scanExtracted(result.text, att.name);
+                            const docText = `${formatTextHeader(att, result)}\n---\n${safe}\n---`;
+                            const _wasTokenised = safe !== result.text;
                             contentParts.push({ type: 'text', text: docText });
-                            if (looksLikePdf && isClaude) {
+                            // Skip shipping the raw PDF alongside when the text was
+                            // tokenised — the raw bytes would bypass the redaction.
+                            if (looksLikePdf && isClaude && !_wasTokenised) {
                                 const base64Data = att.content.includes(',') ? att.content.split(',')[1] : att.content;
                                 const mediaType = att.type && att.type.includes('pdf') ? att.type : 'application/pdf';
                                 contentParts.push({ type: 'document', source: { type: 'base64', media_type: mediaType, data: base64Data } });
@@ -625,11 +620,23 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
 
                     // Plain text / unknown — best-effort UTF-8 inline.
                     const textContent = att.content.startsWith('data:') ? Buffer.from(att.content.split(',')[1] || '', 'base64').toString('utf-8') : att.content;
-                    if (textContent) contentParts.push({ type: 'text', text: `[File: ${att.name}]\n---\n${textContent.slice(0, 8000)}\n---` });
+                    if (textContent) {
+                        const safe = await _scanExtracted(textContent.slice(0, 8000), att.name);
+                        contentParts.push({ type: 'text', text: `[File: ${att.name}]\n---\n${safe}\n---` });
+                    }
                 } catch (err) {
+                    if (err?.code === 'ATTACHMENT_PII_BLOCKED') throw err;
                     console.warn(`[WebpageChat] Attachment processing failed for ${att?.name}: ${err.message}`);
                     contentParts.push({ type: 'text', text: `[${att?.name || 'attachment'} — failed to read: ${err.message}]` });
                 }
+            }
+            } catch (e) {
+                if (e?.code === 'ATTACHMENT_PII_BLOCKED') {
+                    const cats = Object.keys(e.summary?.byCategory || {}).join(', ');
+                    send('error', { error: `Attachment "${e.filename}" was blocked by your organization's Privacy Shield${cats ? ` (contains ${cats})` : ''}.` });
+                    return res.end();
+                }
+                throw e;
             }
             const hasMultimodalBlocks = contentParts.some(p => p.type === 'image_url' || p.type === 'document');
             if (hasMultimodalBlocks) {
@@ -643,7 +650,7 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
         }
 
         // Tool list
-        const webpageTools = [...WEBPAGE_DOC_TOOLS, ...WEBPAGE_MULTI_FILE_TOOLS, ...WEBPAGE_DB_TOOLS, ...WEBPAGE_BRIDGE_TOOLS, WEBPAGE_ADD_SOURCE_TOOL];
+        const webpageTools = [...WEBPAGE_DOC_TOOLS, ...WEBPAGE_MULTI_FILE_TOOLS, ...WEBPAGE_DB_TOOLS, ...WEBPAGE_BRIDGE_TOOLS, WEBPAGE_ADD_SOURCE_TOOL, WEBPAGE_SET_FRAMEWORK_TOOL, WEBPAGE_SET_RUNTIME_TOOL, WEBPAGE_SCREENSHOT_TOOL];
         // Plan tool exposed ONLY in ask/plan modes — auto mode is "just work,
         // no approval gate". Also dropped on plan-execution turns so the AI
         // can't propose another plan after the user already approved one.
@@ -659,6 +666,13 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
         // Per-turn read-set: tracks slots the AI called webpage_file_read on so
         // the read-before-edit guard can warn when an edit comes in cold.
         const readSlots = new Set();
+        // Post-generation validation bookkeeping (BFSF-222): extra files the
+        // AI touched this turn + the framework as of the latest tool round, so
+        // the end-of-turn validator knows what to scan. At most ONE repair
+        // round per turn.
+        const touchedExtraPaths = new Set();
+        let validationRepairUsed = false;
+        let currentFramework = framework;
 
         const tierSettings = tiers[resolvedTier] || {};
         const { TIER_DEFAULTS } = require('../../core/modelResolver');
@@ -724,6 +738,11 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             attachment_bytes: _termAttachmentBytes,
         });
 
+        // Screenshots captured this round, queued to be handed to a vision-capable
+        // model as a user message after the tool results (tool-result content must
+        // be a string for non-Claude providers). Drained inside the tool loop.
+        const pendingVisionImages = [];
+
         async function dispatchToolCall(toolCall) {
             const toolName = toolCall.function?.name || toolCall.name;
             let toolArgs = {};
@@ -759,8 +778,10 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             } else if (isMultiFileTool(toolName)) {
                 toolResult = await executeMultiFileTool(toolName, toolArgs, { webpageId, userId });
                 if (toolResult?._action === 'webpage_extra_update') {
+                    touchedExtraPaths.add(toolResult.path);
                     send('webpage_extra_update', { path: toolResult.path, meta: toolResult.meta });
                 } else if (toolResult?._action === 'webpage_extra_deleted') {
+                    touchedExtraPaths.add(toolResult.path);
                     send('webpage_extra_deleted', { path: toolResult.path });
                 }
             } else if (isDbTool(toolName)) {
@@ -772,6 +793,14 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
                 }
             } else if (isBridgeTool(toolName)) {
                 toolResult = await executeBridgeTool(toolName, toolArgs, { webpageId, userId, session: req.session });
+            } else if (isFrameworkTool(toolName)) {
+                toolResult = await executeFrameworkTool(toolName, toolArgs, { webpageId, userId });
+                if (toolResult?._action === 'webpage_framework_changed') {
+                    currentFramework = toolResult.framework;
+                    send('webpage_framework_changed', { framework: toolResult.framework });
+                } else if (toolResult?._action === 'webpage_runtime_changed') {
+                    send('webpage_runtime_changed', { runtime: toolResult.runtime });
+                }
             } else if (toolName === 'webpage_add_source') {
                 try {
                     const { ingestTextSource } = require('../../agents/webpages/sourceIngestion');
@@ -814,16 +843,38 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
                 } catch (err) {
                     toolResult = { error: `Search failed: ${err.message}` };
                 }
+            } else if (isScreenshotTool(toolName)) {
+                try {
+                    toolResult = await executeScreenshotTool(toolName, toolArgs, { webpageId, userId, modelSupportsVision });
+                    if (toolResult?._screenshotDataUrl) {
+                        // Always show the user the screenshot (reuse the standard
+                        // 'image' event → MessageItem renders msg.images).
+                        const m = /^data:([^;]+);base64,(.+)$/s.exec(toolResult._screenshotDataUrl);
+                        if (m) send('image', { data: m[2], mimeType: m[1], caption: `Screenshot · ${toolResult._screenshotViewport}` });
+                        // Give the MODEL the image only if it can see images — as a
+                        // user message injected after the tool results (below), since
+                        // tool-result content must be a string for Mistral/OpenAI.
+                        if (modelSupportsVision) pendingVisionImages.push(toolResult._screenshotDataUrl);
+                    }
+                } catch (err) {
+                    toolResult = { content: `Screenshot failed: ${err.message}` };
+                }
             } else {
                 toolResult = { error: `Unknown tool: ${toolName}` };
             }
 
-            send('tool_end', { name: toolName, result: toolResult });
+            // The screenshot tool's result is a plain STRING (the diagnostics);
+            // the base64 image never goes through tool_end or the tool message.
+            const isScreenshotResult = toolResult && typeof toolResult === 'object' && toolResult._screenshotDataUrl;
+            send('tool_end', { name: toolName, result: isScreenshotResult ? { message: 'Screenshot captured.' } : toolResult });
 
             // The full toolResult goes to the UI (SSE above). The compact
             // shape goes back to the model — strips file content the model
             // already wrote and over-large query rows so prompt size doesn't
             // balloon round-over-round.
+            if (isScreenshotResult) {
+                return { role: 'tool', tool_call_id: toolCall.id, content: String(toolResult.content || 'Screenshot captured.') };
+            }
             return {
                 role: 'tool',
                 tool_call_id: toolCall.id,
@@ -833,17 +884,98 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             };
         }
 
+        // ── Post-generation validation (BFSF-222) ─────────────────────────
+        // Runs ONCE at end-of-turn (the model returned no tool calls): scans
+        // the in-memory html + touched extras for broken anchors and wrong/
+        // missing images. When error-severity findings exist it returns a
+        // repair system message so the model can fix its own output in one
+        // extra round. Advisory and fail-open — never blocks persistence.
+        async function maybeBuildValidationRepair() {
+            if (validationRepairUsed) return null;
+            const touchedRelevant = [...touchedExtraPaths].some(p => /\.(html|jsx|js)$/i.test(p));
+            if (!dirtySlots.has('html') && !touchedRelevant) return null;
+            try {
+                // Ops kill-switch — default on, mirrors max_tool_rounds_chat.
+                if ((await configStore.getConfig('webpage_validation_enabled')) === 'false') return null;
+                const {
+                    validateWebpageProject,
+                    buildRepairMessage,
+                    mergeAllowedImgHosts,
+                } = require('../../services/webpageValidation');
+                const allowedHosts = mergeAllowedImgHosts(await configStore.getConfig('webpage_img_host_allowlist'));
+                const extras = await webpageStore.listExtraFiles(webpageId);
+                // ALL extras (text AND binary) — AI-created SVGs are text
+                // extras and must count as existing assets.
+                const assetPaths = extras.map(e => e.path);
+                let scriptTexts;
+                let sourcesMap;
+                if (currentFramework === 'react-mui') {
+                    sourcesMap = {};
+                    const srcExtras = extras.filter(e => e.isText && /^src\/.*\.(jsx|js)$/i.test(e.path)).slice(0, 10);
+                    for (const e of srcExtras) {
+                        const f = await webpageStore.readExtraFile({ webpageId, userId, path: e.path });
+                        if (f?.text) sourcesMap[e.path] = f.text;
+                    }
+                } else {
+                    scriptTexts = [liveFiles.js];
+                    const jsExtras = extras.filter(e => e.isText && /\.(js|mjs|cjs)$/i.test(e.path)).slice(0, 10);
+                    for (const e of jsExtras) {
+                        const f = await webpageStore.readExtraFile({ webpageId, userId, path: e.path });
+                        if (f?.text) scriptTexts.push(f.text);
+                    }
+                }
+                const { violations } = validateWebpageProject({
+                    framework: currentFramework,
+                    html: liveFiles.html,
+                    scriptTexts,
+                    sources: sourcesMap,
+                    assetPaths,
+                    allowedHosts,
+                });
+                const actionable = violations.filter(v => v.severity !== 'info');
+                if (actionable.length === 0) return null;
+                // Observability — the frontend SSE switch ignores unknown
+                // event names, so old clients are unaffected.
+                send('webpage_validation', { violations: actionable });
+                console.log(`[WebpageChat] Validation found ${actionable.length} issue(s)`);
+                // Warns alone never trigger the extra LLM round — only real
+                // errors (broken anchor / missing asset) are worth the cost.
+                if (!actionable.some(v => v.severity === 'error')) return null;
+                return buildRepairMessage(actionable, { assetPaths });
+            } catch (valErr) {
+                console.warn('[WebpageChat] Post-generation validation failed (skipping):', valErr.message);
+                return null;
+            }
+        }
+
         // Unified streaming loop: every model round streams, so users see
         // text + reasoning + tool calls immediately rather than waiting on
         // blocking chat completions before the first paint.
+        // PII token-preservation: when attachment scanning minted tokens, tell the
+        // model what the [token]s mean so it echoes them verbatim. Best-effort.
+        if (_dlpActive) {
+            try {
+                const { buildTokenPreservationAddendum } = require('../../core/dlp/tokenPreservationPrompt');
+                const _convMap = require('../../core/dlp/dlpRunner').getConversationTokenMap(_dlpConvId);
+                const _add = buildTokenPreservationAddendum(_convMap);
+                if (_add && messages[0]?.role === 'system') messages[0].content += _add;
+            } catch (_) { /* best-effort */ }
+        }
+        // Response un-tokeniser: restore [token]s minted from attachment PII back to
+        // real values as chunks stream (shared by every phase below). Passthrough
+        // when the shield is off. Flushed once before send('done').
+        const _streamUntok = _dlpActive
+            ? require('../../core/dlp/untokeniseStream').createUntokeniser(() => require('../../core/dlp/dlpRunner').getConversationTokenMap(_dlpConvId))
+            : null;
+
         let fullContent = '';
         let streamToolCalls = [];
         let streamThinkingParts = {};
 
         const streamCallback = (type, data) => {
             if (type === 'text') {
-                fullContent += data.text;
-                send('content', { text: data.text });
+                const _safe = _streamUntok ? _streamUntok.push(data.text) : data.text;
+                if (_safe) { fullContent += _safe; send('content', { text: _safe }); }
             } else if (type === 'thinking_start') {
                 if (data.partId) {
                     streamThinkingParts[data.partId] = { redacted: !!data.redacted };
@@ -912,7 +1044,20 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
                 terminationStore.logTermination({ ..._terminationBase(), termination_type: 'max_tokens' }).catch(() => {});
             }
 
-            if (streamToolCalls.length === 0) break;
+            if (streamToolCalls.length === 0) {
+                // End of turn — validate what was generated and, on real
+                // problems, feed them back for a single repair round
+                // (BFSF-222). Stays bounded: one injection per turn, and the
+                // repair round still counts against MAX_TOOL_ROUNDS.
+                const repair = await maybeBuildValidationRepair();
+                if (repair) {
+                    messages.push({ role: 'assistant', content: (fullContent && fullContent.trim()) ? fullContent : 'Edits applied.' });
+                    messages.push({ role: 'system', content: repair });
+                    validationRepairUsed = true;
+                    continue;
+                }
+                break;
+            }
 
             messages.push({
                 role: 'assistant',
@@ -922,6 +1067,21 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             toolCallRounds++;
             const toolResults = await Promise.all(streamToolCalls.map(dispatchToolCall));
             messages.push(...toolResults);
+
+            // Hand any screenshots taken this round to the (vision-capable) model
+            // as a user message — so it can actually SEE the page and iterate.
+            // image_url blocks are converted to the provider's native image format
+            // by the adapter (Claude). Only populated when the model has vision.
+            if (pendingVisionImages.length > 0) {
+                messages.push({
+                    role: 'user',
+                    content: [
+                        ...pendingVisionImages.map(url => ({ type: 'image_url', image_url: { url } })),
+                        { type: 'text', text: 'Above is the screenshot you just captured. Review the layout, spacing, colour, contrast and alignment, and fix any visual problems before continuing.' },
+                    ],
+                });
+                pendingVisionImages.length = 0;
+            }
 
             // Plan proposed — stop the loop. Then run one more streaming
             // round (no tools) so the model can deliver its natural-language
@@ -989,6 +1149,11 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             } catch (persistErr) {
                 console.error('[WebpageChat] Failed to persist tool-driven edits:', persistErr.message);
             }
+        }
+
+        if (_streamUntok) {
+            const _tail = _streamUntok.flush();
+            if (_tail) { fullContent += _tail; send('content', { text: _tail }); }
         }
 
         send('done', {});

@@ -21,6 +21,8 @@ const { FIREFLIES_TOOLS } = require('../integrations/firefliesTools');
 const { YOUTRACK_TOOLS } = require('../integrations/youtrackTools');
 const { SIGNREQUEST_TOOLS } = require('../integrations/signrequestTools');
 const { GAMMA_TOOLS } = require('../integrations/gammaTools');
+const { AFAS_TOOLS } = require('../integrations/afasTools');
+const { NMBRS_TOOLS } = require('../integrations/nmbrsTools');
 const { buildN8nTools } = require('../integrations/n8nTools');
 const { N8N_WORKFLOW_TOOLS, getN8nToolPermission } = require('../integrations/n8nWorkflowTools');
 const { hasPermission } = require('../auth/permissions');
@@ -79,7 +81,7 @@ const AUTO_ENABLED_APPS = ['agent-search', 'workspace', 'image-gen', 'music-gen'
  * @param {boolean} options.isAdmin      - Whether user is admin
  * @returns {Object} { tools: Array, n8nOrgId: string|null }
  */
-async function getIntegrationTools({ userId, session, isAdmin, agentConfig, routineStep = false }) {
+async function getIntegrationTools({ userId, session, isAdmin, agentConfig, routineStep = false, connectionPolicy = null }) {
     const tools = [];
     let n8nOrgId = null;
 
@@ -165,8 +167,27 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig, rout
 
     // AUTO_ENABLED_APPS is now module-scoped (see top of file).
 
+    // Unified entitlement resolution — the single source of truth for which
+    // integrations this user/org is entitled to: ceiling ∩ org-grant ∩ per-group
+    // grant. This is what folds the org-admin "active" subset AND the new
+    // grant-only per-group access into one decision. The per-user `enabled_apps`
+    // selection and the legacy NC per-group opt-out stay below as the final
+    // tool-selection step — the NC connector path is untouched.
+    let entSnapshot = null;
+    let effectiveIntegrations = null;
+    try {
+        const entitlements = require('./entitlements');
+        const resolveOrgId = (userOrgId && userOrgId !== '__system__') ? userOrgId : null;
+        const snap = await entitlements.resolveEntitlements({ userId, orgId: resolveOrgId, session });
+        entSnapshot = snap;
+        if (snap && !snap.degraded) effectiveIntegrations = new Set(snap.effective.integration);
+    } catch (_) { effectiveIntegrations = null; /* fall back to the legacy org gate */ }
+    let _capReg = null;
+    try { _capReg = require('./capabilityRegistry'); } catch (_) { _capReg = null; }
+    const isKnownIntegration = (appId) => !!(_capReg && _capReg.getCapability(appId)?.kind === 'integration');
+
     const isAppOn = (appId) => {
-        // Must be enabled at user level
+        // Must be enabled at user level (a per-user UX preference)
         if (userEnabledApps) {
             // For auto-enabled apps, they're on unless _explicitly_ in a list that excluded them
             // after they existed. Since we can't tell, we default to enabled.
@@ -177,19 +198,23 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig, rout
                 return false;
             }
         }
-        // Org-level gating applies to all integrations except exempt ones
-        if (!ORG_EXEMPT_APPS.includes(appId) && orgEnabledIntegrations && !orgEnabledIntegrations.includes(appId)) return false;
-        // Org-admin "active" subset filter — applies only to non-NC, non-
-        // exempt integrations. NC integrations are governed by the NC panel
-        // and the per-group opt-out below. Super admins bypass (orgActiveSet
-        // stays null) so the platform stays fully operable for them.
-        if (orgActiveSet && !ORG_EXEMPT_APPS.includes(appId) && !ncIdSet.has(appId) && !orgActiveSet.has(appId)) {
-            return false;
+        // ENTITLEMENT — the unified resolver decides org-wide + per-group grants
+        // (org_enabled_integrations is the org-wide grant; NC + exempt apps are
+        // granted by the resolver's bypass; group grants add within the ceiling).
+        // Ids unknown to the registry (exempt infra tools) pass through. If the
+        // resolver was unavailable, fall back to the legacy inline org gate so a
+        // transient failure never strips an agent's whole toolbelt.
+        if (effectiveIntegrations && isKnownIntegration(appId)) {
+            if (!effectiveIntegrations.has(appId)) return false;
+        } else {
+            if (!ORG_EXEMPT_APPS.includes(appId) && orgEnabledIntegrations && !orgEnabledIntegrations.includes(appId)) return false;
+            if (orgActiveSet && !ORG_EXEMPT_APPS.includes(appId) && !ncIdSet.has(appId) && !orgActiveSet.has(appId)) {
+                return false;
+            }
         }
-        // Per-group NC opt-out with "enable wins". Only kicks in for the NC
-        // prefix and only when the user has at least one group with a non-
-        // empty disabled list. The tool is denied only if EVERY user group
-        // disables it — a single permissive group is enough to allow it.
+        // Per-group NC opt-out with "enable wins" (transitional, NC only). The
+        // tool is denied only if EVERY user group disables it — a single
+        // permissive group is enough to allow it. Untouched from before.
         if (userGroupDisableLists && appId.startsWith('nextcloud') && userGroupDisableLists.every(lst => lst.includes(appId))) {
             return false;
         }
@@ -273,28 +298,67 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig, rout
         }
     }
 
-    // Fireflies — requires user API key
-    const hasFirefliesKey = !!(await configStore.getSecret(`fireflies_api_key_user_${userId}`));
+    // ── Connection lending (gated) ──────────────────────────────────
+    // On a SHARED resource run (connectionPolicy carries the owner + resource),
+    // a provider the running user hasn't connected may still be available via a
+    // LENT connection from the owner (full delegation, resolved at dispatch).
+    // isLentProvider lets the catalog OFFER those tools; the dispatch override in
+    // chatStream/chatWithAgent then runs them as the owner. Inert unless
+    // INTEGRATION_CONNECTION_LENDING_ENABLED is set AND a policy is passed — and
+    // only agent paths that ALSO apply the dispatch override pass a policy.
+    let _lendCtx = undefined;
+    const _cr = require('./connectionResolution');
+    const _lendingOn = _cr.isLendingEnabled() && connectionPolicy && connectionPolicy.ownerUserId && connectionPolicy.ownerUserId !== userId;
+    async function isLentProvider(provider) {
+        if (!_lendingOn) return false;
+        try {
+            if (_lendCtx === undefined) _lendCtx = await _cr.runningUserContext(userId);
+            const store = require('../stores/integrationConnectionStore');
+            const r = await store.resolveConnectionForRun({
+                runningUserId: userId, runningUserOrgId: _lendCtx.orgId, runningUserGroups: _lendCtx.groups,
+                ownerUserId: connectionPolicy.ownerUserId, provider,
+                resourceType: connectionPolicy.resourceType || null, resourceId: connectionPolicy.resourceId || null,
+            });
+            return !!(r && r.mode === 'delegated');
+        } catch (_) { return false; }
+    }
+
+    // Fireflies — requires user API key (or a lent connection)
+    const hasFirefliesKey = !!(await configStore.getSecret(`fireflies_api_key_user_${userId}`)) || await isLentProvider('fireflies');
     if (!userSimpleMode && hasFirefliesKey && isAppOn('fireflies')) {
         addTools(FIREFLIES_TOOLS);
     }
 
-    // YouTrack — requires user URL + token
-    const hasYouTrackConfig = !!(await configStore.getSecret(`youtrack_url_user_${userId}`)) && !!(await configStore.getSecret(`youtrack_token_user_${userId}`));
+    // YouTrack — requires user URL + token (or a lent connection)
+    const hasYouTrackConfig = (!!(await configStore.getSecret(`youtrack_url_user_${userId}`)) && !!(await configStore.getSecret(`youtrack_token_user_${userId}`))) || await isLentProvider('youtrack');
     if (hasYouTrackConfig && isAppOn('youtrack')) {
         addTools(YOUTRACK_TOOLS);
     }
 
-    // Gamma — requires user API key
-    const hasGammaKey = !!(await configStore.getSecret(`gamma_api_key_user_${userId}`));
+    // Gamma — requires user API key (or a lent connection)
+    const hasGammaKey = !!(await configStore.getSecret(`gamma_api_key_user_${userId}`)) || await isLentProvider('gamma');
     if (hasGammaKey && isAppOn('gamma')) {
         addTools(GAMMA_TOOLS);
     }
 
-    // SignRequest — requires user subdomain + token
-    const hasSignRequestConfig = !!(await configStore.getSecret(`signrequest_subdomain_user_${userId}`)) && !!(await configStore.getSecret(`signrequest_token_user_${userId}`));
+    // SignRequest — requires user subdomain + token (or a lent connection)
+    const hasSignRequestConfig = (!!(await configStore.getSecret(`signrequest_subdomain_user_${userId}`)) && !!(await configStore.getSecret(`signrequest_token_user_${userId}`))) || await isLentProvider('signrequest');
     if (hasSignRequestConfig && isAppOn('signrequest')) {
         addTools(SIGNREQUEST_TOOLS);
+    }
+
+    // AFAS Profit — requires user member number + AppConnector token. Deliberately
+    // NOT lendable (no isLentProvider clause): ERP data stays bring-your-own.
+    const hasAfasConfig = !!(await configStore.getSecret(`afas_token_user_${userId}`)) && !!(await configStore.getSecret(`afas_member_number_user_${userId}`));
+    if (hasAfasConfig && isAppOn('afas-profit')) {
+        addTools(AFAS_TOOLS);
+    }
+
+    // NMBRS — read-only payroll/HR. Requires subdomain + token (and login email
+    // for the SOAP API). Bring-your-own like AFAS: payroll data is not lendable.
+    const hasNmbrsConfig = !!(await configStore.getSecret(`nmbrs_subdomain_user_${userId}`)) && !!(await configStore.getSecret(`nmbrs_token_user_${userId}`));
+    if (hasNmbrsConfig && isAppOn('nmbrs')) {
+        addTools(NMBRS_TOOLS);
     }
 
     // N8N workflows — org-level config. Read/run tools are implicit for every
@@ -343,8 +407,20 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig, rout
 
     // Workspace/Notebook — check feature flag (disabled from admin panel = no tools)
     const notebooksFeatureEnabled = (await configStore.getConfig('feature_notebooks_enabled')) !== false;
-    if (!userSimpleMode && notebooksFeatureEnabled && isAppOn('workspace')) {
-        addTools(WORKSPACE_TOOLS);
+    if (!userSimpleMode && notebooksFeatureEnabled) {
+        // BFSF-207: notebook tools mirror the HTTP surface gates — `notebooks`
+        // capability via the unified resolver (same as requireCapability on
+        // /api/notebooks + /api/ai/chat/notebook) AND the use_notebooks RBAC
+        // permission (same as routes/notebooks.js). Fail closed on a missing/
+        // degraded snapshot (matches the MCP fail-closed posture below).
+        let notebooksEntitled = false;
+        try {
+            const entitlements = require('./entitlements');
+            notebooksEntitled = !!(entSnapshot && !entSnapshot.degraded && entitlements.snapshotHas(entSnapshot, 'notebooks'));
+        } catch (_) { notebooksEntitled = false; }
+        if (notebooksEntitled && await hasPermission(userId, 'use_notebooks', session)) {
+            addTools(WORKSPACE_TOOLS);
+        }
     }
 
     // KB Search — available when agent has knowledge bases configured
@@ -360,8 +436,8 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig, rout
         addTools(KB_INGEST_TOOLS);
     }
 
-    // LinkedIn — requires user OAuth tokens
-    const hasLinkedIn = !!(await configStore.getSecret(`linkedin_access_token_user_${userId}`));
+    // LinkedIn — requires user OAuth tokens (or a lent connection)
+    const hasLinkedIn = !!(await configStore.getSecret(`linkedin_access_token_user_${userId}`)) || await isLentProvider('linkedin');
     if (hasLinkedIn && isAppOn('linkedin')) {
         addTools(LINKEDIN_TOOLS);
     }
@@ -372,8 +448,8 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig, rout
         addTools(MAPS_TOOLS);
     }
 
-    // GitHub — requires user PAT
-    const hasGitHub = !!(await configStore.getSecret(`github_token_user_${userId}`));
+    // GitHub — requires user PAT (or a lent connection)
+    const hasGitHub = !!(await configStore.getSecret(`github_token_user_${userId}`)) || await isLentProvider('github');
     if (hasGitHub && isAppOn('github')) {
         addTools(GITHUB_TOOLS);
     }
@@ -477,7 +553,116 @@ async function getIntegrationTools({ userId, session, isAdmin, agentConfig, rout
         } catch (_) { /* beta lookup failed — fail closed */ }
     }
 
+    // MCP servers are integrations (id `mcp:<serverId>`). Gate them by the same
+    // effective.integration set computed above — single path, no duplication.
+    await appendMcpTools(tools, { effectiveIntegrations });
+
+    // Org-scoped custom integrations (AI Integration Builder, id
+    // `custom:<uuid>`) — same effective-set gate; the dark-ship feature flag
+    // is enforced inside the helper.
+    await appendCustomIntegrationTools(tools, { effectiveIntegrations, orgId: userOrgId });
+
+    // Agent-callable routines (automations with trigger.kind === 'agent_call').
+    // Each active one the user owns becomes a function tool the model can call
+    // from direct chat or a configured agent. Gated by the same 'automations'
+    // capability the scheduler checks — fail closed if the org lacks it or the
+    // lookup throws, so we never surface routines on installs without routines.
+    try {
+        const { hasCapability } = require('./entitlements');
+        const resolveOrgId = (userOrgId && userOrgId !== '__system__') ? userOrgId : null;
+        if (await hasCapability('automations', { userId, orgId: resolveOrgId })) {
+            const { getAgentCallableToolsForUser } = require('../automation/agentCallableTools');
+            const agentTools = await getAgentCallableToolsForUser(userId);
+            for (const t of agentTools) {
+                if (!tools.find(x => x?.function?.name === t?.function?.name)) tools.push(t);
+            }
+        }
+    } catch (e) {
+        console.warn('[IntegrationTools] Failed to load agent-callable routines:', e.message);
+    }
+
+    // Reusable Steps (kind='block') the user published and marked "available in
+    // chat". Owner-only in v1 (mirrors agent_call), so the Step runs under the
+    // caller's own identity. Same 'automations' capability gate.
+    try {
+        const { hasCapability } = require('./entitlements');
+        const resolveOrgId = (userOrgId && userOrgId !== '__system__') ? userOrgId : null;
+        if (await hasCapability('automations', { userId, orgId: resolveOrgId })) {
+            const { getStepToolsForUser } = require('../automation/agentCallableTools');
+            const stepTools = await getStepToolsForUser(userId);
+            for (const t of stepTools) {
+                if (!tools.find(x => x?.function?.name === t?.function?.name)) tools.push(t);
+            }
+        }
+    } catch (e) {
+        console.warn('[IntegrationTools] Failed to load Step tools:', e.message);
+    }
+
     return { tools, n8nOrgId };
+}
+
+/**
+ * Append connected MCP-server tools to a tool list, gated by the caller's
+ * effective integration set. Shared by getIntegrationTools (running user) and
+ * agentRuntime/agentTools (agent owner) so the gating lives in ONE place.
+ *
+ *   effectiveIntegrations : Set<string> of granted integration ids, or null.
+ *     null ⇒ fail-closed (no MCP tools) — the resolver was unavailable/degraded.
+ *   Each MCP server `mcp:<id>` must be present in the set to expose its tools.
+ *   (No tier/umbrella gate — MCP servers are plain integrations.)
+ */
+async function appendMcpTools(tools, { effectiveIntegrations }) {
+    if (!effectiveIntegrations) return; // fail closed
+    try {
+        const mcpManager = require('./mcpManager');
+        const mcpTools = await mcpManager.getAllToolsAsOpenAI();
+        for (const t of mcpTools) {
+            const serverId = t._mcp?.serverId;
+            if (!serverId) continue;                                  // unidentifiable ⇒ fail closed
+            if (!effectiveIntegrations.has(`mcp:${serverId}`)) continue;
+            if (!tools.find(x => x.function?.name === t.function?.name)) tools.push(t);
+        }
+    } catch (e) {
+        console.warn('[IntegrationTools] MCP injection failed:', e.message);
+    }
+}
+
+/**
+ * Append org-scoped custom-integration tools (AI Integration Builder) to a
+ * tool list, gated by the caller's effective integration set. Shared by
+ * getIntegrationTools (running user) and agentRuntime/agentTools (agent
+ * owner) so the gating lives in ONE place.
+ *
+ *   effectiveIntegrations : Set<string> of granted capability ids, or null.
+ *     null ⇒ fail-closed (no custom tools) — the resolver was unavailable/degraded.
+ *   orgId : the user's OWN org — custom integrations are org-scoped, so a
+ *     missing org (or the '__system__' super-admin scope) means none exist.
+ *   Each integration `custom:<uuid>` must be present in the set to expose its
+ *   tools_cache entries (already OpenAI-format with cint_-prefixed names,
+ *   frozen at activation — including any `_cint` metadata they carry).
+ *   The dark-ship feature flag is re-checked here so flipping it off removes
+ *   injection without touching callers.
+ */
+async function appendCustomIntegrationTools(tools, { effectiveIntegrations, orgId }) {
+    if (!effectiveIntegrations) return; // fail closed
+    if (!orgId || orgId === '__system__') return; // org-scoped feature — no org, no tools
+    try {
+        const { isCustomIntegrationsEnabled } = require('./customIntegrations/featureFlag');
+        if (!(await isCustomIntegrationsEnabled())) return; // feature ships dark
+        const store = require('../stores/orgCustomIntegrationStore');
+        const rows = await store.listActiveForOrg(orgId);
+        for (const row of Array.isArray(rows) ? rows : []) {
+            if (!row || !row.id) continue;                            // unidentifiable ⇒ fail closed
+            if (!effectiveIntegrations.has(`custom:${row.id}`)) continue;
+            for (const entry of Array.isArray(row.toolsCache) ? row.toolsCache : []) {
+                const name = entry?.function?.name;
+                if (!name) continue;                                  // unidentifiable ⇒ fail closed
+                if (!tools.find(x => x.function?.name === name)) tools.push(entry);
+            }
+        }
+    } catch (e) {
+        console.warn('[IntegrationTools] Custom integration injection failed:', e.message);
+    }
 }
 
 /**
@@ -497,6 +682,8 @@ async function buildToolHint(tools, userId = null) {
     if (tools.some(t => t.function.name.startsWith('keep_'))) integrations.push('Google Keep (list, get, create, delete notes — create/delete require user approval, enterprise Workspace only)');
     if (tools.some(t => t.function.name.startsWith('groups_'))) integrations.push('Google Groups (list conversations in a group, read full conversation threads, reply to group conversations — replies require user approval before sending)');
     if (tools.some(t => t.function.name.startsWith('youtrack_'))) integrations.push('YouTrack (search, create, update issues)');
+    if (tools.some(t => t.function.name.startsWith('afas_'))) integrations.push('AFAS Profit (discover GetConnectors with afas_list_connectors, inspect fields with afas_describe_connector, then read data with afas_query; read-only)');
+    if (tools.some(t => t.function.name.startsWith('nmbrs_'))) integrations.push('NMBRS payroll/HR (read-only: list debtors → companies → employees with nmbrs_list_*, then read an employee\'s contracts, salaries, wage components and payslips)');
     if (tools.some(t => t.function.name.startsWith('signrequest_'))) integrations.push('SignRequest (send documents for e-signature, check signing status, list documents, cancel requests)');
     if (tools.some(t => t.function.name.startsWith('fireflies_'))) integrations.push('Fireflies (meeting transcripts)');
     if (tools.some(t => t.function.name.startsWith('gamma_'))) integrations.push('Gamma (create presentations/documents/webpages/social posts, generate from templates using gammaId or a pasted gamma.app/docs URL, poll generation status, list themes/folders; create tools start asynchronous jobs and return generationId first, then use gamma_get_generation_status to retrieve gammaUrl/exportUrl; existing Gammas cannot be read by URL or edited in place via the public API. If the user asks to create/remix a new Gamma from a URL, call gamma_create_from_template instead of saying the URL cannot be used)');
@@ -578,6 +765,30 @@ async function buildToolHint(tools, userId = null) {
             const label = serverId.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
             integrations.push(`${label} via MCP (${toolDescs.length} tools: ${toolDescs.slice(0, 5).join(', ')}${toolDescs.length > 5 ? `, ... and ${toolDescs.length - 5} more` : ''})`);
         }
+    }
+
+    // Custom org integrations (AI Integration Builder) — cint_<slug>_<tool>.
+    // Cheap by construction: skipped entirely when no cint_ tools made it into
+    // the list, one getBySlug lookup per distinct integration otherwise.
+    // Fail-soft: a store hiccup only costs the hint line, never the tools.
+    const cintTools = tools.filter(t => t.function?.name?.startsWith('cint_'));
+    if (cintTools.length > 0) {
+        try {
+            const { parsePrefixedName } = require('../integrations/customIntegrationRunner');
+            const orgCustomIntegrationStore = require('../stores/orgCustomIntegrationStore');
+            const bySlug = new Map();
+            for (const t of cintTools) {
+                const parsed = parsePrefixedName(t.function.name);
+                if (!parsed) continue;
+                if (!bySlug.has(parsed.slug)) bySlug.set(parsed.slug, []);
+                bySlug.get(parsed.slug).push(t.function.name);
+            }
+            for (const [slug, toolNames] of bySlug) {
+                const row = await orgCustomIntegrationStore.getBySlug(slug);
+                if (!row || !row.name) continue;
+                integrations.push(`${row.name} (custom org integration: ${toolNames.join(', ')})`);
+            }
+        } catch (_) { /* fail soft — hint only, the tools themselves still work */ }
     }
 
     let hint = ' You have access to tools — use them when they would help answer the user\'s question. You can call multiple tools in parallel when appropriate.';
@@ -676,4 +887,4 @@ async function getUserPermittedApps({ userId, session, isAdmin } = {}) {
     return out;
 }
 
-module.exports = { getIntegrationTools, buildToolHint, getUserPermittedApps };
+module.exports = { getIntegrationTools, buildToolHint, getUserPermittedApps, appendMcpTools, appendCustomIntegrationTools };

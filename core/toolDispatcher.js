@@ -25,10 +25,12 @@ const { isFirefliesTool, executeFirefliesTool } = require('../integrations/firef
 const { isYouTrackTool, executeYouTrackTool } = require('../integrations/youtrackTools');
 const { isSignRequestTool, executeSignRequestTool } = require('../integrations/signrequestTools');
 const { isGammaTool, executeGammaTool } = require('../integrations/gammaTools');
+const { isAfasTool, executeAfasTool } = require('../integrations/afasTools');
+const { isNmbrsTool, executeNmbrsTool } = require('../integrations/nmbrsTools');
 const { isN8nTool, executeN8nTool } = require('../integrations/n8nTools');
 const { isN8nWorkflowTool, executeN8nWorkflowTool, getN8nToolPermission } = require('../integrations/n8nWorkflowTools');
 const { hasPermission } = require('../auth/permissions');
-const { isAgentSearchTool, executeAgentSearchTool } = require('../integrations/agentSearchTools');
+const { isAgentSearchTool, executeWebSearch } = require('../integrations/agentSearchTools');
 const { isRegexGeneratorTool, executeRegexGeneratorTool } = require('../integrations/regexGeneratorTools');
 const { executeWorkspaceTool } = require('../integrations/workspaceTools');
 const { isKbSearchTool, executeKbSearchTool } = require('../integrations/kbSearchTools');
@@ -110,6 +112,25 @@ async function executeTool(toolName, toolArgs, context = {}) {
 
     // ─── Terminal Tools (removed — module no longer exists) ────
     // Terminal container system has been removed from the platform
+
+    // ─── Custom Integrations (AI Integration Builder) ───────────
+    // Org-scoped cint_<slug>_<tool> calls go straight to the hardened runner
+    // — org match, status, capability backstop, origin pin, SSRF re-check,
+    // method gate and secret scrub all live there. Dispatched BEFORE the
+    // per-integration chain so no prefix collision can shadow it.
+    // `unattended`: context.autoSend is the only dispatch-side headless
+    // marker today — the automation runner sets it on LIVE routine runs and
+    // webpageApiRuntime sets it on backend handler calls. Legacy AI tasks
+    // (aiTaskRunner) carry NO marker and dispatch as attended; the runner
+    // refuses unattended===true outright for now, and the capability
+    // backstop still gates every call regardless of path.
+    const customRunner = require('../integrations/customIntegrationRunner');
+    if (customRunner.isCustomIntegrationTool(toolName)) {
+        return await customRunner.executeCustomIntegrationTool(toolName, toolArgs, {
+            userId,
+            unattended: !!context.autoSend,
+        });
+    }
 
     // ─── Skill Activation (dynamic skill loading) ──────────────
     const { ACTIVATE_SKILL_TOOL_NAME, executeActivateSkill } = require('./skillInjection');
@@ -205,6 +226,12 @@ async function executeTool(toolName, toolArgs, context = {}) {
     if (isGammaTool(toolName)) {
         return await executeGammaTool(toolName, toolArgs, userId);
     }
+    if (isAfasTool(toolName)) {
+        return await executeAfasTool(toolName, toolArgs, userId);
+    }
+    if (isNmbrsTool(toolName)) {
+        return await executeNmbrsTool(toolName, toolArgs, userId);
+    }
     if (isGmailTool(toolName)) {
         // `autoSend` is opt-in per-call: only the automation runner sets it
         // (no user is present to confirm a draft). Direct chat / agent chat
@@ -259,35 +286,10 @@ async function executeTool(toolName, toolArgs, context = {}) {
         return await executeN8nTool(toolName, toolArgs, orgId, attachments);
     }
     if (isAgentSearchTool(toolName)) {
-        // Route by admin-configured search provider.
-        // Wrapped in try-catch to survive transient PostgreSQL DNS failures (EAI_AGAIN).
-        try {
-            const searchProvider = await configStore.getConfig('search_provider');
-            if (searchProvider === 'bing') {
-                const { executeBingSearchTool } = require('../integrations/bingSearchTools');
-                return await executeBingSearchTool(toolName, toolArgs);
-            }
-            if (searchProvider === 'node-search') {
-                const { executeNodeSearchTool } = require('../integrations/nodeSearchTools');
-                return await executeNodeSearchTool(toolName, toolArgs);
-            }
-            // Implicit fallback: provider is agent-search (or unset) but the
-            // GPU service URL is empty. If a Serper key is configured, route
-            // to node-search so search still works in CPU-only deploys.
-            if (!searchProvider || searchProvider === 'agent-search') {
-                const hasAgentSearchUrl = !!process.env.SEARCH_SERVICE_URL || !!(await configStore.getConfig('agent_search_url'));
-                if (!hasAgentSearchUrl) {
-                    const hasSerperKey = !!(await configStore.getSecret('serper_api_key'));
-                    if (hasSerperKey) {
-                        const { executeNodeSearchTool } = require('../integrations/nodeSearchTools');
-                        return await executeNodeSearchTool(toolName, toolArgs);
-                    }
-                }
-            }
-        } catch (cfgErr) {
-            console.warn(`[ToolDispatcher] Config lookup failed (search_provider), using default: ${cfgErr.message}`);
-        }
-        return await executeAgentSearchTool(toolName, toolArgs);
+        // Route by admin-configured search provider (bing / node-search /
+        // agent-search service, with node-search fallback for CPU-only deploys).
+        // Single source of truth lives in agentSearchTools.executeWebSearch.
+        return await executeWebSearch(toolName, toolArgs);
     }
 
     // ─── Reminder Tool ──────────────────────────────────────────
@@ -349,6 +351,24 @@ async function executeTool(toolName, toolArgs, context = {}) {
     // ─── Notebook Tools (formerly Workspace) ──────────────────────
     if (toolName === 'notebook_read' || toolName === 'notebook_write' || toolName === 'notebook_replace' || toolName === 'notebook_insert' ||
         toolName === 'workspace_read' || toolName === 'workspace_write' || toolName === 'workspace_replace') {
+        // BFSF-207 backstop: notebook tools are entitlement-gated at registration;
+        // re-check at dispatch so no other injection path can execute them.
+        // Mirror registration's org resolution (user's own org — context.orgId is
+        // absent in agent chat and may be the LENDER's org under connection lending).
+        try {
+            const { hasCapability } = require('./entitlements');
+            const { hasPermission } = require('../auth/permissions');
+            let resolveOrgId = null;
+            try { resolveOrgId = (await require('../stores/userStore').getUser(userId))?.organizationId || null; } catch (_) {}
+            const ok = !!userId
+                && await hasCapability('notebooks', { userId, orgId: resolveOrgId, session })
+                && await hasPermission(userId, 'use_notebooks', session);
+            if (!ok) {
+                return { error: 'The notebook is not available for this user — the notebooks feature is not included in their plan or has not been enabled for them. Briefly let the user know the notebook is unavailable and continue helping them directly in chat.' };
+            }
+        } catch (_) {
+            return { error: 'The notebook is temporarily unavailable. Continue helping the user directly in chat.' };
+        }
         return await executeWorkspaceTool(toolName, toolArgs, {
             conversationId: context.conversationId,
             agentId: context.agentId,
@@ -432,7 +452,11 @@ async function executeTool(toolName, toolArgs, context = {}) {
         return await executeTicketAssistantTool(toolName, toolArgs, userId, session);
     }
     if (isSupportTool(toolName)) {
-        return await executeSupportTool(toolName, toolArgs, { userId, session, userAuth, supportThreadId: context.supportThreadId });
+        return await executeSupportTool(toolName, toolArgs, {
+            userId, session, userAuth,
+            supportThreadId: context.supportThreadId,
+            supportActionPolicy: userAuth?.supportActionPolicy || null,
+        });
     }
     if (isWebpageAutomationTool(toolName)) {
         return await executeWebpageAutomationTool(toolName, toolArgs, {
@@ -459,6 +483,39 @@ async function executeTool(toolName, toolArgs, context = {}) {
     }
     if (isTranscriptionTool(toolName)) {
         return await executeTranscriptionTool(toolName, toolArgs, { userId, session, attachments, req });
+    }
+
+    // ─── Agent-Callable Routines (trigger.kind === 'agent_call') ─
+    // These tools are per-user and named dynamically (toolName or
+    // automation_<id>), so they can't be matched by a static isXxxTool guard.
+    // Look the caller's active routines up by name and dispatch to the runner.
+    if (userId) {
+        try {
+            const { getAgentCallableToolsForUser, dispatchAgentCallableTool } = require('../automation/agentCallableTools');
+            const agentTools = await getAgentCallableToolsForUser(userId);
+            const match = agentTools.find(t => t?.function?.name === toolName);
+            if (match) {
+                return await dispatchAgentCallableTool(match.__automation, toolArgs, { userId });
+            }
+        } catch (e) {
+            console.warn('[ToolDispatcher] agent-callable routine lookup failed:', e.message);
+        }
+    }
+
+    // ─── Reusable Steps (kind='block') exposed as chat tools ────
+    // Named step_<title>; matched the same dynamic way as agent-callable
+    // routines and dispatched to runStepAsTool (owner-only, runs as caller).
+    if (userId) {
+        try {
+            const { getStepToolsForUser, dispatchStepTool } = require('../automation/agentCallableTools');
+            const stepTools = await getStepToolsForUser(userId);
+            const match = stepTools.find(t => t?.function?.name === toolName);
+            if (match) {
+                return await dispatchStepTool(match.__step, toolArgs, { userId });
+            }
+        } catch (e) {
+            console.warn('[ToolDispatcher] Step tool lookup failed:', e.message);
+        }
     }
 
     // ─── Progressive-disclosure safety net ─────────────────────

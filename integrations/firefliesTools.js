@@ -17,13 +17,13 @@ const FIREFLIES_TOOLS = [
         type: 'function',
         function: {
             name: 'fireflies_list_transcripts',
-            description: 'List meeting transcripts from Fireflies.ai. Returns meeting titles, dates, durations, organizers, and participants. Supports filtering by title, date range, host, or participant. Use this when the user asks about their meetings, calls, or transcriptions.',
+            description: 'List meeting transcripts from Fireflies.ai. Returns meeting titles, dates, durations, organizers, and participants. Supports filtering by title, date range, host, or participant. Use this when the user asks about their meetings, calls, or transcriptions. When the user names a specific meeting, pass its title in `title`: the result includes matchQuality and exactMatches — if matchQuality is "exact", immediately use that transcript id with fireflies_get_summary/fireflies_get_transcript instead of listing again.',
             parameters: {
                 type: 'object',
                 properties: {
                     title: {
                         type: 'string',
-                        description: 'Filter by meeting title (partial match)'
+                        description: 'Meeting title to find. Exact (case/whitespace-insensitive) matches are detected and flagged first; partial matches are returned otherwise.'
                     },
                     limit: {
                         type: 'integer',
@@ -221,6 +221,35 @@ async function firefliesRequest(apiKey, query, variables = {}) {
     return json.data;
 }
 
+// ─── Title Matching ────────────────────────────────────────────
+
+/**
+ * Normalize a meeting title for comparison: lowercase, collapse whitespace, trim.
+ */
+function normalizeTitle(s) {
+    return String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Split transcripts into exact and partial matches for a wanted title.
+ * Exact = normalized titles are equal; partial = one normalized title
+ * contains the other.
+ */
+function classifyTitleMatches(transcripts, wantedTitle) {
+    const wanted = normalizeTitle(wantedTitle);
+    const exact = [];
+    const partial = [];
+    for (const t of transcripts || []) {
+        const title = normalizeTitle(t && t.title);
+        if (wanted && title === wanted) {
+            exact.push(t);
+        } else if (wanted && title && (title.includes(wanted) || wanted.includes(title))) {
+            partial.push(t);
+        }
+    }
+    return { exact, partial };
+}
+
 // ─── Tool Execution ────────────────────────────────────────────
 
 async function executeFirefliesTool(toolName, args, userId) {
@@ -243,24 +272,77 @@ async function executeFirefliesTool(toolName, args, userId) {
 
         console.log(`[Fireflies] Listing transcripts`, variables);
         const data = await firefliesRequest(apiKey, LIST_TRANSCRIPTS_QUERY, variables);
-        const transcripts = data.transcripts || [];
+        let transcripts = data.transcripts || [];
 
-        return {
-            results: transcripts.map(t => ({
-                id: t.id,
-                title: t.title,
-                date: t.dateString || t.date,
-                duration: t.duration ? `${t.duration} min` : 'unknown',
-                organizer: t.organizer_email,
-                participants: t.participants || [],
-                speakers: (t.speakers || []).map(s => s.name),
-                url: t.transcript_url,
-            })),
-            count: transcripts.length,
-            message: transcripts.length === 0
-                ? 'No transcripts found matching your criteria.'
-                : `Found ${transcripts.length} transcript(s).`,
+        // If a title was asked for but the server-side filter found nothing,
+        // scan one fallback page of the 50 most-recent transcripts so
+        // near-misses (casing, extra whitespace) are caught in the same tool
+        // call. Hard bound: max 2 upstream requests per call.
+        let usedFallback = false;
+        if (args.title && transcripts.length === 0) {
+            const fallbackVariables = { ...variables, title: null, limit: 50, skip: 0 };
+            console.log(`[Fireflies] Listing transcripts (title fallback)`, fallbackVariables);
+            const fallbackData = await firefliesRequest(apiKey, LIST_TRANSCRIPTS_QUERY, fallbackVariables);
+            transcripts = fallbackData.transcripts || [];
+            usedFallback = true;
+        }
+
+        const mapTranscript = t => ({
+            id: t.id,
+            title: t.title,
+            date: t.dateString || t.date,
+            duration: t.duration ? `${t.duration} min` : 'unknown',
+            organizer: t.organizer_email,
+            participants: t.participants || [],
+            speakers: (t.speakers || []).map(s => s.name),
+            url: t.transcript_url,
+        });
+
+        // No title filter — behavior unchanged.
+        if (!args.title) {
+            return {
+                results: transcripts.map(mapTranscript),
+                count: transcripts.length,
+                message: transcripts.length === 0
+                    ? 'No transcripts found matching your criteria.'
+                    : `Found ${transcripts.length} transcript(s).`,
+            };
+        }
+
+        const { exact, partial } = classifyTitleMatches(transcripts, args.title);
+        const matchQuality = exact.length > 0 ? 'exact' : (partial.length > 0 ? 'partial' : 'none');
+        const exactMatches = exact.map(mapTranscript);
+
+        // Mapped record list, exact matches first.
+        let results = [...exact, ...transcripts.filter(t => !exact.includes(t))].map(mapTranscript);
+        let scannedTitles;
+        if (usedFallback && matchQuality !== 'exact') {
+            // Keep the payload compact: the 10 best partial matches plus a
+            // titles-only list of everything scanned so the model can spot
+            // near-misses without token bloat.
+            results = partial.slice(0, 10).map(mapTranscript);
+            scannedTitles = transcripts.slice(0, 50).map(t => t.title);
+        }
+
+        let message;
+        if (matchQuality === 'exact') {
+            const hit = exactMatches[0];
+            message = `Exact title match: "${hit.title}" (id: ${hit.id}, ${hit.date}). Call fireflies_get_summary or fireflies_get_transcript with this id now — do not list further.`;
+        } else if (matchQuality === 'partial') {
+            message = `No exact title match for "${args.title}". Returning ${results.length} partial match(es) — pick the closest by title/date or ask the user to confirm. Do not page through unrelated meetings.`;
+        } else {
+            message = `No transcript titled "${args.title}" found among the ${transcripts.length} most recent meetings (titles scanned are included). The meeting may be older — retry once with fromDate/toDate, or tell the user it was not found. Do not guess transcript ids.`;
+        }
+
+        const result = {
+            results,
+            count: results.length,
+            message,
+            matchQuality,
+            exactMatches,
         };
+        if (scannedTitles) result.scannedTitles = scannedTitles;
+        return result;
 
     } else if (toolName === 'fireflies_get_summary') {
         const { transcriptId } = args;
@@ -336,4 +418,6 @@ module.exports = {
     FIREFLIES_TOOLS,
     executeFirefliesTool,
     isFirefliesTool,
+    normalizeTitle,
+    classifyTitleMatches,
 };

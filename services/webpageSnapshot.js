@@ -16,15 +16,23 @@
  *      (`webpage-public-shares/{share_id}/...`) so it survives owner
  *      deletion or transfer
  *
- * JS is NOT included in the snapshot. The public viewer renders the snapshot
- * inside an iframe with `sandbox="allow-scripts allow-forms"` (no
+ * JS is NOT included in the VANILLA snapshot. The public viewer renders the
+ * snapshot inside an iframe with `sandbox="allow-scripts allow-forms"` (no
  * allow-same-origin) — the page's own JS is stripped at snapshot time so
  * allow-scripts only benefits whitelisted nested iframes (the Bee Flow chat
- * embed). Keeping the snapshot script-free means a future sandbox tightening
- * remains a no-op for stored pages.
+ * embed). Keeping the vanilla snapshot script-free means a future sandbox
+ * tightening remains a no-op for stored pages.
  *
- * Extra files (multi-file projects): text files (HTML/CSS/SVG) are sanitized
- * and copied; binary files (images, fonts) are copied as-is.
+ * REACT-MUI pages are different: a React app renders nothing without JS, so we
+ * bundle it server-side (reactBundleServer.composeReactDoc — the same artifact
+ * the headless thumbnail render uses) into ONE self-contained document with
+ * STUBBED bridges (no live DB/AI), store it in the `reactdoc` slot, and serve
+ * it with a script-allowing CSP. The trust boundary is the no-same-origin
+ * sandbox (executing JS can't reach beeflow.nl cookies/session), not DOMPurify.
+ *
+ * Extra files (multi-file projects, vanilla only): text files (HTML/CSS/SVG)
+ * are sanitized and copied; binary files (images, fonts) are copied as-is. For
+ * react-mui, assets are inlined as data: URLs inside the bundled doc.
  */
 
 const { JSDOM } = require('jsdom');
@@ -33,6 +41,9 @@ const createDOMPurify = require('dompurify');
 const webpageStore = require('../stores/webpageStore');
 const publicShareStore = require('../stores/webpagePublicShareStore');
 const storageStore = require('../stores/storageStore');
+const { resolveFramework } = require('../integrations/webpageFramework');
+const { composeReactDoc } = require('./reactBundleServer');
+const { loadReactFiles } = require('./webpageReactFiles');
 
 // Single shared DOMPurify instance — jsdom window is expensive to create.
 const _window = new JSDOM('<!doctype html><html><body></body></html>').window;
@@ -181,9 +192,17 @@ function sanitizeExtra(content, mime) {
 /**
  * Build and store a snapshot for an existing share row.
  *
- * Reads the live HTML/CSS (plus extras) from the owner's prefix, sanitizes,
- * and writes to webpage-public-shares/{shareId}/.... Returns a small summary
- * of what was captured.
+ * Branches on the page's FRAMEWORK:
+ *   • react-mui → bundle the React app server-side into a single self-contained
+ *     document (reactBundleServer.composeReactDoc — inline module + esm.sh
+ *     import map + STUBBED bridges) and store it in the `reactdoc` slot. The
+ *     public viewer serves it with a script-allowing CSP inside the
+ *     no-same-origin sandbox. Records snapshot_kind = 'react'.
+ *   • vanilla → read the live HTML/CSS (plus extras) from the owner's prefix,
+ *     sanitize with DOMPurify, and write the script-free trio. Records
+ *     snapshot_kind = 'static'.
+ *
+ * Returns a small summary of what was captured.
  *
  * @param {object} args
  * @param {string} args.shareId
@@ -196,6 +215,14 @@ async function writeSnapshot({ shareId, webpageId, ownerId, includeExtraFiles = 
     if (!storageStore.isAvailable()) {
         throw new Error('RustFS not configured — cannot snapshot webpage for public share');
     }
+
+    const wp = await webpageStore.getWebpageRaw(webpageId).catch(() => null);
+    const framework = resolveFramework(wp);
+
+    if (framework === 'react-mui') {
+        return writeReactSnapshot({ shareId, webpageId, ownerId });
+    }
+
     const { html, css /* js omitted by design */ } = await webpageStore.readAllSlots(ownerId, webpageId);
 
     const cleanHtml = sanitizeHtml(html);
@@ -236,7 +263,32 @@ async function writeSnapshot({ shareId, webpageId, ownerId, includeExtraFiles = 
         }
     }
 
+    await publicShareStore.setSnapshotKind(shareId, 'static');
     return captured;
+}
+
+/**
+ * Snapshot a react-mui page: bundle it server-side into one self-contained
+ * document and store it in the `reactdoc` slot. No DOMPurify — this is the
+ * owner's OWN bundled code; isolation comes from the no-same-origin sandbox +
+ * stubbed bridges (composeReactDoc) + the script-allowing CSP scoped to the
+ * react `/content` response. Throws on a bundle failure so share creation can
+ * surface it (and roll back) and the fire-and-forget re-snapshot can log it.
+ */
+async function writeReactSnapshot({ shareId, webpageId, ownerId }) {
+    const { files, assetMap } = await loadReactFiles(webpageId, ownerId);
+    const composed = await composeReactDoc({ files, assetMap });
+    if (composed.buildError) {
+        throw new Error('React bundle failed: ' + composed.buildError);
+    }
+    const docBuf = Buffer.from(composed.doc, 'utf8');
+    await storageStore.uploadFile(
+        publicShareStore.snapshotKey(shareId, 'reactdoc'),
+        docBuf,
+        'text/html; charset=utf-8'
+    );
+    await publicShareStore.setSnapshotKind(shareId, 'react');
+    return { reactDoc: docBuf.length, html: 0, css: 0, extras: 0 };
 }
 
 async function readExtraBytes(ownerId, webpageId, path) {

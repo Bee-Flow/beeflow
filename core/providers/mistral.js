@@ -28,6 +28,20 @@ class MistralProvider extends BaseProvider {
 
     // ─── Helpers ─────────────────────────────────────────────────
 
+    /**
+     * Map the normalized cross-provider tool_choice to Mistral's vocabulary.
+     * Mistral expects 'auto' | 'any' | 'none' | a specific function object. Our
+     * stack emits 'required' (OpenAI's word) to mean "must call a tool" — Mistral
+     * calls that 'any', so translate it; everything else passes through. Without
+     * this, forceFirstToolCall (small Mistral models) sent an invalid value and
+     * the forced-first-tool turn broke. Claude/OpenAI/Google already map it.
+     */
+    mapToolChoice(toolChoice) {
+        if (!toolChoice) return 'auto';
+        if (toolChoice === 'required') return 'any';
+        return toolChoice;
+    }
+
     /** Check if model is a native reasoning (Magistral) model */
     isReasoningModel(modelId) {
         return /magistral/i.test(modelId);
@@ -85,6 +99,21 @@ class MistralProvider extends BaseProvider {
         return messages.map(msg => {
             const normalized = { ...msg };
 
+            // OpenAI-style image blocks → Mistral content chunks. The Mistral SDK
+            // validates content with a Zod schema that expects { type:'image_url',
+            // imageUrl: <string|{url}> } (camelCase) and rejects { image_url:{url} }
+            // outright (ZodError). Convert user/assistant array content so vision
+            // (pixtral) works and a stray image block never crashes the request.
+            if (Array.isArray(normalized.content)) {
+                normalized.content = normalized.content.map(block => {
+                    if (block && block.type === 'image_url' && block.image_url !== undefined) {
+                        const url = typeof block.image_url === 'string' ? block.image_url : (block.image_url?.url || '');
+                        return { type: 'image_url', imageUrl: url };
+                    }
+                    return block;
+                });
+            }
+
             if (normalized.role === 'assistant') {
                 // Ensure content is never null (Mistral rejects it)
                 if (normalized.content === null || normalized.content === undefined) {
@@ -131,7 +160,7 @@ class MistralProvider extends BaseProvider {
         if (options.temperature !== undefined) params.temperature = options.temperature;
         if (options.tools && options.tools.length > 0) {
             params.tools = options.tools;
-            params.toolChoice = options.toolChoice || 'auto';
+            params.toolChoice = this.mapToolChoice(options.toolChoice);
         }
 
         // Adjustable reasoning for mistral-small
@@ -178,7 +207,7 @@ class MistralProvider extends BaseProvider {
         if (options.temperature !== undefined) params.temperature = options.temperature;
         if (options.tools && options.tools.length > 0) {
             params.tools = options.tools;
-            params.toolChoice = options.toolChoice || 'auto';
+            params.toolChoice = this.mapToolChoice(options.toolChoice);
         }
 
         // Adjustable reasoning for mistral-small

@@ -10,6 +10,11 @@ const router = express.Router();
 const languageStore = require('../../stores/languageStore');
 const { PROMPT_IDS, PROMPT_LABELS, PROMPT_CATEGORIES, getAllDefaults } = require('../../i18n/defaults/promptDefaults');
 const { GUI_DEFAULTS, getGUINamespaces } = require('../../i18n/defaults/en');
+const {
+    EMAIL_TEMPLATE_IDS, EMAIL_TEMPLATE_FIELDS, EMAIL_TEMPLATE_VARIABLES,
+    EMAIL_TEMPLATE_LABELS, EMAIL_TEMPLATE_DEFAULTS,
+} = require('../../i18n/defaults/emailTemplates');
+const { LEGAL_DOC_IDS, getLegalDefault } = require('../../i18n/defaults/legalDocs');
 
 // ── Middleware ───────────────────────────────────────────────────
 
@@ -156,6 +161,176 @@ router.patch('/:code/gui', requireAdmin, async (req, res) => {
         await languageStore.setGUITranslations(req.params.code, merged);
         res.json({ success: true, translations: merged });
     } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ── Email Templates (verification + welcome) ─────────────────────
+// Per-locale, structured-field transactional email templates. Stored as
+// overrides; getEffectiveEmailTemplate merges per-field over the English
+// defaults so a partially translated locale still renders.
+
+// GET /admin/languages/:code/email-templates — overrides + defaults + meta
+router.get('/:code/email-templates', requireAdmin, async (req, res) => {
+    try {
+        const code = req.params.code;
+        const templates = await languageStore.getAllEmailTemplates(code);
+        // Per-template effective view (defaults merged with this locale's overrides).
+        const effective = {};
+        for (const id of EMAIL_TEMPLATE_IDS) {
+            effective[id] = await languageStore.getEffectiveEmailTemplate(id, code);
+        }
+        res.json({
+            templates,            // raw overrides for this locale
+            effective,            // defaults + overrides, per template
+            defaults: EMAIL_TEMPLATE_DEFAULTS,
+            templateIds: EMAIL_TEMPLATE_IDS,
+            fields: EMAIL_TEMPLATE_FIELDS,
+            variables: EMAIL_TEMPLATE_VARIABLES,
+            labels: EMAIL_TEMPLATE_LABELS,
+        });
+    } catch (err) {
+        console.error('[Languages] Email templates get error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// PUT /admin/languages/:code/email-templates — save one template's fields
+// (empty/blank field = reset that field to the English default)
+router.put('/:code/email-templates', requireAdmin, async (req, res) => {
+    try {
+        const { templateId, fields } = req.body || {};
+        if (!templateId || !EMAIL_TEMPLATE_IDS.includes(templateId)) {
+            return res.status(400).json({ error: 'Valid templateId is required' });
+        }
+        if (!fields || typeof fields !== 'object') {
+            return res.status(400).json({ error: 'fields object is required' });
+        }
+        const templates = await languageStore.setEmailTemplate(req.params.code, templateId, fields);
+        res.json({ success: true, templates });
+    } catch (err) {
+        console.error('[Languages] Email templates save error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /admin/languages/:code/email-templates/:templateId/preview
+// Render a branded HTML preview WITHOUT sending. Accepts optional in-progress
+// `fields` in the body so the admin sees unsaved edits; otherwise uses the
+// effective (saved/merged) template.
+router.post('/:code/email-templates/:templateId/preview', requireAdmin, async (req, res) => {
+    try {
+        const { code, templateId } = req.params;
+        if (!EMAIL_TEMPLATE_IDS.includes(templateId)) {
+            return res.status(400).json({ error: 'Unknown templateId' });
+        }
+        const { renderEmailFromTemplate } = require('../../utils/emailService');
+        const base = await languageStore.getEffectiveEmailTemplate(templateId, code);
+        // Merge in-progress fields (non-empty) over the effective template.
+        const incoming = (req.body && typeof req.body.fields === 'object') ? req.body.fields : {};
+        const tpl = { ...base };
+        for (const f of EMAIL_TEMPLATE_FIELDS) {
+            if (typeof incoming[f] === 'string' && incoming[f].trim()) tpl[f] = incoming[f];
+        }
+        const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
+        const vars = {
+            name: 'Alex Example',
+            orgName: 'Bee Flow',
+            ...(templateId === 'verification' ? { verifyUrl: `${clientHost}/auth/verify-email/preview` } : { loginUrl: clientHost }),
+        };
+        const { subject, html } = renderEmailFromTemplate(tpl, vars);
+        res.json({ subject, html });
+    } catch (err) {
+        console.error('[Languages] Email template preview error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /admin/languages/:code/email-templates/:templateId/test
+// Send the REAL rendered template to a recipient for a true end-to-end check.
+router.post('/:code/email-templates/:templateId/test', requireAdmin, async (req, res) => {
+    try {
+        const { code, templateId } = req.params;
+        const { testRecipient } = req.body || {};
+        if (!EMAIL_TEMPLATE_IDS.includes(templateId)) {
+            return res.status(400).json({ error: 'Unknown templateId' });
+        }
+        if (!testRecipient || !String(testRecipient).trim()) {
+            return res.status(400).json({ error: 'Test recipient email is required' });
+        }
+        const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
+        const { sendVerificationEmail, sendWelcomeEmail } = require('../../utils/emailService');
+        const common = { email: String(testRecipient).trim(), displayName: 'Alex Example', orgName: 'Bee Flow', locale: code };
+        const result = templateId === 'verification'
+            ? await sendVerificationEmail({ ...common, verifyUrl: `${clientHost}/auth/verify-email/preview` })
+            : await sendWelcomeEmail({ ...common, loginUrl: clientHost });
+        if (result.success) return res.json({ success: true, messageId: result.messageId });
+        return res.status(500).json({ error: result.error || 'Failed to send test email' });
+    } catch (err) {
+        console.error('[Languages] Email template test error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /admin/languages/:code/ai-translate-emails — AI-translate the email
+// template fields for a locale (preserves {{variables}}). Mirrors the GUI
+// ai-translate handler.
+router.post('/:code/ai-translate-emails', requireAdmin, async (req, res) => {
+    const locale = req.params.code;
+    const { modelTier = 'fast' } = req.body || {};
+    if (locale === 'en') {
+        return res.status(400).json({ error: 'Cannot AI-translate the base English locale' });
+    }
+    try {
+        const llmClient = require('../../core/llmClient');
+        const { resolveModelForTierName } = require('../../core/modelResolver');
+
+        let modelId;
+        try {
+            modelId = await resolveModelForTierName(modelTier || 'fast', { fallback: 'mistral-small-latest' });
+        } catch (_) {
+            const { getAIConfig } = require('../../core/aiAgent');
+            modelId = (await getAIConfig()).model || 'mistral-small-latest';
+        }
+
+        const locales = await languageStore.getAvailableLocales();
+        const languageName = (locales.find(l => l.code === locale)?.name) || locale;
+
+        const systemPrompt = `You are a professional translator. Translate the following English transactional-email fields to ${languageName} (${locale}).
+Return ONLY a valid JSON object with the same shape: { "<templateId>": { "subject": "...", "title": "...", "intro": "...", "body": "...", "ctaLabel": "..." }, ... }.
+Keep it natural and concise — these are customer emails.
+CRITICAL: preserve placeholder tokens EXACTLY as written, e.g. {{name}}, {{orgName}}, {{verifyUrl}}, {{loginUrl}}. Do not translate or alter them.
+Do NOT translate the JSON keys (templateId / field names), only the values.
+Do NOT add explanation, markdown, or code fences — output raw JSON only.`;
+
+        const payload = {};
+        for (const id of EMAIL_TEMPLATE_IDS) payload[id] = EMAIL_TEMPLATE_DEFAULTS[id];
+
+        const result = await llmClient.chat(modelId, [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: JSON.stringify(payload, null, 2) },
+        ], { maxTokens: 2048, temperature: 0.3 });
+
+        let responseText = (result.content || '').trim();
+        responseText = responseText.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
+        const translated = JSON.parse(responseText);
+
+        let count = 0;
+        for (const id of EMAIL_TEMPLATE_IDS) {
+            const t = translated[id];
+            if (!t || typeof t !== 'object') continue;
+            const fields = {};
+            for (const f of EMAIL_TEMPLATE_FIELDS) {
+                if (typeof t[f] === 'string' && t[f].trim()) fields[f] = t[f];
+            }
+            if (Object.keys(fields).length) {
+                await languageStore.setEmailTemplate(locale, id, fields);
+                count++;
+            }
+        }
+        res.json({ success: true, translated: count, message: `Translated ${count} email template(s)` });
+    } catch (err) {
+        console.error('[Languages AI] Email translate error:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -398,6 +573,119 @@ RULES:
     }
 });
 
+// POST /admin/languages/:code/ai-translate-legal — Use AI to auto-translate legal documents
+// Long-form, markdown-preserving (mirrors ai-translate-prompts). Re-translates any
+// document whose stored translation is missing or built from an older version.
+router.post('/:code/ai-translate-legal', requireAdmin, async (req, res) => {
+    const locale = req.params.code;
+    const { modelTier = 'fast', docIds: requestedIds } = req.body;
+
+    if (locale === 'en') {
+        return res.status(400).json({ error: 'Cannot AI-translate the base English locale' });
+    }
+
+    try {
+        const llmClient = require('../../core/llmClient');
+        const { resolveModelForTierName } = require('../../core/modelResolver');
+
+        // ── Resolve model ───────────────────────────────────────────
+        const resolvedTier = modelTier || 'fast';
+        let modelId;
+        try {
+            modelId = await resolveModelForTierName(resolvedTier, { fallback: 'mistral-small-latest' });
+        } catch (_) {
+            const { getAIConfig } = require('../../core/aiAgent');
+            const config = await getAIConfig();
+            modelId = config.model || 'mistral-small-latest';
+        }
+
+        console.log(`[Languages AI] Translating legal docs to ${locale} using model ${modelId} (tier: ${resolvedTier})`);
+
+        // ── Resolve locale name ─────────────────────────────────────
+        const locales = await languageStore.getAvailableLocales();
+        const localeInfo = locales.find(l => l.code === locale);
+        const languageName = localeInfo?.name || locale;
+
+        // ── Gather docs needing (re)translation (missing OR stale version) ──
+        const idsToTranslate = [];
+        for (const docId of (requestedIds || LEGAL_DOC_IDS)) {
+            const meta = getLegalDefault(docId);
+            if (!meta || !meta.markdown) continue;
+            const stored = await languageStore.getLegalDocTranslation(locale, docId);
+            if (!stored || !stored.markdown || Number(stored.version) !== Number(meta.version)) {
+                idsToTranslate.push(docId);
+            }
+        }
+
+        if (idsToTranslate.length === 0) {
+            return res.json({ success: true, translated: 0, total: LEGAL_DOC_IDS.length, message: 'All legal documents are already translated for the current version' });
+        }
+
+        // ── Translate each document individually (long-form, markdown) ──
+        const systemPrompt = `You are a professional legal translator. Translate the following legal document from English to ${languageName} (${locale}).
+
+RULES:
+- Translate the ENTIRE document faithfully and precisely. Do not summarize, omit, reorder, or add anything.
+- Preserve ALL Markdown formatting exactly (headings, numbered sections, lists, tables, bold, blockquotes, links).
+- Keep legal and statutory citations EXACTLY as written, untranslated (e.g. "BW art. 6:233", "GDPR Art. 28", "Article 50 of the EU AI Act", "Regulation (EU) 2024/1689", "§5 DDG", "Commission Implementing Decision (EU) 2021/914").
+- Keep proper nouns, company names, product names, registration identifiers and contact details unchanged (e.g. "Bee Flow B.V.", "KvK 97632430", "NL868147011B01", "info@beeflow.nl", "Scaleway", "Anthropic", "OpenAI", "Stripe", "Mistral").
+- Keep all URLs and Markdown link targets unchanged.
+- Preserve placeholder tokens like {name}, {{variable}}.
+- This is a convenience translation; the English version remains the legally authoritative text. Where the document states that the English version prevails, translate that statement faithfully — do not weaken it.
+- Output ONLY the translated Markdown — no explanations, no commentary, no code fences.`;
+
+        let translatedCount = 0;
+        let errors = 0;
+
+        const CONCURRENCY = 3;
+        for (let i = 0; i < idsToTranslate.length; i += CONCURRENCY) {
+            const batch = idsToTranslate.slice(i, i + CONCURRENCY);
+            const results = await Promise.allSettled(batch.map(async (docId) => {
+                const meta = getLegalDefault(docId);
+                const defaultText = meta.markdown;
+                if (!defaultText || defaultText.trim().length < 10) return null;
+
+                const result = await llmClient.chat(modelId, [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: defaultText },
+                ], { maxTokens: 16384, temperature: 0.2 });
+
+                const translated = (result.content || '').trim();
+                if (translated && translated.length > 20) {
+                    await languageStore.setLegalDoc(locale, docId, translated, meta.version);
+                    console.log(`[Languages AI] Translated legal doc "${docId}" → ${locale} (${translated.length} chars)`);
+                    return docId;
+                }
+                return null;
+            }));
+
+            for (const result of results) {
+                if (result.status === 'fulfilled' && result.value) {
+                    translatedCount++;
+                } else if (result.status === 'rejected') {
+                    console.error(`[Languages AI] Legal doc translation failed:`, result.reason?.message);
+                    errors++;
+                }
+            }
+        }
+
+        console.log(`[Languages AI] Legal translation done: ${translatedCount} new/updated for ${locale} (${errors} errors)`);
+
+        res.json({
+            success: true,
+            translated: translatedCount,
+            total: LEGAL_DOC_IDS.length,
+            errors,
+            message: errors > 0
+                ? `Translated ${translatedCount} documents with ${errors} error(s)`
+                : `Successfully translated ${translatedCount} documents`,
+        });
+    } catch (err) {
+        console.error('[Languages AI] Legal translation error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ── Prompt Translations ─────────────────────────────────────────
 
 // GET /admin/languages/defaults/prompts — Get all default prompt texts
@@ -479,6 +767,74 @@ router.put('/:code/prompts/:promptId', requireAdmin, async (req, res) => {
         // Clear prompt cache so changes take effect immediately
         const { clearDefaultsCache } = require('../../i18n/defaults/promptDefaults');
         clearDefaultsCache();
+
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ── Legal Document Translations ─────────────────────────────────
+
+// GET /admin/languages/:code/legal — List legal docs + translation status for a locale
+router.get('/:code/legal', requireAdmin, async (req, res) => {
+    try {
+        const docs = await languageStore.listLegalDocs(req.params.code);
+        res.json({
+            docs,
+            stats: {
+                total: docs.length,
+                translated: docs.filter(d => d.hasTranslation && !d.stale).length,
+                stale: docs.filter(d => d.stale).length,
+            },
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET /admin/languages/:code/legal/:docId — Get a single legal doc translation + default
+router.get('/:code/legal/:docId', requireAdmin, async (req, res) => {
+    try {
+        const { code, docId } = req.params;
+        if (!LEGAL_DOC_IDS.includes(docId)) {
+            return res.status(404).json({ error: `Unknown legal document: ${docId}` });
+        }
+        const meta = getLegalDefault(docId);
+        const stored = await languageStore.getLegalDocTranslation(code, docId);
+        res.json({
+            docId,
+            title: meta.title,
+            version: meta.version,
+            default: meta.markdown || '',
+            translation: stored?.markdown || '',
+            translationVersion: stored?.version ?? null,
+            hasTranslation: !!(stored && stored.markdown),
+            stale: !!(stored && stored.markdown && Number(stored.version) !== Number(meta.version)),
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// PUT /admin/languages/:code/legal/:docId — Save/override or clear a legal doc translation
+router.put('/:code/legal/:docId', requireAdmin, async (req, res) => {
+    try {
+        const { code, docId } = req.params;
+        const { text } = req.body;
+
+        if (!LEGAL_DOC_IDS.includes(docId)) {
+            return res.status(400).json({ error: `Unknown legal document: ${docId}` });
+        }
+
+        if (text === '' || text === null || text === undefined) {
+            // Empty = remove the override (fall back to English).
+            const configStore = require('../../stores/configStore');
+            await configStore.deleteConfig(`i18n_legal_${code}_${docId}`);
+        } else {
+            const meta = getLegalDefault(docId);
+            await languageStore.setLegalDoc(code, docId, text, meta.version);
+        }
 
         res.json({ success: true });
     } catch (err) {
@@ -626,6 +982,32 @@ router.get('/public/strings/:locale', async (req, res) => {
         const strings = await languageStore.getEffectiveGUIStrings(locale);
         res.set('Cache-Control', 'public, max-age=600');
         res.json(strings);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET /api/languages/public/legal/:docId/:locale — Localized legal document, no auth
+// Used by the public legal pages and the pre-auth signup/consent screen (and the
+// links on the OAuth consent screen). Falls back to authoritative English when the
+// locale isn't configured or no current-version translation exists.
+router.get('/public/legal/:docId/:locale', async (req, res) => {
+    try {
+        const { docId } = req.params;
+        let locale = req.params.locale;
+        if (!LEGAL_DOC_IDS.includes(docId)) {
+            return res.status(404).json({ error: 'Unknown legal document' });
+        }
+        // Fall back to English rather than 404 when the locale isn't configured,
+        // so a not-yet-translated locale still renders the document.
+        const locales = await languageStore.getAvailableLocales();
+        if (!locales.find(l => l.code === locale)) locale = 'en';
+
+        const doc = await languageStore.getEffectiveLegalDoc(docId, locale);
+        if (!doc) return res.status(404).json({ error: 'Unknown legal document' });
+
+        res.set('Cache-Control', 'public, max-age=600');
+        res.json(doc);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }

@@ -16,9 +16,11 @@ const {
 const configStore = require('../../stores/configStore');
 const { getAdapter } = require('../../core/providers');
 const notebookStore = require('../../stores/notebookStore');
+const notebookConversationStore = require('../../stores/notebookConversationStore');
 const { startSseHeartbeat } = require('../../core/sseHelpers');
 
 const { NOTEBOOK_DOC_TOOLS, NOTEBOOK_ADD_SOURCE_TOOL, executeNotebookDocTool } = require('../../integrations/notebookDocTools');
+const { htmlToMarkdown } = require('../../core/markdown');
 const { AGENT_SEARCH_TOOLS, executeAgentSearchTool, isAgentSearchTool } = require('../../integrations/agentSearchTools');
 const { searchNotebookKB, executeNotebookKBSearchTool, NOTEBOOK_KB_SEARCH_TOOL } = require('../../core/notebookKnowledgeSearch');
 const { emitPhase, emitPhaseEnd } = require('../../core/agentRuntime/phaseEvents');
@@ -46,6 +48,16 @@ const { sanitizeMessagesUnicode } = require('../../utils/unicodeSanitizer');
 const { resolveShieldFor, mergeWithOrgShield } = require('../../core/orgShield');
 const { checkRegexPatterns } = require('../../core/guardrails');
 const guardrailEventStore = require('../../stores/guardrailEventStore');
+
+// ── PII tokenization round-trip (parity with direct chat) ────────────
+// The notebook path tokenizes inbound (doc body + user message) but historically
+// never restored outbound, so `[person_1]` leaked into the chat + the editor and
+// the token map was never persisted. These finish the round-trip: un-tokenise the
+// stream for display, teach the model to preserve tokens, and re-tokenise history.
+const dlpRunner = require('../../core/dlp/dlpRunner');
+const { createUntokeniser } = require('../../core/dlp/untokeniseStream');
+const { buildTokenPreservationAddendum } = require('../../core/dlp/tokenPreservationPrompt');
+const { applyTokenMapToMessages, untokeniseToolArgs } = require('../../core/dlp/applyTokenMapToOutbound');
 
 const LEGAL_TOOLS = [...RECHTSPRAAK_TOOLS, ...EURLEX_TOOLS, ...TUCHTRECHT_TOOLS, ...KAMERSTUKKEN_TOOLS, ...BEKENDMAKINGEN_TOOLS];
 function isLegalTool(name) {
@@ -230,6 +242,25 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
     emitPhaseEnd(send, 'model_resolved');
 
     try {
+        // ── PII round-trip setup (shared by KB / document / message scans) ──
+        // Hydrate the notebook's persisted PII token map (keyed by notebookId)
+        // BEFORE any tokenization this turn, so doc/KB/message tokens reuse tokens
+        // minted on earlier turns and survive a server restart. Idempotent.
+        try { await dlpRunner.getConversationTokenMapAsync(notebookId); } catch (_) { /* best-effort */ }
+        // Resolve the org Privacy Shield ONCE — respect-the-shield: tokenization
+        // only runs when the admin has it enabled. Reused by the KB + doc scans.
+        const docShield = userOrgForTiers
+            ? await configStore.getConfig(`org_privacy_shield_${userOrgForTiers}`)
+            : null;
+        // When the shield is on AND set to fail closed, a scan that throws must
+        // abort the turn rather than silently sending raw PII to the model.
+        const _failClosed = !!docShield?.enabled && (docShield?.dlpFailureMode === 'fail_closed');
+        const _abortFailClosed = (where) => {
+            console.warn(`[NotebookChat] 🚫 Privacy Shield scan failed (${where}); fail_closed → aborting turn`);
+            send('error', { error: 'Privacy Shield could not verify this content for personal data, so the request was blocked. Please try again shortly.' });
+            res.end();
+        };
+
         // Search notebook knowledge base for relevant context
         let kbContext = '';
         let citationSources = [];
@@ -267,6 +298,38 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
                     }));
                     kbContext = kbResult.contextPrompt;
                     console.log(`[NotebookChat] Injected ${kbResult.chunks.length} KB chunks for notebook "${notebook.name}"`);
+
+                    // Tokenize the retrieved KB context BEFORE it enters the prompt.
+                    // Embeddings + stored source text stay REAL (ingest untouched) —
+                    // we only tokenize the small set of chunks actually injected,
+                    // seeded from + merged into the SAME notebook map so a name shared
+                    // by a source and the document maps to one [person_1]. The
+                    // citationSources previews (sent to the client below) stay REAL —
+                    // they are the user's own sources.
+                    if (kbContext && docShield?.enabled) {
+                        try {
+                            const { scanAttachmentText } = require('../../core/dlp/attachmentScanner');
+                            const kbScan = await scanAttachmentText({
+                                text: kbContext, filename: 'kb-context', orgShield: docShield, conversationId: notebookId,
+                            });
+                            if (kbScan && kbScan.action === 'tokenize' && kbScan.text) {
+                                kbContext = kbScan.text;
+                                const n = Array.isArray(kbScan.findings) ? kbScan.findings.length : 0;
+                                if (n > 0) console.warn(`[NotebookChat] 🔒 KB context tokenized (${n} PII spans)`);
+                            }
+                            // Coverage guarantee: per-chunk detection can miss a span
+                            // the ingest-time scan already mapped. Apply the notebook's
+                            // accumulated map (real→token) so EVERY known entity in the
+                            // retrieved context is tokenised before the model sees it —
+                            // the model must never read a raw name that's already mapped.
+                            const { buildReverseReplacer } = require('../../core/dlp/applyTokenMapToOutbound');
+                            const _rev = buildReverseReplacer(dlpRunner.getConversationTokenMap(notebookId));
+                            if (_rev) kbContext = _rev(kbContext);
+                        } catch (kbScanErr) {
+                            console.warn('[NotebookChat] KB context PII scan failed:', kbScanErr.message);
+                            if (_failClosed) return _abortFailClosed('kb-context');
+                        }
+                    }
                 }
             } catch (kbErr) {
                 console.warn('[NotebookChat] KB search failed:', kbErr.message);
@@ -308,9 +371,6 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
         let scannedDocumentContent = documentContent;
         if (documentContent && documentContent.trim() && documentContent !== '<p></p>') {
             try {
-                const docShield = userOrgForTiers
-                    ? await configStore.getConfig(`org_privacy_shield_${userOrgForTiers}`)
-                    : null;
                 if (docShield?.enabled) {
                     const { scanAttachmentText } = require('../../core/dlp/attachmentScanner');
                     const scanRes = await scanAttachmentText({
@@ -327,13 +387,27 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
                             console.warn(`[NotebookChat] 🔒 Document content tokenized (${findingCount} PII spans)`);
                         }
                     }
+                    // Coverage guarantee (mirrors the KB-context path): apply the
+                    // notebook's accumulated map (real→token) so any mapped entity the
+                    // per-document detection missed is still tokenised before the body
+                    // enters the prompt — the model reads `[email_1]`, never the real
+                    // value, when it re-reads its own stored-real document.
+                    const { buildReverseReplacer } = require('../../core/dlp/applyTokenMapToOutbound');
+                    const _revDoc = buildReverseReplacer(dlpRunner.getConversationTokenMap(notebookId));
+                    if (_revDoc) scannedDocumentContent = _revDoc(scannedDocumentContent);
                 }
             } catch (docScanErr) {
                 console.warn('[NotebookChat] Document PII scan failed, falling back to raw content:', docScanErr.message);
+                if (_failClosed) return _abortFailClosed('document');
             }
         }
         if (scannedDocumentContent && scannedDocumentContent.trim() && scannedDocumentContent !== '<p></p>') {
-            const fit = fitIntoTokenBudget(scannedDocumentContent, DOCUMENT_CONTEXT_TOKENS);
+            // Inline the document as Markdown (≈30–60% fewer tokens than the HTML
+            // for the same content), so more of it fits in the context budget.
+            const scannedMarkdown = (notebook.documentMd && !docPiiTokenMap)
+                ? notebook.documentMd
+                : htmlToMarkdown(scannedDocumentContent);
+            const fit = fitIntoTokenBudget(scannedMarkdown, DOCUMENT_CONTEXT_TOKENS);
             if (fit.truncated) {
                 documentTruncation = {
                     originalTokens: fit.originalTokens,
@@ -341,21 +415,21 @@ router.post('/chat/notebook/stream', requireAuth, async (req, res) => {
                 };
                 documentContext =
                     `\n\n[DOCUMENT EDITOR — CURRENT CONTENT, TRUNCATED]\n` +
-                    `The user has a large rich-text document editor (TipTap) open in the center panel. ` +
+                    `The user has a large rich-text document editor open in the center panel. ` +
                     `Roughly ${fit.keptTokens.toLocaleString()} of ${fit.originalTokens.toLocaleString()} tokens shown below. ` +
                     `If the user asks about something not visible here, use notebook_kb_search to retrieve from the indexed content, ` +
                     `or ask them to quote / select the section they mean.\n` +
-                    `\`\`\`html\n${fit.text}\n\`\`\`\n` +
+                    `\`\`\`markdown\n${fit.text}\n\`\`\`\n` +
                     `You can read, write, or edit this document using the notebook_doc_* tools.`;
             } else {
                 documentContext =
                     `\n\n[DOCUMENT EDITOR — CURRENT CONTENT]\n` +
-                    `The user has a rich-text document editor (TipTap) open in the center panel. Current content:\n` +
-                    `\`\`\`html\n${fit.text}\n\`\`\`\n` +
+                    `The user has a rich-text document editor open in the center panel. Current content:\n` +
+                    `\`\`\`markdown\n${fit.text}\n\`\`\`\n` +
                     `You can read, write, or edit this document using the notebook_doc_* tools.`;
             }
         } else {
-            documentContext = '\n\n[DOCUMENT EDITOR — EMPTY]\nThe user has an empty rich-text document editor (TipTap) open. Use notebook_doc_write to create content.';
+            documentContext = '\n\n[DOCUMENT EDITOR — EMPTY]\nThe user has an empty rich-text document editor open. Use notebook_doc_write to create content.';
         }
 
         // Append the user's editor selection (set by the Ask AI / rewrite /
@@ -416,102 +490,26 @@ You have tools to interact with the user's document editor:
 - notebook_doc_write: Replace ALL document content (for new documents or full rewrites)
 - notebook_doc_replace: Replace a SPECIFIC portion (preferred for edits)
 
-TIPTAP HTML REFERENCE — Use ONLY these supported elements:
-Block nodes:
-  <p>paragraph text</p>
-  <h1>Heading 1</h1>  <h2>Heading 2</h2>  <h3>Heading 3</h3>
-  <ul><li><p>bullet item</p></li></ul>
-  <ol><li><p>numbered item</p></li></ol>
-  <blockquote><p>quoted text</p></blockquote>
-  <pre><code>code block</code></pre>
-  <hr>  (horizontal rule / divider)
-
-Inline marks (wrap text inside <p> or <li>):
-  <strong>bold</strong>
-  <em>italic</em>
-  <u>underline</u>
-  <s>strikethrough</s>
-  <mark>highlighted</mark>
-  <code>inline code</code>
-  <a href="https://example.com" target="_blank" rel="noopener noreferrer">link text</a>
-
-MATH FORMULAS (KaTeX — @tiptap/extension-mathematics):
-  Inline math:  $E = mc^2$    (dollar signs around the LaTeX expression)
-  Block math:   $$\\frac{a}{b} = \\frac{c}{d}$$    (double dollar signs on their own line)
-  Rules:
-  - Use LaTeX syntax inside the $ delimiters (e.g., \\frac, \\sum, \\int, \\sqrt, ^, _)
-  - Inline math goes directly inside a <p> tag: <p>The formula $E = mc^2$ shows mass-energy equivalence.</p>
-  - Block math goes in its own <p> tag on a separate line: <p>$$\\sum_{i=1}^{n} x_i$$</p>
-  - NEVER escape the dollar signs in HTML — write them as literal $ characters
-  - Good example: <p>Einstein's equation $E = mc^2$ states that energy equals mass times the speed of light squared.</p>
-
-EMOJI (via :shortcode: syntax — @tiptap/extension-emoji):
-  The editor supports emoji shortcodes using GitHub emoji names.
-  Examples: :rocket: 🚀  :fire: 🔥  :check: ✅  :warning: ⚠️  :star: ⭐  :brain: 🧠  :book: 📖
-  - Emoji can be placed directly inline in text: <p>Great work! :rocket: This is a breakthrough :fire:</p>
-  - You can also use the literal Unicode emoji character directly in HTML: <p>Great work! 🚀</p>
-  - Prefer Unicode characters in document tool calls for maximum compatibility.
-
-DRAG HANDLE (user feature — no action needed from AI):
-  The editor has a drag handle that appears when the user hovers over a block.
-  This allows blocks to be reordered by drag-and-drop. No special HTML is needed.
-
-TEXT COLOR & HIGHLIGHTS (@tiptap/extension-color + TextStyle + Highlight):
-  Apply text colors using inline styles on <span> elements:
-    <span style="color: #e74c3c">red text</span>
-    <span style="color: #2ecc71">green text</span>
-    <span style="color: #3498db">blue text</span>
-  Apply background highlights using <mark>:
-    <mark>default yellow highlight</mark>
-    <mark style="background-color: #ffeaa7">custom highlight color</mark>
-  You can combine color with other formatting:
-    <strong><span style="color: #e74c3c">bold red</span></strong>
-    <em><mark style="background-color: #dfe6e9">italic highlighted</mark></em>
-  Use colors when the user asks for colored, highlighted, or styled text.
-  Common color palette: #e74c3c (red), #e67e22 (orange), #f1c40f (yellow),
-    #2ecc71 (green), #3498db (blue), #9b59b6 (purple), #1abc9c (teal), #34495e (dark)
-
-TYPOGRAPHY (auto-corrections — transparent to AI):
-  The editor auto-corrects typographic patterns (smart quotes, em dashes, fractions).
-  Examples: typing -- → —, (tm) → ™, 1/2 → ½. These happen automatically. No action needed from AI.
-
-IMAGES (@tiptap/extension-image):
-  - HTML: <img src="URL" alt="description">
-  - When inserting images, use publicly accessible URLs. User uploads go via the toolbar (not AI).
-  - If the user asks to add an image by URL: <p><img src="https://example.com/photo.jpg" alt="Description"></p>
-  - Do NOT try to upload images or use data: URLs from AI tool calls.
-
-TASK LISTS (@tiptap/extension-task-list + TaskItem):
-  - Use <ul data-type="taskList"> for task/checklist items
-  - Each item: <li data-type="taskItem" data-checked="false"><label><input type="checkbox"></label><div><p>Task text</p></div></li>
-  - Checked item: data-checked="true" (and add checked attribute to input)
-  - Example:
-    <ul data-type="taskList">
-      <li data-type="taskItem" data-checked="false"><label><input type="checkbox"></label><div><p>Review document</p></div></li>
-      <li data-type="taskItem" data-checked="true"><label><input type="checkbox" checked></label><div><p>Write introduction</p></div></li>
-    </ul>
-  - Use task lists when the user asks for action items, to-do lists, checklists, or follow-ups.
-
-IMPORTANT HTML RULES:
-- List items MUST contain <p> tags: <ul><li><p>text</p></li></ul>, NOT <ul><li>text</li></ul>
-- Links MUST use <a href="url" target="_blank" rel="noopener noreferrer">text</a> format
-- For citations/sources with URLs, ALWAYS use clickable <a> tags, NOT plain text references like [1]
-- Use <hr> to separate sections visually
-- All text must be inside block nodes (<p>, <h1>, <li>, etc.)
+DOCUMENT FORMAT — write the document in Markdown (BFM):
+- Headings: # H1, ## H2, ### H3
+- Inline: **bold**, *italic*, ~~strike~~, inline code in single backticks, ==highlight==
+- Lists: "- item", "1. item"; task lists "- [ ] todo" / "- [x] done"
+- > blockquote, --- divider, [text](url) links
+- Tables: a header row, then a |---|---| separator row, then data rows
+- Fenced code blocks (triple-backtick + language); diagrams use triple-backtick mermaid fences
+- Math (KaTeX): $inline$ and $$block$$
+- Images: ![alt](url){w=400 align=center wrap} (attrs optional; user uploads go via the toolbar, not AI)
+- Color/font are rare: [text]{color=#e74c3c} / [text]{font=Georgia}
 
 DOCUMENT RULES — FOLLOW STRICTLY:
-1. When the user asks you to rewrite, shorten, expand, fix, edit, or modify text from the document: ALWAYS use notebook_doc_replace to apply the change directly. Do NOT just return the modified text in your response.
-2. For partial edits, ALWAYS prefer notebook_doc_replace over notebook_doc_write
-3. Before using notebook_doc_replace, call notebook_doc_read first to see the EXACT current content
-4. When asked to write, create, or draft something: write it to the document using notebook_doc_write — don't just reply with the content in chat
-5. The user's message may include text from the document — use notebook_doc_replace with that text as find_text to apply your changes directly
-6. After applying changes via tool, briefly confirm what you did in your response (e.g. "I've shortened that paragraph in the document")
-7. For source citations in documents, use clickable links: <a href="url" target="_blank" rel="noopener noreferrer">Source Name</a> — never use [1] style refs
-8. STYLE CONSISTENCY: When using notebook_doc_replace, ALWAYS match the original text's formatting. If you are replacing text that was in a paragraph, the replacement MUST be wrapped in <p> tags. Do NOT use headers (h1, h2, h3) for replacements unless specifically asked for a header. Avoid "Big Bold Letters" unless they were already there.
-9. MATH: When writing scientific, mathematical, or technical content — use KaTeX math syntax ($inline$ or $$block$$) for formulas. This renders beautifully in the editor.
-10. EMOJI: You may use Unicode emoji characters directly in document content where appropriate for visual clarity.
-11. TASK LISTS: When the user asks for action items, to-dos, checklists, or follow-up tasks — use the task list HTML syntax above. This renders as real interactive checkboxes.
-12. IMAGES: Only insert images by URL when explicitly asked. Do NOT invent image URLs.
+1. To rewrite, shorten, expand, fix, edit, or modify text from the document: ALWAYS use notebook_doc_replace to apply the change directly — do NOT just return the modified text in chat.
+2. For partial edits, ALWAYS prefer notebook_doc_replace over notebook_doc_write.
+3. Before notebook_doc_replace, call notebook_doc_read to see the EXACT current Markdown.
+4. When asked to write, create, or draft something: write it via notebook_doc_write — don't just reply in chat.
+5. The user's message may include selected document text — pass it verbatim as find_text.
+6. After applying a change, briefly confirm what you did (e.g. "I've shortened that paragraph").
+7. For source citations use clickable [Source name](url) links — never [1]-style refs.
+8. STYLE CONSISTENCY: when replacing, match the original formatting — don't promote a paragraph to a heading unless asked.
 
 ${searchAvailable ? `[WEB SEARCH & SOURCES]
 - You can search the web using agent_search for current information and research
@@ -548,6 +546,21 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             // PDFs/DOCX/spreadsheets are turned into real text (pdfjs → Azure →
             // Mistral OCR → vision) instead of being UTF-8-decoded into garbage.
             const { extractAttachment, formatTextHeader, formatImagesHeader, formatFailureNote, isPdf, isDocx, isSpreadsheet } = require('../../core/attachmentExtractor');
+            // Tokenize PII in extracted attachment text BEFORE it enters the prompt
+            // — a file attached in Legal/Notebook chat must not send names/BSN/email
+            // to the model raw (notebook chat used to inline attachment text raw).
+            // Honors the org's chosen action and merges into the same notebook token
+            // map so the streamed reply un-tokenises consistently. Reuses the same
+            // scanner as direct chat + the KB/doc scans.
+            const _scanAttBody = async (text, filename) => {
+                if (!text || !docShield?.enabled) return text;
+                try {
+                    const { scanAttachmentText } = require('../../core/dlp/attachmentScanner');
+                    const r = await scanAttachmentText({ text, filename: filename || 'attachment', orgShield: docShield, conversationId: notebookId });
+                    if (r && r.action === 'tokenize' && r.text) return r.text;
+                } catch (e) { console.warn('[NotebookChat] attachment PII scan failed:', e.message); }
+                return text;
+            };
             for (const att of attachments) {
                 try {
                     if (att.type && att.type.startsWith('image/') && att.content) {
@@ -555,7 +568,8 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
                     } else if (att.content && (isPdf(att) || isDocx(att) || isSpreadsheet(att))) {
                         const result = await extractAttachment(att, { modelSupportsVision: adapter.supportsVision?.(modelId) });
                         if (result.kind === 'text') {
-                            contentParts.push({ type: 'text', text: `${formatTextHeader(att, result)}\n---\n${(result.text || '').slice(0, 20000)}\n---` });
+                            const _body = await _scanAttBody((result.text || '').slice(0, 20000), att.name);
+                            contentParts.push({ type: 'text', text: `${formatTextHeader(att, result)}\n---\n${_body}\n---` });
                         } else if (result.kind === 'images' && Array.isArray(result.images)) {
                             contentParts.push({ type: 'text', text: formatImagesHeader(att, result) });
                             for (const img of result.images) {
@@ -567,7 +581,10 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
                     } else if (att.content && typeof att.content === 'string') {
                         // Plain-text / csv / code files — a UTF-8 decode is correct.
                         const textContent = att.content.startsWith('data:') ? Buffer.from(att.content.split(',')[1] || '', 'base64').toString('utf-8') : att.content;
-                        if (textContent) contentParts.push({ type: 'text', text: `[File: ${att.name}]\n---\n${textContent.slice(0, 8000)}\n---` });
+                        if (textContent) {
+                            const _body = await _scanAttBody(textContent.slice(0, 8000), att.name);
+                            contentParts.push({ type: 'text', text: `[File: ${att.name}]\n---\n${_body}\n---` });
+                        }
                     }
                 } catch (attErr) {
                     contentParts.push({ type: 'text', text: `[Bestand: ${att.name} — kon niet worden gelezen: ${attErr.message}]` });
@@ -610,9 +627,18 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
         // run validateInputForPii on the last user message and apply
         // tokenize/block actions. detectPii() calls the PII Guard service.
         let piiTokenMap = null;
+        // Privacy-panel parity with directChat: assembled once per turn, emitted
+        // to the client (live) AND persisted on the assistant message (so the
+        // "Privacy protection" panel survives a refresh). `_userPiiCategories`
+        // backs the redacted badge on the user bubble; `_showRawPayload` gates
+        // surfacing the exact tokenised prompt / token map (org opt-in).
+        let _assistantTokenisationInfo = null;
+        let _userPiiCategories = [];
+        let _showRawPayload = false;
         try {
             const orgShield = userOrgForTiers ? await configStore.getConfig(`org_privacy_shield_${userOrgForTiers}`) : null;
             const orgPiiEnabled = !!orgShield?.enabled;
+            _showRawPayload = !!orgShield?.showRawPayload;
             // Hydrate the conversation-scoped token map (keyed on notebookId
             // here, matching the mergeTokenMap key below) before tokenisation
             // runs so turn 2+ reuses tokens minted on turn 1 instead of
@@ -635,6 +661,30 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
                     piiTokenMap = piiResult.tokenMap;
                     try { require('../../core/dlp/dlpRunner').mergeTokenMap(notebookId, piiResult.tokenMap); } catch (_) { /* non-fatal */ }
                     console.warn(`[NotebookChat] 🔒 PII tokenized (${Object.keys(piiTokenMap).length} tokens)`);
+
+                    // ── Surface the tokenisation to the client (parity w/ directChat) ──
+                    // Drives the user-bubble "redacted" badge + the assistant-side
+                    // "Privacy protection" panel. The exact tokenised prompt + the
+                    // real-value token map are only emitted when the org opted into
+                    // showRawPayload; the count/categories badge always shows.
+                    _userPiiCategories = [...new Set((piiResult.entities || []).map(e => e.label || e.category).filter(Boolean))];
+                    const _piiCount = Object.keys(piiTokenMap).length;
+                    send('pii_tokenized', {
+                        entities: (piiResult.entities || []).map(e => ({ label: e.label, category: e.category })),
+                        tokenCount: _piiCount,
+                    });
+                    _assistantTokenisationInfo = {
+                        source: 'pii', action: 'redact', count: _piiCount,
+                        categories: _userPiiCategories, provider: modelId || null, automatic: true,
+                    };
+                    if (_showRawPayload) {
+                        send('privacy_payload', { tokenizedPrompt: piiResult.tokenizedText, provider: modelId || null, source: 'pii', timestamp: Date.now() });
+                        _assistantTokenisationInfo.tokenizedPrompt = piiResult.tokenizedText;
+                        if (_piiCount > 0) {
+                            send('privacy_token_map', { tokenMap: piiTokenMap, source: 'pii' });
+                            _assistantTokenisationInfo.tokenMap = piiTokenMap;
+                        }
+                    }
                 }
             }
         } catch (piiError) {
@@ -644,6 +694,19 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             }
             // Service unavailable → fail-open
         }
+
+        // ── Token-preservation prompt addendum ───────────────────────────
+        // Teach the model to treat tokens as opaque and reuse them verbatim so it
+        // doesn't invent new placeholders or mangle `[person_1]`. Must run AFTER
+        // the doc/KB/message tokenization above so the map already holds this
+        // turn's tokens. Mirrors directChat.
+        try {
+            if (messages[0]?.role === 'system' && typeof messages[0].content === 'string'
+                && !messages[0].content.includes('[PII TOKEN PRESERVATION')) {
+                const _add = buildTokenPreservationAddendum(dlpRunner.getConversationTokenMap(notebookId));
+                if (_add) messages[0].content += _add;
+            }
+        } catch (_) { /* addendum is best-effort */ }
 
         // ── Regex Guardrails (org Privacy Shield + input check) ──────────
         // Resolve org-wide regex rules; mirrors directChat.js:2348-2393
@@ -744,25 +807,87 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             chatOptions.maxTokens = Math.max(chatOptions.maxTokens || 0, 8192);
         }
 
-        // Track mutable document content (updated by doc tools across rounds).
-        let currentDocContent = documentContent || '';
+        // Track mutable document content (HTML for the client) + its Markdown
+        // mirror (token-efficient source the doc tools read/edit) across rounds.
+        // CRITICAL: seed the mirror in TOKEN-space when the doc was tokenized, so
+        // it matches what the model sees in the system prompt (scannedDocumentContent).
+        // Otherwise notebook_doc_read returns RAW text while the model's find_text
+        // was written against the tokenized text it saw → notebook_doc_replace misses.
+        let currentDocContent = scannedDocumentContent || documentContent || '';
+        let currentDocMd = docPiiTokenMap
+            ? htmlToMarkdown(scannedDocumentContent)
+            : (notebook.documentMd || (documentContent ? htmlToMarkdown(documentContent) : ''));
+        // Set when any notebook_doc_* tool wrote this turn. The mid-turn write
+        // restores tokens against whatever map existed at that instant; tokens
+        // minted LATER in the same turn (source/KB/tool-result scans) would
+        // otherwise leave the saved document with raw `[person_5]`/`[email]1`.
+        // We re-restore the document once at end of turn against the COMPLETE map.
+        let _docWritten = false;
 
         // Single tool executor — used for every tool the model calls, in every
         // round. Performs side-effects (doc update, source added, legal citation
         // feed-through) and returns the result object handed back to the model.
         const executeNotebookTool = async (toolName, toolArgs) => {
             if (toolName.startsWith('notebook_doc_')) {
-                const r = executeNotebookDocTool(toolName, toolArgs, currentDocContent);
+                const r = executeNotebookDocTool(toolName, toolArgs, currentDocContent, currentDocMd);
                 if (r && r._action === 'notebook_doc_update') {
+                    _docWritten = true;
+                    // Keep the in-memory mirror in TOKEN-space so a chained
+                    // notebook_doc_read/replace later in the same turn keeps matching
+                    // the tokenized text the model saw.
                     currentDocContent = r.content;
-                    send('notebook_doc_update', { content: r.content, title: r.title });
+                    if (r.contentMd != null) currentDocMd = r.contentMd;
+                    // Restore tokens → real values BEFORE persisting + displaying.
+                    // The editor is the user's work product and must never store or
+                    // show `[person_1]` (the doc-side analogue of untokeniseToolArgs
+                    // for write tools). The conv map holds the doc/source/chat tokens.
+                    // Rich-text restore: the document is HTML/Markdown, so a token
+                    // typed in italic/bold can be split by inline markup or have its
+                    // brackets/underscore escaped — restoreTokensInRichText tolerates
+                    // that, where plain restoreTokens would leave `[person_1]` raw.
+                    const { restoreTokensInRichText } = require('../../core/piiDetection');
+                    const _docMap = dlpRunner.getConversationTokenMap(notebookId) || {};
+                    const realHtml = restoreTokensInRichText(r.content, _docMap);
+                    const realMd = r.contentMd != null ? restoreTokensInRichText(r.contentMd, _docMap) : null;
+                    // PERSIST the AI's edit to the database. Previously this only
+                    // updated the in-memory mirror and emitted the SSE below, so an
+                    // AI-written document lived ONLY in the browser editor — and
+                    // `onNotebookDocUpdate` doesn't trigger the interactive autosave,
+                    // so the whole document was lost on refresh (the user never
+                    // manually typed to save it). Snapshot for version history first,
+                    // mirroring the PUT /api/notebooks/:id autosave path. All compares
+                    // are real-vs-real (prev.documentContent is stored real).
+                    try {
+                        if (realHtml && realHtml.trim() && await notebookStore.shouldAutoVersion(notebookId).catch(() => false)) {
+                            const prev = await notebookStore.getNotebook(notebookId, userId).catch(() => null);
+                            if (prev?.documentContent && prev.documentContent.trim() && prev.documentContent !== realHtml) {
+                                await notebookStore.createVersion(notebookId, prev.documentContent, 'AI edit').catch(() => {});
+                            }
+                        }
+                        const ok = await notebookStore.updateNotebook(notebookId, userId, {
+                            documentContent: realHtml,
+                            ...(realMd != null ? { documentMd: realMd } : {}),
+                        });
+                        if (!ok) console.warn(`[NotebookChat] AI doc write not persisted for notebook ${notebookId}`);
+                    } catch (e) {
+                        console.error('[NotebookChat] AI doc persist failed:', e.message);
+                    }
+                    // Client applies real HTML; the real Markdown mirror is persisted
+                    // alongside so a later notebook GET serves real values directly.
+                    send('notebook_doc_update', { content: realHtml, title: r.title });
                 }
                 return r;
             }
             if (toolName === 'notebook_add_source') {
                 const { ingestTextSource } = require('../../agents/notebooks/sourceIngestion');
                 const sourceName = toolArgs.name || 'AI Research';
-                const sourceContent = toolArgs.content || '';
+                // The model may echo tokens (`[person_1]`) in the content it asks us
+                // to save as a new source. Restore to real values before ingest so the
+                // stored source + its embeddings hold real text (sources are stored
+                // raw/real; tokenization happens at query-time in step B4).
+                const { restoreTokens } = require('../../core/piiDetection');
+                const _srcMap = dlpRunner.getConversationTokenMap(notebookId) || {};
+                const sourceContent = restoreTokens(toolArgs.content || '', _srcMap);
                 const sourceMeta = toolArgs.metadata || {};
                 if (!sourceContent.trim()) return { error: 'Content is required to add a source.' };
                 const source = await notebookStore.addSource({
@@ -799,13 +924,27 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
         let fullContent = '';
         emitPhase(send, 'streaming_start', modelId);
 
+        // Un-tokenise the streamed answer for DISPLAY (Model 1): the model emits
+        // tokens (it's instructed to preserve them); the user must only ever see
+        // real values. LIVE getter so tokens minted mid-turn (doc/KB/tool scans)
+        // are picked up. Storage (`fullContent`) stays tokenized — it is restored
+        // on reload via the persisted map (see GET /:id/conversation). Mirrors
+        // directChat.js. Spans the whole turn; flushed once after the loop.
+        const _untok = createUntokeniser(() => dlpRunner.getConversationTokenMap(notebookId));
+
         for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
             const isFinalRound = round === MAX_TOOL_ROUNDS;
             let roundText = '';
             const roundToolCalls = [];
             const streamCallback = (type, data) => {
-                if (type === 'text') { roundText += data.text; fullContent += data.text; send('content', { text: data.text }); }
-                else if (type === 'thinking') send('thinking', { text: data.text });
+                if (type === 'text') {
+                    // Accumulate tokenized text for storage; stream un-tokenised text
+                    // (buffered so a token split across SSE chunks isn't shown raw).
+                    roundText += data.text; fullContent += data.text;
+                    const safe = _untok.push(data.text);
+                    if (safe) send('content', { text: safe });
+                }
+                else if (type === 'thinking') send('thinking', { text: _untok.restore(data.text) });
                 else if (type === 'thinking_start') send('thinking_start', data || {});
                 else if (type === 'thinking_stop') send('thinking_stop', data || {});
                 else if (type === 'tool_use') {
@@ -826,7 +965,12 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             };
 
             try {
-                await adapter.stream(apiKey, apiUrl, modelId, messages, streamOptions, streamCallback);
+                // Re-tokenise known real values across the WHOLE outbound payload
+                // (client-sent history goes raw otherwise — only the last user msg
+                // was tokenized) so no real PII reaches the provider. Returns a new
+                // array; the canonical `messages` (mutated across rounds) is unchanged.
+                const outboundMessages = applyTokenMapToMessages({ conversationId: notebookId, messages });
+                await adapter.stream(apiKey, apiUrl, modelId, outboundMessages, streamOptions, streamCallback);
             } catch (err) {
                 console.error('[NotebookChat] Stream error:', err.message);
                 send('error', { error: err.message });
@@ -838,33 +982,162 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             // Record the assistant turn (preamble + tool calls), run the tools
             // with tool_start/tool_end, feed results back, and loop.
             messages.push({ role: 'assistant', content: roundText || null, tool_calls: roundToolCalls });
-            const toolResults = await Promise.all(roundToolCalls.map(async (toolCall) => {
+            // Run the round's tools SEQUENTIALLY, not via Promise.all. The
+            // notebook_doc_* tools mutate shared closure state (currentDocContent /
+            // currentDocMd) and persist to the DB; running them concurrently lets a
+            // notebook_doc_read batched alongside a notebook_doc_write observe the
+            // document before the write commits, so the agent "can't read what it
+            // just wrote" (BFSF-234). Sequential execution makes each tool see the
+            // committed result of the previous one. Order is preserved, so the
+            // tool_call_id ↔ result mapping the model expects is unchanged.
+            const toolResults = [];
+            for (const toolCall of roundToolCalls) {
                 const toolName = toolCall.function?.name || toolCall.name;
                 let toolArgs = {};
                 try { toolArgs = JSON.parse(toolCall.function?.arguments || '{}'); } catch (_) {}
-                send('tool_start', { name: toolName, args: toolArgs });
+                // The model passes tokens in tool args (e.g. find_text). Restore for
+                // the CLIENT-facing tool_start/tool_end previews only — the model-facing
+                // result fed back below stays tokenized (token-space consistency).
+                // _restoreView reads the LIVE map so tokens minted by this turn's
+                // tool-result scan (below) are restored in the client preview too.
+                const { restoreTokens: _rt } = require('../../core/piiDetection');
+                const _restoreView = (s) => {
+                    const m = dlpRunner.getConversationTokenMap(notebookId) || {};
+                    return (Object.keys(m).length && typeof s === 'string') ? _rt(s, m) : s;
+                };
+                send('tool_start', { name: toolName, args: untokeniseToolArgs(toolArgs, dlpRunner.getConversationTokenMap(notebookId) || {}) });
                 let toolResult;
                 try { toolResult = await executeNotebookTool(toolName, toolArgs); }
                 catch (err) { toolResult = { error: err.message }; }
-                const resultStr = typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult);
-                send('tool_end', { name: toolName, result: resultStr.slice(0, 800) });
-                return { role: 'tool', tool_call_id: toolCall.id, content: resultStr };
-            }));
+                let resultStr = typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult);
+                // Tokenize source/web content returned by RETRIEVAL tools before the
+                // model sees it — Legal/Notebook SOURCES (notebook_kb_search) and web
+                // results would otherwise reach the LLM raw. Exclude notebook_doc_*
+                // (already token-space, B3) and the Dutch legal tools (public court
+                // data whose exact ECLI/CELEX identifiers citation-matching needs).
+                if (docShield?.enabled && resultStr && (toolName === 'notebook_kb_search' || isAgentSearchTool(toolName))) {
+                    try {
+                        const { scanAttachmentText } = require('../../core/dlp/attachmentScanner');
+                        const r = await scanAttachmentText({ text: resultStr, filename: `${toolName}-result`, orgShield: docShield, conversationId: notebookId });
+                        if (r && r.action === 'tokenize' && r.text) resultStr = r.text;
+                    } catch (e) { console.warn('[NotebookChat] tool-result PII scan failed:', e.message); }
+                }
+                send('tool_end', { name: toolName, result: _restoreView(resultStr).slice(0, 800) });
+                toolResults.push({ role: 'tool', tool_call_id: toolCall.id, content: resultStr });
+            }
             messages.push(...toolResults);
+        }
+
+        // ── Un-tokenise the final answer for display ─────────────────────
+        // Flush any trailing partial token, then run a full-text restore as a
+        // safety net (covers tokens minted very late in the turn / any chunk the
+        // streaming un-tokeniser missed). `fullContent` stays TOKENIZED for storage
+        // (restored on reload via the persisted map); `displayContent` is what the
+        // user sees. Mirrors directChat's end-of-stream content_replace.
+        { const _tail = _untok.flush(); if (_tail) send('content', { text: _tail }); }
+        let displayContent = fullContent;
+        {
+            const { restoreTokens } = require('../../core/piiDetection');
+            const _mergedMap = {
+                ...(dlpRunner.getConversationTokenMap(notebookId) || {}),
+                ...(docPiiTokenMap || {}),
+                ...(piiTokenMap || {}),
+            };
+            if (Object.keys(_mergedMap).length) {
+                const restored = restoreTokens(fullContent, _mergedMap);
+                if (restored !== fullContent) { displayContent = restored; send('content_replace', { text: restored }); }
+            }
+        }
+
+        // ── Assistant "Privacy protection" panel (parity with directChat) ──
+        // For Legal/Notebook the PII almost always comes from the SOURCES (doc/KB/
+        // tool scans), not the user's chat line — so input PII rarely fires. The
+        // tokens the model echoed from those sources are restored for display by
+        // `_untok`; surface exactly those (token → real) so the user can SEE what
+        // was tokenised. Falls back to the notebook vault's protected-state badge.
+        // Skipped when input PII already populated the panel above.
+        try {
+            if (!_assistantTokenisationInfo) {
+                const replaced = (_untok && typeof _untok.getReplacedTokens === 'function') ? _untok.getReplacedTokens() : null;
+                if (replaced && replaced.size > 0) {
+                    let restoredCount = 0;
+                    for (const [, info] of replaced) restoredCount += info.count || 0;
+                    // Show the FULL notebook map so the panel's TOKEN MAPPING lists
+                    // EVERY value tokenised in this dossier (sources + document +
+                    // chat), not just the few echoed in this reply — the user asked
+                    // to see all converted values, not only the chat ones.
+                    const convMap = dlpRunner.getConversationTokenMap(notebookId) || {};
+                    const tokenMap = Object.keys(convMap).length
+                        ? { ...convMap }
+                        : Object.fromEntries([...replaced].map(([t, i]) => [t, i.value]));
+                    const catSet = new Set();
+                    for (const tok of Object.keys(tokenMap)) { const mm = /^\[([a-z0-9_]+)_\d+\]$/.exec(tok); if (mm) catSet.add(mm[1]); }
+                    _assistantTokenisationInfo = {
+                        source: 'restored', action: 'restore', count: Object.keys(tokenMap).length,
+                        restoredCount, categories: [...catSet], provider: modelId || null, automatic: true, tokenMap,
+                    };
+                    send('tokenisation_info', _assistantTokenisationInfo);
+                } else {
+                    const convMap = dlpRunner.getConversationTokenMap(notebookId) || {};
+                    const convEntries = Object.entries(convMap);
+                    if (convEntries.length > 0) {
+                        const catSet = new Set();
+                        for (const [tok] of convEntries) { const m = /^\[([a-z0-9_]+)_\d+\]$/.exec(tok); if (m) catSet.add(m[1]); }
+                        _assistantTokenisationInfo = {
+                            source: 'conversation_vault', action: 'protected', count: convEntries.length,
+                            categories: [...catSet], provider: modelId || null, automatic: true,
+                            tokenMap: Object.fromEntries(convEntries),
+                        };
+                        send('tokenisation_info', _assistantTokenisationInfo);
+                    }
+                }
+            }
+        } catch (_) { /* the panel is best-effort — never break the turn */ }
+
+        // ── Re-restore the AI-written document against the COMPLETE map ──────
+        // The mid-turn notebook_doc_* write restored tokens using whatever map
+        // existed at that instant. Source/KB/tool tokens minted later this turn
+        // would leave the saved document with raw `[person_5]`/`[email]1` even
+        // though they are now mapped (the chat reply, restored at end of turn,
+        // already shows them real — this brings the document to parity). Re-run
+        // the drift-tolerant restore on the TOKEN-space mirror with the final
+        // (hydrated) map and re-persist + re-emit only when it actually changed.
+        if (_docWritten) {
+            try {
+                const { restoreTokensInRichText } = require('../../core/piiDetection');
+                const _finalMap = (await dlpRunner.getConversationTokenMapAsync(notebookId).catch(() => null))
+                    || dlpRunner.getConversationTokenMap(notebookId) || {};
+                if (Object.keys(_finalMap).length) {
+                    const realHtml = restoreTokensInRichText(currentDocContent, _finalMap);
+                    const realMd = currentDocMd != null ? restoreTokensInRichText(currentDocMd, _finalMap) : null;
+                    const prev = await notebookStore.getNotebook(notebookId, userId).catch(() => null);
+                    if (prev && typeof realHtml === 'string' && prev.documentContent !== realHtml) {
+                        await notebookStore.updateNotebook(notebookId, userId, {
+                            documentContent: realHtml,
+                            ...(realMd != null ? { documentMd: realMd } : {}),
+                        }).catch(e => console.error('[NotebookChat] end-of-turn doc re-restore persist failed:', e.message));
+                        send('notebook_doc_update', { content: realHtml });
+                        console.warn('[NotebookChat] 🔓 Document re-restored against final token map');
+                    }
+                }
+            } catch (e) {
+                console.warn('[NotebookChat] end-of-turn doc re-restore failed:', e.message);
+            }
         }
 
         // ── Output Regex Guardrails (agentOutput scope) ──────────────────
         // Check the model's response for guardrail violations; apply redaction
-        // or warning. Mirrors directChat.js:3753
-        if (regexConfig?.enabled && regexConfig?.scope?.agentOutput && fullContent) {
-            const outputMatches = checkRegexPatterns(fullContent, regexConfig.rulesWithNames);
+        // or warning. Mirrors directChat.js:3753. Runs against the RESTORED text
+        // (displayContent) — regex rules match real values, not `[person_1]`.
+        if (regexConfig?.enabled && regexConfig?.scope?.agentOutput && displayContent) {
+            const outputMatches = checkRegexPatterns(displayContent, regexConfig.rulesWithNames);
             if (outputMatches.length > 0) {
                 const ruleNames = outputMatches.map(m => m.ruleName).join(', ');
                 console.log(`[NotebookChat RegexGuard] Output violated rules: ${ruleNames}, action: ${regexConfig.action}`);
 
                 if (regexConfig.action === 'redact') {
                     // Redact the output
-                    let redactedOutput = fullContent;
+                    let redactedOutput = displayContent;
                     for (const rule of regexConfig.rulesWithNames) {
                         try {
                             const regex = new RegExp(rule.pattern, 'gi');
@@ -872,7 +1145,7 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
                         } catch (e) { /* skip invalid patterns */ }
                     }
                     send('content_redact', {
-                        originalMessage: fullContent.slice(0, 500),
+                        originalMessage: displayContent.slice(0, 500),
                         redactedMessage: redactedOutput.slice(0, 500),
                         rules: ruleNames,
                         autoRedactSeconds: 5
@@ -913,6 +1186,44 @@ Now: ${(() => { const _tz = timezone || 'Europe/Amsterdam'; try { const _now = n
             const _fallback = "I couldn't produce a response for that. Please try rephrasing your request.";
             send('content', { text: _fallback });
             fullContent = _fallback;
+        }
+
+        // ── Persist the turn (audit-grade, encrypted) ──────────────────────
+        // In-notebook chat — for regular notebooks AND legal_matter dossiers —
+        // is now durable: the user message + final assistant answer are appended
+        // to the encrypted notebook_conversations blob so the conversation
+        // survives a refresh / notebook switch / restart. This is the Dutch-law
+        // drafting record for legal matters. Best-effort: a persist failure must
+        // never break the response the user just received.
+        try {
+            const encryptionKey = req.session?.encryptionKey || null;
+            const nowIso = new Date().toISOString();
+            const userContent = typeof message === 'string' ? message : String(message ?? '');
+            const attachmentNames = Array.isArray(attachments)
+                ? attachments.map(a => a?.name || a?.filename).filter(Boolean)
+                : [];
+            // Persist the privacy metadata alongside the turn so the redacted
+            // badge + "Privacy protection" panel render identically after a
+            // refresh (the blob is JSON, so these extra fields round-trip; GET
+            // /conversation returns them and the client reads them). Assistant
+            // `content` stays TOKENISED here and is restored on load via the
+            // persisted notebook token map (mirrors directChat).
+            const userMsg = {
+                role: 'user',
+                content: userContent,
+                createdAt: nowIso,
+                ...(attachmentNames.length ? { attachments: attachmentNames } : {}),
+            };
+            if (piiTokenMap && Object.keys(piiTokenMap).length) {
+                userMsg.piiTokenizedCount = Object.keys(piiTokenMap).length;
+                userMsg.piiCategories = _userPiiCategories;
+            }
+            const assistantMsg = { role: 'assistant', content: fullContent || '', createdAt: nowIso, modelId, modelTier };
+            if (_assistantTokenisationInfo) assistantMsg.tokenisationInfo = _assistantTokenisationInfo;
+            const turn = [userMsg, assistantMsg];
+            await notebookConversationStore.appendMessages(notebookId, userId, encryptionKey, turn);
+        } catch (persistErr) {
+            console.error('[NotebookChat] conversation persist failed:', persistErr.message);
         }
 
         send('done', {});

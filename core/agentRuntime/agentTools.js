@@ -93,46 +93,29 @@ async function getAgentTools(agentId) {
         tools.push(...SYSTEM_TOOLS);
     }
 
-    // Load MCP tools from all connected external servers
+    // MCP-server + custom-integration tools (integrations now), gated by the
+    // agent OWNER's effective integration set. This path is owner-keyed
+    // because chatWithAgent does not call getIntegrationTools. Reuses the
+    // shared append helpers so the gating/filter logic lives in ONE place.
+    // Fail CLOSED: null set ⇒ no MCP and no custom tools.
     try {
-        const mcpManager = require('../mcpManager');
-        const beforeCount = tools.length;
-        let mcpTools = await mcpManager.getAllToolsAsOpenAI();
-        console.log(`[MCP-DEBUG] agentTools: got ${mcpTools.length} MCP tools from mcpManager (agent: ${agentId}, existing tools: ${beforeCount})`);
-        // Gate MCP tools by org-level enabledIntegrations
-        if (mcpTools.length > 0) {
-            try {
-                const agent = await agentStore.getAgent(agentId);
-                if (agent?.userId) {
-                    const userStore = require('../../stores/userStore');
-                    const configStoreForMcp = require('../../stores/configStore');
-                    const agentOwner = await userStore.getUser(agent.userId);
-                    if (agentOwner?.organizationId) {
-                        const org = await userStore.getOrganization(agentOwner.organizationId);
-                        let orgEnabled = null;
-                        if (org?.enabledIntegrations) {
-                            orgEnabled = typeof org.enabledIntegrations === 'string'
-                                ? JSON.parse(org.enabledIntegrations) : org.enabledIntegrations;
-                        } else {
-                            const globalDefs = await configStoreForMcp.getConfig('default_org_integrations');
-                            if (globalDefs) {
-                                orgEnabled = typeof globalDefs === 'string' ? JSON.parse(globalDefs) : globalDefs;
-                            }
-                        }
-                        if (orgEnabled) {
-                            mcpTools = mcpTools.filter(t => {
-                                const serverId = t._mcp?.serverId;
-                                return !serverId || orgEnabled.includes(`mcp:${serverId}`);
-                            });
-                        }
-                    }
-                }
-            } catch (_) { /* ignore */ }
-            if (mcpTools.length > 0) {
-                tools.push(...mcpTools);
-                console.log(`[MCP-DEBUG] agentTools: total tools after MCP injection: ${tools.length}`);
-            }
+        const agent = await agentStore.getAgent(agentId);
+        let effectiveIntegrations = null;
+        let ownerOrgId = null;
+        if (agent?.userId) {
+            const userStore = require('../../stores/userStore');
+            const entitlements = require('../entitlements');
+            const owner = await userStore.getUser(agent.userId);
+            ownerOrgId = owner?.organizationId || null;
+            const snap = await entitlements.resolveEntitlements({
+                userId: agent.userId,
+                orgId: ownerOrgId,
+            });
+            if (snap && !snap.degraded) effectiveIntegrations = new Set(snap.effective.integration);
         }
+        const { appendMcpTools, appendCustomIntegrationTools } = require('../integrationTools');
+        await appendMcpTools(tools, { effectiveIntegrations });
+        await appendCustomIntegrationTools(tools, { effectiveIntegrations, orgId: ownerOrgId });
     } catch (err) {
         console.warn('[AgentTools] Failed to load MCP tools:', err.message);
     }

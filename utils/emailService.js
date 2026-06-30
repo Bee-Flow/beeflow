@@ -1,91 +1,104 @@
 /**
- * Email Service — Gmail SMTP sender using configStore credentials
- * 
+ * Email Service — Gmail API sender using OAuth2 (configStore credentials)
+ *
  * Provides a reusable `sendServiceEmail()` function for sending
  * customer-facing emails from the platform's configured service account.
- * 
- * Credentials are stored encrypted at rest via configStore.setSecret().
- * Requires a Gmail account with 2FA + App Password.
+ *
+ * Transport is the Gmail REST API over HTTPS (port 443), NOT SMTP. Scaleway
+ * (and most cloud hosts) block outbound SMTP (25/465/587) for anti-abuse, so
+ * the App-Password/SMTP path timed out in production. OAuth2 + the Gmail API
+ * runs entirely over 443 — the same path the Support inbox already uses
+ * (see services/email/providerClients.js) — and survives node replacement.
+ *
+ * The admin connects a Google account once (Admin → Integrations → Email);
+ * the resulting refresh-token blob is stored encrypted via configStore.setSecret
+ * under `service_email_oauth_tokens`, and the connected address under the config
+ * key `service_email_address`. Access tokens are auto-refreshed and written back.
  */
 
 const configStore = require('../stores/configStore');
 
-/**
- * Get the current service email configuration (without exposing the password).
- * @returns {{ configured: boolean, address: string, displayName: string }}
- */
-async function getServiceEmailConfig() {
-    console.log('[EmailService] getServiceEmailConfig — looking up credentials...');
-    const address = await configStore.getConfig('service_email_address');
-    const password = await configStore.getSecret('service_email_password');
-    const hasPassword = !!password;
-    const displayName = await configStore.getConfig('service_email_display_name') || '';
+// ── OAuth token storage (encrypted at rest via configStore.setSecret) ────────
 
-    console.log(`[EmailService] Config: address=${address ? address : '(empty)'}, hasPassword=${hasPassword}, displayName=${displayName || '(empty)'}`);
+const OAUTH_TOKENS_KEY = 'service_email_oauth_tokens';
 
-    return {
-        configured: !!(address && hasPassword),
-        address: address || '',
-        displayName,
-    };
+/** Load the stored Gmail OAuth token blob, or null if not connected. */
+async function _loadOAuthTokens() {
+    const raw = await configStore.getSecret(OAUTH_TOKENS_KEY);
+    if (!raw) return null;
+    try { return JSON.parse(raw); } catch { return null; }
+}
+
+/** Persist (or clear, when blob is falsy) the Gmail OAuth token blob. */
+async function _saveOAuthTokens(blob) {
+    await configStore.setSecret(OAUTH_TOKENS_KEY, blob ? JSON.stringify(blob) : '');
 }
 
 /**
- * Create a nodemailer transporter using the stored Gmail SMTP credentials.
- * @returns {Promise<import('nodemailer').Transporter>}
+ * Get the current service email configuration (without exposing tokens).
+ * `configured` is true only when a Google account is connected (refresh token
+ * present) and an address is stored.
+ * @returns {{ configured: boolean, address: string, displayName: string }}
  */
-async function _createTransporter() {
-    console.log('[EmailService] _createTransporter — loading nodemailer...');
-    let nodemailer;
-    try {
-        nodemailer = require('nodemailer');
-        console.log('[EmailService] nodemailer loaded OK');
-    } catch (e) {
-        console.error('[EmailService] nodemailer require FAILED:', e.message);
-        throw new Error('Email service unavailable — nodemailer package is not installed. Run: npm install nodemailer');
-    }
+async function getServiceEmailConfig() {
     const address = await configStore.getConfig('service_email_address');
-    const password = await configStore.getSecret('service_email_password');
+    const tokens = await _loadOAuthTokens();
+    const displayName = await configStore.getConfig('service_email_display_name') || '';
+    const configured = !!(address && tokens && tokens.refreshToken);
+    console.log(`[EmailService] Config: address=${address || '(empty)'}, connected=${configured}, displayName=${displayName || '(empty)'}`);
+    return { configured, address: address || '', displayName };
+}
 
-    console.log(`[EmailService] Transporter: address=${address ? address : '(empty)'}, password=${password ? '***' + password.slice(-4) : '(empty/null)'}`);
+// ── OAuth connect lifecycle (drives Admin → Integrations → Email) ─────────────
 
-    if (!address || !password) {
-        const reason = !address ? 'no address' : 'no password (decrypt failed?)';
-        console.error(`[EmailService] Cannot create transporter: ${reason}`);
-        throw new Error(`Service email is not configured (${reason}). Re-enter credentials in Admin → Integrations → Email.`);
-    }
+/**
+ * Build the Google consent URL for connecting the platform service account.
+ * Reuses the shared Gmail OAuth client + gmail.send scope from providerClients.
+ * @param {{ redirectUri: string, state: string }} opts
+ * @returns {Promise<string>}
+ */
+async function buildConnectUrl({ redirectUri, state }) {
+    const providerClients = require('../services/email/providerClients');
+    return providerClients.buildAuthUrl('gmail', { redirectUri, state });
+}
 
-    console.log('[EmailService] Creating SMTP transporter for smtp.gmail.com:587...');
-    const transporter = nodemailer.createTransport({
-        host: 'smtp.gmail.com',
-        port: 587,
-        secure: false, // STARTTLS
-        auth: {
-            user: address,
-            pass: password,
-        },
-        connectionTimeout: 10000, // 10s to establish TCP connection
-        greetingTimeout: 10000,   // 10s for SMTP greeting
-        socketTimeout: 15000,     // 15s for socket inactivity
+/**
+ * Complete the OAuth connect: exchange the authorization code, store the token
+ * blob + the connected Gmail address. The address Google reports IS the only
+ * valid `From` for Gmail-API sends, so we trust it over any prior value.
+ * @param {{ code: string, redirectUri: string }} opts
+ * @returns {Promise<{ address: string }>}
+ */
+async function completeOAuthConnect({ code, redirectUri }) {
+    const providerClients = require('../services/email/providerClients');
+    const { tokens, emailAddress } = await providerClients.exchangeCode('gmail', { code, redirectUri });
+    await _saveOAuthTokens(tokens);
+    await configStore.setConfig('service_email_address', emailAddress || '');
+    console.log(`[EmailService] Connected service email account: ${emailAddress}`);
+    return { address: emailAddress };
+}
+
+/** Disconnect the service account — clears tokens and the stored address. */
+async function disconnectServiceEmail() {
+    await _saveOAuthTokens(null);
+    await configStore.setConfig('service_email_address', '');
+    console.log('[EmailService] Service email disconnected');
+}
+
+/**
+ * Build a base64url-encoded RFC822 message for the Gmail API `messages.send`
+ * `raw` field, using nodemailer's MailComposer (same approach as supportMailer).
+ */
+async function _buildRawMessage({ from, to, cc, bcc, replyTo, subject, text, html }) {
+    const MailComposer = require('nodemailer/lib/mail-composer');
+    const composer = new MailComposer({
+        from, to, cc: cc || undefined, bcc: bcc || undefined, replyTo: replyTo || undefined,
+        subject, text: text || undefined, html: html || undefined,
     });
-
-    // Verify connection with a hard timeout
-    try {
-        console.log('[EmailService] Verifying SMTP connection (10s timeout)...');
-        await Promise.race([
-            transporter.verify(),
-            new Promise((_, reject) => setTimeout(() => reject(new Error(
-                'SMTP connection timed out after 10s — port 587 may be blocked on this server. ' +
-                'Try: sudo ufw allow out 587/tcp  OR check cloud firewall rules.'
-            )), 10000)),
-        ]);
-        console.log('[EmailService] SMTP connection verified OK');
-    } catch (verifyErr) {
-        console.error('[EmailService] SMTP verify FAILED:', verifyErr.message);
-        throw new Error(`SMTP connection failed: ${verifyErr.message}`);
-    }
-
-    return transporter;
+    const msg = await new Promise((resolve, reject) => {
+        composer.compile().build((err, m) => (err ? reject(err) : resolve(m)));
+    });
+    return msg.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 /**
@@ -104,29 +117,32 @@ async function _createTransporter() {
 async function sendServiceEmail({ to, subject, text, html, cc, bcc, replyTo }) {
     console.log(`[EmailService] sendServiceEmail — to=${to}, subject="${subject}"`);
     try {
-        const transporter = await _createTransporter();
-        const config = await getServiceEmailConfig();
-        const fromName = config.displayName || 'Service';
-        const fromAddress = config.address;
+        const address = await configStore.getConfig('service_email_address');
+        const tokens = await _loadOAuthTokens();
+        if (!address || !tokens || !tokens.refreshToken) {
+            throw new Error('Service email is not connected. Connect a Google account in Admin → Integrations → Email.');
+        }
 
-        const mailOptions = {
-            from: `"${fromName}" <${fromAddress}>`,
+        const { gmailClientFromTokens } = require('../services/email/providerClients');
+        // Refreshed access tokens are written back so the next send reuses them.
+        const gmail = await gmailClientFromTokens(tokens, (updated) => _saveOAuthTokens(updated));
+
+        const fromName = (await configStore.getConfig('service_email_display_name')) || 'Service';
+        // Gmail rewrites `From` to the authenticated account unless it's a verified
+        // send-as alias, so `address` (the connected account) is the correct sender.
+        const raw = await _buildRawMessage({
+            from: `"${fromName}" <${address}>`,
             to: Array.isArray(to) ? to.join(', ') : to,
-            subject,
-            text: text || undefined,
-            html: html || undefined,
-            cc: cc || undefined,
-            bcc: bcc || undefined,
-            replyTo: replyTo || undefined,
-        };
+            cc, bcc, replyTo, subject, text, html,
+        });
 
-        console.log(`[EmailService] Sending from "${fromName}" <${fromAddress}> → ${to}`);
-        const info = await transporter.sendMail(mailOptions);
+        console.log(`[EmailService] Sending via Gmail API from "${fromName}" <${address}> → ${to}`);
+        const sent = await gmail.users.messages.send({ userId: 'me', requestBody: { raw } });
 
-        console.log(`[EmailService] ✅ Email sent: ${info.messageId} → ${to}`);
+        console.log(`[EmailService] ✅ Email sent: ${sent.data.id} → ${to}`);
         return {
             success: true,
-            messageId: info.messageId,
+            messageId: sent.data.id,
         };
     } catch (error) {
         console.error(`[EmailService] ❌ Failed to send email:`, error.message);
@@ -146,7 +162,8 @@ async function sendInvitationEmail({ email, orgName, inviterName, inviteUrl, rol
     const roleLabel = role && role !== 'user' ? role.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()) : '';
 
     const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
-    const logoUrl = `${clientHost}/bee-flow-logo.svg`;
+    // PNG, not SVG: most mail clients (Gmail/Outlook) strip SVG. Served from agent-hub/public/.
+    const logoUrl = `${clientHost}/bee-flow-logo.png`;
 
     const html = `
 <!DOCTYPE html>
@@ -210,7 +227,8 @@ async function sendInvitationEmail({ email, orgName, inviterName, inviteUrl, rol
  */
 async function sendWaitlistApprovedEmail({ email, displayName }) {
     const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
-    const logoUrl = `${clientHost}/bee-flow-logo.svg`;
+    // PNG, not SVG: most mail clients (Gmail/Outlook) strip SVG. Served from agent-hub/public/.
+    const logoUrl = `${clientHost}/bee-flow-logo.png`;
     const loginUrl = clientHost;
 
     const html = `
@@ -277,7 +295,8 @@ async function sendWaitlistApprovedEmail({ email, displayName }) {
  */
 async function sendTrialEndingEmail({ email, displayName, orgName, trialEndIso, portalUrl }) {
     const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
-    const logoUrl = `${clientHost}/bee-flow-logo.svg`;
+    // PNG, not SVG: most mail clients (Gmail/Outlook) strip SVG. Served from agent-hub/public/.
+    const logoUrl = `${clientHost}/bee-flow-logo.png`;
     const targetName = orgName || displayName || 'there';
     const trialEnd = trialEndIso ? new Date(trialEndIso) : null;
     const trialEndPretty = trialEnd ? trialEnd.toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' }) : 'soon';
@@ -344,7 +363,8 @@ async function sendTrialEndingEmail({ email, displayName, orgName, trialEndIso, 
  */
 function _renderEmailShell({ title, intro, body, ctaLabel, ctaUrl, footer }) {
     const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
-    const logoUrl = `${clientHost}/bee-flow-logo.svg`;
+    // PNG, not SVG: most mail clients (Gmail/Outlook) strip SVG. Served from agent-hub/public/.
+    const logoUrl = `${clientHost}/bee-flow-logo.png`;
     const cta = (ctaLabel && ctaUrl)
         ? `
         <table width="100%" cellpadding="0" cellspacing="0">
@@ -384,6 +404,103 @@ function _renderEmailShell({ title, intro, body, ctaLabel, ctaUrl, footer }) {
 </body>
 </html>`.trim();
     return html;
+}
+
+// ── Configurable template helpers (verification + welcome) ──────────────
+// Admin-authored templates are structured PLAIN-TEXT fields rendered into the
+// branded shell. We treat all field content as plain text: substitute the
+// {{variables}}, HTML-escape the result, then (for the body) turn newlines
+// into <br>. This keeps user-supplied values (name/orgName) and any stray
+// markup from breaking the HTML.
+
+function _escapeHtml(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+/** Replace {{var}} tokens with raw values from `vars` (unknown tokens → ''). */
+function _substituteVars(str, vars = {}) {
+    return String(str == null ? '' : str).replace(/\{\{\s*(\w+)\s*\}\}/g, (_m, key) =>
+        Object.prototype.hasOwnProperty.call(vars, key) ? String(vars[key] ?? '') : ''
+    );
+}
+
+/** Render a plain-text template field to safe HTML (substitute → escape → <br>). */
+function _renderField(str, vars, { multiline = false } = {}) {
+    const escaped = _escapeHtml(_substituteVars(str, vars));
+    return multiline ? escaped.replace(/\n/g, '<br>') : escaped;
+}
+
+/**
+ * Build a {subject, html, text} email from a configurable, locale-aware
+ * template. Shared by the send functions and the admin preview/test endpoint
+ * (no-send path). The CTA URL is taken from vars.verifyUrl / vars.loginUrl.
+ *
+ * @param {'verification'|'welcome'} templateId
+ * @param {string} locale
+ * @param {Object} vars  e.g. { name, orgName, verifyUrl } or { name, orgName, loginUrl }
+ */
+/**
+ * Build {subject, html, text} from an already-resolved template object
+ * ({subject,title,intro,body,ctaLabel}) and substitution vars. Used by the
+ * send functions and by the admin live-preview endpoint (which passes
+ * in-progress, unsaved fields).
+ */
+function renderEmailFromTemplate(tpl, vars = {}) {
+    const ctaUrl = vars.verifyUrl || vars.loginUrl || null;
+    const html = _renderEmailShell({
+        title: _renderField(tpl.title, vars),
+        intro: tpl.intro ? _renderField(tpl.intro, vars) : '',
+        body: _renderField(tpl.body, vars, { multiline: true }),
+        ctaLabel: tpl.ctaLabel ? _renderField(tpl.ctaLabel, vars) : null,
+        ctaUrl,
+    });
+
+    const subject = _substituteVars(tpl.subject, vars);
+    const lines = [_substituteVars(tpl.intro, vars), _substituteVars(tpl.body, vars)].filter(Boolean);
+    if (ctaUrl) lines.push(`${_substituteVars(tpl.ctaLabel, vars)}: ${ctaUrl}`.trim());
+    const text = lines.join('\n\n');
+
+    return { subject, html, text };
+}
+
+async function renderEmailTemplate(templateId, locale, vars = {}) {
+    const languageStore = require('../stores/languageStore');
+    const tpl = await languageStore.getEffectiveEmailTemplate(templateId, locale);
+    if (!tpl) throw new Error(`Unknown email template '${templateId}'`);
+    return renderEmailFromTemplate(tpl, vars);
+}
+
+/**
+ * Email-address verification. The raw token only ever travels in `verifyUrl`
+ * (the DB stores SHA-256(token)). Sent at signup when verification is enabled.
+ *
+ * @param {{ email: string, displayName?: string, verifyUrl: string, orgName?: string, locale?: string }} opts
+ */
+async function sendVerificationEmail({ email, displayName, verifyUrl, orgName, locale }) {
+    const vars = { name: displayName || 'there', verifyUrl, orgName: orgName || 'BeeFlow' };
+    const { subject, html, text } = await renderEmailTemplate('verification', locale, vars);
+    return sendServiceEmail({ to: email, subject, text, html });
+}
+
+/**
+ * Welcome / confirmation email. Sent once an account first becomes active
+ * (after verification for verified signups; on creation for trusted accounts).
+ *
+ * @param {{ email: string, displayName?: string, loginUrl: string, orgName?: string, locale?: string }} opts
+ */
+async function sendWelcomeEmail({ email, displayName, loginUrl, orgName, locale }) {
+    // BFSF-230: the confirmation email doubles as an onboarding touchpoint with
+    // a Learning Center link. Derived from the same client host as other links.
+    const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
+    const learnUrl = `${clientHost}/app`;
+    const vars = { name: displayName || 'there', loginUrl, learnUrl, orgName: orgName || 'BeeFlow' };
+    const { subject, html, text } = await renderEmailTemplate('welcome', locale, vars);
+    return sendServiceEmail({ to: email, subject, text, html });
 }
 
 /**
@@ -516,10 +633,83 @@ async function sendNcVerificationCodeEmail({ to, code, orgName, expiresAt }) {
     });
 }
 
+/**
+ * Admin notification — a new subscription was started. Sent to the address
+ * configured in Admin → Subscriptions → Stripe (`subscription_notify_email`),
+ * once per new subscription. The webhook is responsible for idempotency
+ * (userStore.claimNotification) so subscription *updates* never re-trigger.
+ *
+ * @param {{ to: string, scope?: string, targetName?: string, planName?: string, price?: number|string, currency?: string, interval?: string, trialDays?: number, adminUrl?: string }} opts
+ */
+async function sendSubscriptionStartedAdminEmail({ to, scope, targetName, planName, price, currency, interval, trialDays, adminUrl }) {
+    const fmtPrice = (price !== undefined && price !== null && price !== '')
+        ? `${currency || 'EUR'} ${price}${interval ? ` / ${interval === 'yearly' ? 'year' : 'month'}` : ''}`
+        : '—';
+    const rows = [
+        ['Customer', targetName || '—'],
+        ['Type', scope === 'consumer' ? 'Personal account' : 'Organisation'],
+        ['Plan', planName || '—'],
+        ['Price', fmtPrice],
+        ...(trialDays ? [['Trial', `${trialDays} day${trialDays === 1 ? '' : 's'}`]] : []),
+    ];
+    const tableRows = rows.map(([k, v]) =>
+        `<tr><td style="padding:6px 12px;color:#64748b;font-size:14px;">${k}</td><td style="padding:6px 12px;color:#0f172a;font-size:14px;font-weight:600;">${v}</td></tr>`
+    ).join('');
+    const html = _renderEmailShell({
+        title: 'New subscription started',
+        body: `A customer just started a new subscription on Bee Flow.
+            <table width="100%" cellpadding="0" cellspacing="0" style="margin:16px 0;border:1px solid #e2e8f0;border-radius:12px;border-collapse:separate;border-spacing:0;">${tableRows}</table>`,
+        ctaLabel: adminUrl ? 'Open admin dashboard' : null,
+        ctaUrl: adminUrl || null,
+        footer: 'You are receiving this because a notification email is set in Admin → Subscriptions → Stripe.',
+    });
+    const text = `New subscription started on Bee Flow.\n\n${rows.map(([k, v]) => `${k}: ${v}`).join('\n')}${adminUrl ? `\n\nAdmin: ${adminUrl}` : ''}`;
+    return sendServiceEmail({
+        to,
+        subject: `Bee Flow: new subscription — ${planName || 'plan'}${targetName ? ` (${targetName})` : ''}`,
+        text,
+        html,
+    });
+}
+
+/**
+ * Self-service password reset link. The raw token only ever travels in this
+ * email (the DB stores SHA-256(token)). Link expires in 60 minutes.
+ *
+ * @param {{ email: string, displayName?: string, resetUrl: string }} opts
+ */
+async function sendPasswordResetEmail({ email, displayName, resetUrl }) {
+    const name = displayName || 'there';
+    const html = _renderEmailShell({
+        title: 'Reset your password',
+        intro: `Hi <strong>${name}</strong>,`,
+        body: 'We received a request to reset your Bee Flow password. Click the button below to choose a new one. This link expires in 1 hour and can be used once. If you didn\'t request this, you can safely ignore this email — your password won\'t change.',
+        ctaLabel: 'Reset password',
+        ctaUrl: resetUrl,
+        footer: 'For your security, this link expires in 60 minutes and can only be used once.',
+    });
+    const text = `Hi ${name},\n\nReset your Bee Flow password using the link below (expires in 1 hour):\n\n${resetUrl}\n\nIf you didn't request this, you can ignore this email — your password won't change.`;
+    return sendServiceEmail({
+        to: email,
+        subject: 'Reset your Bee Flow password',
+        text,
+        html,
+    });
+}
+
 module.exports = {
     getServiceEmailConfig,
     sendServiceEmail,
+    buildConnectUrl,
+    completeOAuthConnect,
+    disconnectServiceEmail,
+    _renderEmailShell,
+    renderEmailFromTemplate,
+    renderEmailTemplate,
+    sendVerificationEmail,
+    sendWelcomeEmail,
     sendNcVerificationCodeEmail,
+    sendPasswordResetEmail,
     sendInvitationEmail,
     sendWaitlistApprovedEmail,
     sendTrialEndingEmail,
@@ -527,4 +717,5 @@ module.exports = {
     sendDunningGraceWarningEmail,
     sendSubscriptionSuspendedEmail,
     sendBreachNotificationEmail,
+    sendSubscriptionStartedAdminEmail,
 };

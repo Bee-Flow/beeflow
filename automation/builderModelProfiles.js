@@ -132,6 +132,9 @@ const CORE_TOOL_NAMES = new Set([
     'builder_add_notification',
     'builder_add_array_op',
     'builder_remove_step',
+    // In-place editing — so a small model edits a step instead of the
+    // remove+re-add dance (which mints a new id and breaks downstream refs).
+    'builder_update_step',
     'builder_set_metadata',
     'builder_inspect_tool',
     'builder_summarise',

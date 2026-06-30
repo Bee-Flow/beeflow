@@ -884,12 +884,48 @@ router.get('/callback/:provider', async (req, res) => {
                 throw e;
             }
             console.log(`[OAuth/${provider}] Created new user via branch=create → ${localId} (azureUserId=${user.azureUserId || 'none'}, preResolvedOrg=${preResolvedOrg?.id || 'none'})`);
+
+            // SSO accounts skip email verification (the IdP already proved the
+            // address). Persist the preferred locale and send the welcome email
+            // once — but only after the status is finalized (a consumer signup
+            // may be waitlisted just below), so re-read the row in the deferred
+            // task and only send when the account is actually active.
+            try {
+                const { resolveSignupLocale } = require('./signupGuards');
+                const ssoLocale = await resolveSignupLocale(req);
+                await userStore.updateUser(localId, { preferredLocale: ssoLocale });
+                if (user.email) {
+                    setImmediate(async () => {
+                        try {
+                            const row = await userStore.getUser(localId);
+                            if (!row || (row.status ?? 'active') !== 'active') return;
+                            const claimed = await userStore.claimNotification('user', localId, 'welcome_email', user.email);
+                            if (!claimed) return;
+                            const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
+                            const orgName = preResolvedOrg?.name || '';
+                            const { sendWelcomeEmail } = require('../utils/emailService');
+                            await sendWelcomeEmail({ email: user.email, displayName: user.displayName, loginUrl: clientHost, orgName, locale: ssoLocale });
+                        } catch (e) { console.warn('[OAuth] welcome email failed:', e.message); }
+                    });
+                }
+            } catch (e) { console.warn('[OAuth] post-create locale/welcome failed:', e.message); }
         }
 
         // Handle pending signup — create organization or consumer account
         if (req.session.pendingSignup) {
             const pendingData = req.session.pendingSignup;
             delete req.session.pendingSignup;
+
+            // ── Legal consent (fail-closed) ──────────────────────────
+            // The acceptance was validated and stashed at /auth/pending-signup.
+            // If it is missing (tampering / lost session), do NOT create the
+            // consumer or org binding — abort the signup.
+            const consentGuards = require('./consentGuards');
+            const consentAccountType = pendingData.signupType === 'consumer' ? 'consumer' : 'org_admin';
+            if (!pendingData.consent || pendingData.consent.accepted !== true) {
+                console.warn('[OAuth] pending signup without recorded consent — aborting');
+                return res.redirect(`${returnTo}?error=consent_required`);
+            }
 
             if (pendingData.signupType === 'consumer') {
                 // Consumer OAuth signup — mark user as consumer, no org.
@@ -905,6 +941,15 @@ router.get('/callback/:provider', async (req, res) => {
                     status: userStatus,
                 });
                 console.log(`[OAuth] Consumer account created for ${user.id} (status: ${userStatus})`);
+
+                // Record legal consent (re-derive required docs/versions from the
+                // registry at record time — defends against a stale session).
+                try {
+                    await consentGuards.recordConsent({
+                        userId: user.id, email: user.email, accountType: 'consumer',
+                        req, method: 'oauth_pending',
+                    });
+                } catch (e) { console.error('[OAuth] consumer consent record failed:', e.message); }
 
                 req.session.accessToken = tokenData.access_token;
                 req.session.refreshToken = tokenData.refresh_token;
@@ -968,41 +1013,27 @@ router.get('/callback/:provider', async (req, res) => {
                         console.log(`[OAuth] Assigned default plan '${defaultPlan.name}' to org ${orgId}`);
                     }
 
-                    // Privacy shield
-                    const privacyLevel = od.privacyLevel || 'off';
-                    if (privacyLevel !== 'off') {
-                        const configStore = require('../stores/configStore');
-                        const BASIC_CATEGORIES = ['violence_and_threats', 'hate_and_discrimination', 'dangerous_and_criminal_content', 'selfharm', 'sexual', 'health', 'financial', 'law'];
-                        const STRICT_CATEGORIES = [...BASIC_CATEGORIES, 'pii'];
-                        const selectedCategories = privacyLevel === 'strict' ? STRICT_CATEGORIES : BASIC_CATEGORIES;
-
-                        // For strict mode, auto-include PII-related regex collections
-                        let autoCollectionIds = [];
-                        if (privacyLevel === 'strict') {
-                            try {
-                                const { getAIConfig } = require('../core/aiAgent');
-                                const aiCfg = await getAIConfig();
-                                const collections = aiCfg.regexGuardrails?.collections || [];
-                                autoCollectionIds = collections
-                                    .filter(c => c.name && c.name.toLowerCase().includes('pii'))
-                                    .map(c => c.id);
-                            } catch (e) { /* ignore */ }
-                        }
-
-                        await configStore.setConfig(`org_privacy_shield_${orgId}`, {
-                            enabled: true, collectionIds: autoCollectionIds,
-                            scope: { userInput: true, agentOutput: true },
-                            action: 'delete', moderationEnabled: true,
-                            moderationCategories: selectedCategories,
-                            euModeEnabled: !!od.euModeEnabled,
-                            updatedAt: new Date().toISOString(), updatedBy: 'system-signup',
-                        });
-                        console.log(`[OAuth] Privacy shield set to '${privacyLevel}' for org ${orgId}`);
+                    // Privacy shield — real piiDetection* fields from the wizard
+                    // (identical shape to Settings → Privacy Shield); null = off.
+                    const configStore = require('../stores/configStore');
+                    const { buildSignupShieldConfig } = require('../core/signupShield');
+                    const shieldConfig = buildSignupShieldConfig(od);
+                    if (shieldConfig) {
+                        await configStore.setConfig(`org_privacy_shield_${orgId}`, shieldConfig);
+                        console.log(`[OAuth] Privacy shield for org ${orgId}: ${shieldConfig.piiDetectionCategories.length} PII categories, action=${shieldConfig.piiDetectionAction}`);
                     }
 
                     // Assign user as org_admin — no default group is created
                     await userStore.updateUser(user.id, { orgRole: 'org_admin', organizationId: orgId });
                     console.log(`[OAuth] Assigned ${user.id} as org_admin of ${orgId}`);
+
+                    // Record legal consent for the org account (terms/privacy/dpa/aup).
+                    try {
+                        await consentGuards.recordConsent({
+                            userId: user.id, email: user.email, accountType: 'org_admin',
+                            req, method: 'oauth_pending', organizationId: orgId,
+                        });
+                    } catch (e) { console.error('[OAuth] org consent record failed:', e.message); }
                 } else {
                     console.warn(`[OAuth] Org "${newOrgName}" already exists, skipping creation`);
                 }
@@ -1064,8 +1095,10 @@ router.get('/callback/:provider', async (req, res) => {
             }
         }
 
-        // Check if existing user is pending
-        if (freshUser?.status === 'pending') {
+        // Check if existing user is pending — but never gate an org founder/owner
+        // or system admin (they are the org's approver; no one above them).
+        const isOrgOwnerOrAdmin = freshUser?.orgRole === 'org_admin' || freshUser?.role === 'admin';
+        if (freshUser?.status === 'pending' && !isOrgOwnerOrAdmin) {
             pendingApproval = true;
         }
 
@@ -1231,7 +1264,10 @@ const requireSsoProvider = (req, res, next) => {
     // Enterprise `sso_saml` licence feature.
     if (provider === 'nextcloud') return next();
     if (!_ssoSamlGate) {
-        _ssoSamlGate = require('../license/middleware').requireFeature('sso_saml');
+        // Unified gate — sso_saml is a non-togglable core capability, so the
+        // resolver grants it implicitly whenever it's in the tier/plan ceiling
+        // (equivalent to the old requireFeature, but on the one resolver).
+        _ssoSamlGate = require('../core/entitlements').requireCapability('sso_saml');
     }
     return _ssoSamlGate(req, res, next);
 };

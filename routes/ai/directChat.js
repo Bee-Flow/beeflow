@@ -82,6 +82,11 @@ function compactToolResultForLLM(toolResult) {
     if (toolResult._action === 'workspace_update' && toolResult.message) {
         return { action: 'notebook_updated', message: toolResult.message };
     }
+    // BFSF-208: keep the (potentially large) revert content out of the LLM context.
+    if (toolResult._nbWriteFailed) {
+        const { _nbWriteFailed, _revertContent, ...rest } = toolResult;
+        return rest;
+    }
     return toolResult;
 }
 const { getIntegrationTools, buildToolHint } = require('../../core/integrationTools');
@@ -651,46 +656,8 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
             }
         }
 
-        // ─── MCP tools injection ─────────────────────────────────────
-        try {
-            const mcpManager = require('../../core/mcpManager');
-            let mcpTools = await mcpManager.getAllToolsAsOpenAI();
-            // Gate MCP tools by org-level enabledIntegrations
-            if (mcpTools.length > 0) {
-                let orgEnabled = null;
-                try {
-                    const userStoreForMcp = require('../../stores/userStore');
-                    const configStoreForMcp = require('../../stores/configStore');
-                    const mcpUser = await userStoreForMcp.getUser(userId);
-                    if (mcpUser?.organizationId) {
-                        const mcpOrg = await userStoreForMcp.getOrganization(mcpUser.organizationId);
-                        if (mcpOrg?.enabledIntegrations) {
-                            orgEnabled = typeof mcpOrg.enabledIntegrations === 'string'
-                                ? JSON.parse(mcpOrg.enabledIntegrations) : mcpOrg.enabledIntegrations;
-                        } else {
-                            const globalDefs = await configStoreForMcp.getConfig('default_org_integrations');
-                            if (globalDefs) {
-                                orgEnabled = typeof globalDefs === 'string' ? JSON.parse(globalDefs) : globalDefs;
-                            }
-                        }
-                    }
-                } catch (_) { /* ignore */ }
-                if (orgEnabled) {
-                    mcpTools = mcpTools.filter(t => {
-                        const serverId = t._mcp?.serverId;
-                        return !serverId || orgEnabled.includes(`mcp:${serverId}`);
-                    });
-                }
-                for (const tool of mcpTools) {
-                    if (!directChatTools.find(t => t.function.name === tool.function.name)) {
-                        directChatTools.push(tool);
-                    }
-                }
-                if (mcpTools.length > 0) console.log(`[DirectChat] 🔌 Loaded ${mcpTools.length} MCP tools`);
-            }
-        } catch (mcpErr) {
-            console.warn('[DirectChat] Failed to load MCP tools:', mcpErr.message);
-        }
+        // MCP-server tools are integrations now — getIntegrationTools() above
+        // already injected the entitled ones (gated by effective.integration).
 
         // ─── Built-in: set_reminder tool ────────────────────────────
         directChatTools.push({
@@ -744,7 +711,10 @@ router.post('/chat/direct/stream', requireAuth, async (req, res) => {
         // to (BFSF-207). This is the authoritative gate — if the tool isn't in
         // the toolset, the model cannot call it.
         const notebooksEnabled = (await configStore.getConfig('feature_notebooks_enabled')) !== false;
-        const canUseNotebooks = notebooksEnabled && await hasPermission(userId, 'use_notebooks', req.session);
+        const { hasCapability } = require('../../core/entitlements');
+        const canUseNotebooks = notebooksEnabled
+            && await hasCapability('notebooks', { userId, orgId: req.session?.user?.organizationId || req.session?.user?.orgId || null, session: req.session, req })
+            && await hasPermission(userId, 'use_notebooks', req.session);
         if (!userSimpleMode && canUseNotebooks) {
             for (const wsTool of WORKSPACE_TOOLS) {
                 if (!directChatTools.find(t => t.function.name === wsTool.function.name)) {
@@ -3356,7 +3326,11 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                     }
                     part.text += data.text;
                 }
-                send('thinking', { text: data.text, partId: data.partId });
+                // Restore PII tokens in the reasoning before it reaches the client —
+                // the thinking panel is user-visible, so placeholder tokens like
+                // [email_1] must be reversed just like content (BFSF-253). Accumulated
+                // part.text stays raw; the full text is restored again at persist time.
+                send('thinking', { text: _streamUntok.restore(data.text), partId: data.partId });
             } else if (type === 'thinking_signature') {
                 // Persisted server-side (for Claude replay), never sent to SSE.
                 if (data.partId && data.signature) {
@@ -3512,7 +3486,11 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                     }
                     part.text += data.text;
                 }
-                send('thinking', { text: data.text, partId: data.partId });
+                // Restore PII tokens in the reasoning before it reaches the client —
+                // the thinking panel is user-visible, so placeholder tokens like
+                // [email_1] must be reversed just like content (BFSF-253). Accumulated
+                // part.text stays raw; the full text is restored again at persist time.
+                send('thinking', { text: _streamUntok.restore(data.text), partId: data.partId });
             } else if (type === 'thinking_signature') {
                 if (data.partId && data.signature) {
                     const part = _getThinkingPart(data.partId);
@@ -3900,6 +3878,13 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                     send('workspace_update', { content: rendered });
                     notebookWriteCommitted = true;
                 }
+                // BFSF-208: write failed after partial content was live-streamed to the panel — roll back to last persisted content.
+                if (toolResult._nbWriteFailed && _nbStreamLastLen > 0) {
+                    const { restoreTokens } = require('../../core/piiDetection');
+                    const _convMapForWs = require('../../core/dlp/dlpRunner').getConversationTokenMap(convId);
+                    send('workspace_update', { content: restoreTokens(toolResult._revertContent || '', _convMapForWs) });
+                    _nbStreamLastLen = 0;
+                }
                 // Emit kb_sources SSE event
                 if (toolResult._action === 'kb_sources' && toolResult._sources?.length > 0) {
                     send('kb_sources', { sources: toolResult._sources });
@@ -4238,10 +4223,22 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
             // Prefer the structured thinking parts (with signatures + timing) over the flat string.
             // The flat string is kept as a fallback for providers that only emit `thinking` without
             // wrapping start/stop events.
+            // Restore PII tokens in persisted thinking (display-only — thinking is
+            // never replayed to the model, so this can't leak PII back to the LLM).
+            // Without it the saved chain-of-thought keeps raw placeholder tokens like
+            // [email_1] that resurface on reload (BFSF-253); mirrors the SSE restore.
+            let _restoreTHd = (s) => s;
+            try {
+                const { restoreTokens } = require('../../core/piiDetection');
+                const _convMapTHd = require('../../core/dlp/dlpRunner').getConversationTokenMap(convId);
+                if (_convMapTHd && Object.keys(_convMapTHd).length > 0) {
+                    _restoreTHd = (s) => (typeof s === 'string' ? restoreTokens(s, _convMapTHd) : s);
+                }
+            } catch (_) { /* render-layer best-effort */ }
             if (thinkingParts.length > 0) {
                 assistantSave.thinking = thinkingParts.map(p => ({
                     id: p.id,
-                    text: p.text,
+                    text: _restoreTHd(p.text),
                     startedAt: p.startedAt,
                     endedAt: p.endedAt || Date.now(),
                     redacted: p.redacted || undefined,
@@ -4249,7 +4246,7 @@ The Notebook panel is currently open. Current rules for edits: 1) Before noteboo
                     phase: p.phase || undefined,
                 }));
             } else if (thinkingContent) {
-                assistantSave.thinking = thinkingContent;
+                assistantSave.thinking = _restoreTHd(thinkingContent);
             }
             if (generatedImages.length > 0) {
                 // Strip base64 data from images for DB — keep only url/mimeType/storageKey

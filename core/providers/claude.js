@@ -10,6 +10,11 @@ const { downscaleClaudeMessages } = require("../imageDownscale");
 
 const DEFAULT_MAX_TOKENS = 8192;
 
+// Claude Code subscription (OAuth) tokens are only accepted by the Anthropic API
+// when the first system block is exactly this string. Injected in OAuth dev mode
+// (BEEFLOW_CLAUDE_CODE_OAUTH=1); see core/providers/claudeCodeAuth.js.
+const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
+
 /**
  * Drop orphan tool_use/tool_result blocks so Anthropic doesn't reject the
  * request. After compaction or aggressive history pruning, the message array
@@ -80,9 +85,53 @@ class ClaudeProvider extends BaseProvider {
 
     // ─── SDK Client ──────────────────────────────────────────────
 
-    createClient(apiKey) {
+    createClient(token, oauth = false) {
         const Anthropic = require('@anthropic-ai/sdk');
-        return new Anthropic({ apiKey });
+        if (oauth) {
+            // Subscription/OAuth token → Authorization: Bearer + the oauth beta
+            // header. apiKey:null stops the SDK falling back to ANTHROPIC_API_KEY
+            // from env and sending both headers (the API 401s when both are set).
+            return new Anthropic({
+                apiKey: null,
+                authToken: token,
+                defaultHeaders: { 'anthropic-beta': 'oauth-2025-04-20' },
+            });
+        }
+        return new Anthropic({ apiKey: token });
+    }
+
+    /**
+     * Resolve the credential + auth mode. In Claude Code OAuth dev mode
+     * (BEEFLOW_CLAUDE_CODE_OAUTH=1) the stored apiKey is ignored and a fresh
+     * subscription token is read/refreshed from ~/.claude/.credentials.json. A
+     * directly-pasted sk-ant-oat… token also flips to OAuth mode (no auto-refresh).
+     */
+    async _resolveAuth(apiKey) {
+        const ccoa = require('./claudeCodeAuth');
+        if (ccoa.isEnabled()) {
+            return { token: await ccoa.getAccessToken(), oauth: true };
+        }
+        if (typeof apiKey === 'string' && apiKey.startsWith('sk-ant-oat')) {
+            return { token: apiKey, oauth: true };
+        }
+        return { token: apiKey, oauth: false };
+    }
+
+    /**
+     * Prepend the Claude Code identity as the first system block (OAuth mode only).
+     * Existing system blocks — and their cache_control breakpoints — are preserved
+     * after it. Idempotent and safe when there is no system prompt yet.
+     */
+    _injectClaudeCodeIdentity(params) {
+        const idBlock = { type: 'text', text: CLAUDE_CODE_IDENTITY };
+        if (Array.isArray(params.system)) {
+            if (params.system[0] && params.system[0].text === CLAUDE_CODE_IDENTITY) return;
+            params.system = [idBlock, ...params.system];
+        } else if (typeof params.system === 'string' && params.system.length) {
+            params.system = [idBlock, { type: 'text', text: params.system }];
+        } else {
+            params.system = [idBlock];
+        }
     }
 
     // ─── Message Normalization ───────────────────────────────────
@@ -418,8 +467,16 @@ class ClaudeProvider extends BaseProvider {
             if (options.toolChoice === "any" || options.toolChoice === "required") {
                 params.tool_choice = { type: "any" };
             }
-            if (options.toolChoice && typeof options.toolChoice === "object" && options.toolChoice.name) {
-                params.tool_choice = { type: "tool", name: options.toolChoice.name };
+            if (options.toolChoice && typeof options.toolChoice === "object") {
+                // Force a single named tool. Accept BOTH the bare `{name}` form
+                // and the OpenAI wire shape `{type:'function',function:{name}}`
+                // that openai-style callers and llmClient.forcedToolChoice emit —
+                // Anthropic's SDK only understands `{type:'tool',name}`, so a
+                // caller passing the OpenAI shape previously fell through here and
+                // silently ran with tool_choice unset (auto), breaking every
+                // forced-structured-output call routed to a Claude model.
+                const forcedName = options.toolChoice.name || options.toolChoice.function?.name;
+                if (forcedName) params.tool_choice = { type: "tool", name: forcedName };
             }
         }
 
@@ -451,8 +508,10 @@ class ClaudeProvider extends BaseProvider {
      * baseUrl is accepted for interface compatibility but ignored — SDK handles it.
      */
     async chat(apiKey, baseUrl, model, messages, options = {}) {
-        const client = this.createClient(apiKey);
+        const { token, oauth } = await this._resolveAuth(apiKey);
+        const client = this.createClient(token, oauth);
         const params = this._buildSdkParams(model, messages, options);
+        if (oauth) this._injectClaudeCodeIdentity(params);
         await downscaleClaudeMessages(params.messages);
 
         console.log('[Claude] SDK chat for model:', model);
@@ -485,8 +544,10 @@ class ClaudeProvider extends BaseProvider {
      * baseUrl is accepted for interface compatibility but ignored.
      */
     async stream(apiKey, baseUrl, model, messages, options = {}, onEvent) {
-        const client = this.createClient(apiKey);
+        const { token, oauth } = await this._resolveAuth(apiKey);
+        const client = this.createClient(token, oauth);
         const params = this._buildSdkParams(model, messages, options);
+        if (oauth) this._injectClaudeCodeIdentity(params);
         await downscaleClaudeMessages(params.messages);
 
         console.log('[Claude] SDK streaming for model:', model);
@@ -670,7 +731,8 @@ class ClaudeProvider extends BaseProvider {
      */
     async listModels(apiKey, baseUrl) {
         try {
-            const client = this.createClient(apiKey);
+            const { token, oauth } = await this._resolveAuth(apiKey);
+            const client = this.createClient(token, oauth);
             const response = await client.models.list();
             return (response.data || []).map(m => ({ id: m.id, name: m.display_name || m.id }));
         } catch (e) {

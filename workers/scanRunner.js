@@ -20,9 +20,6 @@
  * socket is not reachable the scan hard-errors.
  */
 
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
 const crypto = require('crypto');
 
 const securityScanStore = require('../stores/securityScanStore');
@@ -55,151 +52,104 @@ async function resolveExecMode() {
     return dockerOk ? 'container' : 'error';
 }
 
-// Base dir for the per-engine sub-workdirs. When the worker is containerized the
-// bind path must be valid on the HOST, so we use a workdir that compose mounts
-// at an identical path on both sides. Native workers just use os.tmpdir().
-function runnerWorkdirBase() {
-    if (scanRunner.isServerInContainer && scanRunner.isServerInContainer()) {
-        return process.env.SECURITY_SCANNER_WORKDIR || '/var/lib/beeflow/scan';
-    }
-    return process.env.SECURITY_SCANNER_WORKDIR || os.tmpdir();
-}
-
 function isHardFailed(ageMs) {
     return ageMs > HARD_FAIL_DAYS * 86_400_000;
 }
 
-// Stable, filesystem-safe slug for an engine descriptor so each engine gets its
-// own sub-workdir (zap-baseline / zap-full / nuclei / testssl).
-function engineSlug(descriptor, idx) {
-    const parts = [descriptor.engine];
-    if (descriptor.engine === 'zap' && descriptor.intensity) parts.push(descriptor.intensity);
-    const slug = parts.join('-').replace(/[^a-zA-Z0-9_-]/g, '');
-    return `${idx}-${slug || 'engine'}`;
-}
-
-// ── Scan execution ─────────────────────────────────────────────────
-
-/**
- * Run every selected engine in its own container + sub-workdir, read each
- * engine's report.json (tolerating a missing/corrupt file from an OOM, timeout
- * or crash), and return the raw per-engine reports keyed by engine name. The
- * worker hands these to the report builder for normalization/aggregation.
- */
-async function runEngines({ scanId, engines, targetUrl, tmpRoot }) {
-    const rawReports = []; // { engine, json|null, exitCode, timedOut }
-    let cancelled = false;
-
-    for (let i = 0; i < engines.length; i++) {
-        const descriptor = engines[i];
-        // Bail out of the remaining engines if the user cancelled mid-scan.
-        // isCancelRequested is synchronous (in-memory Set) — no .catch().
-        if (securityScanStore.isCancelRequested(scanId)) {
-            cancelled = true;
-            break;
-        }
-
-        const subWorkdir = path.join(tmpRoot, engineSlug(descriptor, i));
-        await fs.promises.mkdir(subWorkdir, { recursive: true }).catch(() => {});
-        // The API/worker runs as root but the scanner images run as a non-root
-        // user (e.g. ZAP = uid 1000). The engine bind-mounts this dir at its
-        // report path and must be able to WRITE report.json + its own working
-        // files there, so open the mounted dir up to the container's user.
-        await fs.promises.chmod(subWorkdir, 0o777).catch(() => {});
-
-        await securityScanStore.appendProgress(scanId, `[scan] starting engine ${descriptor.engine}${descriptor.intensity ? ` (${descriptor.intensity})` : ''}`).catch(() => {});
-
-        let result;
-        try {
-            result = await scanRunner.runEngineContainer({
-                scanId,
-                engine: descriptor.engine,
-                intensity: descriptor.intensity || null,
-                workdir: subWorkdir,
-                targetUrl,
-                onLine: (line) => securityScanStore.appendProgress(scanId, line).catch(() => {}),
-                timeoutMs: ENGINE_TIMEOUT_MS,
-            });
-        } catch (e) {
-            // A failed engine doesn't sink the whole scan — record it and carry
-            // on so the other engines still produce findings.
-            await securityScanStore.appendProgress(scanId, `[scan] engine ${descriptor.engine} failed: ${e.message}`).catch(() => {});
-            rawReports.push({ engine: descriptor.engine, json: null, exitCode: 1, timedOut: false, error: e.message });
-            continue;
-        }
-
-        // Every engine in the contract writes its report to <workdir>/report.json.
-        let json = null;
-        try {
-            json = JSON.parse(await fs.promises.readFile(path.join(subWorkdir, 'report.json'), 'utf-8'));
-        } catch (_) { /* OOM / timeout / crash / no findings — no report */ }
-
-        if (result.timedOut) {
-            await securityScanStore.appendProgress(scanId, `[scan] engine ${descriptor.engine} exceeded ${ENGINE_TIMEOUT_MS}ms and was stopped`).catch(() => {});
-        }
-        rawReports.push({ engine: descriptor.engine, json, exitCode: result.exitCode, timedOut: result.timedOut });
-    }
-
-    return { rawReports, cancelled };
-}
-
 // ── Agent mode ─────────────────────────────────────────────────────
 //
-// AI-driven scan: Claude drives a long-lived ZAP daemon (REST API) + a
-// free-form tools sandbox step-by-step, streaming each action/scanstat/terminal
-// event live. The daemon + sandbox carry this scan's bf.scanId label, so the
-// cancel poll's killScan() and the reaper tear them down too; we also cleanup()
-// explicitly in finally. Returns the same outcome shape as quick mode.
-async function runAgentMode({ scanId, targetUrl, engines, userId, organizationId, tmpRoot, startedAt }) {
+// AI-driven scan: Claude drives ONE container (the Kali toolbox) that holds the
+// full arsenal AND runs the ZAP daemon inside itself. The agent steps through
+// the scan live, streaming each action/scanstat/terminal event. The toolbox
+// carries this scan's bf.scanId label, so the cancel poll's killScan() and the
+// reaper tear it down too; we also cleanup() explicitly in finally.
+
+// Shell-quote a value for safe interpolation into a single in-container command.
+function shQuote(v) {
+    return `'${String(v).replace(/'/g, `'\\''`)}'`;
+}
+
+async function runAgentMode({ scanId, targetUrl, engines, userId, organizationId, modelTier, aggression, maxSteps, prewarmId }) {
     const securityScanDriver = require('../services/securityScanDriver');
     const onLine = (line) => securityScanStore.appendProgress(scanId, line).catch(() => {});
-    let daemon = null;
-    let sandbox = null;
+    let toolbox = null;
     try {
-        await securityScanStore.appendProgress(scanId, '[scan] starting ZAP daemon (this can take ~30s)…').catch(() => {});
-        daemon = await scanRunner.startZapDaemon({ scanId, onLine });
-        await securityScanStore.appendProgress(scanId, '[scan] starting tools sandbox…').catch(() => {});
-        sandbox = await scanRunner.startToolsSandbox({ scanId, onLine });
+        // Adopt the pre-warmed toolbox if the dialog warmed one and it's still in
+        // the in-process registry; otherwise cold-start.
+        if (prewarmId) {
+            toolbox = await scanRunner.adoptToolbox(prewarmId);
+            if (toolbox) await securityScanStore.appendProgress(scanId, '[scan] using pre-warmed toolbox + ZAP daemon').catch(() => {});
+        }
+        if (!toolbox) {
+            await securityScanStore.appendProgress(scanId, '[scan] starting toolbox container + ZAP daemon (this can take ~60s)…').catch(() => {});
+            toolbox = await scanRunner.startAgentToolbox({ scanId, onLine });
+        }
+        scanRunner.registerActiveToolbox(scanId, toolbox);
 
-        // Adapter the driver calls for its nuclei_run / testssl_run tools. opts
-        // is ignored for these engines (no intensity); the engine writes its
-        // report into a per-engine sub-workdir (chmod 0777 so the non-root
-        // scanner image can write it) which we read back.
-        const runEngine = async (engine /*, opts */) => {
-            const sub = path.join(tmpRoot, `agent-${engine}`);
-            await fs.promises.mkdir(sub, { recursive: true }).catch(() => {});
-            await fs.promises.chmod(sub, 0o777).catch(() => {});
-            const r = await scanRunner.runEngineContainer({
-                scanId, engine, intensity: null, workdir: sub, targetUrl,
-                onLine,
-                timeoutMs: ENGINE_TIMEOUT_MS,
+        // Capture full stdout from an in-container command (for reading reports).
+        const capture = async (command, timeoutMs) => {
+            let out = '';
+            const r = await toolbox.exec(command, {
+                onChunk: (c) => { if (c?.stream === 'stdout' && out.length < 4_000_000) out += String(c.chunk); },
+                timeoutMs,
             });
+            return { out, exitCode: r.exitCode, timedOut: r.timedOut };
+        };
+
+        // Adapter the driver calls for its nuclei_run / testssl_run convenience
+        // tools. The binaries are baked into the toolbox, so we run them via
+        // in-container exec (writing JSON into the workdir) and read it back —
+        // no throwaway containers, no bind mounts.
+        const runEngine = async (engine, opts = {}) => {
+            const outFile = `/home/scanner/work/agent-${engine}.json`;
+            let cmd;
+            if (engine === 'nuclei') {
+                const tags = opts.tags ? ` -tags ${shQuote(opts.tags)}` : '';
+                const templates = opts.templates ? ` -t ${shQuote(opts.templates)}` : '';
+                cmd = `nuclei -u ${shQuote(targetUrl)} -je ${outFile} -silent${tags}${templates}`;
+            } else if (engine === 'testssl') {
+                cmd = `testssl.sh --jsonfile ${outFile} --quiet ${shQuote(targetUrl)}`;
+            } else {
+                return { json: null, exitCode: 1, timedOut: false };
+            }
+            const r = await toolbox.exec(`rm -f ${outFile}; ${cmd}`, { onChunk: onLine ? (c) => {} : undefined, timeoutMs: ENGINE_TIMEOUT_MS });
+            const read = await capture(`cat ${outFile} 2>/dev/null || true`, 30000);
             let json = null;
-            try { json = JSON.parse(await fs.promises.readFile(path.join(sub, 'report.json'), 'utf-8')); } catch (_) { /* missing/corrupt */ }
+            try { json = JSON.parse(read.out); } catch (_) { /* missing/corrupt/no findings */ }
             return { json, exitCode: r.exitCode, timedOut: r.timedOut };
         };
 
         return await securityScanDriver.runAgentScan({
             scanId, targetUrl, engines, userId, organizationId,
-            maxSteps: null,
-            zap: { baseUrl: daemon.baseUrl, apiKey: daemon.apiKey },
-            terminal: { exec: sandbox.exec },
+            modelTier, aggression, maxSteps,
+            zap: toolbox.zap,
+            terminal: { exec: toolbox.exec },
             // NOTE: do NOT pass onLine here — the driver's log() already writes
             // every line to the store via appendProgress; passing appendProgress
             // again as onLine would double every line in the progress stream.
             runEngine,
         });
     } finally {
-        if (daemon) { try { await daemon.cleanup(); } catch (_) {} }
-        if (sandbox) { try { await sandbox.cleanup(); } catch (_) {} }
+        scanRunner.unregisterActiveToolbox(scanId);
+        if (toolbox) { try { await toolbox.cleanup(); } catch (_) {} }
     }
 }
 
 // ── Drain loop ────────────────────────────────────────────────────
 
 async function processScan(claim) {
-    const { scan_id: scanId, user_id: userId, organization_id: organizationId, target_url: targetUrl, engines: rawEngines, metadata: rawMetadata, mode: rawMode } = claim;
-    const mode = rawMode === 'agent' ? 'agent' : 'quick';
+    const { scan_id: scanId, user_id: userId, organization_id: organizationId, target_url: targetUrl, engines: rawEngines, metadata: rawMetadata, model_tier: rawModelTier, aggression: rawAggression } = claim;
+    // Every scan is AI-agent driven now.
+    const modelTier = rawModelTier || null;
+    const aggression = rawAggression || null;
+    // Optional autonomy/step budget + pre-warmed toolbox handle from metadata.
+    let stepBudget = null;
+    let prewarmId = null;
+    try {
+        const md = typeof rawMetadata === 'string' ? JSON.parse(rawMetadata) : (rawMetadata || null);
+        if (md && Number.isFinite(Number(md.stepBudget))) stepBudget = Number(md.stepBudget);
+        if (md && typeof md.prewarmId === 'string') prewarmId = md.prewarmId;
+    } catch (_) { /* metadata optional */ }
 
     // Re-check the SSRF guard at claim time — the row may have sat queued long
     // enough for DNS to start resolving to a private address, and the guard is
@@ -235,13 +185,8 @@ async function processScan(claim) {
 
     await securityScanStore.markRunning(scanId);
 
-    const startedAt = new Date().toISOString();
-    const base = runnerWorkdirBase();
-    await fs.promises.mkdir(base, { recursive: true }).catch(() => {});
-    const tmpRoot = await fs.promises.mkdtemp(path.join(base, 'bf-scan-'));
-
-    // Poll for cancellation and kill any in-flight engine container. runEngines
-    // also checks the flag between engines so we stop launching new ones.
+    // Poll for cancellation and tear down the toolbox container if the user
+    // cancels mid-scan (killScan removes every container with this bf.scanId).
     const cancelPoll = setInterval(() => {
         if (securityScanStore.isCancelRequested) {
             Promise.resolve(securityScanStore.isCancelRequested(scanId))
@@ -253,71 +198,14 @@ async function processScan(claim) {
 
     let outcome;
     try {
-      if (mode === 'agent') {
-        outcome = await runAgentMode({ scanId, targetUrl, engines, userId, organizationId, tmpRoot, startedAt });
-      } else {
-        const { rawReports, cancelled } = await runEngines({ scanId, engines, targetUrl, tmpRoot });
-
-        if (cancelled) {
-            outcome = { status: 'cancelled', error: 'cancelled' };
-        } else {
-            // Normalize each engine's raw report, aggregate into a single findings
-            // set + severity summary, render the report page, and host it.
-            const reportBuilder = require('../services/securityReportBuilder');
-
-            const findingArrays = [];
-            for (const r of rawReports) {
-                if (!r.json) continue;
-                try {
-                    if (r.engine === 'zap') findingArrays.push(reportBuilder.normalizeZap(r.json));
-                    else if (r.engine === 'nuclei') findingArrays.push(reportBuilder.normalizeNuclei(r.json));
-                    else if (r.engine === 'testssl') findingArrays.push(reportBuilder.normalizeTestssl(r.json));
-                } catch (e) {
-                    await securityScanStore.appendProgress(scanId, `[scan] could not parse ${r.engine} report: ${e.message}`).catch(() => {});
-                }
-            }
-
-            const { findings, severitySummary } = reportBuilder.aggregate(findingArrays);
-            const finishedAt = new Date().toISOString();
-
-            const { html, css } = reportBuilder.renderReportHtml({
-                targetUrl,
-                engines,
-                findings,
-                severitySummary,
-                startedAt,
-                finishedAt,
-            });
-
-            // Persist the rendered report as a hosted webpage. Best-effort: a
-            // storage hiccup shouldn't sink an otherwise-complete scan, so we
-            // still finish with the structured findings even if hosting fails.
-            let reportWebpageId = null;
-            try {
-                reportWebpageId = await reportBuilder.persistReportWebpage({ userId, targetUrl, html, css });
-            } catch (e) {
-                await securityScanStore.appendProgress(scanId, `[scan] report page could not be hosted: ${e.message}`).catch(() => {});
-            }
-
-            const reportJson = {
-                targetUrl,
-                engines,
-                startedAt,
-                finishedAt,
-                severitySummary,
-                findings,
-            };
-
-            outcome = { status: 'completed', reportJson, reportWebpageId, severitySummary };
-        }
-      }
+        outcome = await runAgentMode({
+            scanId, targetUrl, engines, userId, organizationId,
+            modelTier, aggression, maxSteps: stepBudget, prewarmId,
+        });
     } catch (e) {
         outcome = { status: 'error', error: `worker_exception: ${e.message}` };
     } finally {
         clearInterval(cancelPoll);
-        // Clean up the workdir tree best-effort. Reports have already been read
-        // back into memory by this point; we still don't want disk to grow.
-        fs.promises.rm(tmpRoot, { recursive: true, force: true }).catch(() => {});
     }
 
     if (outcome.status === 'cancelled') {
@@ -394,5 +282,5 @@ module.exports = {
     reapRunners,
     isPrivateTarget,
     // exported for tests
-    _internals: { runEngines, engineSlug, resolveExecMode, runnerWorkdirBase, processScan },
+    _internals: { resolveExecMode, processScan, shQuote },
 };

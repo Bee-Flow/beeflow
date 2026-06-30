@@ -38,8 +38,7 @@ const PROPOSE_WEBPAGE_PLAN_TOOL = {
                         properties: {
                             file: {
                                 type: 'string',
-                                enum: ['html', 'css', 'js'],
-                                description: 'Which slot this step touches.',
+                                description: 'The file this step touches: "html", "css" or "js" for the three primary slots, OR an extra file path like "src/App.jsx", "src/components/Header.jsx", or "modules/state.js".',
                             },
                             action: {
                                 type: 'string',
@@ -73,6 +72,18 @@ const PROPOSE_WEBPAGE_PLAN_TOOL = {
  * The plan id is generated server-side so it's stable across the round-trip
  * and the frontend can use it as a React key + the approval payload key.
  */
+/**
+ * Normalise a plan step's `file`. Keeps the three primary slots verbatim and
+ * passes any other value through as a literal extra-file path (trimmed, capped),
+ * so react/multi-file plans like "src/App.jsx" survive instead of collapsing to
+ * "html". Falls back to "html" only when nothing usable was provided.
+ */
+function sanitizePlanFile(file) {
+    if (file === 'html' || file === 'css' || file === 'js') return file;
+    const p = String(file || '').trim().replace(/^\/+/, '').slice(0, 240);
+    return p || 'html';
+}
+
 function executeProposeWebpagePlan(args) {
     const title = String(args?.title || '').trim().slice(0, 200);
     const summary = String(args?.summary || '').trim().slice(0, 1000);
@@ -89,7 +100,7 @@ function executeProposeWebpagePlan(args) {
         if (action === 'partial_edit') action = 'edit';
         if (!['edit', 'create', 'rewrite'].includes(action)) action = 'edit';
         return {
-            file: s?.file === 'html' || s?.file === 'css' || s?.file === 'js' ? s.file : 'html',
+            file: sanitizePlanFile(s?.file),
             action,
             why: String(s?.why || '').trim().slice(0, 400),
             preview: s?.preview ? String(s.preview).slice(0, 400) : undefined,

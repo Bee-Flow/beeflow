@@ -13,9 +13,13 @@
 const crypto = require('crypto');
 const automationStore = require('../stores/automationStore');
 const { summariseDefinition } = require('./summarise');
-const { validateDefinition } = require('./validate');
+const { validateDefinition, collectCallLayerSteps } = require('./validate');
 const { getDeliverableEvents } = require('./deliverableEvents');
 const { isSideEffect } = require('./sideEffectMap');
+
+// §WS5 — trigger catalog data + tool schemas live in ./builderTools/.
+const { TRIGGER_FIELDS_BY_EVENT, triggerFieldsFor, TRIGGER_OUTPUT_SAMPLES, buildTriggerOutputsCatalog } = require('./builderTools/triggerCatalog');
+const { TOOL_SCHEMAS } = require('./builderTools/schemas');
 
 function newId(prefix = 's') { return `${prefix}_${crypto.randomBytes(3).toString('hex')}`; }
 
@@ -116,326 +120,6 @@ const VALID_REF_ROOTS = new Set(['trigger', 'steps', 'vars', 'secrets', 'loop'])
 // Trigger output fields the LLM commonly mis-roots — when a ref path is bare
 // ("from", "subject", …) we can confidently prepend `trigger.output.` instead
 // of bouncing the call back to the model. Keyed by `<provider>.<event>`.
-const TRIGGER_FIELDS_BY_EVENT = {
-    'gmail.mail.new':                 ['messageId', 'threadId', 'from', 'to', 'cc', 'subject', 'snippet', 'labelIds', 'date', 'sizeEstimate', 'historyId'],
-    'gmail.label.added':              ['messageId', 'threadId', 'addedLabelIds', 'from', 'to', 'subject', 'snippet', 'labelIds', 'date'],
-    'google-calendar.event.changed':  ['eventId', 'summary', 'description', 'start', 'end', 'status', 'calendarId', 'organizer', 'attendees', 'htmlLink'],
-    'google-calendar.event.upcoming': ['eventId', 'summary', 'description', 'start', 'end', 'status', 'calendarId', 'organizer', 'attendees', 'htmlLink', 'minutesUntilStart'],
-    'google-drive.file.new':          ['fileId', 'name', 'mimeType', 'parents', 'createdTime', 'owners', 'webViewLink'],
-    'nextcloud.file.new':             ['activityId', 'path', 'name', 'extension', 'kind', 'actor', 'datetime', 'link'],
-    'nextcloud.file.changed':         ['activityId', 'path', 'name', 'extension', 'kind', 'actor', 'datetime', 'link'],
-    'nextcloud.file.deleted':         ['activityId', 'path', 'name', 'extension', 'kind', 'actor', 'datetime', 'link'],
-    'nextcloud.file.renamed':         ['activityId', 'path', 'oldPath', 'name', 'extension', 'kind', 'actor', 'datetime', 'link'],
-    'nextcloud.share.received':       ['activityId', 'path', 'name', 'kind', 'actor', 'datetime', 'link'],
-    'nextcloud.share.created':        ['shareId', 'shareType', 'path', 'name', 'kind', 'actor', 'datetime', 'link'],
-    'nextcloud.activity.new':         ['activityId', 'type', 'subject', 'message', 'actor', 'objectName', 'link', 'datetime'],
-    'nextcloud.notification.new':     ['notificationId', 'app', 'subject', 'message', 'link', 'datetime'],
-    // Calendar (calendar.event.upcoming is poller-backed; shapes mirror the
-    // triggerBus poller emit, not Google's). Other calendar.event.* are push-only.
-    'nextcloud.calendar.event.upcoming': ['uid', 'calendarId', 'summary', 'startsAt', 'endsAt', 'location', 'attendees', 'minutesUntilStart', 'actor', 'datetime'],
-    'nextcloud.calendar.event.created':  ['uid', 'calendarId', 'summary', 'startsAt', 'endsAt', 'location', 'actor', 'datetime'],
-    'nextcloud.calendar.event.changed':  ['uid', 'calendarId', 'summary', 'startsAt', 'endsAt', 'location', 'actor', 'datetime'],
-    // Deck — push-only (connector); fields mirror the connector normalisePayload
-    // so the variable picker shows real binding paths before validation lands.
-    'nextcloud.deck.card.created':    ['cardId', 'boardId', 'stackId', 'title', 'description', 'actor', 'datetime'],
-    'nextcloud.deck.card.changed':    ['cardId', 'boardId', 'stackId', 'title', 'archived', 'actor', 'datetime'],
-    'nextcloud.deck.card.moved':      ['cardId', 'boardId', 'stackId', 'fromStackId', 'toStackId', 'title', 'actor', 'datetime'],
-    'nextcloud.deck.card.completed':  ['cardId', 'boardId', 'stackId', 'title', 'archived', 'actor', 'datetime'],
-    // Talk — push-only (connector).
-    'nextcloud.talk.message.received':['messageId', 'roomToken', 'roomName', 'actor', 'message', 'datetime'],
-    'ticket-assistant.ticket.new':    ['ticketId', 'connectionId', 'provider', 'subject', 'body', 'status', 'status_bucket', 'priority', 'category', 'sourceUri', 'attachments', 'ingestedAt'],
-    'ticket-assistant.sync.completed':['connectionId', 'provider', 'outcome', 'stats'],
-};
-
-function triggerFieldsFor(draft) {
-    const t = draft?.trigger;
-    if (!t || t.kind !== 'app_event') return [];
-    const key = `${t.appEvent?.provider}.${t.appEvent?.event}`;
-    return TRIGGER_FIELDS_BY_EVENT[key] || [];
-}
-
-/**
- * Realistic sample values for each trigger output field — used by the
- * client-side VariableTree to show "what does this field actually look
- * like" without needing a dry-run. Keyed by `<provider>.<event>` and
- * mirrors TRIGGER_FIELDS_BY_EVENT.
- *
- * For non-app_event triggers (manual, schedule, webhook) the trigger's
- * own runtime payload is mostly empty (manual/schedule) or user-supplied
- * (webhook body) — we expose a tiny `now` field instead so binding to a
- * schedule trigger has at least one meaningful path.
- */
-const TRIGGER_OUTPUT_SAMPLES = {
-    'gmail.mail.new': {
-        messageId: 'msg-abc123',
-        threadId: 'th-abc123',
-        from: 'alice@example.com',
-        to: 'me@example.com',
-        cc: '',
-        subject: 'Project update — Q2',
-        snippet: 'Hi, attached is the latest deck for the kickoff…',
-        labelIds: ['INBOX', 'UNREAD'],
-        date: 'Wed, 13 May 2026 09:15:00 +0200',
-        sizeEstimate: 12345,
-        historyId: '987654',
-    },
-    'gmail.label.added': {
-        messageId: 'msg-abc123',
-        threadId: 'th-abc123',
-        addedLabelIds: ['Label_3'],
-        from: 'alice@example.com',
-        to: 'me@example.com',
-        subject: 'Project update — Q2',
-        snippet: 'Hi, attached is the latest deck…',
-        labelIds: ['INBOX', 'Label_3'],
-        date: 'Wed, 13 May 2026 09:15:00 +0200',
-    },
-    'google-calendar.event.changed': {
-        eventId: 'evt-abc',
-        summary: 'Team standup',
-        description: 'Daily sync',
-        start: '2026-05-13T09:00:00+02:00',
-        end: '2026-05-13T09:30:00+02:00',
-        status: 'confirmed',
-        calendarId: 'primary',
-        organizer: { email: 'me@example.com', displayName: 'Me' },
-        attendees: [{ email: 'alice@example.com', responseStatus: 'accepted' }],
-        htmlLink: 'https://calendar.google.com/event?eid=…',
-    },
-    'google-calendar.event.upcoming': {
-        eventId: 'evt-abc',
-        summary: 'Team standup',
-        description: 'Daily sync',
-        start: '2026-05-13T09:00:00+02:00',
-        end: '2026-05-13T09:30:00+02:00',
-        status: 'confirmed',
-        calendarId: 'primary',
-        organizer: { email: 'me@example.com', displayName: 'Me' },
-        attendees: [{ email: 'alice@example.com', responseStatus: 'accepted' }],
-        htmlLink: 'https://calendar.google.com/event?eid=…',
-        minutesUntilStart: 15,
-    },
-    'google-drive.file.new': {
-        fileId: 'file-xyz',
-        name: 'Invoice-2026-001.pdf',
-        mimeType: 'application/pdf',
-        parents: ['folder-abc'],
-        createdTime: '2026-05-13T09:15:00Z',
-        owners: [{ emailAddress: 'me@example.com', displayName: 'Me' }],
-        webViewLink: 'https://drive.google.com/file/d/file-xyz',
-    },
-    'nextcloud.file.new': {
-        activityId: 12345,
-        path: '/Documents/Invoices/Invoice-2026-001.pdf',
-        name: 'Invoice-2026-001.pdf',
-        extension: 'pdf',
-        kind: 'file',
-        actor: 'alice',
-        datetime: '2026-05-13T09:15:00Z',
-        link: 'https://cloud.example.com/f/12345',
-    },
-    'nextcloud.file.changed': {
-        activityId: 12346,
-        path: '/Documents/Invoices/Invoice-2026-001.pdf',
-        name: 'Invoice-2026-001.pdf',
-        extension: 'pdf',
-        kind: 'file',
-        actor: 'alice',
-        datetime: '2026-05-13T10:20:00Z',
-        link: 'https://cloud.example.com/f/12345',
-    },
-    'nextcloud.share.received': {
-        activityId: 12347,
-        path: '/Shared/Project.docx',
-        name: 'Project.docx',
-        kind: 'file',
-        actor: 'bob',
-        datetime: '2026-05-13T11:00:00Z',
-        link: 'https://cloud.example.com/f/22345',
-    },
-    'nextcloud.file.deleted': {
-        activityId: 12348,
-        path: '/Documents/Old/Draft.docx',
-        name: 'Draft.docx',
-        extension: 'docx',
-        kind: 'file',
-        actor: 'alice',
-        datetime: '2026-05-13T11:30:00Z',
-        link: 'https://cloud.example.com/f/12348',
-    },
-    'nextcloud.file.renamed': {
-        activityId: 12349,
-        path: '/Documents/Invoices/Invoice-2026-001.pdf',
-        oldPath: '/Documents/Invoices/draft.pdf',
-        name: 'Invoice-2026-001.pdf',
-        extension: 'pdf',
-        kind: 'file',
-        actor: 'alice',
-        datetime: '2026-05-13T11:45:00Z',
-        link: 'https://cloud.example.com/f/12345',
-    },
-    'nextcloud.share.created': {
-        shareId: 778,
-        shareType: 'link',
-        path: '/Shared/Report.pdf',
-        name: 'Report.pdf',
-        kind: 'file',
-        actor: 'alice',
-        datetime: '2026-05-13T13:00:00Z',
-        link: 'https://cloud.example.com/s/AbCdEf',
-    },
-    'nextcloud.calendar.event.upcoming': {
-        uid: 'evt-9f2a',
-        calendarId: 'personal',
-        summary: 'Kickoff with Nextcloud',
-        startsAt: '2026-05-13T15:00:00+02:00',
-        endsAt: '2026-05-13T15:30:00+02:00',
-        location: 'Online',
-        attendees: ['alice@example.com', 'bob@example.com'],
-        minutesUntilStart: 15,
-        actor: 'me',
-        datetime: '2026-05-13T14:45:00Z',
-    },
-    'nextcloud.calendar.event.created': {
-        uid: 'evt-9f2b',
-        calendarId: 'personal',
-        summary: 'Design review',
-        startsAt: '2026-05-14T10:00:00+02:00',
-        endsAt: '2026-05-14T11:00:00+02:00',
-        location: '',
-        actor: 'alice',
-        datetime: '2026-05-13T09:00:00Z',
-    },
-    'nextcloud.calendar.event.changed': {
-        uid: 'evt-9f2b',
-        calendarId: 'personal',
-        summary: 'Design review (moved)',
-        startsAt: '2026-05-14T11:00:00+02:00',
-        endsAt: '2026-05-14T12:00:00+02:00',
-        location: 'Room 2',
-        actor: 'alice',
-        datetime: '2026-05-13T09:30:00Z',
-    },
-    'nextcloud.deck.card.created': {
-        cardId: 4521,
-        boardId: 12,
-        stackId: 34,
-        title: 'Follow up with Nextcloud',
-        description: 'Prep the integration demo',
-        actor: 'alice',
-        datetime: '2026-05-13T09:20:00Z',
-    },
-    'nextcloud.deck.card.changed': {
-        cardId: 4521,
-        boardId: 12,
-        stackId: 34,
-        title: 'Follow up with Nextcloud',
-        archived: false,
-        actor: 'alice',
-        datetime: '2026-05-13T10:00:00Z',
-    },
-    'nextcloud.deck.card.moved': {
-        cardId: 4521,
-        boardId: 12,
-        stackId: 36,
-        fromStackId: 34,
-        toStackId: 36,
-        title: 'Follow up with Nextcloud',
-        actor: 'alice',
-        datetime: '2026-05-13T10:30:00Z',
-    },
-    'nextcloud.deck.card.completed': {
-        cardId: 4521,
-        boardId: 12,
-        stackId: 36,
-        title: 'Follow up with Nextcloud',
-        archived: true,
-        actor: 'alice',
-        datetime: '2026-05-13T11:00:00Z',
-    },
-    'nextcloud.talk.message.received': {
-        messageId: 88123,
-        roomToken: 'a1b2c3d4',
-        roomName: 'Demo team',
-        actor: 'alice',
-        message: 'Can someone post the latest invoice summary?',
-        datetime: '2026-05-13T12:30:00Z',
-    },
-    'nextcloud.activity.new': {
-        activityId: 12350,
-        type: 'file_created',
-        subject: 'alice created Invoice-2026-001.pdf',
-        message: '',
-        actor: 'alice',
-        objectName: 'Invoice-2026-001.pdf',
-        link: 'https://cloud.example.com/f/12345',
-        datetime: '2026-05-13T09:15:00Z',
-    },
-    'nextcloud.notification.new': {
-        notificationId: 9876,
-        app: 'comments',
-        subject: 'alice mentioned you',
-        message: '@me please take a look',
-        link: 'https://cloud.example.com/comment/9876',
-        datetime: '2026-05-13T12:00:00Z',
-    },
-    'ticket-assistant.ticket.new': {
-        ticketId: 'TKT-1024',
-        connectionId: 'conn-1',
-        provider: 'youtrack',
-        subject: 'Login fails after password reset',
-        body: 'Steps: 1. Reset password. 2. Try to log in. Result: 401.',
-        status: 'open',
-        status_bucket: 'open',
-        priority: 'high',
-        category: 'authentication',
-        sourceUri: 'https://youtrack.example.com/issue/TKT-1024',
-        attachments: [],
-        ingestedAt: '2026-05-13T08:00:00Z',
-    },
-    'ticket-assistant.sync.completed': {
-        connectionId: 'conn-1',
-        provider: 'youtrack',
-        outcome: 'success',
-        stats: { ingested: 12, updated: 3, skipped: 0 },
-    },
-};
-
-/**
- * Build a `<provider>.<event>` → { fields:[{key, sample}] } map for the
- * client catalog. Fields come from TRIGGER_FIELDS_BY_EVENT (the
- * authoritative list); samples come from TRIGGER_OUTPUT_SAMPLES so the
- * VariableTree can show a realistic placeholder next to each path.
- */
-function buildTriggerOutputsCatalog() {
-    const out = {};
-    for (const [key, fields] of Object.entries(TRIGGER_FIELDS_BY_EVENT)) {
-        const sample = TRIGGER_OUTPUT_SAMPLES[key] || {};
-        out[key] = {
-            fields: fields.map(f => ({ key: f, sample: sample[f] })),
-            sample,
-        };
-    }
-    // Non-app_event triggers expose minimal output. Manual/schedule fire
-    // with no user-supplied payload; `now` is always available via the
-    // runtime so it's worth surfacing as a bindable path.
-    out['__manual'] = { fields: [{ key: 'now', sample: new Date().toISOString() }], sample: { now: new Date().toISOString() } };
-    out['__schedule'] = { fields: [{ key: 'now', sample: new Date().toISOString() }], sample: { now: new Date().toISOString() } };
-    out['__webhook'] = { fields: [{ key: 'body', sample: { /* user-defined */ } }, { key: 'headers', sample: {} }], sample: { body: {}, headers: {} } };
-    return out;
-}
-
-/**
- * Inspect every binding inside a freshly-supplied `inputs` map (and any
- * `template` strings within them). Returns `{ inputs, error }`:
- *   - `inputs`: the canonicalised map, with safe auto-fixes applied
- *     (bare path "from" → "trigger.output.from" when the trigger exposes it,
- *     leading dots stripped).
- *   - `error`: a human-readable message for the LLM if any binding is still
- *     invalid after auto-fixes — caller should surface this as the tool
- *     result so the model corrects on its NEXT turn instead of running
- *     through a dry-run failure cycle.
- */
 function validateAndFixBindings(rawInputs, draft) {
     const fixed = canonicalizeInputs(rawInputs || {});
     const triggerFields = new Set(triggerFieldsFor(draft));
@@ -537,6 +221,38 @@ function validateAndFixBindings(rawInputs, draft) {
     };
 }
 
+/**
+ * Validate an optional per-step `forEach` spec. A leaf step (integration_action
+ * / ai_step / code / notification / set) can run once per item of an upstream
+ * array WITHOUT a wrapping `loop` container — the runner iterates the step and
+ * its body refers to the current item as `loop.<itemVar>`. The `overRef` is
+ * validated exactly like an input ref (root must be trigger/steps/vars/secrets/
+ * loop) so it self-repairs and errors consistently with everything else.
+ *
+ * Returns `{ forEach }` (forEach === undefined when `raw` is absent) or `{ error }`.
+ */
+function sanitizeForEach(raw, graph) {
+    if (raw === undefined || raw === null) return { forEach: undefined };
+    if (typeof raw !== 'object' || Array.isArray(raw)) {
+        return { error: 'forEach must be an object { overRef, itemVar, maxIterations? }, or omitted.' };
+    }
+    if (!raw.overRef || typeof raw.overRef !== 'string') {
+        return { error: 'forEach requires `overRef` — a ref to an upstream array, e.g. "steps.<id>.output.results".' };
+    }
+    const { inputs, error } = validateAndFixBindings({ overRef: { kind: 'ref', path: raw.overRef } }, graph);
+    if (error) return { error: `forEach.overRef: ${error}` };
+    const itemVar = (typeof raw.itemVar === 'string' && raw.itemVar.trim()) ? raw.itemVar.trim() : 'item';
+    const forEach = { overRef: inputs.overRef.path, itemVar };
+    if (raw.maxIterations !== undefined) {
+        const n = Number(raw.maxIterations);
+        if (!Number.isInteger(n) || n < 1 || n > 1000) {
+            return { error: 'forEach.maxIterations must be an integer between 1 and 1000.' };
+        }
+        forEach.maxIterations = n;
+    }
+    return { forEach };
+}
+
 function lastStepId(def) {
     if (def.steps.length === 0) return def.trigger.id;
     return def.steps[def.steps.length - 1].id;
@@ -551,580 +267,7 @@ function lastStepId(def) {
 //   { "kind": "ref",      "path":  "steps.s1.output.items[0].subject" }
 //   { "kind": "template", "value": "Found {{steps.s1.output.count}} items" }
 //   { "kind": "expr",     "value": "steps.s1.output.amount > 1000" }
-const BINDING_HINT = 'Each input value must be a binding: {"kind":"literal","value":...} OR {"kind":"ref","path":"steps.<id>.output.<field>"} OR {"kind":"template","value":"... {{steps.x.output.y}} ..."} OR {"kind":"expr","value":"<restricted-js>"}.';
-
-const TOOL_SCHEMAS = [
-    {
-        type: 'function',
-        function: {
-            name: 'builder_propose_trigger',
-            description: `Set or replace the automation trigger. ALWAYS call this first when starting a new draft.
-
-KIND OPTIONS:
-  - schedule     — fires on a cron timer (5-field cron, minute hour dom month dow).
-  - manual       — fires only when the user clicks "Run".
-  - webhook      — fires on inbound HTTPS POST to a signed URL.
-  - app_event    — fires when a connected service (Gmail / Calendar / Drive / Nextcloud) emits an event.
-
-SCHEDULE EXAMPLES:
-  - weekly Monday 9am Europe/Amsterdam → {kind:"schedule",cron:"0 9 * * 1",tz:"Europe/Amsterdam"}
-  - first Monday of the month at 9am  → {kind:"schedule",cron:"0 9 1-7 * 1",tz:"Europe/Amsterdam"}
-
-APP_EVENT TRIGGERS (pick the most specific; use filters to narrow):
-
-  ── Gmail ──
-  • mail.new — fires on every new email. Most-asked Gmail trigger.
-    Filters: from, to, cc, subjectContains, subjectRegex, labelIds[],
-             excludeLabelIds[], hasAttachment, excludeFromSelf, maxAgeMinutes.
-    Payload: {messageId, threadId, from, to, cc, subject, date, snippet,
-             labelIds, sizeEstimate, historyId}.
-    EXAMPLE — only emails from your boss:
-      {kind:"app_event",appProvider:"gmail",appEvent:"mail.new",
-       filter:{from:"boss@example.com",excludeFromSelf:true}}
-    **Replying**: when adding a gmail_compose step to reply, ALWAYS bind
-    replyToMessageId: trigger.output.messageId. Without it Gmail renders
-    the reply as a fresh standalone email instead of inline in the
-    original conversation — even if you also pass threadId.
-    NOTE — "in the last 24 hours" is NOT a filter for mail.new because it
-    fires on every newly-arrived message in real time. For "every morning
-    summarise yesterday's email", use a schedule trigger + a gmail_search
-    step with q:"newer_than:1d" instead.
-
-  • label.added — fires when a label is applied (manually or by a Gmail
-    filter rule). Useful for "when I label something 'urgent', do X".
-    Filters: labelId (REQUIRED), from, subjectContains, excludeLabelIds[].
-    Payload: {messageId, threadId, addedLabelIds, from, to, subject,
-             snippet, labelIds, date}.
-    EXAMPLE: {kind:"app_event",appProvider:"gmail",appEvent:"label.added",
-             filter:{labelId:"Label_3"}}
-
-  ── Google Calendar ──
-  • event.changed — fires when any event in the user's primary calendar
-    is created, updated, or cancelled.
-    Filters: calendarId, statusEquals ("confirmed"/"cancelled"),
-             attendeeEmailContains.
-    Payload: {eventId, summary, description, start, end, status,
-             calendarId, organizer, attendees, htmlLink}.
-
-  • event.upcoming — fires N minutes BEFORE an event starts. Best for
-    "remind me 15 min before any meeting" workflows.
-    Filters: leadMinutes (default 15), calendarId, includeAllDay (default
-             false), attendeeEmailContains.
-    Payload: same as event.changed plus {minutesUntilStart}.
-    EXAMPLE: {kind:"app_event",appProvider:"google-calendar",
-             appEvent:"event.upcoming",filter:{leadMinutes:15}}
-
-  ── Google Drive ──
-  • file.new — fires when a file is created (not modified) in the user's
-    Drive.
-    Filters: folderId, mimeType, nameContains, excludeOwnUploads.
-    Payload: {fileId, name, mimeType, parents, createdTime, owners,
-             webViewLink}.
-    EXAMPLE — PDFs landing in /Invoices folder:
-      {kind:"app_event",appProvider:"google-drive",appEvent:"file.new",
-       filter:{folderId:"<drive-folder-id>",mimeType:"application/pdf"}}
-
-  ── Nextcloud ──
-  Connector-bound users get sub-second push delivery via the Bee Flow
-  Nextcloud ExApp; everyone else falls back to 60s polling for the
-  events that have a poller (file.new, file.changed, share.received,
-  activity.new, notification.new). The other triggers below require the
-  connector — activate fails with an explanatory error otherwise.
-
-  ── Files ──
-  • file.new / file.changed / file.deleted / file.renamed
-    Filters: inFolder (path prefix), extension, nameContains,
-             excludeOwnUploads, any[]/none[]/expr/age (rich filter DSL).
-    Payload: {id, path, name, extension, kind, actor, datetime, link}.
-
-  • file.commented — fires when a comment is added to a file.
-    Filters: pathPrefix, actorEquals, messageContains.
-    Payload: {fileId, path, name, comment, actor, datetime}.
-
-  • file.tagged — fires when a system tag is added or removed from a file.
-    Filters: tagName, tagAction ("added"/"removed"), pathPrefix.
-    Payload: {fileId, path, tagName, tagAction, actor, datetime}.
-
-  ── Sharing ──
-  • share.created / share.received / share.accepted / share.deleted
-    Filters: actorEquals, nameContains, kindEquals ("file"/"folder"),
-             shareType ("link"/"user"/"group"/"federated").
-    Payload: {shareId, path, name, kind, shareType, actor, datetime, link}.
-
-  ── Calendar ──
-  • calendar.event.created / calendar.event.changed / calendar.event.deleted
-    Filters: calendarId, summaryContains, attendeeContains.
-    Payload: {uid, calendarId, summary, startsAt, endsAt, actor, datetime}.
-
-  • calendar.event.upcoming — schedule-driven (poll-only); fires N minutes
-    before an event starts.
-    Filters: leadMinutes (default 15), calendarId, summaryContains.
-
-  ── Deck (kanban) ──
-  • deck.card.created / deck.card.changed / deck.card.deleted
-    Filters: boardId, stackId, titleContains, archived (true/false).
-    Payload: {cardId, boardId, stackId, title, archived, actor, datetime}.
-
-  • deck.card.moved — fires when a card moves between stacks (a special
-    case of deck.card.changed).
-    Filters: boardId, fromStackId, toStackId.
-
-  • deck.card.completed — fires when "Done"/"Closed" stack receives a card
-    (heuristic: stack title matches /done|closed|complete/i).
-
-  ── Talk (chat) ──
-  • talk.message.received — fires for new chat messages.
-    Filters: roomToken, roomNameContains, actorEquals, messageContains,
-             excludeOwnMessages.
-    Payload: {messageId, roomToken, roomName, actor, message, datetime}.
-
-  • talk.mention.received — fires only when the message @-mentions the user.
-    Filters: roomToken, actorEquals.
-
-  ── Tasks ──
-  • task.created / task.completed / task.due
-    Filters: listId, titleContains, priorityEquals.
-    Payload: {taskId, listId, title, completed, priority, due, actor, datetime}.
-
-  ── Generic ──
-  • activity.new — power-user catch-all over the activity feed.
-    Filters: type, objectNameContains, actorEquals.
-
-  • notification.new — fires on Nextcloud system notifications.
-    Filters: app, subjectContains.
-    Payload: {notificationId, app, subject, message, link, datetime}.
-
-  • user.status.changed — fires on user status updates (online/away/dnd).
-    Filters: status ("online"/"away"/"dnd"/"invisible"), userIdEquals.
-
-  ── Ticket Assistant (ITIL ticket sync — gmail/outlook/jira/servicenow/
-                       zendesk/freshservice/topdesk) ──
-  • ticket.new — fires when the Ticket Assistant ingests a new email or
-    ticket. Org-scoped: every user in the org sees events for any of the
-    org's connections. Pair with the ticket_assistant_* tools to rebuild
-    or extend the standalone TA pipeline (clean → redact → summarise →
-    classify) inside a routine.
-    Filters: connectionId, provider ("gmail"/"outlook"/"jira"/"zendesk"/…),
-             subjectContains, bodyContains, categoryEquals (post-AI),
-             priorityEquals, statusEquals.
-    Payload: {ticketId, connectionId, provider, subject, body, status,
-             status_bucket, priority, category, sourceUri, attachments,
-             ingestedAt}.
-    EXAMPLE — high-priority Jira tickets only:
-      {kind:"app_event",appProvider:"ticket-assistant",
-       appEvent:"ticket.new",filter:{provider:"jira",priorityEquals:"high"}}
-
-  • sync.completed — fires when a TA connection's sync run finishes.
-    Filters: connectionId, provider, outcomeEquals ("success"/"error"/
-             "partial").
-    Payload: {connectionId, provider, outcome, stats}.
-
-GENERAL: bind the trigger payload via trigger.output.<field>. DO NOT add a
-leading search step just to look up data that's already in the payload.`,
-            parameters: {
-                type: 'object',
-                properties: {
-                    kind: { type: 'string', enum: ['schedule', 'manual', 'webhook', 'app_event', 'agent_call'] },
-                    cron: { type: 'string', description: 'Standard 5-field cron, REQUIRED when kind=schedule. Use exact format: minute hour day-of-month month day-of-week. Example: "0 9 * * 1" = every Monday at 9:00.' },
-                    tz: { type: 'string', description: 'IANA timezone, e.g. Europe/Amsterdam (when kind=schedule).' },
-                    appProvider: { type: 'string', description: 'Provider id (when kind=app_event): gmail | google-calendar | google-drive | nextcloud | ticket-assistant' },
-                    appEvent: { type: 'string', description: 'Event name (when kind=app_event). Allowed: gmail.{mail.new, label.added}; google-calendar.{event.changed, event.upcoming}; google-drive.file.new; nextcloud.{file.new, file.changed, file.deleted, file.renamed, file.commented, file.tagged, share.created, share.received, share.accepted, share.deleted, calendar.event.created, calendar.event.changed, calendar.event.deleted, calendar.event.upcoming, deck.card.created, deck.card.changed, deck.card.deleted, deck.card.moved, deck.card.completed, talk.message.received, talk.mention.received, task.created, task.completed, task.due, activity.new, notification.new, user.status.changed}; ticket-assistant.{ticket.new, sync.completed}.' },
-                    filter: { type: 'object', description: 'Optional filter object that must shallowly match the event payload.' },
-                    // §28 agent-callable trigger: routine is exposed as a tool the agent / direct chat can invoke.
-                    toolName: { type: 'string', description: 'When kind=agent_call: the tool name agents will see (sanitised to [a-z0-9_]). Defaults to automation_<id>.' },
-                    parametersSchema: { type: 'object', description: 'When kind=agent_call: JSON-schema-shaped input declaration for the tool. The runtime exposes this verbatim to the model.' },
-                },
-                required: ['kind'],
-            },
-        },
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'builder_add_action',
-            description: `Append an integration action that calls a real connected tool. The tool name MUST match the catalog exactly. ${BINDING_HINT} EXAMPLE — search Gmail for unread invoices: {tool:"gmail_search",inputs:{query:{kind:"literal",value:"label:Invoices is:unread"},maxResults:{kind:"literal",value:20}},label:"Find invoices"}. EXAMPLE — read a specific email: {tool:"gmail_read",inputs:{messageId:{kind:"ref",path:"loop.email.id"}}}. NEVER pass plain strings as input values; ALWAYS wrap in {kind,...}.`,
-            parameters: {
-                type: 'object',
-                properties: {
-                    afterStepId: { type: 'string', description: 'Insert after this step id. Default: last step.' },
-                    tool: { type: 'string', description: 'Exact tool name from the catalog (e.g. gmail_search, gmail_compose, calendar_create_event).' },
-                    inputs: { type: 'object', description: `Map of input-name to a binding object. ${BINDING_HINT}` },
-                    branch: { type: 'string', enum: ['then', 'else'], description: 'When afterStepId is a condition: which branch this step begins. Omit to auto-fill (then first, else second).' },
-                    caseName: { type: 'string', description: 'When afterStepId is a switch: the case name (or "default") this step begins.' },
-                    label: { type: 'string', description: 'Short human-readable label for the diagram.' },
-                },
-                required: ['tool'],
-            },
-        },
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'builder_add_ai_step',
-            description: `Append an AI reasoning step that transforms or summarises upstream data. By default no tool calls — set allowTools:true (and optionally a tools allowlist) when this step needs to fetch data on its own (web search, Gmail lookup, etc.). The user's per-org integration permissions are still enforced at runtime. Use this for: extracting structured fields from text, summarising, classifying, drafting reply text, OR (with allowTools) free-form research that doesn't fit a static integration_action. ${BINDING_HINT} EXAMPLE — extract invoice fields: {prompt:"Extract amount, currency, vendor, dueDate from this invoice email.",inputs:{emailBody:{kind:"ref",path:"loop.email.body"}},outputSchema:{type:"object",properties:{amount:{type:"number"},currency:{type:"string"},vendor:{type:"string"},dueDate:{type:"string"}}},modelTier:"fast"}.`,
-            parameters: {
-                type: 'object',
-                properties: {
-                    afterStepId: { type: 'string' },
-                    prompt: { type: 'string', description: 'The instruction for the AI. Reference the inputs by name.' },
-                    inputs: { type: 'object', description: `Map of binding-name to a binding object. ${BINDING_HINT}` },
-                    outputSchema: { type: 'object', description: 'JSON schema describing the desired structured output. Strongly recommended so downstream steps can reference fields.' },
-                    modelTier: { type: 'string', enum: ['auto', 'fast', 'standard', 'thinking'], description: 'Default: auto (mirrors direct chat — classifier picks fast/standard/thinking based on prompt complexity).' },
-                    allowTools: { type: 'boolean', description: 'Default false. When true the AI step can call the user\'s integration tools (web search, gmail_search, etc.). Use sparingly — most steps should bind upstream integration_action output instead.' },
-                    tools: { type: 'array', items: { type: 'string' }, description: 'Optional allowlist of tool names the AI step may call. Empty / omitted = whatever allowTools dictates.' },
-                    branch: { type: 'string', enum: ['then', 'else'], description: 'When afterStepId is a condition: which branch this step begins. Omit to auto-fill (then first, else second).' },
-                    caseName: { type: 'string', description: 'When afterStepId is a switch: the case name (or "default") this step begins.' },
-                    label: { type: 'string' },
-                },
-                required: ['prompt'],
-            },
-        },
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'builder_add_condition',
-            description: 'Append an if/else branch. The expr is a restricted JS expression — supports member access, comparisons, &&, ||, ?:, math. NO function calls. EXAMPLES: "steps.parse.output.amount > 1000", "steps.s1.output.count == 0", "loop.email.subject == \\"Urgent\\"". To grow a branch, call builder_add_action / builder_add_ai_step / builder_add_notification with afterStepId set to this condition\'s id — the edge is AUTO-labelled "then" on the first append and "else" on the second. Pass branch:"then"|"else" on that call to be explicit. Use thenStepId/elseStepId here only to wire EXISTING steps as branches.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    afterStepId: { type: 'string' },
-                    expr: { type: 'string', description: 'Restricted JS expression (no function calls).' },
-                    thenStepId: { type: 'string', description: 'Optional id of an existing step to wire as the "then" branch.' },
-                    elseStepId: { type: 'string', description: 'Optional id of an existing step to wire as the "else" branch.' },
-                    label: { type: 'string' },
-                },
-                required: ['expr'],
-            },
-        },
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'builder_add_loop',
-            description: `Append a for-each loop over an upstream array. The body is a SUB-DAG of steps that runs once per item. Inside the body, refer to the current item as loop.<itemVar>. ${BINDING_HINT} EXAMPLE — for each invoice email, extract fields and create YouTrack issue: {overRef:"steps.search.output.items",itemVar:"email",maxIterations:50,body:[{type:"ai_step",prompt:"Extract amount and vendor.",inputs:{body:{kind:"ref",path:"loop.email.body"}}},{type:"integration_action",tool:"youtrack_create_issue",inputs:{summary:{kind:"template",value:"Invoice {{loop.email.subject}}"}}}]}. IMPORTANT: every body step MUST have a "type" field; the system will assign ids if missing.`,
-            parameters: {
-                type: 'object',
-                properties: {
-                    afterStepId: { type: 'string' },
-                    overRef: { type: 'string', description: 'Path to the array, e.g. steps.search.output.items.' },
-                    itemVar: { type: 'string', description: 'Loop variable name; available inside body as loop.<itemVar>.' },
-                    body: { type: 'array', description: 'Sub-DAG step objects (linear). Each must include "type". "id" is auto-assigned if missing.' },
-                    maxIterations: { type: 'integer', description: 'Cap, default 100, max 1000.' },
-                    branch: { type: 'string', enum: ['then', 'else'], description: 'When afterStepId is a condition: which branch this step begins. Omit to auto-fill (then first, else second).' },
-                    caseName: { type: 'string', description: 'When afterStepId is a switch: the case name (or "default") this step begins.' },
-                    label: { type: 'string' },
-                },
-                required: ['overRef', 'itemVar'],
-            },
-        },
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'builder_add_code_step',
-            description: 'Append a sandboxed JavaScript step. Use ONLY when no integration fits. Code receives `inputs` and `ctx` (with ctx.log, ctx.http, ctx.integrations.<tool>, ctx.secrets). Define `function main(inputs, ctx)` and return the result. Code is gated by org policy; only propose this when the catalog clearly lacks a fitting tool.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    afterStepId: { type: 'string' },
-                    code: { type: 'string', description: 'JavaScript source. Define `async function main(inputs, ctx) { ... return result; }`.' },
-                    inputs: { type: 'object' },
-                    outputSchema: { type: 'object' },
-                    allowedTools: { type: 'array', items: { type: 'string' }, description: 'Tool names this step may call via ctx.integrations.<tool>(args).' },
-                    branch: { type: 'string', enum: ['then', 'else'], description: 'When afterStepId is a condition: which branch this step begins. Omit to auto-fill (then first, else second).' },
-                    caseName: { type: 'string', description: 'When afterStepId is a switch: the case name (or "default") this step begins.' },
-                    label: { type: 'string' },
-                },
-                required: ['code'],
-            },
-        },
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'builder_add_notification',
-            description: `Append a notification step that delivers a result to the user. The title and body are TEMPLATES — interpolate upstream data with double curly braces. EXAMPLE: {title:"Monthly invoice report",body:"Found {{steps.search.output.count}} invoices totalling €{{steps.sum.output.total}}",channels:["notification"]}. For Gmail-delivered notifications, instead use builder_add_action with tool gmail_compose.`,
-            parameters: {
-                type: 'object',
-                properties: {
-                    afterStepId: { type: 'string' },
-                    title: { type: 'string', description: 'Template string. Supports {{steps.<id>.output.<path>}}.' },
-                    body: { type: 'string', description: 'Template string. Supports {{steps.<id>.output.<path>}}.' },
-                    channels: { type: 'array', items: { type: 'string' }, description: 'Default: ["notification"].' },
-                    branch: { type: 'string', enum: ['then', 'else'], description: 'When afterStepId is a condition: which branch this step begins. Omit to auto-fill (then first, else second).' },
-                    caseName: { type: 'string', description: 'When afterStepId is a switch: the case name (or "default") this step begins.' },
-                    label: { type: 'string' },
-                },
-                required: ['title'],
-            },
-        },
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'builder_add_set',
-            description: `Append a "set" step that produces an explicit object. Each field's value uses the standard binding shape — literal/ref/template/expr. Use this to renaming/restructuring fields before a downstream integration_action. ${BINDING_HINT} EXAMPLE: {fields:{name:{kind:"literal",value:"Alice"},email:{kind:"ref",path:"trigger.output.from"}}}.`,
-            parameters: {
-                type: 'object',
-                properties: {
-                    afterStepId: { type: 'string' },
-                    fields: { type: 'object', description: `Map of fieldName → binding. ${BINDING_HINT}` },
-                    label: { type: 'string' },
-                },
-                required: ['fields'],
-            },
-        },
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'builder_add_datetime',
-            description: 'Append a date/time operation. ops: now (current time), parse (string→ISO), format (ISO→formatted string), addDays/addHours/addMinutes (offset by amount), diff (two refs → numeric diff in unit), extract (year/month/day/hour/minute/dayOfWeek). EXAMPLES: {op:"now"} | {op:"addDays",input:"trigger.output.timestamp",amount:7} | {op:"format",input:"steps.x.output.iso",format:"yyyy-MM-dd"} | {op:"diff",input:"trigger.output.start",input2:"trigger.output.end",unit:"hours"}.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    afterStepId: { type: 'string' },
-                    op: { type: 'string', enum: ['now', 'parse', 'format', 'addDays', 'addHours', 'addMinutes', 'diff', 'extract'] },
-                    input: { type: 'string', description: 'Path to a date value (ISO string or epoch ms). Omit for op:now.' },
-                    input2: { type: 'string', description: 'Second date path. Required for op:diff.' },
-                    amount: { type: 'number', description: 'Offset amount (positive or negative). Required for addDays/addHours/addMinutes.' },
-                    format: { type: 'string', description: 'Format string with tokens yyyy/MM/dd/HH/mm/ss. Required for op:format.' },
-                    part: { type: 'string', enum: ['year', 'month', 'day', 'hour', 'minute', 'second', 'dayOfWeek'], description: 'Required for op:extract.' },
-                    unit: { type: 'string', enum: ['days', 'hours', 'minutes', 'seconds'], description: 'Required for op:diff.' },
-                    label: { type: 'string' },
-                },
-                required: ['op'],
-            },
-        },
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'builder_add_wait',
-            description: 'Append a step that pauses the run for N seconds (1..86400). Use for simple rate limiting or to give an external service time to settle. Dry-run skips the wait.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    afterStepId: { type: 'string' },
-                    seconds: { type: 'integer', description: 'Number of seconds to wait. Capped at 86400 (24h).' },
-                    label: { type: 'string' },
-                },
-                required: ['seconds'],
-            },
-        },
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'builder_add_stop_error',
-            description: 'Append a step that halts the run with a custom error message. The message is a TEMPLATE — interpolate upstream fields with double curly braces. Use as a guardrail downstream of a condition that detects "we should not continue". EXAMPLE: {message:"Budget exceeded: {{steps.calc.output.delta}}"}.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    afterStepId: { type: 'string' },
-                    message: { type: 'string', description: 'Template string surfaced as the run error.' },
-                    label: { type: 'string' },
-                },
-                required: ['message'],
-            },
-        },
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'builder_add_switch',
-            description: 'Append a multi-way branch. Evaluates expr and routes to the first matching case. Each case is { name, value }. Wire each case to its next step by passing nextStepIds: { "<caseName>": "<stepId>", "default": "<stepId>" }. EXAMPLE: {expr:"trigger.output.priority",cases:[{name:"urgent",value:"high"},{name:"normal",value:"medium"}],defaultBranch:"fallback"}. To grow a case branch by appending a NEW step, call an add tool with afterStepId set to this switch\'s id AND caseName set to the case it belongs to — otherwise the edge is unlabelled and that case dead-ends.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    afterStepId: { type: 'string' },
-                    expr: { type: 'string', description: 'Restricted JS expression whose value gets matched.' },
-                    cases: { type: 'array', description: 'Array of { name, value } — match in order, first hit wins.', items: { type: 'object', properties: { name: { type: 'string' }, value: {} }, required: ['name'] } },
-                    defaultBranch: { type: 'string', description: 'Case name to route to when no case matches (otherwise dead-ends).' },
-                    nextStepIds: { type: 'object', description: 'Map of case name → existing step id to wire as the branch target. Use this in one shot instead of calling builder_add_* with afterStepId per branch.' },
-                    label: { type: 'string' },
-                },
-                required: ['expr', 'cases'],
-            },
-        },
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'builder_add_filter',
-            description: 'Append a collection filter — keeps array items matching expr. arrayRef points to an upstream array; expr is evaluated per element with the current element bound as `item`. Output is { items, count }. EXAMPLE: {arrayRef:"steps.search.output.results",expr:"item.amount > 1000"}.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    afterStepId: { type: 'string' },
-                    arrayRef: { type: 'string' },
-                    expr: { type: 'string', description: 'Restricted JS expression referencing item.<field>.' },
-                    label: { type: 'string' },
-                },
-                required: ['arrayRef', 'expr'],
-            },
-        },
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'builder_add_limit',
-            description: 'Append a step that returns the first or last N items of an array. Output is { items, count }.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    afterStepId: { type: 'string' },
-                    arrayRef: { type: 'string' },
-                    count: { type: 'integer', description: 'How many items to keep.' },
-                    mode: { type: 'string', enum: ['first', 'last'], description: 'Default: first.' },
-                    label: { type: 'string' },
-                },
-                required: ['arrayRef', 'count'],
-            },
-        },
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'builder_add_dedupe',
-            description: 'Append a step that removes duplicate items. With keyField, dedup by that field; without, dedup by deep equality. Output is { items, removed }.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    afterStepId: { type: 'string' },
-                    arrayRef: { type: 'string' },
-                    keyField: { type: 'string', description: 'Optional. If set, items with the same value at this field are treated as duplicates.' },
-                    label: { type: 'string' },
-                },
-                required: ['arrayRef'],
-            },
-        },
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'builder_add_aggregate',
-            description: 'Append a step that pulls one field across every item of an array into a flat list. Output is { values, count }. EXAMPLE: {arrayRef:"steps.search.output.results",field:"email"} → values is an array of emails.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    afterStepId: { type: 'string' },
-                    arrayRef: { type: 'string' },
-                    field: { type: 'string', description: 'Field name to read from each item.' },
-                    label: { type: 'string' },
-                },
-                required: ['arrayRef', 'field'],
-            },
-        },
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'builder_add_summarize',
-            description: 'Append a statistics step over a numeric field of an array. ops: sum, count (length of arrayRef regardless of field), avg, min, max. Output is { result, op, count }.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    afterStepId: { type: 'string' },
-                    arrayRef: { type: 'string' },
-                    field: { type: 'string' },
-                    op: { type: 'string', enum: ['sum', 'count', 'avg', 'min', 'max'] },
-                    label: { type: 'string' },
-                },
-                required: ['arrayRef', 'field', 'op'],
-            },
-        },
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'builder_add_array_op',
-            description: `Append an array operation step. Single entry point for filter / limit / dedupe / aggregate / summarize — pick \`op\` and supply the matching fields. Preferred over the five individual builder_add_{filter,limit,dedupe,aggregate,summarize} tools (which still work but are legacy).
-
-OPS:
-  - filter:    keep items matching expr.    Required: arrayRef, expr.        Output: { items, count }.
-  - limit:     first/last N items.          Required: arrayRef, count.       Optional: mode ("first"|"last"). Output: { items, count }.
-  - dedupe:    drop duplicates.             Required: arrayRef.               Optional: keyField (dedup by that field; else deep equality). Output: { items, removed }.
-  - aggregate: pull one field across items. Required: arrayRef, field.       Output: { values, count }.
-  - summarize: numeric stats over a field.  Required: arrayRef, field, fn.   fn ∈ sum|count|avg|min|max. Output: { result, op, count }.
-
-arrayRef is a path string (e.g. "steps.search.output.results"), NOT a binding object. EXAMPLE: {op:"filter",arrayRef:"steps.search.output.results",expr:"item.amount > 1000"}.`,
-            parameters: {
-                type: 'object',
-                properties: {
-                    op: { type: 'string', enum: ['filter', 'limit', 'dedupe', 'aggregate', 'summarize'] },
-                    afterStepId: { type: 'string' },
-                    arrayRef: { type: 'string', description: 'Dotted path to an upstream array, e.g. "steps.search.output.results".' },
-                    expr: { type: 'string', description: 'filter only: restricted JS expression referencing item.<field>.' },
-                    count: { type: 'integer', description: 'limit only: how many items to keep.' },
-                    mode: { type: 'string', enum: ['first', 'last'], description: 'limit only: default "first".' },
-                    keyField: { type: 'string', description: 'dedupe only: field to dedup by; omit for deep-equality dedup.' },
-                    field: { type: 'string', description: 'aggregate and summarize: field name on each item.' },
-                    fn: { type: 'string', enum: ['sum', 'count', 'avg', 'min', 'max'], description: 'summarize only: which statistic to compute.' },
-                    branch: { type: 'string', enum: ['then', 'else'], description: 'When afterStepId is a condition: which branch this step begins. Omit to auto-fill (then first, else second).' },
-                    caseName: { type: 'string', description: 'When afterStepId is a switch: the case name (or "default") this step begins.' },
-                    label: { type: 'string' },
-                },
-                required: ['op', 'arrayRef'],
-            },
-        },
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'builder_remove_step',
-            description: 'Remove a step from the draft by id, including its incident edges.',
-            parameters: { type: 'object', properties: { stepId: { type: 'string' } }, required: ['stepId'] },
-        },
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'builder_set_metadata',
-            description: 'Set the user-visible title and/or description for this automation.',
-            parameters: { type: 'object', properties: { title: { type: 'string' }, description: { type: 'string' } } },
-        },
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'builder_inspect_tool',
-            description: 'Look up the EXACT output shape of an integration tool. Use this BEFORE adding actions whose output you need to chain — so you know whether the field is "results" or "items" or "events" without guessing. Returns a one-line shape descriptor (e.g. "results: array of { id, from, subject, ... }; total: integer") sourced from runtime samples when available, otherwise from the curated schema.',
-            parameters: {
-                type: 'object',
-                properties: { tool: { type: 'string', description: 'Exact tool name from the catalog.' } },
-                required: ['tool'],
-            },
-        },
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'builder_summarise',
-            description: 'Return a deterministic plain-English summary of the current draft. Call after every batch of mutations so the user sees what changed.',
-            parameters: { type: 'object', properties: {} },
-        },
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'builder_request_dry_run',
-            description: 'Execute the draft in dry-run mode. Side-effect actions are simulated (no real emails sent, no real issues created); read-only and AI steps run for real. Returns the run row + per-step output. ALWAYS dry-run after building a complete draft, then read the per-step output. If any step errored, fix it (remove_step + add_*) and dry-run again. Only after a clean dry-run should you call builder_finalize.',
-            parameters: { type: 'object', properties: { triggerPayload: { type: 'object', description: 'Optional fake trigger payload (used to feed app_event triggers a sample).' } } },
-        },
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'builder_finalize',
-            description: 'Mark the draft as finalised (is_draft=false). The automation remains INACTIVE until the user clicks Activate in the UI. Only call this after a successful dry-run.',
-            parameters: { type: 'object', properties: {} },
-        },
-    },
-];
-
-// ── Apply mutations ─────────────────────────────────────
+// §WS5 — BINDING_HINT moved to ./builderTools/schemas.js (its only consumer).
 
 function applyTrigger(draft, args) {
     draft.trigger = { id: 'trg', type: 'trigger', kind: args.kind, output: {} };
@@ -1143,9 +286,18 @@ function applyTrigger(draft, args) {
  * Auto-infers the label (then first, else second) and accepts an explicit
  * `branch` override; switches use `caseName`. Non-branching predecessors get
  * a plain `{from, to}` edge — identical to the previous behaviour.
+ *
+ * §WS4: `branch:'error'` labels the edge 'on_error' regardless of the
+ * predecessor type — the runner only follows it when the source step
+ * exhausts its retries and fails. Validation enforces which step types may
+ * carry an error branch (edge.error_label_invalid / _unlikely).
  */
 function branchEdgeFor(draft, fromId, toId, { branch, caseName } = {}) {
     const edge = { from: fromId, to: toId };
+    if (branch === 'error') {
+        edge.label = 'on_error';
+        return edge;
+    }
     const pred = (draft.steps || []).find(s => s.id === fromId);
     if (pred && pred.type === 'condition') {
         let label = (branch === 'then' || branch === 'else') ? branch : null;
@@ -1161,16 +313,45 @@ function branchEdgeFor(draft, fromId, toId, { branch, caseName } = {}) {
     return edge;
 }
 
+/**
+ * Resolve the predecessor id a freshly-built step (id `newStepId`) should be
+ * wired FROM, keeping a flowlet's `layer_output` ("Return") step terminal.
+ *
+ * A flowlet skeleton wires `trigger → layer_output` straight away, so the naive
+ * "append after the last step" lands every new step AFTER the output — the
+ * flowlet then returns nothing and does its real work as dead code. Here, when
+ * the natural anchor would be the output (no explicit afterStepId, or it points
+ * AT the output), we splice the new step in just before it: re-point the
+ * output's incoming edge to come from the new step and return the output's old
+ * predecessor as the anchor. Non-flowlet graphs (no layer_output) are unaffected.
+ */
+function layerAwareAnchor(graph, afterStepId, newStepId) {
+    const out = Array.isArray(graph.steps) ? graph.steps.find(s => s && s.type === 'layer_output') : null;
+    // No output, or an explicit anchor on a real (non-output) step → respect it.
+    if (!out || (afterStepId && afterStepId !== out.id)) {
+        return afterStepId || lastStepId(graph);
+    }
+    const feed = Array.isArray(graph.edges) ? graph.edges.find(e => e && e.to === out.id) : null;
+    const anchor = feed ? feed.from : (graph.trigger?.id || lastStepId(graph));
+    if (feed) feed.from = newStepId;                       // out now follows the new step
+    else (graph.edges = graph.edges || []).push({ from: newStepId, to: out.id });
+    return anchor;
+}
+
 function appendAfter(draft, afterStepId, step, opts = {}) {
-    const lastId = afterStepId || lastStepId(draft);
+    const anchor = layerAwareAnchor(draft, afterStepId, step.id);
     draft.steps.push(step);
-    draft.edges.push(branchEdgeFor(draft, lastId, step.id, opts));
+    draft.edges.push(branchEdgeFor(draft, anchor, step.id, opts));
     return step;
 }
 
-function applyAddAction(draft, args) {
+function applyAddAction(draft, args, draftWrap) {
+    const gate = inspectGateError(args.tool, args.inputs, draftWrap);
+    if (gate) return gate;
     const { inputs, error } = validateAndFixBindings(args.inputs || {}, draft);
     if (error) return { error };
+    const { forEach, error: feErr } = sanitizeForEach(args.forEach, draft);
+    if (feErr) return { error: feErr };
     const step = {
         id: newId('a'),
         type: 'integration_action',
@@ -1178,6 +359,7 @@ function applyAddAction(draft, args) {
         inputs,
         label: args.label || args.tool,
         sideEffect: isSideEffect(args.tool),
+        ...(forEach ? { forEach } : {}),
     };
     appendAfter(draft, args.afterStepId, step, { branch: args.branch, caseName: args.caseName });
     return { added: step };
@@ -1186,6 +368,8 @@ function applyAddAction(draft, args) {
 function applyAddAi(draft, args) {
     const { inputs, error } = validateAndFixBindings(args.inputs || {}, draft);
     if (error) return { error };
+    const { forEach, error: feErr } = sanitizeForEach(args.forEach, draft);
+    if (feErr) return { error: feErr };
     const step = {
         id: newId('ai'),
         type: 'ai_step',
@@ -1203,6 +387,7 @@ function applyAddAi(draft, args) {
         label: args.label || 'AI step',
         allowTools: !!args.allowTools,
         tools: Array.isArray(args.tools) ? args.tools.filter(t => typeof t === 'string') : null,
+        ...(forEach ? { forEach } : {}),
     };
     appendAfter(draft, args.afterStepId, step, { branch: args.branch, caseName: args.caseName });
     return { added: step };
@@ -1210,7 +395,7 @@ function applyAddAi(draft, args) {
 
 function applyAddCondition(draft, args) {
     const step = { id: newId('cond'), type: 'condition', expr: args.expr, label: args.label || 'Condition' };
-    const lastId = args.afterStepId || lastStepId(draft);
+    const lastId = layerAwareAnchor(draft, args.afterStepId, step.id);
     draft.steps.push(step);
     // Route the incoming edge through branchEdgeFor so chaining a condition
     // directly after another condition/switch still labels the branch.
@@ -1256,6 +441,8 @@ function applyAddLoop(draft, args) {
 function applyAddCode(draft, args) {
     const { inputs, error } = validateAndFixBindings(args.inputs || {}, draft);
     if (error) return { error };
+    const { forEach, error: feErr } = sanitizeForEach(args.forEach, draft);
+    if (feErr) return { error: feErr };
     const step = {
         id: newId('code'),
         type: 'code',
@@ -1267,12 +454,15 @@ function applyAddCode(draft, args) {
         allowedTools: Array.isArray(args.allowedTools) ? args.allowedTools : [],
         limits: { cpuMs: 1000, memoryMb: 64, wallMs: 5000 },
         label: args.label || 'Custom code',
+        ...(forEach ? { forEach } : {}),
     };
     appendAfter(draft, args.afterStepId, step, { branch: args.branch, caseName: args.caseName });
     return { added: step };
 }
 
 function applyAddNotification(draft, args) {
+    const { forEach, error: feErr } = sanitizeForEach(args.forEach, draft);
+    if (feErr) return { error: feErr };
     const step = {
         id: newId('notif'),
         type: 'notification',
@@ -1280,6 +470,7 @@ function applyAddNotification(draft, args) {
         body: args.body || '',
         channels: Array.isArray(args.channels) ? args.channels : ['notification'],
         label: args.label || 'Notify',
+        ...(forEach ? { forEach } : {}),
     };
     appendAfter(draft, args.afterStepId, step, { branch: args.branch, caseName: args.caseName });
     return { added: step };
@@ -1290,8 +481,186 @@ function applyAddNotification(draft, args) {
 function applyAddSet(draft, args) {
     const { inputs: fields, error } = validateAndFixBindings(args.fields || {}, draft);
     if (error) return { error };
-    const step = { id: newId('set'), type: 'set', fields, label: args.label || 'Edit fields' };
+    const { forEach, error: feErr } = sanitizeForEach(args.forEach, draft);
+    if (feErr) return { error: feErr };
+    const step = { id: newId('set'), type: 'set', fields, label: args.label || 'Edit fields', ...(forEach ? { forEach } : {}) };
     appendAfter(draft, args.afterStepId, step, { branch: args.branch, caseName: args.caseName });
+    return { added: step };
+}
+
+// ── Inline-flowlet helpers ──────────────────────────────
+
+const LAYER_KEY_RE = /^[a-z][a-z0-9_]*$/;
+
+/** slug a title into a valid flowlet key; uniquify against existing keys. */
+function generateLayerKey(title, layers) {
+    let slug = String(title || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 40)
+        .replace(/^_+|_+$/g, '');
+    if (!slug) slug = 'layer';
+    else if (/^[0-9]/.test(slug)) slug = `layer_${slug}`;
+    let key = slug;
+    let n = 2;
+    while (layers && Object.prototype.hasOwnProperty.call(layers, key)) key = `${slug}_${n++}`;
+    return key;
+}
+
+function sanitizeLayerParams(params) {
+    if (!Array.isArray(params)) return [];
+    return params
+        .filter(p => p && typeof p === 'object' && typeof p.name === 'string' && p.name.trim())
+        .map(p => ({
+            name: p.name.trim(),
+            type: typeof p.type === 'string' && p.type ? p.type : 'string',
+            ...(p.required ? { required: true } : {}),
+        }));
+}
+
+/**
+ * Every flowlet key transitively reachable from `startKey` via call_layer
+ * steps (including startKey itself). Used to reject recursive wiring:
+ * adding a call to T from inside flowlet S is illegal when closure(T) ∋ S.
+ */
+function layerClosureKeys(layers, startKey) {
+    const seen = new Set();
+    const stack = [startKey];
+    while (stack.length) {
+        const k = stack.pop();
+        if (seen.has(k)) continue;
+        seen.add(k);
+        const g = layers?.[k];
+        if (!g) continue;
+        for (const { step } of collectCallLayerSteps(g)) {
+            if (typeof step.layerKey === 'string' && !seen.has(step.layerKey)) stack.push(step.layerKey);
+        }
+    }
+    return seen;
+}
+
+/**
+ * The empty skeleton for a new inline flowlet: a layer_input trigger wired
+ * straight to a layer_output "Return". Extracted so the flowlet sub-agent
+ * (flowletAgent.js) seeds isolated drafts with the EXACT same shape this
+ * tool produces — no drift between the two creation paths.
+ */
+function makeLayerSkeleton(title, params) {
+    return {
+        title: (typeof title === 'string' && title.trim()) ? title.trim() : 'New layer',
+        trigger: { id: 'trg', type: 'trigger', kind: 'layer_input', params: sanitizeLayerParams(params) },
+        steps: [{ id: 'out', type: 'layer_output', fields: {}, label: 'Return' }],
+        edges: [{ from: 'trg', to: 'out' }],
+    };
+}
+
+function applyCreateLayer(draft, args) {
+    const title = (typeof args.title === 'string' && args.title.trim()) ? args.title.trim() : 'New layer';
+    if (!draft.layers || typeof draft.layers !== 'object' || Array.isArray(draft.layers)) draft.layers = {};
+    const layerKey = generateLayerKey(title, draft.layers);
+    draft.layers[layerKey] = makeLayerSkeleton(title, args.params);
+    // Inline flowlets are the schemaVersion 2 marker.
+    draft.schemaVersion = 2;
+    return { layerKey, layer: draft.layers[layerKey] };
+}
+
+function applySetLayerContract(draft, args) {
+    const layerKey = typeof args.layerKey === 'string' ? args.layerKey : null;
+    const layer = layerKey ? draft.layers?.[layerKey] : null;
+    if (!layer) {
+        return { error: `Unknown layerKey "${layerKey || ''}". Existing flowlets: ${Object.keys(draft.layers || {}).join(', ') || '(none — create one with builder_create_layer)'}.` };
+    }
+    if (args.params !== undefined) {
+        if (!Array.isArray(args.params)) return { error: 'params must be an array of { name, type, required? }.' };
+        layer.trigger = layer.trigger || { id: 'trg', type: 'trigger', kind: 'layer_input' };
+        layer.trigger.params = sanitizeLayerParams(args.params);
+    }
+    if (args.outputFields !== undefined) {
+        if (!Array.isArray(args.outputFields) || args.outputFields.some(f => typeof f !== 'string' || !f.trim())) {
+            return { error: 'outputFields must be an array of non-empty field-name strings.' };
+        }
+        layer.steps = Array.isArray(layer.steps) ? layer.steps : [];
+        layer.edges = Array.isArray(layer.edges) ? layer.edges : [];
+        let outStep = layer.steps.find(s => s && s.type === 'layer_output');
+        if (!outStep) {
+            outStep = { id: 'out', type: 'layer_output', fields: {}, label: 'Return' };
+            const prevLast = lastStepId(layer);
+            layer.steps.push(outStep);
+            layer.edges.push({ from: prevLast, to: outStep.id });
+        }
+        const old = (outStep.fields && typeof outStep.fields === 'object' && !Array.isArray(outStep.fields)) ? outStep.fields : {};
+        outStep.fields = {};
+        for (const f of args.outputFields) {
+            const name = f.trim();
+            // Keep an existing binding for retained keys; new keys start as
+            // empty literals the user (or AI, with scope) binds afterwards.
+            outStep.fields[name] = old[name] || { kind: 'literal', value: '' };
+        }
+    }
+    // Bind the flowlet's return values directly (declare + bind in ONE call):
+    // `outputs` maps fieldName → binding ({kind:'ref',path:'steps.<id>.output.<f>'}).
+    // This is THE way a flowlet returns data — never via a separate `set` step.
+    if (args.outputs !== undefined) {
+        if (!args.outputs || typeof args.outputs !== 'object' || Array.isArray(args.outputs)) {
+            return { error: 'outputs must be a map of fieldName → binding, e.g. { invoices: { kind:"ref", path:"steps.agg1.output.values" } }.' };
+        }
+        layer.steps = Array.isArray(layer.steps) ? layer.steps : [];
+        layer.edges = Array.isArray(layer.edges) ? layer.edges : [];
+        let outStep = layer.steps.find(s => s && s.type === 'layer_output');
+        if (!outStep) {
+            outStep = { id: 'out', type: 'layer_output', fields: {}, label: 'Return' };
+            const prevLast = lastStepId(layer);
+            layer.steps.push(outStep);
+            layer.edges.push({ from: prevLast, to: outStep.id });
+        }
+        const { inputs: bound, error } = validateAndFixBindings(args.outputs, layer);
+        if (error) return { error };
+        outStep.fields = {
+            ...(outStep.fields && typeof outStep.fields === 'object' && !Array.isArray(outStep.fields) ? outStep.fields : {}),
+            ...bound,
+        };
+    }
+    const outStep = (layer.steps || []).find(s => s && s.type === 'layer_output');
+    return {
+        layerKey,
+        params: layer.trigger?.params || [],
+        outputFields: Object.keys(outStep?.fields || {}),
+    };
+}
+
+/**
+ * Append a call_layer step. `graph` is where the step lands (the root, or
+ * the flowlet selected via scope); `draft` is always the root document
+ * (flowlets live there); `scope` is the calling flowlet key (null at root) —
+ * needed for the recursion check.
+ */
+function applyAddCallLayer(draft, args, { graph = draft, scope = null } = {}) {
+    if (!args.layerKey || typeof args.layerKey !== 'string') {
+        if (args.layerId) return { error: 'call_layer now takes a layerKey (inline flowlets) — layerId is no longer supported. Create the flowlet with builder_create_layer and pass its layerKey.' };
+        return { error: 'call_layer requires a layerKey.' };
+    }
+    const layers = draft.layers || {};
+    const target = layers[args.layerKey];
+    if (!target) {
+        return { error: `Unknown layerKey "${args.layerKey}". Existing flowlets: ${Object.keys(layers).join(', ') || '(none — create one with builder_create_layer)'}.` };
+    }
+    // Recursion guard: from inside flowlet `scope`, the target's transitive
+    // call closure must not reach back to `scope` (and a flowlet can never
+    // call itself). Root-scope calls can't recurse by construction.
+    if (scope && layerClosureKeys(layers, args.layerKey).has(scope)) {
+        return { error: `Recursive flowlet call rejected: flowlet "${args.layerKey}" (transitively) calls "${scope}", which is the flowlet you are adding this step to.` };
+    }
+    const { inputs, error } = validateAndFixBindings(args.inputs || {}, graph);
+    if (error) return { error };
+    const step = {
+        id: newId('cl'),
+        type: 'call_layer',
+        layerKey: args.layerKey,
+        inputs,
+        label: args.label || target.title || 'Call layer',
+    };
+    appendAfter(graph, args.afterStepId, step, { branch: args.branch, caseName: args.caseName });
     return { added: step };
 }
 
@@ -1333,7 +702,7 @@ function applyAddSwitch(draft, args) {
         defaultBranch: typeof args.defaultBranch === 'string' ? args.defaultBranch : null,
         label: args.label || 'Switch',
     };
-    const lastId = args.afterStepId || lastStepId(draft);
+    const lastId = layerAwareAnchor(draft, args.afterStepId, step.id);
     draft.steps.push(step);
     // Route the incoming edge through branchEdgeFor so chaining a switch
     // directly after a condition/switch still labels the branch.
@@ -1416,11 +785,399 @@ function applyAddArrayOp(draft, args) {
     }
 }
 
-function applyRemoveStep(draft, args) {
+/**
+ * §WS4 — wire an on_error edge between two EXISTING steps of `graph` (the
+ * root, or a flowlet via scope). The source-type gate mirrors validate.js's
+ * edge.error_label_invalid set so the LLM gets immediate feedback instead
+ * of a validation bounce on the next persist.
+ */
+const ERROR_BRANCH_FORBIDDEN_SOURCES = new Set(['condition', 'switch', 'approval', 'stop_error']);
+
+function applyWireErrorBranch(graph, args) {
+    const from = typeof args.fromStepId === 'string' ? args.fromStepId : null;
+    const to = typeof args.toStepId === 'string' ? args.toStepId : null;
+    if (!from || !to) return { error: 'fromStepId and toStepId are both required.' };
+    if (from === to) return { error: 'fromStepId and toStepId must be different steps.' };
+    const stepIds = (graph.steps || []).map(s => s.id);
+    if (from === graph.trigger?.id) {
+        return { error: 'Triggers cannot fail — an error branch must start from a step, not the trigger.' };
+    }
+    const fromStep = (graph.steps || []).find(s => s.id === from);
+    if (!fromStep) return { error: `Unknown fromStepId "${from}". Existing step ids: ${stepIds.join(', ') || '(none)'}.` };
+    if (!stepIds.includes(to) && to !== graph.trigger?.id) {
+        return { error: `Unknown toStepId "${to}". Existing step ids: ${stepIds.join(', ') || '(none)'}.` };
+    }
+    if (to === graph.trigger?.id) return { error: 'toStepId cannot be the trigger.' };
+    if (ERROR_BRANCH_FORBIDDEN_SOURCES.has(fromStep.type)) {
+        return { error: `A "${fromStep.type}" step cannot have an error branch — only failure-capable steps can (integration_action, ai_step, code, call_layer, loop, parallel, notification, wait).` };
+    }
+    const existing = (graph.edges || []).find(e => e.from === from && e.to === to && e.label === 'on_error');
+    if (existing) return { wired: existing, note: 'edge already existed' };
+    const edge = { from, to, label: 'on_error' };
+    graph.edges.push(edge);
+    return { wired: edge };
+}
+
+// Branching step types — they route via labelled outgoing edges
+// (then/else, case:*). Used by the in-place edit/delete reconcilers.
+const BRANCHING_TYPES = new Set(['condition', 'switch']);
+
+/** Plain-text id list for "step not found" errors (mirrors applyWireErrorBranch). */
+function listStepIds(graph) {
+    return (graph.steps || []).map(s => s.id).join(', ') || '(none)';
+}
+
+/**
+ * Locate a step by id within a graph (the root or a flowlet — `scope` is
+ * already resolved to `graph` by the dispatcher). Also finds steps nested in a
+ * `loop.body[]`. Branch members (then/else/case targets) live in `graph.steps`
+ * wired by edge labels, so the top-level scan already covers them.
+ *
+ * Returns { step, container, index, kind, graph[, parentLoop] } or null.
+ *   kind 'graph' → container is graph.steps; 'loop' → container is loop.body.
+ */
+function findStepAnywhere(graph, stepId) {
+    const steps = Array.isArray(graph.steps) ? graph.steps : [];
+    const top = steps.findIndex(s => s && s.id === stepId);
+    if (top >= 0) return { step: steps[top], container: steps, index: top, kind: 'graph', graph };
+    for (const s of steps) {
+        if (s && s.type === 'loop' && Array.isArray(s.body)) {
+            const i = s.body.findIndex(b => b && b.id === stepId);
+            if (i >= 0) return { step: s.body[i], container: s.body, index: i, kind: 'loop', parentLoop: s, graph };
+        }
+    }
+    return null;
+}
+
+// Per-type allow-list of fields a builder_update_step patch may change. `inputs`
+// / `fields` / `forEach` get special merge+revalidate handling; everything else
+// is copied through normalizePatchField (which mirrors the apply* clamps).
+const PATCHABLE_FIELDS = {
+    integration_action: ['tool', 'inputs', 'label', 'forEach'],
+    ai_step: ['prompt', 'systemPrompt', 'inputs', 'outputSchema', 'modelTier', 'allowTools', 'tools', 'label', 'forEach'],
+    condition: ['expr', 'label'],
+    switch: ['expr', 'cases', 'defaultBranch', 'label'],
+    loop: ['overRef', 'itemVar', 'maxIterations', 'label'],   // body steps are edited by their own id
+    code: ['code', 'inputs', 'outputSchema', 'allowedTools', 'label', 'forEach'],
+    notification: ['title', 'body', 'channels', 'label', 'forEach'],
+    set: ['fields', 'label', 'forEach'],
+    datetime: ['op', 'input', 'input2', 'amount', 'format', 'part', 'unit', 'label'],
+    wait: ['seconds', 'label'],
+    stop_error: ['message', 'label'],
+    filter: ['arrayRef', 'expr', 'label'],
+    limit: ['arrayRef', 'count', 'mode', 'label'],
+    dedupe: ['arrayRef', 'keyField', 'label'],
+    aggregate: ['arrayRef', 'field', 'label'],
+    summarize: ['arrayRef', 'field', 'op', 'label'],
+    call_layer: ['inputs', 'label'],   // layerKey change = builder_replace_step (recursion guard re-runs)
+};
+
+/**
+ * Normalize a scalar/structured patch field to the exact shape the matching
+ * apply* builder would produce, so a patched step is byte-identical to a
+ * freshly-added one. Returns `undefined` to mean "clear this optional field"
+ * (the caller keeps an existing label instead of clearing it).
+ */
+function normalizePatchField(type, key, value) {
+    if (key === 'label') return (typeof value === 'string' && value.trim()) ? value : undefined;
+    if (type === 'ai_step') {
+        if (key === 'systemPrompt') return (typeof value === 'string' && value.trim()) ? value.trim() : null;
+        if (key === 'modelTier') return value || 'auto';
+        if (key === 'allowTools') return !!value;
+        if (key === 'tools') return Array.isArray(value) ? value.filter(t => typeof t === 'string') : null;
+        if (key === 'outputSchema') return value || null;
+    }
+    if (type === 'code') {
+        if (key === 'outputSchema') return value || null;
+        if (key === 'allowedTools') return Array.isArray(value) ? value : [];
+    }
+    if (type === 'notification' && key === 'channels') return Array.isArray(value) ? value : ['notification'];
+    if (type === 'switch') {
+        if (key === 'cases') return Array.isArray(value) ? value.map(c => ({ name: c.name, value: c.value })) : [];
+        if (key === 'defaultBranch') return typeof value === 'string' ? value : null;
+    }
+    if (type === 'loop' && key === 'maxIterations') return value || 100;
+    if (type === 'wait' && key === 'seconds') return Math.max(1, Math.min(86400, Number(value) || 1));
+    if (type === 'limit') {
+        if (key === 'count') return Math.max(0, Math.floor(Number(value) || 0));
+        if (key === 'mode') return value === 'last' ? 'last' : 'first';
+    }
+    if (type === 'dedupe' && key === 'keyField') return typeof value === 'string' ? value : undefined;
+    if (type === 'datetime') {
+        if (['input', 'input2', 'format', 'part', 'unit'].includes(key)) return typeof value === 'string' ? value : undefined;
+        if (key === 'amount') return typeof value === 'number' ? value : undefined;
+    }
+    return value;
+}
+
+/**
+ * §B3 inspect-before-bind gate. When the route has attached the per-turn
+ * `_inputSchemasByTool` map and the agent hasn't inspected `tool` this session,
+ * block adding a non-trivial integration_action (≥1 required input, or >1 total
+ * input) unless every required param is already bound. The reject is a
+ * self-correcting tool error — the loop then runs inspect → add automatically.
+ * No-op when no catalog is attached (tests / older callers) or the tool has no
+ * declared inputSchema.
+ */
+function inspectGateError(tool, rawInputs, draftWrap) {
+    if (!tool || typeof tool !== 'string' || !draftWrap) return null;
+    const schemas = draftWrap._inputSchemasByTool;
+    if (!schemas) return null;
+    const schema = schemas[tool];
+    if (!schema || !schema.properties) return null;        // unknown / declarationless tool → exempt
+    const props = Object.keys(schema.properties);
+    const required = Array.isArray(schema.required) ? schema.required : [];
+    const nonTrivial = required.length >= 1 || props.length > 1;
+    if (!nonTrivial) return null;                          // trivial tool → stays one-shot
+    const inspected = draftWrap._inspectedTools instanceof Set ? draftWrap._inspectedTools : null;
+    if (inspected && inspected.has(tool)) return null;     // already inspected this session
+    const bound = (rawInputs && typeof rawInputs === 'object') ? Object.keys(rawInputs) : [];
+    if (required.length && required.every(r => bound.includes(r))) return null;   // escape hatch
+    return {
+        error: `Inspect "${tool}" before adding it: call builder_inspect_tool({tool:"${tool}"}) to get its exact input params, then add the action with the correct param names.${required.length ? ` Required params: ${required.join(', ')}.` : ''}`,
+        _needsInspect: tool,
+    };
+}
+
+/**
+ * builder_update_step — patch an existing step in place (same type, same id,
+ * wiring preserved). Reuses validateAndFixBindings / sanitizeForEach so the
+ * patched step is identical to a freshly-added one.
+ */
+function applyUpdateStep(graph, args, draftWrap) {
+    const stepId = typeof args.stepId === 'string' ? args.stepId : null;
+    if (!stepId) return { error: 'stepId is required.' };
+    const patch = (args.patch && typeof args.patch === 'object' && !Array.isArray(args.patch)) ? args.patch : null;
+    if (!patch) return { error: 'patch must be an object of fields to change.' };
+    if ('type' in patch) return { error: 'Cannot change a step\'s type via builder_update_step — use builder_replace_step.' };
+    if ('id' in patch) return { error: 'Cannot change a step id.' };
+
+    const found = findStepAnywhere(graph, stepId);
+    if (!found) return { error: `Unknown stepId "${stepId}". Existing step ids: ${listStepIds(graph)}.` };
+    const step = found.step;
+    const allowed = PATCHABLE_FIELDS[step.type];
+    if (!allowed) return { error: `Step type "${step.type}" cannot be patched.` };
+    const bad = Object.keys(patch).filter(k => !allowed.includes(k));
+    if (bad.length) return { error: `Field(s) ${bad.join(', ')} not patchable on a ${step.type} step. Allowed: ${allowed.join(', ')}.` };
+
+    // §B3 gate: re-pointing an integration_action at a new tool re-arms inspect.
+    if (step.type === 'integration_action' && 'tool' in patch) {
+        const mergedInputs = ('inputs' in patch) ? { ...(step.inputs || {}), ...(patch.inputs || {}) } : (step.inputs || {});
+        const gate = inspectGateError(patch.tool, mergedInputs, draftWrap);
+        if (gate) return gate;
+    }
+
+    const next = { ...step };
+
+    // inputs / fields: merge-by-key (null deletes) unless inputsMode:'replace'.
+    const bindKey = step.type === 'set' ? 'fields' : 'inputs';
+    if (bindKey in patch) {
+        const mode = args.inputsMode === 'replace' ? 'replace' : 'merge';
+        let raw = (patch[bindKey] && typeof patch[bindKey] === 'object') ? patch[bindKey] : {};
+        if (mode === 'merge') {
+            const merged = { ...(step[bindKey] || {}) };
+            for (const [k, v] of Object.entries(raw)) { if (v === null) delete merged[k]; else merged[k] = v; }
+            raw = merged;
+        }
+        const { inputs, error } = validateAndFixBindings(raw, graph);
+        if (error) return { error };
+        next[bindKey] = inputs;
+    }
+
+    // forEach: re-validate; null clears it.
+    if ('forEach' in patch) {
+        if (patch.forEach === null) { delete next.forEach; }
+        else {
+            const { forEach, error } = sanitizeForEach(patch.forEach, graph);
+            if (error) return { error };
+            if (forEach) next.forEach = forEach; else delete next.forEach;
+        }
+    }
+
+    // Scalar / structured fields.
+    for (const k of allowed) {
+        if (k === 'inputs' || k === 'fields' || k === 'forEach') continue;
+        if (!(k in patch)) continue;
+        const norm = normalizePatchField(step.type, k, patch[k]);
+        if (norm === undefined) { if (k !== 'label') delete next[k]; }
+        else next[k] = norm;
+    }
+
+    // Derived fields the apply* builders compute.
+    if (step.type === 'code' && 'code' in patch) {
+        next.codeHash = crypto.createHash('sha256').update(next.code || '').digest('hex');
+    }
+    if (step.type === 'integration_action' && 'tool' in patch) {
+        next.sideEffect = isSideEffect(next.tool);
+        if (!('label' in patch) && (step.label === step.tool)) next.label = next.tool; // keep auto-label tracking the tool
+    }
+
+    found.container[found.index] = next;
+    return { updated: next };
+}
+
+/** builder_update_steps — batch, all-or-nothing (snapshot + rollback). */
+function applyUpdateSteps(graph, args, draftWrap) {
+    const updates = Array.isArray(args.updates) ? args.updates : null;
+    if (!updates || !updates.length) return { error: 'updates must be a non-empty array of { stepId, patch }.' };
+    const snapSteps = structuredClone(graph.steps);
+    const snapEdges = structuredClone(graph.edges);
+    const applied = [];
+    for (const u of updates) {
+        const r = applyUpdateStep(graph, u || {}, draftWrap);
+        if (r.error) {
+            graph.steps = snapSteps;
+            graph.edges = snapEdges;
+            return { error: `update for "${u && u.stepId}": ${r.error}`, _rolledBack: true };
+        }
+        applied.push(r.updated.id);
+    }
+    return { updated: applied };
+}
+
+// Map a step type to the apply* builder that constructs it — reused by
+// builder_replace_step so a type swap inherits every per-type validation/clamp.
+const ADD_FOR_TYPE = {
+    integration_action: applyAddAction, ai_step: applyAddAi, condition: applyAddCondition,
+    switch: applyAddSwitch, code: applyAddCode, notification: applyAddNotification, set: applyAddSet,
+    datetime: applyAddDateTime, wait: applyAddWait, stop_error: applyAddStopError,
+    filter: applyAddFilter, limit: applyAddLimit, dedupe: applyAddDedupe,
+    aggregate: applyAddAggregate, summarize: applyAddSummarize, call_layer: applyAddCallLayer, loop: applyAddLoop,
+};
+
+/**
+ * After a type swap (same id), reconcile the OUTGOING edges so the runner never
+ * dead-ends. Strips now-invalid branch labels, drops on_error edges from step
+ * types that can't carry them, and returns a human note when the agent must
+ * finish wiring (validation surfaces dead_branch/partial_branch as the signal).
+ */
+function reconcileOutgoingEdges(graph, oldStep, newStep) {
+    const id = newStep.id;
+    const wasBranching = BRANCHING_TYPES.has(oldStep.type);
+    const nowBranching = BRANCHING_TYPES.has(newStep.type);
+    const out = (graph.edges || []).filter(e => e.from === id);
+    const stripped = [];
+    const dropIdx = new Set();
+    for (const e of out) {
+        const lbl = e.label;
+        if (lbl === 'on_error') {
+            if (ERROR_BRANCH_FORBIDDEN_SOURCES.has(newStep.type)) dropIdx.add(e);
+            continue;
+        }
+        const isBranchLabel = lbl === 'then' || lbl === 'else' || (typeof lbl === 'string' && lbl.startsWith('case:'));
+        if (!isBranchLabel) continue;
+        // Labels are invalid when the step is no longer branching, or when the
+        // branch class changed (condition then/else ↔ switch case:*).
+        if (!nowBranching || (wasBranching && oldStep.type !== newStep.type)) {
+            delete e.label; delete e.caseName; stripped.push(`${lbl}→${e.to}`);
+        }
+    }
+    if (dropIdx.size) graph.edges = graph.edges.filter(e => !dropIdx.has(e));
+    const notes = [];
+    if (stripped.length) notes.push(`Stripped now-invalid branch labels on outgoing edges: ${stripped.join(', ')}.`);
+    if (dropIdx.size) notes.push(`Dropped on_error edge(s) — a ${newStep.type} step cannot carry one.`);
+    if (!wasBranching && nowBranching) {
+        notes.push(`This step is now branching (${newStep.type}) but its outgoing edge(s) are unlabelled — set branch targets so they don't dead-end (re-wire with builder_add_* branch/caseName, or builder_remove_step + re-add).`);
+    }
+    return notes.length ? notes.join(' ') : null;
+}
+
+/**
+ * builder_replace_step — change a step's TYPE in place, keeping its id and
+ * surrounding wiring. Builds the new step on a throwaway graph (so every apply*
+ * validation runs without touching real edges), grafts the old id, then
+ * reconciles outgoing branch edges.
+ */
+function applyReplaceStep(graph, args, { draft, scope = null } = {}, draftWrap) {
+    const stepId = typeof args.stepId === 'string' ? args.stepId : null;
+    if (!stepId) return { error: 'stepId is required.' };
+    const newType = typeof args.newType === 'string' ? args.newType : null;
+    const builder = newType && ADD_FOR_TYPE[newType];
+    if (!builder) return { error: `Cannot replace into type "${newType}". Allowed: ${Object.keys(ADD_FOR_TYPE).join(', ')}.` };
+    const spec = (args.spec && typeof args.spec === 'object' && !Array.isArray(args.spec)) ? args.spec : null;
+    if (!spec) return { error: 'spec must be an object with the new step\'s fields (same shape as builder_add_<newType>).' };
+
+    const found = findStepAnywhere(graph, stepId);
+    if (!found) return { error: `Unknown stepId "${stepId}". Existing step ids: ${listStepIds(graph)}.` };
+    if (found.kind === 'loop') {
+        return { error: 'Cannot replace a loop-body step\'s type in place — patch it with builder_update_step, or remove + add it inside the loop body.' };
+    }
+    const oldStep = found.step;
+
+    if (newType === 'integration_action') {
+        const gate = inspectGateError(spec.tool, spec.inputs, draftWrap);
+        if (gate) return gate;
+    }
+
+    // Throwaway graph: shares the real trigger (for ref validation) but its own
+    // empty steps/edges arrays so appendAfter wiring is discarded.
+    const scratch = { trigger: graph.trigger, steps: [], edges: [], layers: draft && draft.layers };
+    const buildArgs = { ...spec };
+    delete buildArgs.afterStepId; delete buildArgs.branch; delete buildArgs.caseName; delete buildArgs.scope;
+    const res = newType === 'call_layer'
+        ? builder(draft, buildArgs, { graph: scratch, scope })
+        : builder(scratch, buildArgs);
+    if (res.error) return res;
+    const built = res.added;
+    built.id = oldStep.id;                       // keep id → every edge still targets it
+
+    found.container[found.index] = built;
+    const rewired = reconcileOutgoingEdges(graph, oldStep, built);
+    return { replaced: built, ...(rewired ? { rewired } : {}) };
+}
+
+function applyRemoveStep(graph, args) {
     const id = args.stepId;
-    draft.steps = draft.steps.filter(s => s.id !== id);
-    draft.edges = draft.edges.filter(e => e.from !== id && e.to !== id);
-    return { removed: id };
+    const found = findStepAnywhere(graph, id);
+    if (!found) return { error: `Unknown stepId "${id}". Existing step ids: ${listStepIds(graph)}.` };
+
+    // Loop-body steps have no top-level edges — just splice them out.
+    if (found.kind === 'loop') {
+        found.container.splice(found.index, 1);
+        return { removed: id };
+    }
+
+    const reconnect = args.reconnect !== false;   // default true
+    const step = found.step;
+    const incoming = (graph.edges || []).filter(e => e.to === id);
+    const outgoing = (graph.edges || []).filter(e => e.from === id);
+    const bridges = [];
+
+    if (reconnect && incoming.length && outgoing.length) {
+        const branching = BRANCHING_TYPES.has(step.type);
+        // Successor targets to bridge to: prefer the success path (skip on_error).
+        let targets;
+        if (!branching) {
+            const succ = outgoing.filter(e => e.label !== 'on_error').map(e => e.to);
+            targets = succ.length ? succ : outgoing.map(e => e.to);
+        } else {
+            // Branching anchor: pick a single primary successor; the rest are dropped.
+            const primary = outgoing.find(e => e.label === 'then')
+                || outgoing.find(e => e.label === 'case:default')
+                || outgoing.find(e => e.label !== 'on_error')
+                || outgoing[0];
+            targets = primary ? [primary.to] : [];
+        }
+        for (const inc of incoming) {
+            for (const to of targets) {
+                if (inc.from === to) continue;
+                const e = { from: inc.from, to };
+                if (inc.label) { e.label = inc.label; if (inc.caseName) e.caseName = inc.caseName; }
+                const dup = (graph.edges || []).some(x => x.from === e.from && x.to === e.to && x.label === e.label);
+                if (!dup) { graph.edges.push(e); bridges.push(`${e.from}→${e.to}`); }
+            }
+        }
+    }
+
+    found.container.splice(found.index, 1);
+    graph.edges = graph.edges.filter(e => e.from !== id && e.to !== id);
+
+    const parts = [];
+    if (bridges.length) parts.push(`reconnected ${bridges.join(', ')}`);
+    if (reconnect && BRANCHING_TYPES.has(step.type) && outgoing.filter(e => e.label !== 'on_error').length > 1) {
+        parts.push('removed a branching step — only its primary branch was reconnected; re-wire the other branch targets if still needed');
+    }
+    return { removed: id, ...(parts.length ? { note: parts.join('; ') } : {}) };
 }
 
 function applySetMetadata(draft, args) {
@@ -1438,9 +1195,33 @@ async function applyInspectTool(args, draftWrap) {
     const tool = args && typeof args.tool === 'string' ? args.tool : null;
     if (!tool) return { error: 'tool name required' };
     const shapeCache = require('./shapeCache');
-    const { describeShape, getOutputSchema } = require('./outputSchemas');
+    const { describeShape, getOutputSchema, iterableFieldsOf } = require('./outputSchemas');
 
-    // Prefer runtime-cached shape (the source of truth from real runs).
+    // §B3: record that the agent inspected this tool this session so the
+    // add-action gate lets the subsequent builder_add_action through.
+    if (draftWrap && draftWrap._inspectedTools instanceof Set) draftWrap._inspectedTools.add(tool);
+
+    // §B2: INPUT params (names/types/required) from the per-turn catalog map the
+    // route attaches — so the agent binds the exact param names without guessing.
+    // The slim catalog only advertises an input COUNT; this is the on-demand detail.
+    let inputs = null;
+    let requiredInputs = [];
+    const inSchema = (draftWrap && draftWrap._inputSchemasByTool) ? draftWrap._inputSchemasByTool[tool] : null;
+    if (inSchema && inSchema.properties && typeof inSchema.properties === 'object') {
+        const required = new Set(Array.isArray(inSchema.required) ? inSchema.required : []);
+        inputs = {};
+        for (const [name, spec] of Object.entries(inSchema.properties)) {
+            inputs[name] = {
+                type: (spec && spec.type) || 'any',
+                required: required.has(name),
+                ...(spec && spec.description ? { description: String(spec.description).split('\n')[0] } : {}),
+                ...(spec && Array.isArray(spec.enum) ? { enum: spec.enum.slice(0, 20) } : {}),
+            };
+        }
+        requiredInputs = [...required];
+    }
+
+    // Prefer runtime-cached output shape (the source of truth from real runs).
     let shapeHint = null;
     let source = 'curated';
     try {
@@ -1454,10 +1235,29 @@ async function applyInspectTool(args, draftWrap) {
         shapeHint = describeShape(tool);
     }
     if (!shapeHint) {
-        return { tool, shape: null, source: 'unknown', note: 'No declared schema and no runtime sample. Run the tool once via dry-run / live to learn its shape, or just bind defensively.' };
+        return {
+            tool,
+            inputs,
+            requiredInputs,
+            shape: null,
+            source: 'unknown',
+            note: 'No declared output schema and no runtime sample. Run the tool once via dry-run / live to learn its shape, or just bind defensively.',
+        };
     }
     const schema = getOutputSchema(tool);
-    return { tool, shape: shapeHint, source, sample: schema?.sample ?? null };
+    // `iterableFields` names the array outputs a per-step `forEach` can run over
+    // (overRef = steps.<id>.output.<field>) — so the model picks the right one
+    // on demand instead of from a bloated always-on prompt.
+    const iterableFields = iterableFieldsOf(tool);
+    return {
+        tool,
+        inputs,
+        requiredInputs,
+        shape: shapeHint,
+        source,
+        sample: schema?.sample ?? null,
+        ...(iterableFields.length ? { iterableFields } : {}),
+    };
 }
 
 // ── Public API ──────────────────────────────────────────
@@ -1483,8 +1283,33 @@ function summariseDraftSteps(draft) {
             id: s.id,
             type: s.type,
             tool: s.tool || undefined,
+            layerKey: s.type === 'call_layer' ? (s.layerKey || undefined) : undefined,
+            forEach: s.forEach?.overRef ? `over ${s.forEach.overRef} as loop.${s.forEach.itemVar || 'item'}` : undefined,
             label: s.label || undefined,
         });
+    }
+    // Per-flowlet sections so the model can target scoped mutations: each
+    // entry reminds it of the flowlet key, its input params (bound inside as
+    // trigger.output.<param>) and the live step ids within that scope.
+    for (const [key, g] of Object.entries(draft?.layers || {})) {
+        if (!g || typeof g !== 'object') continue;
+        const steps = [{
+            id: g.trigger?.id || 'trg',
+            type: 'trigger',
+            kind: 'layer_input',
+            params: (Array.isArray(g.trigger?.params) ? g.trigger.params : []).map(p => p?.name).filter(Boolean),
+        }];
+        for (const s of (g.steps || [])) {
+            steps.push({
+                id: s.id,
+                type: s.type,
+                tool: s.tool || undefined,
+                layerKey: s.type === 'call_layer' ? (s.layerKey || undefined) : undefined,
+                forEach: s.forEach?.overRef ? `over ${s.forEach.overRef} as loop.${s.forEach.itemVar || 'item'}` : undefined,
+                label: s.label || undefined,
+            });
+        }
+        list.push({ layer: key, title: g.title || undefined, steps });
     }
     return list;
 }
@@ -1493,13 +1318,77 @@ const MUTATING_TOOLS = new Set([
     'builder_propose_trigger', 'builder_add_action', 'builder_add_ai_step',
     'builder_add_condition', 'builder_add_loop', 'builder_add_code_step',
     'builder_add_notification', 'builder_remove_step', 'builder_set_metadata',
+    // §A in-place editing (no destroy-to-update)
+    'builder_update_step', 'builder_update_steps', 'builder_replace_step',
     // n8n-style utility nodes
     'builder_add_set', 'builder_add_datetime', 'builder_add_wait',
-    'builder_add_stop_error', 'builder_add_switch',
+    'builder_add_stop_error', 'builder_add_switch', 'builder_add_call_layer',
     'builder_add_filter', 'builder_add_limit', 'builder_add_dedupe',
     'builder_add_aggregate', 'builder_add_summarize',
     'builder_add_array_op',
+    // inline flowlets
+    'builder_create_layer', 'builder_set_layer_contract',
+    // §WS4 on-error branches
+    'builder_wire_error_branch',
 ]);
+
+// Step-graph mutators that accept scope:'<layerKey>' to operate inside
+// definition.layers[<key>] instead of the root flow. Excludes the root-only
+// tools (propose_trigger, set_metadata) and the flowlet-management tools
+// (create_layer / set_layer_contract take layerKey explicitly).
+const SCOPED_GRAPH_TOOLS = new Set(
+    [...MUTATING_TOOLS].filter(n => ![
+        'builder_propose_trigger', 'builder_set_metadata',
+        'builder_create_layer', 'builder_set_layer_contract',
+    ].includes(n)),
+);
+
+// Inject the shared `scope` parameter into every scoped tool's schema so
+// the model discovers it without 18 hand-edited copies drifting apart.
+for (const t of TOOL_SCHEMAS) {
+    if (!SCOPED_GRAPH_TOOLS.has(t.function?.name)) continue;
+    t.function.parameters = t.function.parameters || { type: 'object', properties: {} };
+    t.function.parameters.properties = t.function.parameters.properties || {};
+    t.function.parameters.properties.scope = {
+        type: 'string',
+        description: "Optional inline-flowlet key — apply this mutation inside definition.layers[<scope>] (that flowlet's own sub-flow) instead of the main flow. Omit for the main flow.",
+    };
+}
+
+// Per-step iteration: a leaf step can run once per item of an upstream array
+// via `forEach` — no wrapping `loop` container. Injected (single source of
+// truth) only into the five step types the validator permits; validate.js's
+// `foreach.type_unsupported` guards everything else.
+const FOREACH_CAPABLE_TOOLS = new Set([
+    'builder_add_action', 'builder_add_ai_step', 'builder_add_code_step',
+    'builder_add_notification', 'builder_add_set',
+]);
+for (const t of TOOL_SCHEMAS) {
+    if (!FOREACH_CAPABLE_TOOLS.has(t.function?.name)) continue;
+    t.function.parameters = t.function.parameters || { type: 'object', properties: {} };
+    t.function.parameters.properties = t.function.parameters.properties || {};
+    t.function.parameters.properties.forEach = {
+        type: 'object',
+        description: 'Run this ONE step once per item of an upstream array (no wrapping loop needed). Reference the current item inside this step as `loop.<itemVar>`. Prefer this over builder_add_loop whenever only a single step repeats per item.',
+        properties: {
+            overRef: { type: 'string', description: 'Ref to the upstream array, e.g. "steps.<id>.output.results". Must start with trigger/steps/vars/secrets/loop.' },
+            itemVar: { type: 'string', description: 'Name for the current item (default "item"); reference it as loop.<itemVar> inside this step.' },
+            maxIterations: { type: 'number', description: 'Optional cap, 1..1000 (default 100).' },
+        },
+        required: ['overRef'],
+    };
+}
+
+// §WS4: extend every `branch` enum with 'error' in one place (same
+// no-drift rationale as the scope injection above). branch:'error' wires
+// the new step onto afterStepId's on_error branch — it runs only when
+// that step fails after exhausting its retries.
+for (const t of TOOL_SCHEMAS) {
+    const b = t.function?.parameters?.properties?.branch;
+    if (!b || !Array.isArray(b.enum)) continue;
+    if (!b.enum.includes('error')) b.enum.push('error');
+    b.description = `${b.description || ''} Pass "error" to wire this step onto afterStepId's on_error branch instead (runs only when that step fails after retries; bind the failure via steps.<afterStepId>.error.message).`.trim();
+}
 
 async function applyToolCall(name, args, draftWrap) {
     const result = await _applyToolCallRaw(name, args, draftWrap);
@@ -1523,26 +1412,48 @@ async function applyToolCall(name, args, draftWrap) {
 
 async function _applyToolCallRaw(name, args, draftWrap) {
     const draft = draftWrap.def;
+    // Central scope resolution (inline flowlets): scoped tools may pass
+    // scope:'<layerKey>' to operate on definition.layers[<key>]'s graph
+    // instead of the root flow. Resolved ONCE here so every apply function
+    // below just works on `graph` (mini-definitions share the root shape).
+    const scope = (args && typeof args.scope === 'string' && args.scope) ? args.scope : null;
+    let graph = draft;
+    if (scope) {
+        if (!SCOPED_GRAPH_TOOLS.has(name)) {
+            return { error: `Tool ${name} does not accept a scope. Flowlet triggers/contracts are managed via builder_create_layer / builder_set_layer_contract.` };
+        }
+        graph = draft.layers?.[scope];
+        if (!graph) {
+            return { error: `Unknown flowlet scope "${scope}". Existing flowlets: ${Object.keys(draft.layers || {}).join(', ') || '(none — create one with builder_create_layer)'}.` };
+        }
+    }
     switch (name) {
         case 'builder_propose_trigger':    return applyTrigger(draft, args);
-        case 'builder_add_action':         return applyAddAction(draft, args);
-        case 'builder_add_ai_step':        return applyAddAi(draft, args);
-        case 'builder_add_condition':      return applyAddCondition(draft, args);
-        case 'builder_add_loop':           return applyAddLoop(draft, args);
-        case 'builder_add_code_step':      return applyAddCode(draft, args);
-        case 'builder_add_notification':   return applyAddNotification(draft, args);
-        case 'builder_add_set':            return applyAddSet(draft, args);
-        case 'builder_add_datetime':       return applyAddDateTime(draft, args);
-        case 'builder_add_wait':           return applyAddWait(draft, args);
-        case 'builder_add_stop_error':     return applyAddStopError(draft, args);
-        case 'builder_add_switch':         return applyAddSwitch(draft, args);
-        case 'builder_add_filter':         return applyAddFilter(draft, args);
-        case 'builder_add_limit':          return applyAddLimit(draft, args);
-        case 'builder_add_dedupe':         return applyAddDedupe(draft, args);
-        case 'builder_add_aggregate':      return applyAddAggregate(draft, args);
-        case 'builder_add_summarize':      return applyAddSummarize(draft, args);
-        case 'builder_add_array_op':       return applyAddArrayOp(draft, args);
-        case 'builder_remove_step':        return applyRemoveStep(draft, args);
+        case 'builder_add_action':         return applyAddAction(graph, args, draftWrap);
+        case 'builder_add_ai_step':        return applyAddAi(graph, args);
+        case 'builder_add_condition':      return applyAddCondition(graph, args);
+        case 'builder_add_loop':           return applyAddLoop(graph, args);
+        case 'builder_add_code_step':      return applyAddCode(graph, args);
+        case 'builder_add_notification':   return applyAddNotification(graph, args);
+        case 'builder_add_set':            return applyAddSet(graph, args);
+        case 'builder_add_call_layer':     return applyAddCallLayer(draft, args, { graph, scope });
+        case 'builder_create_layer':       return applyCreateLayer(draft, args);
+        case 'builder_set_layer_contract': return applySetLayerContract(draft, args);
+        case 'builder_add_datetime':       return applyAddDateTime(graph, args);
+        case 'builder_add_wait':           return applyAddWait(graph, args);
+        case 'builder_add_stop_error':     return applyAddStopError(graph, args);
+        case 'builder_add_switch':         return applyAddSwitch(graph, args);
+        case 'builder_add_filter':         return applyAddFilter(graph, args);
+        case 'builder_add_limit':          return applyAddLimit(graph, args);
+        case 'builder_add_dedupe':         return applyAddDedupe(graph, args);
+        case 'builder_add_aggregate':      return applyAddAggregate(graph, args);
+        case 'builder_add_summarize':      return applyAddSummarize(graph, args);
+        case 'builder_add_array_op':       return applyAddArrayOp(graph, args);
+        case 'builder_wire_error_branch':  return applyWireErrorBranch(graph, args);
+        case 'builder_remove_step':        return applyRemoveStep(graph, args);
+        case 'builder_update_step':        return applyUpdateStep(graph, args, draftWrap);
+        case 'builder_update_steps':       return applyUpdateSteps(graph, args, draftWrap);
+        case 'builder_replace_step':       return applyReplaceStep(graph, args, { draft, scope }, draftWrap);
         case 'builder_set_metadata':       return applySetMetadata(draftWrap, args);
         case 'builder_summarise':          return applySummarise(draft);
         case 'builder_inspect_tool':       return applyInspectTool(args, draftWrap);
@@ -1628,7 +1539,12 @@ async function persistDraft(draftWrap, { finalize = false } = {}) {
 }
 
 module.exports = {
-    TOOL_SCHEMAS, applyToolCall, persistDraft, emptyDefinition,
+    TOOL_SCHEMAS, MUTATING_TOOLS, SCOPED_GRAPH_TOOLS, applyToolCall, persistDraft, emptyDefinition,
+    // Flowlet-creation primitives reused by the flowlet sub-agent (flowletAgent.js)
+    // so its isolated drafts seed the EXACT same skeleton / keying.
+    generateLayerKey, makeLayerSkeleton, sanitizeLayerParams,
     TRIGGER_FIELDS_BY_EVENT, TRIGGER_OUTPUT_SAMPLES, buildTriggerOutputsCatalog,
     _test_validateAndFixBindings: validateAndFixBindings,
+    // §A in-place-edit internals (exported for tests)
+    findStepAnywhere, PATCHABLE_FIELDS,
 };

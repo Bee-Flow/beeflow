@@ -163,8 +163,11 @@ async function ingestNextcloudRecording(opts) {
         let { merged, transcript, speakers, totalDuration } = buildTranscriptArtifacts(response.segments || []);
 
         // Map diarization speaker IDs → real names (parity with upload route).
+        // For Talk recordings we also pass the real attendee roster so the model
+        // maps speaker_0/1/2 to the actual participants instead of guessing.
+        const participantNames = talkRoomToken ? await resolveTalkParticipantNames(session, userId, talkRoomToken) : [];
         const speakerIds = speakers.map(s => s.id);
-        const nameMapping = speakerIds.length ? await identifySpeakerNames(transcript, speakerIds, language, userName, orgId) : null;
+        const nameMapping = speakerIds.length ? await identifySpeakerNames(transcript, speakerIds, language, userName, orgId, participantNames) : null;
         if (nameMapping) {
             for (const seg of merged) {
                 if (nameMapping[seg.speaker]) seg.speaker = nameMapping[seg.speaker];
@@ -262,6 +265,25 @@ async function postSummaryToTalk({ session, userId, talkRoomToken, title, summar
     } catch (err) {
         console.warn(`[IngestNextcloudRecording] Talk write-back threw for ${talkRoomToken}: ${err.message}`);
         return { ok: false, error: err.message };
+    }
+}
+
+/**
+ * Fetch the real display-name roster for a Talk room (best-effort). Used to
+ * anchor diarization → real-name mapping. Never throws.
+ */
+async function resolveTalkParticipantNames(session, userId, talkRoomToken) {
+    try {
+        const { executeNextcloudTalkTool } = require('../../integrations/nextcloudTalkTools');
+        const res = await executeNextcloudTalkTool('nextcloud_talk_list_participants', { token: talkRoomToken }, userId, session);
+        if (!res || res.error || !Array.isArray(res.participants)) return [];
+        const names = res.participants
+            .map(p => (p.displayName || '').trim())
+            // Drop empty + obvious bot/system actors.
+            .filter(n => n && !/^(bot|system|changelog)$/i.test(n));
+        return Array.from(new Set(names));
+    } catch (_) {
+        return [];
     }
 }
 

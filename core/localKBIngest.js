@@ -843,14 +843,18 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
         // span both org-owned and system-provisioned KBs.
         const vectorSearchPromise = (pgvectorAvailable && vectorStr)
             ? client.query(
+                // Access boundary is kb_ids (authorized by every caller upstream);
+                // knowledge_base_id scoping already restricts to those KBs. We do
+                // NOT filter by the searcher's tenant_id — org-shared KBs are
+                // ingested under the KB owner's tenant, so a tenant_id = searcher
+                // filter wrongly hides every chunk for anyone but the ingester.
                 `SELECT id, title, content, source_uri, document_id, chunk_id,
                         1 - (embedding <=> $1::vector) AS vec_score
                  FROM kb_chunks
-                 WHERE (tenant_id = $2 OR tenant_id = 'system')
-                   AND knowledge_base_id = ANY($3::text[])
+                 WHERE knowledge_base_id = ANY($2::text[])
                  ORDER BY embedding <=> $1::vector
-                 LIMIT $4`,
-                [vectorStr, tenantId, kbIds, topK * 2]
+                 LIMIT $3`,
+                [vectorStr, kbIds, topK * 2]
             ).catch(err => { console.warn(`[LocalKBSearch] Vector search failed: ${err.message}`); return { rows: [] }; })
             : Promise.resolve({ rows: [] });
 
@@ -863,15 +867,14 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
                             ts_rank_cd(tsv, websearch_to_tsquery('simple', $1))
                         ) AS fts_score
                  FROM kb_chunks
-                 WHERE (tenant_id = $2 OR tenant_id = 'system')
-                   AND knowledge_base_id = ANY($3::text[])
+                 WHERE knowledge_base_id = ANY($2::text[])
                    AND (
                        tsv @@ websearch_to_tsquery('dutch', $1)
                        OR tsv @@ websearch_to_tsquery('simple', $1)
                    )
                  ORDER BY fts_score DESC
                  LIMIT 15`,
-                [ftsQueryStr, tenantId, kbIds]
+                [ftsQueryStr, kbIds]
             ).catch(e => { console.warn('[LocalKBSearch] FTS query failed:', e.message); return { rows: [] }; })
             : Promise.resolve({ rows: [] });
 
@@ -896,15 +899,14 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
                                 ts_rank_cd(tsv, websearch_to_tsquery('simple', $1))
                             ) AS fts_score
                      FROM kb_chunks
-                     WHERE (tenant_id = $2 OR tenant_id = 'system')
-                       AND knowledge_base_id = ANY($3::text[])
+                     WHERE knowledge_base_id = ANY($2::text[])
                        AND (
                            tsv @@ websearch_to_tsquery('dutch', $1)
                            OR tsv @@ websearch_to_tsquery('simple', $1)
                        )
                      ORDER BY fts_score DESC
                      LIMIT 15`,
-                    [ftsOrQuery, tenantId, kbIds]
+                    [ftsOrQuery, kbIds]
                 );
             } catch (e) {
                 console.warn('[LocalKBSearch] FTS OR fallback failed:', e.message);
@@ -1004,10 +1006,9 @@ async function searchLocally(tenantId, kbIds, query, options = {}) {
                          SELECT document_id, chunk_id FROM kb_chunks WHERE id = ANY($1::bigint[])
                      ) h ON c.document_id = h.document_id
                         AND c.chunk_id BETWEEN h.chunk_id - 1 AND h.chunk_id + 1
-                     WHERE (c.tenant_id = $2 OR c.tenant_id = 'system')
-                       AND c.id != ALL($1::bigint[])
+                     WHERE c.id != ALL($1::bigint[])
                      LIMIT 10`,
-                    [results.map(r => r.id), tenantId]
+                    [results.map(r => r.id)]
                 );
 
                 // Issue #6 fix: apply orphan filter to adjacent chunks too

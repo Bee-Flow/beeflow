@@ -566,7 +566,7 @@ router.get('/organizations/:id', requireOrgAdmin('id'), async (req, res) => {
 
 router.put('/organizations/:id', requireOrgAdmin('id'), async (req, res) => {
     const { id } = req.params;
-    const { name, description, tagline, address, email, phone, website, kvk, vat, logo, footerText, defaultGroups, allowSignup, authMethod, enabledIntegrations, autoApproveSSO, allowedDomains, usagePooled } = req.body;
+    const { name, description, tagline, address, billingLine2, billingPostalCode, billingCity, billingCountry, email, phone, website, kvk, vat, logo, footerText, defaultGroups, allowSignup, authMethod, enabledIntegrations, autoApproveSSO, allowedDomains, usagePooled } = req.body;
 
     // authMethod can only be set once — if already set, ignore any change
     const existing = await userStore.getOrganization(id);
@@ -614,11 +614,11 @@ router.put('/organizations/:id', requireOrgAdmin('id'), async (req, res) => {
         finalAllowedDomains = normalised;
     }
 
-    const orgUpdates = { name, description, tagline, address, email, phone, website, kvk, vat, logo, footerText, defaultGroups, allowSignup, authMethod: finalAuthMethod, enabledIntegrations: finalIntegrations, autoApproveSSO, allowedDomains: finalAllowedDomains, usagePooled };
+    const orgUpdates = { name, description, tagline, address, billingLine2, billingPostalCode, billingCity, billingCountry, email, phone, website, kvk, vat, logo, footerText, defaultGroups, allowSignup, authMethod: finalAuthMethod, enabledIntegrations: finalIntegrations, autoApproveSSO, allowedDomains: finalAllowedDomains, usagePooled };
     if (await userStore.updateOrganization(id, orgUpdates)) {
         // Record only the access-relevant deltas. existing was loaded above
         // for the authMethod check; reuse it.
-        const AUDIT_FIELDS = ['name', 'description', 'tagline', 'address', 'email', 'phone', 'website', 'kvk', 'vat', 'authMethod', 'enabledIntegrations', 'allowSignup', 'autoApproveSSO', 'allowedDomains', 'defaultGroups', 'usagePooled'];
+        const AUDIT_FIELDS = ['name', 'description', 'tagline', 'address', 'billingLine2', 'billingPostalCode', 'billingCity', 'billingCountry', 'email', 'phone', 'website', 'kvk', 'vat', 'authMethod', 'enabledIntegrations', 'allowSignup', 'autoApproveSSO', 'allowedDomains', 'defaultGroups', 'usagePooled'];
         const oldVals = {};
         const newVals = {};
         for (const f of AUDIT_FIELDS) {
@@ -637,6 +637,18 @@ router.put('/organizations/:id', requireOrgAdmin('id'), async (req, res) => {
                 newVals,
                 id,
             );
+        }
+        // Keep the org's Stripe Customer (and thus Checkout + Billing Portal)
+        // in sync with the billing address/phone/name just saved. Cloud-only,
+        // fire-and-forget, non-fatal: no-op when the org has no Stripe customer.
+        if ((process.env.DEPLOYMENT_MODE || 'cloud') === 'cloud') {
+            const billingTouched = ['address', 'billingLine2', 'billingPostalCode', 'billingCity', 'billingCountry', 'phone', 'name', 'email']
+                .some(f => orgUpdates[f] !== undefined);
+            if (billingTouched) {
+                setImmediate(() => {
+                    require('../services/stripeService').pushOrgBillingToStripe(id).catch(() => {});
+                });
+            }
         }
         res.json({ success: true });
     } else {
@@ -887,6 +899,69 @@ router.put('/groups/:id', requireAuth, async (req, res) => {
     } else {
         res.status(404).json({ error: 'Group not found' });
     }
+});
+
+// Reciprocal group→user membership management (BFSF-219). The forward
+// user→group flow already existed (PUT /auth/users/:id with a `groups` array
+// from the Users tab); this lets an admin add/remove members directly from the
+// group view. Membership lives on the user's `groups` array, so we update the
+// target user. Same permission model + same-org guard as editing the group.
+async function assertCanManageGroupMembers(req, res, groupId) {
+    const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
+    const adminId = req.session.user?.id;
+    const allGroups = await userStore.getAllGroups();
+    const group = allGroups.find(g => g.id === groupId);
+    if (!group) { res.status(404).json({ error: 'Group not found' }); return null; }
+    if (!isSuperAdmin) {
+        const perms = await getUserPermissions(adminId, req.session);
+        if (!perms.includes('all') && !perms.includes('org_admin') && !perms.includes('manage_users')) {
+            res.status(403).json({ error: 'Organisation admin access required to manage group members' });
+            return null;
+        }
+        const currentUser = await userStore.getUser(adminId);
+        if (!currentUser?.organizationId || group.organizationId !== currentUser.organizationId) {
+            res.status(403).json({ error: 'You can only manage groups in your organisation' });
+            return null;
+        }
+    }
+    return { group, adminId, isSuperAdmin };
+}
+
+router.post('/groups/:id/members', requireAuth, async (req, res) => {
+    const { id } = req.params;
+    const targetUserId = req.body?.userId;
+    if (!targetUserId) return res.status(400).json({ error: 'userId required' });
+    const ctx = await assertCanManageGroupMembers(req, res, id);
+    if (!ctx) return;
+    const target = await userStore.getUser(targetUserId);
+    if (!target) return res.status(404).json({ error: 'User not found' });
+    if (!ctx.isSuperAdmin && target.organizationId !== ctx.group.organizationId) {
+        return res.status(403).json({ error: 'User is not in this organisation' });
+    }
+    const groups = Array.isArray(target.groups) ? target.groups : [];
+    if (groups.includes(id)) return res.json({ success: true, alreadyMember: true });
+    if (!await userStore.updateUser(targetUserId, { groups: [...groups, id] })) {
+        return res.status(500).json({ error: 'Failed to add member' });
+    }
+    await userStore.logAccessAudit('group.member.add', 'group', id, ctx.adminId || null, null, { userId: targetUserId }, ctx.group.organizationId || null);
+    try { await invalidateAllPermissionCaches(); } catch (_) { /* best-effort */ }
+    res.json({ success: true });
+});
+
+router.delete('/groups/:id/members/:userId', requireAuth, async (req, res) => {
+    const { id, userId: targetUserId } = req.params;
+    const ctx = await assertCanManageGroupMembers(req, res, id);
+    if (!ctx) return;
+    const target = await userStore.getUser(targetUserId);
+    if (!target) return res.status(404).json({ error: 'User not found' });
+    const groups = Array.isArray(target.groups) ? target.groups : [];
+    if (!groups.includes(id)) return res.json({ success: true, notMember: true });
+    if (!await userStore.updateUser(targetUserId, { groups: groups.filter(g => g !== id) })) {
+        return res.status(500).json({ error: 'Failed to remove member' });
+    }
+    await userStore.logAccessAudit('group.member.remove', 'group', id, ctx.adminId || null, { userId: targetUserId }, null, ctx.group.organizationId || null);
+    try { await invalidateAllPermissionCaches(); } catch (_) { /* best-effort */ }
+    res.json({ success: true });
 });
 
 router.delete('/groups/:id', requireAuth, async (req, res) => {
@@ -1411,6 +1486,7 @@ async function resolveActiveFeaturesContext(req) {
             orgId: null,
             allowedBetaFeatures: [], enabledBetaFeatures: [],
             allowedIntegrations: [], enabledIntegrations: [],
+            customIntegrations: [],
             betaRegistry: BETA_FEATURES,
             betaGoverned: betaGovernedBySubscription(),
         };
@@ -1457,11 +1533,30 @@ async function resolveActiveFeaturesContext(req) {
     // enabled. Self-hosted keeps the org-admin's saved active subset.
     const betaGoverned = betaGovernedBySubscription();
 
+    // Custom integrations (AI Integration Builder) — surface the org's ACTIVE
+    // custom integrations additively so the panel can render them alongside
+    // the catalog. Fail-soft to []; hidden entirely while the dark-ship kill
+    // switch is off (the same flag gates every other layer of the feature).
+    let customIntegrations = [];
+    try {
+        const { isCustomIntegrationsEnabled } = require('../core/customIntegrations/featureFlag');
+        if (await isCustomIntegrationsEnabled()) {
+            const rows = await require('../stores/orgCustomIntegrationStore').listActiveForOrg(orgId);
+            customIntegrations = rows.map(r => ({
+                id: `custom:${r.id}`,
+                name: r.name,
+                description: r.description || '',
+                category: 'Custom integrations',
+            }));
+        }
+    } catch (_) { /* fail-soft — never break the panel */ }
+
     return {
         orgId,
         allowedBetaFeatures,
         enabledBetaFeatures: betaGoverned ? allowedBetaFeatures : enabledBetaFeatures,
         allowedIntegrations: planCappedInt, enabledIntegrations,
+        customIntegrations,
         betaRegistry: BETA_FEATURES,
         betaGoverned,
     };
@@ -1566,6 +1661,308 @@ router.put('/me/active-features', requireAuth, async (req, res) => {
         res.json({ orgId: ctx.orgId, enabledBetaFeatures: savedBeta, enabledIntegrations: savedInt });
     } catch (e) {
         console.error('[ActiveFeatures] /me PUT error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ── Unified entitlements (the single client snapshot + Access matrix) ─────
+// GET /auth/my-entitlements — one read for the whole SPA. Supersedes the read
+// side of /api/license/status + /auth/my-permissions + /auth/me/active-features.
+router.get('/my-entitlements', requireAuth, async (req, res) => {
+    try {
+        const entitlements = require('../core/entitlements');
+        const snap = await entitlements.resolveEntitlements({
+            userId: req.session.user?.id,
+            orgId: req.session.user?.organizationId || req.session.user?.orgId || null,
+            session: req.session,
+            req,
+        });
+        const { _sets, ...pub } = snap;
+        res.json({
+            ...pub,
+            registry: entitlements.registry.listCapabilities().map(c => ({
+                id: c.id, kind: c.kind, name: c.name, description: c.description,
+                category: c.category, lifecycle: c.lifecycle, userFacing: c.userFacing,
+                // licenseFeature lets the SPA resolve legacy licence-feature names
+                // (e.g. 'ticket_assistant') to their capability id
+                // ('itil_ticket_assistant') so hasFeature()/can() accept either
+                // namespace and agree with the server gate.
+                licenseFeature: c.licenseFeature || null,
+            })),
+        });
+    } catch (e) {
+        console.error('[Entitlements] /my-entitlements error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Resolve the ORG-scoped entitlement snapshot (ceiling + actual org-wide grants)
+// independent of who is asking — uses the org's own tier, never the caller's
+// (super-admin) elevated tier, so the matrix shows the real org state.
+async function resolveOrgEntitlementSnapshot(orgId) {
+    const entitlements = require('../core/entitlements');
+    return entitlements.resolveEntitlements({ userId: null, orgId, session: null, req: null });
+}
+
+function unionKindArrays(kindObj) {
+    return [...(kindObj.core || []), ...(kindObj.beta || []), ...(kindObj.integration || [])];
+}
+
+// Shared builder for the "Access & Permissions" matrix payload (org-scoped).
+async function buildGroupAccessResponse(orgId) {
+    const entitlements = require('../core/entitlements');
+    const snap = await resolveOrgEntitlementSnapshot(orgId);
+    // Ensure installed MCP servers are projected as integration capabilities so
+    // they appear in the matrix (even if the snapshot above was degraded/cached).
+    await entitlements.registry.refreshMcpIntegrationDescriptors();
+    const matrixCaps = entitlements.registry.listCapabilities().filter(c => c.userFacing && c.groupTogglable);
+    const capIdSet = new Set(matrixCaps.map(c => c.id));
+    const capabilities = matrixCaps.map(c => ({ id: c.id, kind: c.kind, name: c.name, description: c.description, category: c.category, lifecycle: c.lifecycle }));
+    const allGroups = await userStore.getAllGroups();
+    const groups = allGroups
+        .filter(g => g.organizationId === orgId)
+        .map(g => ({ id: g.id, name: g.name, granted: (Array.isArray(g.granted_capabilities) ? g.granted_capabilities : []).filter(id => capIdSet.has(id)) }));
+    // Keep ceiling/everyone consistent with the matrix-visible capabilities
+    // (excludes NC family + exempt + infra core, which aren't toggled here).
+    const inMatrix = (ids) => unionKindArrays(ids).filter(id => capIdSet.has(id));
+    return {
+        orgId,
+        mode: snap.mode,
+        capabilities,
+        // The distribution matrix is bounded by the org's ACCESS MENU
+        // (orgAvailable), not the raw plan/license ceiling: an org-admin can only
+        // grant what the org has been given access to. Locked rows = outside the
+        // menu. The super-admin sets the menu in the Organisation access surface.
+        ceiling: inMatrix(snap.orgAvailable),
+        everyone: inMatrix(snap.orgEnabled),
+        groups,
+        // On cloud the subscription governs which betas the org has; the beta
+        // "All members" column is plan-driven (read-only). Integrations (incl.
+        // MCP servers) and core are org + per-group distributable in both modes.
+        betaGoverned: snap.mode === 'cloud',
+    };
+}
+
+// Shared writer for the org-wide "All members" grants (clamped to ceiling).
+async function writeOrgAccessGrants(orgId, granted, actorId) {
+    const entitlements = require('../core/entitlements');
+    const snap = await resolveOrgEntitlementSnapshot(orgId);
+    await entitlements.registry.refreshMcpIntegrationDescriptors(); // so getCapability('mcp:x') resolves
+    // Clamp to the org's ACCESS MENU (orgAvailable), not the raw ceiling, so an
+    // org-admin's "All members" grants can never exceed the org's access.
+    const bound = snap.orgAvailable;
+    // MCP servers have kind 'integration' now → they land in buckets.integration
+    // and persist via setOrgEnabledIntegrations, like every other integration.
+    const buckets = { core: [], beta: [], integration: [] };
+    for (const capId of granted) {
+        const cap = entitlements.registry.getCapability(capId);
+        if (!cap || !cap.groupTogglable) continue;
+        if (!bound[cap.kind] || !bound[cap.kind].includes(capId)) continue; // server-side clamp
+        buckets[cap.kind].push(capId);
+    }
+    await userStore.setOrgEnabledIntegrations(orgId, buckets.integration); // NC bypasses; MCP included
+    if (snap.mode !== 'cloud') await userStore.setOrgEnabledBetaFeatures(orgId, buckets.beta); // cloud betas governed
+    await userStore.setOrgGrantedCapabilities(orgId, [...buckets.core]);
+    await entitlements.invalidateForOrg(orgId);
+    try {
+        await userStore.logAccessAudit('org.access.update', 'organization', orgId, actorId || null, {}, { granted }, orgId);
+    } catch (e) { console.warn('[Entitlements] org-access audit failed:', e.message); }
+    return [...buckets.integration, ...buckets.beta, ...buckets.core];
+}
+
+// GET /auth/me/group-access — matrix data for the caller's own organisation.
+router.get('/me/group-access', requireAuth, async (req, res) => {
+    if (!(await requireOrgAdminLike(req, res))) return;
+    try {
+        const ctx = await resolveActiveFeaturesContext(req);
+        if (!ctx.orgId) {
+            return res.json({ orgId: null, mode: betaGovernedBySubscription() ? 'cloud' : 'self-hosted', capabilities: [], ceiling: [], everyone: [], groups: [], betaGoverned: betaGovernedBySubscription() });
+        }
+        res.json(await buildGroupAccessResponse(ctx.orgId));
+    } catch (e) {
+        console.error('[Entitlements] /me/group-access error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// PUT /auth/me/org-access — write the caller's org-wide "All members" grants.
+router.put('/me/org-access', requireAuth, async (req, res) => {
+    if (!(await requireOrgAdminLike(req, res))) return;
+    try {
+        const { granted } = req.body || {};
+        if (!Array.isArray(granted)) return res.status(400).json({ error: 'granted must be an array of capability ids' });
+        const ctx = await resolveActiveFeaturesContext(req);
+        if (!ctx.orgId) return res.status(400).json({ error: 'No organisation to update' });
+        const everyone = await writeOrgAccessGrants(ctx.orgId, granted, req.session.user?.id);
+        res.json({ success: true, everyone });
+    } catch (e) {
+        console.error('[Entitlements] /me/org-access PUT error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Org-scoped variants for the super-admin Beheerdashboard (manage any org).
+// requireOrgAdmin('orgId') passes for super-admins and for that org's admins.
+router.get('/organizations/:orgId/group-access', requireOrgAdmin('orgId'), async (req, res) => {
+    try {
+        res.json(await buildGroupAccessResponse(req.params.orgId));
+    } catch (e) {
+        console.error('[Entitlements] org group-access error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+router.put('/organizations/:orgId/org-access', requireOrgAdmin('orgId'), async (req, res) => {
+    try {
+        const { granted } = req.body || {};
+        if (!Array.isArray(granted)) return res.status(400).json({ error: 'granted must be an array of capability ids' });
+        const everyone = await writeOrgAccessGrants(req.params.orgId, granted, req.session.user?.id);
+        res.json({ success: true, everyone });
+    } catch (e) {
+        console.error('[Entitlements] org org-access PUT error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ── Organisation access menu (super-admin only) ──────────────────────────────
+// The per-org set of capabilities the org MAY use, within the plan/license
+// ceiling. This is the upper bound the org-admin distributes within (it is NOT
+// a grant). Only a platform super-admin can change it.
+function requireSuperAdmin(req, res) {
+    const ok = req.session?.isAdmin || req.session?.user?.role === 'admin';
+    if (!ok) { res.status(403).json({ error: 'Super-admin access required' }); return false; }
+    return true;
+}
+
+async function buildOrgAvailabilityResponse(orgId) {
+    const entitlements = require('../core/entitlements');
+    const snap = await resolveOrgEntitlementSnapshot(orgId);
+    await entitlements.registry.refreshMcpIntegrationDescriptors(); // MCP servers as integration caps
+    const matrixCaps = entitlements.registry.listCapabilities().filter(c => c.userFacing && c.groupTogglable);
+    const capIdSet = new Set(matrixCaps.map(c => c.id));
+    const capabilities = matrixCaps.map(c => ({ id: c.id, kind: c.kind, name: c.name, description: c.description, category: c.category, lifecycle: c.lifecycle }));
+    const inMatrix = (ids) => unionKindArrays(ids).filter(id => capIdSet.has(id));
+    const stored = await userStore.getOrgAvailableCapabilities(orgId); // null = unrestricted
+    return {
+        orgId,
+        mode: snap.mode,
+        capabilities,
+        ceiling: inMatrix(snap.ceiling),     // the full plan/license menu to choose from
+        available: inMatrix(snap.orgAvailable), // what the org may currently use
+        unrestricted: stored == null,
+    };
+}
+
+router.get('/organizations/:orgId/org-availability', requireOrgAdmin('orgId'), async (req, res) => {
+    if (!requireSuperAdmin(req, res)) return;
+    try {
+        res.json(await buildOrgAvailabilityResponse(req.params.orgId));
+    } catch (e) {
+        console.error('[Entitlements] org-availability GET error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+router.put('/organizations/:orgId/org-availability', requireOrgAdmin('orgId'), async (req, res) => {
+    if (!requireSuperAdmin(req, res)) return;
+    try {
+        const orgId = req.params.orgId;
+        const entitlements = require('../core/entitlements');
+        const { available, unrestricted } = req.body || {};
+        if (unrestricted === true) {
+            await userStore.setOrgAvailableCapabilities(orgId, null); // clear → org may use everything in ceiling
+        } else {
+            if (!Array.isArray(available)) return res.status(400).json({ error: 'available must be an array of capability ids (or pass unrestricted:true)' });
+            // Clamp to the plan/license ceiling + matrix-visible togglable caps.
+            const snap = await resolveOrgEntitlementSnapshot(orgId);
+            const ceilingSet = new Set(unionKindArrays(snap.ceiling));
+            const clean = Array.from(new Set(available.filter(capId => {
+                const cap = entitlements.registry.getCapability(capId);
+                return cap && cap.userFacing && cap.groupTogglable && ceilingSet.has(capId);
+            })));
+            await userStore.setOrgAvailableCapabilities(orgId, clean);
+        }
+        await entitlements.invalidateForOrg(orgId);
+        // Also drop the EDITING admin's own per-request entitlement cache: a global
+        // admin isn't a member of `orgId`, so invalidateForOrg won't bust their
+        // session — without this their own Studio would lag the change by the cache
+        // TTL even after the UI reloads entitlements.
+        for (const k of Object.keys(req.session)) if (k.startsWith('_ent:')) delete req.session[k];
+        try {
+            await userStore.logAccessAudit('org.availability.update', 'organization', orgId, req.session.user?.id || null, {}, { available: unrestricted === true ? null : available }, orgId);
+        } catch (e) { console.warn('[Entitlements] org-availability audit failed:', e.message); }
+        res.json(await buildOrgAvailabilityResponse(orgId));
+    } catch (e) {
+        console.error('[Entitlements] org-availability PUT error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// PUT /auth/admin/selected-org — persist the Access org-picker selection on the
+// session so a GLOBAL super-admin (organizationId=null) has their OWN entitlement
+// resolution governed by the org they're administering (see governingOrgId in
+// entitlements.resolveEntitlements). Without this a no-org admin escapes every
+// per-org access menu. Session-only; super-admin gated.
+router.put('/admin/selected-org', requireAuth, async (req, res) => {
+    if (!requireSuperAdmin(req, res)) return;
+    try {
+        const { orgId } = req.body || {};
+        const clearCache = () => { for (const k of Object.keys(req.session)) if (k.startsWith('_ent:')) delete req.session[k]; };
+        if (orgId == null || orgId === '') {
+            delete req.session.adminSelectedOrgId;
+            clearCache();
+            return res.json({ success: true, adminSelectedOrgId: null });
+        }
+        const org = await userStore.getOrganization(orgId);
+        if (!org) return res.status(404).json({ error: 'organization_not_found' });
+        req.session.adminSelectedOrgId = orgId;
+        clearCache(); // drop the admin's cached snapshot so the new scope applies immediately
+        res.json({ success: true, adminSelectedOrgId: orgId });
+    } catch (e) {
+        console.error('[Entitlements] selected-org PUT error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// PUT /auth/groups/:id/access — write a single group's grants (clamped to the
+// registry + the org access menu). Grant-only; a grant can never exceed it.
+router.put('/groups/:id/access', requireAuth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { granted } = req.body || {};
+        if (!Array.isArray(granted)) return res.status(400).json({ error: 'granted must be an array of capability ids' });
+        const userId = req.session.user?.id;
+        const isSuperAdmin = req.session.isAdmin || req.session.user?.role === 'admin';
+        const allGroups = await userStore.getAllGroups();
+        const group = allGroups.find(g => g.id === id);
+        if (!group) return res.status(404).json({ error: 'Group not found' });
+        if (!isSuperAdmin) {
+            const perms = await getUserPermissions(userId, req.session);
+            const me = await userStore.getUser(userId);
+            if (!(perms.includes('all') || perms.includes('org_admin')) || me?.organizationId !== group.organizationId) {
+                return res.status(403).json({ error: 'Organization admin access required' });
+            }
+        }
+        const entitlements = require('../core/entitlements');
+        const snap = await resolveOrgEntitlementSnapshot(group.organizationId);
+        // Clamp per-group grants to the org's ACCESS MENU (orgAvailable), so a
+        // group can never be granted a capability the org has no access to.
+        const boundSet = new Set(unionKindArrays(snap.orgAvailable));
+        const clean = Array.from(new Set(granted.filter(capId => {
+            const cap = entitlements.registry.getCapability(capId);
+            return cap && cap.groupTogglable && boundSet.has(capId);
+        })));
+        const prev = Array.isArray(group.granted_capabilities) ? group.granted_capabilities : [];
+        if (!(await userStore.updateGroup(id, { grantedCapabilities: clean }))) {
+            return res.status(404).json({ error: 'Group not found' });
+        }
+        try {
+            await userStore.logAccessAudit('group.access.update', 'group', id, userId || null, { grantedCapabilities: prev }, { grantedCapabilities: clean }, group.organizationId || null);
+        } catch (e) { console.warn('[Entitlements] group-access audit failed:', e.message); }
+        await entitlements.invalidateForOrg(group.organizationId);
+        res.json({ success: true, granted: clean });
+    } catch (e) {
+        console.error('[Entitlements] /groups/:id/access PUT error:', e.message);
         res.status(500).json({ error: e.message });
     }
 });
@@ -1702,7 +2099,7 @@ router.get('/default-integrations', requireAdmin, async (req, res) => {
         mcpIntegrations = mcpServers.map(s => ({
             id: `mcp:${s.id}`,
             label: s.name,
-            category: 'MCP',
+            category: 'MCP servers',
             icon: s.icon || '🔌',
         }));
     } catch (e) { /* mcpStore not available */ }
@@ -1825,7 +2222,11 @@ router.post('/invitations', requireAuth, invitationInviterLimiter, async (req, r
         // 302 fires. The endpoint moves the token into the session and
         // redirects to /login?signup=1.
         const clientHost = `${process.env.CLIENT_PROTOCOL || 'https'}://${process.env.CLIENT_PUBLIC_HOST || 'beeflow.nl'}`;
-        const inviteUrl = `${clientHost}/api/auth/redeem-invite/${invitation.token}`;
+        // The auth router is mounted at `/auth` (server/index.js), NOT `/api/auth`,
+        // so the redeem endpoint lives at `/auth/redeem-invite/:token`. Using the
+        // wrong prefix here produced a raw "Cannot GET /api/auth/redeem-invite/..."
+        // 404 for every invited user (BFSF-240).
+        const inviteUrl = `${clientHost}/auth/redeem-invite/${invitation.token}`;
 
         // Get org name and inviter display name
         const org = await userStore.getOrganization(orgId);
@@ -1940,3 +2341,7 @@ router.delete('/invitations/:id', requireAuth, async (req, res) => {
 });
 
 module.exports = router;
+// Shared org-admin helpers — reused by org-scoped routers mounted outside
+// this file (e.g. routes/orgIntegrations/builder.js).
+module.exports.isOrgAdminForOrg = isOrgAdminForOrg;
+module.exports.requireOrgAdmin = requireOrgAdmin;

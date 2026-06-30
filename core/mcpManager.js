@@ -122,6 +122,24 @@ async function getConnection(serverId, userId) {
     const timer = setTimeout(() => closeConnection(poolKey), IDLE_TIMEOUT_MS);
     connectionPool.set(poolKey, { client, transport, lastUsed: Date.now(), timer });
 
+    // Safety net: a credential-gated server can't be probed at admin-install time
+    // (no creds yet), so its tools_cache may be empty. Now that we have a live,
+    // authenticated connection, discover + cache tools one time so agents see them.
+    try {
+        const fresh = await mcpStore.getServer(serverId);
+        if (fresh && (fresh.tools_cache || []).length === 0) {
+            const listed = await client.listTools();
+            const tools = (listed.tools || []).map(t => ({
+                name: t.name,
+                description: t.description || '',
+                inputSchema: t.inputSchema || { type: 'object', properties: {} },
+            }));
+            if (tools.length) {
+                await mcpStore.updateServer(serverId, { tools_cache: tools, status: 'ready', error: null });
+            }
+        }
+    } catch (_) { /* best-effort — never block a runtime connection on discovery */ }
+
     return client;
 }
 
@@ -237,7 +255,12 @@ async function testCommand(command, args = [], envVars = {}, transportType = 'st
             if (!_StreamableHTTPClientTransport) {
                 return { success: false, tools: [], error: 'StreamableHTTP transport not available' };
             }
-            transport = new _StreamableHTTPClientTransport(new URL(url));
+            // Pass auth the same way getConnection does, so credential-gated remote
+            // servers can be probed once the caller supplies their credentials.
+            const httpHeaders = {};
+            if (envVars.AUTHORIZATION) httpHeaders['Authorization'] = envVars.AUTHORIZATION;
+            else if (envVars.API_KEY) httpHeaders['Authorization'] = `Bearer ${envVars.API_KEY}`;
+            transport = new _StreamableHTTPClientTransport(new URL(url), { requestInit: { headers: httpHeaders } });
         } else {
             transport = new _StdioClientTransport({
                 command,
@@ -281,13 +304,18 @@ async function refreshServerTools(serverId) {
             error: null,
         });
         return result.tools;
-    } else {
-        await mcpStore.updateServer(serverId, {
-            status: 'error',
-            error: result.error,
-        });
-        throw new Error(result.error);
     }
+    // A credential-gated server can't be probed without creds (set per-user in
+    // Settings). That's not a hard error — mark it pending so the admin UI shows
+    // a friendly "awaiting credentials" state, and discover tools later (on the
+    // user's first authenticated connection / when they save credentials).
+    const pending = (server.required_credentials || []).length > 0;
+    await mcpStore.updateServer(serverId, {
+        status: pending ? 'pending_credentials' : 'error',
+        error: pending ? null : result.error,
+    });
+    if (pending) return [];
+    throw new Error(result.error);
 }
 
 /**
@@ -297,7 +325,12 @@ async function addServer({ id, name, command, args = [], required_credentials = 
     // Save to store
     await mcpStore.createServer({ id, name, command, args, required_credentials, transport, url, category, description, icon, source });
 
-    // Test and cache tools
+    // Test and cache tools. Many servers list their tools without credentials
+    // (creds are only needed to *call* a tool) and discover fine here. Others
+    // (e.g. Google Search Console) crash at startup without their env vars — for
+    // those we can't probe at install time, so mark them pending_credentials
+    // rather than surfacing a scary connection error with no path forward.
+    const pending = (required_credentials || []).length > 0;
     try {
         const result = await testCommand(command, args, {}, transport, url);
         if (result.success) {
@@ -308,14 +341,14 @@ async function addServer({ id, name, command, args = [], required_credentials = 
             });
         } else {
             await mcpStore.updateServer(id, {
-                status: 'error',
-                error: result.error,
+                status: pending ? 'pending_credentials' : 'error',
+                error: pending ? null : result.error,
             });
         }
     } catch (err) {
         await mcpStore.updateServer(id, {
-            status: 'error',
-            error: err.message,
+            status: pending ? 'pending_credentials' : 'error',
+            error: pending ? null : err.message,
         });
     }
 
@@ -378,6 +411,31 @@ async function getServersForUser(userId) {
 }
 
 /**
+ * Discover + cache a server's tools using a specific user's stored credentials.
+ * No-op unless the server still lacks tools AND the user has supplied every
+ * required credential. This is how credential-gated servers (which can't be
+ * probed at admin-install time) get their tools_cache populated so agents can
+ * use them.
+ */
+async function discoverWithUserCreds(serverId, userId) {
+    const server = await mcpStore.getServer(serverId);
+    if (!server || !server.enabled) return;
+    if ((server.tools_cache || []).length > 0 && server.status === 'ready') return;
+
+    const userEnv = {};
+    for (const cred of (server.required_credentials || [])) {
+        const v = await configStore.getSecret(`mcp_cred_${serverId}_${cred.key}_user_${userId}`);
+        if (!v) return; // wait until every credential is present
+        userEnv[cred.key] = v;
+    }
+
+    const result = await testCommand(server.command, server.args || [], userEnv, server.transport || 'stdio', server.url);
+    if (result.success) {
+        await mcpStore.updateServer(serverId, { tools_cache: result.tools, status: 'ready', error: null });
+    }
+}
+
+/**
  * Save a user's credential for an MCP server.
  */
 async function saveUserCredential(userId, serverId, credKey, value) {
@@ -385,6 +443,13 @@ async function saveUserCredential(userId, serverId, credKey, value) {
     // Close any existing connection so it re-spawns with new creds
     const poolKey = `${userId}:${serverId}`;
     await closeConnection(poolKey);
+    // Now that a credential has changed, try to (re)discover this server's tools
+    // with the user's full credential set — bootstraps credential-gated servers.
+    try {
+        await discoverWithUserCreds(serverId, userId);
+    } catch (err) {
+        console.warn(`[MCP] Post-credential tool discovery failed for ${serverId}:`, err.message);
+    }
 }
 
 module.exports = {

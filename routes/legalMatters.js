@@ -23,7 +23,7 @@ const kbStore = require('../stores/knowledgeBases');
 const { executeTool } = require('../core/toolDispatcher');
 const { verifyText } = require('../core/legalCitationVerifier');
 const { requirePermission } = require('../auth');
-const { requireBetaFeature } = require('../core/betaFeatures');
+const { requireCapability } = require('../core/entitlements');
 
 const MATTER_TYPE = 'legal_matter';
 
@@ -34,7 +34,7 @@ function requireAuth(req, res, next) {
 
 router.use(requireAuth);
 router.use(requirePermission('use_notebooks'));
-router.use(requireBetaFeature('dutch_legal_sources'));
+router.use(requireCapability('dutch_legal_sources'));
 
 // Guard: confirm the notebook exists, belongs to the user, AND is a legal
 // matter (so notebook ids of other types can't be driven through these routes).
@@ -155,6 +155,11 @@ router.delete('/:id', async (req, res) => {
         // statute KB is never in this list, so it's safe.
         for (const kbId of (result.knowledgeBaseIds || [])) {
             try { await kbStore.deleteKB(kbId); } catch (e) { console.warn(`[LegalMatters] KB cleanup ${kbId}:`, e.message); }
+        }
+        // Drop the dossier's persisted chat history so a deleted matter leaves
+        // no orphaned conversation.
+        try { await require('../stores/notebookConversationStore').deleteForNotebook(matter.id); } catch (e) {
+            console.warn('[LegalMatters] Conversation cleanup failed:', e.message);
         }
         res.json({ success: true });
     } catch (err) {

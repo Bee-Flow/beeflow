@@ -313,7 +313,11 @@ async function readThumbnail(userId, webpageId) {
 // "assets/logo.svg"). RustFS S3 supports slashes in keys natively.
 
 const TEXT_MIME_PREFIXES = ['text/', 'application/javascript', 'application/json', 'application/xml', 'image/svg+xml'];
-const TEXT_EXTENSIONS = new Set(['html', 'htm', 'css', 'js', 'mjs', 'json', 'txt', 'md', 'svg', 'xml', 'csv', 'tsv', 'yaml', 'yml']);
+const TEXT_EXTENSIONS = new Set([
+    'html', 'htm', 'css', 'js', 'mjs', 'cjs', 'json', 'txt', 'md', 'svg', 'xml', 'csv', 'tsv', 'yaml', 'yml',
+    // React/TS source — full-tier & react-mui projects author these as extras
+    'jsx', 'ts', 'tsx', 'mts', 'cts', 'scss', 'less', 'env',
+]);
 
 function isTextFile(mime, ext) {
     if (mime && TEXT_MIME_PREFIXES.some(p => mime.startsWith(p))) return true;
@@ -329,6 +333,15 @@ function guessMime(path) {
         css: 'text/css; charset=utf-8',
         js: 'application/javascript; charset=utf-8',
         mjs: 'application/javascript; charset=utf-8',
+        cjs: 'application/javascript; charset=utf-8',
+        jsx: 'text/jsx; charset=utf-8',
+        ts: 'application/typescript; charset=utf-8',
+        tsx: 'text/tsx; charset=utf-8',
+        mts: 'application/typescript; charset=utf-8',
+        cts: 'application/typescript; charset=utf-8',
+        scss: 'text/x-scss; charset=utf-8',
+        less: 'text/x-less; charset=utf-8',
+        env: 'text/plain; charset=utf-8',
         json: 'application/json; charset=utf-8',
         txt: 'text/plain; charset=utf-8',
         md: 'text/markdown; charset=utf-8',
@@ -437,6 +450,49 @@ async function upsertExtraFile({ webpageId, userId, path, content }) {
     const { mime, ext } = guessMime(path);
     const isText = isTextFile(mime, ext);
     const { sha, size } = await writeExtra(userId, webpageId, path, content, mime);
+
+    const existing = await getExtraFile(webpageId, path);
+    if (existing) {
+        await run(
+            `UPDATE webpage_extra_files SET mime_type = $1, is_text = $2, sha256 = $3, size = $4, updated_at = NOW()
+             WHERE webpage_id = $5 AND path = $6`,
+            [mime, isText, sha, size, webpageId, path]
+        );
+        return { ...existing, mimeType: mime, isText, sha256: sha, size, updatedAt: new Date().toISOString() };
+    }
+
+    const id = crypto.randomUUID();
+    await run(
+        `INSERT INTO webpage_extra_files (id, webpage_id, path, mime_type, is_text, sha256, size)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [id, webpageId, path, mime, isText, sha, size]
+    );
+    await run('UPDATE webpages SET updated_at = NOW() WHERE id = $1', [webpageId]);
+    return { id, webpageId, path, mimeType: mime, isText, sha256: sha, size };
+}
+
+/**
+ * Upsert a BINARY extra file (uploaded image / font / audio / etc).
+ *
+ * Unlike upsertExtraFile (which coerces content to UTF-8 text and derives the
+ * mime from the path), this takes raw bytes + an explicit mime, computes the
+ * sha over the bytes (not a lossy utf8 round-trip), and forces is_text=false.
+ * Used by the asset-upload route (POST /api/webpages/:id/assets).
+ */
+async function upsertBinaryExtraFile({ webpageId, userId, path, buffer, mimeType }) {
+    await initDB();
+    const validation = validateExtraPath(path);
+    if (validation) throw new Error(validation);
+    if (!Buffer.isBuffer(buffer)) throw new Error('buffer is required');
+    if (!storageStore.isAvailable()) throw new Error('RustFS not configured — cannot persist assets');
+
+    const guessed = guessMime(path);
+    const mime = mimeType || guessed.mime;
+    const isText = false;
+
+    await storageStore.uploadFile(extraKey(userId, webpageId, path), buffer, mime);
+    const sha = crypto.createHash('sha256').update(buffer).digest('hex');
+    const size = buffer.length;
 
     const existing = await getExtraFile(webpageId, path);
     if (existing) {
@@ -1239,6 +1295,7 @@ module.exports = {
     getExtraFile,
     readExtraFile,
     upsertExtraFile,
+    upsertBinaryExtraFile,
     deleteExtraFile,
     validateExtraPath,
     isTextFile,

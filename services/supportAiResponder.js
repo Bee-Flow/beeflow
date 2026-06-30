@@ -22,7 +22,7 @@ const supportStore = require('../stores/supportStore');
 const configStore = require('../stores/configStore');
 const { chatWithAgent } = require('../core/agentRuntime');
 const { quickKBSearch } = require('../core/agentRuntime/knowledgeSearch');
-const { SUPPORT_TOOLS } = require('../integrations/supportTools');
+const { buildSupportToolset, makeActionPolicy } = require('../integrations/supportTools');
 
 const ESCALATE_RE = /\[ESCALATE(?::\s*([^\]]+))?\]/i;
 const RESOLVED_RE = /\[RESOLVED\]/i;
@@ -71,6 +71,12 @@ function _normalizeConfig(c) {
         autoresolveThreshold: Number(c.autoresolveThreshold) || DEFAULT_AUTORESOLVE_THRESHOLD,
         v2Enabled: !!c.v2Enabled,
         toolsEnabled: c.toolsEnabled !== undefined ? !!c.toolsEnabled : !!c.v2Enabled,
+        enabledToolIds: Array.isArray(c.enabledToolIds) ? c.enabledToolIds : [],
+        // Designated operator: integration tools (Gmail/Calendar/n8n/YouTrack/…)
+        // resolve + execute under THIS user's identity and org (never the
+        // requester's). null = no integration tools.
+        operatorUserId: c.operatorUserId || null,
+        operatorOrgId: c.operatorOrgId || null,
     };
 }
 
@@ -90,6 +96,53 @@ async function _resolveEffectiveConfig(thread, opts = {}) {
     const threshold = Number(await configStore.getConfig('support_ai_autoresolve_threshold')) || DEFAULT_AUTORESOLVE_THRESHOLD;
     const v2Enabled = !!(await configStore.getConfig('support_ai_v2_enabled'));
     return { agentId, kbIds, replyMode: 'legacy', autoresolveThreshold: threshold, v2Enabled, toolsEnabled: v2Enabled };
+}
+
+/**
+ * Resolve the integration tools the support AI may use this run, scoped to the
+ * inbox's designated operator. Returns { tools, session } — `tools` is the
+ * intersection of (a) the `integration:<id>` grants on the inbox and (b) what
+ * the operator is actually entitled to + has connected (resolved by
+ * getIntegrationTools, the same gate used for normal user chat). `session` is a
+ * refreshing auth shim for the operator (or a bare {userId} shim if they have no
+ * OAuth creds, so non-OAuth tools still work). Fail-closed: returns no tools on
+ * any gap or error.
+ */
+async function _resolveOperatorIntegrations(cfg) {
+    const empty = { tools: [], session: null };
+    const grantedIntegrationIds = (cfg.enabledToolIds || [])
+        .filter(t => typeof t === 'string' && t.startsWith('integration:'))
+        .map(t => t.slice('integration:'.length))
+        .filter(Boolean);
+    if (!grantedIntegrationIds.length || !cfg.operatorUserId) return empty;
+
+    try {
+        const routineAuth = require('../core/routineAuth');
+        const { getIntegrationTools } = require('../core/integrationTools');
+        const { toolNamesForApps } = require('../automation/toolRegistry');
+
+        // Refreshing session from the operator's credential vault. null = the
+        // operator has no working OAuth creds for the granted providers; fall
+        // back to a bare shim so non-OAuth tools (n8n/YouTrack/Gamma) still load
+        // while OAuth tools naturally drop (getIntegrationTools needs accessToken).
+        const session = await routineAuth.buildUserAuth(cfg.operatorUserId, { enabledIntegrations: grantedIntegrationIds })
+            || { userId: cfg.operatorUserId, accessToken: null, oauthProvider: null, routineProviders: {} };
+
+        const { tools: opTools } = await getIntegrationTools({
+            userId: cfg.operatorUserId, session, isAdmin: false,
+        });
+        // Intersect by exact tool name with the explicitly-granted integrations
+        // (getIntegrationTools already enforced org-enabled + entitlement +
+        // per-user connection, so a forged/stale grant resolves to nothing).
+        const grantedNames = toolNamesForApps(grantedIntegrationIds);
+        const tools = (opTools || []).filter(t => grantedNames.has(t.function?.name));
+        if (!tools.length) return { tools: [], session: null };
+        console.log(`[SupportAI] operator ${cfg.operatorUserId} contributed ${tools.length} integration tool(s) from grants [${grantedIntegrationIds.join(', ')}]`);
+        return { tools, session };
+    } catch (e) {
+        console.warn('[SupportAI] operator integration tools unavailable:', e.message);
+        return empty;
+    }
 }
 
 /**
@@ -126,6 +179,27 @@ async function _composeAiReply({ thread, messages, lastRequester, cfg, aiUserId 
         return `${who}: ${m.body}`;
     }).join('\n\n');
 
+    // Resolve the tool set the agent may use this run (read lookups and/or
+    // mutating actions, the latter gated by reply mode).
+    const { tools: supportToolset, actionLevel } = buildSupportToolset({
+        enabledToolIds: cfg.enabledToolIds, toolsEnabled: cfg.toolsEnabled, replyMode: cfg.replyMode,
+    });
+    const hasReadTools = supportToolset.some(t => t.function?.name === 'support_search_knowledge_base');
+    const hasActionTools = actionLevel !== 'none' && supportToolset.some(t => t.function?.name?.startsWith('support_set') || t.function?.name === 'support_assign_to_teammate');
+
+    // Operator-scoped integration tools. The inbox may name a designated
+    // operator; the support AI is then allowed the org integrations the admin
+    // granted (`integration:<id>` tokens) — but ONLY the ones that operator is
+    // actually entitled to and has connected. Resolution + execution both run
+    // under the operator's identity (their org = the inbox's org, never the
+    // requester's). Fail-closed: any gap leaves integrations off.
+    const { tools: integrationTools, session: operatorSession } =
+        await _resolveOperatorIntegrations(cfg);
+
+    const toolHint = (supportToolset.length || integrationTools.length)
+        ? `You may use the available support tools${hasReadTools ? ' to look up the customer, their organization, subscription, and the knowledge base' : ''}${hasActionTools ? ', and to update this ticket (priority, tags, category, status, assignment, escalation) when clearly warranted' : ''}.${integrationTools.length ? ' You also have connected integration tools (e.g. calendar, files, issue tracking) — use them on the customer\'s behalf only when clearly warranted, and never to email the customer directly (your reply text is sent for you).' : ''} `
+        : '';
+
     const userMessage = `You are answering a customer-support thread.
 
 ${requesterLine}
@@ -135,7 +209,7 @@ Full conversation so far:
 ${transcript}
 ${kbContext}
 
-Reply only to the customer's most recent message. If the knowledge base does not contain a confident answer, or the question involves account-specific actions you can't safely perform (billing changes, password resets, account deletion, custom-deal pricing, anything escalation-worthy), respond briefly and end your reply with the exact token [ESCALATE: <short reason>]. ${cfg.toolsEnabled ? 'You may use the available read-only support tools to look up the customer, their organization, subscription, and the knowledge base before answering. ' : ''}If you are confident your reply fully resolves the customer's issue and no human follow-up is needed, append the exact token [RESOLVED] on its own line at the very end. Otherwise answer concisely and cite the KB section by title where applicable.`;
+Reply only to the customer's most recent message. If the knowledge base does not contain a confident answer, or the question involves account-specific actions you can't safely perform (billing changes, password resets, account deletion, custom-deal pricing, anything escalation-worthy), respond briefly and end your reply with the exact token [ESCALATE: <short reason>]. ${toolHint}If you are confident your reply fully resolves the customer's issue and no human follow-up is needed, append the exact token [RESOLVED] on its own line at the very end. Otherwise answer concisely and cite the KB section by title where applicable.`;
 
     // A support reply is first-party processing of the customer's OWN email
     // (their address/IBAN/order ids legitimately appear in the thread), sent to
@@ -145,9 +219,24 @@ Reply only to the customer's most recent message. If the knowledge base does not
     // not used here: non-streaming chatWithAgent doesn't de-tokenize output, so
     // tokens would leak into the customer reply.)
     const chatAuth = { userOrgId: thread.organization_id || null, piiActionOverride: 'allow' };
-    if (cfg.toolsEnabled) {
-        chatAuth.extraTools = SUPPORT_TOOLS;
+    let actionPolicy = null;
+    const extraTools = [...supportToolset, ...integrationTools];
+    if (extraTools.length) {
+        chatAuth.extraTools = extraTools;
         chatAuth.supportThreadId = thread.id;
+        if (actionLevel !== 'none') {
+            actionPolicy = makeActionPolicy({ actionLevel });
+            chatAuth.supportActionPolicy = actionPolicy;
+        }
+    }
+    // Execute integration tool calls under the operator's identity. This is
+    // decoupled from the synthetic `aiUserId` (which chatWithAgent uses to
+    // bucket the per-thread conversation), so OAuth tools run off the operator's
+    // session, per-user API-key tools off their userId, and n8n off their org.
+    if (integrationTools.length && operatorSession && cfg.operatorUserId) {
+        chatAuth.session = operatorSession;
+        chatAuth.integrationUserId = cfg.operatorUserId;
+        chatAuth.integrationOrgId = cfg.operatorOrgId || null;
     }
 
     const result = await _withTimeout(
@@ -175,7 +264,12 @@ Reply only to the customer's most recent message. If the knowledge base does not
     const finalBody = cleanBody || 'I was not able to draft a confident response — a human will follow up shortly.';
     const citations = kbHits.map(h => ({ title: h.title, score: h.score, source_uri: h.source_uri }));
 
-    return { finalBody, escalated, escalateReason, aiResolved, citations, modelUsed, topScore, kbCount: kbHits.length };
+    return {
+        finalBody, escalated, escalateReason, aiResolved, citations, modelUsed, topScore, kbCount: kbHits.length,
+        // True when the agent used an action tool that already moved the ticket's
+        // status — the caller must not clobber it with its own transition.
+        actionStatusChanged: !!(actionPolicy && actionPolicy.statusChangedByTool),
+    };
 }
 
 async function _safeRecordEvent(payload) {
@@ -215,7 +309,7 @@ async function _escalate(threadId, reason, { systemMessage } = {}) {
     await _safeRecordEvent({
         threadId,
         actorUserId: null,
-        actorKind: 'system',
+        actorKind: 'ai',
         action: 'ai_escalated',
         payload: { reason },
     });
@@ -234,8 +328,16 @@ async function _escalate(threadId, reason, { systemMessage } = {}) {
 async function _maybeAutoAssign(threadId) {
     const thread = await supportStore.getThread(threadId);
     if (!thread || thread.assignee_user_id) return;
+    // Respect per-inbox group access when picking an assignee.
+    let sharedGroups = [];
+    if (thread.inbox_id) {
+        try {
+            const inbox = await require('../stores/supportInboxStore').getInbox(thread.inbox_id);
+            sharedGroups = Array.isArray(inbox?.shared_groups) ? inbox.shared_groups : [];
+        } catch { /* default open */ }
+    }
     const { pickNextAssignee } = require('./supportAutoAssigner');
-    const next = await pickNextAssignee(thread.organization_id || null);
+    const next = await pickNextAssignee(thread.organization_id || null, { sharedGroups });
     if (!next) return;
     await supportStore.updateThread(threadId, { assignee_user_id: next, auto_assigned: true });
     await _safeRecordEvent({
@@ -335,7 +437,7 @@ async function runAiAutoResponder(threadId, opts = {}) {
             return null;
         }
 
-        const { finalBody, escalated, escalateReason, aiResolved, citations, modelUsed, topScore, kbCount } = composed;
+        const { finalBody, escalated, escalateReason, aiResolved, citations, modelUsed, topScore, kbCount, actionStatusChanged } = composed;
 
         // Reply-mode gate — decide deliver vs. human-review draft. Legacy (Bee
         // Flow's own company inbox) always yields a deliverable message; the
@@ -365,7 +467,7 @@ async function runAiAutoResponder(threadId, opts = {}) {
         await _safeRecordEvent({
             threadId,
             actorUserId: null,
-            actorKind: 'system',
+            actorKind: 'ai',
             action: wantsDraft ? 'ai_draft' : 'ai_reply',
             payload: {
                 model: modelUsed, mode,
@@ -375,7 +477,11 @@ async function runAiAutoResponder(threadId, opts = {}) {
             },
         });
 
-        if (wantsDraft) {
+        if (actionStatusChanged) {
+            // An action tool already moved the ticket to its intended status; just
+            // flag AI handling and leave that status in place (no clobber).
+            await supportStore.updateThread(threadId, { ai_handled: true });
+        } else if (wantsDraft) {
             // Human reviews + sends. Same transition as an escalation
             // (awaiting_agent + auto-assign) but nothing is sent to the customer.
             await supportStore.updateThread(threadId, {
@@ -394,7 +500,7 @@ async function runAiAutoResponder(threadId, opts = {}) {
                 ai_escalated_reason: null,
             });
             await _safeRecordEvent({
-                threadId, actorUserId: null, actorKind: 'system',
+                threadId, actorUserId: null, actorKind: 'ai',
                 action: 'resolved', payload: { by: 'ai', awaitingCustomerConfirmation: true },
             });
         } else {
@@ -408,8 +514,15 @@ async function runAiAutoResponder(threadId, opts = {}) {
         // Fire-and-forget tag + category suggestion (never blocks the reply).
         Promise.resolve().then(() => _autoTag(thread, lastRequester.body, finalBody)).catch(() => {});
 
+        // Reflect a tool-driven resolve so the caller fires KB-ingest / delivery.
+        let resolvedOut = aiResolved;
+        if (actionStatusChanged) {
+            const fresh = await supportStore.getThread(threadId).catch(() => null);
+            if (fresh && fresh.status === 'resolved') resolvedOut = true;
+        }
+
         settled = true;
-        return { message: aiMsg, escalated, escalateReason, resolved: aiResolved, mode, sent: !wantsDraft, confidence: topScore };
+        return { message: aiMsg, escalated, escalateReason, resolved: resolvedOut, mode, sent: !wantsDraft, confidence: topScore };
     } catch (outerErr) {
         // Catch-all — any unexpected throw (DB hiccup, bad config, etc.).
         console.error('[SupportAI] runAiAutoResponder unexpected error:', outerErr.message);

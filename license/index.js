@@ -369,7 +369,7 @@ async function resolveTier(scope) {
  *   3. consumer_subscriptions on userId.
  *   4. Community fallback.
  */
-async function getLicenseStatus({ organizationId = null, userId = null, orgIds = null } = {}) {
+async function getLicenseStatus({ organizationId = null, userId = null, orgIds = null, superAdmin = false } = {}) {
     // Snapshot the server-wide licence once. `serverLicense` is exposed on
     // every response (mode-independent) so the admin Server-licence panel can
     // always display it. Whether it OVERRIDES per-org billing depends on the
@@ -473,7 +473,23 @@ async function getLicenseStatus({ organizationId = null, userId = null, orgIds =
         }
     }
 
-    const source = lic ? 'license_key' : (subscriptionShape ? 'stripe_subscription' : 'default');
+    // Operator floor (option A): a platform super-admin inherits the ACTIVE
+    // server-wide licence tier even on cloud, where that licence doesn't govern
+    // customer orgs (serverLicenseGovernsOrgs() === false). This unlocks the
+    // operator's own admin surface from the licence itself — no per-user licence
+    // needed — while tenant orgs keep their own subscription tier untouched.
+    // `serverSnap.tier` is already community when no active server licence
+    // exists (resolveTierFromLicense), so this is a no-op without one. It only
+    // ever raises the tier, never lowers it, and is gated to super-admins, who
+    // the request/middleware layer already resolves to 'full' server-side.
+    let serverFloorApplied = false;
+    if (superAdmin && tiers.tierRank(serverSnap.tier) > tiers.tierRank(tier)) {
+        tier = serverSnap.tier;
+        serverFloorApplied = true;
+    }
+    const source = serverFloorApplied
+        ? 'server_license'
+        : (lic ? 'license_key' : (subscriptionShape ? 'stripe_subscription' : 'default'));
     // Union the tier's features with any plan-level grants (allowed_features) on
     // the orgs this user touches, so the SPA's hasLicenseFeature() matches the
     // backend gates (hasFeature / requireFeature) — both now honour plan grants.
@@ -489,7 +505,7 @@ async function getLicenseStatus({ organizationId = null, userId = null, orgIds =
     return {
         tier,
         source,
-        scope: scope || subscriptionScope,
+        scope: serverFloorApplied ? 'server' : (scope || subscriptionScope),
         license: lic ? publicLicenseShape(lic) : null,
         subscription: subscriptionShape,
         features,

@@ -46,17 +46,21 @@ function setupSSE(res) {
  *
  * The Nextcloud AppAPI PHP proxy (and some gateways) idle-time-out a silent
  * connection, which 504'd long webpage/notebook builds and surfaced as a false
- * "Error generating response." in the chat (BFSF-221). We write an SSE comment
- * frame (`: ping\n\n`) every `intervalMs`; comment frames are ignored by
- * EventSource and our fetch-based SSE parser, so they keep the socket warm
- * without affecting the event stream. Returns stop() to clear the timer; it is
- * also cleared automatically on res close/finish/error.
+ * "Error generating response." in the chat (BFSF-221). Each beat writes TWO
+ * frames: a comment frame (`: ping\n\n`) — kept for the Nextcloud AppAPI proxy
+ * the original fix targeted — PLUS a real no-op `ping` event, so intermediaries
+ * and clients whose idle timers reset on parsed *events* (not ignored comment
+ * frames) also stay warm. Both are ignored by the client (EventSource skips the
+ * comment; our fetch-based parser routes `ping` to a no-op in
+ * useChatEngine.handleSSEEvent), so neither affects the event stream. Returns
+ * stop() to clear the timer; it is also cleared automatically on res
+ * close/finish/error.
  *
  * @param {Object} res - Express response (after headers are written)
- * @param {number} [intervalMs=15000]
+ * @param {number} [intervalMs=10000]
  * @returns {Function} stop
  */
-function startSseHeartbeat(res, intervalMs = 15000) {
+function startSseHeartbeat(res, intervalMs = 10000) {
     let timer = null;
     const stop = () => {
         if (timer) { clearInterval(timer); timer = null; }
@@ -64,7 +68,7 @@ function startSseHeartbeat(res, intervalMs = 15000) {
     timer = setInterval(() => {
         try {
             if (res.writableEnded || res.destroyed) { stop(); return; }
-            res.write(': ping\n\n');
+            res.write(': ping\n\nevent: ping\ndata: {}\n\n');
         } catch (_e) {
             stop();
         }

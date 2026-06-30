@@ -1,0 +1,11 @@
+{
+  "name": "beeflow-webpage-runner",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Bee Flow full-tier webpage runtime — Vite dev server + optional Node backend, one per project. Gated/inert by default.",
+  "license": "SEE LICENSE IN ../../LICENSE.md",
+  "dependencies": {
+    "vite": "^7.2.4",
+    "@vitejs/plugin-react": "^5.1.1"
+  }
+}

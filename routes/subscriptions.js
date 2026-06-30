@@ -219,6 +219,24 @@ router.put('/plans/:id', async (req, res) => {
         const updated = await userStore.getPlan(req.params.id);
         await userStore.logSubscriptionAudit('update_plan', 'plan', req.params.id, getAdminId(req), oldPlan, req.body);
 
+        // Bust stale entitlement snapshots for orgs on this plan. The resolver
+        // memoises per-session for ~30s (keys `_ent:…:v{ver}` / `_lic:…:v{ver}`),
+        // and plan edits never went through the org/group grant-write path that
+        // calls bustSessionsForOrg — so a feature toggled here (e.g. Notebooks)
+        // was served from a stale snapshot for up to 30s, making it look like the
+        // change "sometimes works". Bumping the install-wide licence version
+        // changes those cache keys so the next request re-resolves from the DB.
+        // Only fires when an entitlement-bearing list actually changed — price /
+        // name edits don't need it.
+        const ENT_FIELDS = ['allowed_features', 'allowed_beta_features', 'allowed_integrations', 'allowed_models'];
+        const entChanged = ENT_FIELDS.some(f =>
+            req.body[f] !== undefined &&
+            JSON.stringify(req.body[f] ?? null) !== JSON.stringify(oldPlan?.[f] ?? null)
+        );
+        if (entChanged) {
+            try { require('../license').bumpServerLicenseVersion(); } catch (_) { /* best-effort cache bust */ }
+        }
+
         // Auto-sync to Stripe if enabled.
         // Fixed plans: trigger on price / name / interval change AND price > 0.
         // PAYG plans:  trigger on name / interval / currency change OR first sync.
@@ -398,7 +416,13 @@ router.get('/orgs/:orgId', async (req, res) => {
         const derivedCap = planPrice > 0
             ? (isPerSeat ? planPrice * seatQty : planPrice)
             : null;
-        const explicitCap = Number(effective?.max_cost_per_month);
+        // Read the genuine subscription override from the raw row — `effective`
+        // now already carries the seat-scaled cap from getEffectiveLimits, so
+        // checking it here would just echo that. Using `sub` lets the displayed
+        // cap track the LIVE seat count (derivedCap) for immediacy, while a real
+        // admin override still wins. Display and enforcement share the price ×
+        // seats formula and converge as soon as the seat sync lands.
+        const explicitCap = Number(sub?.max_cost_per_month);
         const effectiveCostCap = (Number.isFinite(explicitCap) && explicitCap > 0)
             ? explicitCap
             : derivedCap;
@@ -1323,10 +1347,30 @@ router.post('/consumer/:userId/start-trial', async (req, res) => {
 router.get('/registries', async (req, res) => {
     try {
         const { BETA_FEATURES } = require('../core/betaFeatures');
+
+        // Installed MCP servers — surfaced to the Plan editor as INTEGRATION
+        // options. IDs are `mcp:<id>` and the editor saves selected ones into the
+        // plan's `allowed_integrations` (MCP servers are integrations now; opt-in
+        // per subscription — never part of an unrestricted/null cap).
+        let mcp_servers = [];
+        try {
+            const servers = await require('../stores/mcpStore').listServers();
+            mcp_servers = (servers || []).map(s => ({
+                id: `mcp:${s.id}`,
+                name: s.name || s.id,
+                description: s.description || '',
+                category: 'MCP servers',
+                enabled: s.enabled !== false,
+            }));
+        } catch (e) {
+            console.warn('[Subscriptions] registries: mcp list unavailable:', e.message);
+        }
+
         res.json({
             beta_features: (BETA_FEATURES || []).filter(f => !f.deprecated).map(f => ({
                 id: f.id, name: f.name, description: f.description, license_feature: f.licenseFeature || null,
             })),
+            mcp_servers,
         });
     } catch (e) {
         console.error('[Subscriptions] registries error:', e);

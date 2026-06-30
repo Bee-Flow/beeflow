@@ -250,6 +250,25 @@ ABSOLUTE RULES:
 
         let messages = [{ role: 'system', content: systemPrompt }];
 
+        // ── Privacy Shield for attachments + response restore ──────────────
+        // Template chat had NO PII pipeline. Mirror directChat: scan extracted
+        // attachment text (tokenize PII / block per org policy) before it enters
+        // the prompt, then restore tokens on the streamed reply so the user sees
+        // real values. Conv-scoped so the scan's mergeTokenMap + the response
+        // un-tokeniser share one map; a synthetic id covers ephemeral sessions.
+        const _crypto = require('crypto');
+        const _dlpConvId = conversationId || `tmpl-${_crypto.randomUUID()}`;
+        const { resolveShieldFor: _resolveShieldFor } = require('../../core/orgShield');
+        const _psShield = await _resolveShieldFor({ orgId: userOrgId, userId }).catch(() => null);
+        const { scanAttachmentText: _scanAttText } = require('../../core/dlp/attachmentScanner');
+        const _dlpActive = !!_psShield?.enabled;
+        const _scanExtracted = async (text, filename) => {
+            if (!_dlpActive || !text) return text;
+            const r = await _scanAttText({ text, filename, orgShield: _psShield, conversationId: _dlpConvId });
+            if (r.action === 'block') { const e = new Error('attachment blocked'); e.code = 'ATTACHMENT_PII_BLOCKED'; e.filename = filename; e.summary = r.summary; throw e; }
+            return r.action === 'tokenize' ? r.text : text;
+        };
+
         // Add conversation history (filter out empty messages)
         if (history && Array.isArray(history)) {
             for (const msg of history) {
@@ -264,51 +283,66 @@ ABSOLUTE RULES:
             const contentParts = [];
             if (message) contentParts.push({ type: 'text', text: message });
 
-            for (const att of attachments) {
-                try {
-                    if (att.type && att.type.startsWith('image/') && att.content) {
-                        // Image — pass as multimodal content
-                        contentParts.push({ type: 'image_url', image_url: { url: att.content } });
-                    } else if (att.source === 'google-drive' && att.content) {
-                        // Google Drive file — already exported as text
-                        contentParts.push({ type: 'text', text: `--- Google Drive: ${att.name} ---\n${att.content}\n--- End of ${att.name} ---` });
-                    } else if (att.content && att.type && att.type.includes('pdf')) {
-                        // PDF — extract text
-                        const base64Data = att.content.split(',')[1] || att.content;
-                        const pdfBuffer = Buffer.from(base64Data, 'base64');
-                        let pdfText = '';
-                        try {
-                            const { extractTextFromPDF } = require('../../core/pdfExtractor');
-                            pdfText = await extractTextFromPDF(pdfBuffer, att.name);
-                        } catch (e) {
-                            console.warn(`[TemplateChat] PDF extraction failed for ${att.name}:`, e.message);
-                        }
-                        if (pdfText) {
-                            contentParts.push({ type: 'text', text: `[PDF Document: ${att.name}]\n---\n${pdfText}\n---` });
-                        }
-                    } else if (att.content && att.type && (att.type.includes('wordprocessing') || att.name?.endsWith('.docx'))) {
-                        // Word doc — extract text with mammoth
-                        const base64Data = att.content.split(',')[1] || att.content;
-                        const docBuffer = Buffer.from(base64Data, 'base64');
-                        try {
-                            const mammothLib = require('mammoth');
-                            const result = await mammothLib.extractRawText({ buffer: docBuffer });
-                            if (result.value) {
-                                contentParts.push({ type: 'text', text: `[Word Document: ${att.name}]\n---\n${result.value}\n---` });
+            try {
+                for (const att of attachments) {
+                    try {
+                        if (att.type && att.type.startsWith('image/') && att.content) {
+                            // Image — pass as multimodal content (image PII not scanned; deferred)
+                            contentParts.push({ type: 'image_url', image_url: { url: att.content } });
+                        } else if (att.source === 'google-drive' && att.content) {
+                            // Google Drive file — already exported as text
+                            const safe = await _scanExtracted(att.content, att.name);
+                            contentParts.push({ type: 'text', text: `--- Google Drive: ${att.name} ---\n${safe}\n--- End of ${att.name} ---` });
+                        } else if (att.content && att.type && att.type.includes('pdf')) {
+                            // PDF — extract text
+                            const base64Data = att.content.split(',')[1] || att.content;
+                            const pdfBuffer = Buffer.from(base64Data, 'base64');
+                            let pdfText = '';
+                            try {
+                                const { extractTextFromPDF } = require('../../core/pdfExtractor');
+                                pdfText = await extractTextFromPDF(pdfBuffer, att.name);
+                            } catch (e) {
+                                console.warn(`[TemplateChat] PDF extraction failed for ${att.name}:`, e.message);
                             }
-                        } catch (e) {
-                            console.warn(`[TemplateChat] Word extraction failed for ${att.name}:`, e.message);
+                            if (pdfText) {
+                                const safe = await _scanExtracted(pdfText, att.name);
+                                contentParts.push({ type: 'text', text: `[PDF Document: ${att.name}]\n---\n${safe}\n---` });
+                            }
+                        } else if (att.content && att.type && (att.type.includes('wordprocessing') || att.name?.endsWith('.docx'))) {
+                            // Word doc — extract text with mammoth
+                            const base64Data = att.content.split(',')[1] || att.content;
+                            const docBuffer = Buffer.from(base64Data, 'base64');
+                            try {
+                                const mammothLib = require('mammoth');
+                                const result = await mammothLib.extractRawText({ buffer: docBuffer });
+                                if (result.value) {
+                                    const safe = await _scanExtracted(result.value, att.name);
+                                    contentParts.push({ type: 'text', text: `[Word Document: ${att.name}]\n---\n${safe}\n---` });
+                                }
+                            } catch (e) {
+                                if (e?.code === 'ATTACHMENT_PII_BLOCKED') throw e;
+                                console.warn(`[TemplateChat] Word extraction failed for ${att.name}:`, e.message);
+                            }
+                        } else if (att.content && typeof att.content === 'string') {
+                            // Plain text or other text-based files
+                            const textContent = att.content.startsWith('data:') ? Buffer.from(att.content.split(',')[1] || '', 'base64').toString('utf-8') : att.content;
+                            if (textContent) {
+                                const safe = await _scanExtracted(textContent.slice(0, 8000), att.name);
+                                contentParts.push({ type: 'text', text: `[File: ${att.name}]\n---\n${safe}\n---` });
+                            }
                         }
-                    } else if (att.content && typeof att.content === 'string') {
-                        // Plain text or other text-based files
-                        const textContent = att.content.startsWith('data:') ? Buffer.from(att.content.split(',')[1] || '', 'base64').toString('utf-8') : att.content;
-                        if (textContent) {
-                            contentParts.push({ type: 'text', text: `[File: ${att.name}]\n---\n${textContent.slice(0, 8000)}\n---` });
-                        }
+                    } catch (e) {
+                        if (e?.code === 'ATTACHMENT_PII_BLOCKED') throw e;
+                        console.warn(`[TemplateChat] Attachment processing failed for ${att.name}:`, e.message);
                     }
-                } catch (e) {
-                    console.warn(`[TemplateChat] Attachment processing failed for ${att.name}:`, e.message);
                 }
+            } catch (e) {
+                if (e?.code === 'ATTACHMENT_PII_BLOCKED') {
+                    const cats = Object.keys(e.summary?.byCategory || {}).join(', ');
+                    send('error', { error: `Attachment "${e.filename}" was blocked by your organization's Privacy Shield${cats ? ` (contains ${cats})` : ''}.` });
+                    return res.end();
+                }
+                throw e;
             }
 
             // If we have images, send as multimodal; otherwise combine text parts
@@ -323,6 +357,18 @@ ABSOLUTE RULES:
             messages.push({ role: 'user', content: message });
         }
 
+        // PII token-preservation: when attachment scanning minted tokens, tell the
+        // model what the [token]s mean so it echoes them verbatim instead of
+        // meta-commenting on "anonymised" values. Best-effort.
+        if (_dlpActive) {
+            try {
+                const { buildTokenPreservationAddendum } = require('../../core/dlp/tokenPreservationPrompt');
+                const _convMap = require('../../core/dlp/dlpRunner').getConversationTokenMap(_dlpConvId);
+                const _add = buildTokenPreservationAddendum(_convMap);
+                if (_add && messages[0]?.role === 'system') messages[0].content += _add;
+            } catch (_) { /* best-effort */ }
+        }
+
         // Stream response
         const tierSettings = tiers[resolvedTier] || {};
         const { TIER_DEFAULTS } = require('../../core/modelResolver');
@@ -332,11 +378,18 @@ ABSOLUTE RULES:
             temperature: tierSettings.temperature !== undefined ? tierSettings.temperature : tierDefaults.temperature,
         };
 
+        // Response un-tokeniser: restore [token]s minted from attachment PII back
+        // to real values as chunks stream, so the user never sees placeholders.
+        // Passthrough when the shield is off (zero behavior change).
+        const _streamUntok = _dlpActive
+            ? require('../../core/dlp/untokeniseStream').createUntokeniser(() => require('../../core/dlp/dlpRunner').getConversationTokenMap(_dlpConvId))
+            : null;
+
         let fullContent = '';
         const streamCallback = (type, data) => {
             if (type === 'text') {
-                fullContent += data.text;
-                send('content', { text: data.text });
+                const safe = _streamUntok ? _streamUntok.push(data.text) : data.text;
+                if (safe) { fullContent += safe; send('content', { text: safe }); }
             } else if (type === 'thinking') {
                 send('thinking', { text: data.text });
             } else if (type === 'error') {
@@ -346,6 +399,11 @@ ABSOLUTE RULES:
         };
 
         await adapter.stream(apiKey, apiUrl, modelId, messages, chatOptions, streamCallback);
+
+        if (_streamUntok) {
+            const _tail = _streamUntok.flush();
+            if (_tail) { fullContent += _tail; send('content', { text: _tail }); }
+        }
 
         send('done', {});
         res.end();

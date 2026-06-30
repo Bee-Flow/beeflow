@@ -56,12 +56,12 @@ async function _tierClamps({ organizationId, userId }) {
  * Returns the list of fields that had to be clamped so the caller can
  * surface a `clamped_fields` marker in the response.
  */
-function _applyTierClamps(config, { hasPiiTokenize, hasWebSearchGuard }) {
+function _applyTierClamps(config, { hasWebSearchGuard }) {
     const clamped = [];
-    if (!hasPiiTokenize && config.piiDetectionAction && config.piiDetectionAction !== 'block') {
-        config.piiDetectionAction = 'block';
-        clamped.push('piiDetectionAction');
-    }
+    // NOTE: `piiDetectionAction` is intentionally NOT clamped to 'block' anymore.
+    // An explicitly-saved "tokenize" is honored end-to-end (see
+    // orgShield.applyTierClampsToShield). The SPA already gates SELECTING tokenize
+    // via `canTokenizePii`, so the page shows + persists the admin's real choice.
     if (!hasWebSearchGuard) {
         if (config.webSearchGuardEnabled) {
             config.webSearchGuardEnabled = false;
@@ -70,6 +70,16 @@ function _applyTierClamps(config, { hasPiiTokenize, hasWebSearchGuard }) {
         if (Array.isArray(config.webSearchGuardPiiCategories) && config.webSearchGuardPiiCategories.length > 0) {
             config.webSearchGuardPiiCategories = [];
             clamped.push('webSearchGuardPiiCategories');
+        }
+        // External-tool PII blocking shares the Web-Search-Guard licence gate
+        // (it's the generalization). Internal-tool blocking is left untouched
+        // on every tier (the data never leaves the box).
+        if (config.toolPiiPolicy?.external?.blockCategories?.length > 0) {
+            config.toolPiiPolicy = {
+                ...config.toolPiiPolicy,
+                external: { blockCategories: [] },
+            };
+            clamped.push('toolPiiPolicy.external');
         }
     }
     return clamped;
@@ -127,7 +137,8 @@ router.get('/:orgId', requireAuth, async (req, res) => {
         const isMember = orgIds === null || (orgIds && orgIds.has(orgId));
         if (!isMember) return res.status(403).json({ error: 'Not a member of this organization' });
 
-        const config = await configStore.getConfig(`org_privacy_shield_${orgId}`) || {
+        const stored = await configStore.getConfig(`org_privacy_shield_${orgId}`);
+        const config = stored || {
             enabled: false,
             collectionIds: [],
             scope: { userInput: true, agentOutput: true },
@@ -137,19 +148,26 @@ router.get('/:orgId', requireAuth, async (req, res) => {
             piiDetectionConfidenceThreshold: 0.7,
             piiDetectionAction: 'block',
             webSearchGuardPiiCategories: [],
+            toolPiiPolicy: { external: { blockCategories: [] }, internal: { blockCategories: [] } },
             monitorIntegrations: false,
         };
 
-        // Also pull current global AI config values so the UI stays in sync
-        const aiBlob = await configStore.getConfig('ai') || {};
-        if (!config.piiDetectionCategories?.length) {
-            config.piiDetectionCategories = aiBlob.piiDetectionCategories || [];
-        }
-        if (config.piiDetectionConfidenceThreshold === undefined) {
-            config.piiDetectionConfidenceThreshold = aiBlob.piiDetectionConfidenceThreshold ?? 0.7;
-        }
-        if (!config.piiDetectionAction) {
-            config.piiDetectionAction = aiBlob.piiDetectionAction || 'block';
+        // Seed the PII fields from the global AI config ONLY for an org that has
+        // never saved a shield row. Once a row exists we honour it verbatim —
+        // otherwise a deliberately-saved empty category list (the "None" button)
+        // or a narrowed selection would be silently resurrected from the global
+        // blob on every reload, so the admin's choice never sticks.
+        if (!stored) {
+            const aiBlob = await configStore.getConfig('ai') || {};
+            if (!config.piiDetectionCategories?.length) {
+                config.piiDetectionCategories = aiBlob.piiDetectionCategories || [];
+            }
+            if (config.piiDetectionConfidenceThreshold === undefined) {
+                config.piiDetectionConfidenceThreshold = aiBlob.piiDetectionConfidenceThreshold ?? 0.7;
+            }
+            if (!config.piiDetectionAction) {
+                config.piiDetectionAction = aiBlob.piiDetectionAction || 'block';
+            }
         }
 
         // Annotate with resolved-shield warnings so the admin UI can flag
@@ -193,11 +211,23 @@ router.put('/:orgId', requireAuth, async (req, res) => {
             return res.status(403).json({ error: 'Only organization admins can manage the privacy shield' });
         }
 
-        const { enabled, collectionIds, scope, action, euModeEnabled, webSearchGuardEnabled, disableSearchOnUpload, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionAction, webSearchGuardPiiCategories, monitorIntegrations,
+        const { enabled, collectionIds, scope, action, euModeEnabled, webSearchGuardEnabled, disableSearchOnUpload, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionAction, webSearchGuardPiiCategories, toolPiiPolicy, monitorIntegrations,
             // DLP
             dlpEnabled, dlpScope, dlpMode, dlpFailureMode, dlpAllowlistedHosts, customSensitiveTerms,
             // Transparency
             showRawPayload } = req.body;
+
+        // Sanitize the per-tool-class block policy: coerce each class to a
+        // { blockCategories: string[] } shape, drop non-strings, cap length.
+        const _sanitizeBlockCats = (v) => ({
+            blockCategories: (v && Array.isArray(v.blockCategories))
+                ? v.blockCategories.filter(c => typeof c === 'string').slice(0, 40)
+                : [],
+        });
+        const sanitizedToolPiiPolicy = {
+            external: _sanitizeBlockCats(toolPiiPolicy?.external),
+            internal: _sanitizeBlockCats(toolPiiPolicy?.internal),
+        };
 
         // Validate every custom term's regex. Report ALL invalid terms at once
         // so the admin doesn't need to fix-save-fix-save through a dozen regex
@@ -248,6 +278,7 @@ router.put('/:orgId', requireAuth, async (req, res) => {
             piiDetectionConfidenceThreshold: typeof piiDetectionConfidenceThreshold === 'number' ? piiDetectionConfidenceThreshold : 0.7,
             piiDetectionAction: ['block', 'tokenize', 'warn'].includes(piiDetectionAction) ? piiDetectionAction : 'block',
             webSearchGuardPiiCategories: Array.isArray(webSearchGuardPiiCategories) ? webSearchGuardPiiCategories : [],
+            toolPiiPolicy: sanitizedToolPiiPolicy,
             monitorIntegrations: !!monitorIntegrations,
             // DLP fields
             dlpEnabled: !!dlpEnabled,

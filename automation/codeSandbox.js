@@ -19,6 +19,8 @@
  * error rather than crashing on require().
  */
 
+const { isPrivateHostname, safeFetch, isPrivateAddressError } = require('../utils/ssrfGuard');
+
 let ivm = null;
 let ivmLoadError = null;
 try {
@@ -107,6 +109,14 @@ async function runCode({ code, inputs = {}, limits = {}, bridges = {} } = {}) {
             if (!bridges.secrets || typeof name !== 'string') return null;
             return bridges.secrets[name] ?? null;
         },
+        // Optional host-provided database bridge (used by webpage api/* handlers
+        // to reach the per-page SQLite). op ∈ 'query'|'exec'|'batch'.
+        db: async (op, argsJson) => {
+            if (typeof bridges.db !== 'function') return { error: 'no db bridge' };
+            let a = {};
+            try { a = argsJson ? JSON.parse(argsJson) : {}; } catch { return { error: 'invalid db args' }; }
+            try { return await bridges.db(op, a); } catch (e) { return { error: e.message || String(e) }; }
+        },
     };
 
     // Expose host-async functions inside the isolate. We wrap each as a
@@ -117,11 +127,18 @@ async function runCode({ code, inputs = {}, limits = {}, bridges = {} } = {}) {
     await jail.set('__hostHttp', new ivm.Reference(ctxHost.http));
     await jail.set('__hostSecret', new ivm.Reference(ctxHost.secret));
     await jail.set('__hostLog', new ivm.Reference(ctxHost.log));
+    const hasDb = typeof bridges.db === 'function';
+    if (hasDb) await jail.set('__hostDb', new ivm.Reference(ctxHost.db));
 
     // Bootstrapping JS that constructs the in-isolate ctx surface and
     // wraps the user code into an async IIFE.
     const bootstrap = `
-        const ctx = {
+        const ctx = {${hasDb ? `
+            db: {
+              query: (sql, params) => __hostDb.apply(undefined, ['query', JSON.stringify({ sql: sql, params: params || [] })], { result: { promise: true, copy: true } }),
+              exec: (sql, params) => __hostDb.apply(undefined, ['exec', JSON.stringify({ sql: sql, params: params || [] })], { result: { promise: true, copy: true } }),
+              batch: (statements) => __hostDb.apply(undefined, ['batch', JSON.stringify({ statements: statements || [] })], { result: { promise: true, copy: true } }),
+            },` : ''}
             log: (...args) => __hostLog.applyIgnored(undefined, args.map(a => typeof a === 'string' ? a : JSON.stringify(a))),
             secrets: (name) => __hostSecret.applySync(undefined, [name]),
             integrations: new Proxy({}, {
@@ -172,15 +189,26 @@ async function runCode({ code, inputs = {}, limits = {}, bridges = {} } = {}) {
 /**
  * HTTPS-only fetch helper used by ctx.http inside the sandbox. The
  * runner injects this so we keep network policy in one place.
+ *
+ * SSRF guard: private/internal hostnames fast-fail before any network
+ * activity, and safeFetch revalidates DNS at every socket connect — so a
+ * public hostname that resolves (or rebinds, or redirects) to a private
+ * address is refused too. All refusals surface as the same structured
+ * { error } shape user code already gets.
  */
 async function defaultFetchHttp(url, opts = {}, { responseCap = HTTP_RESPONSE_CAP, timeoutMs = 10_000 } = {}) {
     if (typeof url !== 'string' || !url.startsWith('https://')) {
         return { error: 'Only https:// URLs are allowed.' };
     }
+    let hostname;
+    try { hostname = new URL(url).hostname; } catch (e) { return { error: e.message || String(e) }; }
+    if (isPrivateHostname(hostname)) {
+        return { error: 'Refused: target resolves to a private/internal address.' };
+    }
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), timeoutMs);
     try {
-        const resp = await fetch(url, {
+        const resp = await safeFetch(url, {
             method: opts.method || 'GET',
             headers: opts.headers || {},
             body: opts.body !== undefined ? (typeof opts.body === 'string' ? opts.body : JSON.stringify(opts.body)) : undefined,
@@ -195,6 +223,9 @@ async function defaultFetchHttp(url, opts = {}, { responseCap = HTTP_RESPONSE_CA
             truncated: text.length > responseCap,
         };
     } catch (e) {
+        if (isPrivateAddressError(e)) {
+            return { error: 'Refused: target resolves to a private/internal address.' };
+        }
         return { error: e.message || String(e) };
     } finally {
         clearTimeout(timer);

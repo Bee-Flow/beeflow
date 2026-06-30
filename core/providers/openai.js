@@ -46,6 +46,9 @@ class OpenAIProvider extends BaseProvider {
 
     createClient(apiKey) {
         const OpenAI = require('openai');
+        // openai-node v5+ uses the platform's native fetch (undici on Node 18+),
+        // which terminates SSE streams cleanly — no node-fetch v2
+        // ERR_STREAM_PREMATURE_CLOSE workaround needed.
         return new OpenAI({ apiKey });
     }
 

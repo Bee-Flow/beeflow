@@ -45,9 +45,28 @@ const STORE_MODULES = [
     { name: 'importStore', file: './stores/importStore' },
     { name: 'iconStore', file: './stores/iconStore' },
     { name: 'notebookStore', file: './stores/notebookStore' },
+    { name: 'notebookConversationStore', file: './stores/notebookConversationStore' },
     { name: 'aiTaskStore', file: './stores/aiTaskStore' },
     { name: 'routineCredentialStore', file: './stores/routineCredentialStore' },
+    { name: 'integrationConnectionStore', file: './stores/integrationConnectionStore' },
+    { name: 'orgCustomIntegrationStore', file: './stores/orgCustomIntegrationStore' },
     { name: 'houseStyleStore', file: './stores/houseStyleStore' },
+    { name: 'leadStudioStore', file: './stores/leadStudioStore' },
+    { name: 'leadCrmStore', file: './stores/leadCrmStore' },
+    { name: 'suggestionScanCache', file: './stores/suggestionScanCache' },
+    { name: 'suggestionFeedbackStore', file: './stores/suggestionFeedbackStore' },
+    // §WS3.5 — automation-feature stores that own DDL (self-init on load). Without
+    // these, a standalone `npm run db:migrate` (CI / pre-deploy) did NOT bring the
+    // automation schema current — it only worked because the app self-inits on boot.
+    { name: 'automationStore', file: './stores/automationStore' },
+    { name: 'securityScanStore', file: './stores/securityScanStore' },
+    { name: 'feedbackStore', file: './stores/feedbackStore' },
+    { name: 'versionStore', file: './stores/versionStore' },
+    // Support studio stores own DDL (threads/messages/audit-log + connected
+    // mailboxes incl. the new shared_groups ACL column). Without these a
+    // standalone `npm run db:migrate` would not bring the support schema current.
+    { name: 'supportStore', file: './stores/supportStore' },
+    { name: 'supportInboxStore', file: './stores/supportInboxStore' },
 ];
 
 console.log('');

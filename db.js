@@ -112,6 +112,31 @@ async function disconnectRedis() {
 
 // ── Async Query Helpers ─────────────────────────────────
 
+// Lightweight query instrumentation: records duration into httpMetrics and
+// logs slow queries. We log ONLY a sanitized SQL prefix + the param COUNT —
+// never param values, which can contain PII or secrets.
+const metrics = require('./core/httpMetrics');
+const DB_SLOW_MS = metrics.DB_SLOW_MS;
+
+function _sanitizeSql(sql) {
+    return String(sql).replace(/\s+/g, ' ').trim().slice(0, 200);
+}
+
+async function _timedQuery(sql, params) {
+    const start = process.hrtime.bigint();
+    try {
+        return await pool.query(sql, params);
+    } finally {
+        try {
+            const ms = Number(process.hrtime.bigint() - start) / 1e6;
+            metrics.recordQuery(ms);
+            if (ms > DB_SLOW_MS) {
+                console.warn(`[DB] Slow query ${ms.toFixed(0)}ms (params=${Array.isArray(params) ? params.length : 0}): ${_sanitizeSql(sql)}`);
+            }
+        } catch (_) { /* instrumentation must never break a query */ }
+    }
+}
+
 /**
  * Execute a query (INSERT, UPDATE, DELETE, DDL).
  * @param {string} sql - SQL with $1, $2 placeholders
@@ -119,7 +144,7 @@ async function disconnectRedis() {
  * @returns {Promise<{ rowCount: number, rows: any[] }>}
  */
 async function run(sql, params = []) {
-    return pool.query(sql, params);
+    return _timedQuery(sql, params);
 }
 
 /**
@@ -129,7 +154,7 @@ async function run(sql, params = []) {
  * @returns {Promise<object|null>}
  */
 async function getOne(sql, params = []) {
-    const { rows } = await pool.query(sql, params);
+    const { rows } = await _timedQuery(sql, params);
     return rows[0] || null;
 }
 
@@ -140,7 +165,7 @@ async function getOne(sql, params = []) {
  * @returns {Promise<object[]>}
  */
 async function getAll(sql, params = []) {
-    const { rows } = await pool.query(sql, params);
+    const { rows } = await _timedQuery(sql, params);
     return rows;
 }
 

@@ -14,6 +14,7 @@
  */
 
 const { getRedis } = require('../db');
+const _metrics = require('../core/httpMetrics');
 
 const REDIS_PREFIX = 'automation:shape:';
 const TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
@@ -88,10 +89,11 @@ async function getShape({ userId, toolName }) {
         const r = getRedis();
         if (r && r.status === 'ready') {
             const raw = await r.get(key);
-            if (!raw) return null;
-            try { return JSON.parse(raw).shape; } catch { return null; }
+            if (!raw) { _metrics.recordCache('shape', false); return null; }
+            try { _metrics.recordCache('shape', true); return JSON.parse(raw).shape; } catch { return null; }
         }
         const cached = _mem.get(key);
+        _metrics.recordCache('shape', !!cached);
         return cached ? cached.shape : null;
     } catch {
         return null;

@@ -11,6 +11,7 @@
 
 const crypto = require('crypto');
 const { run, getOne, getAll, exec } = require('../db');
+const { htmlToMarkdown } = require('../core/markdown');
 
 let initialized = false;
 
@@ -45,6 +46,32 @@ async function initDB() {
         await exec(`ALTER TABLE notebooks ADD COLUMN IF NOT EXISTS type TEXT DEFAULT 'notebook'`);
     } catch (_) {}
 
+    // Migration: canonical Markdown mirror + per-row source-of-truth format flag
+    // (for the new editor's token-efficient AI path; document_content stays the
+    // HTML mirror so export + the TipTap fallback keep working unchanged).
+    try {
+        await exec(`ALTER TABLE notebooks ADD COLUMN IF NOT EXISTS document_md TEXT DEFAULT NULL`);
+        await exec(`ALTER TABLE notebooks ADD COLUMN IF NOT EXISTS document_format TEXT DEFAULT 'html'`);
+    } catch (_) {}
+
+    // Migration: optimistic-concurrency version counter. Bumped on every content
+    // write; lets a caller pass `expectedVersion` to detect a lost-update race
+    // (two tabs, or a tool-write vs a user autosave). Callers that don't pass it
+    // keep today's last-writer-wins behaviour — the column is purely additive.
+    try {
+        await exec(`ALTER TABLE notebooks ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 0`);
+    } catch (_) {}
+
+    // Migration: PII token map (the {token → real value} dictionary the Privacy
+    // Shield builds while tokenizing this notebook's chat/document/sources for
+    // the LLM). Persisting it here lets dlpRunner restore `[person_1]` → real
+    // values on reload / after a restart. dlpRunner reads & write-throughs this
+    // column directly (keyed by notebook id), the same way it does for
+    // agent_conversations / direct_conversations.
+    try {
+        await exec(`ALTER TABLE notebooks ADD COLUMN IF NOT EXISTS pii_token_map JSONB`);
+    } catch (_) {}
+
     // ── Notebook Sources table ───────────────────────────────────────
     await exec(`
         CREATE TABLE IF NOT EXISTS notebook_sources (
@@ -62,6 +89,11 @@ async function initDB() {
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         CREATE INDEX IF NOT EXISTS idx_notebook_sources_notebook ON notebook_sources(notebook_id);
+        -- V2 source improvements: manual ordering, ingestion stage, and stored
+        -- original text so pasted-text / meeting sources become retryable.
+        ALTER TABLE notebook_sources ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0;
+        ALTER TABLE notebook_sources ADD COLUMN IF NOT EXISTS stage TEXT;
+        ALTER TABLE notebook_sources ADD COLUMN IF NOT EXISTS content_text TEXT;
     `);
 
     // ── Notebook Versions table (immutable content snapshots) ────────
@@ -153,15 +185,46 @@ async function updateNotebook(id, userId, updates) {
     if (updates.instructions !== undefined) { setClauses.push(`instructions = $${idx++}`); params.push(updates.instructions); }
     if (updates.knowledgeBaseIds !== undefined) { setClauses.push(`knowledge_base_ids = $${idx++}`); params.push(JSON.stringify(updates.knowledgeBaseIds)); }
     if (updates.settings !== undefined) { setClauses.push(`settings = $${idx++}`); params.push(JSON.stringify(updates.settings)); }
-    if (updates.documentContent !== undefined) { setClauses.push(`document_content = $${idx++}`); params.push(updates.documentContent); }
+    let contentChanged = false;
+    if (updates.documentContent !== undefined) {
+        contentChanged = true;
+        setClauses.push(`document_content = $${idx++}`); params.push(updates.documentContent);
+        // Keep the canonical Markdown mirror fresh (derive from HTML unless the
+        // caller supplied it directly). If derivation throws, still persist the
+        // document content — losing the user's edit would be far worse than a
+        // stale mirror, and the AI tools already fall back to deriving Markdown
+        // from HTML on the fly. Previously a throw here aborted the whole save.
+        let md = updates.documentMd;
+        if (md === undefined) {
+            try { md = htmlToMarkdown(updates.documentContent); }
+            catch (e) { md = undefined; console.warn(`[NotebookStore] document_md derivation failed for ${id} — content still saved: ${e.message}`); }
+        }
+        if (md !== undefined) { setClauses.push(`document_md = $${idx++}`); params.push(md); }
+    }
+    if (updates.documentFormat !== undefined) { setClauses.push(`document_format = $${idx++}`); params.push(updates.documentFormat); }
 
     if (setClauses.length === 0) return false;
+    // Bump the version on any content-bearing write so a CAS caller can detect a
+    // concurrent change.
+    if (contentChanged) setClauses.push(`version = version + 1`);
     setClauses.push(`updated_at = NOW()`);
     params.push(id, userId);
+    let where = `id = $${idx++} AND user_id = $${idx++}`;
+    // Optimistic concurrency: when the caller passes the version it last read,
+    // refuse the write if the row moved underneath it (lost-update guard).
+    if (typeof updates.expectedVersion === 'number') {
+        where += ` AND version = $${idx++}`;
+        params.push(updates.expectedVersion);
+    }
     const { rowCount } = await run(
-        `UPDATE notebooks SET ${setClauses.join(', ')} WHERE id = $${idx++} AND user_id = $${idx}`,
+        `UPDATE notebooks SET ${setClauses.join(', ')} WHERE ${where}`,
         params
     );
+    if (rowCount === 0 && typeof updates.expectedVersion === 'number') {
+        // Distinguish a CAS conflict so the caller can surface it instead of
+        // silently overwriting (it reaches workspaceTools' _nbWriteFailed path).
+        return { ok: false, conflict: true };
+    }
     return rowCount > 0;
 }
 
@@ -176,27 +239,47 @@ async function deleteNotebook(id, userId) {
 
 // ── Source CRUD ─────────────────────────────────────────────────────
 
-async function addSource({ notebookId, type, name, storageKey, fileName, metadata, wordCount }) {
+async function addSource({ notebookId, type, name, storageKey, fileName, metadata, wordCount, contentText, stage }) {
     await initDB();
     const id = crypto.randomUUID();
+    // Append to the end of the manual order.
+    const ord = await getOne('SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM notebook_sources WHERE notebook_id = $1', [notebookId]);
+    const sortOrder = ord?.next ?? 0;
     await run(
-        `INSERT INTO notebook_sources (id, notebook_id, type, name, storage_key, file_name, metadata, status, word_count)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'processing', $8)`,
+        `INSERT INTO notebook_sources (id, notebook_id, type, name, storage_key, file_name, metadata, status, word_count, content_text, stage, sort_order)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'processing', $8, $9, $10, $11)`,
         [id, notebookId, type, name || 'Untitled', storageKey || null, fileName || null,
-         JSON.stringify(metadata || {}), wordCount || 0]
+         JSON.stringify(metadata || {}), wordCount || 0, contentText || null, stage || 'queued', sortOrder]
     );
     // Touch the notebook's updated_at
     await run('UPDATE notebooks SET updated_at = NOW() WHERE id = $1', [notebookId]);
-    return { id, notebookId, type, name, storageKey, fileName, metadata: metadata || {}, status: 'processing', wordCount: wordCount || 0 };
+    return { id, notebookId, type, name, storageKey, fileName, metadata: metadata || {}, status: 'processing', stage: stage || 'queued', wordCount: wordCount || 0, sortOrder };
 }
 
 async function getSources(notebookId) {
     await initDB();
     const rows = await getAll(
-        `SELECT * FROM notebook_sources WHERE notebook_id = $1 ORDER BY created_at ASC`,
+        `SELECT * FROM notebook_sources WHERE notebook_id = $1 ORDER BY sort_order ASC, created_at ASC`,
         [notebookId]
     );
     return rows.map(mapSourceRow);
+}
+
+/** Full extracted text of a source (for the preview panel + text/meeting retry). */
+async function getSourceContent(id) {
+    await initDB();
+    const r = await getOne('SELECT content_text FROM notebook_sources WHERE id = $1', [id]);
+    return r ? (r.content_text || '') : null;
+}
+
+/** Persist a manual ordering (array of source ids in the desired order). */
+async function reorderSources(notebookId, orderedIds) {
+    await initDB();
+    let i = 0;
+    for (const sid of orderedIds) {
+        await run('UPDATE notebook_sources SET sort_order = $1, updated_at = NOW() WHERE id = $2 AND notebook_id = $3', [i++, sid, notebookId]);
+    }
+    return true;
 }
 
 async function getSource(id) {
@@ -216,6 +299,9 @@ async function updateSource(id, updates) {
     if (updates.wordCount !== undefined) { setClauses.push(`word_count = $${idx++}`); params.push(updates.wordCount); }
     if (updates.metadata !== undefined) { setClauses.push(`metadata = $${idx++}`); params.push(JSON.stringify(updates.metadata)); }
     if (updates.name !== undefined) { setClauses.push(`name = $${idx++}`); params.push(updates.name); }
+    if (updates.stage !== undefined) { setClauses.push(`stage = $${idx++}`); params.push(updates.stage); }
+    if (updates.contentText !== undefined) { setClauses.push(`content_text = $${idx++}`); params.push(updates.contentText); }
+    if (updates.sortOrder !== undefined) { setClauses.push(`sort_order = $${idx++}`); params.push(updates.sortOrder); }
 
     if (setClauses.length === 0) return false;
     setClauses.push(`updated_at = NOW()`);
@@ -275,7 +361,10 @@ function mapNotebookRow(r) {
         knowledgeBaseIds: parseJSON(r.knowledge_base_ids, []),
         settings: parseJSON(r.settings, {}),
         documentContent: r.document_content || '',
+        documentMd: r.document_md != null ? r.document_md : null,
+        documentFormat: r.document_format || 'html',
         type: r.type || 'notebook',
+        version: typeof r.version === 'number' ? r.version : (parseInt(r.version) || 0),
         sourceCount: parseInt(r.source_count) || 0,
         createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
         updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : null,
@@ -292,8 +381,13 @@ function mapSourceRow(r) {
         fileName: r.file_name,
         metadata: parseJSON(r.metadata, {}),
         status: r.status,
+        stage: r.stage || null,
         error: r.error || null,
         wordCount: parseInt(r.word_count) || 0,
+        sortOrder: parseInt(r.sort_order) || 0,
+        // Flag (not the content) so the list payload stays small but the UI knows
+        // a preview is available and whether a text/meeting source can be retried.
+        hasContent: !!(r.content_text && r.content_text.length),
         createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
         updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : null,
     };
@@ -410,6 +504,8 @@ module.exports = {
     addSource,
     getSources,
     getSource,
+    getSourceContent,
+    reorderSources,
     updateSource,
     deleteSource,
     timeoutStuckSources,

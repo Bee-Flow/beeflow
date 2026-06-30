@@ -5,8 +5,12 @@
  *   requireLicenseFeature('security_scan')
  *   requireBetaFeature('security_scan')
  *
+ * Every scan is AI-agent driven: Claude drives the full toolbox inside one
+ * isolated container. The legacy deterministic 'quick' pipeline is gone.
+ *
  * Endpoints:
- *   POST   /scans                    — body: { targetUrl, engines:[{engine,intensity?}], authorized:true }
+ *   GET    /scans/policy             — aggression levels + ceiling + netRaw flag
+ *   POST   /scans                    — body: { targetUrl, engines?, authorized:true, modelTier?, aggression? }
  *   GET    /scans/active
  *   GET    /scans/:id
  *   GET    /scans/:id/report
@@ -20,9 +24,10 @@
  * org-admin escalation alongside the GA admin UI.
  *
  * Safety: scans only ever run against targets the requester explicitly
- * authorizes (authorized:true) and that pass the SSRF guard. ZAP/Nuclei
- * "active" (full) scans are gated behind SECURITY_ALLOW_ACTIVE_SCAN so a
- * default install can only run passive baseline checks.
+ * authorizes (authorized:true) and that pass the SSRF guard. Intrusive/attack
+ * behaviour is governed by a graded aggression level (recon/passive/active/
+ * offensive) clamped to the server ceiling SECURITY_MAX_AGGRESSION — see
+ * core/securityAggression.js.
  */
 
 const express = require('express');
@@ -30,11 +35,16 @@ const router = express.Router();
 
 const securityScanStore = require('../stores/securityScanStore');
 const scanRunner = require('../workers/scanRunner');
+const scanRunnerSvc = require('../services/scanRunner');
 const { checkSubscriptionLimits } = require('../core/limits');
+const aggression = require('../core/securityAggression');
 
-// Engines the worker knows how to run, and the intensities each accepts.
+// Engines that seed the report header. In agent mode the agent drives the full
+// toolbox inside one container, so this is metadata + a ZAP default rather than
+// a fixed pipeline.
 const VALID_ENGINES = ['zap', 'nuclei', 'testssl'];
 const ZAP_INTENSITIES = ['baseline', 'full'];
+const MODEL_TIER_RE = /^[a-zA-Z0-9_:-]{1,64}$/;
 
 function requireAuth(req, res, next) {
     if (req.session?.user) return next();
@@ -43,23 +53,58 @@ function requireAuth(req, res, next) {
 
 router.use(requireAuth);
 
+// ── Policy ─────────────────────────────────────────────────────────
+// Lets the New-scan UI know which aggression levels are available (so it can
+// disable any above the server ceiling) and whether raw-socket tooling is on.
+router.get('/scans/policy', (req, res) => {
+    res.json({
+        aggression: {
+            levels: aggression.LEVELS,
+            default: aggression.DEFAULT_AGGRESSION,
+            ceiling: aggression.ceiling(),
+        },
+        netRaw: process.env.SECURITY_TOOLBOX_NET_RAW !== 'false',
+    });
+});
+
+// ── Pre-warm ───────────────────────────────────────────────────────
+// The New-scan dialog calls prewarm on open so a toolbox + ZAP boot in the
+// background; the scan then adopts it for an instant start. Best-effort: a null
+// prewarmId just means the scan cold-starts.
+router.post('/scans/prewarm', async (req, res) => {
+    try {
+        if (!(await scanRunnerSvc.dockerAvailable())) return res.json({ prewarmId: null });
+        const prewarmId = scanRunnerSvc.prewarmToolbox({ userId: req.session.user.id });
+        res.json({ prewarmId });
+    } catch (err) {
+        console.warn('[Security] prewarm failed:', err.message);
+        res.json({ prewarmId: null });
+    }
+});
+
+router.post('/scans/prewarm/:id/release', async (req, res) => {
+    try { await scanRunnerSvc.releasePrewarm(req.params.id); } catch (_) { /* idempotent */ }
+    res.json({ ok: true });
+});
+
 // ── Scans ──────────────────────────────────────────────────────────
 
 router.post('/scans', async (req, res) => {
     try {
         const body = req.body || {};
         const { targetUrl, authorized = false, metadata = null } = body;
+        // Every scan is now AI-agent driven — Claude drives the full toolbox
+        // inside one container. (The legacy deterministic 'quick' pipeline has
+        // been removed.)
+        const mode = 'agent';
         let engines = body.engines;
-        // 'quick' = the deterministic one-shot pipeline; 'agent' = the live,
-        // AI-driven scan that drives a ZAP daemon + tools sandbox step-by-step.
-        const mode = body.mode === 'agent' ? 'agent' : 'quick';
         if (!targetUrl || typeof targetUrl !== 'string') {
             return res.status(400).json({ error: 'targetUrl is required' });
         }
-        // Agent mode drives a ZAP daemon by default and treats nuclei/testssl as
-        // optional tools, so a missing engine list is fine — default to ZAP so
-        // the engine validation + report header have something concrete.
-        if (mode === 'agent' && (!Array.isArray(engines) || engines.length === 0)) {
+        // The agent drives a ZAP daemon by default and treats every other tool
+        // as something it may invoke, so a missing engine list is fine — default
+        // to ZAP so the report header has something concrete.
+        if (!Array.isArray(engines) || engines.length === 0) {
             engines = [{ engine: 'zap' }];
         }
         if (scanRunner.isPrivateTarget(targetUrl)) {
@@ -77,11 +122,9 @@ router.post('/scans', async (req, res) => {
             });
         }
 
-        // Validate the engine selection up-front so the worker never has to
-        // reason about a malformed descriptor.
-        if (!Array.isArray(engines) || engines.length === 0) {
-            return res.status(400).json({ error: 'engines must be a non-empty array' });
-        }
+        // Validate the engine descriptors (report header only — no quick-mode
+        // pipeline behind them any more, and ZAP active scanning is governed by
+        // the aggression level, not a per-engine intensity flag).
         const normalizedEngines = [];
         for (const e of engines) {
             if (!e || typeof e !== 'object' || typeof e.engine !== 'string') {
@@ -91,24 +134,33 @@ router.post('/scans', async (req, res) => {
                 return res.status(400).json({ error: `invalid engine: ${e.engine}` });
             }
             const descriptor = { engine: e.engine };
-            if (e.engine === 'zap') {
-                const intensity = e.intensity || 'baseline';
-                if (!ZAP_INTENSITIES.includes(intensity)) {
-                    return res.status(400).json({ error: `invalid zap intensity: ${intensity}` });
-                }
-                // A full (active) scan sends attack traffic — only allow it
-                // when the operator has opted the install in. Default installs
-                // are limited to the passive baseline.
-                if (intensity === 'full' && process.env.SECURITY_ALLOW_ACTIVE_SCAN !== 'true') {
-                    return res.status(403).json({
-                        error: 'active_scan_disabled',
-                        message: 'Active (full) ZAP scans are disabled on this install. Contact your administrator.',
-                    });
-                }
-                descriptor.intensity = intensity;
+            if (e.engine === 'zap' && e.intensity && ZAP_INTENSITIES.includes(e.intensity)) {
+                descriptor.intensity = e.intensity;
             }
             normalizedEngines.push(descriptor);
         }
+
+        // Model tier (which Claude tier drives the agent). Opaque key resolved
+        // server-side at run time; validate shape only. The driver falls back to
+        // a Claude model if the tier resolves to a non-Claude provider.
+        let modelTier = typeof body.modelTier === 'string' ? body.modelTier.trim() : null;
+        if (modelTier && !MODEL_TIER_RE.test(modelTier)) {
+            return res.status(400).json({ error: 'invalid_model_tier' });
+        }
+
+        // Aggression level — validated and CLAMPED to the server ceiling so the
+        // selector can later be plan-gated by lowering SECURITY_MAX_AGGRESSION.
+        const chosenAggression = aggression.isValid(body.aggression) ? body.aggression : aggression.DEFAULT_AGGRESSION;
+        const effectiveAggression = aggression.clamp(chosenAggression);
+
+        // Pre-warmed toolbox handle (the dialog warmed one on open). Validated by
+        // shape; the worker adopts it if the in-process registry still has it,
+        // else cold-starts. Round-tripped via metadata so the worker receives it.
+        let prewarmId = typeof body.prewarmId === 'string' ? body.prewarmId.trim() : null;
+        if (prewarmId && !/^[a-f0-9]{8,64}$/i.test(prewarmId)) prewarmId = null;
+        const mergedMetadata = prewarmId
+            ? { ...(metadata && typeof metadata === 'object' ? metadata : {}), prewarmId }
+            : metadata;
 
         // Subscription / plan gate (billed under the 'security' agent type).
         const orgId = req.session.user.organizationId || null;
@@ -123,8 +175,10 @@ router.post('/scans', async (req, res) => {
             targetUrl,
             engines: normalizedEngines,
             authorized: true,
-            metadata,
+            metadata: mergedMetadata,
             mode,
+            modelTier,
+            aggression: effectiveAggression,
         });
 
         // Fast-path: kick the worker once for this row so users don't wait

@@ -12,9 +12,13 @@
  *
  * Token model:
  *   • Raw token = base64url(32 bytes from crypto.randomBytes) — 256-bit entropy
- *   • Only sha256(token) is stored. The raw token is shown to the publisher
- *     exactly once at creation; lookup is by hash so a DB leak does not give
- *     an attacker working links.
+ *   • Lookup is by sha256(token) (token_hash), so a DB-only leak does not give
+ *     an attacker working links. Additionally, the raw token is stored
+ *     AES-256-GCM-encrypted (token_cipher) under MASTER_ENCRYPTION_KEY — the
+ *     same trust level as all config secrets — so the server can rebuild share
+ *     URLs for already-authorized readers (BFSF-188). Without the key, the
+ *     cipher is NULL and the share degrades to the legacy non-retrievable
+ *     behaviour.
  *   • Magic-link query parameter `k=...` (email-gated mode) is signed with
  *     HMAC by publicShareToken.js — separate concern from the share token.
  *
@@ -30,6 +34,7 @@
 const crypto = require('crypto');
 const argon2 = require('argon2');
 const { run, getOne, getAll, exec } = require('../db');
+const configStore = require('./configStore');
 const storageStore = require('./storageStore');
 const webpageStore = require('./webpageStore');
 
@@ -89,6 +94,22 @@ async function runInit() {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_wpps_token_hash ON webpage_public_shares(token_hash);
     `);
 
+    // Self-migration: encrypted raw token at rest so already-authorized
+    // readers can recover share URLs (BFSF-188). Nullable — rows created
+    // before this column (or without MASTER_ENCRYPTION_KEY) stay legacy.
+    await exec(`
+        ALTER TABLE webpage_public_shares ADD COLUMN IF NOT EXISTS token_cipher TEXT;
+    `);
+
+    // Self-migration: how the snapshot under this share must be served.
+    //   'static' — sanitized HTML/CSS trio (vanilla pages), script-free iframe.
+    //   'react'  — a self-contained, server-bundled React doc stored in the
+    //              `reactdoc` slot, served with a script-allowing CSP.
+    // Defaults to 'static' so every pre-existing share keeps its behaviour.
+    await exec(`
+        ALTER TABLE webpage_public_shares ADD COLUMN IF NOT EXISTS snapshot_kind TEXT NOT NULL DEFAULT 'static';
+    `);
+
     await exec(`
         CREATE TABLE IF NOT EXISTS webpage_public_share_views (
             id BIGSERIAL PRIMARY KEY,
@@ -144,6 +165,8 @@ function snapshotKey(shareId, slot) {
     if (slot === 'html') return `${snapshotPrefix(shareId)}index.html`;
     if (slot === 'css')  return `${snapshotPrefix(shareId)}style.css`;
     if (slot === 'js')   return `${snapshotPrefix(shareId)}script.js`;
+    // The self-contained, server-bundled React document (react-mui pages).
+    if (slot === 'reactdoc') return `${snapshotPrefix(shareId)}index.react.html`;
     return `${snapshotPrefix(shareId)}${slot}`;
 }
 
@@ -172,6 +195,7 @@ function mapRow(r) {
         expiresAt: r.expires_at ? new Date(r.expires_at).toISOString() : null,
         revokedAt: r.revoked_at ? new Date(r.revoked_at).toISOString() : null,
         snapshotPrefix: r.snapshot_prefix,
+        snapshotKind: r.snapshot_kind || 'static',
         title: r.title || '',
         viewCount: parseInt(r.view_count) || 0,
         lastViewedAt: r.last_viewed_at ? new Date(r.last_viewed_at).toISOString() : null,
@@ -214,6 +238,12 @@ async function createShare({ webpageId, createdBy, organizationId, accessMode, p
     const id = crypto.randomUUID();
     const rawToken = generateRawToken();
     const tokenHash = hashToken(rawToken);
+    // Best-effort encrypted copy of the raw token so getRetrievableTokens()
+    // can rebuild URLs later. If MASTER_ENCRYPTION_KEY is unset, degrade to
+    // the legacy non-retrievable model (token shown once at create only).
+    let tokenCipher = null;
+    try { tokenCipher = configStore.encryptValue(rawToken, organizationId || null); }
+    catch (_) { /* MASTER_ENCRYPTION_KEY unset — degrade to legacy non-retrievable */ }
     const passwordHash = accessMode === 'password'
         ? await argon2.hash(password, { type: argon2.argon2id })
         : null;
@@ -224,10 +254,10 @@ async function createShare({ webpageId, createdBy, organizationId, accessMode, p
 
     await run(
         `INSERT INTO webpage_public_shares
-            (id, webpage_id, created_by, organization_id, token_hash, access_mode,
+            (id, webpage_id, created_by, organization_id, token_hash, token_cipher, access_mode,
              password_hash, allowed_emails, expires_at, snapshot_prefix, title)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-        [id, webpageId, createdBy, organizationId || null, tokenHash, accessMode,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+        [id, webpageId, createdBy, organizationId || null, tokenHash, tokenCipher, accessMode,
          passwordHash, emails ? JSON.stringify(emails) : null,
          expiresAt || null, prefix, title || '']
     );
@@ -256,6 +286,28 @@ async function getShareById(id) {
     await initDB();
     const r = await getOne('SELECT * FROM webpage_public_shares WHERE id = $1', [id]);
     return mapRow(r);
+}
+
+/**
+ * Decrypt the raw tokens for a webpage's non-revoked shares so the route
+ * layer can rebuild share URLs for already-authorized readers (BFSF-188).
+ * Returns { [shareId]: rawToken }. Legacy rows (NULL cipher) and rows whose
+ * cipher no longer decrypts (key rotation) are silently omitted — the share
+ * degrades to non-retrievable, it never breaks. Ciphertext stays inside this
+ * function; mapRow never exposes it.
+ */
+async function getRetrievableTokens(webpageId) {
+    await initDB();
+    const rows = await getAll(
+        `SELECT id, token_cipher FROM webpage_public_shares
+          WHERE webpage_id = $1 AND token_cipher IS NOT NULL AND revoked_at IS NULL`,
+        [webpageId]);
+    const out = {};
+    for (const r of rows) {
+        const raw = configStore.decryptValue(r.token_cipher);
+        if (raw && typeof raw === 'string') out[r.id] = raw; // null on decrypt failure
+    }
+    return out;
 }
 
 /**
@@ -326,6 +378,22 @@ async function updateExpiry(id, createdBy, expiresAt) {
     return rowCount > 0;
 }
 
+/**
+ * Record how the share's snapshot must be served ('static' | 'react').
+ * Called by webpageSnapshot.writeSnapshot after it decides which artifact it
+ * stored, so the public viewer knows whether to wrap HTML/CSS (script-free) or
+ * serve the self-contained React doc with a script-allowing CSP. Keyed by id
+ * only — the caller already authorized the write.
+ */
+async function setSnapshotKind(shareId, kind) {
+    await initDB();
+    const value = kind === 'react' ? 'react' : 'static';
+    await run(
+        `UPDATE webpage_public_shares SET snapshot_kind = $1, updated_at = NOW() WHERE id = $2`,
+        [value, shareId]
+    );
+}
+
 async function recordView(shareId, { viewerEmail, ip, userAgent }) {
     await initDB();
     await run(
@@ -374,11 +442,13 @@ module.exports = {
     createShare,
     listSharesForWebpage,
     getShareById,
+    getRetrievableTokens,
     findByToken,
     verifyPassword,
     isEmailAllowed,
     revokeShare,
     updateExpiry,
+    setSnapshotKind,
     recordView,
     deleteShare,
     purgeSnapshotObjects,

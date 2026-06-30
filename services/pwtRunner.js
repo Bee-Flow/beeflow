@@ -43,6 +43,18 @@ const SHM_MB = parseInt(process.env.PLAYWRIGHT_RUNNER_SHM_MB || '256', 10);
 const MAX_AGE_MS = parseInt(process.env.PLAYWRIGHT_RUNNER_MAX_AGE_MS || '600000', 10); // 10 min
 const SERVE_READY_TIMEOUT_MS = parseInt(process.env.PLAYWRIGHT_SERVE_READY_TIMEOUT_MS || '60000', 10);
 
+// ── Long-lived shared browser singleton ─────────────────────────────────────
+// A persistent serve container (distinct from the per-run throwaways) that the
+// API process drives remotely for PDF export, thumbnails, SPA ingestion, and
+// the Tests Studio host fallback. It carries a DIFFERENT kind label so the
+// reaper never touches it, and it owns its own liveness checks.
+const BROWSER_NAME = process.env.BROWSER_CONTAINER_NAME || 'bf-browser';
+const LABEL_KIND_BROWSER = 'pwt-browser';
+const BROWSER_MEMORY_MB = parseInt(process.env.BROWSER_CONTAINER_MEMORY_MB || '1024', 10);
+const BROWSER_CPUS = parseFloat(process.env.BROWSER_CONTAINER_CPUS || '1.0');
+const BROWSER_SHM_MB = parseInt(process.env.BROWSER_CONTAINER_SHM_MB || '256', 10);
+const BROWSER_READY_TIMEOUT_MS = parseInt(process.env.BROWSER_READY_TIMEOUT_MS || '60000', 10);
+
 function getDocker() {
     return new Docker({ socketPath: '/var/run/docker.sock' });
 }
@@ -411,6 +423,135 @@ async function startServeContainer({ runId, onLine }) {
     }
 }
 
+// ── Shared browser singleton ────────────────────────────────────────────────
+
+function browserHostConfigCaps(extra = {}) {
+    return {
+        Memory: Math.max(256, BROWSER_MEMORY_MB) * 1024 * 1024,
+        NanoCpus: Math.round(Math.max(0.25, BROWSER_CPUS) * 1e9),
+        PidsLimit: 512,
+        ShmSize: Math.max(64, BROWSER_SHM_MB) * 1024 * 1024,
+        Init: true,
+        AutoRemove: false,
+        SecurityOpt: ['no-new-privileges'],
+        RestartPolicy: { Name: 'no' },
+        ...extra,
+    };
+}
+
+let _browserSingleton = null;   // { wsEndpoint, containerId } | { wsEndpoint, external:true }
+let _browserStarting = null;    // in-flight promise to dedupe concurrent first use
+
+/**
+ * Is the cached singleton still usable? External endpoints are assumed up;
+ * docker-managed ones are confirmed via inspect (Running).
+ */
+async function isBrowserAlive(s) {
+    if (!s) return false;
+    if (s.external) return true;
+    try {
+        const info = await getDocker().getContainer(s.containerId || BROWSER_NAME).inspect();
+        return info?.State?.Running === true;
+    } catch (_) {
+        return false;
+    }
+}
+
+/**
+ * Ensure a long-lived browser is reachable and return { wsEndpoint, ... }.
+ *   • BROWSER_WS_ENDPOINT set        → use it verbatim (external/sidecar), no docker.
+ *   • cached singleton still alive   → reuse.
+ *   • otherwise                      → (re)create the `bf-browser` serve container.
+ *
+ * The launchServer endpoint embeds a per-launch guid we can't recover from the
+ * outside, so we always remove+recreate on a cold start to capture a fresh
+ * PWT_WS_ENDPOINT line. The container reuses the same `serve` entrypoint and the
+ * isolated PWT_NETWORK as the throwaway runners.
+ */
+async function ensureBrowserSingleton({ onLine } = {}) {
+    if (process.env.BROWSER_WS_ENDPOINT) {
+        return { wsEndpoint: process.env.BROWSER_WS_ENDPOINT, external: true };
+    }
+    if (_browserSingleton && await isBrowserAlive(_browserSingleton)) return _browserSingleton;
+    if (_browserStarting) return _browserStarting;
+
+    _browserStarting = (async () => {
+        if (!(await dockerAvailable())) {
+            throw new Error('docker_unavailable: cannot start the shared browser container');
+        }
+        const docker = getDocker();
+        const image = await resolvePwtImage(docker, onLine);
+        await ensurePwtNetwork(docker);
+        const inContainer = isServerInContainer();
+        if (inContainer) await connectSelfToNetwork(docker);
+        await removeContainerIfExists(docker, BROWSER_NAME);
+
+        const createOpts = {
+            name: BROWSER_NAME,
+            Image: image,
+            Cmd: ['serve'],
+            Env: [`PWT_SERVE_PORT=${SERVE_PORT}`],
+            Labels: { [LABEL_KIND]: LABEL_KIND_BROWSER, [LABEL_BORN]: String(Date.now()) },
+            WorkingDir: '/runner',
+            ExposedPorts: { [`${SERVE_PORT}/tcp`]: {} },
+            NetworkingConfig: { EndpointsConfig: { [PWT_NETWORK]: {} } },
+        };
+        const hostExtra = { NetworkMode: PWT_NETWORK };
+        if (!inContainer) {
+            hostExtra.PortBindings = { [`${SERVE_PORT}/tcp`]: [{ HostIp: '127.0.0.1', HostPort: '0' }] };
+        }
+        createOpts.HostConfig = browserHostConfigCaps(hostExtra);
+
+        const container = await docker.createContainer(createOpts);
+        let detach = () => {};
+        try {
+            await container.start();
+
+            let reachableHost;
+            if (inContainer) {
+                reachableHost = `${BROWSER_NAME}:${SERVE_PORT}`;
+            } else {
+                const info = await container.inspect();
+                const binding = info?.NetworkSettings?.Ports?.[`${SERVE_PORT}/tcp`]?.[0];
+                const hostPort = binding?.HostPort;
+                if (!hostPort) throw new Error('browser container did not publish a host port');
+                reachableHost = `127.0.0.1:${hostPort}`;
+            }
+
+            const rawEndpoint = await new Promise((resolve, reject) => {
+                const timer = setTimeout(() => reject(new Error('browser container did not report a wsEndpoint in time')), BROWSER_READY_TIMEOUT_MS);
+                timer.unref?.();
+                detach = followLogs(docker, container, (line) => {
+                    const m = /^PWT_WS_ENDPOINT=(.+)$/.exec(line);
+                    if (m) { clearTimeout(timer); resolve(m[1].trim()); }
+                    else if (onLine) onLine(line);
+                });
+            });
+
+            const wsEndpoint = rawEndpoint.replace(/^ws:\/\/[^/]+/, `ws://${reachableHost}`);
+            _browserSingleton = { wsEndpoint, containerId: container.id };
+            return _browserSingleton;
+        } catch (e) {
+            try { detach(); } catch (_) {}
+            try { await container.stop({ t: 3 }); } catch (_) {}
+            try { await container.remove({ force: true }); } catch (_) {}
+            throw e;
+        } finally {
+            // We only needed logs to capture the endpoint line; liveness is
+            // tracked via inspect afterwards, so stop following.
+            try { detach(); } catch (_) {}
+        }
+    })().finally(() => { _browserStarting = null; });
+
+    return _browserStarting;
+}
+
+/** Convenience: ensure the singleton and return just its ws endpoint. */
+async function getBrowserEndpoint(opts) {
+    const s = await ensureBrowserSingleton(opts || {});
+    return s.wsEndpoint;
+}
+
 // ── Cancellation + reaping ──────────────────────────────────────────────────
 
 async function killRun(runId) {
@@ -425,6 +566,10 @@ async function killRun(runId) {
  * MAX_AGE_MS, or whose run is no longer active. Run on worker boot (kills
  * leftovers from a crashed worker) and on an interval. `isRunActive` lets the
  * caller consult the DB so we don't reap a container whose run is mid-flight.
+ *
+ * NOTE: the long-lived browser singleton carries the DIFFERENT kind label
+ * `pwt-browser`, so the `pwt-runner` filter below never matches it — it is
+ * intentionally exempt from reaping and manages its own liveness.
  */
 async function reapStaleRunners(isRunActive = null) {
     if (!(await dockerAvailable())) return { reaped: 0 };
@@ -467,6 +612,9 @@ module.exports = {
     ensurePwtNetwork,
     runSuiteContainer,
     startServeContainer,
+    ensureBrowserSingleton,
+    getBrowserEndpoint,
+    isBrowserAlive,
     killRun,
     reapStaleRunners,
     PWT_NETWORK,

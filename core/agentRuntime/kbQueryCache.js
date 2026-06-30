@@ -18,6 +18,7 @@
  */
 
 const crypto = require('crypto');
+const _metrics = require('../httpMetrics');
 
 const MAX_ENTRIES_PER_CONV = 64;
 const CONV_IDLE_TTL_MS = 60 * 60 * 1000; // 1 hour
@@ -42,15 +43,16 @@ function buildKey(query, kbIds) {
 function get(conversationId, query, kbIds) {
     if (!conversationId) return null;
     const bucket = _cache.get(conversationId);
-    if (!bucket) return null;
+    if (!bucket) { _metrics.recordCache('kb_query', false); return null; }
     const key = buildKey(query, kbIds);
     const value = bucket.entries.get(key);
-    if (!value) return null;
+    if (!value) { _metrics.recordCache('kb_query', false); return null; }
 
     // Promote to LRU tail.
     bucket.entries.delete(key);
     bucket.entries.set(key, value);
     bucket.lastAccess = Date.now();
+    _metrics.recordCache('kb_query', true);
     return value;
 }
 

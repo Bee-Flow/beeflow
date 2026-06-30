@@ -11,8 +11,8 @@ const crypto = require('crypto');
 const kbStore = require('../stores/knowledgeBases');
 const configStore = require('../stores/configStore');
 const userStore = require('../stores/userStore');
-const { requireAuth, resolveUserOrgIds, requirePermission, hasPermission, assertUserCanUseOrg, validateSharedGroupsForOrg, requireActiveOrgForMutations } = require('../auth');
-const { getUserBetaFeatures } = require('../core/betaFeatures');
+const { requireAuth, resolveUserOrgIds, requirePermission, hasPermission, assertUserCanUseOrg, validateSharedGroupsForOrg, requireActiveOrgForMutations, isOrgAdminRole } = require('../auth');
+const { userHasBetaFeature } = require('../core/betaFeatures');
 
 // Block mutations when the caller's org is suspended/archived. Reads pass through.
 router.use(requireActiveOrgForMutations());
@@ -25,13 +25,16 @@ const SYSTEM_KB_BETA_SLUGS = ['dutch_legal_sources'];
 async function resolveEnabledSystemSlugs(req) {
     const userId = req.session?.user?.id;
     if (!userId) return [];
-    try {
-        const features = await getUserBetaFeatures(userId, req.session);
-        const featureSet = new Set(features);
-        return SYSTEM_KB_BETA_SLUGS.filter(slug => featureSet.has(slug));
-    } catch (_) {
-        return [];
+    // Route through the resolver (userHasBetaFeature delegates to resolveEntitlements)
+    // so a system KB's beta respects the per-org access ceiling — including for a
+    // global admin (orgAvailable via governingOrgId), not the raw "admins get all
+    // betas" list. "Disabled in the menu ⇒ hidden" then holds for the Legal KB too.
+    const enabled = [];
+    for (const slug of SYSTEM_KB_BETA_SLUGS) {
+        try { if (await userHasBetaFeature(userId, slug, req.session)) enabled.push(slug); }
+        catch (_) { /* skip this slug on resolve failure */ }
     }
+    return enabled;
 }
 
 const SEARCH_SERVICE_URL = process.env.SEARCH_SERVICE_URL || 'https://services.beeflow.nl';
@@ -92,11 +95,24 @@ async function resolveUserGroups(req) {
     return [];
 }
 
+// True when the requesting user is an organisation admin (org_admin / legacy
+// admin). Org admins always see every KB in their organisation — including
+// unpublished drafts and group-restricted KBs.
+async function resolveIsOrgAdmin(req) {
+    const userId = getUserId(req);
+    if (!userId) return false;
+    try {
+        const user = await userStore.getUser(userId);
+        return !!(user && isOrgAdminRole(user.orgRole));
+    } catch (_) { return false; }
+}
+
 /**
  * Centralized KB access check. Mirrors `kbStore.canUserAccessKB` so that the
  * list filter and per-id route guards never drift.
  * - Owner (tenant_id) always has access
  * - Super admin (resolveUserOrgIds returns null) always has access
+ * - Org admin: every KB in their organisation (incl. drafts + group-restricted)
  * - Org member: KB must be in their org AND published AND, if shared_groups
  *   is set, the user must belong to at least one of those groups
  */
@@ -105,7 +121,21 @@ async function canAccessKB(req, kb) {
     if (kb.tenant_id === userId) return true;
     const orgIds = await resolveUserOrgIds(req);
     const userGroups = await resolveUserGroups(req);
-    return kbStore.canUserAccessKB(kb, userId, orgIds, userGroups);
+    const isOrgAdmin = await resolveIsOrgAdmin(req);
+    return kbStore.canUserAccessKB(kb, userId, orgIds, userGroups, { isOrgAdmin });
+}
+
+/**
+ * Management check for KB settings mutations (BFSF-214). Mirrors the
+ * publish route's owner-or-manager policy but adds same-org scoping.
+ * Does NOT grant content read access — GET/document/search routes keep
+ * canAccessKB.
+ */
+async function canManageKB(req, kb) {
+    const userId = getUserId(req);
+    const orgIds = await resolveUserOrgIds(req);
+    const hasPerm = await hasPermission(userId, 'manage_knowledge', req.session);
+    return kbStore.canUserManageKB(kb, userId, orgIds, hasPerm);
 }
 
 /**
@@ -136,12 +166,13 @@ router.get('/', requireAuth, async (req, res) => {
     try {
         const userId = getUserId(req);
         const orgIds = await resolveUserOrgIds(req);
+        const isOrgAdmin = await resolveIsOrgAdmin(req);
         const systemSlugs = await resolveEnabledSystemSlugs(req);
-        const kbs = await kbStore.listKBs(userId, orgIds, { ...listFilterFromQuery(req), systemSlugs });
+        const kbs = await kbStore.listKBs(userId, orgIds, { ...listFilterFromQuery(req), systemSlugs, isOrgAdmin });
         const userGroups = await resolveUserGroups(req);
-        // Owners always see drafts; org members see only published KBs that pass
-        // shared_groups restriction.
-        const filtered = kbStore.filterByGroupAccess(kbs, userId, userGroups);
+        // Owners always see drafts; org admins see every org KB (incl. drafts);
+        // regular org members see only published KBs that pass shared_groups.
+        const filtered = kbStore.filterByGroupAccess(kbs, userId, userGroups, { orgIds, isOrgAdmin });
         res.json(filtered);
     } catch (e) {
         console.error('[KB] List error:', e.message);
@@ -248,6 +279,47 @@ router.post('/', requireAuth, requirePermission('manage_knowledge'), async (req,
         res.status(201).json(kb);
     } catch (e) {
         console.error('[KB] Create error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Duplicate a Knowledge Base's structure (BFSF-217). Copies the KB shell —
+// name ("Copy of …"), description, category, icon and usage contexts — into a
+// new manual KB owned by the requester. Documents are NOT copied (their chunks
+// + embeddings live in the search service); the user adds/swaps sources for the
+// new use case. Requires manage_knowledge + read access to the source KB.
+router.post('/:id/duplicate', requireAuth, requirePermission('manage_knowledge'), async (req, res) => {
+    try {
+        const userId = getUserId(req);
+        const source = await kbStore.getKB(req.params.id);
+        if (!source) return res.status(404).json({ error: 'Knowledge base not found' });
+        if (!await canAccessKB(req, source)) return res.status(404).json({ error: 'Knowledge base not found' });
+
+        // Personal KBs (organization_id null) copy as personal; org KBs stay in
+        // the same org when the requester may use it, else fall back to personal.
+        let assignOrgId = source.organization_id || null;
+        if (assignOrgId) {
+            try { assignOrgId = await assertUserCanUseOrg(req, assignOrgId); } catch (_) { assignOrgId = null; }
+        }
+
+        let usageContexts = null;
+        try { usageContexts = Array.isArray(source.usage_contexts) ? source.usage_contexts : JSON.parse(source.usage_contexts || 'null'); } catch (_) { usageContexts = null; }
+
+        const copy = await kbStore.createKB(
+            userId,
+            `Copy of ${source.name}`.slice(0, 200),
+            source.description || '',
+            assignOrgId || null,
+            {
+                categoryId: source.category_id || null,
+                icon: source.icon || null,
+                sourceKind: 'manual',
+                ...(Array.isArray(usageContexts) ? { usageContexts } : {}),
+            }
+        );
+        res.status(201).json(copy);
+    } catch (e) {
+        console.error('[KB] Duplicate error:', e.message);
         res.status(500).json({ error: e.message });
     }
 });
@@ -449,7 +521,7 @@ router.patch('/:id', requireAuth, requirePermission('manage_knowledge'), async (
     try {
         const kb = await kbStore.getKB(req.params.id);
         if (!kb) return res.status(404).json({ error: 'KB not found' });
-        if (!(await canAccessKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
+        if (!(await canManageKB(req, kb))) return res.status(403).json({ error: 'Access denied' });
         if (blockIfSystemKB(kb, res)) return;
 
         const { name, description, categoryId, icon, usageContexts } = req.body || {};
@@ -468,7 +540,8 @@ router.patch('/:id', requireAuth, requirePermission('manage_knowledge'), async (
 
 /**
  * Toggle publish state + set sharing scope. Mirrors PATCH /api/agents/:id/publish.
- * Owner can always publish/unpublish; non-owners need manage_knowledge.
+ * Owner can always publish/unpublish; non-owners need same-org
+ * manage_knowledge (canManageKB, BFSF-214).
  */
 router.patch('/:id/publish', requireAuth, async (req, res) => {
     try {
@@ -477,11 +550,8 @@ router.patch('/:id/publish', requireAuth, async (req, res) => {
         if (!kb) return res.status(404).json({ error: 'KB not found' });
         if (blockIfSystemKB(kb, res)) return;
 
-        const isOwner = kb.tenant_id === userId;
-        const isAdmin = req.session?.isAdmin || req.session?.user?.role === 'admin';
-        if (!isOwner && !isAdmin) {
-            const hasPerm = await hasPermission(userId, 'manage_knowledge', req.session);
-            if (!hasPerm) return res.status(403).json({ error: 'Permission denied' });
+        if (!(await canManageKB(req, kb))) {
+            return res.status(403).json({ error: 'Permission denied' });
         }
 
         // A KB must be attached to an organization to be published.
@@ -1252,26 +1322,43 @@ router.post('/search', requireAuth, async (req, res) => {
         const userId = getUserId(req);
         const { kb_ids, query, top_k } = req.body;
 
-        if (!query || !kb_ids || !Array.isArray(kb_ids) || kb_ids.length === 0) {
-            return res.status(400).json({ error: 'query and kb_ids[] are required' });
+        if (!query || !String(query).trim()) {
+            return res.status(400).json({ error: 'query is required' });
         }
 
-        // Verify access to all KBs in a single round-trip
         const orgIds = await resolveUserOrgIds(req);
         const userGroups = await resolveUserGroups(req);
+        const isOrgAdmin = await resolveIsOrgAdmin(req);
         const { getAll } = require('../db');
-        const kbRows = await getAll(
-            `SELECT * FROM knowledge_bases WHERE id = ANY($1::uuid[])`,
-            [kb_ids]
-        );
-        const foundIds = new Set(kbRows.map(r => String(r.id)));
-        const missing = kb_ids.find(id => !foundIds.has(String(id)));
-        if (missing) {
-            return res.status(403).json({ error: `Access denied for KB ${missing}` });
-        }
-        for (const kb of kbRows) {
-            if (!kbStore.canUserAccessKB(kb, userId, orgIds, userGroups)) {
-                return res.status(403).json({ error: `Access denied for KB ${kb.id}` });
+
+        // Global search (BFSF-216): when no kb_ids are supplied, search across
+        // every KB the user can access instead of erroring. Explicit ids keep
+        // the existing strict per-KB access check. Org admins may search every
+        // KB in their org (incl. drafts / group-restricted) — same policy as the
+        // KB list & per-id guards (canUserAccessKB opts.isOrgAdmin).
+        let effectiveKbIds = Array.isArray(kb_ids) ? kb_ids.filter(Boolean) : [];
+        if (effectiveKbIds.length === 0) {
+            const all = await kbStore.listKBs(userId, orgIds, { isOrgAdmin });
+            effectiveKbIds = (all || [])
+                .filter(kb => kbStore.canUserAccessKB(kb, userId, orgIds, userGroups, { isOrgAdmin }))
+                .map(kb => kb.id);
+            if (effectiveKbIds.length === 0) {
+                return res.json({ chunks: [], results: [], kb_ids: [] });
+            }
+        } else {
+            const kbRows = await getAll(
+                `SELECT * FROM knowledge_bases WHERE id = ANY($1::uuid[])`,
+                [effectiveKbIds]
+            );
+            const foundIds = new Set(kbRows.map(r => String(r.id)));
+            const missing = effectiveKbIds.find(id => !foundIds.has(String(id)));
+            if (missing) {
+                return res.status(403).json({ error: `Access denied for KB ${missing}` });
+            }
+            for (const kb of kbRows) {
+                if (!kbStore.canUserAccessKB(kb, userId, orgIds, userGroups, { isOrgAdmin })) {
+                    return res.status(403).json({ error: `Access denied for KB ${kb.id}` });
+                }
             }
         }
 
@@ -1283,7 +1370,7 @@ router.post('/search', requireAuth, async (req, res) => {
         let results;
         if (useLocalKB) {
             const { searchLocally } = require('../core/localKBIngest');
-            const localResults = await searchLocally(userId, kb_ids, query, { topK: top_k || 8 });
+            const localResults = await searchLocally(userId, effectiveKbIds, query, { topK: top_k || 8 });
             results = {
                 chunks: localResults,
                 results: localResults
@@ -1294,7 +1381,7 @@ router.post('/search', requireAuth, async (req, res) => {
                 headers: getServiceHeaders(),
                 body: JSON.stringify({
                     tenant_id: userId,
-                    kb_ids,
+                    kb_ids: effectiveKbIds,
                     query,
                     top_k: top_k || 8,
                     rerank: true
@@ -1323,7 +1410,7 @@ router.post('/search', requireAuth, async (req, res) => {
         if (!alreadyFiltered && allChunks.length > 0 && allChunks.some(c => c.document_id)) {
             try {
                 const { getAll } = require('../db');
-                const dbDocs = await getAll('SELECT id FROM documents WHERE knowledge_base_id = ANY($1::uuid[])', [kb_ids]);
+                const dbDocs = await getAll('SELECT id FROM documents WHERE knowledge_base_id = ANY($1::uuid[])', [effectiveKbIds]);
                 const validDocIds = new Set(dbDocs.map(d => String(d.id).toLowerCase()));
                 const filterFn = c => !c.document_id || validDocIds.has(String(c.document_id).toLowerCase());
                 

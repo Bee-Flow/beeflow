@@ -40,6 +40,8 @@ const INTEGRATION_CATALOG = [
     { id: 'fireflies', label: 'Fireflies.ai', description: 'Meeting transcripts', requiresKey: 'hasFirefliesKey' },
     { id: 'youtrack', label: 'YouTrack', description: 'Issues and projects', requiresKey: 'hasYouTrackConfig' },
     { id: 'gamma', label: 'Gamma', description: 'AI presentations', requiresKey: 'hasGammaKey' },
+    { id: 'afas-profit', label: 'AFAS Profit', description: 'Query AFAS Profit business data (read-only)', requiresKey: 'hasAfasConfig' },
+    { id: 'nmbrs', label: 'NMBRS', description: 'Read NMBRS payroll & HR data (read-only)', requiresKey: 'hasNmbrsConfig' },
     { id: 'linkedin', label: 'LinkedIn', description: 'Post and search on LinkedIn', requiresKey: 'hasLinkedInConfig' },
     { id: 'n8n', label: 'n8n', description: 'Run workflows', requiresKey: 'hasN8nConfig' },
     { id: 'web-search', label: 'Web Search', description: 'Search the web' },
@@ -94,6 +96,10 @@ async function getAvailableIntegrations(userId) {
     const hasYouTrackConfig = !!(await configStore.getSecret(`youtrack_url_user_${userId}`).catch(() => null))
         && !!(await configStore.getSecret(`youtrack_token_user_${userId}`).catch(() => null));
     const hasGammaKey = !!(await configStore.getSecret(`gamma_api_key_user_${userId}`).catch(() => null));
+    const hasAfasConfig = !!(await configStore.getSecret(`afas_token_user_${userId}`).catch(() => null))
+        && !!(await configStore.getSecret(`afas_member_number_user_${userId}`).catch(() => null));
+    const hasNmbrsConfig = !!(await configStore.getSecret(`nmbrs_subdomain_user_${userId}`).catch(() => null))
+        && !!(await configStore.getSecret(`nmbrs_token_user_${userId}`).catch(() => null));
     const hasLinkedInConfig = !!(await configStore.getSecret('linkedin_client_id').catch(() => null));
     let hasN8nConfig = false;
     if (orgId) {
@@ -104,7 +110,7 @@ async function getAvailableIntegrations(userId) {
         } catch (_) { /* ignore */ }
     }
 
-    const status = { isGoogleUser, isMicrosoftUser, hasFirefliesKey, hasYouTrackConfig, hasGammaKey, hasLinkedInConfig, hasN8nConfig };
+    const status = { isGoogleUser, isMicrosoftUser, hasFirefliesKey, hasYouTrackConfig, hasGammaKey, hasAfasConfig, hasNmbrsConfig, hasLinkedInConfig, hasN8nConfig };
 
     return INTEGRATION_CATALOG.filter(item => {
         if (orgEnabled && !orgEnabled.includes(item.id)) return false;
@@ -121,6 +127,7 @@ const PLAN_SCHEMA = `{
   "description": "string (1-2 sentences, second person, in the user's language)",
   "avatar": "single emoji",
   "capabilities": ["string", ...],         // 2-5 short capability bullets
+  "model": "fast|smart|thinking",           // recommended model tier for the agent's task complexity
   "enabledIntegrations": ["id", ...],       // pick ONLY ids from the provided list
   "skills": [
     {
@@ -166,6 +173,7 @@ Rules:
 - Write all user-facing text (name, description, capabilities, skills.name, skills.description, skills.instructions, systemPrompt) in ${langName}. If the user's prompt is clearly in another language, prefer that language.
 - Keep "name" under 40 characters.
 - Capabilities are short user-visible bullets, not technical jargon.
+- model: recommend "fast" for simple lookups and Q&A, "smart" for analysis and writing, "thinking" for deep multi-step reasoning. Default to "fast" when unsure.
 - enabledIntegrations: APPS ARE OFF BY DEFAULT. Add an id ONLY when the agent's stated job clearly requires it (e.g. include "gmail" only if the agent must read or send email). Do not enable apps speculatively. If unsure, leave the array empty — the user can flip apps on later in the editor.
 - skills: propose 0-5 skills. Reuse existing ones by id when there's a clear match; otherwise propose new skills with id=null and meaningful instructions.
 - systemPrompt must be self-contained: tone, scope, what to do, what to avoid.
@@ -179,6 +187,10 @@ function normalizePlan(plan, availableIntegrationIds) {
 
     if (!Array.isArray(plan.capabilities)) plan.capabilities = [];
     if (!plan.avatar) plan.avatar = '🤖';
+
+    // Model tier recommendation (BFSF-201) — validate against the known tiers,
+    // null otherwise so the client only applies a real suggestion.
+    plan.model = ['fast', 'smart', 'thinking'].includes(plan.model) ? plan.model : null;
 
     // Validate integration ids against the user-allowed list (security: drop unknowns).
     if (!Array.isArray(plan.enabledIntegrations)) plan.enabledIntegrations = [];

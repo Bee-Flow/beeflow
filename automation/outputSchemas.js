@@ -35,15 +35,35 @@ const OUTPUT_SCHEMAS = {
         shape: {
             id: 'string', threadId: 'string',
             from: 'string', to: 'string', subject: 'string',
-            date: 'string', body: 'string (plain text)', html: 'string (optional)',
-            attachments: 'array of { id, filename, mimeType, size }',
+            date: 'string', body: 'string (plain text)',
+            attachments: 'array of { attachmentId, filename, mimeType, size, canOCR, messageId, threadId }',
         },
         sample: {
             id: 'msg-1', threadId: 'th-1',
             from: 'sender@example.com', to: 'me@example.com',
             subject: 'Sample invoice', date: 'Mon, 06 Apr 2026 08:23:19 -0700',
             body: 'Beste klant,\n\nHierbij ontvangt u onze factuur met nummer 2026-001.\n\nBedrag: €1,234.50 (incl. BTW)\nBetalingstermijn: 30 dagen.\n\nMet vriendelijke groet.',
-            attachments: [],
+            // Non-empty so the builder's variable tree / LoopOverPicker / auto-map
+            // expose the per-attachment fields. Each item carries messageId so a
+            // "for each attachment" loop can feed gmail_read_attachment directly.
+            attachments: [
+                { attachmentId: 'attach-1', filename: 'invoice_2026-001.pdf', mimeType: 'application/pdf', size: 45678, canOCR: true, messageId: 'msg-1', threadId: 'th-1' },
+            ],
+        },
+    },
+    gmail_read_attachment: {
+        shape: {
+            filename: 'string', mimeType: 'string',
+            content: 'string (extracted text)', charCount: 'integer',
+            truncated: 'boolean', extractedVia: 'string (pdfjs|azure|mistral|documentParser|utf8)',
+            sourceHandle: 'opaque { kind, messageId, attachmentId, filename, mimeType, size } — pass to drive_upload_file / nextcloud_upload_file to forward the raw bytes',
+            error: 'string (only when extraction failed; sourceHandle still provided)',
+        },
+        sample: {
+            filename: 'invoice_2026-001.pdf', mimeType: 'application/pdf',
+            content: 'INVOICE 2026-001\nDate: 2026-04-06\nAmount Due: €1,234.50',
+            charCount: 1847, truncated: false, extractedVia: 'pdfjs',
+            sourceHandle: { kind: 'gmail_attachment', messageId: 'msg-1', attachmentId: 'attach-1', filename: 'invoice_2026-001.pdf', mimeType: 'application/pdf', size: 45678 },
         },
     },
     gmail_compose: {
@@ -59,6 +79,38 @@ const OUTPUT_SCHEMAS = {
     gmail_compose_reply: {
         shape: { sent: 'boolean', messageId: 'string', threadId: 'string', message: 'string' },
         sample: { sent: true, messageId: 'msg-reply-1', threadId: 'th-1', message: 'Reply sent.' },
+    },
+    gmail_list_labels: {
+        shape: { labels: 'array of { id, name, type }' },
+        sample: { labels: [
+            { id: 'INBOX', name: 'INBOX', type: 'system' },
+            { id: 'UNREAD', name: 'UNREAD', type: 'system' },
+            { id: 'Label_3', name: 'Work', type: 'user' },
+        ] },
+    },
+    gmail_modify_labels: {
+        shape: { messageId: 'string', labelIds: 'array of string (labels after the change)', addLabelIds: 'array of string', removeLabelIds: 'array of string', modified: 'boolean' },
+        sample: { messageId: 'msg-1', labelIds: ['INBOX', 'Label_3'], addLabelIds: ['Label_3'], removeLabelIds: [], modified: true },
+    },
+    gmail_mark_read: {
+        shape: { messageId: 'string', labelIds: 'array of string', read: 'boolean' },
+        sample: { messageId: 'msg-1', labelIds: ['INBOX'], read: true },
+    },
+    gmail_mark_unread: {
+        shape: { messageId: 'string', labelIds: 'array of string', read: 'boolean' },
+        sample: { messageId: 'msg-1', labelIds: ['INBOX', 'UNREAD'], read: false },
+    },
+    gmail_archive: {
+        shape: { messageId: 'string', labelIds: 'array of string', archived: 'boolean' },
+        sample: { messageId: 'msg-1', labelIds: [], archived: true },
+    },
+    gmail_trash: {
+        shape: { messageId: 'string', trashed: 'boolean', labelIds: 'array of string' },
+        sample: { messageId: 'msg-1', trashed: true, labelIds: ['TRASH'] },
+    },
+    gmail_create_draft: {
+        shape: { draftId: 'string', messageId: 'string', threadId: 'string', to: 'string', subject: 'string', message: 'string' },
+        sample: { draftId: 'draft-1', messageId: 'msg-draft-1', threadId: 'th-1', to: 'recipient@example.com', subject: 'Re: Sample subject', message: 'Draft saved.' },
     },
 
     // ── Google Calendar ───────────────────────────────────────────
@@ -490,4 +542,37 @@ function describeShape(toolName) {
     return Object.entries(schema.shape).map(([k, v]) => `${k}: ${v}`).join('; ');
 }
 
-module.exports = { OUTPUT_SCHEMAS, getOutputSchema, synthesizeDryRunOutput, describeShape };
+/**
+ * Output field names whose value is an ARRAY — the things a per-step `forEach`
+ * can iterate over (overRef = `steps.<id>.output.<field>`). Derived from the
+ * declared shape (values described as "array …") plus any array fields in the
+ * sample. Returns [] when the tool returns no iterable list / is unknown.
+ */
+function iterableFieldsOf(toolName) {
+    const schema = OUTPUT_SCHEMAS[toolName];
+    if (!schema) return [];
+    const out = new Set();
+    if (schema.shape && typeof schema.shape === 'object' && !schema.shape._string) {
+        for (const [k, v] of Object.entries(schema.shape)) {
+            if (k.startsWith('_')) continue;
+            if (typeof v === 'string' && /array/i.test(v)) out.add(k);
+        }
+    }
+    const sample = schema.sample;
+    if (sample && typeof sample === 'object' && !Array.isArray(sample)) {
+        for (const [k, v] of Object.entries(sample)) {
+            if (Array.isArray(v)) out.add(k);
+        }
+    }
+    return [...out];
+}
+
+/** Whether a tool's output contains (or is) a list the AI can forEach over. */
+function producesList(toolName) {
+    const schema = OUTPUT_SCHEMAS[toolName];
+    if (!schema) return false;
+    if (Array.isArray(schema.sample)) return true;            // top-level array output
+    return iterableFieldsOf(toolName).length > 0;
+}
+
+module.exports = { OUTPUT_SCHEMAS, getOutputSchema, synthesizeDryRunOutput, describeShape, iterableFieldsOf, producesList };

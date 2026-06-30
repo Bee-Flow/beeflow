@@ -2,7 +2,7 @@ const configStore = require('../../stores/configStore');
 const { getServiceHeaders } = require('../serviceAuth');
 const { estimateTokens, fitIntoTokenBudget } = require('../tokenBudget');
 const { getAll } = require('../../db');
-const { getUserBetaFeatures } = require('../betaFeatures');
+const { userHasBetaFeature } = require('../betaFeatures');
 
 // Mirror of routes/knowledgeBases.js — kept here too so the agent runtime
 // doesn't have to import a routes-layer constant. Slugs identify a
@@ -26,11 +26,15 @@ async function filterSystemKBsForUser(kbIds, userId, session) {
         );
     } catch (_) { return kbIds; }
     if (!rows || rows.length === 0) return kbIds;
-    let enabled;
-    try {
-        const features = await getUserBetaFeatures(userId, session || null);
-        enabled = new Set(features);
-    } catch (_) { enabled = new Set(); }
+    // Check each referenced system slug via the resolver (userHasBetaFeature →
+    // resolveEntitlements) so the per-org access ceiling binds it — including a
+    // global admin (governingOrgId) — instead of the raw "admins get all betas" list.
+    const referencedSlugs = [...new Set(rows.map(r => r.system_slug).filter(s => s && SYSTEM_KB_BETA_SLUGS.has(s)))];
+    const enabled = new Set();
+    for (const slug of referencedSlugs) {
+        try { if (await userHasBetaFeature(userId, slug, session || null)) enabled.add(slug); }
+        catch (_) { /* treat as disabled on failure */ }
+    }
     const denied = new Set(
         rows
             .filter(r => r.system_slug && SYSTEM_KB_BETA_SLUGS.has(r.system_slug) && !enabled.has(r.system_slug))

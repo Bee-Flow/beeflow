@@ -20,19 +20,23 @@ RUN install -m 0755 -d /etc/apt/keyrings \
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies with npm cache
-RUN --mount=type=cache,target=/root/.npm \
-    npm install --omit=dev --no-audit --no-fund --prefer-offline
+# No Chromium is baked into this image. All browser work (PDF export, webpage
+# thumbnails, SPA URL ingestion, Tests Studio) is driven REMOTELY against a
+# long-lived, network-isolated browser container that the server launches via
+# the mounted docker socket (see services/pwtRunner.js + services/browserProvider.js),
+# or against an external Playwright server via BROWSER_WS_ENDPOINT. The
+# `playwright` npm package stays as the thin client. Belt-and-braces: make sure
+# `npm install` never pulls browser binaries either.
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
-# Install Playwright Chromium for document rendering (PDF generation) and
-# the Tests Studio explore-mode / suite-mode runs. The browser binaries must
-# live in the final image, NOT a buildkit cache mount — a cache mount is only
-# present during build, so cached browsers would vanish at runtime. We also
-# pin a stable cache path via PLAYWRIGHT_BROWSERS_PATH so dev bind-mounts
-# can't shadow it.
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-RUN npx playwright install-deps chromium \
-    && npx playwright install chromium
+# Install dependencies with npm cache. `npm ci` (not `npm install`) is
+# deterministic and never rewrites package-lock.json, so the install layer cache
+# stays valid across rebuilds — the expensive isolated-vm native compile is only
+# re-run when package*.json actually changes. Requires package-lock.json to be in
+# sync with package.json (it is tracked); a drift makes the build fail loudly,
+# which is the intended signal to commit an updated lockfile.
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --omit=dev --no-audit --no-fund
 
 # Copy server source
 COPY . .

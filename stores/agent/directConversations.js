@@ -101,6 +101,7 @@ async function searchDirectConversations(userId, query, filters = {}, encryption
     let filterClauses = '';
     let filterIdx = 2;
     if (filters.startDate) { filterClauses += ` AND c.updated_at >= $${filterIdx++}`; filterParams.push(filters.startDate); }
+    if (filters.endDate) { filterClauses += ` AND c.updated_at <= $${filterIdx++}`; filterParams.push(filters.endDate); }
     const likeIdx = filterIdx;
 
     // Strategy A: title OR migrated message content
@@ -123,47 +124,46 @@ async function searchDirectConversations(userId, query, filters = {}, encryption
     const results = [...stratA];
     const matchedIds = new Set(results.map(r => r.id));
 
-    if (results.length < 50) {
-        if (!encryptionKey) {
-            const remaining = 50 - results.length;
-            const stratB = await getAll(`
-                SELECT
-                    c.id, c.user_id, c.title, c.updated_at, c.model_tier,
-                    c.messages_migrated
-                FROM direct_conversations c
-                WHERE c.user_id = $1
-                  AND c.messages_migrated = FALSE
-                  AND c.messages_json ILIKE $${likeIdx}
-                  ${filterClauses}
-                ORDER BY c.updated_at DESC
-                LIMIT ${remaining}
-            `, [...filterParams, likeQuery]);
-            for (const r of stratB) {
-                if (!matchedIds.has(r.id)) { results.push(r); matchedIds.add(r.id); }
-            }
-        } else {
-            const encCandidates = await getAll(`
-                SELECT
-                    c.id, c.user_id, c.title, c.updated_at, c.model_tier,
-                    c.messages_json, c.messages_migrated
-                FROM direct_conversations c
-                WHERE c.user_id = $1
-                  AND c.messages_migrated = FALSE
-                  ${filterClauses}
-                ORDER BY c.updated_at DESC
-                LIMIT 200
-            `, filterParams);
-            for (const conv of encCandidates) {
-                if (matchedIds.has(conv.id) || results.length >= 50) break;
-                try {
-                    const decrypted = decryptMessages(conv.messages_json || '[]', encryptionKey, conv.id, userId);
-                    if (decrypted.toLowerCase().includes(lowerQuery)) {
-                        results.push({ ...conv, messages_json: decrypted });
-                        matchedIds.add(conv.id);
-                    }
-                } catch (e) {
-                    console.error('[DirectConversations] Search decrypt error:', e);
+    if (!encryptionKey) {
+        const stratB = await getAll(`
+            SELECT
+                c.id, c.user_id, c.title, c.updated_at, c.model_tier,
+                c.messages_migrated
+            FROM direct_conversations c
+            WHERE c.user_id = $1
+              AND c.messages_migrated = FALSE
+              AND c.messages_json ILIKE $${likeIdx}
+              ${filterClauses}
+            ORDER BY c.updated_at DESC
+            LIMIT 50
+        `, [...filterParams, likeQuery]);
+        for (const r of stratB) {
+            if (!matchedIds.has(r.id)) { results.push(r); matchedIds.add(r.id); }
+        }
+    } else {
+        const encCandidates = await getAll(`
+            SELECT
+                c.id, c.user_id, c.title, c.updated_at, c.model_tier,
+                c.messages_json, c.messages_migrated
+            FROM direct_conversations c
+            WHERE c.user_id = $1
+              AND c.messages_migrated = FALSE
+              ${filterClauses}
+            ORDER BY c.updated_at DESC
+            LIMIT 200
+        `, filterParams);
+        let cAdded = 0;
+        for (const conv of encCandidates) {
+            if (matchedIds.has(conv.id)) continue;
+            try {
+                const decrypted = decryptMessages(conv.messages_json || '[]', encryptionKey, conv.id, userId);
+                if (decrypted.toLowerCase().includes(lowerQuery)) {
+                    results.push({ ...conv, messages_json: decrypted });
+                    matchedIds.add(conv.id);
+                    if (++cAdded >= 50) break;
                 }
+            } catch (e) {
+                console.error('[DirectConversations] Search decrypt error:', e);
             }
         }
     }

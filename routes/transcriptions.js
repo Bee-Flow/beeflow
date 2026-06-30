@@ -263,7 +263,13 @@ router.get('/', requireAuth, async (req, res) => {
 
 // ── Get single transcription ─────────────────────────────
 
-router.get('/:id', requireAuth, async (req, res) => {
+// Static GET routes below (e.g. /nextcloud-talk-recordings, /talk-meetings) are
+// registered after this param route, so let their literal names fall through
+// instead of being captured as an :id and 404'ing.
+const RESERVED_GET_PATHS = new Set(['nextcloud-audio-files', 'nextcloud-talk-recordings', 'talk-meetings']);
+
+router.get('/:id', requireAuth, async (req, res, next) => {
+    if (RESERVED_GET_PATHS.has(req.params.id)) return next();
     try {
         const userId = req.session.user.id;
         const { orgIds, userGroupIds, isSuperAdmin } = await resolveAccessContext(req);
@@ -1417,6 +1423,86 @@ router.post('/from-nextcloud', requireAuth, async (req, res) => {
     } catch (err) {
         console.error('[Transcriptions] from-nextcloud failed:', err.message);
         res.status(err.status || 500).json({ error: err.message, ...(err.code ? { code: err.code } : {}) });
+    }
+});
+
+// ── Upcoming Talk meetings (calendar-linked) ─────────────
+//
+// Powers the Meeting Notes "Upcoming" view: the user's calendar Talk meetings,
+// each enriched with whether they moderate it, live call/recording state, the
+// per-meeting record toggle (exclusion), and a status chip.
+
+router.get('/talk-meetings', requireAuth, async (req, res) => {
+    const userId = req.session.user.id;
+    try {
+        const userOrgId = await resolveUserOrgFromReq(req);
+        const talk = require('../integrations/nextcloudTalkTools');
+        const { listUpcomingTalkMeetings } = require('../core/meetingNotes/talkCalendar');
+        const { resolveTalkNotesSettings } = require('../core/meetingNotes/talkNotesSettings');
+
+        const cap = await talk.getTalkRecordingCapability(req.session, userId);
+        const settings = await resolveTalkNotesSettings({ orgId: userOrgId, userId });
+        const meetings = await listUpcomingTalkMeetings({ session: req.session, userId, windowHours: 48 });
+
+        // One room list to enrich moderator + call/recording state by token.
+        const roomsByToken = {};
+        try {
+            const roomsRes = await talk.executeNextcloudTalkTool('nextcloud_talk_list_rooms', {}, userId, req.session);
+            if (roomsRes && Array.isArray(roomsRes.rooms)) for (const r of roomsRes.rooms) roomsByToken[r.token] = r;
+        } catch (_) { /* best-effort enrichment */ }
+
+        const excludedTokens = new Set(settings.excludedRoomTokens || []);
+        const excludedUids = new Set(settings.excludedEventUids || []);
+
+        const out = [];
+        for (const m of meetings) {
+            const room = roomsByToken[m.talkToken] || null;
+            const isModerator = room ? [1, 2].includes(room.participantType) : null;
+            const recordingNow = !!(room && room.callRecording && room.callRecording !== 0);
+            const excluded = excludedTokens.has(m.talkToken) || (m.uid && excludedUids.has(m.uid));
+            let recordedNoteId = null;
+            try {
+                const t = await transcriptionStore.getTranscriptionByTalkRoomToken(m.talkToken, userId);
+                if (t) recordedNoteId = t.id;
+            } catch (_) { /* ignore */ }
+
+            let status;
+            if (recordingNow) status = 'recording_now';
+            else if (recordedNoteId) status = 'recorded';
+            else if (isModerator === false) status = 'not_moderator';
+            else if (settings.autoRecord && cap.recordingEnabled && !excluded && isModerator) status = 'will_record';
+            else status = 'upcoming';
+
+            out.push({ ...m, isModerator, recordingNow, excluded, recordedNoteId, status });
+        }
+
+        res.json({
+            recordingEnabled: cap.recordingEnabled,
+            autoRecord: settings.autoRecord,
+            autoRecordScope: settings.autoRecordScope,
+            recordingMode: settings.recordingMode,
+            count: out.length,
+            meetings: out,
+        });
+    } catch (err) {
+        console.error('[Transcriptions] talk-meetings error:', err.message);
+        if (err.message === 'NOT_CONNECTED') return res.status(400).json({ error: 'Nextcloud not connected for this account' });
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Toggle a single meeting's auto-record on/off (writes the user's exclusions).
+router.patch('/talk-meetings/:token', requireAuth, async (req, res) => {
+    const userId = req.session.user.id;
+    const token = req.params.token;
+    const { record, eventUid } = req.body || {};
+    try {
+        const { setMeetingRecord } = require('../core/meetingNotes/talkNotesSettings');
+        await setMeetingRecord(userId, { roomToken: token, eventUid: eventUid || null, record: !!record });
+        res.json({ ok: true, token, record: !!record });
+    } catch (err) {
+        console.error('[Transcriptions] talk-meetings PATCH error:', err.message);
+        res.status(500).json({ error: err.message });
     }
 });
 

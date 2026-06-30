@@ -5,7 +5,7 @@
 const { v4: uuidv4 } = require('uuid');
 const { run, getOne, getAll } = require('../../db');
 const { initDB } = require('./initSchema');
-const { getAgentTools, getAgentToolsWithParams } = require('./agentTools');
+const { getAgentTools, getAgentToolsWithParams, getAgentToolsBatch, getAgentToolsWithParamsBatch } = require('./agentTools');
 
 // ── GitHub Sync hook (fire-and-forget) ───────────────────────────
 async function _notifySync(orgId, agentId, action = 'pending') {
@@ -40,8 +40,10 @@ function parseConfig(agent) {
     };
 }
 
-async function buildToolParams(agentId) {
-    const toolsWithParams = await getAgentToolsWithParams(agentId);
+// Convert a list of { componentId, params } (from getAgentToolsWithParams or its
+// batch variant) into the tool_params shape the API exposes:
+//   { [componentId]: { [paramName]: { value, fixed: true } } }
+function buildToolParamsFromList(toolsWithParams) {
     const tool_params = {};
     for (const t of toolsWithParams) {
         if (t.params) {
@@ -52,6 +54,11 @@ async function buildToolParams(agentId) {
         }
     }
     return tool_params;
+}
+
+async function buildToolParams(agentId) {
+    const toolsWithParams = await getAgentToolsWithParams(agentId);
+    return buildToolParamsFromList(toolsWithParams);
 }
 
 async function createAgent(name, description, systemPrompt, ownerId, model = null, starterPrompts = [], threadsEnabled = true, copyEnabled = true, workspaceEnabled = false, config = {}, organizationId = null, sharedGroups = [], categoryId = null) {
@@ -75,12 +82,8 @@ async function createAgent(name, description, systemPrompt, ownerId, model = nul
 async function getAgents(ownerId) {
     await initDB();
     const agents = await getAll("SELECT * FROM agents WHERE owner_id = $1 OR owner_id = 'system' ORDER BY updated_at DESC", [ownerId]);
-    const result = [];
-    for (const agent of agents) {
-        const tools = await getAgentTools(agent.id);
-        result.push({ ...parseConfig(agent), tools });
-    }
-    return result;
+    const toolsByAgent = await getAgentToolsBatch(agents.map(a => a.id));
+    return agents.map(agent => ({ ...parseConfig(agent), tools: toolsByAgent.get(agent.id) || [] }));
 }
 
 async function getAgent(id) {
@@ -133,13 +136,11 @@ async function forceDeleteAgent(id) {
 async function getPublishedAgents() {
     await initDB();
     const agents = await getAll("SELECT * FROM agents WHERE is_published = TRUE AND owner_id NOT IN ('system', 'swarm') ORDER BY name ASC");
-    const result = [];
-    for (const agent of agents) {
-        const tools = await getAgentTools(agent.id);
-        const tool_params = await buildToolParams(agent.id);
-        result.push({ ...parseConfig(agent), tools, tool_params });
-    }
-    return result;
+    const twpByAgent = await getAgentToolsWithParamsBatch(agents.map(a => a.id));
+    return agents.map(agent => {
+        const twp = twpByAgent.get(agent.id) || [];
+        return { ...parseConfig(agent), tools: twp.map(t => t.componentId), tool_params: buildToolParamsFromList(twp) };
+    });
 }
 
 async function setAgentPublished(id, isPublished, ownerId, sharedGroups = undefined) {
@@ -201,35 +202,25 @@ async function getPublishedAgentsForUser(userGroups = [], userOrgId = null, reso
         return true;
     });
 
-    const result = [];
-    for (const agent of filtered) {
-        const tools = await getAgentTools(agent.id);
-        const tool_params = await buildToolParams(agent.id);
-        result.push({ ...parseConfig(agent), tools, tool_params });
-    }
-    return result;
+    const twpByAgent = await getAgentToolsWithParamsBatch(filtered.map(a => a.id));
+    return filtered.map(agent => {
+        const twp = twpByAgent.get(agent.id) || [];
+        return { ...parseConfig(agent), tools: twp.map(t => t.componentId), tool_params: buildToolParamsFromList(twp) };
+    });
 }
 
 async function getAllAgents() {
     await initDB();
     const agents = await getAll("SELECT * FROM agents WHERE owner_id NOT IN ('system', 'swarm') ORDER BY updated_at DESC");
-    const result = [];
-    for (const agent of agents) {
-        const tools = await getAgentTools(agent.id);
-        result.push({ ...parseConfig(agent), tools });
-    }
-    return result;
+    const toolsByAgent = await getAgentToolsBatch(agents.map(a => a.id));
+    return agents.map(agent => ({ ...parseConfig(agent), tools: toolsByAgent.get(agent.id) || [] }));
 }
 
 async function getSystemAgents() {
     await initDB();
     const agents = await getAll("SELECT * FROM agents WHERE owner_id = 'system' ORDER BY name ASC");
-    const result = [];
-    for (const agent of agents) {
-        const tools = await getAgentTools(agent.id);
-        result.push({ ...parseConfig(agent), tools });
-    }
-    return result;
+    const toolsByAgent = await getAgentToolsBatch(agents.map(a => a.id));
+    return agents.map(agent => ({ ...parseConfig(agent), tools: toolsByAgent.get(agent.id) || [] }));
 }
 
 async function ensurePlaceholderAgent(id, name, description) {

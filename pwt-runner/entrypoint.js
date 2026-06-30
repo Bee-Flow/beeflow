@@ -13,6 +13,17 @@
  *     and drives the browser remotely (explore / agent modes). Idles until the
  *     container is stopped.
  *
+ *     Two optional env knobs make `serve` usable as a long-lived Deployment
+ *     (the Kapsule `bf-browser` pod) where the docker-socket lifecycle that
+ *     scrapes the endpoint from this log line is unavailable:
+ *       PWT_SERVE_WS_PATH  serve at a STABLE path instead of an unguessable
+ *                          per-launch one, so a STATIC BROWSER_WS_ENDPOINT can
+ *                          target it (ws://<svc>:<port><path>).
+ *       PWT_SERVE_HOST     bind host (e.g. 0.0.0.0) so a k8s Service can route
+ *                          to the pod.
+ *     Both UNSET → identical behaviour to before (random path, default bind),
+ *     so the docker singleton / throwaway-runner paths are unaffected.
+ *
  * This file has no dependency on the main server — it only needs `playwright`,
  * which is installed in the image.
  */
@@ -20,17 +31,25 @@
 const mode = process.argv[2];
 
 const SERVE_PORT = parseInt(process.env.PWT_SERVE_PORT || '9222', 10);
+let SERVE_WS_PATH = process.env.PWT_SERVE_WS_PATH || '';
+if (SERVE_WS_PATH && !SERVE_WS_PATH.startsWith('/')) SERVE_WS_PATH = `/${SERVE_WS_PATH}`;
+const SERVE_HOST = process.env.PWT_SERVE_HOST || '';
 
 async function runServe() {
     const { chromium } = require('playwright');
-    const server = await chromium.launchServer({
+    const launchOpts = {
         headless: true,
         port: SERVE_PORT,
         // The container is itself the sandbox boundary; Chromium's own sandbox
         // does not work without extra capabilities, so disable it here. shm is
         // small by default — point Chromium away from it.
         args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-    });
+    };
+    // Only override when explicitly set so the docker-managed paths keep their
+    // existing (random-path, default-bind) behaviour byte-for-byte.
+    if (SERVE_WS_PATH) launchOpts.wsPath = SERVE_WS_PATH;
+    if (SERVE_HOST) launchOpts.host = SERVE_HOST;
+    const server = await chromium.launchServer(launchOpts);
 
     // Single, greppable line the worker waits for. Flush before idling.
     process.stdout.write(`PWT_WS_ENDPOINT=${server.wsEndpoint()}\n`);

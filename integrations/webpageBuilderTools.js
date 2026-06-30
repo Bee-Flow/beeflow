@@ -12,6 +12,7 @@
 
 const webpageStore = require('../stores/webpageStore');
 const { executeWebpageDocTool } = require('./webpageDocTools');
+const { resolveFramework } = require('./webpageFramework');
 const { scheduleThumbnail } = require('../core/webpageThumbnailGenerator');
 
 // Hex like "#aabbcc" or "#abc". Restrict to a known palette range so a stray
@@ -220,12 +221,38 @@ async function executeBuilderTool(toolName, args, ctx) {
         await webpageStore.writeSlot(userId, webpageId, file, content);
         console.log(`[WebpageBuilder] webpage_file_write: ${file} → ${webpageId} (${content.length} chars)`);
 
+        // Soft post-write validation (BFSF-222) — full-page html writes on
+        // vanilla projects only. Advisory: appends a one-line note to the
+        // tool result, never blocks or alters the write itself.
+        let validationNote = '';
+        if (file === 'html' && resolveFramework(webpage) !== 'react-mui') {
+            try {
+                const configStore = require('../stores/configStore');
+                if ((await configStore.getConfig('webpage_validation_enabled')) !== 'false') {
+                    const { validateWebpageProject, formatToolWarning, mergeAllowedImgHosts } = require('../services/webpageValidation');
+                    const allowedHosts = mergeAllowedImgHosts(await configStore.getConfig('webpage_img_host_allowlist'));
+                    const extras = await webpageStore.listExtraFiles(webpageId);
+                    const slots = await webpageStore.readAllSlots(userId, webpageId);
+                    const { violations } = validateWebpageProject({
+                        framework: 'vanilla',
+                        html: content,
+                        scriptTexts: [slots.js],
+                        assetPaths: extras.map(e => e.path),
+                        allowedHosts,
+                    });
+                    validationNote = formatToolWarning(violations);
+                }
+            } catch (valErr) {
+                console.warn('[WebpageBuilder] Post-write validation failed (skipping):', valErr.message);
+            }
+        }
+
         // Background thumbnail render — debounced so a burst of html+css+js
         // writes coalesce into a single screenshot.
         scheduleThumbnail({ userId, webpageId });
 
         return {
-            result: { message: docResult.message, file, webpageId },
+            result: { message: docResult.message + validationNote, file, webpageId },
             webpageUpdate: { webpageId, file, content, title: title || file },
         };
     }

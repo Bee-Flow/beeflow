@@ -40,11 +40,25 @@ async function upsertCitation({ notebookId, kind, identifier, title, pinpoint, u
     const safeKind = VALID_KINDS.has(kind) ? kind : 'literatuur';
     const id = crypto.randomUUID();
     const isVerified = !!verified;
+    // A definitive "not found" (the registry was queried and the record does not
+    // exist) is the ONLY signal allowed to DOWNGRADE a previously-verified row.
+    // A transient 'unverified'/'pending' must never flip a green cite to red.
+    const isNotFound = verificationMethod === 'not_found';
     const verifiedAt = isVerified ? new Date().toISOString() : null;
-    const ident = identifier || null;
 
-    // NULL identifiers (free-text literatuur) aren't covered by the partial
-    // unique index, so ON CONFLICT can't fire — plain insert in that case.
+    let ident = identifier || null;
+    if (!ident && title && title.trim()) {
+        // Free-text literatuur has no natural identifier (ECLI/CELEX/BWB), so two
+        // identical titles would otherwise accumulate duplicate rows on every
+        // add/verify. Synthesize a stable internal identifier from the normalized
+        // title so the existing partial unique index dedups them via ON CONFLICT.
+        // It's hidden from the UI in mapCitationRow (the `lit:` form).
+        const norm = title.trim().toLowerCase().replace(/\s+/g, ' ');
+        ident = 'lit:' + crypto.createHash('sha1').update(norm).digest('hex').slice(0, 24);
+    }
+
+    // Only when there's neither an identifier NOR a title is there nothing to
+    // dedup on — fall back to a plain insert in that rare case.
     if (!ident) {
         await run(
             `INSERT INTO legal_citations (id, notebook_id, kind, identifier, title, pinpoint, url, verified, verification_method, verified_at, source_id, metadata)
@@ -63,14 +77,19 @@ async function upsertCitation({ notebookId, kind, identifier, title, pinpoint, u
             title = COALESCE(EXCLUDED.title, legal_citations.title),
             pinpoint = COALESCE(EXCLUDED.pinpoint, legal_citations.pinpoint),
             url = COALESCE(EXCLUDED.url, legal_citations.url),
-            verified = legal_citations.verified OR EXCLUDED.verified,
-            verification_method = CASE WHEN EXCLUDED.verified THEN EXCLUDED.verification_method ELSE legal_citations.verification_method END,
-            verified_at = CASE WHEN EXCLUDED.verified AND legal_citations.verified_at IS NULL THEN NOW() ELSE legal_citations.verified_at END,
+            verified = CASE WHEN $13 THEN FALSE
+                            WHEN EXCLUDED.verified THEN TRUE
+                            ELSE legal_citations.verified END,
+            verification_method = CASE WHEN $13 OR EXCLUDED.verified THEN EXCLUDED.verification_method
+                                       ELSE legal_citations.verification_method END,
+            verified_at = CASE WHEN $13 THEN NULL
+                               WHEN EXCLUDED.verified AND legal_citations.verified_at IS NULL THEN NOW()
+                               ELSE legal_citations.verified_at END,
             source_id = COALESCE(EXCLUDED.source_id, legal_citations.source_id),
             metadata = legal_citations.metadata || EXCLUDED.metadata
          RETURNING *`,
         [id, notebookId, safeKind, ident, title || null, pinpoint || null, url || null,
-         isVerified, verificationMethod || null, verifiedAt, sourceId || null, JSON.stringify(metadata || {})]
+         isVerified, verificationMethod || null, verifiedAt, sourceId || null, JSON.stringify(metadata || {}), isNotFound]
     );
     return r ? mapCitationRow(r) : null;
 }
@@ -132,7 +151,9 @@ function mapCitationRow(r) {
         id: r.id,
         notebookId: r.notebook_id,
         kind: r.kind,
-        identifier: r.identifier || null,
+        // Hide the synthetic `lit:<hash>` identifier used purely for literatuur
+        // dedup — it's an internal key, not something the lawyer should see.
+        identifier: (r.identifier && !String(r.identifier).startsWith('lit:')) ? r.identifier : null,
         title: r.title || null,
         pinpoint: r.pinpoint || null,
         url: r.url || null,

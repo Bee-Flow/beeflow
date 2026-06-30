@@ -33,6 +33,38 @@ async function getAgentToolsWithParams(agentId) {
     }));
 }
 
+// ── Batch loaders (avoid N+1 when hydrating agent lists) ─────────────────────
+// Both return a Map keyed by agent_id with an entry for EVERY requested id
+// (empty array when an agent has no tools), so callers can do `map.get(id)`
+// without null checks. Single query via `= ANY($1)` instead of one-per-agent.
+
+async function getAgentToolsBatch(agentIds) {
+    await initDB();
+    const map = new Map();
+    if (!Array.isArray(agentIds) || agentIds.length === 0) return map;
+    for (const id of agentIds) map.set(id, []);
+    const rows = await getAll('SELECT agent_id, component_id FROM agent_tools WHERE agent_id = ANY($1::text[])', [agentIds]);
+    for (const row of rows) {
+        const arr = map.get(row.agent_id);
+        if (arr) arr.push(row.component_id); else map.set(row.agent_id, [row.component_id]);
+    }
+    return map;
+}
+
+async function getAgentToolsWithParamsBatch(agentIds) {
+    await initDB();
+    const map = new Map();
+    if (!Array.isArray(agentIds) || agentIds.length === 0) return map;
+    for (const id of agentIds) map.set(id, []);
+    const rows = await getAll('SELECT agent_id, component_id, params_json FROM agent_tools WHERE agent_id = ANY($1::text[])', [agentIds]);
+    for (const row of rows) {
+        const entry = { componentId: row.component_id, params: row.params_json ? JSON.parse(row.params_json) : null };
+        const arr = map.get(row.agent_id);
+        if (arr) arr.push(entry); else map.set(row.agent_id, [entry]);
+    }
+    return map;
+}
+
 async function updateAgentToolParams(agentId, componentId, params) {
     await initDB();
     await run('UPDATE agent_tools SET params_json = $1 WHERE agent_id = $2 AND component_id = $3', [params ? JSON.stringify(params) : null, agentId, componentId]);
@@ -50,4 +82,5 @@ async function setAgentTools(agentId, componentIds, toolParams = {}) {
 module.exports = {
     addAgentTool, removeAgentTool, getAgentTools,
     getAgentToolsWithParams, updateAgentToolParams, setAgentTools,
+    getAgentToolsBatch, getAgentToolsWithParamsBatch,
 };

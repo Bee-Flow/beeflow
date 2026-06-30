@@ -46,12 +46,18 @@ class ElevenLabsProvider {
 
         console.log(`[ElevenLabs] Music: "${prompt.substring(0, 80)}" (${durationMs / 1000}s, instrumental: ${instrumental})`);
 
-        const audioStream = await client.music.compose({
+        // SDK v2.x uses camelCase: musicLengthMs / forceInstrumental / outputFormat.
+        // The old snake_case keys were silently dropped, so duration + instrumental
+        // never took effect. (verified against @elevenlabs/elevenlabs-js@2.46 types)
+        const composeReq = {
             prompt,
-            duration_ms: Math.max(3000, Math.min(600000, durationMs)),
-            instrumental,
-            output_format: 'mp3_44100_128',
-        });
+            musicLengthMs: Math.max(3000, Math.min(600000, durationMs)),
+            forceInstrumental: instrumental,
+            outputFormat: 'mp3_44100_128',
+        };
+        if (options.model) composeReq.modelId = options.model; // music_v1 (default) | music_v2
+
+        const audioStream = await client.music.compose(composeReq);
 
         const audioBuffer = await this._streamToBuffer(audioStream);
 
@@ -84,11 +90,18 @@ class ElevenLabsProvider {
 
         console.log(`[ElevenLabs] TTS: "${text.substring(0, 80)}" (voice: ${voiceId}, model: ${model})`);
 
-        const audioStream = await client.textToSpeech.convert(voiceId, {
+        const convertReq = {
             text,
-            model_id: model,
-            output_format: 'mp3_44100_128',
-        });
+            modelId: model,            // camelCase for SDK v2.x (snake_case is dropped)
+            outputFormat: 'mp3_44100_128',
+        };
+        // Optional voice settings — speed (0.7–1.2), stability, similarityBoost,
+        // style, useSpeakerBoost. Makes the speed/stability controls real.
+        if (options.voiceSettings && typeof options.voiceSettings === 'object' && Object.keys(options.voiceSettings).length) {
+            convertReq.voiceSettings = options.voiceSettings;
+        }
+
+        const audioStream = await client.textToSpeech.convert(voiceId, convertReq);
 
         const audioBuffer = await this._streamToBuffer(audioStream);
 
@@ -123,8 +136,8 @@ class ElevenLabsProvider {
 
         const audioStream = await client.textToSoundEffects.convert({
             text: prompt,
-            duration_seconds: Math.max(0.5, Math.min(30, durationSec)),
-            prompt_influence: Math.max(0, Math.min(1, promptInfluence)),
+            durationSeconds: Math.max(0.5, Math.min(30, durationSec)),  // camelCase for SDK v2.x
+            promptInfluence: Math.max(0, Math.min(1, promptInfluence)),
         });
 
         const audioBuffer = await this._streamToBuffer(audioStream);

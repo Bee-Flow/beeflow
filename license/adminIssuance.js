@@ -104,9 +104,6 @@ async function issueAdminLicense({
     }
     if (scope === 'organization' && !organizationId) throw new Error('organizationId required');
     if (!tiers.isValidTier(tier)) throw new Error(`Invalid tier: ${tier}`);
-    if (tier === 'full' && process.env.ALLOW_ADMIN_FULL_TIER !== 'true') {
-        throw new Error('full tier admin grants disabled (set ALLOW_ADMIN_FULL_TIER=true to enable)');
-    }
     if (billingInterval !== 'monthly' && billingInterval !== 'yearly') {
         throw new Error(`Invalid billingInterval: ${billingInterval}`);
     }
@@ -181,9 +178,6 @@ async function importAdminLicense(blob, { activatedBy = null, organizationId = n
     const decoded = decodeAdminLicenseBlob(blob);
     if (decoded.v !== 1) throw new Error(`Unsupported blob version: ${decoded.v}`);
     if (!tiers.isValidTier(decoded.tier)) throw new Error(`Invalid tier in blob: ${decoded.tier}`);
-    if (decoded.tier === 'full' && process.env.ALLOW_ADMIN_FULL_TIER !== 'true') {
-        throw new Error('full tier admin imports disabled (set ALLOW_ADMIN_FULL_TIER=true to enable)');
-    }
 
     // Server-scope blobs are "unbound" — caller-provided org wins; if absent
     // we persist as scope='server' on this install too.

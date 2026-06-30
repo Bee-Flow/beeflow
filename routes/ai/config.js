@@ -12,6 +12,10 @@ const {
 } = require('../../core/aiAgent');
 const configStore = require('../../stores/configStore');
 const { hasPermission } = require('../../auth/permissions');
+const { normalizeAfasToken } = require('../../integrations/afasTools');
+const { SUBDOMAIN_RE: NMBRS_SUBDOMAIN_RE, TOKEN_RE: NMBRS_TOKEN_RE, EMAIL_RE: NMBRS_EMAIL_RE } = require('../../integrations/nmbrsTools');
+const { sanitizeLearningProgress, mergeLearningProgress } = require('../../learning/progressValidation');
+const { readServerProgress } = require('../../learning/certificates');
 
 // Authentication middleware
 function requireAuth(req, res, next) {
@@ -61,6 +65,14 @@ router.get('/config', async (req, res) => {
         bingSearchMarket: await configStore.getConfig('bing_search_market') || '',
         hasGoogleMapsKey: !!(await configStore.getSecret('google_maps_api_key')),
         hasLinkedInConfig: !!(await configStore.getSecret('linkedin_client_id')) && !!(await configStore.getSecret('linkedin_client_secret')),
+        // Lead Studio enrichment providers (global keys; per-org overrides live
+        // under org_<id>_*). The Lead Studio campaign modal greys a provider
+        // until its key is present here.
+        hasKvkKey: !!(await configStore.getSecret('kvk_api_key')),
+        hasHunterKey: !!(await configStore.getSecret('hunter_api_key')),
+        hasApolloKey: !!(await configStore.getSecret('apollo_api_key')),
+        hasApifyToken: !!(await configStore.getSecret('apify_token')),
+        apifyLinkedinActor: await configStore.getConfig('apify_linkedin_actor') || '',
         regexGuardrails: config.regexGuardrails || null,
         piiDetectionEnabled: config.piiDetectionEnabled || false,
         piiDetectionCategories: config.piiDetectionCategories || null,
@@ -97,8 +109,9 @@ router.get('/config', async (req, res) => {
         hasAzureRerankerEndpoint: !!(await configStore.getConfig('azure_reranker_endpoint')),
         hasAzureRerankerKey: !!(await configStore.getSecret('azure_reranker_key')),
         azureRerankerModel: await configStore.getConfig('azure_reranker_model') || 'Cohere-rerank-v4.0-fast',
-        // Service Email (Gmail SMTP)
-        hasServiceEmail: !!(await configStore.getConfig('service_email_address')) && !!(await configStore.getSecret('service_email_password')),
+        // Service Email (Gmail OAuth) — "configured" means a Google account is
+        // connected (token blob present), not that an App Password was saved.
+        hasServiceEmail: !!(await configStore.getConfig('service_email_address')) && !!(await configStore.getSecret('service_email_oauth_tokens')),
         serviceEmailAddress: await configStore.getConfig('service_email_address') || '',
         serviceEmailDisplayName: await configStore.getConfig('service_email_display_name') || '',
         // Feature flags (runtime-togglable)
@@ -133,6 +146,9 @@ router.get('/config', async (req, res) => {
         stripeEnabled: !!(await configStore.getConfig('stripe_enabled')),
         stripeTaxEnabled: !!(await configStore.getConfig('stripe_tax_enabled')),
         stripeTaxCountry: await configStore.getConfig('stripe_tax_country') || 'NL',
+        // Address that receives a notification email whenever a new
+        // subscription is started (empty = notifications off).
+        subscriptionNotifyEmail: await configStore.getConfig('subscription_notify_email') || '',
     });
 });
 
@@ -141,7 +157,7 @@ router.post('/config', requireAuth, async (req, res) => {
     if (!(await isAdminUser(req))) {
         return res.status(403).json({ error: 'Admin access required' });
     }
-    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionScope, piiDetectionAction, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing, serviceEmailAddress, serviceEmailPassword, serviceEmailDisplayName, azureSpeechKey, azureSpeechRegion, transcriptionProvider, notebooksEnabled, projectsEnabled, askAiEnabled, exportEnabled, openInNotebookEnabled, notebooksMenuEnabled, azureRerankerEndpoint, azureRerankerKey, azureRerankerModel, stripeSecretKey, stripeWebhookSecret, stripePublishableKey, stripeEnabled, stripeTaxEnabled, stripeTaxCountry } = req.body;
+    const { url, model, apiKey, mistralApiKey, openaiApiKey, claudeApiKey, googleApiKey, elevenlabsApiKey, googleVertexProject, googleVertexLocation, googleVertexServiceAccountKey, azureEndpoint, azureApiKey, azureApiVersion, azureModels, agentSearchUrl, lakeraApiKey, regexGuardrails, piiDetectionEnabled, piiDetectionCategories, piiDetectionConfidenceThreshold, piiDetectionScope, piiDetectionAction, embeddingModel, embeddingProviderId, allowedModelsByAgentType, directChatRegexGuardrails, googleMapsApiKey, serperApiKey, azureDocIntelligenceEndpoint, azureDocIntelligenceKey, azureOpenaiEmbeddingEndpoint, azureOpenaiEmbeddingKey, azureOpenaiEmbeddingModel, useAzureDocProcessing, serviceEmailAddress, serviceEmailPassword, serviceEmailDisplayName, azureSpeechKey, azureSpeechRegion, transcriptionProvider, notebooksEnabled, projectsEnabled, askAiEnabled, exportEnabled, openInNotebookEnabled, notebooksMenuEnabled, azureRerankerEndpoint, azureRerankerKey, azureRerankerModel, stripeSecretKey, stripeWebhookSecret, stripePublishableKey, stripeEnabled, stripeTaxEnabled, stripeTaxCountry, subscriptionNotifyEmail } = req.body;
     const existing = await getAIConfig();
 
     if (allowedModelsByAgentType !== undefined) {
@@ -192,6 +208,22 @@ router.post('/config', requireAuth, async (req, res) => {
     }
     if (googleMapsApiKey !== undefined) {
         await configStore.setSecret('google_maps_api_key', googleMapsApiKey || '');
+    }
+    // ── Lead Studio enrichment provider keys (global) ──
+    if (req.body.kvkApiKey !== undefined) {
+        await configStore.setSecret('kvk_api_key', req.body.kvkApiKey || '');
+    }
+    if (req.body.hunterApiKey !== undefined) {
+        await configStore.setSecret('hunter_api_key', req.body.hunterApiKey || '');
+    }
+    if (req.body.apolloApiKey !== undefined) {
+        await configStore.setSecret('apollo_api_key', req.body.apolloApiKey || '');
+    }
+    if (req.body.apifyToken !== undefined) {
+        await configStore.setSecret('apify_token', req.body.apifyToken || '');
+    }
+    if (req.body.apifyLinkedinActor !== undefined) {
+        await configStore.setConfig('apify_linkedin_actor', req.body.apifyLinkedinActor || '');
     }
     if (req.body.linkedinClientId !== undefined) {
         await configStore.setSecret('linkedin_client_id', req.body.linkedinClientId || '');
@@ -259,13 +291,9 @@ router.post('/config', requireAuth, async (req, res) => {
     if (req.body.localWhisperEnabled !== undefined) {
         await configStore.setConfig('local_whisper_enabled', !!req.body.localWhisperEnabled);
     }
-    // Service Email (Gmail SMTP)
-    if (serviceEmailAddress !== undefined) {
-        await configStore.setConfig('service_email_address', serviceEmailAddress || '');
-    }
-    if (serviceEmailPassword !== undefined) {
-        await configStore.setSecret('service_email_password', serviceEmailPassword || '');
-    }
+    // Service Email (Gmail OAuth) — the address is set by the OAuth connect flow
+    // (the connected Google account), so only the display name is editable here.
+    // serviceEmailAddress/serviceEmailPassword are legacy SMTP fields, ignored.
     if (serviceEmailDisplayName !== undefined) {
         await configStore.setConfig('service_email_display_name', serviceEmailDisplayName || '');
     }
@@ -317,6 +345,9 @@ router.post('/config', requireAuth, async (req, res) => {
     if (stripeTaxCountry !== undefined) {
         await configStore.setConfig('stripe_tax_country', stripeTaxCountry || 'NL');
     }
+    if (subscriptionNotifyEmail !== undefined) {
+        await configStore.setConfig('subscription_notify_email', (subscriptionNotifyEmail || '').trim());
+    }
 
     const success = await saveAIConfig({
         url: url !== undefined ? url : existing.url,
@@ -364,7 +395,7 @@ const DELETABLE_KEYS = [
     'google_vertex_service_account_key', 'azure_api_key', 'azure_content_safety_key',
     'azure_doc_intelligence_key', 'azure_openai_embedding_key', 'azure_speech_key',
     'bing_search_key', 'linkedin_client_id', 'linkedin_client_secret',
-    'service_email_password', 'whisperx_url', 'whisperx_token',
+    'service_email_password', 'service_email_oauth_tokens', 'whisperx_url', 'whisperx_token',
     'azure_reranker_key', 'stripe_secret_key', 'stripe_webhook_secret',
 ];
 
@@ -451,6 +482,62 @@ router.post('/config/test-service-email', requireAuth, async (req, res) => {
         }
     } catch (err) {
         console.error('[Config] Test service email error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ─── Service Email OAuth (Gmail API connect) ─────────────────────────────────
+// The service account sends via the Gmail API over HTTPS (cloud hosts block
+// outbound SMTP). We reuse the shared Gmail OAuth client and the ALREADY
+// REGISTERED redirect URI `/api/support-inbox/oauth/callback` — so no Google
+// Cloud Console change is needed, and it works identically on live and dev.
+// The callback (server/routes/supportInbox.js) dispatches to this flow when it
+// sees `req.session.serviceEmailConnect`.
+
+/**
+ * Resolve the OAuth redirect URI. MUST byte-match the one the support-inbox
+ * callback uses, since that path is what's registered with Google. Mirrors
+ * supportInbox.redirectUriFor: explicit SERVER_PUBLIC_HOST/PROTOCOL first.
+ */
+function _serviceEmailRedirectUri(req) {
+    let host = process.env.SERVER_PUBLIC_HOST;
+    let protocol = process.env.SERVER_PROTOCOL || req.protocol || 'https';
+    if (!host) {
+        host = req.get('X-Forwarded-Host') || null;
+        if (!host) {
+            const ref = req.get('Referer');
+            if (ref) { try { const u = new URL(ref); host = u.host; protocol = u.protocol.replace(':', ''); } catch { /* ignore */ } }
+        }
+        if (!host) host = req.get('host');
+    }
+    return `${protocol}://${host}/api/support-inbox/oauth/callback`;
+}
+
+router.get('/config/service-email/oauth/start', requireAuth, async (req, res) => {
+    try {
+        if (!(await isAdminUser(req))) return res.status(403).json({ error: 'Admin access required' });
+        const crypto = require('crypto');
+        const state = crypto.randomBytes(24).toString('hex');
+        const redirectUri = _serviceEmailRedirectUri(req);
+        req.session.serviceEmailConnect = { state, redirectUri, ts: Date.now() };
+        const { buildConnectUrl } = require('../../utils/emailService');
+        const url = await buildConnectUrl({ redirectUri, state });
+        await new Promise((r) => req.session.save(() => r()));
+        res.json({ url });
+    } catch (err) {
+        console.error('[Config] service-email oauth/start error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.post('/config/service-email/disconnect', requireAuth, async (req, res) => {
+    try {
+        if (!(await isAdminUser(req))) return res.status(403).json({ error: 'Admin access required' });
+        const { disconnectServiceEmail } = require('../../utils/emailService');
+        await disconnectServiceEmail();
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[Config] service-email disconnect error:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -1416,6 +1503,14 @@ router.get('/user-settings', requireAuth, async (req, res) => {
     // flash-guard, but this is the authoritative source).
     const hasSeenIntroTour = !!(await configStore.getConfig(`has_seen_intro_tour_user_${userId}`));
 
+    // Per-lesson Learning Center completion: { [lessonId]: { completedAt } }.
+    // Stored per-user in the DB so checkmarks persist across devices (the client
+    // also keeps a localStorage mirror as a flash-guard). Read through
+    // readServerProgress so the legacy intro-tour flag is lazily migrated into a
+    // real getting-started entry (same view the achievements endpoints use).
+    let learningProgress = {};
+    try { learningProgress = await readServerProgress(userId); } catch (_) { /* empty on failure */ }
+
     // Check if EU models are configured at all (admin must set these up)
     let hasEuModelsConfigured = false;
     try {
@@ -1428,6 +1523,13 @@ router.get('/user-settings', requireAuth, async (req, res) => {
         hasYouTrackConfig: !!(await configStore.getSecret(`youtrack_url_user_${userId}`)) && !!(await configStore.getSecret(`youtrack_token_user_${userId}`)),
         hasSignRequestConfig: !!(await configStore.getSecret(`signrequest_subdomain_user_${userId}`)) && !!(await configStore.getSecret(`signrequest_token_user_${userId}`)),
         hasGammaKey: !!(await configStore.getSecret(`gamma_api_key_user_${userId}`)),
+        hasAfasConfig: !!(await configStore.getSecret(`afas_token_user_${userId}`)) && !!(await configStore.getSecret(`afas_member_number_user_${userId}`)),
+        hasNmbrsConfig: !!(await configStore.getSecret(`nmbrs_subdomain_user_${userId}`)) && !!(await configStore.getSecret(`nmbrs_token_user_${userId}`)),
+        // Non-secret NMBRS fields so the settings form can pre-fill (the token is never returned).
+        nmbrsApiMode: (await configStore.getSecret(`nmbrs_api_mode_user_${userId}`)) || 'soap',
+        nmbrsSubdomain: (await configStore.getSecret(`nmbrs_subdomain_user_${userId}`)) || '',
+        nmbrsEmail: (await configStore.getSecret(`nmbrs_email_user_${userId}`)) || '',
+        nmbrsEnv: (await configStore.getSecret(`nmbrs_env_user_${userId}`)) || 'production',
         hasLinkedInConfig: !!(await configStore.getSecret('linkedin_client_id')) && !!(await configStore.getSecret('linkedin_client_secret')),
         hasGoogleKey: !!(await configStore.getSecret('google_api_key')),
         hasElevenLabsKey: !!(await configStore.getSecret('elevenlabs_api_key')),
@@ -1447,12 +1549,14 @@ router.get('/user-settings', requireAuth, async (req, res) => {
         simpleMode,
         // New-user product tour seen flag (personal UI preference)
         hasSeenIntroTour,
+        // Learning Center per-lesson completion map
+        learningProgress,
     });
 });
 
 router.post('/user-settings', requireAuth, async (req, res) => {
     const userId = req.session.user.id;
-    const { firefliesApiKey, youtrackUrl, youtrackToken, gammaApiKey, signrequestSubdomain, signrequestToken, enabledApps, simpleMode, hasSeenIntroTour } = req.body;
+    const { firefliesApiKey, youtrackUrl, youtrackToken, gammaApiKey, signrequestSubdomain, signrequestToken, afasMemberNumber, afasToken, afasEnvType, nmbrsApiMode, nmbrsSubdomain, nmbrsEmail, nmbrsToken, nmbrsEnv, enabledApps, simpleMode, hasSeenIntroTour, learningProgress, learningProgressReset } = req.body;
 
     if (firefliesApiKey !== undefined) {
         await configStore.setSecret(`fireflies_api_key_user_${userId}`, firefliesApiKey || '');
@@ -1476,6 +1580,73 @@ router.post('/user-settings', requireAuth, async (req, res) => {
         await configStore.setSecret(`signrequest_token_user_${userId}`, signrequestToken || '');
     }
 
+    // AFAS Profit — validated on save: the member number forms the API URL's
+    // subdomain (SSRF guard) and the token is stored in canonical XML form.
+    // Empty string clears a field (disconnect), like the other integrations.
+    if (afasMemberNumber !== undefined) {
+        const nr = String(afasMemberNumber || '').trim();
+        if (nr && !/^\d{1,10}$/.test(nr)) {
+            return res.status(400).json({ error: 'AFAS member number must be digits only.' });
+        }
+        await configStore.setSecret(`afas_member_number_user_${userId}`, nr);
+    }
+    if (afasToken !== undefined) {
+        let value = '';
+        if (afasToken) {
+            value = normalizeAfasToken(afasToken);
+            if (!value) {
+                return res.status(400).json({ error: 'AFAS token is not a valid AppConnector token. Paste the token XML or its hex data.' });
+            }
+        }
+        await configStore.setSecret(`afas_token_user_${userId}`, value);
+    }
+    if (afasEnvType !== undefined) {
+        const env = String(afasEnvType || '').trim().toLowerCase();
+        if (!['', 'production', 'test', 'accept'].includes(env)) {
+            return res.status(400).json({ error: 'AFAS environment type must be production, test or accept.' });
+        }
+        await configStore.setSecret(`afas_env_type_user_${userId}`, env);
+    }
+
+    // NMBRS (read-only) — validated on save. The subdomain forms the SOAP Domain
+    // / REST tenant (SSRF-relevant), the token/email travel in auth headers, so
+    // each is shape-checked. Empty string clears a field (disconnect).
+    if (nmbrsApiMode !== undefined) {
+        const mode = String(nmbrsApiMode || '').trim().toLowerCase();
+        if (!['', 'soap', 'rest'].includes(mode)) {
+            return res.status(400).json({ error: 'NMBRS API mode must be soap or rest.' });
+        }
+        await configStore.setSecret(`nmbrs_api_mode_user_${userId}`, mode);
+    }
+    if (nmbrsSubdomain !== undefined) {
+        const sub = String(nmbrsSubdomain || '').trim();
+        if (sub && !NMBRS_SUBDOMAIN_RE.test(sub)) {
+            return res.status(400).json({ error: 'NMBRS subdomain is invalid — use just the tenant name (e.g. "mycompany"), no dots or slashes.' });
+        }
+        await configStore.setSecret(`nmbrs_subdomain_user_${userId}`, sub);
+    }
+    if (nmbrsEmail !== undefined) {
+        const email = String(nmbrsEmail || '').trim();
+        if (email && !NMBRS_EMAIL_RE.test(email)) {
+            return res.status(400).json({ error: 'NMBRS login email is invalid.' });
+        }
+        await configStore.setSecret(`nmbrs_email_user_${userId}`, email);
+    }
+    if (nmbrsToken !== undefined) {
+        const token = String(nmbrsToken || '').trim();
+        if (token && !NMBRS_TOKEN_RE.test(token)) {
+            return res.status(400).json({ error: 'NMBRS token is invalid — paste the API token / bearer token with no spaces.' });
+        }
+        await configStore.setSecret(`nmbrs_token_user_${userId}`, token);
+    }
+    if (nmbrsEnv !== undefined) {
+        const env = String(nmbrsEnv || '').trim().toLowerCase();
+        if (!['', 'production', 'sandbox'].includes(env)) {
+            return res.status(400).json({ error: 'NMBRS environment must be production or sandbox.' });
+        }
+        await configStore.setSecret(`nmbrs_env_user_${userId}`, env);
+    }
+
     if (enabledApps !== undefined) {
         await configStore.setConfig(`enabled_apps_user_${userId}`, enabledApps);
     }
@@ -1493,6 +1664,32 @@ router.post('/user-settings', requireAuth, async (req, res) => {
 
     if (hasSeenIntroTour !== undefined) {
         await configStore.setConfig(`has_seen_intro_tour_user_${userId}`, !!hasSeenIntroTour);
+    }
+
+    // Learning Center completion map. This blob feeds badge/certificate
+    // eligibility, so incoming payloads are sanitized (lesson ids whitelisted
+    // against the server catalog, entries shape-checked, size-capped) and MERGED
+    // into the stored map — a stale device can no longer erase another device's
+    // progress. Reset is an explicit flag, since under merge semantics an empty
+    // map would be a no-op.
+    if (learningProgressReset === true) {
+        await configStore.setConfig(`learning_progress_user_${userId}`, {});
+        // Mark the legacy intro-tour migration done so the old flag can't
+        // resurrect 'getting-started' after an explicit reset.
+        await configStore.setConfig(`learning_intro_migrated_user_${userId}`, true);
+    } else if (learningProgress !== undefined) {
+        const { map, dropped, error } = sanitizeLearningProgress(learningProgress);
+        if (error === 'too_large') {
+            return res.status(400).json({ error: 'Learning progress payload too large.' });
+        }
+        if (dropped.length) console.warn(`[user-settings] dropped ${dropped.length} invalid learning progress entries for user ${userId}`);
+        if (map && Object.keys(map).length) {
+            const existing = (await configStore.getConfig(`learning_progress_user_${userId}`)) || {};
+            await configStore.setConfig(
+                `learning_progress_user_${userId}`,
+                mergeLearningProgress(existing, map),
+            );
+        }
     }
 
     res.json({ success: true });
@@ -2264,6 +2461,42 @@ router.post('/mcp-servers/user-credentials', requireAuth, requireMcp, async (req
     } catch (err) {
         console.error('[MCP] Save credential error:', err);
         res.status(500).json({ error: err.message });
+    }
+});
+
+// ─── Live MCP Registry browse ───────────────────────────────────────
+// Proxies the OFFICIAL, open MCP registry (registry.modelcontextprotocol.io)
+// so the marketplace's "Browse all" tab can surface thousands of servers with
+// no API key and no third-party SaaS dependency. Results are mapped to our
+// install shape server-side and cached briefly to spare the upstream.
+const mcpRegistry = require('../../integrations/mcpRegistryClient');
+const { createTtlCache } = require('../../utils/ttlCache');
+const mcpRegistryCache = createTtlCache({ ttlMs: 5 * 60 * 1000, max: 200 });
+
+// GET /ai/mcp-registry/search?q=&cursor=&verifiedOnly=1
+router.get('/mcp-registry/search', requireAuth, requireMcp, async (req, res) => {
+    try {
+        const q = (req.query.q || '').toString().slice(0, 200).trim();
+        const cursor = (req.query.cursor || '').toString();
+        // Default to verified-only (active + latest) as a supply-chain guardrail.
+        const verifiedOnly = req.query.verifiedOnly !== '0' && req.query.verifiedOnly !== 'false';
+
+        const cacheKey = `official|${verifiedOnly ? 'v' : 'all'}|${q}|${cursor}`;
+        const cached = mcpRegistryCache.get(cacheKey);
+        if (cached) return res.json(cached);
+
+        const { servers, nextCursor } = await mcpRegistry.searchOfficial({ q, cursor });
+        const mapped = servers
+            .filter(e => !verifiedOnly || mcpRegistry.isActiveLatest(e))
+            .map(e => mcpRegistry.registryEntryToInstallConfig(e))
+            .filter(Boolean);
+
+        const payload = { servers: mapped, nextCursor, source: 'official' };
+        mcpRegistryCache.set(cacheKey, payload);
+        res.json(payload);
+    } catch (err) {
+        console.error('[MCP] Registry search error:', err);
+        res.status(502).json({ error: 'mcp_registry_unavailable', detail: err.message });
     }
 });
 

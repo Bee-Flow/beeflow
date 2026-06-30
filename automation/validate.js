@@ -3,10 +3,15 @@
  *
  * Checks:
  *   - Required top-level shape (trigger, steps[], edges[]).
- *   - Each step has a unique id.
+ *   - Each step has a unique id (per graph).
  *   - DAG is acyclic via Kahn's algorithm.
  *   - condition.expr parses under the restricted grammar.
  *   - integration_action.tool is a string (catalog lookup happens at run time).
+ *   - Inline layers (`definition.layers`, root-only map of mini-definitions):
+ *     map shape + key format, per-layer graph rules (layer_input trigger,
+ *     exactly one layer_output, no approval, no nesting), call_layer
+ *     references resolve, required layer params are bound, and the
+ *     layer-reference graph is acyclic and within the depth cap.
  *
  * Reference paths (`{{steps.x.output.y}}`) are NOT validated as blocking
  * errors. The runtime resolves missing refs to `undefined` safely, and
@@ -23,7 +28,28 @@ const VALID_STEP_TYPES = new Set([
     // n8n-style utility nodes (Phase A: data + control flow, Phase B: collection ops)
     'set', 'datetime', 'wait', 'stop_error', 'switch',
     'filter', 'limit', 'dedupe', 'aggregate', 'summarize',
+    // Layers (inline sub-flows): call a layer / return from one.
+    'call_layer', 'layer_output',
+    // Steps (reusable building blocks, kind='block'): call an external Step.
+    'call_block',
 ]);
+
+// §WS4 — edge-label rules. The runner routes labelled edges (nextEdgesFor):
+// unlabelled/'on_success' fire on success, 'then'/'else' on conditions,
+// 'case:<name>' on switches, 'on_error' when the step exhausts its retries
+// and fails. Anything else never fires — warn so a typo ("onerror",
+// "success") doesn't silently dead-end a branch.
+const KNOWN_EDGE_LABELS = new Set(['then', 'else', 'on_success', 'on_error']);
+// Step types that can meaningfully FAIL at run time — the only legal
+// sources for an 'on_error' edge.
+const ON_ERROR_SOURCE_TYPES = new Set([
+    'integration_action', 'ai_step', 'code', 'call_layer', 'call_block', 'loop', 'parallel', 'notification', 'wait',
+]);
+// Sources where an error branch is structurally wrong: the trigger never
+// dispatches, condition/switch route by their own branch labels (an
+// 'on_error' edge there would shadow the branch routing), approval pauses
+// rather than fails, and stop_error's entire JOB is to fail the run.
+const ON_ERROR_FORBIDDEN_SOURCE_TYPES = new Set(['trigger', 'condition', 'switch', 'approval', 'stop_error']);
 
 const DATETIME_OPS = new Set(['now', 'parse', 'format', 'addDays', 'addHours', 'addMinutes', 'diff', 'extract']);
 const SUMMARIZE_OPS = new Set(['sum', 'count', 'avg', 'min', 'max']);
@@ -31,192 +57,103 @@ const LIMIT_MODES = new Set(['first', 'last']);
 const DATETIME_PARTS = new Set(['year', 'month', 'day', 'hour', 'minute', 'second', 'dayOfWeek']);
 const DATETIME_DIFF_UNITS = new Set(['days', 'hours', 'minutes', 'seconds']);
 
-function isObject(x) { return x && typeof x === 'object' && !Array.isArray(x); }
+// Inline-layer keys: lowercase snake, must start with a letter. Shared
+// contract with the builder tools and the frontend layer helpers.
+const LAYER_KEY_RE = /^[a-z][a-z0-9_]*$/;
+
+// §WS1.4 — hard ceilings on graph size, independent of the 20MB body limit.
+// Without these, a single authenticated save can submit a pathological
+// definition (hundreds of thousands of trivial nodes) that bloats the JSONB
+// column/version history and burns CPU on the O(steps+edges) topo-sort + the
+// per-step Levenshtein suggestion work on every validate/activate/run. The
+// caps are far above any real automation, so they only ever trip on abuse.
+const MAX_STEPS = 500;          // per graph (root or a single layer)
+const MAX_EDGES = 2000;         // per graph
+const MAX_TOTAL_NODES = 3000;   // root + all layers combined
+
+// §WS5 — pure graph/string helpers extracted into validate/helpers.js so this
+// file holds the validation RULES, not the plumbing. Behaviour is unchanged.
+const {
+    isObject,
+    validatePosition,
+    topoOrder,
+    collectRefPaths,
+    collectLiteralBraces,
+    rootOf,
+    pickClosestId,
+    secondSegment,
+} = require('./validate/helpers');
+const { collectCallLayerSteps, validateCallLayerStep } = require('./validate/callLayer');
+const { collectCallBlockSteps, validateCallBlockStep } = require('./validate/callBlock');
+const { validateLayerGraph } = require('./validate/layerGraph');
 
 /**
- * Optional canvas position (`{ x, y }`) — written by the drag-and-drop
- * builder, ignored by the runner. We reject only malformed shapes so a
- * typo on the UI side surfaces fast instead of silently round-tripping
- * garbage through the JSONB blob.
+ * Walk a graph (root definition or a layer mini-definition) collecting every
+ * call_layer step — including those nested inside loop bodies and parallel
+ * branches. Returns [{ step, path }] with builder-style paths.
  */
-function validatePosition(pos, at, push) {
-    if (pos === undefined || pos === null) return;
-    if (!isObject(pos)) {
-        push({ code: 'position.shape', severity: 'error', path: at + '.position', message: 'position must be an object { x, y }.', hint: 'Pass { x: number, y: number } or omit the field entirely.' });
-        return;
-    }
-    for (const k of ['x', 'y']) {
-        const v = pos[k];
-        if (typeof v !== 'number' || !Number.isFinite(v)) {
-            push({ code: 'position.coord', severity: 'error', path: at + `.position.${k}`, message: `position.${k} must be a finite number.`, hint: 'Use canvas coordinates from the visual editor.' });
-        }
-    }
-}
-
-function topoOrder(nodes, edges) {
-    const inDeg = new Map();
-    const adj = new Map();
-    for (const n of nodes) { inDeg.set(n, 0); adj.set(n, []); }
-    for (const e of edges) {
-        if (!adj.has(e.from)) { adj.set(e.from, []); inDeg.set(e.from, inDeg.get(e.from) || 0); }
-        if (!inDeg.has(e.to)) { inDeg.set(e.to, 0); adj.set(e.to, []); }
-        adj.get(e.from).push(e.to);
-        inDeg.set(e.to, (inDeg.get(e.to) || 0) + 1);
-    }
-    const q = [];
-    for (const [k, v] of inDeg) if (v === 0) q.push(k);
-    const order = [];
-    while (q.length) {
-        const cur = q.shift();
-        order.push(cur);
-        for (const next of (adj.get(cur) || [])) {
-            inDeg.set(next, inDeg.get(next) - 1);
-            if (inDeg.get(next) === 0) q.push(next);
-        }
-    }
-    if (order.length !== inDeg.size) return null; // cycle
-    return order;
-}
-
-function collectRefPaths(value, out) {
-    if (value == null) return;
-    if (Array.isArray(value)) { value.forEach(v => collectRefPaths(v, out)); return; }
-    if (typeof value !== 'object') return;
-    if (typeof value.kind === 'string') {
-        if (value.kind === 'ref' && typeof value.path === 'string') out.push({ kind: 'ref', path: value.path });
-        if (value.kind === 'template' && typeof value.value === 'string') {
-            const re = /\{\{\s*([^}]+?)\s*\}\}/g;
-            let m; while ((m = re.exec(value.value))) out.push({ kind: 'ref', path: m[1].trim() });
-        }
-        if (value.kind === 'expr' && typeof value.value === 'string') {
-            out.push({ kind: 'expr', src: value.value });
-        }
-        // literal: nothing
-        return;
-    }
-    for (const k of Object.keys(value)) collectRefPaths(value[k], out);
-}
 
 /**
- * Collect `kind:'literal'` string values that contain `{{…}}` placeholders.
- * Only `kind:'template'` values are interpolated at runtime (see bind.js), so
- * a literal carrying `{{…}}` ships the braces verbatim — almost always a
- * mistake. Pushes the offending strings onto `out`.
- */
-function collectLiteralBraces(value, out) {
-    if (value == null) return;
-    if (Array.isArray(value)) { value.forEach(v => collectLiteralBraces(v, out)); return; }
-    if (typeof value !== 'object') return;
-    if (typeof value.kind === 'string') {
-        if (value.kind === 'literal' && typeof value.value === 'string' && /\{\{[^}]+\}\}/.test(value.value)) {
-            out.push(value.value);
-        }
-        return;
-    }
-    for (const k of Object.keys(value)) collectLiteralBraces(value[k], out);
-}
-
-function rootOf(path) {
-    const m = String(path).match(/^([A-Za-z_$][A-Za-z0-9_$]*)/);
-    return m ? m[1] : null;
-}
-
-/**
- * Pick the closest candidate id to `target` by Levenshtein distance —
- * used to suggest "did you mean" in validation errors when an LLM
- * fabricates a step id like "step_1" that doesn't exist.
- */
-function pickClosestId(target, candidates) {
-    if (!Array.isArray(candidates) || candidates.length === 0) return null;
-    let best = null;
-    let bestDist = Infinity;
-    for (const c of candidates) {
-        const d = levenshtein(String(target), String(c));
-        if (d < bestDist) { bestDist = d; best = c; }
-    }
-    // Only suggest when the distance is short enough that the suggestion
-    // is actually useful — otherwise return the first candidate as a hint
-    // so the LLM at least sees a real id.
-    if (bestDist <= Math.max(3, Math.floor(String(target).length / 2))) return best;
-    return candidates[0];
-}
-
-function levenshtein(a, b) {
-    if (a === b) return 0;
-    const al = a.length, bl = b.length;
-    if (al === 0) return bl;
-    if (bl === 0) return al;
-    const v0 = new Array(bl + 1);
-    const v1 = new Array(bl + 1);
-    for (let j = 0; j <= bl; j++) v0[j] = j;
-    for (let i = 0; i < al; i++) {
-        v1[0] = i + 1;
-        for (let j = 0; j < bl; j++) {
-            const cost = a[i] === b[j] ? 0 : 1;
-            v1[j + 1] = Math.min(v1[j] + 1, v0[j + 1] + 1, v0[j] + cost);
-        }
-        for (let j = 0; j <= bl; j++) v0[j] = v1[j];
-    }
-    return v1[bl];
-}
-
-function secondSegment(path) {
-    const m = String(path).match(/^[A-Za-z_$][A-Za-z0-9_$]*\.([A-Za-z_$][A-Za-z0-9_$]*)/);
-    return m ? m[1] : null;
-}
-
-/**
- * Validate a definition. Returns { ok, errors[], warnings[] } where each
- * record is `{ code, severity, path, message, hint }`. The structured
- * shape lets the SSE builder loop feed *specific* failures back to the
- * LLM so it can self-correct instead of guessing what the free-text
- * meant.
+ * Validate ONE graph — the root definition or a layer mini-definition.
+ * Pushes records onto opts.errors / opts.warnings with `pathPrefix`
+ * prepended to every path ('' for root, 'layers.<key>.' for layers).
  *
- *   code        — short, stable identifier (e.g. 'condition.dead_branch')
- *   severity    — 'error' | 'warning'
- *   path        — JSON-pointer-ish path into the def (e.g. 'steps[3].expr')
- *   message     — human-readable, for UI display
- *   hint        — actionable next step, written for the LLM
+ * opts:
+ *   errors / warnings   — shared record arrays (mutated)
+ *   scope               — 'root' | 'layer'
+ *   layers              — the ROOT layers map (for call_layer reference checks)
+ *   availableTools / toolRequiredParams / deliverableEvents — as on
+ *                         validateDefinition.
  *
- * `availableTools` (optional) is a Set of tool names from the catalog. When
- * provided, integration_action.tool is checked against it.
- *
- * `toolRequiredParams` (optional) is an object map { toolName: ['p1', …] } of
- * each tool's required input names. When provided, an integration_action whose
- * required input is absent (or bound to an empty-string literal) is flagged —
- * this is what stops a Talk-send-with-no-room or calendar-event-with-no-date
- * from activating green and then failing silently.
+ * Mirrors the original single-graph behaviour: stops validating THIS graph
+ * at the same phase boundaries the original function early-returned at
+ * (shape → ids/edges → DAG → per-step), without aborting sibling graphs.
  */
-function validateDefinition(def, { availableTools = null, toolRequiredParams = null, deliverableEvents = null } = {}) {
-    const errors = [];
-    const warnings = [];
+function validateGraph(graph, pathPrefix, opts) {
+    const { errors, warnings, scope = 'root', layers = {}, availableTools = null, toolRequiredParams = null, deliverableEvents = null, availableBlocks = null } = opts;
     const pushE = (rec) => errors.push(rec);
     const pushW = (rec) => warnings.push(rec);
+    const startErrors = errors.length;
+    const p = (s) => pathPrefix + s;
+    // Contract scopes (layer + block) share the input/output-contract rules:
+    // a fixed layer_input trigger, exactly one layer_output, no approval, no
+    // nested layers. 'block' is a standalone Step (kind='block') validated at
+    // the document root; 'layer' is an inline flowlet.
+    const isContractScope = scope === 'layer' || scope === 'block';
+    const contractNoun = scope === 'block' ? 'Step' : 'Layer';
 
-    if (!isObject(def)) {
-        return {
-            ok: false,
-            errors: [{ code: 'shape.not_object', severity: 'error', path: '', message: 'Definition must be an object.', hint: 'Pass a JSON object with trigger, steps, and edges keys.' }],
-            warnings: [],
-        };
-    }
-    if (!isObject(def.trigger)) pushE({ code: 'trigger.missing', severity: 'error', path: 'trigger', message: 'Missing or invalid `trigger`.', hint: 'Call builder_propose_trigger before adding any steps.' });
-    if (!Array.isArray(def.steps)) pushE({ code: 'steps.not_array', severity: 'error', path: 'steps', message: '`steps` must be an array.', hint: 'Initialise the draft via builder_propose_trigger so the shape is correct.' });
-    if (!Array.isArray(def.edges)) pushE({ code: 'edges.not_array', severity: 'error', path: 'edges', message: '`edges` must be an array.', hint: 'Initialise the draft via builder_propose_trigger so the shape is correct.' });
-    if (errors.length) return { ok: false, errors, warnings };
+    if (!isObject(graph.trigger)) pushE({ code: 'trigger.missing', severity: 'error', path: p('trigger'), message: 'Missing or invalid `trigger`.', hint: isContractScope ? `Every ${contractNoun} needs a layer_input trigger declaring its params.` : 'Call builder_propose_trigger before adding any steps.' });
+    if (!Array.isArray(graph.steps)) pushE({ code: 'steps.not_array', severity: 'error', path: p('steps'), message: '`steps` must be an array.', hint: 'Initialise the draft via builder_propose_trigger so the shape is correct.' });
+    if (!Array.isArray(graph.edges)) pushE({ code: 'edges.not_array', severity: 'error', path: p('edges'), message: '`edges` must be an array.', hint: 'Initialise the draft via builder_propose_trigger so the shape is correct.' });
+    if (errors.length > startErrors) return;
 
     // Trigger — ensure it has an id and a kind.
-    const trigger = def.trigger;
-    if (!trigger.id || typeof trigger.id !== 'string') pushE({ code: 'trigger.id_missing', severity: 'error', path: 'trigger.id', message: 'trigger.id is required.', hint: 'Re-run builder_propose_trigger; it generates a stable id.' });
-    if (!trigger.kind || typeof trigger.kind !== 'string') pushE({ code: 'trigger.kind_missing', severity: 'error', path: 'trigger.kind', message: 'trigger.kind is required.', hint: 'Use one of: schedule, manual, webhook, app_event, agent_call.' });
-    validatePosition(trigger.position, 'trigger', pushE);
+    const trigger = graph.trigger;
+    if (!trigger.id || typeof trigger.id !== 'string') pushE({ code: 'trigger.id_missing', severity: 'error', path: p('trigger.id'), message: 'trigger.id is required.', hint: 'Re-run builder_propose_trigger; it generates a stable id.' });
+    if (isContractScope) {
+        // Layer/Step graphs: the trigger is the input contract — kind is fixed.
+        if (trigger.kind !== 'layer_input') {
+            pushE({ code: 'layer.trigger_kind', severity: 'error', path: p('trigger.kind'), message: `${contractNoun} trigger kind must be 'layer_input' (got "${trigger.kind}").`, hint: `${contractNoun}s are invoked by their callers, not by their own triggers — set trigger.kind to 'layer_input' and declare params.` });
+        }
+        if (trigger.params !== undefined && !Array.isArray(trigger.params)) {
+            pushE({ code: 'layer.params_shape', severity: 'error', path: p('trigger.params'), message: `${contractNoun} trigger.params must be an array of { name, type, required? }.`, hint: 'Use builder_set_layer_contract to declare the inputs.' });
+        }
+        // No document nesting — layers/Steps don't contain inline layers.
+        if (graph.layers !== undefined) {
+            pushE({ code: 'layers.nested', severity: 'error', path: p('layers'), message: `A ${contractNoun} cannot contain a nested \`layers\` map.`, hint: 'Move the nested layer up to definition.layers and reference it by key (sibling calls are allowed).' });
+        }
+    } else {
+        if (!trigger.kind || typeof trigger.kind !== 'string') pushE({ code: 'trigger.kind_missing', severity: 'error', path: p('trigger.kind'), message: 'trigger.kind is required.', hint: 'Use one of: schedule, manual, webhook, app_event, agent_call.' });
+    }
+    validatePosition(trigger.position, p('trigger'), pushE);
 
-    // Deliverability warning (opt-in): an app_event trigger whose event has no
-    // producer on this install — neither a triggerBus poller nor a connector
-    // push subscription — will activate but never fire. Non-blocking: push-only
-    // events are deliverable on connector installs but not OAuth-only ones, so
-    // we warn rather than block.
-    if (deliverableEvents && trigger.kind === 'app_event') {
+    // Deliverability warning (opt-in; root only — layer triggers are
+    // layer_input): an app_event trigger whose event has no producer on this
+    // install — neither a triggerBus poller nor a connector push subscription
+    // — will activate but never fire. Non-blocking: push-only events are
+    // deliverable on connector installs but not OAuth-only ones, so we warn
+    // rather than block.
+    if (scope === 'root' && deliverableEvents && trigger.kind === 'app_event') {
         const prov = trigger.appEvent?.provider;
         const ev = trigger.appEvent?.event;
         const set = prov && deliverableEvents[prov];
@@ -229,41 +166,96 @@ function validateDefinition(def, { availableTools = null, toolRequiredParams = n
             const message = pushPending
                 ? `Trigger event "${prov}.${ev}" requires the Bee Flow ExApp connector and is pending live validation — it will activate but may not fire yet.`
                 : `Trigger event "${prov}.${ev}" has no delivery path on this install — it will activate but may never fire.`;
-            pushW({ code: 'trigger.app_event_undeliverable', severity: 'warning', path: 'trigger.appEvent.event', message, hint: 'Pick a poller-backed event (e.g. file.new, calendar.event.upcoming) to fire today, or wait for the connector validation before relying on this event.' });
+            pushW({ code: 'trigger.app_event_undeliverable', severity: 'warning', path: p('trigger.appEvent.event'), message, hint: 'Pick a poller-backed event (e.g. file.new, calendar.event.upcoming) to fire today, or wait for the connector validation before relying on this event.' });
         }
     }
 
-    // Steps — unique ids, valid types.
+    // Steps — unique ids (per graph), valid types.
     const ids = new Set([trigger.id]);
     const stepById = new Map();
     if (trigger.id) stepById.set(trigger.id, trigger);
-    for (let i = 0; i < def.steps.length; i++) {
-        const s = def.steps[i];
-        const at = `steps[${i}]`;
+    for (let i = 0; i < graph.steps.length; i++) {
+        const s = graph.steps[i];
+        const at = p(`steps[${i}]`);
         if (!isObject(s)) { pushE({ code: 'step.not_object', severity: 'error', path: at, message: 'Each step must be an object.', hint: 'Remove the malformed entry and add a fresh step via builder_add_*.' }); continue; }
         if (!s.id || typeof s.id !== 'string') { pushE({ code: 'step.id_missing', severity: 'error', path: at + '.id', message: 'Each step needs an `id`.', hint: 'Use the id returned from the previous builder_add_* tool result.' }); continue; }
         if (ids.has(s.id)) { pushE({ code: 'step.id_duplicate', severity: 'error', path: at + '.id', message: `Duplicate step id: ${s.id}`, hint: 'Remove the duplicate or call builder_remove_step on one of them.' }); continue; }
         if (!VALID_STEP_TYPES.has(s.type)) { pushE({ code: 'step.unknown_type', severity: 'error', path: at + '.type', message: `Step ${s.id}: unknown type "${s.type}".`, hint: `Use one of: ${[...VALID_STEP_TYPES].join(', ')}.` }); continue; }
+        // Approval steps pause the run and resume by PARENT-graph step id —
+        // a pause inside a layer/Step sub-graph has no resumable address. The
+        // runner enforces this too (execApproval throws inside layers).
+        if (isContractScope && s.type === 'approval') {
+            pushE({ code: 'layer.approval_forbidden', severity: 'error', path: at + '.type', message: `Step ${s.id}: approval steps are not supported inside a ${contractNoun}.`, hint: `Move the approval to the parent flow, before or after the call to this ${contractNoun}.` });
+            continue;
+        }
+        // v1: a Step cannot call another Step (cross-row recursion can't be
+        // statically checked). Inline flowlets and nested-in-automation calls
+        // remain fine; only scope='block' forbids it.
+        if (scope === 'block' && s.type === 'call_block') {
+            pushE({ code: 'block.nested_call_forbidden', severity: 'error', path: at + '.type', message: `Step ${s.id}: a Step cannot contain another Step (call_block) yet.`, hint: 'Inline the logic, or compose Steps at the automation level instead.' });
+            continue;
+        }
         validatePosition(s.position, at, pushE);
         ids.add(s.id);
         stepById.set(s.id, s);
     }
 
-    // Edges — reference known nodes.
-    for (let i = 0; i < def.edges.length; i++) {
-        const e = def.edges[i];
-        const at = `edges[${i}]`;
+    // Layer output contract: exactly one layer_output per layer. Zero is a
+    // degenerate-but-runnable layer (returns the last step's output) →
+    // warning; more than one is ambiguous → error. At the ROOT, layer_output
+    // steps stay legal (orphan layers converted to automations keep theirs).
+    if (isContractScope) {
+        const outs = graph.steps.filter(s => isObject(s) && s.type === 'layer_output');
+        if (outs.length === 0) {
+            pushW({ code: 'layer.no_output', severity: 'warning', path: p('steps'), message: `${contractNoun} has no layer_output step — callers receive the last step\'s raw output.`, hint: 'Add a layer_output step with explicit fields so it has a stable output contract.' });
+        } else if (outs.length > 1) {
+            pushE({ code: 'layer.multiple_outputs', severity: 'error', path: p('steps'), message: `${contractNoun} has ${outs.length} layer_output steps — the output contract is ambiguous.`, hint: 'Keep exactly one layer_output step; merge the branches into it.' });
+        }
+    }
+
+    // Edges — reference known nodes; labels are known + on_error sources legal.
+    for (let i = 0; i < graph.edges.length; i++) {
+        const e = graph.edges[i];
+        const at = p(`edges[${i}]`);
         if (!isObject(e) || !e.from || !e.to) { pushE({ code: 'edge.shape', severity: 'error', path: at, message: 'Each edge needs `from` and `to`.', hint: 'Re-add the edge via the relevant builder_add_* tool which fills both fields.' }); continue; }
         if (!ids.has(e.from)) pushE({ code: 'edge.unknown_from', severity: 'error', path: at + '.from', message: `Edge from unknown node: ${e.from}`, hint: 'Either remove the edge or add the missing step.' });
         if (!ids.has(e.to))   pushE({ code: 'edge.unknown_to',   severity: 'error', path: at + '.to',   message: `Edge to unknown node: ${e.to}`,   hint: 'Either remove the edge or add the missing step.' });
+        if (typeof e.label === 'string' && e.label) {
+            // 'case:<name>' labels are validated against the switch's case
+            // names by the switch-step block below; everything else must be
+            // one of the runner's routed labels or it never fires.
+            if (!KNOWN_EDGE_LABELS.has(e.label) && !e.label.startsWith('case:')) {
+                pushW({ code: 'edge.label_unknown', severity: 'warning', path: at + '.label', message: `Edge ${e.from} → ${e.to} has unknown label "${e.label}" — it will never fire.`, hint: 'Use one of: then, else, on_success, on_error, case:<switch-case-name>, or remove the label so the edge fires on success.' });
+            }
+            if (e.label === 'on_error' && ids.has(e.from)) {
+                const srcType = e.from === trigger.id ? 'trigger' : stepById.get(e.from)?.type;
+                if (ON_ERROR_FORBIDDEN_SOURCE_TYPES.has(srcType)) {
+                    pushE({ code: 'edge.error_label_invalid', severity: 'error', path: at + '.label', message: `Edge ${e.from} → ${e.to}: a ${srcType === 'trigger' ? 'trigger' : `"${srcType}" step`} cannot have an on_error branch.`, hint: 'Error branches start from steps that can fail at run time (integration_action, ai_step, code, call_layer, loop, parallel, notification, wait). Remove this edge or move it to the failing step.' });
+                } else if (!ON_ERROR_SOURCE_TYPES.has(srcType)) {
+                    pushW({ code: 'edge.error_label_unlikely', severity: 'warning', path: at + '.label', message: `Edge ${e.from} → ${e.to}: "${srcType}" steps are pure data operations that rarely fail — this error branch will likely never run.`, hint: 'Error branches are meant for steps that talk to external systems (integration_action, ai_step, code, call_layer, …). Keep it only if you rely on a structured failure like collection_too_large.' });
+                }
+            }
+        }
     }
-    if (errors.length) return { ok: false, errors, warnings };
+    if (errors.length > startErrors) return;
 
     // DAG check.
     const nodes = Array.from(ids);
-    const order = topoOrder(nodes, def.edges);
-    if (!order) pushE({ code: 'graph.cycle', severity: 'error', path: 'edges', message: 'Definition contains a cycle.', hint: 'Inspect the edges array; remove the back-edge that closes the loop.' });
-    if (errors.length) return { ok: false, errors, warnings };
+    const order = topoOrder(nodes, graph.edges);
+    if (!order) pushE({ code: 'graph.cycle', severity: 'error', path: p('edges'), message: 'Definition contains a cycle.', hint: 'Inspect the edges array; remove the back-edge that closes the loop.' });
+    if (errors.length > startErrors) return;
+
+    // call_layer reference checks — run over EVERY call step in this graph,
+    // including those nested inside loop bodies / parallel branches.
+    for (const { step, path: at } of collectCallLayerSteps(graph, pathPrefix)) {
+        validateCallLayerStep(step, at, layers, pushE);
+    }
+
+    // call_block reference checks — external Step references. availableBlocks
+    // (when provided) is the caller's published-Steps catalog.
+    for (const { step, path: at } of collectCallBlockSteps(graph, pathPrefix)) {
+        validateCallBlockStep(step, at, availableBlocks, pushE);
+    }
 
     // Per-step validation + reference scoping (top-level only; loop bodies
     // are validated within their own scope below).
@@ -272,7 +264,7 @@ function validateDefinition(def, { availableTools = null, toolRequiredParams = n
         const step = stepById.get(id);
         if (!step) continue;
         if (step.id === trigger.id) continue;
-        const at = `steps[${id}]`;
+        const at = p(`steps[${id}]`);
 
         // Step-type-specific structural checks.
         if (step.type === 'integration_action') {
@@ -306,7 +298,7 @@ function validateDefinition(def, { availableTools = null, toolRequiredParams = n
             // A condition with no `then` and no `else` outgoing edges
             // dead-ends at runtime — promote from warning to error so
             // the builder cannot finalize a definitionally broken graph.
-            const out = def.edges.filter(e => e.from === step.id);
+            const out = graph.edges.filter(e => e.from === step.id);
             const labels = new Set(out.map(e => e.label));
             if (!labels.has('then') && !labels.has('else')) {
                 pushE({ code: 'condition.dead_branch', severity: 'error', path: at + '.edges', message: `Step ${step.id}: condition has no 'then' or 'else' edges — both branches dead-end.`, hint: 'Append the next step with afterStepId set to this condition id (the edge auto-labels then, then else), or pass thenStepId/elseStepId to wire existing steps.' });
@@ -326,12 +318,39 @@ function validateDefinition(def, { availableTools = null, toolRequiredParams = n
                 pushE({ code: 'loop.max_iterations_range', severity: 'error', path: at + '.maxIterations', message: `Step ${step.id}: loop maxIterations must be 1..1000.`, hint: 'Pick a small integer; 100 is a sensible default.' });
             }
         }
+        // Per-step iteration ("run once per item"). A leaf executable step
+        // may carry `step.forEach = { overRef, itemVar, maxIterations }` to
+        // fan out over an upstream array — the runner runs the step once per
+        // element with `loop.<itemVar>` bound (see execForEachStep). Control /
+        // container types iterate via their own mechanics, so forEach there is
+        // rejected (default-deny allow-list).
+        if (step.forEach !== undefined && step.forEach !== null) {
+            const FOREACH_ALLOWED = new Set(['integration_action', 'ai_step', 'code', 'notification', 'set']);
+            if (!isObject(step.forEach)) {
+                pushE({ code: 'foreach.shape', severity: 'error', path: at + '.forEach', message: `Step ${step.id}: forEach must be an object { overRef, itemVar, maxIterations }.`, hint: 'Remove it, or provide overRef + itemVar.' });
+            } else if (!FOREACH_ALLOWED.has(step.type)) {
+                pushE({ code: 'foreach.type_unsupported', severity: 'error', path: at + '.forEach', message: `Step ${step.id}: "${step.type}" steps cannot use forEach iteration.`, hint: 'Only integration_action / ai_step / code / notification / set can run once per item. Use a loop step, or remove forEach.' });
+            } else {
+                if (!step.forEach.overRef || typeof step.forEach.overRef !== 'string') pushE({ code: 'foreach.overRef_missing', severity: 'error', path: at + '.forEach.overRef', message: `Step ${step.id}: forEach requires \`overRef\`.`, hint: 'Bind to an upstream array, e.g. `steps.<id>.output.results`.' });
+                if (!step.forEach.itemVar || typeof step.forEach.itemVar !== 'string') pushE({ code: 'foreach.itemVar_missing', severity: 'error', path: at + '.forEach.itemVar', message: `Step ${step.id}: forEach requires \`itemVar\`.`, hint: 'Choose a short name like `item` or `result`; reference each element as loop.<itemVar>.' });
+                if (step.forEach.maxIterations !== undefined && (typeof step.forEach.maxIterations !== 'number' || step.forEach.maxIterations < 1 || step.forEach.maxIterations > 1000)) {
+                    pushE({ code: 'foreach.max_iterations_range', severity: 'error', path: at + '.forEach.maxIterations', message: `Step ${step.id}: forEach maxIterations must be 1..1000.`, hint: 'Pick a small integer; 100 is a sensible default.' });
+                }
+            }
+        }
         if (step.type === 'code') {
             if (!step.code || typeof step.code !== 'string') pushE({ code: 'code.code_missing', severity: 'error', path: at + '.code', message: `Step ${step.id}: code step requires \`code\`.`, hint: 'Provide the JS source as a string.' });
             if (step.language && step.language !== 'javascript') pushE({ code: 'code.language_unsupported', severity: 'error', path: at + '.language', message: `Step ${step.id}: only language: 'javascript' supported.`, hint: 'Either omit `language` or set it to "javascript".' });
         }
         if (step.type === 'notification') {
             if (!step.title && !step.body) pushE({ code: 'notification.empty', severity: 'error', path: at, message: `Step ${step.id}: notification needs at least \`title\` or \`body\`.`, hint: 'Provide one (or both) so the user has something to read.' });
+        }
+        // call_layer reference checks ran above (collectCallLayerSteps pass —
+        // covers loop bodies / parallel branches too). Leftover denormalized
+        // contract fields (inputContract/outputContract/version) are tolerated
+        // and ignored.
+        if (step.type === 'layer_output') {
+            if (step.fields !== undefined && !isObject(step.fields)) pushE({ code: 'layer_output.fields_shape', severity: 'error', path: at + '.fields', message: `Step ${step.id}: layer_output.fields must be an object map of {key: binding}.`, hint: 'Use { result: { kind: "ref", path: "..." }, ... }.' });
         }
         // ── n8n-style utility nodes ───────────────────────────────────
         if (step.type === 'set') {
@@ -374,7 +393,7 @@ function validateDefinition(def, { availableTools = null, toolRequiredParams = n
                     if (seenNames.has(c.name)) pushE({ code: 'switch.case_name_duplicate', severity: 'error', path: at + `.cases[${i}].name`, message: `Step ${step.id}: duplicate switch case name "${c.name}".`, hint: 'Each case name must be unique.' });
                     seenNames.add(c.name);
                 }
-                const out = def.edges.filter(e => e.from === step.id);
+                const out = graph.edges.filter(e => e.from === step.id);
                 const caseLabels = new Set(out.map(e => e.caseName).filter(Boolean));
                 const wired = step.cases.filter(c => caseLabels.has(c.name)).length;
                 if (wired === 0) pushE({ code: 'switch.no_branches', severity: 'error', path: at + '.edges', message: `Step ${step.id}: switch has no case edges wired — all branches dead-end.`, hint: 'Add edges from this switch with caseName matching each case.' });
@@ -384,6 +403,15 @@ function validateDefinition(def, { availableTools = null, toolRequiredParams = n
         // Phase B: collection ops — every type takes `arrayRef`.
         if (step.type === 'filter' || step.type === 'limit' || step.type === 'dedupe' || step.type === 'aggregate' || step.type === 'summarize') {
             if (!step.arrayRef || typeof step.arrayRef !== 'string') pushE({ code: `${step.type}.arrayRef_missing`, severity: 'error', path: at + '.arrayRef', message: `Step ${step.id}: ${step.type} requires \`arrayRef\`.`, hint: 'Bind to an upstream array, e.g. `steps.<id>.output.items`.' });
+            // Optional input cap — the runner enforces min(maxItems, platform
+            // ceiling), so a value above 10000 is legal but ineffective.
+            if (step.maxItems !== undefined) {
+                if (typeof step.maxItems !== 'number' || !Number.isInteger(step.maxItems) || step.maxItems < 1) {
+                    pushE({ code: `${step.type}.maxItems_invalid`, severity: 'error', path: at + '.maxItems', message: `Step ${step.id}: maxItems must be a positive integer.`, hint: 'Set a positive integer, or omit it to use the platform default cap.' });
+                } else if (step.maxItems > 10000) {
+                    pushW({ code: `${step.type}.maxItems_exceeds_cap`, severity: 'warning', path: at + '.maxItems', message: `Step ${step.id}: maxItems ${step.maxItems} exceeds the platform cap (10000) — the cap still wins at runtime.`, hint: 'Lower maxItems to 10000 or below, or raise AUTOMATION_COLLECTION_MAX_ITEMS server-side.' });
+                }
+            }
         }
         if (step.type === 'filter') {
             if (!step.expr || typeof step.expr !== 'string') pushE({ code: 'filter.expr_missing', severity: 'error', path: at + '.expr', message: `Step ${step.id}: filter requires \`expr\`.`, hint: 'Use the current element as `item`, e.g. `item.amount > 1000`.' });
@@ -403,7 +431,9 @@ function validateDefinition(def, { availableTools = null, toolRequiredParams = n
         // Reference scoping — collect all ref paths used in this step's
         // inputs / prompt / expr / template fields, ensure their roots
         // resolve to known sources, and any "steps.<id>.output" is for
-        // a step that has run before this one.
+        // a step that has run before this one. Inside a layer the same
+        // roots apply: `trigger` is the layer_input (so bindings stay
+        // {{trigger.output.<param>}}), `steps` are the layer's own steps.
         const refs = [];
         collectRefPaths(step.inputs, refs);
         // NOTE: ai_step.prompt is NOT a runtime template — the runner passes
@@ -419,7 +449,10 @@ function validateDefinition(def, { availableTools = null, toolRequiredParams = n
         }
         if (step.type === 'condition') refs.push({ kind: 'expr', src: step.expr || '' });
         if (step.type === 'loop' && step.overRef) refs.push({ kind: 'ref', path: step.overRef });
+        // forEach iteration source resolves like a loop's overRef.
+        if (step.forEach && typeof step.forEach.overRef === 'string' && step.forEach.overRef) refs.push({ kind: 'ref', path: step.forEach.overRef });
         if (step.type === 'set') collectRefPaths(step.fields, refs);
+        if (step.type === 'layer_output') collectRefPaths(step.fields, refs);
         if (step.type === 'datetime') {
             if (typeof step.input === 'string' && step.input) refs.push({ kind: 'ref', path: step.input });
             if (typeof step.input2 === 'string' && step.input2) refs.push({ kind: 'ref', path: step.input2 });
@@ -483,8 +516,121 @@ function validateDefinition(def, { availableTools = null, toolRequiredParams = n
         }
         seenSoFar.add(step.id);
     }
+}
+
+
+/**
+ * Validate a definition. Returns { ok, errors[], warnings[] } where each
+ * record is `{ code, severity, path, message, hint }`. The structured
+ * shape lets the SSE builder loop feed *specific* failures back to the
+ * LLM so it can self-correct instead of guessing what the free-text
+ * meant.
+ *
+ *   code        — short, stable identifier (e.g. 'condition.dead_branch')
+ *   severity    — 'error' | 'warning'
+ *   path        — JSON-pointer-ish path into the def (e.g. 'steps[3].expr',
+ *                 'layers.enrich.steps[2].expr' for layer-scoped records)
+ *   message     — human-readable, for UI display
+ *   hint        — actionable next step, written for the LLM
+ *
+ * `availableTools` (optional) is a Set of tool names from the catalog. When
+ * provided, integration_action.tool is checked against it.
+ *
+ * `toolRequiredParams` (optional) is an object map { toolName: ['p1', …] } of
+ * each tool's required input names. When provided, an integration_action whose
+ * required input is absent (or bound to an empty-string literal) is flagged —
+ * this is what stops a Talk-send-with-no-room or calendar-event-with-no-date
+ * from activating green and then failing silently.
+ */
+function validateDefinition(def, { availableTools = null, toolRequiredParams = null, deliverableEvents = null, scope = 'root', availableBlocks = null } = {}) {
+    const errors = [];
+    const warnings = [];
+    const pushE = (rec) => errors.push(rec);
+    const pushW = (rec) => warnings.push(rec);
+
+    if (!isObject(def)) {
+        return {
+            ok: false,
+            errors: [{ code: 'shape.not_object', severity: 'error', path: '', message: 'Definition must be an object.', hint: 'Pass a JSON object with trigger, steps, and edges keys.' }],
+            warnings: [],
+        };
+    }
+
+    // ── Inline layers map: root-only, plain object, snake-case keys ──────
+    // Validated FIRST so call_layer reference checks inside the graphs can
+    // resolve against the well-formed subset.
+    const layersMap = {};
+    if (def.layers !== undefined) {
+        if (!isObject(def.layers)) {
+            pushE({ code: 'layers.shape', severity: 'error', path: 'layers', message: '`layers` must be an object map of { key: miniDefinition }.', hint: 'Each entry is { title, trigger (kind layer_input), steps (incl. a layer_output), edges }.' });
+        } else {
+            for (const [key, value] of Object.entries(def.layers)) {
+                if (!LAYER_KEY_RE.test(key)) {
+                    pushE({ code: 'layers.key_invalid', severity: 'error', path: `layers.${key}`, message: `Invalid layer key "${key}".`, hint: 'Keys must match ^[a-z][a-z0-9_]*$ (lowercase snake_case, starting with a letter).' });
+                    continue;
+                }
+                if (!isObject(value)) {
+                    pushE({ code: 'layers.value_shape', severity: 'error', path: `layers.${key}`, message: `Layer "${key}" must be an object (a mini-definition).`, hint: 'Use { title, trigger, steps, edges } — same shape as the root document.' });
+                    continue;
+                }
+                layersMap[key] = value;
+            }
+        }
+    }
+
+    // §WS1.4 — graph-size ceilings (DoS guard, independent of the body limit).
+    // Counted up front and failed fast so the O(n) graph passes (topo-sort +
+    // Levenshtein id suggestions) never run on a pathologically large blob.
+    {
+        const rootSteps = Array.isArray(def.steps) ? def.steps.length : 0;
+        const rootEdges = Array.isArray(def.edges) ? def.edges.length : 0;
+        if (rootSteps > MAX_STEPS) {
+            pushE({ code: 'shape.too_many_steps', severity: 'error', path: 'steps', message: `Definition has ${rootSteps} steps — the maximum is ${MAX_STEPS}.`, hint: 'Split the work into reusable Steps/Flowlets or multiple automations.' });
+        }
+        if (rootEdges > MAX_EDGES) {
+            pushE({ code: 'shape.too_many_edges', severity: 'error', path: 'edges', message: `Definition has ${rootEdges} edges — the maximum is ${MAX_EDGES}.`, hint: 'Simplify the graph or split it into multiple automations.' });
+        }
+        let totalNodes = rootSteps;
+        for (const layer of Object.values(layersMap)) {
+            totalNodes += Array.isArray(layer.steps) ? layer.steps.length : 0;
+            if (Array.isArray(layer.steps) && layer.steps.length > MAX_STEPS) {
+                pushE({ code: 'layers.too_many_steps', severity: 'error', path: 'layers', message: `A layer has ${layer.steps.length} steps — the maximum is ${MAX_STEPS} per layer.`, hint: 'Flatten or split the layer.' });
+            }
+        }
+        if (totalNodes > MAX_TOTAL_NODES) {
+            pushE({ code: 'shape.too_many_nodes', severity: 'error', path: '', message: `Definition has ${totalNodes} total steps across all layers — the maximum is ${MAX_TOTAL_NODES}.`, hint: 'Reduce the number of steps or split into multiple automations.' });
+        }
+        if (errors.length) return { ok: false, errors, warnings };
+    }
+
+    const graphOpts = { errors, warnings, layers: layersMap, availableTools, toolRequiredParams, deliverableEvents, availableBlocks };
+
+    // Root graph. Preserve the original early-return semantics: a root
+    // whose basic shape is broken returns immediately (the layer graphs
+    // would only add noise on top of a fundamentally malformed document).
+    // scope is 'root' for automations or 'block' for a standalone Step (whose
+    // root IS the input/output contract — validateGraph applies the layer
+    // rules and flags any nested `layers` itself).
+    validateGraph(def, '', { ...graphOpts, scope });
+    if (!isObject(def.trigger) || !Array.isArray(def.steps) || !Array.isArray(def.edges)) {
+        return { ok: false, errors, warnings };
+    }
+
+    // Steps (scope='block') don't carry inline layers — skip the per-layer and
+    // layer-reference passes entirely (validateGraph already flagged any).
+    if (scope !== 'block') {
+        // Each layer mini-definition gets the SAME per-graph validation under
+        // its own path prefix, plus the layer-scope rules (layer_input trigger,
+        // single layer_output, no approval, no nested layers).
+        for (const [key, layer] of Object.entries(layersMap)) {
+            validateGraph(layer, `layers.${key}.`, { ...graphOpts, scope: 'layer' });
+        }
+
+        // Layer-reference graph: cycles, depth cap, orphans.
+        validateLayerGraph(def, layersMap, pushE, pushW);
+    }
 
     return { ok: errors.length === 0, errors, warnings };
 }
 
-module.exports = { validateDefinition, topoOrder };
+module.exports = { validateDefinition, topoOrder, collectCallLayerSteps, collectCallBlockSteps, LAYER_KEY_RE, MAX_STEPS, MAX_EDGES, MAX_TOTAL_NODES };

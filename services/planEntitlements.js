@@ -75,6 +75,9 @@ async function getOrgCaps(orgId) {
     const plan = await store.getPlan(sub.plan_id);
     if (!plan) return { integrations: null, betaFeatures: null };
     return {
+        // MCP servers are integrations now: their `mcp:<id>` ids live inside
+        // allowed_integrations (the resolver only adds them when explicitly
+        // listed — a null cap never includes MCP).
         integrations: plan.allowed_integrations ?? null,
         betaFeatures: plan.allowed_beta_features ?? null,
     };

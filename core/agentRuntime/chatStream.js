@@ -224,6 +224,11 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 session,
                 isAdmin: session?.user?.isAdmin || false,
                 agentConfig: agent.config,
+                // Connection lending (gated): offer a provider's tools when the
+                // agent owner has LENT a connection for it, even if the running
+                // user hasn't connected it. The per-tool dispatch override below
+                // then runs those tools as the owner. Inert unless the flag is on.
+                connectionPolicy: { ownerUserId: agent.owner_id || null, resourceType: 'agent', resourceId: agentId },
             });
             if (integrationResult.tools.length > 0) {
                 // Deduplicate — don't add integration tools that overlap with component tools
@@ -857,6 +862,14 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 // whatever is buffered so we never leave a partial token dangling.
                 const tail = _ut.flush();
                 if (tail) _rawOnEvent('content', { text: tail });
+                // Restore PII tokens in the model's reasoning too. The thinking
+                // panel is user-visible, so placeholder tokens like [email_1] (and
+                // any redacted artefacts) must be reversed here just as for content,
+                // or they leak the token mechanics into the UI (BFSF-253).
+                if (type === 'thinking' && data && typeof data.text === 'string') {
+                    _rawOnEvent(type, { ...data, text: _ut.restore(data.text) });
+                    return;
+                }
                 _rawOnEvent(type, data);
             };
         } else if (_captureRaw) {
@@ -1747,6 +1760,11 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     break;
                 }
 
+                // Borrowed-connection attribution for this batch, keyed by
+                // toolCall.id — bridges the dispatch closure to the (separate)
+                // egress-logging scope. Empty unless lending resolves a grant.
+                const _lentByToolCall = new Map();
+
                 // Execute all tools in parallel
                 const toolExecutionPromises = currentToolCalls.map(async (toolCall) => {
                     const toolName = toolCall.function.name;
@@ -1770,15 +1788,32 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         };
                     }
 
-                    // Restore DLP tokens in outbound tool args so write-side tools
-                    // get the real value, not the [email_1] placeholder (BFSF-171).
-                    // Search queries keep their tokens (PII off external search).
-                    if (!/^(agent_search|web_search|search|brave_search)$/i.test(toolName || '')) {
-                        try {
-                            const _argMap = require('../dlp/dlpRunner').getConversationTokenMap(conversation?.id);
-                            if (_argMap && Object.keys(_argMap).length) toolArgs = untokeniseToolArgs(toolArgs, _argMap);
-                        } catch (_) { /* best-effort */ }
+                    // Org tool-PII policy for this tool's CLASS (external = data leaves
+                    // the box, internal = on-box). Resolved once per tool call and
+                    // reused by the pre-dispatch block check AND the result-redaction
+                    // step below. classifyToolClass lives in orgShield (single source
+                    // of truth shared with the admin route/UI).
+                    const { classifyToolClass: _classifyToolClass } = require('../orgShield');
+                    const _toolClass = _classifyToolClass(toolName);
+                    const _piiThreshold = (typeof dlpShield?.piiDetectionConfidenceThreshold === 'number')
+                        ? dlpShield.piiDetectionConfidenceThreshold : 0.7;
+                    const _blockCats = new Set((dlpShield?.toolPiiPolicy?.[_toolClass]?.blockCategories) || []);
+                    // Legacy Web Search Guard: its category list still BLOCKS external
+                    // tools, but only when the guard is actually enabled. Orgs that
+                    // picked categories with the guard DISABLED stay monitor-only
+                    // (logged, not blocked) — handled in the guard below.
+                    if (_toolClass === 'external' && webSearchGuardEnabled && Array.isArray(webSearchGuardPiiCategories)) {
+                        for (const c of webSearchGuardPiiCategories) _blockCats.add(c);
                     }
+
+                    // Restore DLP tokens in outbound tool args so EVERY tool —
+                    // including web/agent search — receives the real value, not the
+                    // [email_1] placeholder (BFSF-171). The block policy above is now
+                    // the only thing that withholds PII from a tool.
+                    try {
+                        const _argMap = require('../dlp/dlpRunner').getConversationTokenMap(conversation?.id);
+                        if (_argMap && Object.keys(_argMap).length) toolArgs = untokeniseToolArgs(toolArgs, _argMap);
+                    } catch (_) { /* best-effort: leave args tokenized on error */ }
 
                     const fixedParams = toolParamsMap[toolName] || null;
                     // Don't log fixedParams directly — they often contain secrets (API keys,
@@ -1815,45 +1850,74 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         }
                     }
 
-                    // Web Search Guard — PII detection on search queries (always runs for monitoring)
-                    if (webSearchGuardPiiCategories && toolName === 'agent_search' && toolArgs?.query) {
+                    // ── Pre-dispatch tool-PII block (generalizes the Web Search Guard) ──
+                    // Args now hold REAL values (detokenized above), so refuse the call
+                    // if any detected PII category is in this tool-class's block list.
+                    // Web search with a configured-but-disabled guard stays monitor-only
+                    // (logged, allowed) to preserve historical behavior.
+                    const _isSearchTool = /^(agent_search|web_search|search|brave_search)$/i.test(toolName || '');
+                    const _monitorCats = (_isSearchTool && !webSearchGuardEnabled
+                        && Array.isArray(webSearchGuardPiiCategories) && webSearchGuardPiiCategories.length)
+                        ? webSearchGuardPiiCategories : null;
+                    if (_blockCats.size > 0 || _monitorCats) {
+                        const { detectPii } = require('../piiDetection');
+                        const _checkCats = [...new Set([..._blockCats, ...(_monitorCats || [])])];
+                        let _argPii = null, _guardErr = false;
                         try {
-                            const { detectPii } = require('../piiDetection');
-                            const piiResult = await detectPii(toolArgs.query, webSearchGuardPiiCategories);
-                            if (piiResult?.hasPii) {
-                                const cats = [...new Set(piiResult.entities.map(e => e.label))].join(', ');
-                                // Always log PII detection for monitoring
+                            _argPii = await detectPii(JSON.stringify(toolArgs || {}), _checkCats, _piiThreshold);
+                        } catch (e) {
+                            _guardErr = true;
+                            console.warn('[ToolPiiGuard] arg PII check failed:', e.message);
+                        }
+
+                        if (_guardErr) {
+                            // Fail-closed ONLY for block-action orgs with an active block
+                            // list; otherwise fail-open (matches the legacy guard).
+                            if (_blockCats.size > 0 && dlpShield?.privacyAction === 'block') {
+                                onEvent('tool_end', { name: toolName, result: `[Tool blocked — PII guard unavailable (fail-closed)]` });
+                                return {
+                                    toolCall, toolName, toolArgs,
+                                    finalToolResult: `[Tool '${toolName}' was not called: the PII guard is unavailable and org policy fails closed. Ask the user to retry shortly.]`,
+                                    blocked: true,
+                                };
+                            }
+                            // else fall through and execute (fail-open)
+                        } else if (_argPii?.hasPii) {
+                            const _blockedHits = _argPii.entities.filter(e => _blockCats.has(e.category));
+                            if (_blockedHits.length > 0) {
+                                const _labels = [...new Set(_blockedHits.map(e => e.label))].join(', ');
                                 guardrailEventStore.logGuardrailEvent({
                                     organization_id: agent.organization_id || null,
-                                    user_id: userId,
-                                    agent_id: agentId,
-                                    agent_name: agent.name,
+                                    user_id: userId, agent_id: agentId, agent_name: agent.name,
                                     conversation_id: conversation?.id || null,
-                                    violation_type: 'pii',
-                                    violation_categories: cats,
-                                    direction: 'input',
-                                    action_taken: webSearchGuardEnabled ? 'search_blocked' : 'pii_detected',
-                                    source: 'agent_stream',
-                                    model: modelToUse,
+                                    violation_type: 'pii', violation_categories: _labels,
+                                    direction: 'output', action_taken: 'tool_blocked',
+                                    source: 'agent_stream', model: modelToUse,
                                 }).catch(() => {});
-                                // Only block when Web Search Guard is enabled
-                                if (webSearchGuardEnabled) {
-                                    console.log(`[WebSearchGuard] Search query BLOCKED by PII (${cats}): "${toolArgs.query.substring(0, 80)}"`);
-                                    onEvent('tool_end', { name: toolName, result: `[Web search blocked — query contains sensitive information (${cats})]` });
-                                    return {
-                                        toolCall,
-                                        toolName,
-                                        toolArgs,
-                                        finalToolResult: `[Web search blocked — the search query contains sensitive personal information (${cats}). Please rephrase without including PII.]`,
-                                        blocked: true
-                                    };
-                                } else {
-                                    console.log(`[WebSearchGuard] PII detected in search query (${cats}): "${toolArgs.query.substring(0, 80)}" — monitoring only, search allowed`);
+                                console.log(`[ToolPiiGuard] '${toolName}' (${_toolClass}) BLOCKED — args contain ${_labels}`);
+                                onEvent('tool_end', { name: toolName, result: `[Tool blocked — arguments contain sensitive information (${_labels})]` });
+                                return {
+                                    toolCall, toolName, toolArgs,
+                                    finalToolResult: `[Tool '${toolName}' was not called: its arguments contained ${_labels}, which org policy forbids sending to ${_toolClass} tools. Continue without that information or ask the user how to proceed.]`,
+                                    blocked: true,
+                                };
+                            }
+                            // Monitor-only (search guard configured but disabled): log, allow.
+                            if (_monitorCats) {
+                                const _monHits = _argPii.entities.filter(e => _monitorCats.includes(e.category));
+                                if (_monHits.length > 0) {
+                                    const _monLabels = [...new Set(_monHits.map(e => e.label))].join(', ');
+                                    guardrailEventStore.logGuardrailEvent({
+                                        organization_id: agent.organization_id || null,
+                                        user_id: userId, agent_id: agentId, agent_name: agent.name,
+                                        conversation_id: conversation?.id || null,
+                                        violation_type: 'pii', violation_categories: _monLabels,
+                                        direction: 'output', action_taken: 'pii_detected',
+                                        source: 'agent_stream', model: modelToUse,
+                                    }).catch(() => {});
+                                    console.log(`[ToolPiiGuard] PII in ${toolName} args (${_monLabels}) — monitor-only, allowed`);
                                 }
                             }
-                            console.log(`[WebSearchGuard] Search query PII check passed`);
-                        } catch (piiErr) {
-                            console.warn(`[WebSearchGuard] PII check failed (fail-open):`, piiErr.message);
                         }
                     }
 
@@ -1864,6 +1928,30 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                     // whole batch — the model receives the error as a tool result and
                     // can decide how to react.
                     const { executeTool: dispatchTool } = require('../toolDispatcher');
+
+                    // Connection lending (GATED, default off): a shared agent run
+                    // by another user may borrow the OWNER's named connection for
+                    // this tool (full delegation). Inert — and zero DB cost —
+                    // unless INTEGRATION_CONNECTION_LENDING_ENABLED is set; with it
+                    // off, effUserId === userId so behavior is unchanged. Never
+                    // overrides an explicit acting identity.
+                    let effUserId = userAuth?.integrationUserId || userId;
+                    let lentConnection = null;
+                    try {
+                        const cr = require('../connectionResolution');
+                        if (cr.isLendingEnabled() && !userAuth?.integrationUserId) {
+                            if (!userAuth.__runCtx) userAuth.__runCtx = await cr.runningUserContext(userId);
+                            const ov = await cr.resolveEffectiveIdentity({
+                                toolName, runningUserId: userId,
+                                runningUserOrgId: userAuth.__runCtx.orgId,
+                                runningUserGroups: userAuth.__runCtx.groups,
+                                ownerUserId: agent.owner_id || null,
+                                resourceType: 'agent', resourceId: agent.id,
+                            });
+                            if (ov) { effUserId = ov.integrationUserId; lentConnection = ov; _lentByToolCall.set(toolCall.id, ov); }
+                        }
+                    } catch (_) { /* fail closed to bring-your-own */ }
+
                     let toolResult;
                     let outboundProbe;
                     try {
@@ -1871,7 +1959,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                             const preMeta = resolveIntegration(toolName, toolArgs || {});
                             if (preMeta?.isLocal) markLocal(preMeta.label || preMeta.integration);
                             return await dispatchTool(toolName, toolArgs, {
-                                userId,
+                                userId: effUserId,
                                 session: userAuth?.session,
                                 userAuth,
                                 fixedParams: fixedParams,
@@ -1883,6 +1971,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                                 onImageGenerated: (data) => {
                                     onEvent('image', data);
                                 },
+                                ...(lentConnection ? { orgId: lentConnection.integrationOrgId, lentConnection } : {}),
                             });
                         });
                         toolResult = probed.result;
@@ -1916,7 +2005,12 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                         toolArgs,
                         finalToolResult,
                         outboundProbe,
-                        blocked: false
+                        blocked: false,
+                        // Carry the resolved tool-PII policy out to the result loop
+                        // (different scope) so it can redact blocked-category PII and
+                        // tokenize the rest before the result is shown to the model.
+                        toolClass: _toolClass,
+                        blockCats: [..._blockCats],
                     };
                 });
 
@@ -1960,6 +2054,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 // Process results in order
                 for (const result of toolResults) {
                     const { toolCall, toolName, toolArgs, finalToolResult, outboundProbe } = result;
+                    const _resBlockCats = new Set(Array.isArray(result.blockCats) ? result.blockCats : []);
 
                     toolCalls.push({ name: toolName, args: toolArgs, result: finalToolResult });
                     // Track for persistence
@@ -2102,6 +2197,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                                 // probe so the row carries is_local=true.
                                 const probeForLog = outboundProbe || null;
                                 if (probeForLog && integMeta.isLocal) probeForLog.is_local = true;
+                                const _lent = _lentByToolCall.get(toolCall.id) || null;
                                 integrationActivityStore.logIntegrationActivity({
                                     organization_id: agent.organization_id || null,
                                     user_id: userId,
@@ -2118,15 +2214,61 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                                     source: 'agent_stream',
                                     model: modelToUse,
                                     probe: probeForLog,
+                                    // Borrowed-connection attribution (null for bring-your-own runs).
+                                    acting_user_id: _lent ? _lent.integrationUserId : null,
+                                    connection_id: _lent ? _lent.connectionId : null,
+                                    grant_id: _lent ? _lent.grantId : null,
                                 }).catch(e => console.error('[IntegrationActivityLog] Error:', e.message));
                             }).catch(() => {});
                         }
                     } catch (e) { /* ignore integration logging errors */ }
 
+                    // ── Scan the tool RESULT for PII before the model sees it ──
+                    // Detect "incoming" PII that arrives THROUGH a tool (web-search
+                    // hits, contacts, calendar attendees, KB chunks via kb_search…).
+                    //   (a) drop blocked-category PII — the refuse-class policy applies
+                    //       to incoming data too;
+                    //   (b) tokenize the remaining PII into the conversation map so it
+                    //       round-trips: restored for the user on the response stream
+                    //       (createUntokeniser) and restored to real values if the model
+                    //       later passes it into another tool (untokeniseToolArgs).
+                    // Fail-open everywhere: never drop the turn over a scan error.
+                    let _toolContent = buildLLMToolContent(finalToolResult);
+                    if (dlpShield?.enabled && typeof _toolContent === 'string' && _toolContent.length > 0) {
+                        try {
+                            const { detectPii } = require('../piiDetection');
+                            const _dlpRunner = require('../dlp/dlpRunner');
+                            const { redactAndTokenizeToolResult } = require('../dlp/toolResultRedact');
+                            const _threshold = (typeof dlpShield.piiDetectionConfidenceThreshold === 'number') ? dlpShield.piiDetectionConfidenceThreshold : 0.7;
+                            const _scanStr = _toolContent.slice(0, MAX_TOOL_CONTENT_BYTES);
+                            const _resPii = await detectPii(_scanStr, null, _threshold);
+                            if (_resPii?.hasPii && _resPii.entities?.length) {
+                                const _existing = _dlpRunner.getConversationTokenMap(conversation?.id) || {};
+                                const _r = redactAndTokenizeToolResult(_scanStr, _resPii.entities, _resBlockCats, _existing);
+                                // Merge result-minted tokens into the conv map (round-trip + DB write-through).
+                                if (_r.tokenMap && Object.keys(_r.tokenMap).length) _dlpRunner.mergeTokenMap(conversation?.id, _r.tokenMap);
+                                if (_r.blockedCount > 0) {
+                                    guardrailEventStore.logGuardrailEvent({
+                                        organization_id: agent.organization_id || null,
+                                        user_id: userId, agent_id: agentId, agent_name: agent.name,
+                                        conversation_id: conversation?.id || null,
+                                        violation_type: 'pii', violation_categories: _r.redactedLabels.join(', '),
+                                        direction: 'input', action_taken: 'tool_result_redacted',
+                                        source: 'agent_stream', model: modelToUse,
+                                    }).catch(() => {});
+                                    console.log(`[ToolResultDlp] '${toolName}' result redacted (${_r.redactedLabels.join(', ')})`);
+                                }
+                                // tokenize-then-truncate so a [token] span is never split.
+                                _toolContent = truncateToolContent(_r.content);
+                            }
+                        } catch (e) {
+                            console.warn('[ToolResultDlp] result scan failed (fail-open):', e.message);
+                        }
+                    }
                     messages.push({
                         role: 'tool',
                         tool_call_id: toolCall.id,
-                        content: buildLLMToolContent(finalToolResult),
+                        content: _toolContent,
                     });
                 }
 
@@ -2219,10 +2361,23 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
             const _capText = (s) => (typeof s === 'string' && s.length > THINKING_BUDGET)
                 ? s.slice(0, THINKING_BUDGET) + '…[thinking truncated]'
                 : (typeof s === 'string' ? s : '');
+            // Restore PII tokens in persisted thinking too — same render-layer
+            // rationale as the toolHistory pass above. Without this the saved
+            // chain-of-thought keeps raw placeholder tokens (e.g. [email_1]) that
+            // resurface verbatim on reload (BFSF-253). Best-effort; the live stream
+            // is handled by the un-tokeniser wrapper.
+            let _restoreTH = (s) => s;
+            try {
+                const { restoreTokens } = require('../piiDetection');
+                const _convMapTHK = require('../dlp/dlpRunner').getConversationTokenMap(conversation?.id);
+                if (_convMapTHK && Object.keys(_convMapTHK).length > 0) {
+                    _restoreTH = (s) => (typeof s === 'string' ? restoreTokens(s, _convMapTHK) : s);
+                }
+            } catch (_) { /* render-layer best-effort */ }
             if (_thinkingParts.length > 0) {
                 let budget = THINKING_BUDGET;
                 assistantMsg.thinking = _thinkingParts.map(p => {
-                    const text = typeof p.text === 'string' ? p.text : '';
+                    const text = _restoreTH(typeof p.text === 'string' ? p.text : '');
                     let outText;
                     if (budget <= 0) {
                         outText = '';
@@ -2245,7 +2400,7 @@ async function chatWithAgentStream(agentId, userId, userMessage, userAuth = {}, 
                 });
             } else if (_thinking) {
                 // Legacy path: flat-string thinking without part metadata.
-                assistantMsg.thinking = _capText(_thinking);
+                assistantMsg.thinking = _capText(_restoreTH(_thinking));
             }
 
             // Privacy / DLP — surface restored tokens too. On turns where no new

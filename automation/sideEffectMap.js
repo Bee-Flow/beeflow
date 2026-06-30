@@ -18,7 +18,7 @@ const READ_ONLY = new Set([
     // Drive / Docs / Sheets
     'drive_search', 'drive_list_files', 'drive_read_file',
     'docs_read', 'docs_list',
-    'sheets_list', 'sheets_get_values',
+    'sheets_list', 'sheets_get_values', 'sheets_list_tabs',
     'slides_list', 'slides_get', 'slides_export_pdf',
     // Contacts / Keep / Groups
     'contacts_search', 'contacts_list',
@@ -36,7 +36,7 @@ const READ_ONLY = new Set([
     'maps_search_places', 'maps_geocode', 'maps_directions',
     'agent_search', 'kb_search',
     // Fireflies
-    'fireflies_search_meetings', 'fireflies_get_meeting',
+    'fireflies_list_transcripts', 'fireflies_get_summary', 'fireflies_get_transcript',
     // ── Nextcloud (read-only) — names verified against the tool modules ──
     // Files & WebDAV
     'nextcloud_list_files', 'nextcloud_search_files', 'nextcloud_read_file',

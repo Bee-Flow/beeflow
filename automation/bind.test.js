@@ -17,6 +17,7 @@ const {
     resolveDeep,
     resolveInputs,
     interpolateTemplate,
+    walkPath,
 } = require('./bind');
 
 (() => {
@@ -116,6 +117,72 @@ const {
         assert.strictEqual(
             input.arr[0].value.keep, true,
             'mutating resolved literal does not corrupt the original binding wrapper',
+        );
+    }
+
+    // ── walkPath: plain dotted/bracketed paths still work ──────────────
+    {
+        const root = { steps: { s1: { output: { items: [{ id: 'a' }, { id: 'b' }] } } } };
+        assert.strictEqual(walkPath('steps.s1.output.items[0].id', root), 'a', 'numeric index');
+        assert.strictEqual(walkPath('steps.s1.output.items[1].id', root), 'b', 'numeric index 2');
+        assert.strictEqual(walkPath('steps.s1.output.missing', root), undefined, 'missing path → undefined');
+    }
+
+    // ── walkPath: [*] maps over an array and flattens one level ─────────
+    {
+        // Mirrors gmail_search → gmail_read(forEach) shape: read's forEach
+        // output is { results: [{ output: { attachments: [...] } }, ...] }.
+        const root = {
+            steps: { read: { output: { results: [
+                { output: { attachments: [{ attachmentId: 'a1' }, { attachmentId: 'a2' }] } },
+                { output: { attachments: [{ attachmentId: 'a3' }] } },
+            ] } } },
+        };
+        const flat = walkPath('steps.read.output.results[*].output.attachments', root);
+        assert.deepStrictEqual(
+            flat,
+            [{ attachmentId: 'a1' }, { attachmentId: 'a2' }, { attachmentId: 'a3' }],
+            '[*] flattens nested attachment arrays across messages into one array',
+        );
+
+        // Scalar projection: results[*].output keeps one entry per element.
+        const objs = walkPath('steps.read.output.results[*].output', root);
+        assert.strictEqual(objs.length, 2, '[*] over objects yields one entry per element');
+
+        // [*] on a non-array → undefined (no throw).
+        assert.strictEqual(walkPath('steps.read.output[*]', root), undefined, '[*] on a non-array → undefined');
+    }
+
+    // ── interpolateTemplate: leaveUnresolved keeps misses verbatim ──────
+    {
+        const runState = {
+            steps: { s1: { output: { found: 'hit', results: [{ c: 'A' }, { c: 'B' }] } } },
+        };
+
+        // Default (no opts): a missing path still blanks out, unchanged.
+        assert.strictEqual(
+            interpolateTemplate('x={{steps.s1.output.missing}}', runState),
+            'x=',
+            'default behaviour: unresolved path renders empty',
+        );
+
+        // leaveUnresolved: resolved paths still fill in, misses stay verbatim.
+        const out = interpolateTemplate(
+            'A={{steps.s1.output.found}} M={{steps.s1.output.missing}} L={{this.is.literal}}',
+            runState,
+            { leaveUnresolved: true },
+        );
+        assert.strictEqual(
+            out,
+            'A=hit M={{steps.s1.output.missing}} L={{this.is.literal}}',
+            'leaveUnresolved: fills resolved tokens, leaves unresolved ones verbatim',
+        );
+
+        // [*] projection interpolates as a JSON array string.
+        assert.strictEqual(
+            interpolateTemplate('vals={{steps.s1.output.results[*].c}}', runState, { leaveUnresolved: true }),
+            'vals=["A","B"]',
+            'leaveUnresolved: [*] projection renders as JSON array',
         );
     }
 

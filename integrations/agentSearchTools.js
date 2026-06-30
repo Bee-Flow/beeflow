@@ -21,8 +21,7 @@ const AGENT_SEARCH_TOOLS = [
 MODE SELECTION — pick the right mode for the task:
 • "web" (DEFAULT) — fetches full pages + reranking, ~2s. Best answer quality. Use for most queries.
 • "web_fast" — snippet-only, ~1s. Use ONLY for trivial one-fact lookups: a single date, price, or yes/no answer.
-• "kb" — searches the internal knowledge base only. Use when user asks about uploaded documents.
-• "auto" — tries KB first, falls back to web if KB confidence is low.
+(For questions about the agent's own uploaded documents / knowledge base, use the dedicated knowledge-search tool when available — NOT this web tool.)
 
 DETAIL LEVEL (web & web_fast modes) — controls how much content is returned:
 • "basic" — compact 3-5 bullet summary (~300 tokens). Use for simple questions: "what year was X founded", weather, quick facts.
@@ -51,8 +50,8 @@ CITATION RULES:
                     },
                     mode: {
                         type: 'string',
-                        enum: ['web', 'web_fast', 'kb', 'auto'],
-                        description: 'web = full page content (default, best quality), web_fast = snippets only (only for trivial single-fact lookups), kb = knowledge base, auto = KB then web fallback'
+                        enum: ['web', 'web_fast'],
+                        description: 'web = full page content (default, best quality), web_fast = snippets only (only for trivial single-fact lookups)'
                     },
                     max_results: {
                         type: 'integer',
@@ -106,8 +105,14 @@ async function executeAgentSearchTool(toolName, args) {
         console.warn(`[AgentSearch] Config lookup failed (agent_search_defaults), using built-in defaults: ${cfgErr.message}`);
     }
 
-    // Determine effective mode
-    const searchMode = ['web', 'web_fast', 'kb', 'auto'].includes(mode) ? mode : (defaults.mode || 'web');
+    // Determine effective mode. WEB-ONLY: this tool has no agent context, so it
+    // cannot supply tenant_id/kb_ids — 'kb'/'auto' would 400 at the search
+    // service ("kb mode requires tenant_id and kb_ids"). KB retrieval is handled
+    // by the dedicated, context-aware KB_SEARCH_TOOLS / performKnowledgeSearch
+    // path. Coerce any stale 'kb'/'auto' request (cached tool def, admin default)
+    // down to a working web search rather than forwarding a doomed mode.
+    const allowedModes = ['web', 'web_fast'];
+    const searchMode = allowedModes.includes(mode) ? mode : (allowedModes.includes(defaults.mode) ? defaults.mode : 'web');
     const isWebFast = searchMode === 'web_fast';
 
     // Use per-mode settings from new nested config, with fallbacks for old flat config
@@ -230,8 +235,43 @@ function isAgentSearchTool(toolName) {
     return toolName === 'agent_search';
 }
 
+/**
+ * Provider-aware web-search execution. Routes `agent_search` to the configured
+ * search provider — bing, node-search (in-process, "cloud-only"), or the
+ * self-hosted agent-search service — with the same implicit node-search
+ * fallback the tool dispatcher uses for CPU-only deploys. This is the single
+ * source of truth for "run a web search the way the admin configured it"; both
+ * core/toolDispatcher and server-side callers (e.g. the Lead Studio runner)
+ * should call THIS rather than executeAgentSearchTool directly, so they don't
+ * hardwire the GPU-service path.
+ */
+async function executeWebSearch(toolName, args) {
+    try {
+        const searchProvider = await configStore.getConfig('search_provider');
+        if (searchProvider === 'bing') {
+            return await require('./bingSearchTools').executeBingSearchTool(toolName, args);
+        }
+        if (searchProvider === 'node-search') {
+            return await require('./nodeSearchTools').executeNodeSearchTool(toolName, args);
+        }
+        if (!searchProvider || searchProvider === 'agent-search') {
+            const hasAgentSearchUrl = !!process.env.SEARCH_SERVICE_URL || !!(await configStore.getConfig('agent_search_url'));
+            if (!hasAgentSearchUrl) {
+                const hasSerperKey = !!(await configStore.getSecret('serper_api_key'));
+                if (hasSerperKey) {
+                    return await require('./nodeSearchTools').executeNodeSearchTool(toolName, args);
+                }
+            }
+        }
+    } catch (cfgErr) {
+        console.warn(`[AgentSearch] provider routing failed, using service path: ${cfgErr.message}`);
+    }
+    return await executeAgentSearchTool(toolName, args);
+}
+
 module.exports = {
     AGENT_SEARCH_TOOLS,
     executeAgentSearchTool,
+    executeWebSearch,
     isAgentSearchTool,
 };

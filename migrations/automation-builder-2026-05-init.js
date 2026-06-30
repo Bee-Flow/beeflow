@@ -53,6 +53,7 @@ async function up() {
             definition_json JSONB NOT NULL,
             saved_by_user_id TEXT NOT NULL,
             saved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            change_summary TEXT,
             UNIQUE (automation_id, version)
         );
         CREATE INDEX IF NOT EXISTS idx_automation_versions_aid ON automation_versions(automation_id);

@@ -134,6 +134,37 @@ app.use((req, res, next) => {
 app.use('/api/stripe/webhook', express.raw({ type: 'application/json' }));
 app.use(bodyParser.json({ limit: '20mb' }));
 
+// ── Request-timing instrumentation ─────────────────────────────────────────────
+// Records per-route latency into httpMetrics (exposed at /api/admin/metrics).
+// Route labels are normalized to a TEMPLATE (id-like segments → :id) so
+// cardinality stays bounded regardless of how many conversations/agents exist.
+// Long-lived SSE streams are skipped — their duration is the stream length, not
+// request-handling latency, and would swamp the histogram.
+const httpMetrics = require('./core/httpMetrics');
+function _normalizeRoute(req) {
+    let full = (req.baseUrl || '') + ((req.route && req.route.path && typeof req.route.path === 'string') ? req.route.path : '');
+    if (!full) full = req.path || '';
+    const norm = full.split('/').filter(Boolean).map(seg => {
+        if (/^\d+$/.test(seg)) return ':id';
+        if (/^[0-9a-fA-F-]{8,}$/.test(seg)) return ':id';
+        if (seg.length > 24) return ':id';
+        return seg;
+    }).join('/');
+    return '/' + norm;
+}
+app.use((req, res, next) => {
+    const start = process.hrtime.bigint();
+    res.on('finish', () => {
+        try {
+            const ct = res.getHeader('Content-Type');
+            if (typeof ct === 'string' && ct.includes('text/event-stream')) return;
+            const ms = Number(process.hrtime.bigint() - start) / 1e6;
+            httpMetrics.recordHttp({ method: req.method, route: _normalizeRoute(req), status: res.statusCode, ms });
+        } catch (_) { /* never break the response */ }
+    });
+    next();
+});
+
 // ── Sessions ──────────────────────────────────────────────────────────────────────
 const pgSession = require('connect-pg-simple')(session);
 const { pool, getRedis, disconnectRedis } = require('./db');
@@ -273,6 +304,11 @@ app.get('/api', (req, res) => {
     res.json({ name: 'Bee Flow API', status: 'ok' });
 });
 
+// ── Well-known discovery docs ─────────────────────────────────────────────────
+// Microsoft Azure AD publisher-domain verification (cloud-only). Mounted before
+// the static/SPA layers so the catch-all doesn't swallow the .well-known path.
+app.use('/.well-known', require('./routes/wellKnown'));
+
 // ── Static files ──────────────────────────────────────────────────────────────
 const agentHubDistPath = path.resolve(__dirname, '../agent-hub/dist');
 if (process.env.NODE_ENV === 'production' && fs.existsSync(agentHubDistPath)) {
@@ -302,14 +338,26 @@ storageStore.init().then(ok => {
     else console.warn('[Server] RustFS unavailable — using local disk fallback');
 }).catch(err => console.warn('[Server] RustFS init error:', err.message));
 
+// ── Legal-document overrides cache ────────────────────────────────────────────
+// Load admin overrides (content / version / requiresConsent / optional consents)
+// into the in-memory cache the synchronous consent registry reads from.
+require('./legal/legalStore').refresh()
+    .then(() => console.log('[Server] Legal overrides loaded'))
+    .catch(err => console.warn('[Server] Legal overrides init error:', err.message));
+
 
 // ── Mount routes ──────────────────────────────────────────────────────────────
 app.use('/auth', authRouter);
+// MFA (TOTP) management — mounted after authRouter so /auth/mfa/* paths the
+// auth router doesn't define (setup/enable/disable/regenerate/status) fall
+// through to here. Login-time verification (/auth/mfa/verify-login) lives in
+// the auth router itself.
+app.use('/auth/mfa', require('./auth/mfaRoutes'));
 // Component Designer is enterprise-tier — same `requireFeature` middleware
 // the other gated routers use at L353+; inlined here because the
 // destructure that exposes it as `requireLicenseFeature` lives further
 // down (same pattern as /api/compliance on L304).
-app.use('/components', (req, res, next) => require('./license/middleware').requireFeature('component_designer')(req, res, next), componentsRouter);
+app.use('/components', (req, res, next) => require('./core/entitlements').requireCapability('component_designer')(req, res, next), componentsRouter);
 app.use('/ai', aiRouter);
 app.use('/workflow-ai', (req, res) => res.status(404).json({ error: 'Workflow AI removed' }));
 app.use('/', executeRouter);
@@ -332,12 +380,12 @@ const _advUsagePrefixGate = (req, res, next) => {
     const path = req.path || '';
     const hit = _ADV_USAGE_PREFIXES.some(p => path === p || path.startsWith(p + '/'));
     if (!hit) return next();
-    return require('./license/middleware').requireFeature('advanced_usage_monitoring')(req, res, next);
+    return require('./core/entitlements').requireCapability('advanced_usage_monitoring')(req, res, next);
 };
 app.use('/api/usage', _advUsagePrefixGate, require('./routes/usage'));
 // /api/terminations and /api/feedback back the Terminations + Feedback
 // usage tabs — same advanced-monitoring gate, applied at the mount.
-const _advUsageGate = (req, res, next) => require('./license/middleware').requireFeature('advanced_usage_monitoring')(req, res, next);
+const _advUsageGate = (req, res, next) => require('./core/entitlements').requireCapability('advanced_usage_monitoring')(req, res, next);
 app.use('/api/terminations', _advUsageGate, require('./routes/terminations'));
 app.use('/api/feedback', _advUsageGate, require('./routes/feedback'));
 app.use('/api/client-errors', require('./routes/clientErrors'));
@@ -347,7 +395,7 @@ app.use('/api/org-privacy-shield', require('./routes/orgPrivacyShield'));
 app.use('/api/org-azure-config', require('./routes/orgAzureConfig'));
 app.use('/api/house-styles', require('./routes/houseStyles'));
 // Compliance Hub — Enterprise-tier feature.
-app.use('/api/compliance', (req, res, next) => require('./license/middleware').requireFeature('compliance_hub_gdpr')(req, res, next), require('./routes/compliance'));
+app.use('/api/compliance', (req, res, next) => require('./core/entitlements').requireCapability('compliance_hub_gdpr')(req, res, next), require('./routes/compliance'));
 // DSR — public submission must remain reachable (GDPR Art. 12). Admin endpoints
 // inside the router enforce admin_compliance permission; the router is mounted
 // without the license gate so unauthenticated subjects can submit requests.
@@ -373,6 +421,18 @@ app.get('/api/guard/health', async (req, res) => {
     if (health) return res.json(health);
     res.json({ status: 'unavailable' });
 });
+// Operational metrics (route latency, slow-query / cache hit-miss counters).
+// Admin-gated — this is operational data, not public. `?format=prometheus`
+// returns the text exposition format; default is JSON.
+const { requireAdmin: _requireAdminForMetrics } = require('./auth/permissions');
+app.get('/api/admin/metrics', _requireAdminForMetrics, (req, res) => {
+    const { getPoolStats } = require('./db');
+    if (req.query.format === 'prometheus') {
+        res.setHeader('Content-Type', 'text/plain; version=0.0.4');
+        return res.send(httpMetrics.renderTextFormat());
+    }
+    res.json({ ...httpMetrics.snapshot(), pool: getPoolStats() });
+});
 app.use('/api/admin/guard', require('./routes/guardInstall'));
 app.use('/api/subscriptions', require('./routes/subscriptions'));
 app.use('/api/stripe', require('./routes/stripe'));
@@ -380,6 +440,13 @@ app.use('/api/billing', require('./routes/billing'));
 app.use('/api/license', require('./routes/license'));
 app.use('/api/admin/licenses', require('./routes/adminLicense'));
 const { requireFeature: requireLicenseFeature, requireTier: requireLicenseTier } = require('./license/middleware');
+// Unified entitlement gate — folds tier + plan-grant + beta opt-in + org/group
+// grant into one decision (compound betas enforce license AND beta). Replaces
+// the requireLicenseFeature(+requireBetaFeature) pairs below where the route is a
+// compound beta or a user-facing core capability. Routes whose gate is a
+// community-licensed GA feature (automations/ai-tasks) or license-only
+// (talk-notes-settings) keep requireLicenseFeature to avoid over-gating.
+const { requireCapability } = require('./core/entitlements');
 app.use('/api/documents', require('./routes/documents'));
 app.use('/api/notifications', require('./routes/notifications'));
 // Project feature gate middleware
@@ -398,11 +465,12 @@ const projectFeatureGate = async (req, res, next) => {
 // less informative "Projects feature is disabled" string. The configStore
 // gate remains as an operator override for enterprise installs that want
 // to disable Projects per deployment.
-app.use('/api/projects', requireLicenseFeature('projects'), projectFeatureGate, require('./routes/projects'));
+app.use('/api/projects', requireCapability('projects'), projectFeatureGate, require('./routes/projects'));
 app.use('/api/reminders', require('./routes/reminders'));
 app.use('/api/ai-tasks', require('./routes/aiTasks'));
 app.use('/api/automation/builder', requireLicenseFeature('automations'), require('./routes/ai/automationBuilder'));
 app.use('/api/automation', requireLicenseFeature('automations'), require('./routes/automation'));
+app.use('/api/step', requireLicenseFeature('automations'), require('./routes/step'));
 app.use('/api/integrations/gdrive', require('./routes/integrations/googleDrive'));
 app.use('/api/integrations/gmail', require('./routes/integrations/gmail'));
 app.use('/api/integrations/calendar', require('./routes/integrations/calendar'));
@@ -415,6 +483,15 @@ app.use('/api/integrations/github-sync', require('./routes/integrations/githubSy
 app.use('/api/integrations/gamma', require('./routes/integrations/gamma'));
 app.use('/api/integrations/outlook', require('./routes/integrations/outlook'));
 app.use('/api/integrations/onedrive', require('./routes/integrations/oneDrive'));
+app.use('/api/integrations/connections', require('./routes/integrations/connections'));
+// AI Integration Builder — org-admin API for org-scoped custom integrations.
+// Double gate at mount: the 'ai_integration_builder' beta capability AND the
+// dark-ship kill switch (feature_custom_integrations_enabled, fail-closed 404).
+const { customIntegrationsFeatureGate } = require('./core/customIntegrations/featureFlag');
+app.use('/api/organizations/:orgId/custom-integrations',
+    requireCapability('ai_integration_builder'),
+    customIntegrationsFeatureGate,
+    require('./routes/orgIntegrations/builder'));
 app.use('/api/templates', require('./routes/templates'));
 // Notebook feature gate middleware
 const notebookFeatureGate = async (req, res, next) => {
@@ -432,16 +509,17 @@ const notebookFeatureGate = async (req, res, next) => {
 // configStore.feature_notebooks_enabled flag remains as an operator
 // kill-switch for enterprise installs that want to disable the feature
 // per deployment.
-app.use('/api/notebooks', requireLicenseFeature('notebooks'), notebookFeatureGate, require('./routes/notebooks'));
-app.use('/api/notebooks', requireLicenseFeature('notebooks'), notebookFeatureGate, require('./routes/notebookExport'));
+app.use('/api/notebooks', requireCapability('notebooks'), notebookFeatureGate, require('./routes/notebooks'));
+app.use('/api/notebooks', requireCapability('notebooks'), notebookFeatureGate, require('./routes/notebookExport'));
 // Legal Studio (Dutch legal matters) — a matter is a notebook of type
 // 'legal_matter', so it shares the notebooks licence + feature gate. The
 // per-org dutch_legal_sources beta gate lives inside the router.
-app.use('/api/legal-matters', requireLicenseFeature('notebooks'), notebookFeatureGate, require('./routes/legalMatters'));
-// Webpages — gated per-organization via the beta-feature registry.
-const { requireBetaFeature: requireWebpagesBeta } = require('./core/betaFeatures');
-app.use('/api/webpages', requireLicenseFeature('webpages'), requireWebpagesBeta('webpages'), require('./routes/webpages'));
-app.use('/api/webpages', requireLicenseFeature('webpages'), requireWebpagesBeta('webpages'), require('./routes/webpageExport'));
+app.use('/api/legal-matters', requireCapability('notebooks'), notebookFeatureGate, require('./routes/legalMatters'));
+// Webpages — compound beta (license 'webpages' AND the webpages beta). The
+// unified gate enforces both via the resolver's effective.beta set and honours
+// per-group grants.
+app.use('/api/webpages', requireCapability('webpages'), require('./routes/webpages'));
+app.use('/api/webpages', requireCapability('webpages'), require('./routes/webpageExport'));
 // Cross-origin endpoints called from the sandboxed preview iframe — guarded
 // by HMAC bearer tokens (issued by the session-authenticated route above),
 // not by the session itself, since the iframe has no cookies.
@@ -452,20 +530,24 @@ app.use('/api/webpages-preview', require('./routes/webpagesPreview'));
 // apply: once a publisher (whose org is gated) creates a share, recipients
 // are anonymous third parties.
 app.use('/share', require('./routes/publicViewer'));
-// Meeting Notes beta feature gate
-const { requireBetaFeature } = require('./core/betaFeatures');
-app.use('/api/transcriptions', requireLicenseFeature('meeting_notes'), requireBetaFeature('meeting_notes'), require('./routes/transcriptions'));
-// Nextcloud Talk → Meeting Notes settings (org + user toggles). Gated by the
-// same licence feature as the notes themselves.
+// Public certificate verification — unauthenticated `/verify/:token` for a
+// LinkedIn-shareable Bee Flow AI certificate. Token-gated (only certs the owner
+// opted public are resolvable), per-IP rate limited, strict CSP, og:image. Mounted
+// before the SPA catch-all so the SPA doesn't swallow it.
+app.use('/verify', require('./routes/verifyCertificate'));
+// Meeting Notes — compound beta (license 'meeting_notes' AND the beta).
+app.use('/api/transcriptions', requireCapability('meeting_notes'), require('./routes/transcriptions'));
+// Nextcloud Talk → Meeting Notes settings (org + user toggles). License-only
+// (no beta gate) — kept on requireLicenseFeature so it isn't over-gated.
 app.use('/api/talk-notes-settings', requireLicenseFeature('meeting_notes'), require('./routes/talkNotesSettings'));
-app.use('/api/skills', requireLicenseFeature('skills'), requireBetaFeature('skills'), require('./routes/skills'));
+app.use('/api/skills', requireCapability('skills'), require('./routes/skills'));
 // ITIL Ticket Assistant (formerly Email Knowledge Base). Both mount paths point
 // to the same router while the `email_knowledge_base` beta-flag alias is live;
 // remove the `/api/email-kb` alias and the alias entry in betaFeatures.js in
 // the release after this one lands.
 const ticketAssistantRouter = require('./routes/ticketAssistant');
-app.use('/api/ticket-assistant', requireLicenseFeature('ticket_assistant'), requireBetaFeature('itil_ticket_assistant'), ticketAssistantRouter);
-app.use('/api/email-kb',        requireLicenseFeature('ticket_assistant'), requireBetaFeature('itil_ticket_assistant'), ticketAssistantRouter);
+app.use('/api/ticket-assistant', requireCapability('itil_ticket_assistant'), ticketAssistantRouter);
+app.use('/api/email-kb',        requireCapability('itil_ticket_assistant'), ticketAssistantRouter);
 
 // Customer Support — Bee Flow's own AI-first support inbox. Mounted publicly
 // (no license/beta gate) because the POST /threads endpoint accepts anonymous
@@ -474,16 +556,20 @@ app.use('/api/email-kb',        requireLicenseFeature('ticket_assistant'), requi
 app.use('/api/support', require('./routes/support'));
 
 // Tests Studio — Playwright generation + runs. Beta-gated + enterprise feature.
-app.use('/api/tests', requireLicenseFeature('playwright_tests'), requireBetaFeature('playwright_tests'), require('./routes/tests'));
-app.use('/api/security', requireLicenseFeature('security_scan'), requireBetaFeature('security_scan'), require('./routes/securityScans'));
-// Support Studio — tenant customer-support inbox (Studio → Support). Enterprise
-// tier + beta opt-in; the org-level support_inbox permission is enforced inside.
-app.use('/api/support-inbox', requireLicenseFeature('support_inbox'), requireBetaFeature('support_inbox'), require('./routes/supportInbox'));
+app.use('/api/tests', requireCapability('playwright_tests'), require('./routes/tests'));
+app.use('/api/security', requireCapability('security_scan'), require('./routes/securityScans'));
+// Support Studio — tenant customer-support inbox (Studio → Support). Compound
+// beta; the org-level support_inbox permission is additionally enforced inside.
+app.use('/api/support-inbox', requireCapability('support_inbox'), require('./routes/supportInbox'));
+// Lead Studio — AI lead generation + enrichment (Studio → Lead Studio). Compound
+// beta; the org-level lead_studio permission is additionally enforced inside.
+app.use('/api/lead-studio', requireCapability('lead_studio'), require('./routes/leadStudio'));
 
 app.use('/', require('./routes/knowledge'));
 app.use('/api/kb', require('./routes/knowledgeBases'));
 app.use('/api/search', require('./routes/search'));
 app.use('/api/languages', require('./routes/admin/languageRoutes'));
+app.use('/api/legal', require('./routes/admin/legalRoutes'));
 app.use('/api/icons', require('./routes/icons'));
 app.use('/api/branding', require('./routes/branding'));
 
@@ -512,6 +598,12 @@ app.listen(PORT, '0.0.0.0', () => {
     const { runBootInit } = require('./boot-init');
     runBootInit().catch(err => console.error('[boot-init] Fatal:', err));
 
+    // Learning-certificate HMAC secret: bootstrap a configStore-persisted secret
+    // for installs that never set LEARNING_CERT_SECRET, so certificate serials
+    // and public verify links survive restarts instead of silently breaking.
+    const { ensureDurableSecret } = require('./auth/certificateToken');
+    ensureDurableSecret().catch(err => console.error('[CertificateToken] bootstrap failed:', err.message));
+
     // Connector bootstrap sanity probe — verifies the tables the
     // /auth/connector/bootstrap endpoint relies on actually exist after the
     // store modules' implicit migrations. Runs after a short delay so the
@@ -538,8 +630,14 @@ app.listen(PORT, '0.0.0.0', () => {
         // Local-dev / ops escape hatch: set SKIP_SYSTEM_KB_SEED=true to skip the
         // (CPU-bound, multi-minute) Dutch legal sources seed and its weekly
         // refresh. Has no effect in production unless the var is set there.
-        if (process.env.SKIP_SYSTEM_KB_SEED === 'true') {
-            console.log('[dutchLawIngest] SKIP_SYSTEM_KB_SEED=true — skipping boot seed and weekly refresh.');
+        // The Dutch legal corpus is Bee-Flow-managed hosted content; only the
+        // cloud deployment maintains it. Self-hosted (and the retired
+        // 'private-cloud' value) must not run the boot seed or weekly refresh
+        // against external sources. Mirrors the DEPLOYMENT_MODE convention in
+        // core/limits.js. The SKIP_SYSTEM_KB_SEED hatch still works everywhere.
+        const isCloud = (process.env.DEPLOYMENT_MODE || 'cloud') === 'cloud';
+        if (process.env.SKIP_SYSTEM_KB_SEED === 'true' || !isCloud) {
+            console.log('[dutchLawIngest] skipping boot seed + weekly refresh (non-cloud deployment or SKIP_SYSTEM_KB_SEED).');
         } else {
             const dutchLawIngest = require('./services/dutchLawIngest');
             dutchLawIngest.seedIfMissing();
@@ -638,6 +736,52 @@ app.listen(PORT, '0.0.0.0', () => {
     setImmediate(() => {
         require('./stores/userStore').backfillAutoProvisionedNcOrgNames().catch(e =>
             console.warn('[Server] nc org-name backfill error:', e.message));
+    });
+
+    // MCP-as-integration migration — idempotent one-shot that folds the dormant
+    // subscription_plans.allowed_mcp_servers into allowed_integrations and moves
+    // legacy mcp:<id> org grants from org_granted_capabilities into
+    // org_enabled_integrations. Re-runs are no-ops once both are cleared.
+    setImmediate(() => {
+        require('./migrations/mcp-as-integration-2026-06').up().catch(e =>
+            console.warn('[Server] mcp-as-integration migration error:', e.message));
+    });
+
+    // Dutch translations for the signup wizard, MFA, password reset and the
+    // Security settings section. Idempotent — only fills keys with no NL value.
+    setImmediate(() => {
+        require('./migrations/add-nl-signup-mfa-reset-auth-translations').up().catch(e =>
+            console.warn('[Server] add-nl-signup-mfa-reset-auth-translations migration error:', e.message));
+    });
+
+    // Dutch label for the relabelled login email field (BFSF-235/236/237/238).
+    // Idempotent — only fills keys with no NL value.
+    setImmediate(() => {
+        require('./migrations/add-nl-login-email-relabel').up().catch(e =>
+            console.warn('[Server] add-nl-login-email-relabel migration error:', e.message));
+    });
+
+    // Repair org founders left at 'pending'/'waitlist' so they stop hitting the
+    // "Awaiting Approval" gate on every login. Idempotent — 0 rows once fixed.
+    setImmediate(() => {
+        require('./migrations/fix-org-admin-approval-status').up().catch(e =>
+            console.warn('[Server] fix-org-admin-approval-status migration error:', e.message));
+    });
+
+    // Ensure exactly one default org plan exists (BFSF-226) so new cloud orgs
+    // land on the capped Free plan instead of plan-less "unlimited". Existing
+    // no-plan orgs are only reported (census), never auto-assigned. Idempotent.
+    setImmediate(() => {
+        require('./migrations/default-org-plan-2026-06').up().catch(e =>
+            console.warn('[Server] default-org-plan migration error:', e.message));
+    });
+
+    // Backfill the unified support_audit_log from legacy support_thread_events so
+    // the new Support → Audit view shows historical events on existing installs.
+    // Idempotent (rows keyed by source id, inserted only WHERE NOT EXISTS).
+    setImmediate(() => {
+        require('./migrations/support-audit-log-backfill-2026-06').up().catch(e =>
+            console.warn('[Server] support-audit-log-backfill migration error:', e.message));
     });
 
     // Dunning + trial-expiry schedulers. The dunning tick scans for orgs
@@ -823,6 +967,22 @@ app.listen(PORT, '0.0.0.0', () => {
         console.warn('[Server] Failed to start test-run drain scheduler:', e.message);
     }
 
+    // Optionally pre-warm the shared browser singleton so the first PDF export /
+    // thumbnail / SPA ingest doesn't pay the container cold-start. Off by default
+    // (idle deployments shouldn't hold a browser container open).
+    if (process.env.BROWSER_WARMUP === 'true') {
+        try {
+            require('./services/pwtRunner')
+                .ensureBrowserSingleton({ onLine: (l) => console.log(`[browser] ${l}`) })
+                .then(
+                    () => console.log('[Server] Shared browser singleton warmed'),
+                    (e) => console.warn('[Server] Browser warmup failed:', e.message),
+                );
+        } catch (e) {
+            console.warn('[Server] Browser warmup error:', e.message);
+        }
+    }
+
     // Security-scan drain — claims security_scan_jobs outbox rows and runs the
     // selected scanner engines (OWASP ZAP / Nuclei / testssl.sh) in isolated
     // containers. Same outbox + backoff + reaper pattern as the test-run drain.
@@ -850,6 +1010,45 @@ app.listen(PORT, '0.0.0.0', () => {
         }
     } catch (e) {
         console.warn('[Server] Failed to start security-scan drain scheduler:', e.message);
+    }
+
+    // Lead Studio drain — claims lead_generation_jobs outbox rows and runs each
+    // campaign's AI discovery/enrichment/compaction pipeline (HTTP/LLM work, no
+    // containers). Same outbox + backoff pattern as the scan drain. Set
+    // LEAD_STUDIO_DRAIN_IN_API=false when a dedicated worker owns draining.
+    try {
+        const leadDrainInApi = process.env.LEAD_STUDIO_DRAIN_IN_API !== 'false';
+        const LEAD_DRAIN_INTERVAL_MS = parseInt(process.env.LEAD_STUDIO_DRAIN_TICK_INTERVAL_MS || '15000', 10);
+        if (leadDrainInApi) {
+            const leadWorker = require('./workers/leadGenerationWorker');
+            const runLeadDrain = async () => {
+                try {
+                    const r = await leadWorker.drainOnce();
+                    if (r?.processed) console.log(`[LeadGenWorker] processed=${r.processed}`);
+                } catch (e) { console.error('[LeadGenWorker] tick error:', e.message); }
+            };
+            setTimeout(runLeadDrain, 23_000).unref();
+            setInterval(runLeadDrain, LEAD_DRAIN_INTERVAL_MS).unref();
+            console.log(`[Server] Lead Studio drain scheduler started (interval=${LEAD_DRAIN_INTERVAL_MS}ms)`);
+        } else {
+            console.log('[Server] Lead Studio drain disabled in API (LEAD_STUDIO_DRAIN_IN_API=false) — dedicated worker owns it');
+        }
+    } catch (e) {
+        console.warn('[Server] Failed to start Lead Studio drain scheduler:', e.message);
+    }
+
+    // Lead Studio retention purge — AVG: delete lead PII past each campaign's
+    // retention window (campaign shells are kept). Daily tick + a first run a
+    // minute after boot.
+    try {
+        const LEAD_PURGE_INTERVAL_MS = parseInt(process.env.LEAD_STUDIO_PURGE_INTERVAL_MS || '86400000', 10);
+        const leadStudioStore = require('./stores/leadStudioStore');
+        const runLeadPurge = () => leadStudioStore.purgeExpiredLeads().catch(err => console.warn('[LeadStudio] purge error:', err.message));
+        setTimeout(runLeadPurge, 60_000).unref();
+        setInterval(runLeadPurge, LEAD_PURGE_INTERVAL_MS).unref();
+        console.log(`[Server] Lead Studio retention purge scheduler started (interval=${LEAD_PURGE_INTERVAL_MS}ms)`);
+    } catch (e) {
+        console.warn('[Server] Failed to start Lead Studio purge scheduler:', e.message);
     }
 
     // Non-invasive self-check of every org Privacy Shield blob. Logs warnings
@@ -970,6 +1169,16 @@ app.listen(PORT, '0.0.0.0', () => {
         }
     } catch (err) {
         console.warn('[Server] Support inbox sync engine load failed:', err.message);
+    }
+    // Support Studio historical-scan drain — runs on-demand "how fast did we
+    // answer in the past?" scans queued from the Insights view. Aggregate-only,
+    // off the sync tick. Set SUPPORT_SCAN_IN_API=false when a worker owns it.
+    try {
+        if (process.env.SUPPORT_SCAN_IN_API !== 'false') {
+            require('./services/supportInboxScanEngine').startSupportInboxScan();
+        }
+    } catch (err) {
+        console.warn('[Server] Support inbox scan engine load failed:', err.message);
     }
     // Customer Support SLA enforcer — policy-driven first-response/resolution
     // breach detection on a 60s tick (replaces the old 15-min at-risk warner).

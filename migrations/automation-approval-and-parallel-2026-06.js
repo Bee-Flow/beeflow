@@ -8,7 +8,7 @@
  *
  * Schema additions:
  *   - automation_runs.awaiting_step_id   TEXT       which step is paused on approval
- *   - automation_runs.approval_token     TEXT       single-use HMAC token for email/Talk-link approve
+ *   - automation_runs.approval_token     TEXT       random (crypto.randomBytes) token reserved for a future email/Talk-link approve flow; NOT an HMAC and not yet validated anywhere — approval is session-gated today (audit §WS1.5)
  *   - automation_run_steps.branch_index  INTEGER    which parallel branch produced this row
  *
  * Idempotent — uses ADD COLUMN IF NOT EXISTS.

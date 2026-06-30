@@ -327,6 +327,24 @@ async function resolveConnectorAuth(session) {
     };
 }
 
+/**
+ * Cheap, network-free check for whether this user has *any* Nextcloud
+ * connection (connector / OAuth / saved app-password). Mirrors the three
+ * branches of resolveAuth but skips the network-y uid resolution, so it's safe
+ * to call on a settings page load to decide whether to show NC-specific UI.
+ */
+async function isConnected(session, userId) {
+    if (session?.user?.provider === 'nextcloud_connector' || session?.connectorOrgId) return true;
+    if (isNextcloudOAuthSession(session)) return true;
+    try {
+        const userStore = require('../stores/userStore');
+        const creds = await userStore.getAppPassword(userId);
+        return !!(creds && creds.username && creds.password);
+    } catch (_) {
+        return false;
+    }
+}
+
 async function resolveAuth(session, userId) {
     // Connector path takes priority: if the user came in via the Nextcloud
     // ExApp connector, we have an instance binding and zero credentials —
@@ -469,6 +487,7 @@ async function downloadBinary(session, userId, ncPath, destPath) {
 
 module.exports = {
     isNextcloudOAuthSession,
+    isConnected,
     getBaseUrl,
     webdavRoot,
     refreshAccessToken,

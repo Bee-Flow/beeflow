@@ -154,6 +154,7 @@ async function searchConversations(userId, query, filters = {}, encryptionKey) {
     let filterIdx = 2;
     if (filters.agentId) { filterClauses += ` AND c.agent_id = $${filterIdx++}`; filterParams.push(filters.agentId); }
     if (filters.startDate) { filterClauses += ` AND c.updated_at >= $${filterIdx++}`; filterParams.push(filters.startDate); }
+    if (filters.endDate) { filterClauses += ` AND c.updated_at <= $${filterIdx++}`; filterParams.push(filters.endDate); }
 
     // likeQuery is the next param after the filter params
     const likeIdx = filterIdx; // e.g. $2 if no filters, $3 if agentId, etc.
@@ -178,56 +179,54 @@ async function searchConversations(userId, query, filters = {}, encryptionKey) {
     const results = [...stratA];
     const matchedIds = new Set(results.map(r => r.id));
 
-    if (results.length < 50) {
-        if (!encryptionKey) {
-            // ── Strategy B: non-migrated blobs, no encryption — search in SQL ──
-            const remaining = 50 - results.length;
-            const stratB = await getAll(`
-                SELECT
-                    c.id, c.agent_id, c.user_id, c.title, c.updated_at,
-                    c.messages_migrated,
-                    a.name AS agent_name, a.avatar AS agent_avatar
-                FROM agent_conversations c
-                LEFT JOIN agents a ON c.agent_id = a.id
-                WHERE c.user_id = $1
-                  AND c.messages_migrated = FALSE
-                  AND c.messages_json ILIKE $${likeIdx}
-                  ${filterClauses}
-                ORDER BY c.updated_at DESC
-                LIMIT ${remaining}
-            `, [...filterParams, likeQuery]);
+    if (!encryptionKey) {
+        // ── Strategy B: non-migrated blobs, no encryption — search in SQL ──
+        const stratB = await getAll(`
+            SELECT
+                c.id, c.agent_id, c.user_id, c.title, c.updated_at,
+                c.messages_migrated,
+                a.name AS agent_name, a.avatar AS agent_avatar
+            FROM agent_conversations c
+            LEFT JOIN agents a ON c.agent_id = a.id
+            WHERE c.user_id = $1
+              AND c.messages_migrated = FALSE
+              AND c.messages_json ILIKE $${likeIdx}
+              ${filterClauses}
+            ORDER BY c.updated_at DESC
+            LIMIT 50
+        `, [...filterParams, likeQuery]);
 
-            for (const r of stratB) {
-                if (!matchedIds.has(r.id)) { results.push(r); matchedIds.add(r.id); }
-            }
-        } else {
-            // ── Strategy C: non-migrated encrypted blobs — bounded JS fallback ──
-            const remaining = 50 - results.length;
-            const encCandidates = await getAll(`
-                SELECT
-                    c.id, c.agent_id, c.user_id, c.title, c.updated_at,
-                    c.messages_json, c.messages_migrated,
-                    a.name AS agent_name, a.avatar AS agent_avatar
-                FROM agent_conversations c
-                LEFT JOIN agents a ON c.agent_id = a.id
-                WHERE c.user_id = $1
-                  AND c.messages_migrated = FALSE
-                  ${filterClauses}
-                ORDER BY c.updated_at DESC
-                LIMIT 200
-            `, filterParams);
+        for (const r of stratB) {
+            if (!matchedIds.has(r.id)) { results.push(r); matchedIds.add(r.id); }
+        }
+    } else {
+        // ── Strategy C: non-migrated encrypted blobs — bounded JS fallback ──
+        const encCandidates = await getAll(`
+            SELECT
+                c.id, c.agent_id, c.user_id, c.title, c.updated_at,
+                c.messages_json, c.messages_migrated,
+                a.name AS agent_name, a.avatar AS agent_avatar
+            FROM agent_conversations c
+            LEFT JOIN agents a ON c.agent_id = a.id
+            WHERE c.user_id = $1
+              AND c.messages_migrated = FALSE
+              ${filterClauses}
+            ORDER BY c.updated_at DESC
+            LIMIT 200
+        `, filterParams);
 
-            for (const conv of encCandidates) {
-                if (matchedIds.has(conv.id) || results.length >= 50) break;
-                try {
-                    const decrypted = decryptMessages(conv.messages_json || '[]', encryptionKey, conv.id, userId);
-                    if (decrypted.toLowerCase().includes(lowerQuery)) {
-                        results.push({ ...conv, messages_json: decrypted });
-                        matchedIds.add(conv.id);
-                    }
-                } catch (e) {
-                    console.error('[AgentConversations] Search decrypt error:', e);
+        let cAdded = 0;
+        for (const conv of encCandidates) {
+            if (matchedIds.has(conv.id)) continue;
+            try {
+                const decrypted = decryptMessages(conv.messages_json || '[]', encryptionKey, conv.id, userId);
+                if (decrypted.toLowerCase().includes(lowerQuery)) {
+                    results.push({ ...conv, messages_json: decrypted });
+                    matchedIds.add(conv.id);
+                    if (++cAdded >= 50) break;
                 }
+            } catch (e) {
+                console.error('[AgentConversations] Search decrypt error:', e);
             }
         }
     }

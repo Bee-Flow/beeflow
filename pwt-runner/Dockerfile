@@ -2,7 +2,9 @@
 #
 # Each Studio test run executes inside a short-lived container built from this
 # image. The base ships Chromium + all OS deps baked in and matches the server's
-# pinned Playwright version (1.58.2), so we never download browsers at runtime.
+# pinned Playwright version (1.59.1), so we never download browsers at runtime.
+# The same image also backs the long-lived shared `bf-browser` singleton that
+# the server drives for PDF export, thumbnails, and SPA ingestion.
 #
 # Two sub-commands (see entrypoint.js):
 #   suite  — run the bind-mounted spec via `playwright test`, write report.json

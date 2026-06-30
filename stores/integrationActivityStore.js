@@ -61,6 +61,12 @@ async function initDB() {
     await exec(`ALTER TABLE integration_activity_log ADD COLUMN IF NOT EXISTS run_id TEXT`).catch(() => {});
     await exec(`ALTER TABLE integration_activity_log ADD COLUMN IF NOT EXISTS step_id TEXT`).catch(() => {});
     await exec(`ALTER TABLE integration_activity_log ADD COLUMN IF NOT EXISTS is_dry_run BOOLEAN DEFAULT false`).catch(() => {});
+    // Borrowed-connection attribution — when a run uses a LENT named connection
+    // (full delegation), record whose connection was borrowed, which connection,
+    // and the grant that authorized it. Null for normal bring-your-own runs.
+    await exec(`ALTER TABLE integration_activity_log ADD COLUMN IF NOT EXISTS acting_user_id TEXT`).catch(() => {});
+    await exec(`ALTER TABLE integration_activity_log ADD COLUMN IF NOT EXISTS connection_id TEXT`).catch(() => {});
+    await exec(`ALTER TABLE integration_activity_log ADD COLUMN IF NOT EXISTS grant_id TEXT`).catch(() => {});
 
     await exec(`CREATE INDEX IF NOT EXISTS idx_integ_timestamp ON integration_activity_log(timestamp DESC)`);
     await exec(`CREATE INDEX IF NOT EXISTS idx_integ_org ON integration_activity_log(organization_id)`);
@@ -127,8 +133,9 @@ async function logIntegrationActivity(event) {
                  data_summary, source, model,
                  server_ip, country_code, country_name, is_eu,
                  peer_ip, peer_ip_source, tls_servername, connect_ms, is_local, operator,
-                 automation_id, run_id, step_id, is_dry_run)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
+                 automation_id, run_id, step_id, is_dry_run,
+                 acting_user_id, connection_id, grant_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33)
         `, [
             event.timestamp || new Date().toISOString(),
             event.organization_id || null,
@@ -160,6 +167,9 @@ async function logIntegrationActivity(event) {
             event.run_id || null,
             event.step_id || null,
             event.is_dry_run || false,
+            event.acting_user_id || null,
+            event.connection_id || null,
+            event.grant_id || null,
         ]);
     } catch (e) {
         console.error('[IntegrationActivityStore] Failed to log:', e.message);

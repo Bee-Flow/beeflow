@@ -68,6 +68,7 @@ const cmsTranslate = require('../core/cmsTranslate');
 const configStore = require('../stores/configStore');
 const languageStore = require('../stores/languageStore');
 const storageStore = require('../stores/storageStore');
+const umamiClient = require('../core/umamiClient');
 const { hasPermission } = require('../auth/permissions');
 const { perUserRateLimit } = require('../utils/perUserRateLimit');
 const { sanitizeSvg } = require('../utils/svgSanitizer');
@@ -110,6 +111,71 @@ const aiTranslateLimiter = perUserRateLimit({ windowMs: 60_000, max: 20 });
 
 const KEY_CMS_LIVE_SITE_ID = 'cms_live_site_id';
 const KEY_CMS_ENABLED      = 'cms_enabled';   // legacy, read-only after migration
+
+// ── Website analytics (Umami) ────────────────────────────────────────
+//
+// Self-hosted, cookieless usage tracking for the public CMS site. Gated to
+// super-admins (operator-only) and only surfaces when the CMS product is
+// active. The actual Umami calls live in core/umamiClient.js; this route layer
+// only stores settings, provisions one Umami "website" per CMS site, and
+// proxies read-only stats to the admin dashboard so the browser never holds
+// Umami credentials.
+//
+// Storage:
+//   cms_analytics_enabled       : boolean  master on/off for tracking
+//   cms_analytics_consent_mode  : 'cookieless' | 'cookies'  (default cookieless)
+//   cms_analytics_site_map      : { [siteId]: umamiWebsiteId }
+//   cms_analytics_url           : Umami base URL (also the public script origin)
+//   cms_analytics_{username,password,api_token} : secrets (umamiClient reads)
+const KEY_ANALYTICS_ENABLED      = 'cms_analytics_enabled';
+const KEY_ANALYTICS_CONSENT_MODE = 'cms_analytics_consent_mode';
+const KEY_ANALYTICS_SITE_MAP     = 'cms_analytics_site_map';
+
+async function getAnalyticsSettings() {
+    const [enabled, consentMode, url] = await Promise.all([
+        configStore.getConfig(KEY_ANALYTICS_ENABLED),
+        configStore.getConfig(KEY_ANALYTICS_CONSENT_MODE),
+        configStore.getConfig(umamiClient.KEY_URL),
+    ]);
+    return {
+        enabled: enabled === true,
+        consentMode: consentMode === 'cookies' ? 'cookies' : 'cookieless',
+        // The PUBLIC script origin the browser loads /script.js from. Operator-
+        // set value wins; UMAMI_PUBLIC_URL is the env fallback. Deliberately NOT
+        // process.env.UMAMI_URL — that's the server's INTERNAL base (e.g.
+        // http://umami:3000) which a visitor's browser can't reach.
+        url: (typeof url === 'string' ? url : (process.env.UMAMI_PUBLIC_URL || '')) || '',
+    };
+}
+
+async function getAnalyticsSiteMap() {
+    const v = await configStore.getConfig(KEY_ANALYTICS_SITE_MAP);
+    return (v && typeof v === 'object' && !Array.isArray(v)) ? v : {};
+}
+
+async function setAnalyticsWebsiteId(siteId, websiteId) {
+    const map = await getAnalyticsSiteMap();
+    map[siteId] = websiteId;
+    await configStore.setConfig(KEY_ANALYTICS_SITE_MAP, map);
+}
+
+// Best-effort: ensure the live/published site has a Umami website provisioned
+// and its id persisted. Never throws — analytics must not break publishing.
+async function provisionAnalyticsForSite(siteId, { name, domain } = {}) {
+    try {
+        const settings = await getAnalyticsSettings();
+        if (!settings.enabled) return null;
+        if (!(await umamiClient.isConfigured())) return null;
+        const map = await getAnalyticsSiteMap();
+        if (map[siteId]) return map[siteId];
+        const websiteId = await umamiClient.ensureWebsite({ name, domain });
+        await setAnalyticsWebsiteId(siteId, websiteId);
+        return websiteId;
+    } catch (err) {
+        console.warn('[CMS] analytics provisioning skipped:', err.message);
+        return null;
+    }
+}
 
 async function getLiveSiteId() {
     const stored = await configStore.getConfig(KEY_CMS_LIVE_SITE_ID);
@@ -170,6 +236,16 @@ async function requireAdmin(req, res, next) {
     const userId = req.session.user?.id;
     if (userId && await hasPermission(userId, 'all', req.session)) return next();
     return res.status(403).json({ error: 'Admin access required' });
+}
+
+// Stricter than requireAdmin: platform operator only (super-admin). Unlike
+// requireAdmin it does NOT admit org users who merely hold the 'all' permission
+// via a group or custom role. Used for the analytics surface, which is operator-
+// facing by product intent (visitor stats span all sites on the install).
+function requireSuperAdmin(req, res, next) {
+    if (!req.session?.user) return res.status(401).json({ error: 'Unauthorized' });
+    if (req.session.isAdmin || req.session.user?.role === 'admin') return next();
+    return res.status(403).json({ error: 'Operator access required' });
 }
 
 async function attachSiteId(req, res, next) {
@@ -726,6 +802,10 @@ async function deleteSiteHandler(req, res) {
         if (liveSiteId === req.siteId) {
             await configStore.setConfig(KEY_CMS_LIVE_SITE_ID, null);
         }
+        // Drop any analytics website mapping so resolveAnalyticsTarget can't
+        // surface a deleted site's stale Umami data via its fallback path.
+        const map = await getAnalyticsSiteMap();
+        if (map[req.siteId]) { delete map[req.siteId]; await configStore.setConfig(KEY_ANALYTICS_SITE_MAP, map); }
         res.json({ success: true });
     } catch (err) { res.status(400).json({ error: err.message }); }
 }
@@ -733,6 +813,13 @@ async function deleteSiteHandler(req, res) {
 async function postSitePublish(req, res) {
     try {
         const result = await cmsStore.publishSite(req.siteId);
+        // Best-effort: ensure this site has a Umami website so its public pages
+        // have an id to report against. Fire-and-forget so publish stays fast.
+        const project = await cmsStore.getProject(req.siteId).catch(() => null);
+        provisionAnalyticsForSite(req.siteId, {
+            name: project?.name || 'CMS site',
+            domain: req.get('host'),
+        }).catch(() => {});
         res.json({ success: true, ...result });
     } catch (err) { res.status(400).json({ error: err.message }); }
 }
@@ -834,6 +921,143 @@ async function handleUpload(req, res) {
     }
 }
 
+// ── Analytics handlers (super-admin; mounted under /admin) ───────────
+
+async function getAnalyticsSettingsHandler(req, res) {
+    try {
+        const settings = await getAnalyticsSettings();
+        const configured = await umamiClient.isConfigured();
+        res.json({
+            enabled: settings.enabled,
+            consentMode: settings.consentMode,
+            url: settings.url,
+            configured,
+        });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+}
+
+async function putAnalyticsSettingsHandler(req, res) {
+    try {
+        const { enabled, consentMode, url, username, password, apiToken } = req.body || {};
+        if (enabled !== undefined) {
+            await configStore.setConfig(KEY_ANALYTICS_ENABLED, enabled === true);
+        }
+        if (consentMode !== undefined) {
+            await configStore.setConfig(KEY_ANALYTICS_CONSENT_MODE,
+                consentMode === 'cookies' ? 'cookies' : 'cookieless');
+        }
+        if (url !== undefined) {
+            await configStore.setConfig(umamiClient.KEY_URL, String(url || '').trim().replace(/\/+$/, ''));
+        }
+        // Secrets — the panel only sends a credential field when the operator
+        // actually typed into it, so a save that leaves a field untouched never
+        // clears the stored secret. Sending an explicit empty string clears it.
+        if (username !== undefined) await configStore.setSecret(umamiClient.KEY_USERNAME, String(username || ''));
+        if (password !== undefined) await configStore.setSecret(umamiClient.KEY_PASSWORD, String(password || ''));
+        if (apiToken !== undefined) await configStore.setSecret(umamiClient.KEY_API_TOKEN, String(apiToken || ''));
+        umamiClient.invalidateEndpointCache();
+
+        const settings = await getAnalyticsSettings();
+        const configured = await umamiClient.isConfigured();
+        // Turning analytics on (or saving fresh creds) provisions the live site
+        // immediately so its public pages start tracking without waiting for the
+        // next publish. Best-effort, fire-and-forget.
+        if (settings.enabled && configured) {
+            const liveSiteId = await getLiveSiteId().catch(() => null);
+            if (liveSiteId) {
+                const project = await cmsStore.getProject(liveSiteId).catch(() => null);
+                provisionAnalyticsForSite(liveSiteId, {
+                    name: project?.name || 'CMS site',
+                    domain: req.get('host'),
+                }).catch(() => {});
+            }
+        }
+        res.json({ success: true, enabled: settings.enabled, consentMode: settings.consentMode, url: settings.url, configured });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+}
+
+async function getAnalyticsSitesHandler(req, res) {
+    try {
+        const [projects, map, liveSiteId] = await Promise.all([
+            cmsStore.listProjects(),
+            getAnalyticsSiteMap(),
+            getLiveSiteId(),
+        ]);
+        const sites = projects.map(p => ({
+            id: p.id,
+            name: p.name,
+            live: p.id === liveSiteId,
+            tracked: !!map[p.id],
+        }));
+        res.json({ sites, liveSiteId });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+}
+
+// Translate a coarse range token into Umami's millisecond-epoch window + the
+// natural bucket size for the timeseries.
+function rangeToWindow(range) {
+    const end = Date.now();
+    const days = range === '24h' ? 1 : range === '30d' ? 30 : range === '90d' ? 90 : 7;
+    const start = end - days * 24 * 60 * 60 * 1000;
+    return { startAt: start, endAt: end, unit: range === '24h' ? 'hour' : 'day' };
+}
+
+// Pick the site the dashboard should show: explicit ?siteId (must be tracked),
+// else the live site, else the first tracked site. Null when nothing tracked.
+async function resolveAnalyticsTarget(req) {
+    const map = await getAnalyticsSiteMap();
+    const wanted = (req.query.siteId || '').toString();
+    if (wanted && SITE_ID_RE.test(wanted) && map[wanted]) return { siteId: wanted, websiteId: map[wanted] };
+    const liveSiteId = await getLiveSiteId();
+    if (liveSiteId && map[liveSiteId]) return { siteId: liveSiteId, websiteId: map[liveSiteId] };
+    const firstSiteId = Object.keys(map)[0];
+    if (firstSiteId) return { siteId: firstSiteId, websiteId: map[firstSiteId] };
+    return null;
+}
+
+async function getAnalyticsOverviewHandler(req, res) {
+    try {
+        const settings = await getAnalyticsSettings();
+        if (!settings.enabled) return res.json({ enabled: false });
+        if (!(await umamiClient.isConfigured())) return res.json({ enabled: true, configured: false });
+
+        const target = await resolveAnalyticsTarget(req);
+        if (!target) return res.json({ enabled: true, configured: true, provisioned: false });
+
+        const { websiteId, siteId } = target;
+        const { startAt, endAt, unit } = rangeToWindow((req.query.range || '7d').toString());
+        const tz = (req.query.timezone || 'UTC').toString();
+
+        const [stats, pageviews, pages, referrers, browsers, os, devices, countries, active] = await Promise.all([
+            umamiClient.getStats(websiteId, { startAt, endAt }).catch(() => null),
+            umamiClient.getPageviews(websiteId, { startAt, endAt, unit, timezone: tz }).catch(() => null),
+            umamiClient.getMetrics(websiteId, { type: 'url',      startAt, endAt, limit: 10 }).catch(() => []),
+            umamiClient.getMetrics(websiteId, { type: 'referrer', startAt, endAt, limit: 10 }).catch(() => []),
+            umamiClient.getMetrics(websiteId, { type: 'browser',  startAt, endAt, limit: 8  }).catch(() => []),
+            umamiClient.getMetrics(websiteId, { type: 'os',       startAt, endAt, limit: 8  }).catch(() => []),
+            umamiClient.getMetrics(websiteId, { type: 'device',   startAt, endAt, limit: 8  }).catch(() => []),
+            umamiClient.getMetrics(websiteId, { type: 'country',  startAt, endAt, limit: 10 }).catch(() => []),
+            umamiClient.getActive(websiteId).catch(() => null),
+        ]);
+
+        // `active` shape varies by Umami version: [{x:N}] or {visitors:N} or N.
+        let activeCount = null;
+        if (Array.isArray(active)) activeCount = active[0]?.x ?? active.length ?? null;
+        else if (active && typeof active === 'object') activeCount = active.x ?? active.visitors ?? null;
+        else if (typeof active === 'number') activeCount = active;
+
+        res.json({
+            enabled: true, configured: true, provisioned: true,
+            siteId, websiteId, range: { startAt, endAt, unit },
+            stats, pageviews, pages, referrers, browsers, os, devices, countries,
+            active: activeCount,
+        });
+    } catch (err) {
+        console.error('[CMS] analytics overview error:', err.message);
+        res.status(502).json({ error: 'Failed to load analytics' });
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════
 // PUBLIC
 // ══════════════════════════════════════════════════════════════════
@@ -899,6 +1123,25 @@ router.get('/site', async (req, res) => {
         const source = await cmsStore.getPublishedSnapshot(siteId).then(s => s ? 'published' : 'draft').catch(() => 'unknown');
         console.log(`[CMS] /site siteId=${siteId} slug="${slug}" source=${source} found=${eff.found} blocks=${eff.page?.blocks?.length ?? 0}`);
 
+        // Analytics tracker config — only when tracking is on, configured, and
+        // THIS live site has a provisioned Umami website. The client injects a
+        // tiny async <script> (cookieless by default) so page load stays fast.
+        // Best-effort: never let an analytics hiccup break the public render.
+        let analytics = null;
+        try {
+            const aSettings = await getAnalyticsSettings();
+            if (aSettings.enabled && aSettings.url) {
+                const websiteId = (await getAnalyticsSiteMap())[siteId];
+                if (websiteId) {
+                    analytics = {
+                        websiteId,
+                        scriptUrl: `${aSettings.url.replace(/\/+$/, '')}/script.js`,
+                        consentMode: aSettings.consentMode,
+                    };
+                }
+            }
+        } catch (e) { console.warn('[CMS] /site analytics config skipped:', e.message); }
+
         if (v2) {
             return res.json({
                 enabled: true,
@@ -912,6 +1155,7 @@ router.get('/site', async (req, res) => {
                 footer: eff.footer,
                 pages: eff.pages,
                 design: eff.design,
+                analytics,
             });
         }
         return res.json({
@@ -926,6 +1170,7 @@ router.get('/site', async (req, res) => {
             locale,
             content: synthesizeLegacyContent(eff),
             design: eff.design,
+            analytics,
         });
     } catch (err) {
         console.error('[CMS] /site error:', err.message);
@@ -993,6 +1238,17 @@ router.get(/^\/asset\/(.+)$/, async (req, res) => {
 // ══════════════════════════════════════════════════════════════════
 
 router.use('/admin', requireAdmin);
+
+// Website analytics — platform-operator only (requireSuperAdmin, stricter than
+// the /admin requireAdmin above which also admits the 'all' permission).
+// Registered BEFORE attachSiteId so opening the analytics dashboard never
+// auto-provisions a default CMS project. Settings + a read-only proxy to Umami;
+// the browser never sees Umami credentials.
+router.get('/admin/analytics/settings', requireSuperAdmin, getAnalyticsSettingsHandler);
+router.put('/admin/analytics/settings', requireSuperAdmin, putAnalyticsSettingsHandler);
+router.get('/admin/analytics/sites',    requireSuperAdmin, getAnalyticsSitesHandler);
+router.get('/admin/analytics/overview', requireSuperAdmin, getAnalyticsOverviewHandler);
+
 router.use('/admin', attachSiteId);
 
 // Per-site content (default-bridge target).

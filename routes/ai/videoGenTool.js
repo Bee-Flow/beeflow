@@ -29,7 +29,19 @@ const VIDEO_GEN_TOOLS = [
                     },
                     duration_seconds: {
                         type: 'number',
-                        description: 'Duration of the video in seconds. Options: 5, 6, 7, or 8. Default: 8'
+                        description: 'Duration of the video in seconds. Options: 4, 6, or 8. Default: 8'
+                    },
+                    resolution: {
+                        type: 'string',
+                        description: 'Output resolution. Options: "720p", "1080p". Default: model default (720p).'
+                    },
+                    generate_audio: {
+                        type: 'boolean',
+                        description: 'Whether Veo should generate synchronized audio with the video. Default: model default.'
+                    },
+                    negative_prompt: {
+                        type: 'string',
+                        description: 'What should NOT appear in the video (e.g. "text overlays, watermarks, blurry").'
                     }
                 },
                 required: ['prompt']
@@ -54,8 +66,12 @@ async function executeVideoGenTool(args, send, req, nanoBananaSettings) {
     const aspectRatio = args.aspect_ratio || videoSettings.aspectRatio || '16:9';
     const durationSeconds = Math.min(8, Math.max(4, args.duration_seconds || videoSettings.duration || 8));
     const model = videoSettings.model || 'veo-3.1-generate-preview';
+    const resolution = args.resolution || videoSettings.resolution || undefined;
+    const generateAudio = (args.generate_audio !== undefined) ? !!args.generate_audio
+        : (typeof videoSettings.generateAudio === 'boolean' ? videoSettings.generateAudio : undefined);
+    const negativePrompt = args.negative_prompt || undefined;
 
-    console.log(`[VideoGen Tool] Generating: "${prompt.substring(0, 80)}" (${aspectRatio}, ${durationSeconds}s, ${model})`);
+    console.log(`[VideoGen Tool] Generating: "${prompt.substring(0, 80)}" (${aspectRatio}, ${durationSeconds}s, ${resolution || 'default'}, ${model})`);
 
     // Notify user that generation is starting (it takes a while)
     send('tool_progress', { name: 'generate_video', message: 'Video generation started — this typically takes 1-3 minutes...' });
@@ -64,6 +80,9 @@ async function executeVideoGenTool(args, send, req, nanoBananaSettings) {
         aspectRatio,
         durationSeconds,
         model,
+        resolution,
+        generateAudio,
+        negativePrompt,
     });
 
     if (!result.videoBase64) {

@@ -35,12 +35,15 @@ function actorId(req) {
 // ── GET /capabilities ──────────────────────────────────────────────────
 router.get('/capabilities', (_req, res) => {
     res.json({
-        tiers: tiers.TIER_HIERARCHY.filter(t => t === 'full' ? process.env.ALLOW_ADMIN_FULL_TIER === 'true' : true),
+        // `full` is a first-class admin-issuable tier, same as enterprise — no
+        // operator-only gate. (Historically full was the internal/operator tier
+        // behind ALLOW_ADMIN_FULL_TIER; super-admins can now grant it directly.)
+        tiers: tiers.TIER_HIERARCHY,
         billingIntervals: ['monthly', 'yearly'],
         scopes: ['organization', 'server'],
         tierFeatures: tiers.TIER_FEATURES,
         tierLimits: tiers.TIER_LIMITS,
-        fullTierEnabled: process.env.ALLOW_ADMIN_FULL_TIER === 'true',
+        fullTierEnabled: true,
     });
 });
 

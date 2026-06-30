@@ -27,6 +27,7 @@ const crypto = require('crypto');
 const testRunStore = require('../stores/testRunStore');
 const testSuiteStore = require('../stores/testSuiteStore');
 const pwtRunner = require('../services/pwtRunner');
+const browserProvider = require('../services/browserProvider');
 
 // ── Per-run secrets (in-memory only) ──────────────────────────────
 // Credentials for agent runs live here for the run's lifetime and are
@@ -104,34 +105,29 @@ export default defineConfig({
 `;
 }
 
-const EXPLORE_BROWSER_ARGS = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'];
-
 // ── SSRF guard: block targets that resolve into RFC1918, loopback, link-
 //    local, or private IPv6 ranges. Defence in depth — a malicious user
 //    could otherwise drive Chromium against an internal service from our
-//    own host.
-const PRIVATE_HOST_REGEXES = [
-    /^localhost$/i,
-    /^127(?:\.\d{1,3}){3}$/,
-    /^10(?:\.\d{1,3}){3}$/,
-    /^192\.168(?:\.\d{1,3}){2}$/,
-    /^172\.(1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2}$/,
-    /^169\.254(?:\.\d{1,3}){2}$/,
-    /^::1$/,
-    /^fc[0-9a-f]{2}:/i,
-    /^fd[0-9a-f]{2}:/i,
-    /^fe80:/i,
-];
+//    own host. Two layers: the shared utils/ssrfGuard literal screen
+//    (localhost, metadata hostnames, canonical private IPs), then the
+//    numeric canonicalizer from core/customIntegrations/ssrfGuard so every
+//    exotic IPv4 spelling — short-form (127.1), decimal (2130706433), hex
+//    (0x7f000001), octal (0177.0.0.1), ::ffff: mapped, 0.0.0.0/8, CGNAT
+//    100.64/10, broadcast — is treated as an IP, never as a DNS name.
+//    Deliberately sync/DNS-less: this is a literal-host pre-filter; the
+//    async assertPublicHttpsTarget() is the full resolver-backed check.
+const { isPrivateHostname } = require('../utils/ssrfGuard');
+const { isForbiddenAddress, normalizeHostname } = require('../core/customIntegrations/ssrfGuard');
 
 function isPrivateTarget(rawUrl) {
     let parsed;
     try { parsed = new URL(rawUrl); } catch { return true; }
     if (!/^https?:$/.test(parsed.protocol)) return true;
-    // URL.hostname strips IPv6 brackets in newer Node versions but leaves
-    // them in some environments — strip defensively so the regexes only
-    // need to match the raw address.
-    const host = parsed.hostname.replace(/^\[/, '').replace(/\]$/, '');
-    return PRIVATE_HOST_REGEXES.some(re => re.test(host));
+    if (isPrivateHostname(parsed.hostname)) return true;
+    const { kind, canonical } = normalizeHostname(parsed.hostname);
+    if (kind === 'name') return false;
+    // Numeric-looking hosts that fail to canonicalize are blocked outright.
+    return canonical === null || isForbiddenAddress(canonical);
 }
 
 function isHardFailed(ageMs) {
@@ -289,6 +285,19 @@ async function runSuiteModeContainer({ runId, targetUrl, code, userId, credentia
 // available on a self-hosted install. Inherits the worker env (unsandboxed) —
 // container mode is strongly preferred.
 async function runSuiteModeHost({ runId, targetUrl, code, credentials = null }) {
+    // No Chromium is baked into the image, so `npx playwright test` (which
+    // launches its own local browser) cannot run here unless a dev explicitly
+    // installed one. Suite runs need docker (container mode); fail explicitly
+    // rather than producing a cryptic "Executable doesn't exist" deep in the
+    // spawned process.
+    if (process.env.BROWSER_ALLOW_LOCAL_LAUNCH !== 'true') {
+        return {
+            status: 'error',
+            error: 'suite_host_no_browser: Suite runs require container mode (a docker socket) because the '
+                + 'server image ships no local browser. Enable Docker, or for native dev install a browser and '
+                + 'set BROWSER_ALLOW_LOCAL_LAUNCH=true.',
+        };
+    }
     const tmpRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'bf-pwt-'));
     const specDir = path.join(tmpRoot, 'tests');
     await fs.promises.mkdir(specDir, { recursive: true });
@@ -460,10 +469,13 @@ async function runExploreMode({ runId, targetUrl, userId, execMode = 'host' }) {
                 onLine: (line) => testRunStore.appendProgress(runId, line).catch(() => {}),
             });
             browser = await chromium.connect(serve.wsEndpoint);
+            ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
         } else {
-            browser = await chromium.launch({ headless: true, args: EXPLORE_BROWSER_ARGS });
+            // Host fallback: no Chromium is baked into the image, so drive the
+            // shared singleton browser. Only the context is ours to close — the
+            // shared browser/connection is owned by browserProvider.
+            ctx = await browserProvider.newSharedContext({ viewport: { width: 1280, height: 800 } });
         }
-        ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
         page = await ctx.newPage();
         page.setDefaultTimeout(15_000);
 

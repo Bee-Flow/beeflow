@@ -34,8 +34,22 @@ const SHEETS_TOOLS = [
     {
         type: 'function',
         function: {
+            name: 'sheets_list_tabs',
+            description: 'List the tabs (sheets) inside a Google Sheets spreadsheet — their names, ids and dimensions. Call this before reading so you can target a specific tab by name in sheets_get_values (e.g. range "Budget!A1:D"). Spreadsheets often have more than one tab.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    spreadsheetId: { type: 'string', description: 'The spreadsheet ID (from sheets_list or the sheet URL).' },
+                },
+                required: ['spreadsheetId'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
             name: 'sheets_get_values',
-            description: 'Read a range from a Google Sheet. Returns a 2D array of values plus the resolved range. Empty cells come back as empty strings.',
+            description: 'Read a range from a Google Sheet. Returns a 2D array of values, the resolved range, and the list of all tab names in the file so you can read another tab next. To read a specific tab, prefix the range with its name (e.g. "Sheet2!A:D"). Empty cells come back as empty strings.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -161,16 +175,28 @@ async function executeSheetsTool(toolName, args, session) {
             return { results, total: results.length };
         }
 
+        case 'sheets_list_tabs': {
+            const { spreadsheetId } = args || {};
+            if (!spreadsheetId) throw new Error('spreadsheetId required');
+            const meta = await sheets.spreadsheets.get({ spreadsheetId, includeGridData: false });
+            const tabs = (meta.data.sheets || []).map(s => ({
+                title: s.properties?.title,
+                sheetId: s.properties?.sheetId,
+                index: s.properties?.index,
+                rows: s.properties?.gridProperties?.rowCount || null,
+                cols: s.properties?.gridProperties?.columnCount || null,
+            }));
+            return { spreadsheetId, title: meta.data.properties?.title || null, tabs, tabCount: tabs.length };
+        }
+
         case 'sheets_get_values': {
             const { spreadsheetId, range } = args || {};
             if (!spreadsheetId) throw new Error('spreadsheetId required');
-            // Default to the first sheet's full data if no range provided.
-            let effectiveRange = range;
-            if (!effectiveRange) {
-                const meta = await sheets.spreadsheets.get({ spreadsheetId, includeGridData: false });
-                const firstTitle = meta.data.sheets?.[0]?.properties?.title || 'Sheet1';
-                effectiveRange = firstTitle;
-            }
+            // Always fetch tab metadata so the model can see every tab (not just
+            // the first) and target another by name next (BFSF-160).
+            const meta = await sheets.spreadsheets.get({ spreadsheetId, includeGridData: false });
+            const tabTitles = (meta.data.sheets || []).map(s => s.properties?.title).filter(Boolean);
+            const effectiveRange = range || tabTitles[0] || 'Sheet1';
             const res = await sheets.spreadsheets.values.get({ spreadsheetId, range: effectiveRange });
             const values = res.data.values || [];
             return {
@@ -179,6 +205,10 @@ async function executeSheetsTool(toolName, args, session) {
                 values,
                 rowCount: values.length,
                 colCount: values.reduce((m, r) => Math.max(m, r.length), 0),
+                availableTabs: tabTitles,
+                ...(!range && tabTitles.length > 1
+                    ? { note: `Read the first tab "${tabTitles[0]}". This file has ${tabTitles.length} tabs (${tabTitles.join(', ')}) — set range to "TabName!A:Z" to read another.` }
+                    : {}),
             };
         }
 

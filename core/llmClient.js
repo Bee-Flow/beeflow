@@ -5,8 +5,58 @@
  * Handles: provider resolution, adapter selection, normalized event dispatching.
  */
 
-const { getAdapter } = require('./providers');
+const { getAdapter, GoogleProvider } = require('./providers');
 const { getProviderForModel } = require('./aiAgent');
+
+/**
+ * Build the provider-correct `toolChoice` that forces the model to call exactly
+ * one named tool. response_format/json_schema is NOT honoured by any adapter, so
+ * forced structured output rides on a forced tool call instead.
+ *
+ * - openai / claude / mistral / generic OpenAI-compatible adapters all accept the
+ *   OpenAI object form `{type:'function',function:{name}}`:
+ *     · openai.js  → mapToolChoice passes objects through
+ *     · claude.js  → maps an object with `.name` → {type:'tool',name}
+ *     · mistral.js → mapToolChoice passes objects through (Mistral wire format
+ *                    accepts {type:'function',function:{name}})
+ *     · base.js    → tool_choice = options.toolChoice (object passthrough)
+ * - GOOGLE (and google-vertex, which extends GoogleProvider) has NO object/name
+ *   case — it only maps 'required'/'any' → functionCallingConfig.mode ANY. With a
+ *   SINGLE-tool list, mode ANY is equivalent to forcing that one tool, so we pass
+ *   the string 'required' instead of the object. Callers must also pass a
+ *   single-tool list (tools:[toolDef]) for Google forcing to be deterministic.
+ *
+ * @param {object} adapter   - resolved provider adapter instance
+ * @param {string} toolName  - the function name to force
+ * @returns {object|string}  - object form, or 'required' for the Google family
+ */
+function forcedToolChoice(adapter, toolName) {
+    // Isolated Google nuance: single-tool list + 'required' === force-that-tool.
+    if (adapter instanceof GoogleProvider) {
+        return 'required';
+    }
+    return { type: 'function', function: { name: toolName } };
+}
+
+/**
+ * Best-effort parse of a forced tool call's arguments into a plain object.
+ * Arguments arrive as a JSON string (OpenAI/Mistral/generic) or as an already
+ * parsed object (Claude/Google `input`). Never throws — returns null on any
+ * absence/parse failure so callers get untrusted-but-safe structured output.
+ */
+function parseToolCallArgs(toolCall) {
+    if (!toolCall) return null;
+    const rawArgs = toolCall.function?.arguments ?? toolCall.input;
+    if (rawArgs == null) return null;
+    if (typeof rawArgs === 'object') return rawArgs;
+    if (typeof rawArgs !== 'string') return null;
+    try {
+        const parsed = JSON.parse(rawArgs);
+        return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch {
+        return null;
+    }
+}
 
 class LLMClient {
     /**
@@ -40,6 +90,46 @@ class LLMClient {
     async chat(modelId, messages, options = {}) {
         const { apiKey, baseUrl, adapter, project, location, serviceAccountKey, apiVersion } = await this._resolve(modelId);
         return adapter.chat(apiKey, baseUrl, modelId, messages, { ...options, project, location, serviceAccountKey, apiVersion });
+    }
+
+    /**
+     * Forced structured output via a single forced tool call.
+     *
+     * No adapter honours response_format/json_schema, so the only reliable way to
+     * get a typed object out of a model is to FORCE it to call one tool exactly
+     * once and read that call's arguments. This resolves the provider, builds the
+     * provider-correct forcing toolChoice (see forcedToolChoice), runs ONE
+     * non-streaming chat with `tools:[toolDef]`, and parses the first tool call.
+     *
+     * The model's output is UNTRUSTED — `structured` is null when the model
+     * declined the tool or emitted unparseable arguments. This never throws on
+     * the parse path; callers must clamp/validate the returned object.
+     *
+     * @param {string} modelId
+     * @param {Array}  messages  - chat messages
+     * @param {object} toolDef   - OpenAI-format tool def: {type:'function',function:{name,description,parameters}}
+     * @param {object} [options] - extra chat options (maxTokens, temperature, …); tools/toolChoice are overridden
+     * @returns {Promise<{structured: object|null, content: string|null, usage: object|undefined, raw: any}>}
+     */
+    async chatForcedTool(modelId, messages, toolDef, options = {}) {
+        const { apiKey, baseUrl, adapter, project, location, serviceAccountKey, apiVersion } = await this._resolve(modelId);
+        const toolName = toolDef?.function?.name;
+        const result = await adapter.chat(apiKey, baseUrl, modelId, messages, {
+            ...options,
+            project,
+            location,
+            serviceAccountKey,
+            apiVersion,
+            tools: [toolDef],
+            toolChoice: forcedToolChoice(adapter, toolName),
+        });
+        const structured = parseToolCallArgs(result?.toolCalls?.[0]);
+        return {
+            structured,
+            content: result?.content ?? null,
+            usage: result?.usage,
+            raw: result?.raw,
+        };
     }
 
     /**
@@ -147,29 +237,64 @@ class LLMClient {
 
     /**
      * Run a tool-calling loop: chat → check for tool calls → execute → repeat.
-     * Returns { messages, content, toolCallRounds }.
-     * 
+     * Returns { messages, content, toolCallRounds, structured }.
+     *
      * @param {string} modelId
      * @param {Array} messages - Initial messages
      * @param {Array} tools - Tool definitions (OpenAI format)
-     * @param {object} options - Chat options
+     * @param {object} options - Chat options. Optional `options.finalTool` (an
+     *   OpenAI-format tool def) FORCES the synthesis/final call to call that tool
+     *   instead of dropping tools / emitting prose. Applies on BOTH exit paths:
+     *   the model stopping its tool calls, and the max-rounds-hit final chat. When
+     *   set, the return value's `structured` is the parsed finalTool args (or null
+     *   when the model declined / emitted unparseable args — output is untrusted).
+     *   When omitted, behaviour is IDENTICAL to before: toolChoice:'auto' loop and
+     *   a final chat with tools:undefined, and `structured` is null.
      * @param {function} executeTool - async (name, args) => result string
      * @param {number} maxRounds - Max tool call rounds (default: 5)
      */
     async runToolLoop(modelId, messages, tools, options = {}, executeTool, maxRounds = 5) {
+        const { finalTool, ...chatOptions } = options;
         let rounds = 0;
         const updatedMessages = [...messages];
 
+        // Force the synthesis call to emit structured output via `finalTool`.
+        // Reuses the same provider-aware forcing as chatForcedTool, so the
+        // synthesis step yields parseable tool args on every provider.
+        const runFinalSynthesis = async () => {
+            const { adapter } = await this._resolve(modelId);
+            const result = await this.chat(modelId, updatedMessages, {
+                ...chatOptions,
+                tools: [finalTool],
+                toolChoice: forcedToolChoice(adapter, finalTool?.function?.name),
+            });
+            return {
+                content: result.content ?? null,
+                structured: parseToolCallArgs(result?.toolCalls?.[0]),
+            };
+        };
+
         while (rounds < maxRounds) {
             const result = await this.chat(modelId, updatedMessages, {
-                ...options,
+                ...chatOptions,
                 tools,
                 toolChoice: 'auto',
             });
 
             if (!result.toolCalls || result.toolCalls.length === 0) {
-                // No tool calls — done
-                return { messages: updatedMessages, content: result.content, toolCallRounds: rounds };
+                // No tool calls — done. When a finalTool is requested, the model
+                // "stopped" without producing structured output, so run one forced
+                // synthesis call to extract it rather than returning prose.
+                if (finalTool) {
+                    const final = await runFinalSynthesis();
+                    return {
+                        messages: updatedMessages,
+                        content: final.content,
+                        toolCallRounds: rounds,
+                        structured: final.structured,
+                    };
+                }
+                return { messages: updatedMessages, content: result.content, toolCallRounds: rounds, structured: null };
             }
 
             // Add assistant message with tool calls
@@ -207,12 +332,23 @@ class LLMClient {
             rounds++;
         }
 
-        // Max rounds hit — do one final chat without tools
+        // Max rounds hit — synthesize a final answer. With a finalTool, force the
+        // structured tool call; otherwise preserve the original behaviour of one
+        // final chat with tools dropped.
+        if (finalTool) {
+            const final = await runFinalSynthesis();
+            return {
+                messages: updatedMessages,
+                content: final.content,
+                toolCallRounds: rounds,
+                structured: final.structured,
+            };
+        }
         const finalResult = await this.chat(modelId, updatedMessages, {
-            ...options,
+            ...chatOptions,
             tools: undefined,
         });
-        return { messages: updatedMessages, content: finalResult.content, toolCallRounds: rounds };
+        return { messages: updatedMessages, content: finalResult.content, toolCallRounds: rounds, structured: null };
     }
 }
 

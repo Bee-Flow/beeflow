@@ -38,7 +38,7 @@ async function _notifyBreach(row, which) {
     const label = which === 'first' ? 'First-response' : 'Resolution';
     try {
         await supportStore.recordThreadEvent({
-            threadId: row.id, actorUserId: null, actorKind: 'system',
+            threadId: row.id, actorUserId: null, actorKind: 'automation',
             action: 'sla_breach', payload: { which },
         });
     } catch (e) { console.warn('[SupportSLA] recordThreadEvent failed:', e.message); }

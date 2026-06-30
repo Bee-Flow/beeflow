@@ -194,6 +194,32 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_support_messages_provider_msg
 -- Fast reply-correlation lookup (In-Reply-To / References → our stored msg id).
 CREATE INDEX IF NOT EXISTS idx_support_messages_rfc822
     ON support_messages(rfc822_message_id) WHERE rfc822_message_id IS NOT NULL;
+
+-- iteration 6: unified audit log. Superset of support_thread_events that can
+-- also hold inbox/config-level events (no thread) and distinguishes the precise
+-- actor kind — 'ai' and 'automation' in addition to staff/system/requester.
+-- All scope columns are nullable: config events have no thread; the company
+-- inbox has no inbox_id. No FK (support_inboxes may init after this batch, same
+-- rationale as support_threads.inbox_id). recordThreadEvent dual-writes here.
+CREATE TABLE IF NOT EXISTS support_audit_log (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id TEXT,
+    inbox_id UUID,
+    thread_id UUID,
+    actor_kind TEXT NOT NULL
+        CHECK (actor_kind IN ('system','automation','ai','staff','requester')),
+    actor_user_id TEXT,
+    action TEXT NOT NULL,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    ip TEXT,
+    ua TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_support_audit_org_created   ON support_audit_log(organization_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_support_audit_inbox_created ON support_audit_log(inbox_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_support_audit_thread        ON support_audit_log(thread_id, created_at) WHERE thread_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_support_audit_action        ON support_audit_log(action);
+CREATE INDEX IF NOT EXISTS idx_support_audit_actor_kind    ON support_audit_log(actor_kind);
 `;
 
 let initialized = false;
@@ -362,6 +388,10 @@ async function listThreads({
     inboxId = null,
     inboxIdIn = null,
     inboxIsNull = null,
+    // Tag filters (used by the non-support routing): tagsIn → only threads
+    // carrying any of these tags; excludeTags → drop threads carrying any.
+    tagsIn = null,
+    excludeTags = null,
 } = {}) {
     await initDB();
     const where = [];
@@ -385,6 +415,14 @@ async function listThreads({
     if (q) {
         params.push(`%${q}%`);
         where.push(`(subject ILIKE $${params.length} OR requester_email ILIKE $${params.length} OR requester_name ILIKE $${params.length})`);
+    }
+    if (tagsIn && tagsIn.length) {
+        params.push(tagsIn);
+        where.push(`jsonb_exists_any(tags, $${params.length}::text[])`);
+    }
+    if (excludeTags && excludeTags.length) {
+        params.push(excludeTags);
+        where.push(`(tags IS NULL OR NOT jsonb_exists_any(tags, $${params.length}::text[]))`);
     }
     const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
     params.push(Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500));
@@ -498,7 +536,7 @@ async function getThreadMessages(threadId, { includeInternal = false } = {}) {
     return rows;
 }
 
-async function countThreadsByStatus({ organizationId = null, inboxId = null, inboxIdIn = null, inboxIsNull = null } = {}) {
+async function countThreadsByStatus({ organizationId = null, inboxId = null, inboxIdIn = null, inboxIsNull = null, tagsIn = null, excludeTags = null } = {}) {
     await initDB();
     const params = [];
     const clauses = [];
@@ -507,6 +545,8 @@ async function countThreadsByStatus({ organizationId = null, inboxId = null, inb
     if (inboxIdIn && inboxIdIn.length) { params.push(inboxIdIn); clauses.push(`inbox_id = ANY($${params.length}::uuid[])`); }
     if (inboxIsNull === true) { clauses.push(`inbox_id IS NULL`); }
     else if (inboxIsNull === false) { clauses.push(`inbox_id IS NOT NULL`); }
+    if (tagsIn && tagsIn.length) { params.push(tagsIn); clauses.push(`jsonb_exists_any(tags, $${params.length}::text[])`); }
+    if (excludeTags && excludeTags.length) { params.push(excludeTags); clauses.push(`(tags IS NULL OR NOT jsonb_exists_any(tags, $${params.length}::text[]))`); }
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
     const { rows } = await pool.query(
         `SELECT status, COUNT(*)::int AS count FROM support_threads ${where} GROUP BY status`,
@@ -569,22 +609,53 @@ async function setMessageDelivery(messageId, { emailSendStatus = null, rfc822Mes
     await pool.query(`UPDATE support_messages SET ${sets.join(', ')} WHERE id = $${params.length}`, params);
 }
 
+// Precise actor kinds for the unified audit log. The legacy
+// support_thread_events CHECK only permits the first three; 'ai'/'automation'
+// collapse to 'system' there but are preserved exactly in support_audit_log.
+const AUDIT_ACTOR_KINDS = ['system', 'automation', 'ai', 'staff', 'requester'];
+const LEGACY_ACTOR_KINDS = new Set(['staff', 'system', 'requester']);
+
 /**
  * Append an audit-log event for a thread. Append-only, used by route handlers
  * and the AI responder. Failures here must never break the caller — wrap.
+ *
+ * Dual-writes: the legacy support_thread_events row (actor_kind collapsed to the
+ * three legacy kinds, so the company inbox + per-thread timeline keep working
+ * unchanged) AND the unified support_audit_log row carrying the PRECISE kind
+ * (incl. 'ai'/'automation'). org/inbox are derived from the thread when not
+ * supplied. The unified write is best-effort — never breaks the legacy write.
  */
-async function recordThreadEvent({ threadId, actorUserId = null, actorKind, action, payload = {} }) {
+async function recordThreadEvent({ threadId, actorUserId = null, actorKind, action, payload = {}, organizationId, inboxId, ip = null, ua = null }) {
     await initDB();
     if (!threadId || !actorKind || !action) return null;
-    if (!['staff', 'system', 'requester'].includes(actorKind)) {
+    if (!AUDIT_ACTOR_KINDS.includes(actorKind)) {
         throw new Error('invalid actorKind');
     }
+    const legacyKind = LEGACY_ACTOR_KINDS.has(actorKind) ? actorKind : 'system';
     const { rows } = await pool.query(
         `INSERT INTO support_thread_events (thread_id, actor_user_id, actor_kind, action, payload)
          VALUES ($1, $2, $3, $4, $5::jsonb)
          RETURNING *`,
-        [threadId, actorUserId, actorKind, action, JSON.stringify(payload || {})]
+        [threadId, actorUserId, legacyKind, action, JSON.stringify(payload || {})]
     );
+    try {
+        let org = organizationId; let inbox = inboxId;
+        if (org === undefined || inbox === undefined) {
+            const { rows: tr } = await pool.query(
+                `SELECT organization_id, inbox_id FROM support_threads WHERE id = $1`, [threadId]
+            );
+            if (tr[0]) {
+                if (org === undefined) org = tr[0].organization_id;
+                if (inbox === undefined) inbox = tr[0].inbox_id;
+            }
+        }
+        await recordAuditEvent({
+            organizationId: org ?? null, inboxId: inbox ?? null, threadId,
+            actorKind, actorUserId, action, payload, ip, ua,
+        });
+    } catch (e) {
+        console.warn('[SupportStore] audit dual-write failed:', e.message);
+    }
     return rows[0];
 }
 
@@ -595,6 +666,90 @@ async function listThreadEvents(threadId, { limit = 200 } = {}) {
         [threadId, Math.min(Math.max(parseInt(limit, 10) || 200, 1), 1000)]
     );
     return rows;
+}
+
+/**
+ * Append an event to the unified support audit log. Called directly by services
+ * (sync engine, AI responder, mailer, classifier) and indirectly via
+ * recordThreadEvent's dual-write. Any of organizationId / inboxId / threadId may
+ * be null — config-level events have no thread. Returns null on missing
+ * actorKind/action so a partial call never throws into a fire-and-forget caller.
+ */
+async function recordAuditEvent({ organizationId = null, inboxId = null, threadId = null, actorKind, actorUserId = null, action, payload = {}, ip = null, ua = null } = {}) {
+    await initDB();
+    if (!actorKind || !action) return null;
+    if (!AUDIT_ACTOR_KINDS.includes(actorKind)) throw new Error('invalid actorKind');
+    const { rows } = await pool.query(
+        `INSERT INTO support_audit_log
+            (organization_id, inbox_id, thread_id, actor_kind, actor_user_id, action, payload, ip, ua)
+         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9)
+         RETURNING *`,
+        [organizationId, inboxId, threadId, actorKind, actorUserId, action, JSON.stringify(payload || {}), ip, ua]
+    );
+    return rows[0];
+}
+
+function _decodeAuditCursor(cursor) {
+    if (!cursor) return null;
+    try {
+        const obj = JSON.parse(Buffer.from(String(cursor), 'base64').toString('utf8'));
+        if (obj && obj.t && obj.id) return obj;
+    } catch { /* ignore malformed cursor */ }
+    return null;
+}
+function _encodeAuditCursor(row) {
+    const t = row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at;
+    return Buffer.from(JSON.stringify({ t, id: row.id })).toString('base64');
+}
+
+/**
+ * List unified audit events newest-first with keyset pagination on
+ * (created_at, id). Filters: organizationId / organizationIdIn, inboxId /
+ * inboxIdIn (array also matches config events with inbox_id IS NULL), threadId,
+ * actorKind, action, since, until. Returns { events, nextCursor }.
+ */
+async function listAuditEvents({ organizationId, organizationIdIn, inboxId, inboxIdIn, threadId, actorKind, action, since, until, limit = 50, cursor } = {}) {
+    await initDB();
+    const where = [];
+    const vals = [];
+    const add = (sql, val) => { vals.push(val); where.push(sql.replace('$$', `$${vals.length}`)); };
+    if (organizationId !== undefined && organizationId !== null) add('organization_id = $$', organizationId);
+    if (Array.isArray(organizationIdIn)) {
+        if (organizationIdIn.length === 0) return { events: [], nextCursor: null };
+        add('organization_id = ANY($$)', organizationIdIn);
+    }
+    if (inboxId !== undefined && inboxId !== null) add('inbox_id = $$', inboxId);
+    if (Array.isArray(inboxIdIn)) {
+        if (inboxIdIn.length === 0) {
+            where.push('inbox_id IS NULL');
+        } else {
+            vals.push(inboxIdIn);
+            where.push(`(inbox_id = ANY($${vals.length}) OR inbox_id IS NULL)`);
+        }
+    }
+    if (threadId) add('thread_id = $$', threadId);
+    if (actorKind) add('actor_kind = $$', actorKind);
+    if (action) add('action = $$', action);
+    if (since) add('created_at >= $$', since);
+    if (until) add('created_at <= $$', until);
+    const cur = _decodeAuditCursor(cursor);
+    if (cur) {
+        vals.push(cur.t); vals.push(cur.id);
+        where.push(`(created_at, id) < ($${vals.length - 1}::timestamptz, $${vals.length}::uuid)`);
+    }
+    const lim = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 200);
+    vals.push(lim + 1);
+    const sql = `SELECT * FROM support_audit_log
+                 ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT $${vals.length}`;
+    const { rows } = await pool.query(sql, vals);
+    let nextCursor = null;
+    if (rows.length > lim) {
+        nextCursor = _encodeAuditCursor(rows[lim - 1]);
+        rows.length = lim;
+    }
+    return { events: rows, nextCursor };
 }
 
 async function findSlaAtRiskThreads({ olderThanMinutes = 60 } = {}) {
@@ -951,7 +1106,7 @@ async function getAndAdvanceRoundRobin(organizationId, candidateUserIds = []) {
 
 // ── Insights / dashboard aggregates ─────────────────────────────────────────
 
-async function getInsights({ organizationId = null, inboxId = null, inboxIdIn = null, inboxIsNull = null } = {}) {
+async function getInsights({ organizationId = null, inboxId = null, inboxIdIn = null, inboxIsNull = null, tagsIn = null, excludeTags = null } = {}) {
     await initDB();
     const clauses = [];
     const params = [];
@@ -960,6 +1115,8 @@ async function getInsights({ organizationId = null, inboxId = null, inboxIdIn = 
     if (inboxIdIn && inboxIdIn.length) { params.push(inboxIdIn); clauses.push(`inbox_id = ANY($${params.length}::uuid[])`); }
     if (inboxIsNull === true) { clauses.push(`inbox_id IS NULL`); }
     else if (inboxIsNull === false) { clauses.push(`inbox_id IS NOT NULL`); }
+    if (tagsIn && tagsIn.length) { params.push(tagsIn); clauses.push(`jsonb_exists_any(tags, $${params.length}::text[])`); }
+    if (excludeTags && excludeTags.length) { params.push(excludeTags); clauses.push(`(tags IS NULL OR NOT jsonb_exists_any(tags, $${params.length}::text[]))`); }
     const orgFilter = clauses.length ? `AND ${clauses.join(' AND ')}` : '';
 
     const csat = await pool.query(
@@ -979,8 +1136,52 @@ async function getInsights({ organizationId = null, inboxId = null, inboxIdIn = 
             COUNT(*) FILTER (WHERE sla_first_response_breached_at IS NOT NULL OR sla_resolution_breached_at IS NOT NULL)                   AS sla_breaches,
             COUNT(*) AS total,
             EXTRACT(EPOCH FROM AVG(first_response_at - created_at) FILTER (WHERE first_response_at IS NOT NULL)) AS avg_first_response_secs,
-            EXTRACT(EPOCH FROM AVG(resolved_at - created_at) FILTER (WHERE resolved_at IS NOT NULL))             AS avg_resolution_secs
+            EXTRACT(EPOCH FROM AVG(resolved_at - created_at) FILTER (WHERE resolved_at IS NOT NULL))             AS avg_resolution_secs,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (first_response_at - created_at)))
+                FILTER (WHERE first_response_at IS NOT NULL) AS p50_first_response_secs,
+            PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (first_response_at - created_at)))
+                FILTER (WHERE first_response_at IS NOT NULL) AS p90_first_response_secs,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (resolved_at - created_at)))
+                FILTER (WHERE resolved_at IS NOT NULL) AS p50_resolution_secs,
+            PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (resolved_at - created_at)))
+                FILTER (WHERE resolved_at IS NOT NULL) AS p90_resolution_secs,
+            COUNT(*) FILTER (WHERE status IN ('open','ai_responding','awaiting_agent'))                          AS open_backlog,
+            MIN(created_at) FILTER (WHERE status = 'awaiting_agent')                                             AS oldest_waiting_at,
+            COUNT(*) FILTER (WHERE first_response_at IS NOT NULL)                                                AS first_response_count,
+            COUNT(*) FILTER (WHERE first_response_at IS NOT NULL AND sla_first_response_breached_at IS NULL)     AS first_response_within_sla
          FROM support_threads WHERE 1=1 ${orgFilter}`,
+        params
+    );
+
+    // Daily ticket volume (last 30 days) — feeds the Insights sparkline.
+    const volume = await pool.query(
+        `SELECT to_char(date_trunc('day', created_at),'YYYY-MM-DD') AS period, COUNT(*)::int AS total
+           FROM support_threads
+          WHERE created_at > now() - interval '30 days' ${orgFilter}
+          GROUP BY 1 ORDER BY 1`,
+        params
+    );
+
+    // Busiest hours (UTC, last 30 days).
+    const busiest = await pool.query(
+        `SELECT EXTRACT(HOUR FROM created_at AT TIME ZONE 'UTC')::int AS hour, COUNT(*)::int AS count
+           FROM support_threads
+          WHERE created_at > now() - interval '30 days' ${orgFilter}
+          GROUP BY 1 ORDER BY 1`,
+        params
+    );
+
+    // Per-assignee leaderboard (resolved count + median first response).
+    const agents = await pool.query(
+        `SELECT assignee_user_id,
+                COUNT(*) FILTER (WHERE status IN ('resolved','closed'))::int AS resolved,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (first_response_at - created_at)))
+                    FILTER (WHERE first_response_at IS NOT NULL) AS p50_first_response_secs
+           FROM support_threads
+          WHERE assignee_user_id IS NOT NULL ${orgFilter}
+          GROUP BY assignee_user_id
+          ORDER BY resolved DESC NULLS LAST
+          LIMIT 10`,
         params
     );
 
@@ -989,6 +1190,11 @@ async function getInsights({ organizationId = null, inboxId = null, inboxIdIn = 
     const respondedRate = Number(c.resolved_total) > 0
         ? Number(c.responses) / Number(c.resolved_total)
         : 0;
+    const num = (v) => (v != null ? Math.round(Number(v)) : null);
+    const total = Number(h.total) || 0;
+    const aiResolved = Number(h.ai_resolved) || 0;
+    const frCount = Number(h.first_response_count) || 0;
+    const frWithinSla = Number(h.first_response_within_sla) || 0;
     return {
         csat: {
             avg7d: c.avg_7d != null ? Number(c.avg_7d) : null,
@@ -997,13 +1203,28 @@ async function getInsights({ organizationId = null, inboxId = null, inboxIdIn = 
             responseRate: Number(respondedRate.toFixed(3)),
         },
         handling: {
-            aiResolved: Number(h.ai_resolved) || 0,
+            aiResolved,
             staffResolved: Number(h.staff_resolved) || 0,
             slaBreaches: Number(h.sla_breaches) || 0,
-            total: Number(h.total) || 0,
-            avgFirstResponseSecs: h.avg_first_response_secs != null ? Math.round(Number(h.avg_first_response_secs)) : null,
-            avgResolutionSecs: h.avg_resolution_secs != null ? Math.round(Number(h.avg_resolution_secs)) : null,
+            total,
+            avgFirstResponseSecs: num(h.avg_first_response_secs),
+            avgResolutionSecs: num(h.avg_resolution_secs),
+            p50FirstResponseSecs: num(h.p50_first_response_secs),
+            p90FirstResponseSecs: num(h.p90_first_response_secs),
+            p50ResolutionSecs: num(h.p50_resolution_secs),
+            p90ResolutionSecs: num(h.p90_resolution_secs),
+            openBacklog: Number(h.open_backlog) || 0,
+            oldestWaitingAt: h.oldest_waiting_at || null,
+            aiHandledRate: total > 0 ? Number((aiResolved / total).toFixed(3)) : null,
+            firstResponseWithinSlaRate: frCount > 0 ? Number((frWithinSla / frCount).toFixed(3)) : null,
         },
+        volume: volume.rows.map(r => ({ period: r.period, total: r.total })),
+        busiestHours: busiest.rows.map(r => ({ hour: r.hour, count: r.count })),
+        agents: agents.rows.map(r => ({
+            userId: r.assignee_user_id,
+            resolved: Number(r.resolved) || 0,
+            p50FirstResponseSecs: num(r.p50_first_response_secs),
+        })),
     };
 }
 
@@ -1026,6 +1247,10 @@ module.exports = {
     setMessageDelivery,
     recordThreadEvent,
     listThreadEvents,
+    // iteration 6: unified audit log
+    recordAuditEvent,
+    listAuditEvents,
+    AUDIT_ACTOR_KINDS,
     // iteration 4
     setThreadTags,
     addThreadTag,

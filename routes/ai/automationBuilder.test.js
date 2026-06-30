@@ -9,7 +9,7 @@
  */
 
 const assert = require('assert');
-const { parseToolArgs, isTransientChatError, chatWithRetry, applyBuilderTierFloor } = require('./automationBuilder')._test;
+const { parseToolArgs, isTransientChatError, chatWithRetry, applyBuilderTierFloor, validateLayerForSummary, sanitiseLayerSummary } = require('./automationBuilder')._test;
 
 (async () => {
     // ── parseToolArgs ──
@@ -75,6 +75,25 @@ const { parseToolArgs, isTransientChatError, chatWithRetry, applyBuilderTierFloo
         assert.strictEqual(r.modelId, 'ministral-8b', 'small-only org keeps the small model');
         assert.strictEqual(r.tier, 'fast', 'small-only org keeps the resolved tier');
     }
+
+    // ── validateLayerForSummary ──
+    assert.strictEqual(validateLayerForSummary({ steps: [] }), null, 'empty-but-valid layer passes');
+    assert.strictEqual(validateLayerForSummary({ title: 'x', steps: [{ id: 's1', type: 'code' }] }), null, 'layer with steps passes');
+    assert.ok(validateLayerForSummary(null), 'null layer rejected');
+    assert.ok(validateLayerForSummary('nope'), 'string layer rejected');
+    assert.ok(validateLayerForSummary([]), 'array layer rejected');
+    assert.ok(validateLayerForSummary({ title: 'x' }), 'layer without steps array rejected');
+    assert.ok(validateLayerForSummary({ steps: {} }), 'non-array steps rejected');
+    assert.ok(validateLayerForSummary({ steps: new Array(201).fill({ id: 'x', type: 'code' }) }), 'oversized layer rejected');
+
+    // ── sanitiseLayerSummary ──
+    assert.strictEqual(sanitiseLayerSummary('  Looks up the contact.  '), 'Looks up the contact.', 'trims surrounding whitespace');
+    assert.strictEqual(sanitiseLayerSummary('"Sends a digest email."'), 'Sends a digest email.', 'strips surrounding straight quotes');
+    assert.strictEqual(sanitiseLayerSummary('“Smart quotes here”'), 'Smart quotes here', 'strips surrounding smart quotes');
+    assert.strictEqual(sanitiseLayerSummary('a\n\n  b   c'), 'a b c', 'collapses internal whitespace runs');
+    assert.strictEqual(sanitiseLayerSummary(null), '', 'null → empty string');
+    assert.strictEqual(sanitiseLayerSummary(undefined), '', 'undefined → empty string');
+    assert.ok(sanitiseLayerSummary('x'.repeat(400)).length <= 280, 'caps very long output at 280 chars');
 
     console.log('automationBuilder.test.js: all helper tests passed');
     process.exit(0);

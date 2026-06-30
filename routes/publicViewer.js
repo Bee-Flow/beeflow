@@ -433,6 +433,32 @@ router.get('/:token/content', async (req, res) => {
             }
         }
 
+        // React-mui shares store a self-contained, server-bundled document
+        // (inline ES module + esm.sh import map + STUBBED bridges). A React app
+        // renders nothing without JS, so this branch RELAXES the iframe CSP to
+        // allow inline scripts + esm.sh. The trust boundary stays the outer
+        // sandbox: `allow-scripts allow-forms` with NO allow-same-origin, so the
+        // executing JS runs in an opaque origin and cannot reach beeflow.nl
+        // cookies/session. Live data bridges are stubbed at bundle time.
+        if (share.snapshotKind === 'react') {
+            const doc = await webpageSnapshot.readSnapshotSlot(share.id, 'reactdoc');
+            const reactCsp = [
+                "default-src 'self' data: https: 'unsafe-inline'",
+                "script-src 'unsafe-inline' https://esm.sh",
+                "style-src 'unsafe-inline' https:",
+                "img-src 'self' data: https:",
+                "font-src 'self' data: https:",
+                "connect-src https:",
+                "object-src 'none'",
+                "frame-ancestors 'self'",
+            ].join('; ');
+            res.setHeader('Content-Security-Policy', reactCsp);
+            res.setHeader('X-Content-Type-Options', 'nosniff');
+            res.setHeader('Referrer-Policy', 'no-referrer');
+            res.setHeader('Cache-Control', 'private, no-store');
+            return res.type('html').send(doc || composeIframeContent({ html: '', css: '', rawToken: ctx.rawToken }));
+        }
+
         const [html, css] = await Promise.all([
             webpageSnapshot.readSnapshotSlot(share.id, 'html'),
             webpageSnapshot.readSnapshotSlot(share.id, 'css'),

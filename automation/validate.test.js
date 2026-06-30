@@ -432,4 +432,264 @@ function trigger() {
     assert.ok(!validateDefinition(sw).errors.some(e => e.code === 'switch.no_branches'), 'labelled case edge → no switch.no_branches');
 }
 
+// ═══ WS3: inline layers ══════════════════════════════════════════════════
+
+function layerGraph(overrides = {}) {
+    return {
+        title: 'Enrich contact',
+        trigger: { id: 'trg', type: 'trigger', kind: 'layer_input', params: [{ name: 'email', type: 'string', required: true }] },
+        steps: [{ id: 'out', type: 'layer_output', fields: { score: { kind: 'literal', value: 1 } } }],
+        edges: [{ from: 'trg', to: 'out' }],
+        ...overrides,
+    };
+}
+
+// ── Happy path: a layer + a call_layer referencing it validates clean ────
+{
+    const def = {
+        schemaVersion: 2,
+        trigger: trigger(),
+        steps: [{ id: 'cl1', type: 'call_layer', layerKey: 'enrich_contact', inputs: { email: { kind: 'ref', path: 'trigger.output.email' } } }],
+        edges: [{ from: 'trg', to: 'cl1' }],
+        layers: { enrich_contact: layerGraph() },
+    };
+    const r = validateDefinition(def);
+    assert.strictEqual(r.ok, true, `valid inline layer should pass, got ${JSON.stringify(r.errors)}`);
+    assert.ok(!r.warnings.some(w => w.code === 'layers.orphaned'), 'referenced layer is not orphaned');
+}
+
+// ── layers map shape + key format ────────────────────────────────────────
+{
+    const def = { trigger: trigger(), steps: [], edges: [], layers: ['nope'] };
+    const r = validateDefinition(def);
+    assert.ok(r.errors.some(e => e.code === 'layers.shape'), 'non-object layers → layers.shape');
+}
+{
+    const def = { trigger: trigger(), steps: [], edges: [], layers: { 'Bad-Key': layerGraph() } };
+    const r = validateDefinition(def);
+    assert.ok(r.errors.some(e => e.code === 'layers.key_invalid'), 'invalid key → layers.key_invalid');
+}
+{
+    const def = { trigger: trigger(), steps: [], edges: [], layers: { good_key: 'not-an-object' } };
+    const r = validateDefinition(def);
+    assert.ok(r.errors.some(e => e.code === 'layers.value_shape'), 'non-object layer value → layers.value_shape');
+}
+
+// ── unknown layerKey → error with did-you-mean hint ──────────────────────
+{
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 'cl1', type: 'call_layer', layerKey: 'enrich_contct', inputs: {} }],
+        edges: [{ from: 'trg', to: 'cl1' }],
+        layers: { enrich_contact: layerGraph({ trigger: { id: 'trg', type: 'trigger', kind: 'layer_input', params: [] } }) },
+    };
+    const r = validateDefinition(def);
+    assert.strictEqual(r.ok, false);
+    const rec = r.errors.find(e => e.code === 'call_layer.unknown_layer');
+    assert.ok(rec, 'expected call_layer.unknown_layer');
+    assert.ok(/enrich_contact/.test(rec.hint), `hint must suggest the real key, got: ${rec.hint}`);
+}
+
+// ── legacy layerId (pre-migration shape) → dedicated error ───────────────
+{
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 'cl1', type: 'call_layer', layerId: 'some-uuid', inputs: {} }],
+        edges: [{ from: 'trg', to: 'cl1' }],
+    };
+    const r = validateDefinition(def);
+    assert.strictEqual(r.ok, false);
+    assert.ok(r.errors.some(e => e.code === 'call_layer.legacy_layerId'), 'expected call_layer.legacy_layerId');
+}
+
+// ── required layer param must be bound ───────────────────────────────────
+{
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 'cl1', type: 'call_layer', layerKey: 'enrich_contact', inputs: {} }],
+        edges: [{ from: 'trg', to: 'cl1' }],
+        layers: { enrich_contact: layerGraph() },
+    };
+    const r = validateDefinition(def);
+    assert.strictEqual(r.ok, false, 'missing required param must block');
+    const rec = r.errors.find(e => e.code === 'call_layer.param_missing');
+    assert.ok(rec && rec.path.endsWith('.email'), 'param_missing on email');
+    // Empty-string literal counts as missing too.
+    const def2 = { ...def, steps: [{ id: 'cl1', type: 'call_layer', layerKey: 'enrich_contact', inputs: { email: { kind: 'literal', value: '' } } }] };
+    assert.ok(validateDefinition(def2).errors.some(e => e.code === 'call_layer.param_missing'), 'empty literal → param_missing');
+}
+
+// ── approval inside a layer → error ──────────────────────────────────────
+{
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 'cl1', type: 'call_layer', layerKey: 'l', inputs: {} }],
+        edges: [{ from: 'trg', to: 'cl1' }],
+        layers: {
+            l: layerGraph({
+                trigger: { id: 'trg', type: 'trigger', kind: 'layer_input', params: [] },
+                steps: [
+                    { id: 'ap', type: 'approval', prompt: 'ok?' },
+                    { id: 'out', type: 'layer_output', fields: {} },
+                ],
+                edges: [{ from: 'trg', to: 'ap' }, { from: 'ap', to: 'out' }],
+            }),
+        },
+    };
+    const r = validateDefinition(def);
+    const rec = r.errors.find(e => e.code === 'layer.approval_forbidden');
+    assert.ok(rec, 'expected layer.approval_forbidden');
+    assert.ok(rec.path.startsWith('layers.l.'), `layer-scoped path, got ${rec.path}`);
+}
+
+// ── layer trigger must be layer_input ────────────────────────────────────
+{
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 'cl1', type: 'call_layer', layerKey: 'l', inputs: {} }],
+        edges: [{ from: 'trg', to: 'cl1' }],
+        layers: { l: layerGraph({ trigger: { id: 'trg', type: 'trigger', kind: 'manual' } }) },
+    };
+    assert.ok(validateDefinition(def).errors.some(e => e.code === 'layer.trigger_kind'), 'non-layer_input trigger → layer.trigger_kind');
+}
+
+// ── layer_output count: >1 error, 0 warning; root layer_output stays legal ─
+{
+    const two = layerGraph({
+        steps: [
+            { id: 'out', type: 'layer_output', fields: {} },
+            { id: 'out2', type: 'layer_output', fields: {} },
+        ],
+        edges: [{ from: 'trg', to: 'out' }, { from: 'out', to: 'out2' }],
+        trigger: { id: 'trg', type: 'trigger', kind: 'layer_input', params: [] },
+    });
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 'cl1', type: 'call_layer', layerKey: 'l', inputs: {} }],
+        edges: [{ from: 'trg', to: 'cl1' }],
+        layers: { l: two },
+    };
+    assert.ok(validateDefinition(def).errors.some(e => e.code === 'layer.multiple_outputs'), 'two layer_outputs → error');
+
+    const zero = layerGraph({
+        steps: [{ id: 's1', type: 'set', fields: {} }],
+        edges: [{ from: 'trg', to: 's1' }],
+        trigger: { id: 'trg', type: 'trigger', kind: 'layer_input', params: [] },
+    });
+    const def0 = { ...def, layers: { l: zero } };
+    const r0 = validateDefinition(def0);
+    assert.strictEqual(r0.ok, true, 'zero layer_outputs is only a warning');
+    assert.ok(r0.warnings.some(w => w.code === 'layer.no_output'), 'zero layer_outputs → warning');
+
+    // layer_output at the ROOT (converted orphan layers) stays legal.
+    const rootOut = {
+        trigger: trigger(),
+        steps: [{ id: 'out', type: 'layer_output', fields: { a: { kind: 'literal', value: 1 } } }],
+        edges: [{ from: 'trg', to: 'out' }],
+    };
+    assert.strictEqual(validateDefinition(rootOut).ok, true, 'root layer_output stays legal');
+}
+
+// ── nested layers key inside a layer → error ─────────────────────────────
+{
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 'cl1', type: 'call_layer', layerKey: 'l', inputs: {} }],
+        edges: [{ from: 'trg', to: 'cl1' }],
+        layers: { l: layerGraph({ layers: { inner: {} }, trigger: { id: 'trg', type: 'trigger', kind: 'layer_input', params: [] } }) },
+    };
+    assert.ok(validateDefinition(def).errors.some(e => e.code === 'layers.nested'), 'nested layers map → layers.nested');
+}
+
+// ── cycle A → B → A → layers.cycle ───────────────────────────────────────
+{
+    const callTo = (key) => layerGraph({
+        trigger: { id: 'trg', type: 'trigger', kind: 'layer_input', params: [] },
+        steps: [
+            { id: 'cl', type: 'call_layer', layerKey: key, inputs: {} },
+            { id: 'out', type: 'layer_output', fields: {} },
+        ],
+        edges: [{ from: 'trg', to: 'cl' }, { from: 'cl', to: 'out' }],
+    });
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 'cl1', type: 'call_layer', layerKey: 'a', inputs: {} }],
+        edges: [{ from: 'trg', to: 'cl1' }],
+        layers: { a: callTo('b'), b: callTo('a') },
+    };
+    const r = validateDefinition(def);
+    assert.ok(r.errors.some(e => e.code === 'layers.cycle'), 'A→B→A must raise layers.cycle');
+}
+
+// ── chain deeper than 8 layers → layers.depth_exceeded ───────────────────
+{
+    const layers = {};
+    const N = 9; // root → l1 → … → l9 = depth 9 > MAX_LAYER_DEPTH (8)
+    for (let i = 1; i <= N; i++) {
+        const next = i < N ? `l${i + 1}` : null;
+        layers[`l${i}`] = layerGraph({
+            trigger: { id: 'trg', type: 'trigger', kind: 'layer_input', params: [] },
+            steps: [
+                ...(next ? [{ id: 'cl', type: 'call_layer', layerKey: next, inputs: {} }] : []),
+                { id: 'out', type: 'layer_output', fields: {} },
+            ],
+            edges: next
+                ? [{ from: 'trg', to: 'cl' }, { from: 'cl', to: 'out' }]
+                : [{ from: 'trg', to: 'out' }],
+        });
+    }
+    const def = {
+        trigger: trigger(),
+        steps: [{ id: 'cl1', type: 'call_layer', layerKey: 'l1', inputs: {} }],
+        edges: [{ from: 'trg', to: 'cl1' }],
+        layers,
+    };
+    const r = validateDefinition(def);
+    assert.ok(r.errors.some(e => e.code === 'layers.depth_exceeded'), `9-deep chain must raise layers.depth_exceeded, got ${JSON.stringify(r.errors.map(e => e.code))}`);
+}
+
+// ── never-referenced layer → orphan warning (non-blocking) ───────────────
+{
+    const def = {
+        trigger: trigger(),
+        steps: [],
+        edges: [],
+        layers: { unused_layer: layerGraph({ trigger: { id: 'trg', type: 'trigger', kind: 'layer_input', params: [] } }) },
+    };
+    const r = validateDefinition(def);
+    assert.strictEqual(r.ok, true, 'orphan layer is a warning, not an error');
+    assert.ok(r.warnings.some(w => w.code === 'layers.orphaned'), 'expected layers.orphaned warning');
+}
+
+// ── call_layer inside a loop body is checked too (unknown key) ───────────
+{
+    const def = {
+        trigger: trigger(),
+        steps: [{
+            id: 'loop1', type: 'loop', overRef: 'trigger.output.items', itemVar: 'item', maxIterations: 10,
+            body: [{ id: 'cl1', type: 'call_layer', layerKey: 'missing', inputs: {} }],
+        }],
+        edges: [{ from: 'trg', to: 'loop1' }],
+        layers: {},
+    };
+    const r = validateDefinition(def);
+    assert.ok(r.errors.some(e => e.code === 'call_layer.unknown_layer' && /body/.test(e.path)), 'loop-body call_layer is validated');
+}
+
+// ── leftover denormalized contract fields are tolerated (ignored) ────────
+{
+    const def = {
+        trigger: trigger(),
+        steps: [{
+            id: 'cl1', type: 'call_layer', layerKey: 'enrich_contact',
+            inputs: { email: { kind: 'literal', value: 'a@b.c' } },
+            migratedFromLayerId: 'old-uuid',
+            inputContract: [{ name: 'email' }], outputContract: [{ name: 'score' }],
+        }],
+        edges: [{ from: 'trg', to: 'cl1' }],
+        layers: { enrich_contact: layerGraph() },
+    };
+    assert.strictEqual(validateDefinition(def).ok, true, 'leftover contract fields are ignored');
+}
+
 console.log('validate.test.js — all checks passed');
